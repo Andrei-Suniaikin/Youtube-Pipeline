@@ -10440,6 +10440,17 @@ def _journal_close_frame(image_data, error: str = "") -> None:
         return
     state["closed"] = True
     path = state["path"]
+    # «Готово» доказывается файлом. Кадр пишет его сам, а клип — нет: его сохраняет
+    # батч уже после того, как поток завершился. Без этой записи успешный клип
+    # закрывался бы как неудача, и следующий прогон оплатил бы его заново.
+    # Байты уже в памяти, батч потом перезапишет тот же файл — цена одна лишняя
+    # локальная запись на клип, и только когда журнал включён.
+    if image_data and path and not os.path.exists(path):
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            save_base64_to_file(image_data, path)
+        except Exception as exc:                                   # noqa: BLE001
+            print_debug(f"[журнал] результат не сохранён в {path}: {exc}")
     if image_data and (not path or os.path.exists(path)):
         state["journal"].delivered(state["call_id"], path)
     else:
@@ -10448,6 +10459,104 @@ def _journal_close_frame(image_data, error: str = "") -> None:
             error or _last_gen_error() or "кадр не получен",
             ordered=state["ordered"],
         )
+
+
+def _journal_clip_provider() -> str:
+    """Кто берёт деньги за клип. Цена и лимиты у veo и v6 разные."""
+    return "veo" if VIDEO_METHOD == "veo" else "googler"
+
+
+def _journal_clip_poll():
+    """Чем опросить уже созданный заказ клипа, не создавая новый."""
+    return veo_poll_task if VIDEO_METHOD == "veo" else poll_v6_generation
+
+
+def _file_sha256(path: str) -> str:
+    """Отпечаток исходного кадра: именно он определяет результат i2v и его цену."""
+    if not path or not os.path.exists(path):
+        return ""
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+    except OSError:
+        return ""
+    return h.hexdigest()
+
+
+def _journal_reserve_clip(unit, prompt, aspect_ratio, image_path, output_path):
+    """Заявка на платный клип ДО обращения к провайдеру.
+
+    В отпечаток входит то, что определяет результат и цену: бэкенд, промпт, соотношение
+    сторон и sha256 исходного кадра (для t2v его нет). Единица — номер сцены, а не
+    позиция в выборке: выборка меняется от запуска к запуску («первые 5 сцен» против
+    «все»), и по позиции один клип оплачивался бы дважды под разными номерами.
+    """
+    _JOURNAL_FRAME.state = None
+    journal = _journal()
+    if journal is None or not journal.enabled:
+        return _JOURNAL_OFF
+    fingerprint = journal.fingerprint(
+        method=VIDEO_METHOD, prompt=prompt, aspect=aspect_ratio,
+        source=_file_sha256(image_path),
+    )
+    decision = journal.reserve(unit=str(unit), fingerprint=fingerprint, kind="video",
+                               provider=_journal_clip_provider(), model=VIDEO_METHOD)
+    if decision.call_id and decision.action != "skip":
+        _JOURNAL_FRAME.state = {
+            "journal": journal, "call_id": decision.call_id, "order_id": "",
+            "ordered": False, "closed": False, "path": output_path or "",
+        }
+    return decision
+
+
+def _journal_clip_gate(decision, index, output_path):
+    """Что делать, когда платить нельзя. Возвращает (перехвачено, данные).
+
+    Три случая различаются ценой ошибки, и путать их нельзя:
+      skip    — клип уже оплачен и получен: отдаём файл, заказ не создаём;
+      verify  — заказ создавался и результата мы не видели: опрашиваем ЕГО;
+      unknown — кабинет не ответил: клип пропускается, его доберёт докачка. Пропустить
+                клип дешевле, чем оплатить его второй раз.
+    """
+    label = index + 1
+    if decision.action == "skip":
+        done = decision.result_path or output_path or ""
+        if done and os.path.exists(done):
+            print_user(f"♻️ [{label}] Журнал: клип уже получен ({os.path.basename(done)}) — "
+                       f"платный запрос не нужен", "INFO")
+            try:
+                with open(done, "rb") as fh:
+                    return True, base64.b64encode(fh.read()).decode("ascii")
+            except OSError as exc:
+                print_user(f"⚠️ [{label}] Журнал: готовый файл не читается ({exc}) — "
+                           f"клип пропущен без нового платного запроса", "ERROR")
+                return True, None
+        print_user(f"⛔ [{label}] Журнал: клип числится оплаченным и полученным, но файла "
+                   f"«{done}» здесь нет — пропускаю без нового платного запроса", "ERROR")
+        return True, None
+    if decision.may_call:
+        return False, None
+    if decision.action == "verify" and decision.remote_order_id:
+        _journal_note_order(decision.remote_order_id, post=False)
+        print_user(f"🔎 [{label}] Журнал: заказ {decision.remote_order_id} уже создан — "
+                   f"опрашиваю его, нового не создаю", "WARNING")
+        data = _journal_clip_poll()(decision.remote_order_id, index,
+                                    timeout=VEO_POLL_TIMEOUT)
+        if data:
+            if output_path:
+                save_base64_to_file(data, output_path)
+            print_user(f"✅ [{label}] Журнал: результат забран у уже оплаченного заказа",
+                       "SUCCESS")
+            return True, data
+        print_user(f"❌ [{label}] Журнал: оплаченный заказ {decision.remote_order_id} "
+                   f"результата не дал — клип пропущен без новой оплаты", "ERROR")
+        return True, None
+    why = ("заказ уже создавался, id неизвестен" if decision.action == "verify"
+           else f"кабинет не ответил ({decision.error or 'причина неизвестна'})")
+    print_user(f"⛔ [{label}] Журнал: {why} — пропускаю клип без повторной оплаты", "ERROR")
+    return True, None
 
 
 def _journal_frame_call(function):
@@ -11647,7 +11756,10 @@ def veo_poll_task(task_id: str, index: int = 0, timeout: int = None) -> Optional
     return None
 
 
-def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: bool = False) -> Tuple[int, Optional[str]]:
+@_journal_frame_call   # 03.09.2026: журнал платных вызовов — клип стоит дороже кадра
+def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: bool = False,
+                   journal_unit: Optional[str] = None,
+                   journal_output: Optional[str] = None) -> Tuple[int, Optional[str]]:
     """
     Генерирует видео из изображения через выбранный бэкенд.
     
@@ -11663,9 +11775,21 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
     image_base64 = image_to_base64(image_path)
     if not image_base64:
         return (index, None)
-    
-    max_attempts = _gen_attempts(VEO_MAX_ATTEMPTS if VIDEO_METHOD == "veo" else 3)
+
     v_ar = GROK_ASPECT_RATIOS.get("landscape", "16:9")  # видео-кадр обычно 16:9
+    # 03.09.2026: заявка в журнал ДО первого обращения к провайдеру. Единица — имя
+    # исходного кадра: из него же строится имя выходного файла, поэтому строка журнала
+    # и файл на диске указывают на одну сцену.
+    _jrn = _journal_reserve_clip(
+        unit=(journal_unit or os.path.splitext(os.path.basename(image_path))[0]),
+        prompt=prompt, aspect_ratio=v_ar, image_path=image_path,
+        output_path=journal_output,
+    )
+    _handled, _data = _journal_clip_gate(_jrn, index, journal_output)
+    if _handled:
+        return (index, _data)
+
+    max_attempts = _gen_attempts(VEO_MAX_ATTEMPTS if VIDEO_METHOD == "veo" else 3)
     _soften_rounds = 0  # раундов GPT-смягчения промпта после контент-фильтра (макс 3)
 
     for attempt in range(max_attempts):
@@ -11685,6 +11809,7 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
                 veo_res = veo_request("video/image-to-video", data=veo_body)
                 task = veo_res.get("data") if isinstance(veo_res, dict) else None
                 task_id = task.get("task_id") if isinstance(task, dict) else None
+                _journal_note_order(task_id)   # 03.09.2026: заказ оплачен — id ДО поллинга
                 if task_id:
                     log(f"📋 [{total_label}] veo task_id: {task_id}")
                     video_data = veo_poll_task(task_id, index, timeout=VEO_POLL_TIMEOUT)
@@ -11747,6 +11872,7 @@ def generate_video_from_prompt_only(prompt: str, aspect_ratio: str = "landscape"
         veo_res = veo_request("video/text-to-video", data={"prompt": prompt, "aspect_ratio": v_ar})
         task = veo_res.get("data") if isinstance(veo_res, dict) else None
         task_id = task.get("task_id") if isinstance(task, dict) else None
+        _journal_note_order(task_id)   # 03.09.2026: заказ оплачен — id ДО поллинга
         if task_id:
             log(f"📋 [{total_label}] veo task_id: {task_id}")
             return (index, veo_poll_task(task_id, index, timeout=VEO_POLL_TIMEOUT))
@@ -11763,9 +11889,23 @@ def generate_video_from_prompt_only(prompt: str, aspect_ratio: str = "landscape"
     return (index, None)
 
 
-def _t2v_generate_with_retry(prompt: str, aspect_ratio: str, index: int) -> Tuple[int, Optional[str]]:
+@_journal_frame_call   # 03.09.2026: журнал платных вызовов, заявка на весь цикл попыток
+def _t2v_generate_with_retry(prompt: str, aspect_ratio: str, index: int,
+                             journal_unit: Optional[str] = None,
+                             journal_output: Optional[str] = None) -> Tuple[int, Optional[str]]:
     """t2v с ретраями — как у i2v generate_video: VEO_MAX_ATTEMPTS для veo (капча/слоты флапают),
     паузы VEO_RETRY_DELAY*attempt (кап 120с)."""
+    # Заявка одна на весь цикл: двадцать попыток одной сцены — это одна единица работы,
+    # и если журнал завести на каждую попытку, повтор после таймаута будет выглядеть
+    # новым кадром и оплатится заново.
+    _jrn = _journal_reserve_clip(
+        unit=(journal_unit if journal_unit is not None else f"{index + 1:03d}"),
+        prompt=prompt, aspect_ratio=aspect_ratio, image_path="",
+        output_path=journal_output,
+    )
+    _handled, _data = _journal_clip_gate(_jrn, index, journal_output)
+    if _handled:
+        return (index, _data)
     max_attempts = _gen_attempts(VEO_MAX_ATTEMPTS if VIDEO_METHOD == "veo" else 3)
     _soften_rounds = 0  # раундов GPT-смягчения промпта после контент-фильтра (макс 3)
     for attempt in range(max_attempts):
@@ -11818,7 +11958,9 @@ def generate_videos_from_prompts_batch(scene_prompts: List[Tuple[int, str]], out
     batch_start = time.time()
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = {
-            executor.submit(_t2v_generate_with_retry, prompt, aspect_ratio, i): scene_num
+            executor.submit(_t2v_generate_with_retry, prompt, aspect_ratio, i,
+                            f"{scene_num:03d}",
+                            os.path.join(output_dir, f"{scene_num:03d}_video.mp4")): scene_num
             for i, (scene_num, prompt) in enumerate(scene_prompts)
         }
         for future in as_completed(futures):
@@ -11974,7 +12116,11 @@ def generate_videos_batch(prompt: str, image_paths: List[str], output_dir: str, 
 
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = {
-            executor.submit(generate_video, prompt, img_path, i, use_legacy): i
+            executor.submit(
+                generate_video, prompt, img_path, i, use_legacy,
+                os.path.splitext(os.path.basename(img_path))[0],
+                os.path.join(output_dir,
+                             os.path.splitext(os.path.basename(img_path))[0] + "_video.mp4")): i
             for i, img_path in enumerate(image_paths)
         }
 
