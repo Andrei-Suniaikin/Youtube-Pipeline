@@ -20,8 +20,18 @@ trap 'kill 0' EXIT
 ( cd "$ROOT/cover"   && "$PY" -m uvicorn cover_server:app --port 8900 --log-level warning ) &
 ( cd "$ROOT/rewrite" && "$PY" -m uvicorn server:app       --port 8899 --log-level warning ) &
 ( cd "$ROOT"         && "$PY" -m uvicorn web.app:app      --port 8010 --log-level warning ) &
+# Тревоги — отдельный процесс, а не поток внутри пульта: в бою это systemd-таймер,
+# и падение опроса не должно уносить с собой интерфейс. Запускается только когда
+# телеграм настроен, иначе крутить цикл в пустоту незачем.
+if grep -qE '^VS_TG_TOKEN=.+' "$ROOT/.env" 2>/dev/null && grep -qE '^VS_TG_CHAT=.+' "$ROOT/.env" 2>/dev/null; then
+  ( cd "$ROOT" && "$PY" dev/alerts.py --loop --every 60 ) &
+  ALERTS="  тревоги  каждые 60 с → телеграм"
+else
+  ALERTS="  тревоги  выключены: нет VS_TG_TOKEN / VS_TG_CHAT в .env (см. .env.example)"
+fi
 echo
 echo "  пульт    http://127.0.0.1:8010   (новый)"
+echo "$ALERTS"
 echo "  кабинет  http://127.0.0.1:8800   (боевой VSGen)"
 echo "  rewrite  http://127.0.0.1:8899"
 echo "  cover    http://127.0.0.1:8900"

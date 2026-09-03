@@ -119,7 +119,7 @@
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
     <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
-    <span class="soon">Пресеты</span>
+    <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
     <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
   </nav>
 </header>
@@ -560,6 +560,56 @@ async function viewNew(){
   };
 }
 
+/* ─────────────────────────────── пресеты ─────────────────────────────── */
+
+async function viewPresets(){
+  const d = await api('/ui/presets');
+  app.innerHTML = '';
+  app.append($(`<h1>Пресеты</h1>
+    <p class="sub">Один список вместо трёх. Всё берётся по HTTP с ключом — не чтением
+      чужих файлов.</p>`));
+
+  if (d.broken.length){
+    app.append($(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">Ссылки в никуда</div>
+      ${d.broken.map(b => `<div class="stage">
+        <div class="dot s-error">!</div>
+        <div class="body">
+          <div class="name">${esc(b.why)}</div>
+          <div class="facts">на него ссылаются: ${b.channels.map(ch =>
+            `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')}</div>
+          <div class="note muted">Сегодня такой канал узнаёт об этом в момент
+            генерации — то есть после того, как встал.</div>
+        </div></div>`).join('')}
+    </div>`));
+  }
+
+  for (const g of d.groups){
+    app.append($(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">${esc(g.title)}</div>
+      ${g.error
+        ? `<div class="stage"><div class="dot s-error">!</div><div class="body">
+             <div class="name">Список не получен — ${esc(g.error)}</div>
+             <div class="note muted">Пусто здесь означает «не спросили», а не
+               «пресетов нет».</div></div></div>`
+        : (g.items.length ? g.items.map(i => `<div class="stage">
+             <div class="dot ${i.channels.length ? 's-done' : 's-idle'}">${
+               i.channels.length ? '✓' : '·'}</div>
+             <div class="body">
+               <div class="name">${esc(i.name)}</div>
+               <div class="facts">${i.facts.map(f => esc(f)).join(' · ') || '—'}</div>
+               <div class="note ${i.channels.length ? 'muted' : ''}">${
+                 i.channels.length
+                   ? 'каналы: ' + i.channels.map(ch =>
+                       `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')
+                   : 'ни один канал им не пользуется'}</div>
+             </div></div>`).join('')
+           : '<div class="empty">Пресетов нет.</div>')}
+      ${g.note ? `<div class="note muted">${esc(g.note)}</div>` : ''}
+    </div>`));
+  }
+}
+
 /* ─────────────────────────── админ: тревоги и диск ─────────────────────────── */
 
 const FATE_TITLE = {keep:'артефакт выпуска — не удаляется', strip:'промежуточное'};
@@ -675,6 +725,7 @@ const ROUTES = [
   ['channels', h => h === '#/channels',           () => viewChannels()],
   ['channels', h => h.startsWith('#/channel/'),   h  => viewChannel(decodeURIComponent(h.slice(10)))],
   ['keys',     h => h === '#/keys',               () => viewKeys()],
+  ['presets',  h => h === '#/presets',            () => viewPresets()],
   ['admin',    h => h === '#/admin',              () => viewAdmin()],
   ['releases', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
   ['releases', h => h === '#/new',                () => viewNew()],
@@ -684,7 +735,7 @@ const ROUTES = [
 async function render(){
   const h = location.hash || '#/releases';
   const hit = ROUTES.find(r => r[1](h));
-  for (const id of ['releases', 'channels', 'queue', 'keys', 'admin'])
+  for (const id of ['releases', 'channels', 'queue', 'keys', 'presets', 'admin'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
   try{ await hit[2](h); }catch(e){ fail(e); }
 }

@@ -463,8 +463,9 @@ def build_api_router(
     job_stop_events: Dict[str, Any],
     job_stop_events_lock: Lock,
     user_is_active: Optional[Callable[[str], bool]] = None,
+    presets_provider: Optional[Callable[[str], Dict]] = None,
 ) -> APIRouter:
-    """Создаёт APIRouter с 7 endpoints. Все требуют api-key через Depends(get_api_user)."""
+    """Создаёт APIRouter с 8 endpoints. Все требуют api-key через Depends(get_api_user)."""
 
     router = APIRouter(
         prefix="/api/v1",
@@ -517,6 +518,28 @@ def build_api_router(
                 "short_code (e.g. 'en'; ambiguous codes rejected with hint)",
             ],
         )
+
+    # ----- 0.2 GET /presets -----
+    # ДОБАВЛЕНО 03.09.2026. Пресеты были доступны только сессии (`GET /presets`), поэтому
+    # кабинет читал их в обход HTTP — прямо из sessions.db соседнего сервиса, сопоставляя
+    # пользователей по логину (pub_neighbors.py). Это анти-контракт: он делает два сервиса
+    # неразделимыми и ломается от любой смены схемы. Здесь тот же список отдаётся по ключу,
+    # то есть по правилам.
+    @router.get(
+        "/presets",
+        summary="List presets",
+        description=(
+            "Пресеты текущего пользователя, три независимых набора: `rewrite` — пресеты "
+            "рерайта по ссылке (модель, потоки, размер куска, языки); `generation` — брифы "
+            "для создания текста с нуля; `gen_settings` — сохранённые наборы настроек "
+            "вкладки генерации. Путать их нельзя: канал в кабинете ссылается именно на "
+            "`rewrite`."
+        ),
+    )
+    def list_presets_api(user: Dict = Depends(get_api_user)) -> Dict:
+        if presets_provider is None:
+            raise HTTPException(status_code=503, detail="presets provider not configured")
+        return presets_provider(_api_user_id(user))
 
     # ----- 1.1 POST /files -----
     @router.post(

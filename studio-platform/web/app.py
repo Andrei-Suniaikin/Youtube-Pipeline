@@ -749,3 +749,129 @@ def ui_disk():
                        for c_, n, f, _pat in pub_retention.CATEGORIES],
         "how": "срок хранения задаёт владелец: dev/retention.py --policy strip=14 drop=90",
     }
+
+
+# ──────────────────────────────── пресеты ────────────────────────────────
+
+def _neighbour_get(base: str, path: str, key: str) -> tuple:
+    """(тело, ошибка). Недоступный сосед не роняет экран, но и не притворяется пустым."""
+    if not key:
+        return None, "ключ доступа не сохранён"
+    req = urllib.request.Request(f"{base}{path}")
+    req.add_header("Authorization", f"Bearer {key}")
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}"), ""
+    except urllib.error.HTTPError as exc:
+        return None, f"ответил {exc.code}"
+    except Exception as exc:                                     # noqa: BLE001
+        return None, f"не отвечает: {type(exc).__name__}"
+
+
+@app.get("/ui/presets")
+def ui_presets():
+    """Один список пресетов вместо трёх (ТЗ §04: пресеты 3 → 1).
+
+    Все три набора берутся **по HTTP с ключом**, а не чтением чужих файлов. Сегодня
+    кабинет получает пресеты соседей через `pub_neighbors.py`, который открывает их
+    SQLite и JSON напрямую и сопоставляет пользователей по логину. Это анти-контракт:
+    он делает три сервиса неразделимыми и ломается от любой смены схемы. Ради этого
+    экрана в Rewrite добавлен `GET /api/v1/presets` — теперь честный путь существует
+    для обоих соседей.
+
+    Отдельно считается то, ради чего экран и нужен: какие каналы на какой пресет
+    ссылаются и есть ли ссылки в никуда. Канал, указывающий на удалённый пресет,
+    сегодня узнаёт об этом в момент генерации.
+    """
+    c = db()
+    try:
+        used = {"rewrite": {}, "vsgen": {}, "cover": {}}
+        for ch in c.execute("SELECT id, name, preset_rewrite, preset_vsgen_id, "
+                            "preset_cover FROM pub_channels WHERE tenant_id=? "
+                            "ORDER BY name", (TENANT,)):
+            for kind, val in (("rewrite", ch["preset_rewrite"]),
+                              ("vsgen", ch["preset_vsgen_id"]),
+                              ("cover", ch["preset_cover"])):
+                if val in (None, ""):
+                    continue
+                used[kind].setdefault(str(val), []).append(
+                    {"id": ch["id"], "name": ch["name"]})
+        vsgen = [{"key": str(r["id"]), "name": r["name"] or f"пресет {r['id']}",
+                  "facts": _preset_facts(r["settings"])}
+                 for r in c.execute("SELECT id, name, settings FROM presets "
+                                    "WHERE tenant_id=? ORDER BY name COLLATE NOCASE",
+                                    (TENANT,))]
+        keys = {n: get_key(c, n) for n in ("rewrite", "cover")}
+    finally:
+        c.close()
+
+    groups = [{"service": "vsgen", "title": "Производство (кабинет)", "items": vsgen,
+               "error": "", "note": "ключ пресета — число, а не имя"}]
+
+    body, err = _neighbour_get(REWRITE_BASE, "/api/v1/presets", keys["rewrite"])
+    rew = (body or {}).get("rewrite") or {}
+    groups.append({
+        "service": "rewrite", "title": "Рерайт по ссылке", "error": err,
+        "note": "канал ссылается именно на этот набор, а не на брифы генерации",
+        "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
+                  for name, cfg in sorted(rew.items(), key=lambda kv: kv[0].lower())]})
+    gen = (body or {}).get("generation") or {}
+    if gen:
+        groups.append({
+            "service": "rewrite_gen", "title": "Брифы генерации с нуля", "error": "",
+            "note": "к рерайту по ссылке отношения не имеют — отдельное хранилище",
+            "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
+                      for name, cfg in sorted(gen.items(), key=lambda kv: kv[0].lower())]})
+
+    body, err = _neighbour_get(COVER_BASE, "/presets", keys["cover"])
+    cov = body if isinstance(body, dict) else {}
+    groups.append({
+        "service": "cover", "title": "Обложки", "error": err, "note": "",
+        "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
+                  for name, cfg in sorted(cov.items(), key=lambda kv: kv[0].lower())]})
+
+    # Кто кем пользуется — и куда ссылок нет.
+    have = {g["service"]: {i["key"] for i in g["items"]} for g in groups}
+    for g in groups:
+        for item in g["items"]:
+            item["channels"] = used.get(g["service"], {}).get(item["key"], [])
+    broken = []
+    for kind, title in (("rewrite", "рерайта"), ("vsgen", "производства"),
+                        ("cover", "обложек")):
+        if have.get(kind) is None or (kind != "vsgen" and not have.get(kind)):
+            continue          # сосед не ответил: молчим, а не объявляем всё сломанным
+        for key, chans in sorted(used[kind].items()):
+            if key in have.get(kind, set()):
+                continue
+            broken.append({"kind": kind, "key": key,
+                           "why": f"пресет {title} «{key}» не найден в сервисе",
+                           "channels": chans})
+    return {"groups": groups, "broken": broken,
+            "unavailable": [] if all(not g["error"] for g in groups) else
+            [{"what": g["title"], "why": g["error"]} for g in groups if g["error"]]}
+
+
+def _preset_facts(settings) -> list:
+    """Две-три вещи, по которым пресет узнают. Секреты сюда не попадают по построению:
+    имена, похожие на ключ, отбрасываются — как на стороне Rewrite, так и здесь."""
+    data = settings
+    if isinstance(settings, str):
+        try:
+            data = json.loads(settings or "{}")
+        except ValueError:
+            return []
+    if not isinstance(data, dict):
+        return []
+    facts = []
+    for k, v in data.items():
+        low = str(k).lower()
+        if any(m in low for m in ("key", "token", "secret", "password", "auth")):
+            continue
+        if isinstance(v, (dict, list)):
+            v = f"{len(v)} шт."
+        if v in (None, "", False):
+            continue
+        facts.append(f"{k}: {v}")
+        if len(facts) >= 4:
+            break
+    return facts

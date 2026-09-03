@@ -3366,6 +3366,43 @@ def _content_disposition(filename: str) -> str:
 
 from api import build_api_router  # noqa: E402
 
+# Секрет в пресете настроек оказаться не должен, но проверяем это здесь, а не надеемся:
+# набор полей задаёт интерфейс, и завтра в нём может появиться что угодно.
+_SECRETISH = ("key", "token", "secret", "password", "cookie", "auth", "credential")
+
+
+def _without_secrets(value):
+    if isinstance(value, dict):
+        return {k: _without_secrets(v) for k, v in value.items()
+                if not any(mark in str(k).lower() for mark in _SECRETISH)}
+    if isinstance(value, list):
+        return [_without_secrets(v) for v in value]
+    return value
+
+
+def _api_presets(user_id: str) -> dict:
+    """Три набора пресетов пользователя для GET /api/v1/presets.
+
+    Разделение не косметическое: `rew_presets` (пресеты рерайта по ссылке) и пресеты
+    генерации живут в разных хранилищах и означают разное. Канал в кабинете привязан
+    именно к пресету рерайта.
+    """
+    cfg = get_keys_config(user_id) or {}
+    rew = cfg.get("rew_presets") or {}
+    gen_settings = cfg.get("gen_settings_presets") or {}
+    try:
+        generation = {p.name: _preset_summary(p)
+                      for p in _preset_manager_for(user_id).list_presets()}
+    except Exception:
+        generation = {}
+    return {
+        "rewrite": _without_secrets(rew if isinstance(rew, dict) else {}),
+        "generation": generation,
+        "gen_settings": _without_secrets(
+            gen_settings if isinstance(gen_settings, dict) else {}),
+    }
+
+
 api_router = build_api_router(
     queue=queue,
     upload_dir=UPLOAD_DIR,
@@ -3373,6 +3410,7 @@ api_router = build_api_router(
     job_stop_events=_job_stop_events,
     job_stop_events_lock=_job_stop_events_lock,
     user_is_active=license_mgr.is_user_active,
+    presets_provider=_api_presets,
 )
 app.include_router(api_router)
 # Channel Studio (Path B) откачен 2026-05-23 — заменяется модернизацией Generation tab.
