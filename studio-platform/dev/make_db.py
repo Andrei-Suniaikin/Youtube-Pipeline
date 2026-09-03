@@ -40,6 +40,13 @@ def build_schema(c) -> int:
         c.execute(s)
         if m and m.group(1).upper() == "TABLE":
             made += 1
+    # Журнал платных вызовов появился после снятия пакета, поэтому его нет в DDL
+    # архива. Создаём тем же кодом, что и кабинет при старте, — второй, расходящийся
+    # вариант схемы завёлся бы в тот же день.
+    sys.path.insert(0, os.path.join(ROOT, "studio-platform", "server"))
+    from pub_calls import ensure_calls_schema
+    ensure_calls_schema(c)
+    made += 1
     return made
 
 
@@ -203,6 +210,79 @@ def seed(c) -> dict:
     return {"release_id": rid, "channel_id": ch_id, "plan_item_id": item_id}
 
 
+# Размеры файлов взяты близкими к настоящим (проект ≈ 518 МБ), но сами файлы —
+# разрежённые: `st_size` показывает нужные мегабайты, а на диске занято несколько
+# килобайт. Иначе локальная песочница отъедала бы полтора гигабайта ради картинки
+# на экране. Уборка меряет ровно `st_size`, поэтому отчёт получается настоящим.
+DISK_LAYOUT = (
+    ("googler/{i:03d}.jpg", 155, 300 * 1024),
+    ("googler video/{i:03d}.mp4", 12, 4 * 1024 * 1024),
+    ("voice_final.mp3", 1, 25 * 1024 * 1024),
+)
+DISK_ARTIFACTS = (
+    ("render/out.mp4", 420 * 1024 * 1024),
+    ("subtitles.srt", 40 * 1024),
+    ("chapters/chapters.txt", 4 * 1024),
+)
+
+
+def _sparse(path: str, size: int) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    # Пустой файл + truncate: дыра получается целиком, и на диске файл занимает ноль.
+    # Вариант «seek к концу и записать байт» на APFS резервирует место целиком для
+    # мелких файлов — 155 кадров превращались в настоящие 45 МБ.
+    open(path, "wb").close()
+    if size > 0:
+        os.truncate(path, size)
+
+
+def seed_disk(c, tenants_dir: str) -> int:
+    """Каталоги проектов на диске — иначе экрану «Диск» нечего показывать.
+
+    Три состояния, ради которых экран и нужен: работающий проект (трогать нельзя),
+    давно опубликованный (кандидат на очистку) и вчерашний (рано).
+    """
+    made = 0
+    plan = (
+        # id проекта,       артефакты?, фаза,          когда опубликован
+        ("proj-dev-0001",   False,      "media_ready",  0),
+        ("proj-dev-0002",   True,       "published",    NOW - 40 * DAY),
+        ("proj-dev-0003",   True,       "published",    NOW - 3 * DAY),
+    )
+    for pid, with_artifacts, phase, published in plan:
+        pdir = os.path.join(tenants_dir, TENANT, "projects", pid)
+        for tmpl, count, size in DISK_LAYOUT:
+            for i in range(count):
+                _sparse(os.path.join(pdir, tmpl.format(i=i)), size)
+        if with_artifacts:
+            for rel, size in DISK_ARTIFACTS:
+                _sparse(os.path.join(pdir, rel), size)
+        if pid != "proj-dev-0001":
+            c.execute("INSERT OR REPLACE INTO projects(id,tenant_id,name,dir_path,status,"
+                      "created,updated,settings) VALUES(?,?,?,?,?,?,?,'{}')",
+                      (pid, TENANT, f"Проект {pid[-4:]}", f"projects/{TENANT}/{pid}",
+                       "done", published - 2 * DAY, published))
+            c.execute(
+                "INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,"
+                "plan_item_version,channel_id,uc,slot_at,project_id,status,phase,"
+                "video_id,attempts,created,updated) VALUES(?,?,?,1,?,?,?,?,?,?,?,0,?,?)",
+                (f"rel-{pid}", TENANT, -abs(hash(pid)) % 10 ** 6, 1,
+                 "UCdev0000000000000000001", published, pid, "done", phase,
+                 "yt-" + pid[-4:], published - 2 * DAY, published))
+        # Журнал платных вызовов: без него уборка не сможет сказать, сколько денег
+        # выбрасывается вместе с кадрами.
+        for i in range(155):
+            c.execute(
+                "INSERT OR IGNORE INTO provider_calls(tenant_id,project_id,release_id,"
+                "kind,unit,fingerprint,provider,model,status,result_path,cost,attempts,"
+                "created,updated) VALUES(?,?,?,'images',?,?,'recrafter','NARWHAL',"
+                "'delivered',?,4.0,1,?,?)",
+                (TENANT, pid, f"rel-{pid}", f"{i:03d}", f"fp-{pid}-{i}",
+                 f"googler/{i:03d}.jpg", NOW - 10 * DAY, NOW - 10 * DAY))
+        made += 1
+    return made
+
+
 def main() -> None:
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(HERE, "vsgen.dev.db")
     if os.path.exists(path):
@@ -211,6 +291,8 @@ def main() -> None:
     try:
         made = build_schema(c)
         ids = seed(c)
+        tenants = os.environ.get("VS_TENANTS_DIR") or os.path.join(HERE, "data", "tenants")
+        projects = seed_disk(c, tenants)
         c.commit()
         tables = c.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
     finally:
@@ -218,6 +300,8 @@ def main() -> None:
     print(f"база:     {path}")
     print(f"таблиц:   {made} создано из DDL, {tables} всего в файле")
     print(f"выпуск:   {ids['release_id']} — фаза media_ready, канал {ids['channel_id']}")
+    print(f"на диске: {projects} проекта в {tenants} (файлы разрежённые: "
+          f"размер настоящий, места почти не занимают)")
 
 
 if __name__ == "__main__":
