@@ -1,0 +1,42 @@
+# Тревоги конвейера: один проход и выход. Запускается таймером, а не крутится сам.
+#
+# Почему не поток внутри кабинета: падение опроса не должно уносить с собой интерфейс,
+# а перезапуск кабинета не должен молча гасить тревоги. Type=oneshot плюс таймер даёт
+# и то и другое, и вдобавок журнал каждого прохода в journalctl.
+#
+#   sudo cp deploy/studio-alerts.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now studio-alerts.timer
+#   systemctl list-timers studio-alerts.timer
+#   journalctl -u studio-alerts -n 50
+
+[Unit]
+Description=Studio: тревоги конвейера в телеграм
+# Смысла ходить в базу до кабинета нет: он её и создаёт.
+After=network-online.target vsgen.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=studio
+WorkingDirectory=/srv/studio/studio-platform
+# Токен и chat_id лежат в .env рядом с кодом и в git не попадают (см. .gitignore).
+# EnvironmentFile с минусом: отсутствие файла не должно ронять юнит — тревоги просто
+# не будут отправляться, и это видно на экране «Админ».
+EnvironmentFile=-/srv/studio/studio-platform/.env
+Environment=VS_DEV_DB=/srv/studio/vsgen.db
+Environment=VS_TENANTS_DIR=/data/tenants
+ExecStart=/srv/studio/studio-platform/.venv/bin/python dev/alerts.py --once
+# Один проход не должен висеть дольше собственного интервала.
+TimeoutStartSec=120
+
+# Тревоги читают базу и ходят в api.telegram.org — больше им ничего не нужно.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/studio
+ReadOnlyPaths=/data/tenants
+
+[Install]
+WantedBy=multi-user.target
