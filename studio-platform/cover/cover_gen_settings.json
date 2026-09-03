@@ -1,0 +1,6 @@
+{
+  "max_parallel_jobs": 4,
+  "max_threads_per_job": 1,
+  "max_generation_retries": 2,
+  "queue_limit_per_user": 40
+}

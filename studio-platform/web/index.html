@@ -1,0 +1,382 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Studio — выпуски</title>
+<style>
+  :root{
+    --bg:#f6f7f9; --card:#fff; --ink:#16181d; --muted:#6b7280; --line:#e3e6ea;
+    --ok:#127a3d; --ok-bg:#e8f5ec; --run:#1257a8; --run-bg:#e7f0fb;
+    --wait:#8a5a00; --wait-bg:#fdf3e0; --bad:#a41d1d; --bad-bg:#fbeaea;
+    --off:#7a7f88; --off-bg:#f0f1f3;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+  a{color:inherit}
+  header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  nav{display:flex;gap:2px;align-items:center;padding:0 16px;max-width:1080px;margin:0 auto;
+      flex-wrap:wrap}
+  nav .brand{font-weight:650;margin-right:18px;padding:13px 0;letter-spacing:.02em}
+  nav a.tab{padding:13px 12px;color:var(--muted);text-decoration:none;
+            border-bottom:2px solid transparent;white-space:nowrap}
+  nav a.tab.on{color:var(--ink);border-bottom-color:var(--ink);font-weight:550}
+  nav span.soon{padding:13px 12px;color:#b4b8bf;cursor:not-allowed;white-space:nowrap}
+  nav span.soon::after{content:" скоро";font-size:11px;opacity:.8}
+  main{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
+  h1{font-size:20px;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0 0 18px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:10px}
+  .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  select,input,textarea,button{font:inherit;color:inherit}
+  select,input,textarea{background:var(--card);border:1px solid var(--line);
+                        border-radius:7px;padding:7px 9px}
+  textarea{width:100%;min-height:120px;resize:vertical;font-family:ui-monospace,Menlo,monospace;
+           font-size:13px}
+  button{background:var(--ink);color:#fff;border:0;border-radius:7px;padding:8px 14px;
+         cursor:pointer;font-weight:550}
+  button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
+  button:disabled{opacity:.5;cursor:default}
+  table{width:100%;border-collapse:collapse}
+  th{text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.04em;
+     color:var(--muted);font-weight:600;padding:11px 14px;border-bottom:1px solid var(--line)}
+  td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  tr:last-child td{border-bottom:0}
+  tr.row:hover{background:#fafbfc;cursor:pointer}
+  .pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600}
+  .s-done{background:var(--ok-bg);color:var(--ok)}
+  .s-running{background:var(--run-bg);color:var(--run)}
+  .s-queued{background:var(--wait-bg);color:var(--wait)}
+  .s-error{background:var(--bad-bg);color:var(--bad)}
+  .s-idle{background:var(--off-bg);color:var(--off)}
+  .s-off{background:transparent;color:var(--off);border:1px dashed #c9cdd4}
+  .muted{color:var(--muted)}
+  .mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
+  .bar{height:4px;background:var(--off-bg);border-radius:3px;overflow:hidden;margin-top:7px;
+       max-width:220px}
+  .bar i{display:block;height:100%;background:var(--run)}
+  .stage{display:flex;gap:13px;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .stage:last-child{border-bottom:0}
+  .stage .dot{flex:0 0 22px;height:22px;border-radius:50%;display:grid;place-items:center;
+              font-size:12px;font-weight:700;margin-top:1px}
+  .stage .body{flex:1;min-width:0}
+  .stage .name{font-weight:600}
+  .stage.off .name{color:var(--off)}
+  .facts{color:var(--muted);font-size:13px;margin-top:2px}
+  .note{margin-top:3px;font-size:13px}
+  .note.bad{color:var(--bad)}
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0;
+        border-bottom:1px solid var(--line)}
+  .grid div{padding:13px 16px;border-right:1px solid var(--line)}
+  .grid div:last-child{border-right:0}
+  .grid .k{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);
+           font-weight:600;margin-bottom:3px}
+  .sec{padding:14px 16px;border-bottom:1px solid var(--line);font-weight:600;font-size:13px}
+  .ev{display:flex;gap:12px;padding:9px 16px;border-bottom:1px solid var(--line);font-size:13px}
+  .ev:last-child{border-bottom:0}
+  .ev time{color:var(--muted);flex:0 0 108px;font-variant-numeric:tabular-nums}
+  .ev .step{flex:0 0 110px;color:var(--muted)}
+  .empty{padding:34px 16px;text-align:center;color:var(--muted)}
+  .err{background:var(--bad-bg);color:var(--bad);padding:11px 14px;border-radius:8px;
+       margin-bottom:14px}
+  .res{margin-top:14px}
+  .res h3{font-size:13px;margin:0 0 6px;text-transform:uppercase;letter-spacing:.04em;
+          color:var(--muted)}
+  .res ul{margin:0 0 14px;padding-left:20px}
+  .back{display:inline-block;margin-bottom:12px;color:var(--muted);text-decoration:none}
+  .back:hover{color:var(--ink)}
+  @media (max-width:640px){ .grid{grid-template-columns:1fr 1fr} .ev time{flex-basis:74px} }
+</style>
+</head>
+<body>
+
+<header>
+  <nav>
+    <span class="brand">Studio</span>
+    <a class="tab" href="#/releases" id="tab-releases">Выпуски</a>
+    <span class="soon">Каналы</span>
+    <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
+    <span class="soon">Ключи</span>
+    <span class="soon">Пресеты</span>
+  </nav>
+</header>
+
+<main id="app"><div class="empty">загрузка…</div></main>
+
+<script>
+const $ = (h, ...kids) => { const e = document.createElement('div'); e.innerHTML = h; return e; };
+const app = document.getElementById('app');
+
+const STATE_TITLE = {done:'готово', running:'идёт', queued:'в очереди',
+                     error:'ошибка', idle:'не начато', off:'не участвует'};
+const DOT = {done:'✓', running:'◐', queued:'·', error:'!', idle:'', off:'–'};
+
+function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+function when(ts){
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  return d.toLocaleString('ru-RU', {day:'2-digit', month:'2-digit',
+                                    hour:'2-digit', minute:'2-digit'});
+}
+function ago(sec){
+  if (sec == null) return '';
+  if (sec < 60) return sec + ' с';
+  if (sec < 3600) return Math.round(sec/60) + ' мин';
+  if (sec < 86400) return Math.round(sec/3600) + ' ч';
+  return Math.round(sec/86400) + ' дн';
+}
+async function api(path, opts){
+  const r = await fetch(path, opts);
+  const body = await r.json().catch(() => ({detail:'ответ не разобран'}));
+  if (!r.ok) throw new Error(body.detail || body.error || ('HTTP ' + r.status));
+  return body;
+}
+function fail(e){
+  app.innerHTML = '';
+  app.append($(`<div class="err">${esc(e.message)}</div>
+    <p class="muted">Проверьте, что база создана: <span class="mono">python3 dev/make_db.py</span></p>`));
+}
+
+/* ─────────────────────────── список выпусков ─────────────────────────── */
+
+let FILTERS = {channel:'', phase:'', status:''};
+
+async function viewReleases(){
+  const q = new URLSearchParams(Object.entries(FILTERS).filter(([,v]) => v)).toString();
+  const [data, chs] = await Promise.all([
+    api('/ui/releases' + (q ? '?' + q : '')),
+    api('/ui/channels'),
+  ]);
+
+  app.innerHTML = '';
+  app.append($(`<h1>Выпуски</h1>
+    <p class="sub">Путь ролика от донорской ссылки до подтверждённой публикации.</p>`));
+
+  const bar = $(`<div class="toolbar">
+    <select id="f-ch"><option value="">все каналы</option>${
+      chs.channels.map(c => `<option value="${c.id}" ${FILTERS.channel==String(c.id)?'selected':''}
+        >${esc(c.name)}</option>`).join('')}</select>
+    <select id="f-ph"><option value="">любая фаза</option>${
+      data.phases.map(p => `<option value="${p.key}" ${FILTERS.phase==p.key?'selected':''}
+        >${esc(p.title)}</option>`).join('')}</select>
+    <select id="f-st"><option value="">любой статус</option>
+      <option value="pending" ${FILTERS.status=='pending'?'selected':''}>ожидает</option>
+      <option value="running" ${FILTERS.status=='running'?'selected':''}>в работе</option>
+      <option value="done" ${FILTERS.status=='done'?'selected':''}>готово</option>
+      <option value="blocked" ${FILTERS.status=='blocked'?'selected':''}>остановлен</option>
+    </select>
+    <span style="flex:1"></span>
+    <button id="new">Новый выпуск по ссылке</button>
+  </div>`);
+  app.append(bar);
+  bar.querySelector('#new').onclick = () => location.hash = '#/new';
+  const bind = (id, key) => bar.querySelector(id).onchange = e => {
+    FILTERS[key] = e.target.value; render();
+  };
+  bind('#f-ch','channel'); bind('#f-ph','phase'); bind('#f-st','status');
+
+  if (!data.releases.length){
+    app.append($(`<div class="card"><div class="empty">
+      Выпусков нет. Вставьте ссылку на донора — она встанет в ближайший свободный выход канала.
+    </div></div>`));
+    return;
+  }
+
+  const rows = data.releases.map(r => `
+    <tr class="row" data-id="${esc(r.release_id)}">
+      <td>
+        <div style="font-weight:600">${esc(r.donor_title || r.donor_url || r.release_id)}</div>
+        <div class="muted mono">${esc(r.release_id)}</div>
+      </td>
+      <td>${esc(r.channel)}<div class="muted">${esc(r.lang)}</div></td>
+      <td>${when(r.slot_at)}</td>
+      <td>
+        <span class="pill s-${r.status === 'done' ? 'done'
+          : r.status === 'blocked' ? 'error'
+          : r.status === 'running' ? 'running' : 'queued'}">${esc(r.phase_title)}</span>
+        <div class="muted" style="margin-top:4px">шаг ${r.phase_index + 1} из ${r.phase_total}</div>
+        <div class="bar"><i style="width:${
+          Math.round((r.phase_index + 1) / r.phase_total * 100)}%"></i></div>
+      </td>
+      <td class="muted">${ago(r.idle_sec)}${r.attempts ? `<div>попыток ${r.attempts}</div>` : ''}
+        ${r.blocked_reason ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : ''}</td>
+    </tr>`).join('');
+
+  const table = $(`<div class="card"><table>
+    <thead><tr><th>Выпуск</th><th>Канал</th><th>Выход</th><th>Фаза</th><th>Без движения</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`);
+  table.querySelectorAll('tr.row').forEach(tr =>
+    tr.onclick = () => location.hash = '#/release/' + tr.dataset.id);
+  app.append(table);
+}
+
+/* ─────────────────────────── карточка выпуска ─────────────────────────── */
+
+async function viewRelease(id){
+  const d = await api('/ui/releases/' + encodeURIComponent(id));
+  const r = d.release;
+
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/releases">← ко всем выпускам</a>
+    <h1>${esc(r.donor_title || r.release_id)}</h1>
+    <p class="sub">${esc(r.channel)} · ${esc(r.lang)} · выход ${when(r.slot_at)}
+      · фаза «${esc(r.phase_title)}»</p>`));
+
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="grid">
+      <div><div class="k">Статус</div>${esc(r.status || '—')}</div>
+      <div><div class="k">Шаг</div>${r.phase_index + 1} из ${r.phase_total}</div>
+      <div><div class="k">Попыток</div>${r.attempts}</div>
+      <div><div class="k">Без движения</div>${ago(r.idle_sec) || '—'}</div>
+      <div><div class="k">Ролик</div>${r.video_id ? esc(r.video_id) : '—'}</div>
+    </div>
+    ${r.blocked_reason ? `<div class="sec" style="color:var(--bad)">
+        Остановлен: ${esc(r.blocked_reason)}</div>` : ''}
+    ${d.stages.map(s => `
+      <div class="stage ${s.state === 'off' ? 'off' : ''}">
+        <div class="dot s-${s.state}">${DOT[s.state] || ''}</div>
+        <div class="body">
+          <div class="name">${esc(s.title)}
+            <span class="pill s-${s.state}" style="margin-left:6px">${STATE_TITLE[s.state]}</span>
+          </div>
+          ${s.facts.length ? `<div class="facts">${s.facts.map(esc).join(' · ')}</div>` : ''}
+          ${s.note ? `<div class="note ${s.state === 'error' ? 'bad' : 'muted'}"
+            >${esc(s.note)}</div>` : ''}
+        </div>
+      </div>`).join('')}
+  </div>`));
+
+  app.append($(`<div class="card">
+    <div class="sec">Что происходило</div>
+    ${d.events.length ? d.events.map(e => `<div class="ev">
+        <time>${when(e.created)}</time>
+        <div class="step">фаза</div>
+        <div>${esc(e.phase_title)}${e.video_id ? ' · ролик ' + esc(e.video_id) : ''}</div>
+      </div>`).join('') : ''}
+    ${d.log.map(l => `<div class="ev">
+        <time>${when(l.ts)}</time>
+        <div class="step">${esc(l.step)}</div>
+        <div${l.level === 'warn' || l.level === 'error' ? ' class="note bad"' : ''}
+          >${esc(l.message)}</div>
+      </div>`).join('')}
+    ${!d.events.length && !d.log.length ? '<div class="empty">Записей пока нет.</div>' : ''}
+  </div>`));
+}
+
+/* ────────────────────── сквозная очередь трёх сервисов ────────────────────── */
+
+const SVC_TITLE = {vsgen:'Видео', rewrite:'Текст', cover:'Обложки'};
+
+async function viewQueue(){
+  const d = await api('/ui/queue');
+
+  app.innerHTML = '';
+  app.append($(`<h1>Очередь</h1>
+    <p class="sub">Задачи трёх сервисов в одном списке. Свои — из базы, чужие — по HTTP.</p>`));
+
+  app.append($(`<div class="toolbar">${d.services.map(s => `
+    <span class="pill ${s.ok ? 's-done' : 's-error'}" title="${esc(s.error)}">
+      ${esc(s.title)}: ${s.ok ? s.count : 'нет связи'}</span>`).join('')}</div>`));
+
+  const down = d.services.filter(s => !s.ok);
+  if (down.length) app.append($(`<div class="err">${down.map(s =>
+    `${esc(s.title)} — ${esc(s.error)}`).join('<br>')}<br>
+    <span style="opacity:.75">Это не «задач нет», а «спросить не удалось».</span></div>`));
+
+  if (!d.rows.length){
+    app.append($(`<div class="card"><div class="empty">Задач нет.</div></div>`));
+    return;
+  }
+
+  app.append($(`<div class="card"><table>
+    <thead><tr><th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th></tr></thead>
+    <tbody>${d.rows.map(r => `
+      <tr>
+        <td><span class="pill s-idle">${esc(SVC_TITLE[r.service] || r.service)}</span></td>
+        <td><div style="font-weight:600">${esc(r.title)}</div>
+            <div class="muted mono">${esc(r.id)}</div></td>
+        <td>${esc(r.kind || '—')}
+            ${r.provider ? `<div class="muted">${esc(r.provider)}</div>` : ''}</td>
+        <td><span class="pill s-${r.state}">${STATE_TITLE[r.state]}</span>
+            ${r.stage ? `<div class="muted" style="margin-top:4px">${esc(r.stage)}</div>` : ''}
+            ${r.progress != null ? `<div class="bar"><i style="width:${
+              Math.round(r.progress * 100)}%"></i></div>` : ''}
+            ${r.error ? `<div class="note bad">${esc(r.error)}</div>` : ''}</td>
+        <td class="muted">${when(r.created)}</td>
+      </tr>`).join('')}</tbody></table></div>`));
+}
+
+/* ─────────────────────────── старт по ссылке ─────────────────────────── */
+
+async function viewNew(){
+  const chs = (await api('/ui/channels')).channels;
+
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/releases">← ко всем выпускам</a>
+    <h1>Новый выпуск по ссылке</h1>
+    <p class="sub">Ссылки раскладываются по свободным выходам канала.
+      Что не влезло в горизонт — сохранится без даты и займёт выход, как только он освободится.</p>`));
+
+  const form = $(`<div class="card" style="padding:16px">
+    <div id="err"></div>
+    <label class="k" style="display:block;margin-bottom:6px">Канал</label>
+    <select id="ch" style="margin-bottom:14px;min-width:280px">${
+      chs.map(c => `<option value="${c.id}">${esc(c.name)} · ${esc(c.lang)}
+        · ${c.per_day} в неделю · горизонт ${c.horizon_days} дн</option>`).join('')}</select>
+    <label class="k" style="display:block;margin-bottom:6px">Ссылки на доноров, по одной в строке</label>
+    <textarea id="links" placeholder="https://www.youtube.com/watch?v=…"></textarea>
+    <div style="margin-top:14px"><button id="go">Поставить в план</button></div>
+    <div id="res"></div>
+  </div>`);
+  app.append(form);
+
+  const errBox = form.querySelector('#err');
+  const resBox = form.querySelector('#res');
+  const btn = form.querySelector('#go');
+
+  btn.onclick = async () => {
+    errBox.innerHTML = ''; resBox.innerHTML = ''; btn.disabled = true;
+    try{
+      const out = await api('/ui/links', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({channel_id: Number(form.querySelector('#ch').value),
+                              links: form.querySelector('#links').value}),
+      });
+      const block = (title, items) => items.length
+        ? `<h3>${title}</h3><ul>${items.map(i => `<li>${esc(i)}</li>`).join('')}</ul>` : '';
+      resBox.innerHTML = `<div class="res">
+        ${block('Разложено по выходам', out.placed)}
+        ${out.queued ? `<h3>Сохранено без даты</h3><ul><li>${out.queued} шт. —
+           в горизонте канала свободных выходов не осталось</li></ul>` : ''}
+        ${block('Пропущено как дубль', out.skipped)}
+        <button class="ghost" onclick="location.hash='#/releases'">К выпускам</button>
+      </div>`;
+      form.querySelector('#links').value = '';
+    }catch(e){
+      errBox.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    }finally{ btn.disabled = false; }
+  };
+}
+
+/* ─────────────────────────────── роутер ─────────────────────────────── */
+
+async function render(){
+  const h = location.hash || '#/releases';
+  const queue = h === '#/queue';
+  document.getElementById('tab-queue').classList.toggle('on', queue);
+  document.getElementById('tab-releases').classList.toggle('on', !queue);
+  try{
+    if (queue) return await viewQueue();
+    if (h.startsWith('#/release/')) return await viewRelease(decodeURIComponent(h.slice(10)));
+    if (h === '#/new') return await viewNew();
+    return await viewReleases();
+  }catch(e){ fail(e); }
+}
+addEventListener('hashchange', render);
+render();
+</script>
+</body>
+</html>

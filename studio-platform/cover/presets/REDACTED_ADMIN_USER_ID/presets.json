@@ -1,0 +1,32 @@
+{
+  "Default RU": {
+    "name": "Default RU",
+    "language": "Русский",
+    "languages": "Русский,Английский",
+    "font_path": "",
+    "text_color": "#FFFFFF",
+    "outline_color": "#000000",
+    "outline_width": 3,
+    "text_position": "center",
+    "text_size_pct": 15,
+    "style_prompt": "",
+    "use_auto_style": true,
+    "fallback_mode": "auto",
+    "generation_provider": "flow",
+    "generation_model": "GEM_PIX_2",
+    "fast_gen_base_url": "",
+    "analysis_provider": "openai",
+    "analysis_model": "gpt-4.1-mini",
+    "aspect_ratio": "16:9",
+    "created_at": "2026-09-03T13:08:47.549144",
+    "updated_at": "2026-09-03T13:08:47.549144",
+    "max_generation_retries": 5,
+    "debug_mode": false,
+    "simple_mode": false,
+    "reference_image": "",
+    "prompt_template": "",
+    "seed_reference_image": "",
+    "seed_reference_filename": "",
+    "seed_n_variants": 3
+  }
+}

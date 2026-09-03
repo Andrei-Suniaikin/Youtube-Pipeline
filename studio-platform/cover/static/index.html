@@ -1,0 +1,2754 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Cover Studio</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect x='2' y='7' width='28' height='18' rx='4' fill='%234c8dff'/><rect x='6' y='11' width='13' height='4' rx='2' fill='white'/><rect x='6' y='18' width='8' height='3' rx='1.5' fill='white' opacity='0.55'/></svg>">
+  <style>
+    :root {
+      --bg: #141416;
+      --surface: #1c1c1f;
+      --raised: #242429;
+      --input: #232327;
+      --border: #32323a;
+      --border-soft: #2a2a30;
+      --text: #ececf1;
+      --text-2: #9b9ba6;
+      --text-3: #6f6f7a;
+      --accent: #4c8dff;
+      --accent-h: #6ba1ff;
+      --green: #34c07c;
+      --red: #e5484d;
+      --red-h: #f2555a;
+      --amber: #e0a53a;
+      --radius: 10px;
+      --radius-s: 8px;
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      margin: 0; background: var(--bg); color: var(--text);
+      font-size: 14px; line-height: 1.45;
+    }
+    h1, h2, h3 { margin: 0; font-weight: 600; }
+    h2 { font-size: 15px; }
+    h3 { font-size: 14px; }
+    p { margin: 0; }
+
+    /* ── Контролы ─────────────────────────────── */
+    input, textarea, select {
+      font: inherit; color: var(--text);
+      background: var(--input); border: 1px solid var(--border);
+      border-radius: var(--radius-s); padding: 7px 10px; margin: 0;
+    }
+    input:focus, textarea:focus, select:focus { border-color: var(--accent); outline: none; }
+    input::placeholder, textarea::placeholder { color: var(--text-3); }
+    textarea { resize: vertical; }
+    input[type="checkbox"] { accent-color: var(--accent); width: 15px; height: 15px; padding: 0; margin: 0; flex: none; }
+    label { user-select: none; }
+
+    .btn {
+      font: inherit; cursor: pointer; border: 1px solid transparent;
+      border-radius: var(--radius-s); padding: 7px 14px;
+      background: var(--raised); color: var(--text);
+      transition: background 0.12s, border-color 0.12s, opacity 0.12s;
+      white-space: nowrap;
+    }
+    .btn:hover { background: #2c2c33; }
+    .btn:disabled { opacity: 0.45; cursor: default; }
+    .btn-primary { background: var(--accent); color: #fff; font-weight: 600; }
+    .btn-primary:hover { background: var(--accent-h); }
+    .btn-ghost { background: transparent; border-color: var(--border); color: var(--text-2); }
+    .btn-ghost:hover { background: var(--raised); color: var(--text); }
+    .btn-danger { background: transparent; border-color: var(--border); color: var(--red); }
+    .btn-danger:hover { background: rgba(229, 72, 77, 0.12); border-color: var(--red); }
+    .btn-sm { padding: 4px 10px; font-size: 13px; border-radius: 6px; }
+
+    .card { background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius); padding: 16px; }
+    .flex { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .error { color: #ff8589; }
+    .hint { font-size: 12px; color: var(--text-3); }
+    .field-hint { font-size: 12px; color: var(--text-3); margin-top: 4px; }
+    .table-scroll { overflow-x: auto; }
+
+    /* ── Шапка ────────────────────────────────── */
+    .topbar {
+      display: flex; align-items: center; gap: 16px;
+      padding: 10px 20px; background: var(--surface);
+      border-bottom: 1px solid var(--border-soft);
+      position: sticky; top: 0; z-index: 20;
+    }
+    .brand { display: flex; align-items: center; gap: 9px; font-size: 16px; font-weight: 700; letter-spacing: 0.01em; }
+    .brand svg { display: block; }
+    .topnav { display: flex; gap: 4px; margin-left: 12px; }
+    .nav-btn {
+      font: inherit; cursor: pointer; border: none; background: transparent;
+      color: var(--text-2); padding: 6px 12px; border-radius: var(--radius-s);
+    }
+    .nav-btn:hover { color: var(--text); background: var(--raised); }
+    .nav-btn.active { color: var(--text); background: var(--raised); font-weight: 600; }
+    .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+
+    /* ── Раскладка ────────────────────────────── */
+    .layout {
+      display: grid; grid-template-columns: minmax(400px, 460px) minmax(0, 1fr);
+      gap: 16px; padding: 16px 20px 40px; max-width: 1600px; margin: 0 auto;
+      align-items: start;
+    }
+    @media (max-width: 1100px) { .layout { grid-template-columns: 1fr; } }
+    .view { display: none; }
+    .view.active { display: block; }
+
+    .form-section { padding: 14px 0; border-top: 1px solid var(--border-soft); }
+    .form-section:first-child { border-top: none; padding-top: 0; }
+    .form-section > h2 { margin-bottom: 10px; }
+    .frow { display: grid; grid-template-columns: 150px 1fr; gap: 8px; align-items: center; margin: 8px 0; }
+    .frow > label:first-child { color: var(--text-2); font-size: 13px; }
+    .frow-check { display: flex; align-items: center; gap: 8px; margin: 10px 0; cursor: pointer; }
+    @media (max-width: 600px) { .frow { grid-template-columns: 1fr; gap: 4px; } }
+
+    /* Сегментный переключатель режима */
+    .seg { display: grid; grid-template-columns: 1fr 1fr; gap: 4px; background: var(--input); border: 1px solid var(--border); border-radius: var(--radius-s); padding: 3px; }
+    .seg button {
+      font: inherit; cursor: pointer; border: none; border-radius: 6px;
+      background: transparent; color: var(--text-2); padding: 7px 10px; font-weight: 500;
+    }
+    .seg button.active { background: var(--raised); color: var(--text); font-weight: 600; box-shadow: 0 1px 3px rgba(0,0,0,0.3); }
+
+    /* Языки */
+    .lang-toolbar { display: flex; gap: 6px; margin-bottom: 8px; align-items: center; }
+    .lang-toolbar input { flex: 1; min-width: 0; padding: 5px 10px; font-size: 13px; }
+    .lang-list {
+      max-height: 216px; overflow-y: auto;
+      border: 1px solid var(--border); border-radius: var(--radius-s);
+      padding: 6px; background: var(--input);
+      display: grid; grid-template-columns: 1fr 1fr; gap: 1px 8px; align-content: start;
+    }
+    .lang-item { display: flex; align-items: center; gap: 7px; padding: 4px 6px; border-radius: 6px; min-width: 0; }
+    .lang-item:hover { background: var(--raised); }
+    .lang-item.hidden { display: none; }
+    .lang-item label { cursor: pointer; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .lang-count { font-size: 12px; color: var(--text-3); margin-top: 6px; }
+
+    /* Референс */
+    .title-ref-container { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 8px 0; }
+    .title-ref-container.hidden { display: none; }
+    .ref-label { font-size: 12px; color: var(--text-2); }
+    #sp-ref-btn.hidden, #url-ref-btn.hidden { display: none; }
+    .ref-status { padding: 4px 10px; background: rgba(52, 192, 124, 0.14); border: 1px solid rgba(52, 192, 124, 0.45); color: #9fe3c0; border-radius: 6px; font-size: 13px; cursor: default; }
+    .ref-status.hidden { display: none; }
+    .ref-status .ref-clear { color: #ff9999; margin-left: 8px; font-weight: bold; cursor: pointer; }
+
+    /* ── Режим «Пресет + семя»: вертикаль карточек ── */
+    .seed-card { background: var(--input); border: 1px solid var(--border-soft); border-radius: var(--radius-s); padding: 12px; margin-bottom: 10px; }
+    .seed-card-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); font-weight: 600; margin-bottom: 8px; }
+    #seed-preset-meta { font-size: 12px; color: var(--text-2); margin-top: 6px; word-break: break-word; }
+    .seed-row { background: var(--surface); border: 1px solid var(--border-soft); border-radius: var(--radius-s); padding: 8px; margin-bottom: 8px; }
+    .seed-row-head { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+    .seed-row-head select { flex: 1; min-width: 0; }
+    .seed-row textarea { width: 100%; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; }
+    .seed-row select.err { border-color: var(--red); }
+
+    /* Расширенные настройки */
+    details.adv { border: 1px solid var(--border-soft); border-radius: var(--radius-s); background: var(--input); }
+    details.adv > summary {
+      cursor: pointer; padding: 10px 12px; color: var(--text-2); font-size: 13px; font-weight: 500;
+      list-style: none; display: flex; align-items: center; gap: 6px;
+    }
+    details.adv > summary::before { content: '▸'; font-size: 11px; transition: transform 0.15s; }
+    details.adv[open] > summary::before { transform: rotate(90deg); }
+    details.adv > summary::-webkit-details-marker { display: none; }
+    details.adv > .adv-body { padding: 2px 12px 12px; }
+    details.adv h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); margin: 14px 0 4px; }
+
+    /* CTA */
+    .cta-block { padding-top: 14px; border-top: 1px solid var(--border-soft); }
+    #btn-start { width: 100%; padding: 11px; font-size: 15px; }
+    #progress-msg { margin-top: 8px; font-size: 13px; min-height: 1em; }
+
+    /* ── Живая очередь (полоска) ──────────────── */
+    .vs-qstrip-wrap { max-width: 1600px; margin: 0 auto; padding: 14px 20px 0; }
+    .vs-qstrip {
+      background: var(--surface, #1c1c1f); border: 1px solid var(--border, #32323a);
+      color: var(--text, #f4eee7); border-radius: 999px; padding: 5px 12px;
+      font-size: 12px; display: inline-flex; gap: 8px; align-items: center;
+      white-space: nowrap; max-width: 100%; overflow: hidden; cursor: pointer;
+    }
+    .vs-qstrip .dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--accent, #4c8dff); }
+    .vs-qstrip .muted, .vs-qstrip .sep { color: var(--muted, var(--text-2, #9b9ba6)); }
+    .vs-qstrip.is-idle .dot { background: var(--green, #34c07c); }
+    .vs-qstrip.is-run .dot { background: var(--accent, #4c8dff); animation: vs-qpulse 1.6s ease-in-out infinite; }
+    .vs-qstrip.is-paused .dot { background: var(--amber, #e0a53a); }
+    .vs-qstrip.is-off .dot { background: var(--text-3, #6b6b76); }
+    @keyframes vs-qpulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+    @media (max-width: 720px) { .vs-qstrip .word { display: none; } }
+
+    /* ── Очередь ──────────────────────────────── */
+    .queue-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+    .queue-head h2 { margin-right: auto; }
+    .queue-head select { padding: 5px 8px; font-size: 13px; }
+    #job-list { width: 100%; border-collapse: collapse; font-size: 13px; }
+    #job-list th { text-align: left; padding: 6px 10px; color: var(--text-3); font-weight: 500; font-size: 12px; border-bottom: 1px solid var(--border); }
+    #job-list td { padding: 8px 10px; border-bottom: 1px solid var(--border-soft); }
+    #job-list tbody tr { cursor: pointer; }
+    #job-list tbody tr:hover { background: var(--raised); }
+    #job-list tbody tr.sel { background: rgba(76, 141, 255, 0.10); box-shadow: inset 2px 0 0 var(--accent); }
+    #job-list td.mono { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; color: var(--text-2); }
+
+    .pill { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; padding: 2px 9px 2px 7px; border-radius: 99px; background: var(--raised); color: var(--text-2); white-space: nowrap; }
+    .pill::before { content: ''; width: 7px; height: 7px; border-radius: 50%; background: var(--text-3); flex: none; }
+    .pill.running { color: #9cc1ff; background: rgba(76, 141, 255, 0.13); }
+    .pill.running::before { background: var(--accent); }
+    .pill.completed { color: #9fe3c0; background: rgba(52, 192, 124, 0.13); }
+    .pill.completed::before { background: var(--green); }
+    .pill.completed_partial { color: #f0cd90; background: rgba(224, 165, 58, 0.13); }
+    .pill.completed_partial::before { background: var(--amber); }
+    .pill.failed { color: #ff9d9f; background: rgba(229, 72, 77, 0.13); }
+    .pill.failed::before { background: var(--red); }
+    .pill.cancelled::before { background: var(--text-3); }
+
+    .bar-wrap { min-width: 130px; }
+    .bar { background: var(--raised); border-radius: 3px; height: 6px; overflow: hidden; }
+    .bar > div { height: 100%; border-radius: 3px; transition: width 0.3s; }
+    .bar-label { font-size: 11px; color: var(--text-3); margin-top: 3px; }
+
+    .pager { display: flex; align-items: center; gap: 6px; margin-top: 10px; flex-wrap: wrap; font-size: 13px; color: var(--text-2); }
+
+    /* Детали задачи */
+    #job-detail-card { margin-top: 16px; }
+    .detail-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+    .detail-head h3 { margin-right: auto; }
+    .detail-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+    .thumbs { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 8px; margin: 10px 0; }
+    .thumbs:empty { display: none; }
+    .thumbs img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; border-radius: 6px; border: 1px solid var(--border-soft); display: block; }
+    .detail-placeholder { color: var(--text-3); padding: 18px 0; text-align: center; }
+    details.plain { margin-top: 10px; }
+    details.plain > summary { cursor: pointer; color: var(--text-2); font-size: 13px; padding: 4px 0; }
+    #job-log { white-space: pre-wrap; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 12px; max-height: 240px; overflow-y: auto; background: #111114; border: 1px solid var(--border-soft); padding: 10px; border-radius: var(--radius-s); margin: 6px 0 0; }
+    .file-link { display: block; margin: 4px 0; color: var(--accent-h); text-decoration: none; font-size: 13px; word-break: break-all; }
+    .file-link:hover { text-decoration: underline; }
+    #job-files { margin-top: 6px; }
+
+    .download-menu { position: relative; display: inline-block; }
+    .download-menu-content { display: none; position: absolute; top: 100%; left: 0; background: var(--raised); border: 1px solid var(--border); border-radius: var(--radius-s); min-width: 230px; z-index: 10; margin-top: 4px; box-shadow: 0 6px 20px rgba(0,0,0,0.45); overflow: hidden; }
+    .download-menu-content.show { display: block; }
+    .download-menu-content a, .download-menu-content button { display: block; width: 100%; text-align: left; padding: 10px 14px; color: var(--text); text-decoration: none; border: none; background: none; cursor: pointer; font-size: 13px; }
+    .download-menu-content a:hover, .download-menu-content button:hover { background: #34343c; }
+
+    /* ── API ключи ────────────────────────────── */
+    #view-keys .card { max-width: 900px; }
+    #api-keys-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    #api-keys-table th { text-align: left; padding: 7px 10px; color: var(--text-3); font-weight: 500; font-size: 12px; border-bottom: 1px solid var(--border); }
+    #api-keys-table td { padding: 8px 10px; border-bottom: 1px solid var(--border-soft); }
+    .key-reveal { background: rgba(76, 141, 255, 0.10); border: 1px solid rgba(76, 141, 255, 0.4); padding: 12px; border-radius: var(--radius-s); margin-bottom: 12px; }
+    .key-reveal code { display: block; padding: 8px 10px; background: #111114; border: 1px solid var(--border); color: #8ec9ff; word-break: break-all; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; border-radius: 6px; margin: 8px 0; }
+    #api-usage-example { background: #111114; border: 1px solid var(--border-soft); color: #c3ccd6; padding: 10px 12px; border-radius: var(--radius-s); font-size: 12px; overflow-x: auto; font-family: ui-monospace, Menlo, Consolas, monospace; }
+
+    /* ── Логин ────────────────────────────────── */
+    #app-login { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 20px; }
+    .login-card { background: var(--surface); border: 1px solid var(--border-soft); border-radius: 14px; padding: 36px 32px; width: 100%; max-width: 400px; text-align: center; }
+    .login-card .brand { justify-content: center; font-size: 20px; margin-bottom: 10px; }
+    .login-card > p.sub { color: var(--text-2); font-size: 13px; margin-bottom: 22px; }
+    .login-card input { width: 100%; padding: 10px 12px; text-align: center; }
+    .login-card .btn-primary { width: 100%; margin-top: 10px; padding: 10px; }
+    #login-msg { margin-top: 10px; font-size: 13px; min-height: 1em; }
+
+    /* ── Модалки, тосты ───────────────────────── */
+    .modal { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.65); z-index: 100; align-items: center; justify-content: center; padding: 20px; }
+    .modal.show { display: flex; }
+    .modal-inner { background: var(--surface); border: 1px solid var(--border); padding: 20px; border-radius: 12px; max-width: 560px; width: 100%; max-height: 90vh; overflow-y: auto; }
+    .modal-inner h2 { margin-bottom: 12px; }
+    #toast { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); background: var(--raised); color: var(--text); padding: 10px 18px; border-radius: var(--radius-s); border: 1px solid #4a4a52; box-shadow: 0 6px 24px rgba(0,0,0,0.5); z-index: 1000; max-width: 80vw; font-size: 14px; transition: opacity 0.3s; display: none; }
+
+    /* ── Галерея задачи: группы, звёзды, бейджи ── */
+    #job-thumbs { margin: 10px 0; }
+    #job-thumbs:empty { display: none; margin: 0; }
+    .thumb-group-title { font-size: 12px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-3); margin: 10px 0 4px; font-weight: 600; }
+    .thumb-group .thumbs { margin: 4px 0 10px; }
+    .thumb { position: relative; cursor: zoom-in; }
+    .thumb-star {
+      position: absolute; top: 4px; right: 4px; z-index: 2;
+      background: rgba(0, 0, 0, 0.55); border: none; border-radius: 6px;
+      color: #fff; font-size: 14px; line-height: 1; padding: 4px 6px; cursor: pointer;
+    }
+    .thumb-star:hover { background: rgba(0, 0, 0, 0.8); }
+    .thumb-star.active { background: rgba(224, 165, 58, 0.45); }
+    .thumb-badge { position: absolute; left: 4px; bottom: 4px; z-index: 2; background: rgba(224, 165, 58, 0.9); color: #1a1a1a; font-size: 10px; padding: 1px 6px; border-radius: 4px; font-weight: 600; }
+
+    /* ── Лайтбокс ── */
+    #lightbox { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.88); z-index: 300; align-items: center; justify-content: center; gap: 12px; padding: 20px; }
+    #lightbox.show { display: flex; }
+    .lb-stage { display: flex; flex-direction: column; align-items: center; gap: 10px; min-width: 0; }
+    #lb-img { max-width: 90vw; max-height: 85vh; object-fit: contain; border-radius: 8px; border: 1px solid var(--border); background: #000; }
+    .lb-bar { display: flex; align-items: center; gap: 12px; color: var(--text-2); font-size: 13px; flex-wrap: wrap; justify-content: center; max-width: 90vw; }
+    #lb-caption { word-break: break-all; }
+    .lb-counter { color: var(--text-3); white-space: nowrap; }
+    .lb-btn { font: inherit; cursor: pointer; background: var(--raised); color: var(--text); border: 1px solid var(--border); border-radius: var(--radius-s); padding: 6px 12px; text-decoration: none; }
+    .lb-btn:hover { background: #34343c; }
+    .lb-nav { font-size: 22px; padding: 8px 14px; flex: none; }
+    #lb-close { position: absolute; top: 16px; right: 20px; z-index: 2; }
+
+    /* ── Избранное ── */
+    .favs-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+    .fav-card { position: relative; background: var(--raised); border: 1px solid var(--border-soft); border-radius: var(--radius-s); overflow: hidden; }
+    .fav-card img { width: 100%; aspect-ratio: 16 / 9; object-fit: cover; display: block; cursor: zoom-in; }
+    .fav-meta { padding: 6px 8px; font-size: 12px; color: var(--text-2); word-break: break-word; }
+    .fav-check { position: absolute; top: 6px; left: 6px; z-index: 2; background: rgba(0, 0, 0, 0.55); border-radius: 6px; padding: 4px; display: flex; cursor: pointer; }
+    .fav-del { position: absolute; top: 6px; right: 6px; z-index: 2; background: rgba(0, 0, 0, 0.55); border: none; border-radius: 6px; color: #ff9d9f; cursor: pointer; padding: 3px 7px; font-size: 13px; }
+    .fav-del:hover { background: rgba(229, 72, 77, 0.8); color: #fff; }
+
+    /* ── Иконки (SVG-спрайт) ── */
+    .ic{width:1em;height:1em;flex:none;vertical-align:-0.135em;display:inline-block;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+    .ic-lg{width:1.25em;height:1.25em}
+
+    #app-main { display: none; }
+  </style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<symbol id="ic-video" viewBox="0 0 24 24"><rect x="2.5" y="5.5" width="13" height="13" rx="2.5"/><path d="M15.5 10.2l5-2.7v9l-5-2.7z"/></symbol>
+<symbol id="ic-film" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M7 4v16M17 4v16M2.5 12h19M2.5 8h4.5M2.5 16h4.5M17 8h4.5M17 16h4.5"/></symbol>
+<symbol id="ic-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="M21 16l-5-5-9 9"/></symbol>
+<symbol id="ic-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4.5-4.5M12 15l4.5-4.5"/><path d="M4 17v2.5a1.5 1.5 0 001.5 1.5h13a1.5 1.5 0 001.5-1.5V17"/></symbol>
+<symbol id="ic-upload" viewBox="0 0 24 24"><path d="M12 21V9m0 0L7.5 13.5M12 9l4.5 4.5"/><path d="M4 7V4.5A1.5 1.5 0 015.5 3h13A1.5 1.5 0 0120 4.5V7"/></symbol>
+<symbol id="ic-save" viewBox="0 0 24 24"><path d="M5 3h11l4 4v12.5A1.5 1.5 0 0118.5 21h-13A1.5 1.5 0 014 19.5v-15A1.5 1.5 0 015.5 3z"/><path d="M8 3v6h7V3M8 21v-6h8v6"/></symbol>
+<symbol id="ic-refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 11-2.6-6.1"/><path d="M20.5 4v5h-5"/></symbol>
+<symbol id="ic-trash" viewBox="0 0 24 24"><path d="M4 6.5h16M9.5 6.5V4.5A1.5 1.5 0 0111 3h2a1.5 1.5 0 011.5 1.5v2"/><path d="M6.5 6.5l1 13A1.5 1.5 0 009 21h6a1.5 1.5 0 001.5-1.5l1-13"/><path d="M10.5 10.5v7M13.5 10.5v7"/></symbol>
+<symbol id="ic-edit" viewBox="0 0 24 24"><path d="M13 5.5l5.5 5.5M4 20l1-4.5L16 4.5a2.1 2.1 0 013 3L8 18.5 4 20z"/></symbol>
+<symbol id="ic-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12.5" height="12.5" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0014.5 4h-9A1.5 1.5 0 004 5.5v9A1.5 1.5 0 005.5 16H8"/></symbol>
+<symbol id="ic-package" viewBox="0 0 24 24"><path d="M12 3l8.5 4.5v9L12 21l-8.5-4.5v-9z"/><path d="M3.5 7.5L12 12l8.5-4.5M12 12v9M7.75 5.25l8.5 4.5"/></symbol>
+<symbol id="ic-star" viewBox="0 0 24 24"><path d="M12 3.5l2.7 5.5 6 .9-4.35 4.2 1.03 6L12 17.25 6.62 20.1l1.03-6L3.3 9.9l6-.9z"/></symbol>
+<symbol id="ic-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v10M14.5 9.3c-.6-.8-1.5-1.2-2.5-1.2-1.4 0-2.5.8-2.5 1.9 0 2.6 5 1.3 5 3.9 0 1.1-1.1 2-2.5 2-1.1 0-2-.4-2.6-1.2"/></symbol>
+<symbol id="ic-flask" viewBox="0 0 24 24"><path d="M9.5 3v6L4.6 17.4A2 2 0 006.3 20.5h11.4a2 2 0 001.7-3.1L14.5 9V3"/><path d="M8 3h8M7.2 14h9.6"/></symbol>
+<symbol id="ic-ruler" viewBox="0 0 24 24"><rect x="2.2" y="8" width="19.6" height="8" rx="1.6" transform="rotate(-45 12 12)"/><path d="M9 7.5l1.6 1.6M11.5 5l1.6 1.6M6.5 10l1.6 1.6M14 2.5l1.6 1.6"/></symbol>
+<symbol id="ic-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></symbol>
+<symbol id="ic-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5.2l3.4 2"/></symbol>
+<symbol id="ic-alert" viewBox="0 0 24 24"><path d="M10.3 4.2L2.6 17.4a2 2 0 001.7 3h15.4a2 2 0 001.7-3L13.7 4.2a2 2 0 00-3.4 0z"/><path d="M12 9.5v4M12 17.2v.01"/></symbol>
+<symbol id="ic-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+<symbol id="ic-check" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></symbol>
+<symbol id="ic-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8 12.2l2.8 2.8 5.2-6"/></symbol>
+<symbol id="ic-stop" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="2.5"/></symbol>
+<symbol id="ic-play" viewBox="0 0 24 24"><path d="M7 4.8l12 7.2-12 7.2z"/></symbol>
+<symbol id="ic-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
+<symbol id="ic-scissors" viewBox="0 0 24 24"><circle cx="6.5" cy="6.5" r="2.6"/><circle cx="6.5" cy="17.5" r="2.6"/><path d="M8.7 8.3L20 18M20 6L8.7 15.7"/></symbol>
+<symbol id="ic-shuffle" viewBox="0 0 24 24"><path d="M3.5 6.5h3.2l10 11h4"/><path d="M3.5 17.5h3.2l3.1-3.4M13.6 9.4l3.1-2.9h4"/><path d="M18 3.5l3 3-3 3M18 14.5l3 3-3 3"/></symbol>
+<symbol id="ic-volume" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M15.5 9.2a4 4 0 010 5.6M18.2 6.5a7.8 7.8 0 010 11"/></symbol>
+<symbol id="ic-music" viewBox="0 0 24 24"><path d="M9 18V5.2l11-2v12.6"/><circle cx="6.5" cy="18" r="2.6"/><circle cx="17.5" cy="15.8" r="2.6"/></symbol>
+<symbol id="ic-mic" viewBox="0 0 24 24"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0013 0M12 18v3.5M8.5 21.5h7"/></symbol>
+<symbol id="ic-key" viewBox="0 0 24 24"><circle cx="7.5" cy="12" r="4"/><path d="M11.5 12H21M18 12v3.5M14.8 12v2.8"/></symbol>
+<symbol id="ic-cpu" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/><rect x="9.8" y="9.8" width="4.4" height="4.4" rx="1"/><path d="M10 3v3.5M14 3v3.5M10 17.5V21M14 17.5V21M3 10h3.5M3 14h3.5M17.5 10H21M17.5 14H21"/></symbol>
+<symbol id="ic-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.8"/><path d="M4.5 20.5a7.5 7.5 0 0115 0"/></symbol>
+<symbol id="ic-users" viewBox="0 0 24 24"><circle cx="9.5" cy="8" r="3.5"/><path d="M3 20a6.5 6.5 0 0113 0"/><path d="M16.5 5.2a3.5 3.5 0 010 6.6M17.5 14.4A6.5 6.5 0 0121 20"/></symbol>
+<symbol id="ic-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.3 15.3L21 21"/></symbol>
+<symbol id="ic-chart" viewBox="0 0 24 24"><path d="M4 20V4M4 20h16"/><path d="M8 20v-6M12.5 20V8.5M17 20v-9"/></symbol>
+<symbol id="ic-palette" viewBox="0 0 24 24"><path d="M12 3.2c-4.9 0-8.8 3.8-8.8 8.5S7.1 20 12 20c1.2 0 2-.8 2-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .9-1.8 2-1.8h1.3c2.5 0 4.5-1.9 4.5-4.3 0-3.6-3.5-6.5-7.8-6.5z"/><circle cx="7.6" cy="11.5" r="1.1"/><circle cx="10.4" cy="7.6" r="1.1"/><circle cx="15.2" cy="8.2" r="1.1"/></symbol>
+<symbol id="ic-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M19.2 14.4a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5v.3a2 2 0 01-4 0v-.2a1.6 1.6 0 00-1-1.5 1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H2.8a2 2 0 010-4H3a1.6 1.6 0 001.5-1 1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V2.8a2 2 0 014 0V3a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1h.3a2 2 0 010 4H21a1.6 1.6 0 00-1.5 1z"/></symbol>
+<symbol id="ic-link" viewBox="0 0 24 24"><path d="M10.2 13.8a4 4 0 006 .5l2.5-2.5a4.2 4.2 0 00-6-6l-1.4 1.4"/><path d="M13.8 10.2a4 4 0 00-6-.5L5.3 12.2a4.2 4.2 0 006 6l1.4-1.4"/></symbol>
+<symbol id="ic-folder" viewBox="0 0 24 24"><path d="M3 7.5A1.5 1.5 0 014.5 6h4.2l2 2.5h8.8A1.5 1.5 0 0121 10v8.5A1.5 1.5 0 0119.5 20h-15A1.5 1.5 0 013 18.5z"/></symbol>
+<symbol id="ic-file" viewBox="0 0 24 24"><path d="M13.5 3H7a1.5 1.5 0 00-1.5 1.5v15A1.5 1.5 0 007 21h10a1.5 1.5 0 001.5-1.5V8z"/><path d="M13.5 3v5h5M9 13h6M9 16.5h6"/></symbol>
+<symbol id="ic-zap" viewBox="0 0 24 24"><path d="M13.5 2.5L4.5 13.8h6.3L10.5 21.5l9-11.3h-6.3z"/></symbol>
+<symbol id="ic-flame" viewBox="0 0 24 24"><path d="M12 21c3.6 0 6.5-2.7 6.5-6 0-4.4-4-6.2-4.6-10.8-2 1.4-3.4 3.4-3.4 5.6 0 1.3-1 2-1.9 1.3-.8-.6-1.1-1.6-1.1-2.4C6 10.1 5.5 12.2 5.5 15c0 3.3 2.9 6 6.5 6z"/></symbol>
+<symbol id="ic-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.6"/><circle cx="12" cy="12" r="1"/></symbol>
+<symbol id="ic-bell" viewBox="0 0 24 24"><path d="M18 9.5a6 6 0 10-12 0c0 5-2 6.5-2 6.5h16s-2-1.5-2-6.5z"/><path d="M13.7 20a2 2 0 01-3.4 0"/></symbol>
+<symbol id="ic-lock" viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.2a4 4 0 018 0v3.3"/></symbol>
+<symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11.2v5M12 7.9v.01"/></symbol>
+<symbol id="ic-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="ic-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+<symbol id="ic-chevron-down" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></symbol>
+<symbol id="ic-chevron-right" viewBox="0 0 24 24"><path d="M9.5 6l6 6-6 6"/></symbol>
+<symbol id="ic-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3.2"/></symbol>
+<symbol id="ic-list" viewBox="0 0 24 24"><path d="M9 6.5h12M9 12h12M9 17.5h12M4 6.5v.01M4 12v.01M4 17.5v.01"/></symbol>
+<symbol id="ic-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.5 5.4 3.5 8.5s-1.2 6.1-3.5 8.5c-2.3-2.4-3.5-5.4-3.5-8.5S9.7 5.9 12 3.5z"/></symbol>
+<symbol id="ic-message" viewBox="0 0 24 24"><path d="M20.5 11.5a7.6 7.6 0 01-8.5 7.5c-.9 0-1.8-.1-2.6-.4L4 20.5l1.4-4.2A7.3 7.3 0 013.5 11.5C3.5 7.4 7.3 4 12 4s8.5 3.4 8.5 7.5z"/></symbol>
+<symbol id="ic-calendar" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/></symbol>
+<symbol id="ic-rocket" viewBox="0 0 24 24"><path d="M13 4.5c3.5-2 6.5-1.5 6.5-1.5s.5 3-1.5 6.5c-1.6 2.8-4 5-6.3 6.4l-3.6-3.6C9.5 10 11.4 6.1 13 4.5z"/><circle cx="15.2" cy="8.8" r="1.4"/><path d="M8.1 12.3L5 13.4l1.6 1.6M11.7 15.9l-1.1 3.1-1.6-1.6M6.5 17.5c-1 1-1.5 3-1.5 3s2-.5 3-1.5"/></symbol>
+</defs></svg>
+
+  <!-- ══ Логин ══ -->
+  <div id="app-login" data-screen-label="Вход">
+    <div class="login-card">
+      <div class="brand">
+        <svg width="26" height="26" viewBox="0 0 32 32"><rect x="2" y="7" width="28" height="18" rx="4" fill="#4c8dff"/><rect x="6" y="11" width="13" height="4" rx="2" fill="white"/><rect x="6" y="18" width="8" height="3" rx="1.5" fill="white" opacity="0.55"/></svg>
+        Cover Studio
+      </div>
+      <p class="sub">Генерация YouTube-обложек на разных языках — по ссылке на видео или по пресету с семенем.</p>
+
+      <!-- v2.0: первичная настройка (создание первого админ-аккаунта) -->
+      <div id="auth-setup" style="display:none;">
+        <p style="text-align:center; margin-bottom:4px; font-weight:600;">Первичная настройка</p>
+        <p class="sub" style="font-size:12px;">Создайте администраторский аккаунт</p>
+        <input type="text" id="setup-username" placeholder="Логин админа (мин. 3)" autocomplete="username" style="margin-bottom:8px; width:100%;">
+        <input type="password" id="setup-password" placeholder="Пароль (мин. 6)" autocomplete="new-password" style="margin-bottom:10px; width:100%;">
+        <button id="btn-setup" class="btn btn-primary" style="width:100%;">Создать администратора</button>
+      </div>
+
+      <!-- Вход по логину/паролю -->
+      <div id="auth-password">
+        <input type="text" id="lp-username" placeholder="Логин" autocomplete="username" style="margin-bottom:8px; width:100%;">
+        <input type="password" id="lp-password" placeholder="Пароль" autocomplete="current-password" style="margin-bottom:10px; width:100%;">
+        <button id="btn-login-password" class="btn btn-primary" style="width:100%;">Войти</button>
+        <p class="sub" style="font-size:12px; margin:10px 0 0;">
+          Пароли рассылались открытым текстом —
+          <a href="#" id="link-claim" style="color:#4c8dff;">задайте свой новый по логину</a>
+        </p>
+      </div>
+
+      <!-- v3.1: одноразовая установка пароля по своему логину -->
+      <div id="auth-claim" style="display:none;">
+        <p style="text-align:center; margin-bottom:4px; font-weight:600;">Новый пароль</p>
+        <p class="sub" style="font-size:12px;">Введите свой логин и придумайте пароль. Форма срабатывает один раз — дальше вход обычный.</p>
+        <input type="text" id="claim-username" placeholder="Ваш логин" autocomplete="username" style="margin-bottom:8px; width:100%;">
+        <input type="password" id="claim-password" placeholder="Новый пароль (мин. 6)" autocomplete="new-password" style="margin-bottom:8px; width:100%;">
+        <input type="password" id="claim-password2" placeholder="Повторите пароль" autocomplete="new-password" style="margin-bottom:10px; width:100%;">
+        <button id="btn-claim" class="btn btn-primary" style="width:100%;">Задать пароль и войти</button>
+        <p class="sub" style="font-size:12px; margin:10px 0 0; text-align:center;">
+          <a href="#" id="link-claim-back" style="color:#4c8dff;">← Обычный вход</a>
+        </p>
+      </div>
+      <p id="login-msg" class="error"></p>
+    </div>
+  </div>
+
+  <!-- ══ Приложение ══ -->
+  <div id="app-main">
+    <header class="topbar">
+      <div class="brand">
+        <svg width="22" height="22" viewBox="0 0 32 32"><rect x="2" y="7" width="28" height="18" rx="4" fill="#4c8dff"/><rect x="6" y="11" width="13" height="4" rx="2" fill="white"/><rect x="6" y="18" width="8" height="3" rx="1.5" fill="white" opacity="0.55"/></svg>
+        Cover Studio
+      </div>
+      <nav class="topnav">
+        <button type="button" class="nav-btn active" data-view="gen">Генерация</button>
+        <button type="button" class="nav-btn" data-view="favs"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-star"/></svg> Избранное</button>
+        <button type="button" class="nav-btn" data-view="keys">API-ключи</button>
+      </nav>
+      <div class="topbar-right">
+        <a class="btn btn-ghost btn-sm" style="text-decoration:none" href="https://rewrite.example.invalid" title="Rewrite Studio — рерайт текста"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-edit"/></svg> Текст</a>
+        <a class="btn btn-ghost btn-sm" style="text-decoration:none" href="https://gen.example.invalid" title="VideoStudio — генерация видео"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Видео</a>
+        <button type="button" id="btn-prompts" class="btn btn-ghost btn-sm">Промпты</button>
+        <button type="button" id="btn-logout" class="btn btn-ghost btn-sm">Выйти</button>
+      </div>
+    </header>
+
+    <!-- ── Вид: Генерация + Очередь ── -->
+    <div id="view-gen" class="view active" data-screen-label="Генерация">
+      <!-- Живая очередь: общая нагрузка сервиса + свои задачи -->
+      <div class="vs-qstrip-wrap" id="vs-qstrip-wrap" style="display:none;">
+        <div class="vs-qstrip is-idle" id="vs-qstrip" title="Общая очередь сервиса — обновляется автоматически">
+          <span class="dot"></span>
+          <span id="vs-q-nums" style="display:none;"></span>
+          <span id="vs-q-note">Очередь пуста — задачи стартуют сразу</span>
+          <span class="sep" id="vs-q-sep" style="display:none;">|</span>
+          <span class="muted" id="vs-q-mine" style="display:none;"></span>
+        </div>
+      </div>
+      <div class="layout">
+
+        <!-- Форма задания -->
+        <div class="card" data-screen-label="Форма задания">
+          <div class="form-section">
+            <div class="frow" style="margin:0;">
+              <label for="preset-combo">Пресет</label>
+              <div class="flex" style="gap:6px;">
+                <select id="preset-combo" style="flex:1; min-width:120px;"></select>
+                <button type="button" id="btn-save-preset" class="btn btn-ghost btn-sm" title="Сохранить текущие настройки в выбранный пресет">Сохранить</button>
+                <button type="button" id="btn-new-preset" class="btn btn-ghost btn-sm" title="Новый пресет из текущих настроек">Новый</button>
+                <button type="button" id="btn-copy-preset" class="btn btn-ghost btn-sm" title="Дублировать выбранный пресет">Копия</button>
+                <button type="button" id="btn-delete-preset" class="btn btn-danger btn-sm" title="Удалить выбранный пресет">Удалить</button>
+              </div>
+            </div>
+            <p id="preset-hint" class="field-hint" style="display:none;">Пресет не обязателен: настройки формы применяются напрямую</p>
+          </div>
+
+          <div class="form-section">
+            <div id="mode-switcher" class="seg">
+              <button type="button" class="mode-btn active" data-mode="url">По ссылкам YouTube</button>
+              <button type="button" class="mode-btn" data-mode="seed">Пресет + семя</button>
+            </div>
+
+            <div class="mode-url-fields" style="margin-top:12px;">
+              <textarea id="urls" rows="5" style="width:100%; font-family:ui-monospace, Menlo, Consolas, monospace; font-size:13px;" placeholder="Ссылки на YouTube-видео — по одной на строку"></textarea>
+              <div class="flex" style="margin-top:6px;">
+                <button id="btn-paste" class="btn btn-ghost btn-sm">Вставить из буфера</button>
+                <button id="btn-clear-urls" class="btn btn-ghost btn-sm">Очистить</button>
+                <button id="btn-load-file" class="btn btn-ghost btn-sm">Из файла…</button>
+                <input type="file" id="file-urls" accept=".txt" style="display:none">
+              </div>
+            </div>
+
+            <div class="mode-seed-fields" style="display:none; margin-top:12px;">
+              <!-- Карточка: Пресет ниши -->
+              <div class="seed-card">
+                <div class="seed-card-title">Пресет ниши</div>
+                <p class="hint" style="margin-bottom:8px;">Пресет хранит постоянные правила канала: стиль, композицию, референс, модель и число обложек.</p>
+                <select id="seed-preset-select" style="width:100%;"><option value="">— выберите пресет —</option></select>
+                <p id="seed-preset-meta">Пресет не выбран</p>
+                <div class="flex" style="margin-top:8px;">
+                  <button type="button" id="btn-seed-preset-new" class="btn btn-ghost btn-sm">+ Новый</button>
+                  <button type="button" id="btn-seed-preset-edit" class="btn btn-ghost btn-sm">Редактировать</button>
+                  <button type="button" id="btn-seed-preset-import" class="btn btn-ghost btn-sm" title="Загрузить пресет из JSON. Перед сохранением откроется редактор.">Импорт JSON</button>
+                  <button type="button" id="btn-seed-preset-export" class="btn btn-ghost btn-sm" title="Скачать выбранный пресет в JSON. Картинка референса в файл не включается.">Экспорт JSON</button>
+                  <button type="button" id="btn-seed-preset-delete" class="btn btn-danger btn-sm" title="Удалить пресет"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-trash"/></svg></button>
+                  <input type="file" id="seed-preset-import-input" accept=".json,application/json" style="display:none">
+                </div>
+                <p class="field-hint">Импорт открывает JSON в редакторе — проверьте поля и нажмите «Сохранить». Экспорт скачивает настройки без самой картинки референса.</p>
+              </div>
+              <!-- Карточка: Семена -->
+              <div class="seed-card">
+                <div class="seed-card-title">Семена</div>
+                <p class="hint" style="margin-bottom:8px;">Семя описывает конкретную обложку: текст, главный объект, сцену и композицию. Для каждого языка — отдельная строка.</p>
+                <div id="seed-rows"></div>
+                <div class="flex" style="margin-top:8px;">
+                  <button type="button" id="btn-seed-add-row" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-plus"/></svg> Добавить язык</button>
+                  <button type="button" id="btn-seed-copy-all" class="btn btn-ghost btn-sm" title="Буквально скопировать текст первой строки во все остальные языки"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-copy"/></svg> Скопировать первое семя во все языки</button>
+                </div>
+              </div>
+              <!-- Переопределения -->
+              <details class="adv">
+                <summary>Изменить настройки только для этого запуска</summary>
+                <div class="adv-body">
+                  <div class="frow">
+                    <label for="seed-ov-model">Модель для этого запуска</label>
+                    <select id="seed-ov-model"><option value="">Не менять модель пресета</option></select>
+                  </div>
+                  <div class="frow">
+                    <label for="seed-ov-variants">Обложек на каждый язык</label>
+                    <input type="number" id="seed-ov-variants" min="1" max="8" placeholder="Как в пресете" style="width:140px;">
+                  </div>
+                  <p class="field-hint">Эти значения действуют один раз и не изменяют сохранённый пресет.</p>
+                </div>
+              </details>
+            </div>
+          </div>
+
+          <div class="form-section" id="lang-section">
+            <h2>Языки</h2>
+            <div class="lang-toolbar">
+              <input type="text" id="lang-search" placeholder="Поиск языка">
+              <button id="btn-lang-all" class="btn btn-ghost btn-sm">Все</button>
+              <button id="btn-lang-none" class="btn btn-ghost btn-sm">Снять</button>
+            </div>
+            <div id="lang-list" class="lang-list"></div>
+            <p class="lang-count" id="lang-count"></p>
+          </div>
+
+          <div class="form-section">
+            <div class="frow" id="row-generation-option">
+              <label for="generation-option">Модель генерации</label>
+              <select id="generation-option">
+                <option value="Flow — Nano Pro" selected>Flow — Nano Pro</option>
+                <option value="Flow — Nano Banana 2">Flow — Nano Banana 2</option>
+                <option value="Nano Banana 2 Flower">Nano Banana 2 Flower</option>
+                <option value="Grok">Grok</option>
+                <option value="OpenAI — gpt-image">OpenAI — gpt-image</option>
+                <option value="Nano Banana Pro (VeoNonStop)">Nano Banana Pro (VeoNonStop)</option>
+                <option value="Nano Banana 2 (VeoNonStop)">Nano Banana 2 (VeoNonStop)</option>
+                <option value="Nano Banana 2 Lite (VeoNonStop)">Nano Banana 2 Lite (VeoNonStop)</option>
+                <option value="💲 GPT-Image-2 low (OpenAI, ~$0.006/шт)">💲 GPT-Image-2 low (OpenAI, ~$0.006/шт)</option>
+              </select>
+            </div>
+
+            <details class="adv" style="margin-top:10px;">
+              <summary>Расширенные настройки</summary>
+              <div class="adv-body">
+                <div id="url-only-advanced">
+                  <div class="frow" id="row-auto-style" style="grid-template-columns:1fr;">
+                    <label class="frow-check" style="margin:0;"><input type="checkbox" id="use-auto-style" checked> Повторить стиль исходной YouTube-обложки</label>
+                  </div>
+                  <div class="frow" id="row-style-prompt" style="display:none; grid-template-columns:1fr;">
+                    <label style="color:var(--text-2); font-size:13px;">Опишите стиль вручную</label>
+                    <textarea id="style-prompt" rows="2" style="width:100%;" placeholder="Например: тёмный кинематографичный кадр, красный контровой свет, крупные лица"></textarea>
+                  </div>
+                  <div id="row-simple-mode">
+                    <label class="frow-check" title="Исходное превью отправляется модели как картинка: она переводит текст и слегка меняет сцену."><input type="checkbox" id="simple-mode"> Редактировать исходную обложку вместо создания новой сцены</label>
+                  </div>
+                  <div id="row-url-ref">
+                    <div class="title-ref-container" id="url-ref-container" style="margin:6px 0;">
+                      <span class="ref-label">Дополнительная картинка-образец стиля:</span>
+                      <button type="button" id="url-ref-btn" class="btn btn-ghost btn-sm">Прикрепить картинку</button>
+                      <span id="url-ref-status" class="ref-status hidden"></span>
+                      <input type="file" id="url-ref-input" accept="image/*" style="display:none;">
+                    </div>
+                  </div>
+                  <label class="frow-check" title="Отключает автоматическую проверку надписи на готовой обложке"><input type="checkbox" id="fallback-overlay"> Не проверять текст после генерации</label>
+
+                  <h3>Анализ исходной обложки</h3>
+                  <div class="frow">
+                    <label for="analysis-model">Модель анализа</label>
+                    <select id="analysis-model">
+                      <option value="">— по умолчанию —</option>
+                      <option value="gpt-4.1-mini" selected>gpt-4.1-mini (рекомендуется)</option>
+                      <option value="gpt-4.1-nano">gpt-4.1-nano</option>
+                      <option value="gpt-4.1">gpt-4.1</option>
+                      <option value="gpt-4o">gpt-4o</option>
+                      <option value="gpt-4o-mini">gpt-4o-mini</option>
+                      <option value="gpt-5-mini">gpt-5-mini</option>
+                    </select>
+                  </div>
+                </div>
+
+                <p class="field-hint">API-ключи, число потоков и повторы управляются сервером. Пользовательские ключи не требуются.</p>
+              </div>
+            </details>
+          </div>
+
+          <div id="gen-settings-panel" class="card" style="display:none; margin-top:12px;">
+            <h3 style="margin-top:0;">Генерация — технические настройки <span class="field-hint" style="font-weight:400;">(только админ)</span></h3>
+            <div class="frow"><label for="gs-parallel">Проекты (job параллельно)</label>
+              <input type="number" id="gs-parallel" min="1" max="100" style="width:110px;"></div>
+            <div class="frow"><label for="gs-threads">Потоки внутри job</label>
+              <input type="number" id="gs-threads" min="1" max="25" style="width:110px;"></div>
+            <div class="frow"><label for="gs-retries">Попытки генерации</label>
+              <input type="number" id="gs-retries" min="1" max="10" style="width:110px;"></div>
+            <div class="frow"><label for="gs-queue">Очередь на пользователя</label>
+              <input type="number" id="gs-queue" min="1" max="100" style="width:110px;"></div>
+            <div style="display:flex; gap:10px; align-items:center; margin-top:8px;">
+              <button id="gs-save" class="btn btn-primary btn-sm">Сохранить</button>
+              <span id="gs-status" class="field-hint"></span>
+            </div>
+            <p id="gs-effective-note" class="field-hint">Потоки, попытки и очередь применяются к новым заданиям сразу. «Проекты» — только после рестарта сервиса.</p>
+          </div>
+
+          <div class="cta-block">
+            <button id="btn-start" class="btn btn-primary">Запустить генерацию</button>
+            <p id="progress-msg"></p>
+          </div>
+        </div>
+
+        <!-- Очередь -->
+        <div data-screen-label="Очередь">
+          <div class="card">
+            <div class="queue-head">
+              <h2>Очередь заданий</h2>
+              <select id="status-filter" title="Фильтр по статусу">
+                <option value="">Все статусы</option>
+                <option value="pending">Ждёт</option>
+                <option value="running">Идёт</option>
+                <option value="completed">Готово</option>
+                <option value="completed_partial">Частично</option>
+                <option value="failed">Ошибка</option>
+                <option value="cancelled">Отменено</option>
+              </select>
+              <button id="btn-refresh" class="btn btn-ghost btn-sm" title="Список обновляется автоматически каждые 3 секунды">Обновить</button>
+            </div>
+            <div class="table-scroll">
+              <table id="job-list">
+                <thead><tr><th>ID</th><th>Статус</th><th>Прогресс</th><th>Создано</th></tr></thead>
+                <tbody></tbody>
+              </table>
+            </div>
+            <div id="job-pagination" class="pager">
+              <button id="btn-page-first" class="btn btn-ghost btn-sm" type="button" title="Первая страница">«</button>
+              <button id="btn-page-prev" class="btn btn-ghost btn-sm" type="button" title="Назад">‹</button>
+              <span id="page-info" style="min-width:120px; text-align:center;">—</span>
+              <button id="btn-page-next" class="btn btn-ghost btn-sm" type="button" title="Вперёд">›</button>
+              <button id="btn-page-last" class="btn btn-ghost btn-sm" type="button" title="Последняя страница">»</button>
+              <span style="margin-left:auto;">На странице:</span>
+              <select id="page-size">
+                <option value="10">10</option>
+                <option value="20" selected>20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+              </select>
+            </div>
+          </div>
+
+          <div class="card" id="job-detail-card" data-screen-label="Детали задачи">
+            <div class="detail-head">
+              <h3 id="job-detail-title">Задача не выбрана</h3>
+              <div class="detail-actions">
+                <button id="btn-cancel-job" class="btn btn-ghost btn-sm">Отменить</button>
+                <button id="btn-retry-job" class="btn btn-ghost btn-sm">Повторить</button>
+                <button id="btn-retry-incomplete" class="btn btn-ghost btn-sm" title="Догенерировать только недостающие обложки по выбранной задаче">Догенерировать недостающие</button>
+                <button id="btn-delete-job" class="btn btn-danger btn-sm">Удалить</button>
+              </div>
+            </div>
+            <p class="detail-placeholder" id="job-detail-placeholder">Выберите задачу в списке — здесь появятся её обложки, файлы и лог</p>
+            <div id="job-error" class="error" style="display:none; margin:8px 0; white-space:pre-wrap;"></div>
+            <div id="job-download-all"></div>
+            <div id="job-thumbs"></div>
+            <details class="plain" id="job-files-details">
+              <summary>Файлы задачи</summary>
+              <div id="job-files"></div>
+            </details>
+            <details class="plain" id="job-log-details">
+              <summary>Лог задачи</summary>
+              <pre id="job-log">(выберите задачу)</pre>
+            </details>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Вид: API-ключи ── -->
+    <div id="view-keys" class="view" data-screen-label="API-ключи">
+      <div class="layout" style="grid-template-columns:1fr;">
+        <div class="card">
+          <h2>API-ключи</h2>
+          <p style="color:var(--text-2); font-size:13px; margin:8px 0 14px;">
+            Программный доступ к REST API <code>/api/v1/*</code>.
+            Ключ показывается <b>один раз</b> при создании — скопируйте и сохраните его сразу.
+            На сервере хранится только отпечаток ключа и первые 12 символов (для опознания).
+          </p>
+          <div class="flex" style="margin-bottom:12px;">
+            <input type="text" id="new-key-name" placeholder="Имя ключа (laptop, ci, …)" style="flex:1; min-width:160px;">
+            <button type="button" id="btn-create-key" class="btn btn-primary">Создать</button>
+            <button type="button" id="btn-refresh-keys" class="btn btn-ghost">Обновить</button>
+          </div>
+          <div id="new-key-result" class="key-reveal" style="display:none;">
+            <div style="font-weight:600;">Скопируйте ключ сейчас — больше он не будет показан:</div>
+            <code id="new-key-plain"></code>
+            <div class="flex">
+              <button type="button" id="btn-copy-key" class="btn btn-primary btn-sm">Скопировать</button>
+              <button type="button" id="btn-close-key-result" class="btn btn-ghost btn-sm">Закрыть</button>
+            </div>
+          </div>
+          <div class="table-scroll">
+            <table id="api-keys-table">
+              <thead>
+                <tr>
+                  <th>Имя</th><th>Префикс</th><th>Создан</th><th>Последнее использование</th><th>Статус</th><th></th>
+                </tr>
+              </thead>
+              <tbody id="api-keys-tbody">
+                <tr><td colspan="6" style="padding:12px; color:var(--text-3);">Загрузка…</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <h3 style="margin:22px 0 8px;">Использование (Bearer)</h3>
+          <pre id="api-usage-example"></pre>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── Вид: Избранное ── -->
+    <div id="view-favs" class="view" data-screen-label="Избранное">
+      <div class="layout" style="grid-template-columns:1fr;">
+        <div class="card">
+          <h2>Избранное</h2>
+          <div class="flex" style="margin:12px 0;">
+            <button type="button" id="btn-favs-select-all" class="btn btn-ghost btn-sm">Выбрать всё</button>
+            <button type="button" id="btn-favs-download-selected" class="btn btn-primary btn-sm" disabled>Скачать выбранные</button>
+            <button type="button" id="btn-favs-download-all" class="btn btn-ghost btn-sm">Скачать всё</button>
+            <span id="favs-count" class="hint" style="margin-left:auto;"></span>
+          </div>
+          <div id="favs-grid" class="favs-grid"></div>
+          <p id="favs-empty" class="detail-placeholder" style="display:none;">Пока пусто — отмечайте обложки звёздочкой <svg class="ic" viewBox="0 0 24 24"><use href="#ic-star"/></svg> в галерее задач</p>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: Промпты -->
+  <div id="modal-prompts" class="modal">
+    <div class="modal-inner" style="max-width:900px;">
+      <h2>Промпты генерации</h2>
+      <p class="hint" style="margin-bottom:12px;">Используются при анализе обложки, генерации и проверке. Сохраняются на сервере.</p>
+      <div id="prompts-fields"></div>
+      <div class="flex" style="margin-top:12px;">
+        <button type="button" id="btn-prompts-save" class="btn btn-primary">Сохранить на сервер</button>
+        <button class="btn btn-ghost" id="btn-prompts-cancel">Закрыть</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: Новый пресет -->
+  <div id="modal-new-preset" class="modal">
+    <div class="modal-inner">
+      <h2>Новый пресет</h2>
+      <div class="frow">
+        <label for="new-preset-name">Название</label>
+        <input type="text" id="new-preset-name" style="width:100%;">
+      </div>
+      <div class="flex" style="margin-top:12px;">
+        <button id="btn-new-preset-ok" class="btn btn-primary">Создать</button>
+        <button class="btn btn-ghost" id="btn-new-preset-cancel">Отмена</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: повтор незавершённых -->
+  <div id="modal-resume" class="modal">
+    <div class="modal-inner">
+      <h2>Догенерировать недостающие</h2>
+      <p style="margin-bottom:10px; font-size:13px; color:var(--text-2);">Догенерируются только отсутствующие обложки — те, что прошли проверку, не трогаются. Можно также перегенерировать обложки, сохранённые без текста.</p>
+      <div class="frow">
+        <label for="resume-model">Модель</label>
+        <select id="resume-model" style="width:100%; max-width:340px;"></select>
+      </div>
+      <label class="frow-check"><input type="checkbox" id="resume-regenerate-fallbacks" checked> Также перегенерировать обложки <b>без текста</b> (fallback)</label>
+      <p id="resume-fallback-count" style="color:#9fe3c0; font-size:13px; margin:4px 0 0;"></p>
+      <div class="flex" style="margin-top:14px;">
+        <button id="btn-resume-confirm" class="btn btn-primary">Запустить</button>
+        <button class="btn btn-ghost" id="btn-resume-cancel">Отмена</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Модальное окно: редактор пресета ниши (режим «Пресет + семя») -->
+  <div id="modal-seed-preset" class="modal">
+    <div class="modal-inner" style="max-width:760px;">
+      <h2 id="sp-title">Создать пресет</h2>
+      <p id="sp-rename-hint" class="hint" style="display:none; margin:0 0 10px;">Изменение имени создаст копию — исходный пресет останется.</p>
+      <div class="frow">
+        <label for="sp-name">Название</label>
+        <input type="text" id="sp-name" maxlength="80" style="width:100%;">
+      </div>
+      <label for="sp-template" style="display:block; margin:10px 0 4px; color:var(--text-2); font-size:13px;">Шаблон промпта</label>
+      <textarea id="sp-template" rows="14" style="width:100%; font-family:ui-monospace, Menlo, Consolas, monospace; font-size:12px;" placeholder="Например:&#10;Сделай YouTube-обложку 16:9 на языке {ЯЗЫК} для ниши «…».&#10;&#10;&gt;&gt;&gt; СЮДА ВСТАВЬ СЕМЯ &lt;&lt;&lt;&#10;&#10;Стиль: крупный читаемый текст, контрастные цвета, драматичный свет."></textarea>
+      <p class="field-hint">Напишите постоянные правила стиля. Вставьте <b>{ЯЗЫК}</b> там, где нужно название языка, и <b>{СЕМЯ}</b> туда, куда должно попасть описание конкретной обложки. Если оставить шаблон пустым, семя станет полным промптом.</p>
+      <div class="title-ref-container" id="sp-ref-container" style="margin-top:10px;">
+        <span class="ref-label">Картинка-образец стиля для всех языков:</span>
+        <button type="button" id="sp-ref-btn" class="btn btn-ghost btn-sm">Прикрепить референс</button>
+        <span id="sp-ref-status" class="ref-status hidden"></span>
+        <input type="file" id="sp-ref-input" accept="image/*" style="display:none;">
+      </div>
+      <p class="field-hint">Модель получает эту картинку напрямую и пытается повторить её стиль. Лучше использовать JPG/PNG до 5 МБ без лишнего текста.</p>
+      <div class="frow">
+        <label for="sp-n-variants">Обложек на каждый язык</label>
+        <input type="number" id="sp-n-variants" min="1" max="8" value="3" style="width:80px;">
+      </div>
+      <div class="frow">
+        <label for="sp-model">Модель генерации</label>
+        <select id="sp-model" style="width:100%;"></select>
+      </div>
+      <div class="flex" style="margin-top:14px;">
+        <button type="button" id="btn-sp-save" class="btn btn-primary"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Сохранить</button>
+        <button type="button" id="btn-sp-cancel" class="btn btn-ghost">Отмена</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Лайтбокс просмотра обложек -->
+  <div id="lightbox">
+    <button type="button" id="lb-close" class="lb-btn" title="Закрыть (Esc)"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>
+    <button type="button" id="lb-prev" class="lb-btn lb-nav" title="Предыдущая (←)">‹</button>
+    <div class="lb-stage">
+      <img id="lb-img" src="" alt="">
+      <div class="lb-bar">
+        <span id="lb-caption"></span>
+        <span id="lb-counter" class="lb-counter"></span>
+        <button type="button" id="lb-star" class="lb-btn" title="В избранное"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-star"/></svg></button>
+        <a id="lb-download" class="lb-btn" href="#" download><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg> Скачать</a>
+      </div>
+    </div>
+    <button type="button" id="lb-next" class="lb-btn lb-nav" title="Следующая (→)">›</button>
+  </div>
+
+  <script>
+    // Security migration must run before auth/session flow or any early return.
+    try { localStorage.removeItem('cover_keys'); } catch (_) {}
+    const API = '';
+    const GENERATION_OPTIONS = [
+      ['Flow — Nano Pro', 'flow', 'GEM_PIX_2'],
+      ['Flow — Nano Banana 2', 'flow', 'NARWHAL'],
+      ['Nano Banana 2 Flower', 'flower', ''],
+      ['Grok', 'grok', ''],
+      ['OpenAI — gpt-image', 'openai_img', ''],
+      ['Nano Banana Pro (VeoNonStop)', 'veo', 'GEM_PIX_2'],
+      ['Nano Banana 2 (VeoNonStop)', 'veo', 'NARWHAL'],
+      ['Nano Banana 2 Lite (VeoNonStop)', 'veo', 'HARBOR_SEAL'],
+      ['💲 GPT-Image-2 low (OpenAI, ~$0.006/шт)', 'gpt_image2', ''],
+      // Только админу: платит личный счёт xAI. Пункт добавляется в списки
+      // в adminOnlyModels() после того, как сервер подтвердил админа.
+      ['💲 Grok — официальный API (~$0.07/шт)', 'grok_api', '']
+    ];
+    const ADMIN_ONLY_LABELS = ['💲 Grok — официальный API (~$0.07/шт)'];
+    let sessionId = localStorage.getItem('cover_session_id');
+    let languagesData = [];
+    let presetsData = {};
+    let selectedJobId = null;
+    // ── Избранное и галерея ──
+    let favoritesItems = [];               // записи GET /favorites (новые первыми)
+    let favByKey = new Map();              // 'jobId|path' → запись избранного
+    let currentGalleryItems = [];          // элементы галереи выбранной задачи (для лайтбокса)
+
+    // Кодируем каждый сегмент пути отдельно, чтобы не сломать /
+    function encodeFilePath(f) {
+      return f.split('/').map(s => encodeURIComponent(s)).join('/');
+    }
+
+    function escapeHtml(s) {
+      return String(s == null ? '' : s).replace(/[&<>"']/g, c => ({
+        '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'
+      }[c]));
+    }
+
+    function showToast(msg, isError) {
+      let t = document.getElementById('toast');
+      if (!t) { t = document.createElement('div'); t.id = 'toast'; document.body.appendChild(t); }
+      t.textContent = msg;
+      t.style.borderColor = isError ? 'var(--red)' : '#4a4a52';
+      t.style.display = 'block';
+      t.style.opacity = '1';
+      clearTimeout(t._timer);
+      t._timer = setTimeout(() => { t.style.opacity = '0'; setTimeout(() => { t.style.display = 'none'; }, 300); }, 4000);
+    }
+
+    function headers() {
+      const h = { 'Content-Type': 'application/json' };
+      if (sessionId) h['X-Session-Id'] = sessionId;
+      return h;
+    }
+
+    async function api(path, opts = {}) {
+      const r = await fetch(API + path, { ...opts, headers: { ...headers(), ...opts.headers } });
+      if (r.status === 401) { sessionId = null; localStorage.removeItem('cover_session_id'); showLogin(); return null; }
+      const text = await r.text();
+      if (!r.ok) {
+        let msg = text || 'Ошибка ' + r.status;
+        try { const j = JSON.parse(text); msg = j.detail || j.error || msg; } catch (_) {}
+        throw new Error(msg);
+      }
+      if (r.status === 204 || !text) return null;
+      try { return JSON.parse(text); } catch (e) {
+        console.error('Ответ сервера не JSON:', text.substring(0, 200));
+        throw new Error('Некорректный ответ сервера: ' + text.substring(0, 100));
+      }
+    }
+
+    function showLogin() {
+      document.getElementById('app-login').style.display = 'flex';
+      document.getElementById('app-main').style.display = 'none';
+      localStorage.removeItem('cover_license_key');
+      // v2.0: если аккаунтов ещё нет — показать первичную настройку вместо формы входа
+      document.getElementById('auth-claim').style.display = 'none';
+      fetch(API + '/auth/status').then(r => r.json()).then(st => {
+        const setup = !!(st && st.needs_setup);
+        document.getElementById('auth-setup').style.display = setup ? 'block' : 'none';
+        document.getElementById('auth-password').style.display = setup ? 'none' : 'block';
+      }).catch(() => {});
+    }
+
+    // Общий обработчик ответа логина / setup
+    function applyLoginSuccess(d) {
+      sessionId = d.session_id;
+      localStorage.setItem('cover_session_id', sessionId);
+      document.getElementById('login-msg').textContent = '';
+      showMain();
+    }
+
+    document.getElementById('btn-login-password').onclick = async () => {
+      const username = document.getElementById('lp-username').value.trim();
+      const password = document.getElementById('lp-password').value;
+      const msg = document.getElementById('login-msg');
+      if (!username || !password) { msg.textContent = 'Введите логин и пароль'; return; }
+      try {
+        const r = await fetch(API + '/auth/login-password', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+        const d = await r.json();
+        if (!r.ok) { msg.textContent = d.error || 'Ошибка'; return; }
+        applyLoginSuccess(d);
+      } catch (e) { msg.textContent = e.message; }
+    };
+    document.getElementById('btn-setup').onclick = async () => {
+      const username = document.getElementById('setup-username').value.trim();
+      const password = document.getElementById('setup-password').value;
+      const msg = document.getElementById('login-msg');
+      if (username.length < 3) { msg.textContent = 'Логин — минимум 3 символа'; return; }
+      if (password.length < 6) { msg.textContent = 'Пароль — минимум 6 символов'; return; }
+      try {
+        const r = await fetch(API + '/auth/setup', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username, password }) });
+        const d = await r.json();
+        if (!r.ok) { msg.textContent = d.error || 'Ошибка'; return; }
+        applyLoginSuccess(d);
+      } catch (e) { msg.textContent = e.message; }
+    };
+    // v3.1: одноразовая установка пароля по своему логину
+    function toggleClaim(show) {
+      document.getElementById('auth-claim').style.display = show ? 'block' : 'none';
+      document.getElementById('auth-password').style.display = show ? 'none' : 'block';
+      document.getElementById('login-msg').textContent = '';
+      if (show) document.getElementById('claim-username').focus();
+    }
+    document.getElementById('link-claim').onclick = (e) => { e.preventDefault(); toggleClaim(true); };
+    document.getElementById('link-claim-back').onclick = (e) => { e.preventDefault(); toggleClaim(false); };
+    document.getElementById('btn-claim').onclick = async () => {
+      const username = document.getElementById('claim-username').value.trim();
+      const p1 = document.getElementById('claim-password').value;
+      const p2 = document.getElementById('claim-password2').value;
+      const msg = document.getElementById('login-msg');
+      if (!username) { msg.textContent = 'Введите свой логин'; return; }
+      if (p1.length < 6) { msg.textContent = 'Пароль — минимум 6 символов'; return; }
+      if (p1 !== p2) { msg.textContent = 'Пароли не совпадают'; return; }
+      try {
+        const r = await fetch(API + '/auth/claim-password', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username, new_password: p1 })
+        });
+        const d = await r.json();
+        if (!r.ok) { msg.textContent = d.error || 'Ошибка'; return; }
+        ['claim-username', 'claim-password', 'claim-password2'].forEach(id => { document.getElementById(id).value = ''; });
+        applyLoginSuccess(d);
+      } catch (e) { msg.textContent = e.message; }
+    };
+    ['claim-username', 'claim-password', 'claim-password2'].forEach(id => document.getElementById(id).addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); document.getElementById('btn-claim').click(); }
+    }));
+
+    ['lp-username', 'lp-password'].forEach(id => document.getElementById(id).addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); document.getElementById('btn-login-password').click(); }
+    }));
+    ['setup-username', 'setup-password'].forEach(id => document.getElementById(id).addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); document.getElementById('btn-setup').click(); }
+    }));
+
+    function showMain() {
+      document.getElementById('app-login').style.display = 'none';
+      document.getElementById('app-main').style.display = 'block';
+      loadFromStorage();
+      (async function() {
+        try {
+          await loadLanguages();
+          await loadPresets();
+          await loadFavorites();
+        } catch (_) { /* сервер недоступен — не роняем UI */ }
+        var settings = null;
+        try { var r = localStorage.getItem('cover_settings'); if (r) settings = JSON.parse(r); } catch (_) {}
+        if (settings) {
+          if (settings.preset_name && presetsData[settings.preset_name]) {
+            document.getElementById('preset-combo').value = settings.preset_name;
+          }
+          if (settings.languages && Array.isArray(settings.languages))
+            document.querySelectorAll('#lang-list .lang-item').forEach(el => { el.querySelector('input').checked = settings.languages.indexOf(el.dataset.lang) >= 0; });
+        }
+        // Рестор seed-режима: выбранный пресет ниши + строки семян (после loadPresets/loadLanguages)
+        try {
+          const savedSeedPreset = localStorage.getItem('cover_seed_preset');
+          const spSel = document.getElementById('seed-preset-select');
+          if (spSel && savedSeedPreset && presetsData[savedSeedPreset]) spSel.value = savedSeedPreset;
+        } catch (_) {}
+        updateSeedPresetMeta();
+        updateAdvancedSettingsVisibility();
+        restoreSeedRows();
+        try {
+          var savedMode = localStorage.getItem('cover_mode');
+          if (savedMode === 'seed') setMode('seed'); // 'title' и прочее игнорируем → остаётся 'url'
+        } catch (_) {}
+        updateLangCount();
+        refreshJobs();
+      })();
+      document.getElementById('use-auto-style').onchange();
+    }
+
+    document.getElementById('btn-logout').onclick = () => {
+      fetch(API + '/auth/logout', { method: 'POST', headers: headers() });
+      sessionId = null;
+      localStorage.removeItem('cover_session_id');
+      showLogin();
+    };
+
+    function loadFromStorage() {
+      try {
+        const settings = localStorage.getItem('cover_settings');
+        if (settings) {
+          const o = JSON.parse(settings);
+          if (o.analysis_model !== undefined) document.getElementById('analysis-model').value = o.analysis_model;
+          else document.getElementById('analysis-model').value = 'gpt-4.1-mini';
+          if (o.preset_name !== undefined) document.getElementById('preset-combo').value = o.preset_name || '';
+          if (o.use_auto_style !== undefined) document.getElementById('use-auto-style').checked = o.use_auto_style;
+          if (o.style_prompt !== undefined) document.getElementById('style-prompt').value = o.style_prompt || '';
+          if (o.fallback) document.getElementById('fallback-overlay').checked = o.fallback === 'always_overlay';
+          if (o.generation_option) document.getElementById('generation-option').value = o.generation_option;
+          if (o.simple_mode !== undefined) document.getElementById('simple-mode').checked = !!o.simple_mode;
+          if (o.reference_image) {
+            const urlRefCont = document.getElementById('url-ref-container');
+            if (urlRefCont) { urlRefCont.dataset.refFileId = o.reference_image; updateUrlRefUI(); }
+          }
+        } else {
+          document.getElementById('analysis-model').value = 'gpt-4.1-mini';
+        }
+      } catch (_) {}
+    }
+
+    function saveSettings() {
+      try {
+        const languages = [];
+        document.querySelectorAll('#lang-list .lang-item input:checked').forEach(cb => {
+          const el = cb.closest('.lang-item');
+          if (el) languages.push(el.dataset.lang);
+        });
+        const o = {
+          analysis_model: document.getElementById('analysis-model').value,
+          preset_name: document.getElementById('preset-combo').value || '',
+          use_auto_style: document.getElementById('use-auto-style').checked,
+          style_prompt: document.getElementById('style-prompt').value,
+          fallback: document.getElementById('fallback-overlay').checked ? 'always_overlay' : 'auto',
+          generation_option: document.getElementById('generation-option').value,
+          simple_mode: document.getElementById('simple-mode').checked,
+          reference_image: (document.getElementById('url-ref-container') || {}).dataset?.refFileId || '',
+          languages: languages
+        };
+        localStorage.setItem('cover_settings', JSON.stringify(o));
+      } catch (_) {}
+    }
+
+    async function loadLanguages() {
+      const list = await api('/languages');
+      if (!list) return;
+      languagesData = list;
+      const container = document.getElementById('lang-list');
+      container.innerHTML = '';
+      list.forEach((l, i) => {
+        const div = document.createElement('div');
+        div.className = 'lang-item';
+        div.dataset.lang = l.display;
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.id = 'lang-' + i;
+        cb.className = 'lang-cb';
+        cb.value = l.display;
+        cb.checked = l.display === 'Русский';
+        const label = document.createElement('label');
+        label.htmlFor = 'lang-' + i;
+        label.textContent = l.display;
+        div.appendChild(cb);
+        div.appendChild(label);
+        container.appendChild(div);
+      });
+      updateLangCount();
+    }
+
+    function updateLangCount() {
+      const el = document.getElementById('lang-count');
+      if (!el) return;
+      const n = document.querySelectorAll('#lang-list .lang-item input[type=checkbox]:checked').length;
+      el.textContent = n ? 'Выбрано языков: ' + n : 'Языки не выбраны — будет использован «Русский»';
+    }
+
+    function filterLanguages() {
+      const q = document.getElementById('lang-search').value.trim().toLowerCase();
+      document.querySelectorAll('#lang-list .lang-item').forEach(el => {
+        el.classList.toggle('hidden', q && !el.dataset.lang.toLowerCase().includes(q));
+      });
+    }
+
+    document.getElementById('lang-search').oninput = filterLanguages;
+    document.getElementById('btn-lang-all').onclick = () => {
+      const q = document.getElementById('lang-search').value.trim().toLowerCase();
+      document.querySelectorAll('#lang-list .lang-item').forEach(el => {
+        if (!q || el.dataset.lang.toLowerCase().includes(q)) el.querySelector('input').checked = true;
+      });
+      updateLangCount();
+      saveSettings();
+    };
+    document.getElementById('btn-lang-none').onclick = () => {
+      document.querySelectorAll('#lang-list input[type=checkbox]').forEach(cb => cb.checked = false);
+      updateLangCount();
+      saveSettings();
+    };
+    document.getElementById('lang-list').addEventListener('change', () => { updateLangCount(); saveSettings(); });
+
+    ['analysis-model', 'preset-combo', 'fallback-overlay', 'generation-option', 'simple-mode'].forEach(id => {
+      var el = document.getElementById(id);
+      if (el) el.addEventListener('change', saveSettings);
+    });
+    document.getElementById('generation-option').addEventListener('change', updateAdvancedSettingsVisibility);
+    document.getElementById('use-auto-style').addEventListener('change', saveSettings);
+    document.getElementById('style-prompt').addEventListener('input', function() { saveSettings(); });
+    async function loadPresets() {
+      const list = await api('/presets');
+      if (!list) return;
+      presetsData = list;
+      const sel = document.getElementById('preset-combo');
+      const names = Object.keys(list);
+      const prevCombo = sel.value; // сохранить выбор url-режима при перерисовках из seed-потоков
+      sel.innerHTML = '<option value="">— без пресета —</option>' + names.map(n => '<option value="' + escapeHtml(n) + '">' + escapeHtml(n) + '</option>').join('');
+      if (prevCombo && list[prevCombo]) sel.value = prevCombo;
+      sel.onchange = onPresetSelect;
+      const presetHint = document.getElementById('preset-hint');
+      if (presetHint) presetHint.style.display = names.length ? 'none' : '';
+      renderSeedPresetSelect(); // seed-режим: тот же словарь пресетов
+    }
+
+    async function onPresetSelect() {
+      const name = document.getElementById('preset-combo').value;
+      if (!name || !presetsData[name]) { saveSettings(); return; }
+      const p = presetsData[name];
+      document.getElementById('analysis-model').value = p.analysis_model || '';
+      document.getElementById('use-auto-style').checked = p.use_auto_style !== false;
+      document.getElementById('style-prompt').value = p.style_prompt || '';
+      // seed-поля пресета (шаблон, референс, варианты) в url-форме не отображаются —
+      // за них отвечает #seed-preset-select и модальный редактор
+      document.getElementById('fallback-overlay').checked = (p.fallback_mode || 'auto') === 'always_overlay';
+      const genOpt = GENERATION_OPTIONS.find(o => o[1] === p.generation_provider && (o[2] || '') === (p.generation_model || ''))
+        || GENERATION_OPTIONS.find(o => o[1] === p.generation_provider)
+        || GENERATION_OPTIONS[0];
+      document.getElementById('generation-option').value = genOpt[0];
+      updateAdvancedSettingsVisibility();
+      document.getElementById('row-style-prompt').style.display = document.getElementById('use-auto-style').checked ? 'none' : '';
+      document.getElementById('simple-mode').checked = !!p.simple_mode;
+      // Восстановить референс стиля из пресета (file_id; имя файла не хранится)
+      const urlRefCont = document.getElementById('url-ref-container');
+      if (urlRefCont) {
+        if (p.reference_image) { urlRefCont.dataset.refFileId = p.reference_image; urlRefCont.dataset.refFilename = ''; }
+        else { delete urlRefCont.dataset.refFileId; delete urlRefCont.dataset.refFilename; }
+        updateUrlRefUI();
+      }
+      const langs = (p.languages || '').split(',').map(s => s.trim()).filter(Boolean);
+      if (langs.length) {
+        document.querySelectorAll('#lang-list .lang-item').forEach(el => {
+          el.querySelector('input').checked = langs.includes(el.dataset.lang);
+        });
+        updateLangCount();
+      }
+      saveSettings();
+    }
+
+    document.getElementById('use-auto-style').onchange = function() {
+      document.getElementById('row-style-prompt').style.display = this.checked ? 'none' : '';
+    };
+
+    function getPresetDataFromForm() {
+      const name = document.getElementById('preset-combo').value || 'default';
+      const selectedLangs = [];
+      document.querySelectorAll('#lang-list .lang-item input:checked').forEach(cb => {
+        const el = cb.closest('.lang-item');
+        if (el) selectedLangs.push(el.dataset.lang);
+      });
+      const lang = selectedLangs[0] || 'Русский';
+      const opt = GENERATION_OPTIONS.find(o => o[0] === document.getElementById('generation-option').value) || ['Flow — Nano Pro', 'flow', 'GEM_PIX_2'];
+      // seed-поля пресета в url-форме не редактируются — берём их из presetsData,
+      // чтобы сохранение из url-формы не затирало их
+      const existing = presetsData[name] || {};
+      return {
+        name,
+        language: lang,
+        languages: selectedLangs.join(','),
+        analysis_provider: 'openai',
+        analysis_model: document.getElementById('analysis-model').value,
+        use_auto_style: document.getElementById('use-auto-style').checked,
+        simple_mode: document.getElementById('simple-mode').checked,
+        reference_image: (document.getElementById('url-ref-container') || {}).dataset?.refFileId || '',
+        style_prompt: document.getElementById('style-prompt').value,
+        prompt_template: existing.prompt_template || '',
+        seed_reference_image: existing.seed_reference_image || '',
+        seed_reference_filename: existing.seed_reference_filename || '',
+        seed_n_variants: existing.seed_n_variants || 3,
+        fallback_mode: document.getElementById('fallback-overlay').checked ? 'always_overlay' : 'auto',
+        generation_provider: opt[1],
+        generation_model: opt[2] || '',
+        aspect_ratio: '16:9',
+        max_generation_retries: 2,
+        debug_mode: false
+      };
+    }
+
+    async function saveCurrentPreset() {
+      let name = document.getElementById('preset-combo').value;
+      if (!name) name = prompt('Введите название пресета:');
+      if (!name) return;
+      document.getElementById('preset-combo').value = name;
+      const preset = getPresetDataFromForm();
+      preset.name = name;
+      const next = { ...presetsData, [name]: preset };
+      try {
+        const res = await api('/presets/sync', { method: 'POST', body: JSON.stringify({ presets: next }) });
+        if (res === null && sessionId === null) { showToast('Сессия истекла. Войдите снова.', true); return; }
+        presetsData = next;
+        await loadPresets();
+        document.getElementById('preset-combo').value = name;
+        showToast('Пресет сохранён: ' + name);
+      } catch (e) { showToast('Ошибка: ' + (e.message || e), true); }
+    }
+    document.getElementById('btn-save-preset').onclick = saveCurrentPreset;
+
+    document.getElementById('btn-new-preset').onclick = () => {
+      document.getElementById('new-preset-name').value = '';
+      document.getElementById('modal-new-preset').classList.add('show');
+    };
+    document.getElementById('btn-new-preset-cancel').onclick = () => document.getElementById('modal-new-preset').classList.remove('show');
+    document.getElementById('btn-new-preset-ok').onclick = async () => {
+      const name = document.getElementById('new-preset-name').value.trim();
+      if (!name) return;
+      const preset = getPresetDataFromForm();
+      preset.name = name;
+      const next = { ...presetsData, [name]: preset };
+      try {
+        await api('/presets/sync', { method: 'POST', body: JSON.stringify({ presets: next }) });
+        presetsData = next;
+        loadPresets();
+        document.getElementById('preset-combo').value = name;
+        document.getElementById('modal-new-preset').classList.remove('show');
+      } catch (e) { showToast(e.message, true); }
+    };
+
+    document.getElementById('btn-copy-preset').onclick = async () => {
+      const src = document.getElementById('preset-combo').value;
+      if (!src) { showToast('Сначала выберите пресет', true); return; }
+      const newName = src + '_copy';
+      const preset = { ...presetsData[src], name: newName };
+      const next = { ...presetsData, [newName]: preset };
+      try {
+        await api('/presets/sync', { method: 'POST', body: JSON.stringify({ presets: next }) });
+        presetsData = next;
+        loadPresets();
+        document.getElementById('preset-combo').value = newName;
+        onPresetSelect();
+      } catch (e) { showToast(e.message, true); }
+    };
+
+    document.getElementById('btn-delete-preset').onclick = async () => {
+      const name = document.getElementById('preset-combo').value;
+      if (!name || !confirm('Удалить пресет "' + name + '"?')) return;
+      const next = { ...presetsData };
+      delete next[name];
+      try {
+        await api('/presets/sync', { method: 'POST', body: JSON.stringify({ presets: next }) });
+        presetsData = next;
+        loadPresets();
+        document.getElementById('preset-combo').value = '';
+      } catch (e) { showToast(e.message, true); }
+    };
+
+    document.getElementById('btn-paste').onclick = async () => {
+      try {
+        const t = await navigator.clipboard.readText();
+        document.getElementById('urls').value += t;
+      } catch (_) {}
+    };
+    document.getElementById('btn-clear-urls').onclick = () => document.getElementById('urls').value = '';
+    document.getElementById('btn-load-file').onclick = () => document.getElementById('file-urls').click();
+    document.getElementById('file-urls').onchange = function() {
+      const f = this.files[0];
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => { document.getElementById('urls').value = r.result; };
+      r.readAsText(f);
+      this.value = '';
+    };
+
+    const PROMPTS_KEYS = ['analyze_prompt', 'style_analyze_prompt', 'check_prompt_template', 'adapt_text_system_template', 'generation_prompt_template'];
+    const PROMPTS_LABELS = {
+      analyze_prompt: 'Анализ обложки (JSON)',
+      style_analyze_prompt: 'Анализ стиля референса (JSON)',
+      check_prompt_template: 'Проверка результата (шаблон: {expected_text}, {video_title})',
+      adapt_text_system_template: 'Адаптация текста (системный шаблон)',
+      generation_prompt_template: 'Промпт генерации (без референса)'
+    };
+    document.getElementById('btn-prompts').onclick = async () => {
+      const container = document.getElementById('prompts-fields');
+      container.innerHTML = '';
+      container.style.maxHeight = '60vh';
+      container.style.overflowY = 'auto';
+      PROMPTS_KEYS.forEach(key => {
+        const row = document.createElement('div');
+        row.style.marginBottom = '12px';
+        row.innerHTML = '<label style="display:block; margin-bottom:4px; font-size:13px; color:var(--text-2);">' + (PROMPTS_LABELS[key] || key) + '</label><textarea id="prompt-' + key + '" rows="4" style="width:100%; font-family:ui-monospace, Menlo, Consolas, monospace; font-size:12px;"></textarea>';
+        container.appendChild(row);
+      });
+      document.getElementById('modal-prompts').classList.add('show');
+      try {
+        const data = await api('/prompts');
+        if (data) {
+          PROMPTS_KEYS.forEach(key => {
+            const ta = document.getElementById('prompt-' + key);
+            if (ta) ta.value = data[key] || '';
+          });
+        }
+      } catch (_) {}
+    };
+    document.getElementById('btn-prompts-cancel').onclick = () => document.getElementById('modal-prompts').classList.remove('show');
+    document.getElementById('btn-prompts-save').onclick = async () => {
+      const prompts = {};
+      PROMPTS_KEYS.forEach(key => {
+        const el = document.getElementById('prompt-' + key);
+        if (el) prompts[key] = el.value;
+      });
+      try {
+        const res = await api('/prompts/sync', { method: 'POST', body: JSON.stringify({ prompts }) });
+        if (res === null && sessionId === null) { showToast('Сессия истекла. Войдите снова.', true); return; }
+        showToast('Промпты сохранены на сервер');
+        document.getElementById('modal-prompts').classList.remove('show');
+      } catch (e) {
+        showToast('Ошибка: ' + (e.message || e), true);
+      }
+    };
+
+    // ── Переключение видов (Генерация / Избранное / API-ключи) ──
+    document.querySelectorAll('.nav-btn[data-view]').forEach(btn => {
+      btn.onclick = () => {
+        document.querySelectorAll('.nav-btn[data-view]').forEach(b => b.classList.toggle('active', b === btn));
+        document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
+        document.getElementById('view-' + btn.dataset.view).classList.add('active');
+        if (btn.dataset.view === 'keys') loadApiKeys();
+        if (btn.dataset.view === 'favs') loadFavorites().catch(e => showToast('Избранное: ' + (e.message || e), true));
+      };
+    });
+
+    // ── API-ключи (v1) ──
+    function fmtKeyDate(ts) {
+      if (!ts) return '—';
+      const d = new Date(ts * 1000);
+      return d.toLocaleString();
+    }
+    async function loadApiKeys() {
+      const tbody = document.getElementById('api-keys-tbody');
+      tbody.innerHTML = '<tr><td colspan="6" style="padding:12px; color:var(--text-3);">Загрузка…</td></tr>';
+      try {
+        const data = await api('/api-keys');
+        if (!data || !Array.isArray(data.items) || data.items.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="6" style="padding:12px; color:var(--text-3);">Нет ключей. Создайте первый выше.</td></tr>';
+          return;
+        }
+        tbody.innerHTML = data.items.map(k => {
+          const isActive = k.status === 'active';
+          const statusBadge = isActive
+            ? '<span class="pill completed">active</span>'
+            : '<span class="pill">' + escapeHtml(k.status) + '</span>';
+          const revokeBtn = isActive
+            ? '<button type="button" class="btn btn-danger btn-sm" data-key-id="' + escapeHtml(k.key_id) + '">Отозвать</button>'
+            : '';
+          return '<tr>' +
+            '<td>' + escapeHtml(k.name) + '</td>' +
+            '<td><code>' + escapeHtml(k.prefix) + '…</code></td>' +
+            '<td>' + fmtKeyDate(k.created_at) + '</td>' +
+            '<td>' + fmtKeyDate(k.last_used_at) + '</td>' +
+            '<td>' + statusBadge + '</td>' +
+            '<td style="text-align:right;">' + revokeBtn + '</td>' +
+            '</tr>';
+        }).join('');
+        tbody.querySelectorAll('button[data-key-id]').forEach(btn => {
+          btn.onclick = () => revokeApiKey(btn.dataset.keyId);
+        });
+      } catch (e) {
+        tbody.innerHTML = '<tr><td colspan="6" style="padding:12px;" class="error">Ошибка: ' + escapeHtml(e.message) + '</td></tr>';
+      }
+    }
+    async function createApiKey() {
+      const nameInput = document.getElementById('new-key-name');
+      const name = (nameInput.value || '').trim();
+      if (!name) { showToast('Введите имя ключа', true); return; }
+      try {
+        const r = await api('/api-keys', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name })
+        });
+        if (!r || !r.plain_key) { showToast('Сервер не вернул ключ', true); return; }
+        document.getElementById('new-key-plain').textContent = r.plain_key;
+        document.getElementById('new-key-result').style.display = 'block';
+        nameInput.value = '';
+        loadApiKeys();
+      } catch (e) {
+        showToast('Не удалось создать ключ: ' + e.message, true);
+      }
+    }
+    async function revokeApiKey(keyId) {
+      if (!confirm('Отозвать ключ ' + keyId + '? Это необратимо — запросы с этим ключом перестанут работать.')) return;
+      try {
+        await api('/api-keys/' + encodeURIComponent(keyId), { method: 'DELETE' });
+        loadApiKeys();
+      } catch (e) {
+        showToast('Не удалось отозвать: ' + e.message, true);
+      }
+    }
+    function copyApiKeyToClipboard() {
+      const txt = document.getElementById('new-key-plain').textContent;
+      if (!txt) return;
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(txt).then(
+          () => { const b = document.getElementById('btn-copy-key'); const o = b.textContent; b.textContent = 'Скопировано'; setTimeout(() => b.textContent = o, 1500); },
+          () => showToast('Не удалось скопировать. Выделите вручную.', true)
+        );
+      } else {
+        showToast('Копирование недоступно в этом браузере. Выделите ключ вручную.', true);
+      }
+    }
+    document.getElementById('btn-create-key').onclick = createApiKey;
+    document.getElementById('btn-refresh-keys').onclick = loadApiKeys;
+    document.getElementById('btn-copy-key').onclick = copyApiKeyToClipboard;
+    document.getElementById('btn-close-key-result').onclick = () => {
+      document.getElementById('new-key-result').style.display = 'none';
+      document.getElementById('new-key-plain').textContent = '';
+    };
+    document.getElementById('new-key-name').addEventListener('keydown', e => {
+      if (e.key === 'Enter') { e.preventDefault(); createApiKey(); }
+    });
+    // curl-пример с реальным origin вместо localhost
+    (function fillApiExample() {
+      const el = document.getElementById('api-usage-example');
+      if (!el) return;
+      const origin = window.location.origin && window.location.origin !== 'null' ? window.location.origin : 'https://адрес-сервера';
+      el.textContent = 'curl -H "Authorization: Bearer cvr_xxxxx" \\\n     ' + origin + '/api/v1/jobs\n\n# или X-API-Key:\ncurl -H "X-API-Key: cvr_xxxxx" \\\n     ' + origin + '/api/v1/jobs';
+    })();
+
+    // ── Режим генерации (url / seed) ──
+    let currentMode = 'url';
+    function setMode(m) {
+      currentMode = m;
+      document.querySelectorAll('#mode-switcher .mode-btn').forEach(b => {
+        b.classList.toggle('active', b.dataset.mode === m);
+      });
+      document.querySelectorAll('.mode-url-fields').forEach(el => el.style.display = m === 'url' ? '' : 'none');
+      document.querySelectorAll('.mode-seed-fields').forEach(el => el.style.display = m === 'seed' ? '' : 'none');
+      // Секция «Языки» и строка «Модель генерации» — только для url-режима
+      // (в seed-режиме языки задаются строками семян, модель — пресетом/переопределением)
+      const langSection = document.getElementById('lang-section');
+      if (langSection) langSection.style.display = m === 'url' ? '' : 'none';
+      const genRow = document.getElementById('row-generation-option');
+      if (genRow) genRow.style.display = m === 'url' ? '' : 'none';
+      updateAdvancedSettingsVisibility();
+      try { localStorage.setItem('cover_mode', m); } catch (_) {}
+      updateStartButton();
+    }
+    document.querySelectorAll('#mode-switcher .mode-btn').forEach(b => {
+      b.onclick = () => setMode(b.dataset.mode);
+    });
+
+    function effectiveGenerationOption() {
+      if (currentMode === 'seed') {
+        const overrideLabel = (document.getElementById('seed-ov-model') || {}).value || '';
+        if (overrideLabel) {
+          const overrideOpt = GENERATION_OPTIONS.find(o => o[0] === overrideLabel);
+          if (overrideOpt) return overrideOpt;
+        }
+        const preset = presetsData[seedSelectedPresetName()];
+        if (preset) {
+          return GENERATION_OPTIONS.find(o => o[1] === preset.generation_provider && (o[2] || '') === (preset.generation_model || ''))
+            || GENERATION_OPTIONS.find(o => o[1] === preset.generation_provider)
+            || GENERATION_OPTIONS[0];
+        }
+        return GENERATION_OPTIONS[0];
+      }
+      const label = (document.getElementById('generation-option') || {}).value || '';
+      return GENERATION_OPTIONS.find(o => o[0] === label) || GENERATION_OPTIONS[0];
+    }
+
+    function updateAdvancedSettingsVisibility() {
+      const urlMode = currentMode === 'url';
+      const urlOnly = document.getElementById('url-only-advanced');
+      if (urlOnly) urlOnly.style.display = urlMode ? '' : 'none';
+    }
+
+    // ═══ Режим «Пресет + семя»: карточки «Пресет → Семена → Переопределения → Запуск» ═══
+
+    // ── Карточка «Пресет ниши»: select + мета-строка ──
+    function seedSelectedPresetName() {
+      const sel = document.getElementById('seed-preset-select');
+      return (sel && sel.value) || '';
+    }
+    function renderSeedPresetSelect() {
+      const sel = document.getElementById('seed-preset-select');
+      if (!sel) return;
+      let prev = sel.value;
+      if (!prev) { try { prev = localStorage.getItem('cover_seed_preset') || ''; } catch (_) {} }
+      const names = Object.keys(presetsData);
+      sel.innerHTML = '<option value="">— выберите пресет —</option>' + names.map(n => '<option value="' + escapeHtml(n) + '">' + escapeHtml(n) + '</option>').join('');
+      if (prev && presetsData[prev]) sel.value = prev;
+      updateSeedPresetMeta();
+    }
+    function updateSeedPresetMeta() {
+      const el = document.getElementById('seed-preset-meta');
+      if (!el) return;
+      const name = seedSelectedPresetName();
+      const p = name ? presetsData[name] : null;
+      if (!p) {
+        el.textContent = 'Пресет не выбран';
+        updateAdvancedSettingsVisibility();
+        updateStartButton();
+        return;
+      }
+      const opt = GENERATION_OPTIONS.find(o => o[1] === p.generation_provider && (o[2] || '') === (p.generation_model || ''))
+        || GENERATION_OPTIONS.find(o => o[1] === p.generation_provider);
+      const parts = [opt ? opt[0] : (p.generation_provider || '—'), (p.seed_n_variants || 3) + ' обложки на язык'];
+      parts.push(p.seed_reference_image ? 'референс: ' + (p.seed_reference_filename || p.seed_reference_image) : 'без картинки-референса');
+      let txt = parts.join(' · ');
+      if (!(p.prompt_template || '').trim()) txt += ' · шаблон пуст: семя станет полным промптом';
+      el.textContent = txt;
+      updateAdvancedSettingsVisibility();
+      updateStartButton();
+    }
+    { const sel = document.getElementById('seed-preset-select'); if (sel) sel.onchange = () => {
+      try { localStorage.setItem('cover_seed_preset', sel.value || ''); } catch (_) {}
+      updateSeedPresetMeta();
+    }; }
+
+    // Заполнить селекты моделей (модал + переопределение) из GENERATION_OPTIONS
+    (function populateSeedModelSelects() {
+      const opts = GENERATION_OPTIONS.map(o => '<option value="' + escapeHtml(o[0]) + '">' + escapeHtml(o[0]) + '</option>').join('');
+      const ov = document.getElementById('seed-ov-model');
+      if (ov) ov.innerHTML = '<option value="">Не менять модель пресета</option>' + opts;
+      const sp = document.getElementById('sp-model');
+      if (sp) sp.innerHTML = opts;
+    })();
+
+    // ── Модальный редактор пресета ниши (#modal-seed-preset) ──
+    function updateSpRefUI() {
+      const cont = document.getElementById('sp-ref-container');
+      const btn = document.getElementById('sp-ref-btn');
+      const status = document.getElementById('sp-ref-status');
+      if (!cont) return;
+      const id = cont.dataset.refFileId;
+      const name = cont.dataset.refFilename || '';
+      if (id) {
+        const short = (name || id).length > 32 ? (name || id).slice(0, 30) + '…' : (name || id);
+        status.innerHTML = '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> ' + escapeHtml(short) + ' <span class="ref-clear" title="Снять референс"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></span>';
+        status.classList.remove('hidden');
+        btn.classList.add('hidden');
+      } else {
+        status.classList.add('hidden');
+        status.innerHTML = '';
+        btn.classList.remove('hidden');
+      }
+    }
+    (function initSpRefHandlers() {
+      const btn = document.getElementById('sp-ref-btn');
+      const fi = document.getElementById('sp-ref-input');
+      const status = document.getElementById('sp-ref-status');
+      const cont = document.getElementById('sp-ref-container');
+      if (!btn || !fi || !status || !cont) return;
+      btn.onclick = () => fi.click();
+      fi.onchange = async () => {
+        const f = fi.files && fi.files[0];
+        if (!f) return;
+        if (f.size > 5 * 1024 * 1024) showToast('Референс больше 5 МБ — сервер отбросит его при генерации. Сожмите картинку.');
+        const oldText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Загрузка…';
+        try {
+          const fd = new FormData();
+          fd.append('file', f);
+          const uploadHeaders = {};
+          if (sessionId) uploadHeaders['X-Session-Id'] = sessionId;
+          const resp = await fetch(API + '/api/v1/files', { method: 'POST', headers: uploadHeaders, body: fd });
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const data = await resp.json();
+          if (!data.file_id) throw new Error('no file_id');
+          cont.dataset.refFileId = data.file_id;
+          cont.dataset.refFilename = data.filename || f.name;
+          updateSpRefUI();
+        } catch (e) {
+          showToast('Не удалось загрузить референс: ' + e.message, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = oldText;
+          fi.value = '';
+        }
+      };
+      status.addEventListener('click', (ev) => {
+        if (!ev.target.closest || !ev.target.closest('.ref-clear')) return;
+        delete cont.dataset.refFileId;
+        delete cont.dataset.refFilename;
+        updateSpRefUI();
+      });
+    })();
+
+    let seedModalBaseData = null; // исходник для merge при rename/import (не терять url-поля)
+    function openSeedPresetModal(mode, data) {
+      data = data || {};
+      seedModalBaseData = (data && Object.keys(data).length) ? { ...data } : null;
+      const editing = mode === 'edit';
+      document.getElementById('sp-title').textContent = editing ? 'Пресет: ' + (data.name || '') : 'Создать пресет';
+      document.getElementById('sp-rename-hint').style.display = editing ? '' : 'none';
+      document.getElementById('sp-name').value = data.name || '';
+      document.getElementById('sp-template').value = data.prompt_template || '';
+      document.getElementById('sp-n-variants').value = Math.max(1, Math.min(8, parseInt(data.seed_n_variants, 10) || 3));
+      const cont = document.getElementById('sp-ref-container');
+      if (data.seed_reference_image) {
+        cont.dataset.refFileId = data.seed_reference_image;
+        cont.dataset.refFilename = data.seed_reference_filename || '';
+      } else {
+        delete cont.dataset.refFileId;
+        delete cont.dataset.refFilename;
+      }
+      updateSpRefUI();
+      const opt = GENERATION_OPTIONS.find(o => o[1] === data.generation_provider && (o[2] || '') === (data.generation_model || ''))
+        || GENERATION_OPTIONS.find(o => o[1] === data.generation_provider)
+        || GENERATION_OPTIONS[0];
+      document.getElementById('sp-model').value = opt[0];
+      document.getElementById('modal-seed-preset').classList.add('show');
+    }
+    document.getElementById('btn-seed-preset-new').onclick = () => openSeedPresetModal('new', null);
+    document.getElementById('btn-seed-preset-edit').onclick = () => {
+      const name = seedSelectedPresetName();
+      if (!name || !presetsData[name]) { showToast('Выберите пресет ниши', true); return; }
+      openSeedPresetModal('edit', { ...presetsData[name], name });
+    };
+    document.getElementById('btn-sp-cancel').onclick = () => document.getElementById('modal-seed-preset').classList.remove('show');
+    document.getElementById('btn-sp-save').onclick = async () => {
+      const name = document.getElementById('sp-name').value.trim();
+      if (!name) { showToast('Введите название пресета', true); return; }
+      const opt = GENERATION_OPTIONS.find(o => o[0] === document.getElementById('sp-model').value) || GENERATION_OPTIONS[0];
+      const cont = document.getElementById('sp-ref-container');
+      // MERGE с существующим пресетом: url-поля (style_prompt, языки и т.д.) не трогаем.
+      // При переименовании в режиме «Редактировать» старый ключ не удаляется (создаётся копия).
+      const next = { ...presetsData };
+      // база: существующий пресет с этим именем, иначе исходник модала (rename-копия /
+      // import наследуют url-поля: style_prompt, simple_mode и т.д., а не дефолты)
+      const base = next[name] || seedModalBaseData || {};
+      next[name] = {
+        ...base,
+        name,
+        prompt_template: document.getElementById('sp-template').value,
+        seed_reference_image: cont.dataset.refFileId || '',
+        seed_reference_filename: cont.dataset.refFilename || '',
+        seed_n_variants: Math.max(1, Math.min(8, parseInt(document.getElementById('sp-n-variants').value, 10) || 3)),
+        generation_provider: opt[1],
+        generation_model: opt[2] || ''
+      };
+      try {
+        const res = await api('/presets/sync', { method: 'POST', body: JSON.stringify({ presets: next }) });
+        if (res === null && sessionId === null) { showToast('Сессия истекла. Войдите снова.', true); return; }
+        presetsData = next;
+        await loadPresets(); // перерисует оба селекта пресетов
+        const sel = document.getElementById('seed-preset-select');
+        if (sel) sel.value = name;
+        try { localStorage.setItem('cover_seed_preset', name); } catch (_) {}
+        updateSeedPresetMeta();
+        document.getElementById('modal-seed-preset').classList.remove('show');
+        showToast('Пресет сохранён: ' + name);
+      } catch (e) { showToast('Ошибка: ' + (e.message || e), true); }
+    };
+    // Import: .json → модал с заполненными полями (без автосохранения)
+    document.getElementById('btn-seed-preset-import').onclick = () => document.getElementById('seed-preset-import-input').click();
+    document.getElementById('seed-preset-import-input').onchange = function() {
+      const f = this.files && this.files[0];
+      this.value = '';
+      if (!f) return;
+      const r = new FileReader();
+      r.onload = () => {
+        try {
+          const obj = JSON.parse(r.result);
+          if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('ожидается объект пресета');
+          openSeedPresetModal('import', obj);
+        } catch (e) { showToast('Битый JSON: ' + (e.message || e), true); }
+      };
+      r.readAsText(f);
+    };
+    // Export: выбранный пресет полным JSON
+    document.getElementById('btn-seed-preset-export').onclick = () => {
+      const name = seedSelectedPresetName();
+      if (!name || !presetsData[name]) { showToast('Выберите пресет ниши', true); return; }
+      const blob = new Blob([JSON.stringify({ ...presetsData[name], name }, null, 2)], { type: 'application/json' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = name.replace(/[\/\\:*?"<>|]+/g, '_') + '.json';
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+    };
+    // Delete: пресет общий с url-режимом — удаляется совсем
+    document.getElementById('btn-seed-preset-delete').onclick = async () => {
+      const name = seedSelectedPresetName();
+      if (!name || !presetsData[name]) { showToast('Выберите пресет ниши', true); return; }
+      if (!confirm('Удалить пресет «' + name + '»? Он общий с режимом «По ссылкам» — удалится совсем.')) return;
+      const next = { ...presetsData };
+      delete next[name];
+      try {
+        await api('/presets/sync', { method: 'POST', body: JSON.stringify({ presets: next }) });
+        presetsData = next;
+        try { if (localStorage.getItem('cover_seed_preset') === name) localStorage.removeItem('cover_seed_preset'); } catch (_) {}
+        await loadPresets(); // перерисует оба селекта
+        showToast('Пресет удалён: ' + name);
+      } catch (e) { showToast(e.message, true); }
+    };
+
+    // ── Карточка «Семена»: строки (язык, семя) ──
+    function seedRowsData() {
+      const rows = [];
+      document.querySelectorAll('#seed-rows .seed-row').forEach(row => {
+        const sel = row.querySelector('.seed-row-lang');
+        const ta = row.querySelector('.seed-row-seed');
+        rows.push({ lang: (sel && sel.value) || '', seed: (ta && ta.value) || '' });
+      });
+      return rows;
+    }
+    function validSeedRows() {
+      return seedRowsData().filter(r => r.lang && (r.seed || '').trim().length >= 10);
+    }
+    function persistSeedRows() {
+      try { localStorage.setItem('cover_seed_rows', JSON.stringify(seedRowsData())); } catch (_) {}
+    }
+    // Подсветка дубликатов языков; возвращает имя первого дублированного языка (или '')
+    function markDuplicateSeedLangs() {
+      const count = {};
+      const sels = document.querySelectorAll('#seed-rows .seed-row-lang');
+      sels.forEach(sel => { count[sel.value] = (count[sel.value] || 0) + 1; });
+      let dup = '';
+      sels.forEach(sel => {
+        const isDup = count[sel.value] > 1;
+        sel.classList.toggle('err', isDup);
+        if (isDup && !dup) dup = sel.value;
+      });
+      return dup;
+    }
+    function seedLangOptionsHtml(selected) {
+      const names = languagesData.map(l => l.display);
+      if (selected && names.indexOf(selected) < 0) names.unshift(selected);
+      if (!names.length) names.push('Русский');
+      return names.map(n => '<option value="' + escapeHtml(n) + '"' + (n === selected ? ' selected' : '') + '>' + escapeHtml(n) + '</option>').join('');
+    }
+    function addSeedRow(lang, seed) {
+      const box = document.getElementById('seed-rows');
+      if (!box) return;
+      const row = document.createElement('div');
+      row.className = 'seed-row';
+      row.innerHTML = '<div class="seed-row-head">' +
+          '<select class="seed-row-lang">' + seedLangOptionsHtml(lang || '') + '</select>' +
+          '<button type="button" class="seed-row-del btn btn-ghost btn-sm" title="Удалить строку"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>' +
+        '</div>' +
+        '<textarea class="seed-row-seed" rows="5" placeholder="ТЕКСТ НА ОБЛОЖКЕ: …&#10;ГЛАВНЫЙ ОБЪЕКТ: …&#10;СЦЕНА: …&#10;КОМПОЗИЦИЯ: …"></textarea>';
+      row.querySelector('.seed-row-seed').value = seed || '';
+      box.appendChild(row);
+    }
+    function restoreSeedRows() {
+      const box = document.getElementById('seed-rows');
+      if (!box) return;
+      box.innerHTML = '';
+      let rows = null;
+      try { const raw = localStorage.getItem('cover_seed_rows'); if (raw) rows = JSON.parse(raw); } catch (_) {}
+      if (!Array.isArray(rows)) {
+        // одноразовая миграция из старого формата cover_seed_texts ({язык: текст})
+        try {
+          const old = JSON.parse(localStorage.getItem('cover_seed_texts') || 'null');
+          if (old && typeof old === 'object' && !Array.isArray(old)) {
+            rows = Object.keys(old).map(lang => ({ lang: lang, seed: old[lang] || '' }));
+            localStorage.removeItem('cover_seed_texts');
+          }
+        } catch (_) {}
+      }
+      if (!Array.isArray(rows) || !rows.length) rows = [{ lang: 'Русский', seed: '' }];
+      rows.forEach(r => addSeedRow((r && r.lang) || 'Русский', (r && r.seed) || ''));
+      persistSeedRows();
+      markDuplicateSeedLangs();
+      updateStartButton();
+    }
+    (function initSeedRowsEvents() {
+      const box = document.getElementById('seed-rows');
+      if (!box) return;
+      box.addEventListener('input', (ev) => {
+        if (ev.target.classList && ev.target.classList.contains('seed-row-seed')) {
+          persistSeedRows();
+          updateStartButton();
+        }
+      });
+      box.addEventListener('change', (ev) => {
+        if (ev.target.classList && ev.target.classList.contains('seed-row-lang')) {
+          persistSeedRows();
+          markDuplicateSeedLangs();
+          updateStartButton();
+        }
+      });
+      box.addEventListener('click', (ev) => {
+        const del = ev.target.closest('.seed-row-del');
+        if (!del) return;
+        const row = del.closest('.seed-row');
+        if (row) row.remove();
+        persistSeedRows();
+        markDuplicateSeedLangs();
+        updateStartButton();
+      });
+    })();
+    document.getElementById('btn-seed-add-row').onclick = () => {
+      const used = new Set(seedRowsData().map(r => r.lang));
+      const names = languagesData.map(l => l.display);
+      const free = names.find(n => !used.has(n)) || names[0] || 'Русский';
+      addSeedRow(free, '');
+      persistSeedRows();
+      markDuplicateSeedLangs();
+      updateStartButton();
+    };
+    // «⧉ Размножить первое семя на все строки»
+    document.getElementById('btn-seed-copy-all').onclick = () => {
+      const tas = Array.from(document.querySelectorAll('#seed-rows .seed-row-seed'));
+      if (tas.length < 2) { showToast('Нужно минимум две строки', true); return; }
+      const src = tas[0].value;
+      if (!src.trim()) { showToast('Семя первой строки пустое — нечего копировать', true); return; }
+      const willOverwrite = tas.slice(1).some(t => t.value.trim() && t.value !== src);
+      if (willOverwrite && !confirm('У некоторых строк семя уже заполнено — перезаписать?')) return;
+      tas.slice(1).forEach(t => { t.value = src; });
+      persistSeedRows();
+      updateStartButton();
+      showToast('Семя скопировано во все строки');
+    };
+
+    // ── Переопределения пресета и живой текст кнопки запуска ──
+    { const s = document.getElementById('seed-ov-model'); if (s) s.onchange = () => {
+      updateAdvancedSettingsVisibility();
+      updateStartButton();
+    }; }
+    { const i = document.getElementById('seed-ov-variants'); if (i) i.addEventListener('input', updateStartButton); }
+    function seedEffectiveVariants(preset) {
+      const ov = parseInt((document.getElementById('seed-ov-variants') || {}).value, 10);
+      const nv = (ov >= 1 ? ov : 0) || (preset && preset.seed_n_variants) || 3;
+      return Math.max(1, Math.min(8, nv));
+    }
+    function updateStartButton() {
+      const btn = document.getElementById('btn-start');
+      if (!btn) return;
+      if (currentMode !== 'seed') { btn.textContent = 'Запустить генерацию'; return; }
+      const n = validSeedRows().length;
+      const preset = presetsData[seedSelectedPresetName()];
+      btn.textContent = 'Сгенерировать (' + n + ' яз. × ' + seedEffectiveVariants(preset) + ' вар.)';
+    }
+
+    // ── Референс стиля для режима «По ссылкам» (сохраняется в пресете) ──
+    function updateUrlRefUI() {
+      const cont = document.getElementById('url-ref-container');
+      const btn = document.getElementById('url-ref-btn');
+      const status = document.getElementById('url-ref-status');
+      if (!cont) return;
+      const id = cont.dataset.refFileId;
+      const name = cont.dataset.refFilename || '';
+      if (id) {
+        const short = (name || id).length > 32 ? (name || id).slice(0, 30) + '…' : (name || id);
+        status.innerHTML = '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> ' + escapeHtml(short) + ' <span class="ref-clear" title="Снять референс"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></span>';
+        status.classList.remove('hidden');
+        btn.classList.add('hidden');
+      } else {
+        status.classList.add('hidden');
+        status.innerHTML = '';
+        btn.classList.remove('hidden');
+      }
+    }
+    (function initUrlRefHandlers() {
+      const btn = document.getElementById('url-ref-btn');
+      const fi = document.getElementById('url-ref-input');
+      const status = document.getElementById('url-ref-status');
+      const cont = document.getElementById('url-ref-container');
+      if (!btn || !fi || !status || !cont) return;
+      btn.onclick = () => fi.click();
+      fi.onchange = async () => {
+        const f = fi.files && fi.files[0];
+        if (!f) return;
+        const oldText = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = 'Загрузка…';
+        try {
+          const fd = new FormData();
+          fd.append('file', f);
+          const uploadHeaders = {};
+          if (sessionId) uploadHeaders['X-Session-Id'] = sessionId;
+          const resp = await fetch(API + '/api/v1/files', { method: 'POST', headers: uploadHeaders, body: fd });
+          if (!resp.ok) throw new Error('HTTP ' + resp.status);
+          const data = await resp.json();
+          if (!data.file_id) throw new Error('no file_id');
+          cont.dataset.refFileId = data.file_id;
+          cont.dataset.refFilename = data.filename || f.name;
+          updateUrlRefUI();
+          saveSettings();
+        } catch (e) {
+          showToast('Не удалось загрузить референс: ' + e.message, true);
+          btn.textContent = oldText;
+        } finally {
+          btn.disabled = false;
+          fi.value = '';
+        }
+      };
+      status.addEventListener('click', (ev) => {
+        if (!ev.target.closest || !ev.target.closest('.ref-clear')) return;
+        delete cont.dataset.refFileId;
+        delete cont.dataset.refFilename;
+        updateUrlRefUI();
+        saveSettings();
+      });
+    })();
+
+    async function createJob() {
+      const selectedLangs = [];
+      document.querySelectorAll('#lang-list .lang-item input:checked').forEach(cb => {
+        const el = cb.closest('.lang-item');
+        if (el) selectedLangs.push(el.dataset.lang);
+      });
+      if (!selectedLangs.length) selectedLangs.push('Русский');
+      const presetData = getPresetDataFromForm();
+
+      let body;
+      if (currentMode === 'seed') {
+        // Механизм «пресет + семя → N обложек»: пресет ниши применяется к каждой строке (язык, семя)
+        const presetName = seedSelectedPresetName();
+        const preset = presetName ? presetsData[presetName] : null;
+        if (!preset) { showToast('Выберите пресет ниши', true); return; }
+        const dupLang = markDuplicateSeedLangs();
+        if (dupLang) { showToast('Язык «' + dupLang + '» указан дважды', true); return; }
+        const rows = validSeedRows();
+        if (!rows.length) { document.getElementById('progress-msg').textContent = 'Заполните хотя бы одну строку семени (минимум 10 символов)'; return; }
+        const seeds_per_lang = {};
+        rows.forEach(r => { seeds_per_lang[r.lang] = r.seed.trim(); });
+        // ИНВАРИАНТ (сервер валидирует): languages == Object.keys(seeds_per_lang)
+        const seedLangs = Object.keys(seeds_per_lang);
+        const nVar = seedEffectiveVariants(preset);
+        const refs_per_language = {};
+        if (preset.seed_reference_image) { seedLangs.forEach(lang => { refs_per_language[lang] = preset.seed_reference_image; }); }
+        // preset_data — пресет целиком; override модели из «Переопределений» подменяет provider/model
+        const seed_preset_data = { ...preset };
+        const ovLabel = (document.getElementById('seed-ov-model') || {}).value || '';
+        if (ovLabel) {
+          const ovOpt = GENERATION_OPTIONS.find(o => o[0] === ovLabel);
+          if (ovOpt) { seed_preset_data.generation_provider = ovOpt[1]; seed_preset_data.generation_model = ovOpt[2] || ''; }
+        }
+        body = {
+          mode: 'seed',
+          seeds_per_lang,
+          n_variants: nVar,
+          languages: seedLangs,
+          preset_name: presetName,
+          preset_data: seed_preset_data,
+          refs_per_language,
+        };
+      } else {
+        const urls = document.getElementById('urls').value.trim().split(/\n/).map(s => s.trim()).filter(Boolean);
+        if (!urls.length) { document.getElementById('progress-msg').textContent = 'Введите хотя бы одну ссылку'; return; }
+        body = {
+          mode: 'url',
+          urls,
+          languages: selectedLangs,
+          preset_name: document.getElementById('preset-combo').value || 'default',
+          preset_data: presetData,
+          refs_per_language: {},
+        };
+      }
+      const startBtn = document.getElementById('btn-start');
+      startBtn.disabled = true;
+      try {
+        const r = await api('/jobs/cover', { method: 'POST', body: JSON.stringify(body) });
+        let desc;
+        if (body.mode === 'seed') desc = Object.keys(body.seeds_per_lang).length + ' яз. × ' + body.n_variants + ' вар.';
+        else desc = body.urls.length + ' ссылок × ' + selectedLangs.length + ' яз.';
+        document.getElementById('progress-msg').textContent = 'Задание ' + r.job_id + ' добавлено в очередь (' + desc + ')';
+        saveSettings();
+        await refreshJobs();
+        if (body.mode === 'seed' && r && r.job_id) selectJob(r.job_id); // подсветить новую задачу в очереди
+      } catch (e) {
+        document.getElementById('progress-msg').textContent = 'Ошибка: ' + e.message;
+      } finally {
+        startBtn.disabled = false;
+      }
+    }
+
+    document.getElementById('btn-start').onclick = createJob;
+
+    // ── Очередь ──
+    const statusLabels = { pending: 'Ждёт', running: 'Идёт', completed: 'Готово', completed_partial: 'Частично', failed: 'Ошибка', cancelled: 'Отменено' };
+    function statusPill(status) {
+      const label = statusLabels[status] || status;
+      return '<span class="pill ' + escapeHtml(status) + '">' + escapeHtml(label) + '</span>';
+    }
+    let jobsPage = 1;
+    let jobsPageSize = parseInt(localStorage.getItem('cover_jobs_page_size') || '20', 10);
+    let jobsStatusFilter = localStorage.getItem('cover_jobs_status') || '';
+    let jobsTotalPages = 1;
+
+    async function refreshJobs() {
+      if (!sessionId) return; // на экране логина не спамим /jobs (401 дёргал showLogin каждые 3с)
+      const params = new URLSearchParams({ page: String(jobsPage), page_size: String(jobsPageSize) });
+      if (jobsStatusFilter) params.set('status', jobsStatusFilter);
+      let resp;
+      try { resp = await api('/jobs?' + params.toString()); } catch (_) { return; }
+      if (!resp) return;
+      // Поддержка обоих форматов: новый {items,...} и старый [array]
+      const list = Array.isArray(resp) ? resp : (resp.items || []);
+      const total = Array.isArray(resp) ? list.length : (resp.total || 0);
+      jobsTotalPages = Array.isArray(resp) ? 1 : (resp.total_pages || 1);
+      if (jobsPage > jobsTotalPages) { jobsPage = jobsTotalPages; return refreshJobs(); }
+
+      const tbody = document.querySelector('#job-list tbody');
+      if (!list.length) {
+        tbody.innerHTML = '<tr><td colspan="4" style="padding:16px; color:var(--text-3); cursor:default;">Пока нет заданий — создайте первое в форме слева</td></tr>';
+      } else {
+      tbody.innerHTML = list.map(j => {
+        // список /jobs отдаёт счётчик «N/M обложек» в поле detail (не progress_detail)
+        const desc = j.created_at ? escapeHtml(new Date(j.created_at * 1000).toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' })) : '';
+        const pct = Math.max(0, Math.min(100, j.progress || 0));
+        const failed = j.status === 'failed' || j.status === 'cancelled';
+        const barColor = failed ? 'var(--red)' : (j.status === 'completed' ? 'var(--green)' : 'var(--accent)');
+        const detailTxt = j.detail ? ' · ' + escapeHtml(String(j.detail)) : '';
+        const bar = '<div class="bar-wrap"><div class="bar"><div style="background:' + barColor + '; width:' + pct + '%;"></div></div>'
+          + '<div class="bar-label">' + pct + '%' + detailTxt + '</div></div>';
+        return '<tr data-id="' + escapeHtml(String(j.id)) + '"><td class="mono">' + escapeHtml(String(j.id)) + '</td><td>' + statusPill(j.status) + '</td><td>' + bar + '</td><td>' + desc + '</td></tr>';
+      }).join('');
+      }
+      tbody.querySelectorAll('tr[data-id]').forEach(tr => {
+        tr.onclick = () => selectJob(tr.dataset.id);
+        if (tr.dataset.id === selectedJobId) tr.classList.add('sel');
+      });
+
+      const info = document.getElementById('page-info');
+      if (info) info.textContent = `Стр. ${jobsPage} / ${jobsTotalPages} · всего: ${total}`;
+      document.getElementById('btn-page-first').disabled = jobsPage <= 1;
+      document.getElementById('btn-page-prev').disabled = jobsPage <= 1;
+      document.getElementById('btn-page-next').disabled = jobsPage >= jobsTotalPages;
+      document.getElementById('btn-page-last').disabled = jobsPage >= jobsTotalPages;
+
+      if (selectedJobId) selectJob(selectedJobId);
+    }
+
+    async function selectJob(id) {
+      selectedJobId = id;
+      document.querySelectorAll('#job-list tbody tr').forEach(tr => { tr.classList.toggle('sel', tr.dataset.id === id); });
+      const job = await api('/jobs/' + id).catch(() => null);
+      if (!job) return;
+      const ph = document.getElementById('job-detail-placeholder');
+      if (ph) ph.style.display = 'none';
+      document.getElementById('job-detail-title').textContent = 'Задача ' + id;
+      // Гвард: пишем лог только при изменении — безусловный textContent на каждом
+      // 3с-поллинге сбрасывал выделение текста в логе.
+      const logEl = document.getElementById('job-log');
+      const logTxt = job.log || '(пусто)';
+      if (logEl.textContent !== logTxt) logEl.textContent = logTxt;
+      // При провале/частичном результате раскрываем лог сами и ведём к причинам —
+      // иначе retry делается вслепую (ошибки видны только в свёрнутой простыне).
+      if (job.status === 'failed' || job.status === 'completed_partial') {
+        const det = document.getElementById('job-log-details');
+        if (det && det.dataset.autoOpened !== id) { det.dataset.autoOpened = id; det.open = true; }
+      }
+      const errEl = document.getElementById('job-error');
+      if (job.error) {
+        errEl.textContent = 'Ошибка: ' + job.error;
+        errEl.style.display = 'block';
+      } else {
+        errEl.textContent = '';
+        errEl.style.display = 'none';
+      }
+      const files = await api('/jobs/' + id + '/files').catch(() => null);
+      const div = document.getElementById('job-files');
+      const downloadAllEl = document.getElementById('job-download-all');
+      const thumbsEl = document.getElementById('job-thumbs');
+      if (!files || !files.length) {
+        div.innerHTML = '<span class="hint">(нет файлов)</span>';
+        downloadAllEl.innerHTML = '';
+        if (thumbsEl && thumbsEl.dataset.key !== id + ':none') {
+          thumbsEl.dataset.key = id + ':none';
+          thumbsEl.innerHTML = '';
+        }
+        return;
+      }
+      const base = API + '/jobs/' + id + '/files/';
+      const sid = sessionId ? '?sid=' + encodeURIComponent(sessionId) : '';
+      const zipUrl = API + '/jobs/' + id + '/download' + sid;
+      // Гвард (как у thumbs): меню перерисовываем только при изменении списка файлов —
+      // безусловный innerHTML на каждом поллинге закрывал открытое «Скачать всё ▾».
+      const dlKey = id + ':' + files.length;
+      if (downloadAllEl.dataset.key !== dlKey) {
+        downloadAllEl.dataset.key = dlKey;
+        downloadAllEl.innerHTML = '<div class="download-menu">' +
+          '<button onclick="this.nextElementSibling.classList.toggle(\'show\')" type="button" class="btn btn-primary btn-sm">Скачать всё <svg class="ic" viewBox="0 0 24 24"><use href="#ic-chevron-down"/></svg></button>' +
+          '<div class="download-menu-content">' +
+          '<a href="' + zipUrl + '" download>Скачать одним ZIP</a>' +
+          '<button type="button" onclick="downloadAllDirect(\'' + escapeHtml(id) + '\')">Скачать файлы по отдельности</button>' +
+          '</div></div>';
+        div.innerHTML = files.map(f => '<a class="file-link" href="' + base + encodeFilePath(f) + sid + '" download="' + escapeHtml(f.split('/').pop()) + '">' + escapeHtml(f) + '</a>').join('');
+      }
+      // Галерея готовых обложек: все картинки, сгруппированные по языку
+      if (thumbsEl) {
+        const imgs = files.filter(f => /\.(png|jpe?g|webp)$/i.test(f));
+        const key = id + ':' + imgs.join(',');
+        if (thumbsEl.dataset.key !== key) {
+          // полная перерисовка только при изменении списка файлов
+          thumbsEl.dataset.key = key;
+          let fallbackSet = new Set();
+          try {
+            const fb = typeof job.fallback_files === 'string' ? JSON.parse(job.fallback_files || '[]') : (job.fallback_files || []);
+            if (Array.isArray(fb)) fallbackSet = new Set(fb);
+          } catch (_) {}
+          // группировка: код языка (префикс до '_'), «Без текста», «Прочее»
+          const groups = new Map();
+          imgs.forEach(f => {
+            const bn = f.split('/').pop();
+            let g;
+            if (bn.indexOf('No text_') === 0) g = 'Без текста';
+            else {
+              const p = bn.split('_')[0];
+              g = /^[a-z]{2,3}$/.test(p) ? p.toUpperCase() : 'Прочее';
+            }
+            if (!groups.has(g)) groups.set(g, []);
+            groups.get(g).push(f);
+          });
+          currentGalleryItems = [];
+          let html = '';
+          groups.forEach((arr, g) => {
+            html += '<div class="thumb-group"><div class="thumb-group-title">' + escapeHtml(g) + '</div><div class="thumbs">';
+            arr.forEach(f => {
+              const idx = currentGalleryItems.length;
+              const url = base + encodeFilePath(f) + sid;
+              currentGalleryItems.push({ url: url, title: f.split('/').pop(), group: g, jobId: id, path: f });
+              const isFav = favByKey.has(id + '|' + f);
+              const badge = fallbackSet.has(f) ? '<span class="thumb-badge">без текста</span>' : '';
+              html += '<div class="thumb" data-index="' + idx + '" title="' + escapeHtml(f) + '">' +
+                '<img src="' + url + '" alt="' + escapeHtml(f.split('/').pop()) + '" loading="lazy">' +
+                '<button type="button" class="thumb-star' + (isFav ? ' active' : '') + '" data-job-id="' + escapeHtml(id) + '" data-path="' + escapeHtml(f) + '" title="В избранное">' + (isFav ? '<svg class="ic" viewBox="0 0 24 24" style="fill:currentColor"><use href="#ic-star"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-star"/></svg>') + '</button>' +
+                badge +
+                '</div>';
+            });
+            html += '</div></div>';
+          });
+          thumbsEl.innerHTML = html;
+        }
+      }
+    }
+
+    // Клики по галерее задачи: звёздочка → избранное, миниатюра → лайтбокс
+    document.getElementById('job-thumbs').addEventListener('click', (ev) => {
+      const star = ev.target.closest('.thumb-star');
+      if (star) {
+        ev.preventDefault();
+        toggleFavorite(star.dataset.jobId, star.dataset.path);
+        return;
+      }
+      const thumb = ev.target.closest('.thumb');
+      if (thumb) openLightbox(currentGalleryItems.slice(), parseInt(thumb.dataset.index, 10) || 0);
+    });
+
+    // Скачать все файлы напрямую (каждый отдельно в Downloads)
+    async function downloadAllDirect(jobId) {
+      document.querySelectorAll('.download-menu-content').forEach(el => el.classList.remove('show'));
+      const files = await api('/jobs/' + jobId + '/files').catch(() => null);
+      if (!files || !files.length) { showToast('Нет файлов', true); return; }
+      const sid = sessionId ? '?sid=' + encodeURIComponent(sessionId) : '';
+      const base = API + '/jobs/' + jobId + '/files/';
+      for (const f of files) {
+        const url = base + f.split('/').map(s => encodeURIComponent(s)).join('/') + sid;
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = f.split('/').pop();
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        await new Promise(r => setTimeout(r, 300));
+      }
+    }
+
+    // Закрыть меню при клике вне
+    document.addEventListener('click', (e) => {
+      if (!e.target.closest('.download-menu')) {
+        document.querySelectorAll('.download-menu-content').forEach(el => el.classList.remove('show'));
+      }
+    });
+
+    // ═══ Избранное ═══
+    function favKey(jobId, path) { return jobId + '|' + path; }
+
+    async function loadFavorites() {
+      const resp = await api('/favorites');
+      if (!resp) return;
+      favoritesItems = resp.items || [];
+      favByKey = new Map();
+      favoritesItems.forEach(it => { favByKey.set(favKey(it.source_job_id, it.source_path), it); });
+      const view = document.getElementById('view-favs');
+      if (view && view.classList.contains('active')) renderFavorites();
+      updateThumbStars();
+    }
+
+    // Точечное обновление звёздочек в галерее задачи + лайтбоксе (без перерисовки)
+    function updateThumbStars() {
+      document.querySelectorAll('#job-thumbs .thumb-star').forEach(btn => {
+        const isFav = favByKey.has(favKey(btn.dataset.jobId, btn.dataset.path));
+        btn.classList.toggle('active', isFav);
+        btn.innerHTML = isFav ? '<svg class="ic" viewBox="0 0 24 24" style="fill:currentColor"><use href="#ic-star"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-star"/></svg>';
+      });
+      const lb = document.getElementById('lightbox');
+      if (lb && lb.classList.contains('show')) updateLightboxStar();
+    }
+
+    async function toggleFavorite(jobId, path) {
+      const key = favKey(jobId, path);
+      const existing = favByKey.get(key);
+      try {
+        if (existing) {
+          await api('/favorites/' + encodeURIComponent(existing.id), { method: 'DELETE' });
+          favByKey.delete(key);
+          favoritesItems = favoritesItems.filter(it => it.id !== existing.id);
+          showToast('Убрано из избранного');
+        } else {
+          const rec = await api('/jobs/' + jobId + '/favorites', { method: 'POST', body: JSON.stringify({ path: path }) });
+          if (rec && rec.id) {
+            favByKey.set(key, rec);
+            favoritesItems.unshift(rec);
+            showToast('Добавлено в избранное');
+          }
+        }
+        updateThumbStars();
+        const view = document.getElementById('view-favs');
+        if (view && view.classList.contains('active')) renderFavorites();
+        loadFavorites().catch(() => {}); // пересинхронизация с сервером
+      } catch (e) {
+        showToast('Ошибка избранного: ' + (e.message || e), true);
+      }
+    }
+
+    function fmtFavDate(ts) {
+      if (!ts) return '';
+      const d = typeof ts === 'number' ? new Date(ts * 1000) : new Date(ts);
+      return isNaN(d.getTime()) ? '' : d.toLocaleString('ru-RU', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
+    }
+
+    function favLightboxItems() {
+      const sid = sessionId ? '?sid=' + encodeURIComponent(sessionId) : '';
+      return favoritesItems.map(it => ({
+        url: API + '/favorites/' + encodeURIComponent(it.id) + '/file' + sid,
+        title: it.filename || '',
+        group: (it.lang || '').toUpperCase(),
+        jobId: it.source_job_id,
+        path: it.source_path,
+        favId: it.id
+      }));
+    }
+
+    function renderFavorites() {
+      const grid = document.getElementById('favs-grid');
+      if (!grid) return;
+      const empty = document.getElementById('favs-empty');
+      if (!favoritesItems.length) {
+        grid.innerHTML = '';
+        if (empty) empty.style.display = '';
+        updateFavsToolbar();
+        return;
+      }
+      if (empty) empty.style.display = 'none';
+      const sid = sessionId ? '?sid=' + encodeURIComponent(sessionId) : '';
+      grid.innerHTML = favoritesItems.map((it, i) => {
+        const url = API + '/favorites/' + encodeURIComponent(it.id) + '/file' + sid;
+        const meta = [it.lang, it.preset, fmtFavDate(it.created_at)].filter(Boolean).join(' · ');
+        return '<div class="fav-card" data-index="' + i + '" data-fav-id="' + escapeHtml(it.id) + '">' +
+          '<img src="' + url + '" alt="' + escapeHtml(it.filename || '') + '" loading="lazy">' +
+          '<label class="fav-check" title="Выбрать"><input type="checkbox" class="fav-cb" data-fav-id="' + escapeHtml(it.id) + '"></label>' +
+          '<button type="button" class="fav-del" data-fav-id="' + escapeHtml(it.id) + '" title="Убрать из избранного"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>' +
+          '<div class="fav-meta">' + escapeHtml(meta || '—') + '</div>' +
+          '</div>';
+      }).join('');
+      updateFavsToolbar();
+    }
+
+    function updateFavsToolbar() {
+      const checked = document.querySelectorAll('#favs-grid .fav-cb:checked');
+      const btnSel = document.getElementById('btn-favs-download-selected');
+      if (btnSel) btnSel.disabled = checked.length === 0;
+      const btnAll = document.getElementById('btn-favs-download-all');
+      if (btnAll) btnAll.disabled = favoritesItems.length === 0;
+      const cnt = document.getElementById('favs-count');
+      if (cnt) cnt.textContent = favoritesItems.length ? ('Выбрано: ' + checked.length + ' из ' + favoritesItems.length) : '';
+    }
+
+    document.getElementById('favs-grid').addEventListener('change', (ev) => {
+      if (ev.target.classList && ev.target.classList.contains('fav-cb')) updateFavsToolbar();
+    });
+    document.getElementById('favs-grid').addEventListener('click', async (ev) => {
+      const del = ev.target.closest('.fav-del');
+      if (del) {
+        try {
+          await api('/favorites/' + encodeURIComponent(del.dataset.favId), { method: 'DELETE' });
+          showToast('Убрано из избранного');
+          await loadFavorites();
+          renderFavorites();
+        } catch (e) { showToast('Ошибка: ' + (e.message || e), true); }
+        return;
+      }
+      if (ev.target.closest('.fav-check')) return; // чекбокс — не открывать лайтбокс
+      const card = ev.target.closest('.fav-card');
+      if (card) openLightbox(favLightboxItems(), parseInt(card.dataset.index, 10) || 0);
+    });
+    document.getElementById('btn-favs-select-all').onclick = () => {
+      const cbs = Array.from(document.querySelectorAll('#favs-grid .fav-cb'));
+      if (!cbs.length) return;
+      const all = cbs.every(cb => cb.checked);
+      cbs.forEach(cb => { cb.checked = !all; });
+      updateFavsToolbar();
+    };
+    document.getElementById('btn-favs-download-selected').onclick = () => {
+      const ids = Array.from(document.querySelectorAll('#favs-grid .fav-cb:checked')).map(cb => cb.dataset.favId);
+      if (!ids.length) return;
+      location.href = API + '/favorites/download?ids=' + ids.map(encodeURIComponent).join(',') + '&sid=' + encodeURIComponent(sessionId || '');
+    };
+    document.getElementById('btn-favs-download-all').onclick = () => {
+      location.href = API + '/favorites/download?sid=' + encodeURIComponent(sessionId || '');
+    };
+
+    // ═══ Лайтбокс ═══
+    let lbItems = [];   // снапшот, не живая коллекция
+    let lbIndex = 0;
+
+    function openLightbox(items, startIndex) {
+      if (!items || !items.length) return;
+      lbItems = items;
+      lbIndex = Math.max(0, Math.min(items.length - 1, startIndex || 0));
+      document.getElementById('lightbox').classList.add('show');
+      renderLightbox();
+    }
+    function closeLightbox() {
+      document.getElementById('lightbox').classList.remove('show');
+      lbItems = [];
+      lbIndex = 0;
+    }
+    function renderLightbox() {
+      const it = lbItems[lbIndex];
+      if (!it) { closeLightbox(); return; }
+      document.getElementById('lb-img').src = it.url;
+      document.getElementById('lb-caption').textContent = it.title + (it.group ? ' · ' + it.group : '');
+      document.getElementById('lb-counter').textContent = (lbIndex + 1) + ' / ' + lbItems.length;
+      const dl = document.getElementById('lb-download');
+      dl.href = it.url;
+      dl.setAttribute('download', it.title || 'cover.jpg');
+      updateLightboxStar();
+    }
+    function updateLightboxStar() {
+      const it = lbItems[lbIndex];
+      const star = document.getElementById('lb-star');
+      if (!it || !star) return;
+      const isFav = it.favId ? true : favByKey.has(favKey(it.jobId, it.path));
+      star.innerHTML = isFav ? '<svg class="ic" viewBox="0 0 24 24" style="fill:currentColor"><use href="#ic-star"/></svg>' : '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-star"/></svg>';
+      star.title = isFav ? 'Убрать из избранного' : 'В избранное';
+    }
+    function lbStep(d) {
+      if (!lbItems.length) return;
+      lbIndex = (lbIndex + d + lbItems.length) % lbItems.length;
+      renderLightbox();
+    }
+    async function lightboxToggleFavorite() {
+      const it = lbItems[lbIndex];
+      if (!it) return;
+      if (it.favId) {
+        // контекст избранного: ⭐ = удалить запись и убрать элемент из снапшота
+        try {
+          await api('/favorites/' + encodeURIComponent(it.favId), { method: 'DELETE' });
+          favoritesItems = favoritesItems.filter(r => r.id !== it.favId);
+          favByKey.delete(favKey(it.jobId, it.path));
+          showToast('Убрано из избранного');
+          lbItems.splice(lbIndex, 1);
+          if (!lbItems.length) closeLightbox();
+          else { if (lbIndex >= lbItems.length) lbIndex = lbItems.length - 1; renderLightbox(); }
+          const view = document.getElementById('view-favs');
+          if (view && view.classList.contains('active')) renderFavorites();
+          updateThumbStars();
+          loadFavorites().catch(() => {});
+        } catch (e) { showToast('Ошибка: ' + (e.message || e), true); }
+      } else {
+        await toggleFavorite(it.jobId, it.path);
+        updateLightboxStar();
+      }
+    }
+    (function initLightbox() {
+      const lb = document.getElementById('lightbox');
+      if (!lb) return;
+      lb.addEventListener('click', (ev) => { if (ev.target === lb) closeLightbox(); });
+      document.getElementById('lb-close').onclick = closeLightbox;
+      document.getElementById('lb-prev').onclick = () => lbStep(-1);
+      document.getElementById('lb-next').onclick = () => lbStep(1);
+      document.getElementById('lb-star').onclick = lightboxToggleFavorite;
+      document.addEventListener('keydown', (ev) => {
+        if (!lb.classList.contains('show')) return;
+        if (ev.key === 'Escape') { ev.preventDefault(); closeLightbox(); }
+        else if (ev.key === 'ArrowLeft') { ev.preventDefault(); lbStep(-1); }
+        else if (ev.key === 'ArrowRight') { ev.preventDefault(); lbStep(1); }
+      });
+    })();
+
+    document.getElementById('btn-refresh').onclick = () => refreshJobs().catch(() => {});
+    document.getElementById('btn-page-first').onclick = () => { jobsPage = 1; refreshJobs(); };
+    document.getElementById('btn-page-prev').onclick  = () => { if (jobsPage > 1) { jobsPage--; refreshJobs(); } };
+    document.getElementById('btn-page-next').onclick  = () => { if (jobsPage < jobsTotalPages) { jobsPage++; refreshJobs(); } };
+    document.getElementById('btn-page-last').onclick  = () => { jobsPage = jobsTotalPages; refreshJobs(); };
+    document.getElementById('page-size').onchange = (e) => {
+      jobsPageSize = parseInt(e.target.value, 10) || 20;
+      localStorage.setItem('cover_jobs_page_size', String(jobsPageSize));
+      jobsPage = 1; refreshJobs();
+    };
+    document.getElementById('status-filter').onchange = (e) => {
+      jobsStatusFilter = e.target.value || '';
+      localStorage.setItem('cover_jobs_status', jobsStatusFilter);
+      jobsPage = 1; refreshJobs();
+    };
+    document.getElementById('page-size').value = String(jobsPageSize);
+    document.getElementById('status-filter').value = jobsStatusFilter;
+
+    document.getElementById('btn-cancel-job').onclick = async () => {
+      if (!selectedJobId) { showToast('Сначала выберите задачу в списке', true); return; }
+      if (!confirm('Отменить задачу? Готовые обложки сохранятся.')) return;
+      try {
+        const res = await api('/jobs/' + selectedJobId + '/cancel', { method: 'POST' });
+        if (res && res.status === 'cancelled') {
+          showToast('Отмена запрошена для ' + selectedJobId + '. Уже готовые обложки можно скачать.');
+        } else if (res) {
+          showToast('Отмена невозможна: ' + (res.detail || res.status), true);
+        }
+        refreshJobs();
+      } catch (e) { showToast('Ошибка отмены: ' + (e.message || e), true); }
+    };
+    document.getElementById('btn-retry-job').onclick = async () => {
+      if (!selectedJobId) { showToast('Сначала выберите задачу в списке', true); return; }
+      try {
+        await api('/jobs/' + selectedJobId + '/retry', { method: 'POST' });
+        refreshJobs();
+      } catch (e) { showToast(e.message, true); }
+    };
+    document.getElementById('btn-retry-incomplete').onclick = async () => {
+      if (!selectedJobId) { showToast('Сначала выберите задачу в списке', true); return; }
+      const modal = document.getElementById('modal-resume');
+      const sel = document.getElementById('resume-model');
+      sel.innerHTML = '<option value="">Без изменений (та же модель)</option>' +
+        GENERATION_OPTIONS.map(o => '<option value="' + o[0] + '">' + o[0] + '</option>').join('');
+      const countEl = document.getElementById('resume-fallback-count');
+      countEl.textContent = '';
+      try {
+        const job = await api('/jobs/' + selectedJobId);
+        const fb = JSON.parse(job.fallback_files || '[]');
+        const out = JSON.parse(job.output_files || '[]');
+        // Ожидаемое число обложек берём из progress_detail («N/M обложек») —
+        // поля total_jobs в Job нет, счёт от него всегда давал «все обложки есть».
+        const pd = /\/\s*(\d+)\s*обложек/.exec(job.progress_detail || '');
+        const expected = pd ? parseInt(pd[1], 10) : 0;
+        const missing = Math.max(0, expected - out.length);
+        countEl.textContent = `В задаче: ${fb.length} без текста (fallback), ${out.length} готово, ` +
+          (expected ? (missing > 0 ? missing + ' не хватает' : 'все обложки есть') : 'ожидаемое число неизвестно') + '.';
+      } catch (e) {}
+      modal.classList.add('show');
+    };
+    document.getElementById('btn-resume-confirm').onclick = async () => {
+      const modal = document.getElementById('modal-resume');
+      const sel = document.getElementById('resume-model');
+      const label = sel.value;
+      const regenFb = document.getElementById('resume-regenerate-fallbacks').checked;
+      const body = { regenerate_fallbacks: regenFb };
+      if (label) {
+        const opt = GENERATION_OPTIONS.find(o => o[0] === label);
+        if (opt) {
+          body.override_provider = opt[1];
+          body.override_model = opt[2];
+        }
+      }
+      modal.classList.remove('show');
+      try {
+        const res = await api('/jobs/' + selectedJobId + '/resume', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+        });
+        let msg = 'Задание ' + selectedJobId + ' возвращено в очередь';
+        if (label) msg += ' (модель: ' + label + ')';
+        if (res && res.removed_fallback_files) msg += '. Удалено fallback-обложек: ' + res.removed_fallback_files + ' (будут перегенерированы)';
+        showToast(msg);
+        refreshJobs();
+      } catch (e) { showToast('Ошибка: ' + (e.message || e), true); }
+    };
+    document.getElementById('btn-resume-cancel').onclick = () => {
+      document.getElementById('modal-resume').classList.remove('show');
+    };
+    document.getElementById('btn-delete-job').onclick = async () => {
+      if (!selectedJobId) { showToast('Сначала выберите задачу в списке', true); return; }
+      if (!confirm('Удалить задание?')) return;
+      try {
+        await api('/jobs/' + selectedJobId, { method: 'DELETE' });
+        selectedJobId = null;
+        document.getElementById('job-detail-title').textContent = 'Задача не выбрана';
+        const ph = document.getElementById('job-detail-placeholder');
+        if (ph) ph.style.display = '';
+        document.getElementById('job-log').textContent = '(выберите задачу)';
+        document.getElementById('job-error').textContent = '';
+        document.getElementById('job-error').style.display = 'none';
+        document.getElementById('job-files').innerHTML = '';
+        const dlAllEl = document.getElementById('job-download-all');
+        dlAllEl.innerHTML = ''; delete dlAllEl.dataset.key;
+        const thumbsEl = document.getElementById('job-thumbs');
+        if (thumbsEl) { thumbsEl.innerHTML = ''; delete thumbsEl.dataset.key; }
+        refreshJobs();
+      } catch (e) { showToast(e.message, true); }
+    };
+
+    setInterval(() => { refreshJobs().catch(() => {}); }, 3000);
+
+    // ── Живая очередь: свой лёгкий поллер (к refreshJobs НЕ приклеиваемся —
+    //    у того нет паузы при скрытой вкладке и свой ритм 3с) ──
+    (function () {
+      const wrap = document.getElementById('vs-qstrip-wrap');
+      const strip = document.getElementById('vs-qstrip');
+      if (!wrap || !strip) return;
+      const elNums = document.getElementById('vs-q-nums');
+      const elNote = document.getElementById('vs-q-note');
+      const elSep = document.getElementById('vs-q-sep');
+      const elMine = document.getElementById('vs-q-mine');
+      const BASE = 5000, MAX = 30000;
+      let timer = null, fails = 0, stopped = false, busy = false;
+
+      function schedule(ms) {
+        clearTimeout(timer);
+        if (stopped || document.hidden) { timer = null; return; }
+        timer = setTimeout(tick, ms);
+      }
+
+      function render(d) {
+        const t = d.totals || {}, m = d.mine || {};
+        const w = t.waiting || 0, r = t.running || 0;
+        // согласование по числу: «1 ждёт», «2 ждут»; нулевую часть не показываем
+        const wd = (k, one, many) => (k % 10 === 1 && k % 100 !== 11) ? one : many;
+        const qp = [];
+        if (w) qp.push(w + ' ' + wd(w, 'ждёт', 'ждут'));
+        if (r) qp.push(r + ' ' + wd(r, 'идёт', 'идут'));
+        const people = t.people_label == null ? '0' : String(t.people_label);
+        elNums.textContent = 'Очередь: ' + qp.join(' · ') + ' · ' + people + ' чел.';
+        if (d.paused) {
+          elNums.style.display = 'none';
+          elNote.style.display = '';
+          elNote.textContent = 'Очередь приостановлена' + (d.paused_reason ? ' — ' + d.paused_reason : '');
+          strip.className = 'vs-qstrip is-paused';
+        } else if (!w && !r) {
+          elNums.style.display = 'none';
+          elNote.style.display = '';
+          // при degraded нули означают «не смогли посчитать», а не «очередь пуста» —
+          // иначе во время аварии БД юзер видит бодрое «стартуют сразу»
+          elNote.textContent = d.degraded ? 'Очередь: нет данных' : 'Очередь пуста — задачи стартуют сразу';
+          strip.className = 'vs-qstrip ' + (d.degraded ? 'is-off' : 'is-idle');
+        } else {
+          elNote.style.display = 'none';
+          elNums.style.display = '';
+          strip.className = 'vs-qstrip ' + (d.degraded ? 'is-off' : (r > 0 ? 'is-run' : 'is-idle'));
+        }
+        const mw = m.waiting || 0, mr = m.running || 0;
+        if (mw || mr) {
+          const parts = [];
+          if (mw) parts.push(mw + ' в очереди');
+          if (mr) parts.push(mr + ' идёт');
+          elMine.textContent = 'вы: ' + parts.join(', ');
+          elSep.style.display = '';
+          elMine.style.display = '';
+        } else {
+          elSep.style.display = 'none';
+          elMine.style.display = 'none';
+        }
+        wrap.style.display = '';
+      }
+
+      async function tick() {
+        if (stopped || busy || document.hidden) return;
+        if (!sessionId) { schedule(BASE); return; }   // на экране логина не спамим
+        busy = true;
+        try {
+          const r = await fetch(API + '/api/queue/pulse', { headers: headers() });
+          // 401 = сессия протухла. Не убиваем поллер навсегда: вход в кабинете не
+          // перезагружает страницу, и виджет остался бы мёртвым до ручного F5.
+          // Прячем полоску и уходим на редкий опрос — после логина она вернётся сама.
+          if (r.status === 401) { wrap.style.display = 'none'; schedule(60000); return; }
+          if (!r.ok) throw new Error('http ' + r.status);
+          render(await r.json());
+          fails = 0;
+          schedule(BASE);
+        } catch (e) {
+          fails++;
+          strip.className = 'vs-qstrip is-off';
+          schedule(fails >= 3 ? Math.min(MAX, BASE * 4) : BASE);
+        } finally {
+          busy = false;
+        }
+      }
+
+      document.addEventListener('visibilitychange', () => {
+        if (stopped) return;
+        if (document.hidden) { clearTimeout(timer); timer = null; }
+        else tick();
+      });
+
+      strip.onclick = () => {
+        const q = document.querySelector('#view-gen [data-screen-label="Очередь"]');
+        if (q) q.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      };
+
+      tick();
+    })();
+
+    // Периодический ping каждые 60 сек, чтобы сессия не умирала
+    setInterval(() => {
+      if (sessionId) {
+        fetch(API + '/auth/ping', { method: 'POST', headers: headers() }).then(r => {
+          if (!r.ok) { sessionId = null; localStorage.removeItem('cover_session_id'); showLogin(); }
+        }).catch(() => {});
+      }
+    }, 60000);
+
+    if (sessionId) {
+      fetch(API + '/auth/ping', { method: 'POST', headers: headers() }).then(r => { if (r.ok) showMain(); else showLogin(); }).catch(() => showLogin());
+    } else {
+      showLogin();
+    }
+  </script>
+<script>
+(function () {
+  var gsFields = {
+    max_parallel_jobs: 'gs-parallel',
+    max_threads_per_job: 'gs-threads',
+    max_generation_retries: 'gs-retries',
+    queue_limit_per_user: 'gs-queue'
+  };
+  function gsApply(d) {
+    var configured = d.settings || {};
+    var effective = d.effective || configured;
+    var overrides = d.env_overrides || {};
+    var defaults = {
+      max_parallel_jobs: 10,
+      max_threads_per_job: 8,
+      max_generation_retries: 2,
+      queue_limit_per_user: 100
+    };
+    Object.keys(gsFields).forEach(function (field) {
+      var input = document.getElementById(gsFields[field]);
+      var value = configured[field];
+      if (value === undefined || value === null) value = effective[field];
+      if (value === undefined || value === null) value = defaults[field];
+      if (overrides[field]) value = effective[field];
+      input.value = value;
+      input.disabled = !!overrides[field];
+      input.title = overrides[field] ? 'Переопределено переменной окружения сервиса' : '';
+    });
+    var note = document.getElementById('gs-effective-note');
+    var active = 'Сейчас: проекты ' + effective.max_parallel_jobs
+      + ', потоки ' + effective.max_threads_per_job
+      + ', попытки ' + effective.max_generation_retries
+      + ', очередь ' + effective.queue_limit_per_user + '. ';
+    var envFields = Object.keys(overrides).filter(function (k) { return overrides[k]; });
+    note.textContent = active
+      + 'Потоки, попытки и очередь применяются к новым заданиям сразу; проекты — после рестарта. '
+      + (envFields.length ? 'Заблокированные поля заданы через ENV и меняются только в конфигурации сервиса.' : '');
+  }
+  // Пункты только для админа дорисовываем в выпадающие списки моделей.
+  // Обычный пользователь их не видит, а подставит вручную — откажет сервер.
+  function adminOnlyModels() {
+    ADMIN_ONLY_LABELS.forEach(function (label) {
+      ['generation-option', 'seed-ov-model', 'sp-model', 'resume-model'].forEach(function (id) {
+        var sel = document.getElementById(id);
+        if (!sel) return;
+        var есть = Array.prototype.some.call(sel.options, function (o) { return o.value === label; });
+        if (есть) return;
+        var opt = document.createElement('option');
+        opt.value = label; opt.textContent = label;
+        sel.appendChild(opt);
+      });
+    });
+  }
+
+  function gsInit() {
+    if (typeof API === 'undefined' || typeof headers !== 'function') return;
+    fetch(API + '/admin/gen-settings', { headers: headers() }).then(function (r) {
+      if (!r.ok) return;
+      r.json().then(function (d) {
+        document.getElementById('gen-settings-panel').style.display = '';
+        gsApply(d);
+        adminOnlyModels();
+      });
+    }).catch(function () {});
+  }
+  document.getElementById('gs-save').addEventListener('click', function () {
+    var st = document.getElementById('gs-status');
+    st.textContent = 'Сохраняю…';
+    fetch(API + '/admin/gen-settings', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' }, headers()),
+      body: JSON.stringify({
+        max_parallel_jobs: +document.getElementById('gs-parallel').value,
+        max_threads_per_job: +document.getElementById('gs-threads').value,
+        max_generation_retries: +document.getElementById('gs-retries').value,
+        queue_limit_per_user: +document.getElementById('gs-queue').value
+      })
+    }).then(function (r) { return r.json(); }).then(function (d) {
+      if (d.status === 'ok') gsApply(d);
+      st.textContent = d.status === 'ok' ? 'Сохранено' : ('Ошибка: ' + JSON.stringify(d));
+      setTimeout(function () { st.textContent = ''; }, 4000);
+    }).catch(function (e) { st.textContent = 'Ошибка сети'; });
+  });
+  var t = setInterval(function () {
+    var login = document.getElementById('app-login');
+    if (login && login.style.display === 'none') { clearInterval(t); gsInit(); }
+  }, 1500);
+})();
+</script>
+</body>
+</html>
