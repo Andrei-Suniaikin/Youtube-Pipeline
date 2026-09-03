@@ -269,7 +269,7 @@ async function viewRelease(id){
     <p class="sub">${esc(r.channel)} · ${esc(r.lang)} · выход ${when(r.slot_at)}
       · фаза «${esc(r.phase_title)}»</p>`));
 
-  app.append($(`<div class="card" style="margin-bottom:16px">
+  const head = $(`<div class="card" style="margin-bottom:16px">
     <div class="grid">
       <div><div class="k">Статус</div>${esc(r.status || '—')}</div>
       <div><div class="k">Шаг</div>${r.phase_index + 1} из ${r.phase_total}</div>
@@ -290,8 +290,15 @@ async function viewRelease(id){
           ${s.note ? `<div class="note ${s.state === 'error' ? 'bad' : 'muted'}"
             >${esc(s.note)}</div>` : ''}
         </div>
+        <div style="white-space:nowrap;align-self:center">${
+          s.job ? actions({service: s.job.service, id: s.job.id,
+                           state: s.state, status: s.job.status}) : ''}</div>
       </div>`).join('')}
-  </div>`));
+  </div>`);
+  app.append(head);
+  // Повтор одного этапа не трогает соседние: кнопка обращается ровно к той задаче,
+  // на которой этап держится, и в тот сервис, которому она принадлежит.
+  wireActions(head);
 
   app.append($(`<div class="card">
     <div class="sec">Что происходило</div>
@@ -506,8 +513,9 @@ async function viewQueue(){
     return;
   }
 
-  app.append($(`<div class="card"><table>
-    <thead><tr><th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th></tr></thead>
+  const card = $(`<div class="card"><table>
+    <thead><tr><th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th>
+      <th></th></tr></thead>
     <tbody>${d.rows.map(r => `
       <tr>
         <td><span class="pill s-idle">${esc(SVC_TITLE[r.service] || r.service)}</span></td>
@@ -521,7 +529,46 @@ async function viewQueue(){
               Math.round(r.progress * 100)}%"></i></div>` : ''}
             ${r.error ? `<div class="note bad">${esc(r.error)}</div>` : ''}</td>
         <td class="muted">${when(r.created)}</td>
-      </tr>`).join('')}</tbody></table></div>`));
+        <td style="white-space:nowrap">${actions(r)}</td>
+      </tr>`).join('')}</tbody></table></div>`);
+  app.append(card);
+  wireActions(card);
+}
+
+/* Кнопка показывается только там, где действие имеет смысл: отменить можно то, что
+   ещё идёт, повторить — то, что уже упало. Кнопка, которая всегда есть и через раз
+   отвечает «нельзя», обучает не нажимать её вовсе. */
+function actions(r){
+  const btn = (act, title) =>
+    `<button class="ghost act" data-service="${esc(r.service)}" data-id="${esc(r.id)}"
+             data-act="${act}">${title}</button>`;
+  if (r.state === 'running' || r.state === 'queued') return btn('cancel', 'Отменить');
+  if (r.state === 'error' || r.status === 'cancelled') return btn('retry', 'Повторить');
+  return '';
+}
+
+function wireActions(root){
+  root.querySelectorAll('button.act').forEach(b => {
+    b.onclick = async () => {
+      const {service, id, act} = b.dataset;
+      b.disabled = true;
+      const was = b.textContent;
+      b.textContent = '…';
+      try{
+        await post(`/ui/actions/${encodeURIComponent(service)}/${encodeURIComponent(id)}/${act}`);
+        await render();
+      }catch(e){
+        b.disabled = false;
+        b.textContent = was;
+        // Отказ сервиса — это ответ, а не сбой экрана: показываем его словами рядом
+        // с той строкой, к которой он относится.
+        const box = document.createElement('div');
+        box.className = 'note bad';
+        box.textContent = e.message;
+        b.parentElement.appendChild(box);
+      }
+    };
+  });
 }
 
 /* ─────────────────────────── старт по ссылке ─────────────────────────── */

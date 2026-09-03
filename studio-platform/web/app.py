@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -243,7 +244,8 @@ def _stages(c, rel: dict) -> list:
 
     out = []
     for key, title, source in STAGES:
-        row = {"key": key, "title": title, "state": "idle", "facts": [], "note": ""}
+        row = {"key": key, "title": title, "state": "idle", "facts": [], "note": "",
+               "job": None}
 
         if source.startswith("remote:"):
             service = source.split(":", 1)[1]
@@ -254,6 +256,9 @@ def _stages(c, rel: dict) -> list:
                 row["state"] = _state(job["status"])
                 if job["remote_job_id"]:
                     row["facts"].append(f'задача {job["remote_job_id"]}')
+                    # Этап делает сосед — значит и отменять/повторять его должен он.
+                    row["job"] = {"service": service, "id": job["remote_job_id"],
+                                  "status": job["status"] or ""}
                 if job["error"]:
                     row["note"] = job["error"]
 
@@ -275,6 +280,10 @@ def _stages(c, rel: dict) -> list:
                 row["state"] = _state((q["status"] if q else None)
                                       or (job["status"] if job else None))
                 if q is not None:
+                    # На чём этап держится — нужно кнопкам «отменить» и «повторить»:
+                    # они не выполняют работу, а пересылают её тому, чья это задача.
+                    row["job"] = {"service": "vsgen", "id": q["job_id"],
+                                  "status": q["status"] or ""}
                     if q["stage"]:
                         row["facts"].append(q["stage"])
                     if q["progress"] is not None and row["state"] == "running":
@@ -1008,3 +1017,71 @@ def ui_public():
                       "Запланированный (ещё приватный) и удалённый выглядят одинаково — "
                       "пустым ответом. Различить их может только OAuth-токен канала.",
     }
+
+
+# ─────────────────────── действия: отменить и повторить ───────────────────────
+
+# Пульт эти действия НЕ выполняет — он их пересылает. У кабинета и соседей они уже
+# написаны, и написаны со всеми гвардами: доступность провайдера, конфликт с уже идущей
+# правкой картинок, отложенный рендер, запрет повтора незавершённой задачи. Повторить
+# эти проверки здесь значило бы завести вторую реализацию, которая разойдётся с первой
+# в первый же месяц. Именно ради этого пульт и хранит сессию кабинета, а не свою.
+ACTIONS = {
+    # сервис: действие → (метод, путь, как авторизуемся)
+    "vsgen": {"cancel": ("POST", "/api/jobs/{id}/cancel", "session"),
+              "retry": ("POST", "/api/jobs/{id}/retry", "session")},
+    "rewrite": {"cancel": ("DELETE", "/api/v1/jobs/{id}", "key"),
+                "retry": ("POST", "/api/v1/jobs/{id}/retry", "key")},
+    "cover": {"cancel": ("POST", "/jobs/{id}/cancel", "key"),
+              "retry": ("POST", "/jobs/{id}/retry", "key")},
+}
+BASES = {"vsgen": None, "rewrite": REWRITE_BASE, "cover": COVER_BASE}
+
+
+@app.post("/ui/actions/{service}/{job_id}/{action}")
+def ui_action(service: str, job_id: str, action: str, request: Request):
+    """Отменить или повторить задачу — в том сервисе, которому она принадлежит.
+
+    Отказ соседа пересказывается как есть: «повтор доступен только для ошибочной или
+    отменённой задачи» — это ответ, а не сбой, и подменять его своим текстом нельзя.
+    """
+    plan = ACTIONS.get(service, {}).get(action)
+    if not plan:
+        raise HTTPException(404, f"нет действия «{action}» для сервиса «{service}»")
+    method, path, how = plan
+    base = BASES[service] or CABINET_BASE
+    headers = {"Content-Type": "application/json"}
+    if how == "session":
+        headers["Cookie"] = f"{auth.COOKIE}={getattr(request.state, 'sid', '')}"
+        # Кабинет отвечает JSON только на пометку «это fetch», иначе шлёт редирект
+        # на свою же страницу очереди — её нам показывать нечем.
+        headers["X-Requested-With"] = "fetch"
+    else:
+        c = db()
+        try:
+            key = get_key(c, service)
+        finally:
+            c.close()
+        if not key:
+            raise HTTPException(503, f"нет ключа доступа к сервису «{service}»")
+        headers["Authorization"] = f"Bearer {key}"
+
+    req = urllib.request.Request(base + path.format(id=urllib.parse.quote(str(job_id))),
+                                 data=b"" if method == "POST" else None, method=method)
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT) as resp:
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            detail = (json.loads(raw or "{}") or {}).get("detail") or raw[:200]
+        except ValueError:
+            detail = raw[:200]
+        raise HTTPException(exc.code if exc.code in (400, 401, 403, 404, 409) else 502,
+                            detail or f"сервис ответил {exc.code}")
+    except Exception as exc:                                     # noqa: BLE001
+        raise HTTPException(502, f"сервис «{service}» не отвечает: {type(exc).__name__}")
+    return {"ok": True, "service": service, "job_id": job_id, "action": action,
+            "answer": body}
