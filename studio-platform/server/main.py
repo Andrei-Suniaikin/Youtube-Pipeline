@@ -1887,6 +1887,44 @@ def _own_credential_for_task(u, provider, kind=None):
     return credential
 
 
+def _own_credential_with_pool(u, provider, kind, params):
+    """Свой ключ задачи и slot под него. Возвращает (credential, lease|None).
+
+    ИСПРАВЛЕНО 03.09.2026. Раньше свой ключ был просто vals[0], и второй ключ семейства
+    не использовался никогда. Машинерия пула в файле была (_own_pool_values, ветка
+    own_values в try_acquire, ДВА определения _own_pool_size), но не имела ни одного
+    вызова: _own_credentials_from_keys схлопывает список в первый элемент через
+    _first_credential ещё до всех расчётов.
+
+    Теперь при двух и более своих ключах берём slot тем же раздатчиком, что и у
+    серверного пула («наименее загруженный, при равенстве — по кругу»), но на отдельной
+    дорожке byok:<провайдер>, чтобы своя нагрузка не мешалась с серверной.
+
+    Slot не выдан (все свои ключи заняты или отдыхают) → остаёмся на прежнем поведении
+    и работаем первым ключом. Правка не должна ронять задачу там, где раньше она
+    проходила.
+    """
+    credential = _own_credential_for_task(u, provider, kind)
+    if not credential:
+        return "", None
+    family = _provider_credential_family(provider)
+    if not family:
+        return credential, None
+    values = _own_pool_values(u, family)
+    if len(values) < 2:
+        return credential, None          # раздавать нечего
+    lease = SERVER_CREDENTIAL_POOL.try_acquire(
+        family,
+        units=_task_capacity_units(kind, params, provider),
+        capacity=_provider_slot_capacity_units(provider),
+        lane=f"byok:{provider}",
+        own_values=values,
+    )
+    if lease is not None and lease.value:
+        return lease.value, lease
+    return credential, lease
+
+
 def _task_uses_own_credential(uid, provider, kind=None):
     """True → этот kind задачи пойдёт на СВОЙ ключ юзера."""
     family = _provider_credential_family(provider)
@@ -9448,6 +9486,7 @@ def _run_task(t):
     proc = None
     redaction_secrets = []
     own_credential = ""
+    own_lease = None          # slot своего ключа; освобождается в finally, как серверный
     # Первый отказ канала промптов за этот запуск: решение о парковке КОНКРЕТНОГО
     # токена принимается в finally, когда воркер уже закончил (зонд к провайдеру
     # занимает секунды и не должен тормозить стрим логов).
@@ -9485,7 +9524,8 @@ def _run_task(t):
         c = db(); u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(); c.close()
         # BYOK-first: вписан свой ключ нужного провайдера → задача идёт на него и
         # серверный lease не берётся (ёмкость общего ключа не расходуется).
-        own_credential = _own_credential_for_task(u, provider, t["kind"])
+        own_credential, own_lease = _own_credential_with_pool(
+            u, provider, t["kind"], params)
         if own_credential and lease is not None:
             # Шедулер зарезервировал серверный слот (снимок ключей был другим) —
             # отдаём его СРАЗУ: держать весь бюджет ключа на время BYOK-задачи нельзя.
@@ -9768,6 +9808,8 @@ def _run_task(t):
             _park_failed_credential(jid, lease, channel_incident)
         if lease:
             lease.release()
+        if own_lease:
+            own_lease.release()
 
 
 def _requeue_stale_generation(c, jid, claim_token, cutoff):
