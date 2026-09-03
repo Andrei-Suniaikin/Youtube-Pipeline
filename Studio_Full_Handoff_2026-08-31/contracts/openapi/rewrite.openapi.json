@@ -1,0 +1,2871 @@
+{
+    "openapi": "3.1.0",
+    "info": {
+        "title": "Rewrite Studio API",
+        "description": "Programmatic access to multi-language rewrite jobs.\n\n- Session-based UI lives at `/`.\n- API v1 lives under `/api/v1/*` and uses api-key auth (Bearer or X-API-Key).\n- See README_API.md and /docs for details.",
+        "version": "1.0.0"
+    },
+    "paths": {
+        "/auth/status": {
+            "get": {
+                "summary": "Auth Status",
+                "description": "FIX-2026-07-02: \u043d\u0443\u0436\u043d\u0430 \u043b\u0438 \u043f\u0435\u0440\u0432\u0438\u0447\u043d\u0430\u044f \u043d\u0430\u0441\u0442\u0440\u043e\u0439\u043a\u0430 (\u0432 \u0441\u0438\u0441\u0442\u0435\u043c\u0435 \u0435\u0449\u0451 \u043d\u0435\u0442 \u043d\u0438 \u043e\u0434\u043d\u043e\u0433\u043e \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430).",
+                "operationId": "auth_status_auth_status_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/setup": {
+            "post": {
+                "summary": "Auth Setup",
+                "description": "FIX-2026-07-02: \u043e\u0434\u043d\u043e\u0440\u0430\u0437\u043e\u0432\u043e\u0435 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u0435 \u041f\u0415\u0420\u0412\u041e\u0413\u041e (\u0430\u0434\u043c\u0438\u043d) \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u0430. \u0420\u0430\u0431\u043e\u0442\u0430\u0435\u0442 \u0442\u043e\u043b\u044c\u043a\u043e \u043f\u043e\u043a\u0430 \u043d\u0435\u0442 \u044e\u0437\u0435\u0440\u043e\u0432.\n\u0410\u0434\u043c\u0438\u043d \u043d\u0430\u0441\u043b\u0435\u0434\u0443\u0435\u0442 \u0432\u0441\u0435 \u0442\u0435\u043a\u0443\u0449\u0438\u0435 \u0434\u0430\u043d\u043d\u044b\u0435 (user_id = ADMIN_USER_ID). \u041f\u0430\u0440\u043e\u043b\u044c \u041d\u0415 \u043b\u043e\u0433\u0438\u0440\u0443\u0435\u0442\u0441\u044f.",
+                "operationId": "auth_setup_auth_setup_post",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/ping": {
+            "post": {
+                "summary": "Auth Ping",
+                "operationId": "auth_ping_auth_ping_post",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/logout": {
+            "post": {
+                "summary": "Auth Logout",
+                "operationId": "auth_logout_auth_logout_post",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/accounts": {
+            "get": {
+                "summary": "Auth List Accounts",
+                "description": "FIX-2026-07-02: \u0441\u043f\u0438\u0441\u043e\u043a \u0430\u043a\u043a\u0430\u0443\u043d\u0442\u043e\u0432 (\u0442\u043e\u043b\u044c\u043a\u043e \u0430\u0434\u043c\u0438\u043d).",
+                "operationId": "auth_list_accounts_auth_accounts_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "summary": "Auth Create Account",
+                "description": "FIX-2026-07-02: \u0430\u0434\u043c\u0438\u043d \u0441\u043e\u0437\u0434\u0430\u0451\u0442 \u0430\u043a\u043a\u0430\u0443\u043d\u0442 (\u0447\u0438\u0441\u0442\u044b\u0439 \u043f\u0440\u043e\u0444\u0438\u043b\u044c, \u0441\u0432\u043e\u0439 user_id). \u041f\u0430\u0440\u043e\u043b\u044c \u041d\u0415 \u043b\u043e\u0433\u0438\u0440\u0443\u0435\u0442\u0441\u044f.",
+                "operationId": "auth_create_account_auth_accounts_post",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/accounts/{username}": {
+            "delete": {
+                "summary": "Auth Delete Account",
+                "description": "Disable account and revoke all sessions/API keys (data is retained).",
+                "operationId": "auth_delete_account_auth_accounts__username__delete",
+                "parameters": [
+                    {
+                        "name": "username",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Username"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/auth/login-password": {
+            "post": {
+                "summary": "Auth Login Password",
+                "description": "FIX-2026-07-02: \u0432\u0445\u043e\u0434 \u043f\u043e \u043b\u043e\u0433\u0438\u043d\u0443/\u043f\u0430\u0440\u043e\u043b\u044e (\u0434\u0443\u0430\u043b-\u0440\u0435\u0436\u0438\u043c \u0441 /auth/login \u043f\u043e \u043a\u043b\u044e\u0447\u0443). \u041f\u0430\u0440\u043e\u043b\u044c \u041d\u0415 \u043b\u043e\u0433\u0438\u0440\u0443\u0435\u0442\u0441\u044f.",
+                "operationId": "auth_login_password_auth_login_password_post",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/": {
+            "get": {
+                "summary": "Serve Index",
+                "operationId": "serve_index__get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "text/html": {
+                                "schema": {
+                                    "type": "string"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/languages": {
+            "get": {
+                "summary": "Get Languages",
+                "operationId": "get_languages_languages_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/models": {
+            "get": {
+                "summary": "Get Models",
+                "operationId": "get_models_models_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/settings/keys": {
+            "get": {
+                "summary": "Get Settings Keys",
+                "operationId": "get_settings_keys_settings_keys_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "summary": "Save Settings Keys",
+                "operationId": "save_settings_keys_settings_keys_post",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/settings/presets": {
+            "post": {
+                "summary": "Save Settings Presets",
+                "description": "FIX-2026-07-02: \u043e\u0442\u0434\u0435\u043b\u044c\u043d\u043e\u0435 \u0441\u043e\u0445\u0440\u0430\u043d\u0435\u043d\u0438\u0435 UI-\u043f\u0440\u0435\u0441\u0435\u0442\u043e\u0432 \u043d\u0430\u0441\u0442\u0440\u043e\u0435\u043a \u0411\u0415\u0417 \u0437\u0430\u0442\u0440\u0430\u0433\u0438\u0432\u0430\u043d\u0438\u044f \u043a\u043b\u044e\u0447\u0435\u0439.\n\u0420\u0430\u043d\u044c\u0448\u0435 \u043f\u0440\u0435\u0441\u0435\u0442\u044b \u0436\u0438\u043b\u0438 \u0442\u043e\u043b\u044c\u043a\u043e \u0432 localStorage \u0431\u0440\u0430\u0443\u0437\u0435\u0440\u0430 \u2192 \u0442\u0435\u0440\u044f\u043b\u0438\u0441\u044c \u043c\u0435\u0436\u0434\u0443 \u0443\u0441\u0442\u0440\u043e\u0439\u0441\u0442\u0432\u0430\u043c\u0438.\n\u041a\u043b\u044e\u0447\u0438 \u043d\u0435 \u043f\u0435\u0440\u0435\u0434\u0430\u044e\u0442\u0441\u044f (None \u2192 partial-update \u0432 save_keys_config \u0438\u0445 \u043d\u0435 \u0442\u0440\u043e\u0433\u0430\u0435\u0442).",
+                "operationId": "save_settings_presets_settings_presets_post",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/presets": {
+            "get": {
+                "summary": "List Presets V2",
+                "description": "List CURRENT TENANT's presets (B1: per-user \u0441\u0442\u043e\u0440).",
+                "operationId": "list_presets_v2_presets_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/presets/sync": {
+            "post": {
+                "summary": "Sync Presets",
+                "description": "\u041f\u043e\u043b\u043d\u0430\u044f \u0437\u0430\u043c\u0435\u043d\u0430 \u043f\u0440\u0435\u0441\u0435\u0442\u043e\u0432 \u0422\u0415\u041a\u0423\u0429\u0415\u0413\u041e \u0442\u0435\u043d\u0430\u043d\u0442\u0430 (B1: \u043f\u0438\u0448\u0435\u0442 \u0442\u043e\u043b\u044c\u043a\u043e \u0432 \u0435\u0433\u043e \u0444\u0430\u0439\u043b, \u043d\u0435 \u0433\u043b\u043e\u0431\u0430\u043b\u044c\u043d\u043e).\n\u041f\u0440\u0438\u043d\u0438\u043c\u0430\u0435\u0442 \u0438\u043b\u0438 {<name>: ...}, \u0438\u043b\u0438 {presets: {...}}.",
+                "operationId": "sync_presets_presets_sync_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "additionalProperties": true,
+                                "type": "object",
+                                "title": "Presets"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/presets/{identifier}": {
+            "get": {
+                "summary": "Get Preset Endpoint",
+                "description": "\u041f\u043e\u043b\u0443\u0447\u0438\u0442\u044c preset \u0422\u0415\u041a\u0423\u0429\u0415\u0413\u041e \u0442\u0435\u043d\u0430\u043d\u0442\u0430 \u043f\u043e id (canonical) \u0438\u043b\u0438 name (backward compat).",
+                "operationId": "get_preset_endpoint_presets__identifier__get",
+                "parameters": [
+                    {
+                        "name": "identifier",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Identifier"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "post": {
+                "summary": "Create Or Update Preset",
+                "description": "Create / update preset \u043f\u043e id \u0438\u043b\u0438 name.\n\nBody \u043c\u043e\u0436\u0435\u0442 \u0441\u043e\u0434\u0435\u0440\u0436\u0430\u0442\u044c:\n  - \u043d\u043e\u0432\u0430\u044f schema: {name, target_length_words?, content}\n  - \u0441\u0442\u0430\u0440\u0430\u044f schema (BACKWARD COMPAT): {prompt_template, custom_instructions, total_words, content_type, ...}\n    \u2192 \u0430\u0432\u0442\u043e\u043c\u0430\u0442\u0438\u0447\u0435\u0441\u043a\u0438 \u0441\u043a\u043b\u0435\u0438\u0432\u0430\u0435\u043c \u0432 content (\u043a\u0430\u043a \u0432 migration v2).",
+                "operationId": "create_or_update_preset_presets__identifier__post",
+                "parameters": [
+                    {
+                        "name": "identifier",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Identifier"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "summary": "Delete Preset Endpoint",
+                "description": "\u0423\u0434\u0430\u043b\u0438\u0442\u044c preset \u0422\u0415\u041a\u0423\u0429\u0415\u0413\u041e \u0442\u0435\u043d\u0430\u043d\u0442\u0430 \u043f\u043e id (\u0438\u043b\u0438 name) (B1).",
+                "operationId": "delete_preset_endpoint_presets__identifier__delete",
+                "parameters": [
+                    {
+                        "name": "identifier",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Identifier"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/generation": {
+            "post": {
+                "summary": "Create Generation Job",
+                "description": "Round 2 generation handler (2026-05-23): single-topic flow + backward compat.",
+                "operationId": "create_generation_job_jobs_generation_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/GenerationJobRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/rewrite": {
+            "post": {
+                "summary": "Create Rewrite Job",
+                "operationId": "create_rewrite_job_jobs_rewrite_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/RewriteJobRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/queue/pulse": {
+            "get": {
+                "summary": "Queue Pulse",
+                "description": "\u0416\u0438\u0432\u0430\u044f \u043e\u0447\u0435\u0440\u0435\u0434\u044c: \u0433\u043b\u043e\u0431\u0430\u043b\u044c\u043d\u044b\u0435 \u0430\u0433\u0440\u0435\u0433\u0430\u0442\u044b (\u0432\u0441\u0435 \u0442\u0435\u043d\u0430\u043d\u0442\u044b) + \u0441\u0432\u043e\u0438 \u0447\u0438\u0441\u043b\u0430.",
+                "operationId": "queue_pulse_api_queue_pulse_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs": {
+            "get": {
+                "summary": "List Jobs",
+                "operationId": "list_jobs_jobs_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/download-zip-bulk": {
+            "get": {
+                "summary": "Download Jobs Zip Bulk",
+                "description": "\u0421\u043a\u0430\u0447\u0430\u0442\u044c \u0444\u0430\u0439\u043b\u044b \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u0438\u0445 \u0437\u0430\u0434\u0430\u0447 \u043e\u0434\u043d\u0438\u043c ZIP. ids \u0447\u0435\u0440\u0435\u0437 \u0437\u0430\u043f\u044f\u0442\u0443\u044e (?ids=a,b,c).\nPATCH-2026-06-20-bulk-download. \u0412\u0410\u0416\u041d\u041e: \u0437\u0430\u0440\u0435\u0433\u0438\u0441\u0442\u0440\u0438\u0440\u043e\u0432\u0430\u043d \u0414\u041e /jobs/{job_id},\n\u0438\u043d\u0430\u0447\u0435 \u0442\u043e\u0442 \u043f\u0435\u0440\u0435\u0445\u0432\u0430\u0442\u0438\u0442 \u043f\u0443\u0442\u044c (job_id='download-zip-bulk').",
+                "operationId": "download_jobs_zip_bulk_jobs_download_zip_bulk_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/{job_id}": {
+            "get": {
+                "summary": "Get Job",
+                "operationId": "get_job_jobs__job_id__get",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "summary": "Delete Job",
+                "operationId": "delete_job_jobs__job_id__delete",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/{job_id}/files": {
+            "get": {
+                "summary": "Get Job Files",
+                "operationId": "get_job_files_jobs__job_id__files_get",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/{job_id}/files/{filename}": {
+            "get": {
+                "summary": "Download File",
+                "operationId": "download_file_jobs__job_id__files__filename__get",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    },
+                    {
+                        "name": "filename",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Filename"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/{job_id}/download-zip": {
+            "get": {
+                "summary": "Download Job Zip",
+                "description": "\u0421\u043a\u0430\u0447\u0430\u0442\u044c \u0432\u0441\u0435 \u0444\u0430\u0439\u043b\u044b \u0437\u0430\u0434\u0430\u0447\u0438 \u043e\u0434\u043d\u0438\u043c ZIP-\u0430\u0440\u0445\u0438\u0432\u043e\u043c.",
+                "operationId": "download_job_zip_jobs__job_id__download_zip_get",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/{job_id}/cancel": {
+            "post": {
+                "summary": "Cancel Job",
+                "operationId": "cancel_job_jobs__job_id__cancel_post",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/{job_id}/retry": {
+            "post": {
+                "summary": "Retry Job",
+                "operationId": "retry_job_jobs__job_id__retry_post",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/{job_id}/retry-full": {
+            "post": {
+                "summary": "Retry Job Full",
+                "description": "\u041f\u043e\u043b\u043d\u0430\u044f \u043f\u0435\u0440\u0435\u0433\u0435\u043d\u0435\u0440\u0430\u0446\u0438\u044f: \u0441\u0431\u0440\u0430\u0441\u044b\u0432\u0430\u0435\u0442 \u0432\u0435\u0441\u044c \u043f\u0440\u043e\u0433\u0440\u0435\u0441\u0441 \u044d\u0442\u043e\u0439 \u0437\u0430\u0434\u0430\u0447\u0438 (\u0432\u0441\u0435 \u0447\u0430\u043d\u043a\u0438, \u0433\u043e\u0442\u043e\u0432\u044b\u0435\n\u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442\u044b, \u0432\u044b\u0445\u043e\u0434\u043d\u044b\u0435 \u0444\u0430\u0439\u043b\u044b) \u0438 \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0435\u0442 \u0441 \u043d\u0443\u043b\u044f.\n\u041e\u0442\u043b\u0438\u0447\u0430\u0435\u0442\u0441\u044f \u043e\u0442 \u043e\u0431\u044b\u0447\u043d\u043e\u0433\u043e /retry \u043a\u043e\u0442\u043e\u0440\u044b\u0439 \u0440\u0435\u0437\u044e\u043c\u0438\u0442 \u0442\u043e\u043b\u044c\u043a\u043e failed/incomplete \u0447\u0430\u043d\u043a\u0438.",
+                "operationId": "retry_job_full_jobs__job_id__retry_full_post",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/jobs/{job_id}/parallel": {
+            "post": {
+                "summary": "Mark Job Parallel",
+                "operationId": "mark_job_parallel_jobs__job_id__parallel_post",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    },
+                    {
+                        "name": "parallel",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "boolean",
+                            "default": true,
+                            "title": "Parallel"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/upload": {
+            "post": {
+                "summary": "Upload File",
+                "operationId": "upload_file_upload_post",
+                "requestBody": {
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/Body_upload_file_upload_post"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/subs/fetch": {
+            "post": {
+                "summary": "Subs Fetch",
+                "operationId": "subs_fetch_subs_fetch_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "additionalProperties": true,
+                                "type": "object",
+                                "title": "Payload"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/subs/download": {
+            "get": {
+                "summary": "Subs Download",
+                "description": "\u041e\u0434\u0438\u043d \u0433\u043e\u0442\u043e\u0432\u044b\u0439 \u0444\u0430\u0439\u043b \u043e\u0442\u0434\u0430\u0451\u043c \u043a\u0430\u043a .txt, \u043d\u0435\u0441\u043a\u043e\u043b\u044c\u043a\u043e \u2014 \u043e\u0434\u043d\u0438\u043c .zip.",
+                "operationId": "subs_download_subs_download_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/languages": {
+            "get": {
+                "tags": [
+                    "API v1"
+                ],
+                "summary": "List supported languages",
+                "description": "Returns the full list of 45 supported languages with all accepted input forms (canonical, Russian display, short code). Use this to discover valid `code` values for `languages[].code` in POST /jobs. Warnings call out legacy short codes (e.g. `po` for Portuguese) and ambiguous short codes (e.g. `ar` matches Arabic+Armenian).",
+                "operationId": "list_languages_api_v1_languages_get",
+                "parameters": [
+                    {
+                        "name": "authorization",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Authorization"
+                        }
+                    },
+                    {
+                        "name": "X-API-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Api-Key"
+                        }
+                    },
+                    {
+                        "name": "X-Session-Id",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Session-Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/LanguagesResponse"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/files": {
+            "post": {
+                "tags": [
+                    "API v1"
+                ],
+                "summary": "Upload input file",
+                "description": "\u0417\u0430\u0433\u0440\u0443\u0437\u043a\u0430 \u0442\u0435\u043a\u0441\u0442\u043e\u0432\u043e\u0433\u043e \u0444\u0430\u0439\u043b\u0430 \u0434\u043b\u044f \u043f\u043e\u0441\u043b\u0435\u0434\u0443\u044e\u0449\u0435\u0433\u043e \u0438\u0441\u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u043d\u0438\u044f \u0432 job. Max 50 MB.",
+                "operationId": "upload_input_file_api_v1_files_post",
+                "parameters": [
+                    {
+                        "name": "authorization",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Authorization"
+                        }
+                    },
+                    {
+                        "name": "X-API-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Api-Key"
+                        }
+                    },
+                    {
+                        "name": "X-Session-Id",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Session-Id"
+                        }
+                    }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "multipart/form-data": {
+                            "schema": {
+                                "$ref": "#/components/schemas/Body_upload_input_file_api_v1_files_post"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiFileUploadResponse"
+                                }
+                            }
+                        }
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    },
+                    "413": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Request Entity Too Large"
+                    },
+                    "415": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unsupported Media Type"
+                    },
+                    "422": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unprocessable Entity"
+                    }
+                }
+            }
+        },
+        "/api/v1/jobs": {
+            "post": {
+                "tags": [
+                    "API v1"
+                ],
+                "summary": "Create rewrite job",
+                "description": "\u0421\u043e\u0437\u0434\u0430\u0451\u0442 \u043d\u043e\u0432\u044b\u0439 rewrite-job \u0434\u043b\u044f \u043e\u0434\u043d\u043e\u0433\u043e \u0437\u0430\u0433\u0440\u0443\u0436\u0435\u043d\u043d\u043e\u0433\u043e \u0444\u0430\u0439\u043b\u0430. webhook_url \u043f\u043e\u043a\u0430 \u043d\u0435 \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044f (422).",
+                "operationId": "create_job_api_v1_jobs_post",
+                "parameters": [
+                    {
+                        "name": "authorization",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Authorization"
+                        }
+                    },
+                    {
+                        "name": "X-API-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Api-Key"
+                        }
+                    },
+                    {
+                        "name": "X-Session-Id",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Session-Id"
+                        }
+                    }
+                ],
+                "requestBody": {
+                    "required": true,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/ApiJobCreate"
+                            }
+                        }
+                    }
+                },
+                "responses": {
+                    "201": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiJobCreateResponse"
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Bad Request"
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    },
+                    "422": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unprocessable Entity"
+                    }
+                }
+            },
+            "get": {
+                "tags": [
+                    "API v1"
+                ],
+                "summary": "List jobs",
+                "description": "\u0421\u043f\u0438\u0441\u043e\u043a jobs \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e \u043f\u043e\u043b\u044c\u0437\u043e\u0432\u0430\u0442\u0435\u043b\u044f \u0441 \u0444\u0438\u043b\u044c\u0442\u0440\u043e\u043c \u043f\u043e \u0441\u0442\u0430\u0442\u0443\u0441\u0443 \u0438 pagination.",
+                "operationId": "list_jobs_api_v1_jobs_get",
+                "parameters": [
+                    {
+                        "name": "status",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "description": "CSV: pending,running,completed,failed,cancelled,partial,interrupted",
+                            "title": "Status"
+                        },
+                        "description": "CSV: pending,running,completed,failed,cancelled,partial,interrupted"
+                    },
+                    {
+                        "name": "limit",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "maximum": 200,
+                            "minimum": 1,
+                            "default": 50,
+                            "title": "Limit"
+                        }
+                    },
+                    {
+                        "name": "offset",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "integer",
+                            "minimum": 0,
+                            "default": 0,
+                            "title": "Offset"
+                        }
+                    },
+                    {
+                        "name": "created_after",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "number"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "description": "Unix timestamp",
+                            "title": "Created After"
+                        },
+                        "description": "Unix timestamp"
+                    },
+                    {
+                        "name": "authorization",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Authorization"
+                        }
+                    },
+                    {
+                        "name": "X-API-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Api-Key"
+                        }
+                    },
+                    {
+                        "name": "X-Session-Id",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Session-Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response List Jobs Api V1 Jobs Get"
+                                }
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/jobs/{job_id}": {
+            "get": {
+                "tags": [
+                    "API v1"
+                ],
+                "summary": "Get job details",
+                "operationId": "get_job_detail_api_v1_jobs__job_id__get",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    },
+                    {
+                        "name": "include_log",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "boolean",
+                            "description": "Include last 5KB of log",
+                            "default": false,
+                            "title": "Include Log"
+                        },
+                        "description": "Include last 5KB of log"
+                    },
+                    {
+                        "name": "authorization",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Authorization"
+                        }
+                    },
+                    {
+                        "name": "X-API-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Api-Key"
+                        }
+                    },
+                    {
+                        "name": "X-Session-Id",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Session-Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response Get Job Detail Api V1 Jobs  Job Id  Get"
+                                }
+                            }
+                        }
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Forbidden"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Not Found"
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            "delete": {
+                "tags": [
+                    "API v1"
+                ],
+                "summary": "Cancel job",
+                "description": "\u041e\u0442\u043c\u0435\u043d\u044f\u0435\u0442 job. \u0414\u043b\u044f running \u0437\u0430\u043f\u0443\u0441\u043a\u0430\u0435\u0442 graceful interrupt (worker \u0437\u0430\u0432\u0435\u0440\u0448\u0438\u0442 \u043f\u043e\u0441\u043b\u0435 \u0442\u0435\u043a\u0443\u0449\u0435\u0433\u043e chunk).",
+                "operationId": "cancel_job_api_api_v1_jobs__job_id__delete",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    },
+                    {
+                        "name": "authorization",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Authorization"
+                        }
+                    },
+                    {
+                        "name": "X-API-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Api-Key"
+                        }
+                    },
+                    {
+                        "name": "X-Session-Id",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Session-Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response Cancel Job Api Api V1 Jobs  Job Id  Delete"
+                                }
+                            }
+                        }
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Forbidden"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Not Found"
+                    },
+                    "409": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Conflict"
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/jobs/{job_id}/files/{lang_code}": {
+            "get": {
+                "tags": [
+                    "API v1"
+                ],
+                "summary": "Download output for a language",
+                "description": "\u0421\u043a\u0430\u0447\u0430\u0442\u044c \u0440\u0435\u0437\u0443\u043b\u044c\u0442\u0430\u0442 \u0440\u0435\u0440\u0430\u0439\u0442\u0430 \u0434\u043b\u044f \u043e\u0434\u043d\u043e\u0433\u043e \u044f\u0437\u044b\u043a\u0430. lang_code \u0432 \u043f\u0440\u043e\u0435\u043a\u0442\u043d\u043e\u0439 \u043d\u043e\u0442\u0430\u0446\u0438\u0438 (en, ru, po, ...). \u0410\u043b\u0438\u0430\u0441 pt\u2192po \u043f\u043e\u0434\u0434\u0435\u0440\u0436\u0438\u0432\u0430\u0435\u0442\u0441\u044f.",
+                "operationId": "download_output_api_v1_jobs__job_id__files__lang_code__get",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    },
+                    {
+                        "name": "lang_code",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Lang Code"
+                        }
+                    },
+                    {
+                        "name": "authorization",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Authorization"
+                        }
+                    },
+                    {
+                        "name": "X-API-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Api-Key"
+                        }
+                    },
+                    {
+                        "name": "X-Session-Id",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Session-Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response"
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Forbidden"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Not Found"
+                    },
+                    "409": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Conflict"
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/v1/jobs/{job_id}/retry": {
+            "post": {
+                "tags": [
+                    "API v1"
+                ],
+                "summary": "Retry job",
+                "description": "\u041f\u043e\u0432\u0442\u043e\u0440\u0438\u0442\u044c \u043d\u0435\u0437\u0430\u0432\u0435\u0440\u0448\u0451\u043d\u043d\u044b\u0435 \u0447\u0430\u043d\u043a\u0438. full=true \u2192 \u043f\u043e\u043b\u043d\u0430\u044f \u043e\u0447\u0438\u0441\u0442\u043a\u0430 \u043f\u0440\u043e\u0433\u0440\u0435\u0441\u0441\u0430 \u0438 .txt, \u043f\u0440\u043e\u0433\u043e\u043d \u0441 \u043d\u0443\u043b\u044f.",
+                "operationId": "retry_job_api_api_v1_jobs__job_id__retry_post",
+                "parameters": [
+                    {
+                        "name": "job_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Job Id"
+                        }
+                    },
+                    {
+                        "name": "full",
+                        "in": "query",
+                        "required": false,
+                        "schema": {
+                            "type": "boolean",
+                            "description": "true \u2192 wipe progress + outputs, full re-run",
+                            "default": false,
+                            "title": "Full"
+                        },
+                        "description": "true \u2192 wipe progress + outputs, full re-run"
+                    },
+                    {
+                        "name": "authorization",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "Authorization"
+                        }
+                    },
+                    {
+                        "name": "X-API-Key",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Api-Key"
+                        }
+                    },
+                    {
+                        "name": "X-Session-Id",
+                        "in": "header",
+                        "required": false,
+                        "schema": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "null"
+                                }
+                            ],
+                            "title": "X-Session-Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "type": "object",
+                                    "additionalProperties": true,
+                                    "title": "Response Retry Job Api Api V1 Jobs  Job Id  Retry Post"
+                                }
+                            }
+                        }
+                    },
+                    "400": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Bad Request"
+                    },
+                    "401": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Unauthorized"
+                    },
+                    "403": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Forbidden"
+                    },
+                    "404": {
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/ApiErrorEnvelope"
+                                }
+                            }
+                        },
+                        "description": "Not Found"
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/keys/create": {
+            "post": {
+                "tags": [
+                    "UI helpers"
+                ],
+                "summary": "Create api-key (session auth)",
+                "description": "UI-only endpoint: \u0441\u043e\u0437\u0434\u0430\u0442\u044c api-key \u0434\u043b\u044f \u0442\u0435\u043a\u0443\u0449\u0435\u0439 \u0441\u0435\u0441\u0441\u0438\u0438. Plain key \u0432\u043e\u0437\u0432\u0440\u0430\u0449\u0430\u0435\u0442\u0441\u044f \u041e\u0414\u0418\u041d \u0440\u0430\u0437.",
+                "operationId": "ui_api_keys_create_api_keys_create_post",
+                "requestBody": {
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "$ref": "#/components/schemas/_ApiKeyCreateRequest"
+                            }
+                        }
+                    },
+                    "required": true
+                },
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/keys/list": {
+            "get": {
+                "tags": [
+                    "UI helpers"
+                ],
+                "summary": "List api-keys (session auth)",
+                "operationId": "ui_api_keys_list_api_keys_list_get",
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    }
+                }
+            }
+        },
+        "/api/keys/{key_id}/revoke": {
+            "post": {
+                "tags": [
+                    "UI helpers"
+                ],
+                "summary": "Revoke api-key (session auth)",
+                "operationId": "ui_api_keys_revoke_api_keys__key_id__revoke_post",
+                "parameters": [
+                    {
+                        "name": "key_id",
+                        "in": "path",
+                        "required": true,
+                        "schema": {
+                            "type": "string",
+                            "title": "Key Id"
+                        }
+                    }
+                ],
+                "responses": {
+                    "200": {
+                        "description": "Successful Response",
+                        "content": {
+                            "application/json": {
+                                "schema": {}
+                            }
+                        }
+                    },
+                    "422": {
+                        "description": "Validation Error",
+                        "content": {
+                            "application/json": {
+                                "schema": {
+                                    "$ref": "#/components/schemas/HTTPValidationError"
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    },
+    "components": {
+        "schemas": {
+            "ApiErrorEnvelope": {
+                "properties": {
+                    "error": {
+                        "additionalProperties": true,
+                        "type": "object",
+                        "title": "Error"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "error"
+                ],
+                "title": "ApiErrorEnvelope"
+            },
+            "ApiFileUploadResponse": {
+                "properties": {
+                    "file_id": {
+                        "type": "string",
+                        "title": "File Id"
+                    },
+                    "filename": {
+                        "type": "string",
+                        "title": "Filename"
+                    },
+                    "size_bytes": {
+                        "type": "integer",
+                        "title": "Size Bytes"
+                    },
+                    "uploaded_at": {
+                        "type": "number",
+                        "title": "Uploaded At"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "file_id",
+                    "filename",
+                    "size_bytes",
+                    "uploaded_at"
+                ],
+                "title": "ApiFileUploadResponse"
+            },
+            "ApiJobCreate": {
+                "properties": {
+                    "files": {
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array",
+                        "maxItems": 1,
+                        "minItems": 1,
+                        "title": "Files",
+                        "description": "Array of file_ids returned by POST /files. v1 accepts exactly 1."
+                    },
+                    "languages": {
+                        "items": {
+                            "$ref": "#/components/schemas/ApiLanguage"
+                        },
+                        "type": "array",
+                        "maxItems": 20,
+                        "minItems": 1,
+                        "title": "Languages",
+                        "description": "Target languages. Each entry's `code` accepts canonical/display/short forms."
+                    },
+                    "model": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "title": "Model",
+                        "description": "LLM model name",
+                        "default": "gpt-4.1-nano"
+                    },
+                    "chunk_size": {
+                        "type": "integer",
+                        "title": "Chunk Size",
+                        "default": 3500
+                    },
+                    "preserve_paragraphs": {
+                        "type": "boolean",
+                        "title": "Preserve Paragraphs",
+                        "default": true
+                    },
+                    "address_style": {
+                        "type": "string",
+                        "maxLength": 8,
+                        "title": "Address Style",
+                        "description": "Forms of address: 'vy' (formal), 'ty' (informal), '' (auto). Free text \u2014 no validation.",
+                        "default": ""
+                    },
+                    "host_name": {
+                        "type": "string",
+                        "maxLength": 80,
+                        "title": "Host Name",
+                        "description": "\u0418\u043c\u044f \u0430\u0432\u0442\u043e\u0440\u0430/\u0434\u0438\u043a\u0442\u043e\u0440\u0430 \u0434\u043b\u044f intro/outro \u0431\u0440\u0435\u043d\u0434\u0438\u043d\u0433\u0430. \u041f\u0443\u0441\u0442\u043e \u2192 fallback 'Anatolij Eugenjanovi\u010d Kazancev' \u0432 prompt.",
+                        "default": "",
+                        "examples": [
+                            "\u0418\u0432\u0430\u043d \u0418\u0432\u0430\u043d\u043e\u0432"
+                        ]
+                    },
+                    "channel_name": {
+                        "type": "string",
+                        "maxLength": 80,
+                        "title": "Channel Name",
+                        "description": "\u041d\u0430\u0437\u0432\u0430\u043d\u0438\u0435 \u043a\u0430\u043d\u0430\u043b\u0430 \u0434\u043b\u044f \u0431\u0440\u0435\u043d\u0434\u0438\u043d\u0433\u0430 (intro/outro/CTA). \u041f\u0443\u0441\u0442\u043e \u2192 \u043a\u0430\u043d\u0430\u043b \u043d\u0435 \u0443\u043f\u043e\u043c\u0438\u043d\u0430\u0435\u0442\u0441\u044f \u0432 \u0432\u044b\u0445\u043e\u0434\u043d\u043e\u043c \u0442\u0435\u043a\u0441\u0442\u0435.",
+                        "default": "",
+                        "examples": [
+                            "\u0421\u043a\u0440\u044b\u0442\u044b\u0439 \u0410\u0440\u0445\u0438\u0432"
+                        ]
+                    },
+                    "max_threads": {
+                        "type": "integer",
+                        "title": "Max Threads",
+                        "default": 1
+                    },
+                    "use_subscription": {
+                        "type": "boolean",
+                        "title": "Use Subscription",
+                        "default": false
+                    },
+                    "parallel": {
+                        "type": "boolean",
+                        "title": "Parallel",
+                        "default": true
+                    },
+                    "safe_text": {
+                        "type": "boolean",
+                        "title": "Safe Text",
+                        "default": false
+                    },
+                    "webhook_url": {
+                        "anyOf": [
+                            {
+                                "type": "string"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Webhook Url",
+                        "description": "RESERVED \u2014 not supported in v1; will return 422 if set."
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "files",
+                    "languages"
+                ],
+                "title": "ApiJobCreate"
+            },
+            "ApiJobCreateResponse": {
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "title": "Job Id"
+                    },
+                    "status": {
+                        "type": "string",
+                        "title": "Status"
+                    },
+                    "created_at": {
+                        "type": "number",
+                        "title": "Created At"
+                    },
+                    "languages_count": {
+                        "type": "integer",
+                        "title": "Languages Count"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "job_id",
+                    "status",
+                    "created_at",
+                    "languages_count"
+                ],
+                "title": "ApiJobCreateResponse"
+            },
+            "ApiLanguage": {
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "maxLength": 32,
+                        "minLength": 1,
+                        "title": "Code",
+                        "description": "Language: canonical name ('English'), Russian display ('\u0410\u043d\u0433\u043b\u0438\u0439\u0441\u043a\u0438\u0439'), or short code ('en'). Normalized to canonical on input.",
+                        "examples": [
+                            "English",
+                            "en",
+                            "\u0410\u043d\u0433\u043b\u0438\u0439\u0441\u043a\u0438\u0439"
+                        ]
+                    },
+                    "display": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "title": "Display",
+                        "description": "UI display name (optional)",
+                        "default": ""
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "code"
+                ],
+                "title": "ApiLanguage",
+                "description": "\u041e\u0434\u0438\u043d \u044f\u0437\u044b\u043a \u0432 \u0437\u0430\u043f\u0440\u043e\u0441\u0435 \u043d\u0430 \u0441\u043e\u0437\u0434\u0430\u043d\u0438\u0435 job.\n\n\u041f\u043e\u043b\u0435 `code` \u043f\u0440\u0438\u043d\u0438\u043c\u0430\u0435\u0442 \u043b\u044e\u0431\u0443\u044e \u0444\u043e\u0440\u043c\u0443: canonical ('English'), display ('\u0410\u043d\u0433\u043b\u0438\u0439\u0441\u043a\u0438\u0439'),\nshort code ('en'). \u0412\u0430\u043b\u0438\u0434\u0430\u0442\u043e\u0440 \u043d\u043e\u0440\u043c\u0430\u043b\u0438\u0437\u0443\u0435\u0442 \u043d\u0430 canonical lang_name \u0438\u0437 LANGUAGES.values()."
+            },
+            "Body_upload_file_upload_post": {
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "contentMediaType": "application/octet-stream",
+                        "title": "File"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "file"
+                ],
+                "title": "Body_upload_file_upload_post"
+            },
+            "Body_upload_input_file_api_v1_files_post": {
+                "properties": {
+                    "file": {
+                        "type": "string",
+                        "contentMediaType": "application/octet-stream",
+                        "title": "File"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "file"
+                ],
+                "title": "Body_upload_input_file_api_v1_files_post"
+            },
+            "GenerationBatchItem": {
+                "properties": {
+                    "topic": {
+                        "type": "string",
+                        "maxLength": 20000,
+                        "minLength": 10,
+                        "title": "Topic"
+                    },
+                    "language": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "maxLength": 64
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Language"
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "topic"
+                ],
+                "title": "GenerationBatchItem"
+            },
+            "GenerationJobRequest": {
+                "properties": {
+                    "preset_id": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "maxLength": 128
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Preset Id"
+                    },
+                    "topic": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "maxLength": 20000
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Topic"
+                    },
+                    "language": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "maxLength": 64
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Language"
+                    },
+                    "target_length_words": {
+                        "anyOf": [
+                            {
+                                "type": "integer",
+                                "maximum": 50000.0,
+                                "minimum": 300.0
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Target Length Words"
+                    },
+                    "max_log_entries": {
+                        "type": "integer",
+                        "maximum": 20.0,
+                        "minimum": 0.0,
+                        "title": "Max Log Entries",
+                        "default": 5
+                    },
+                    "chunk_size_words": {
+                        "anyOf": [
+                            {
+                                "type": "integer"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Chunk Size Words",
+                        "description": "Max \u0441\u043b\u043e\u0432 \u043d\u0430 \u043e\u0434\u0438\u043d LLM-\u0432\u044b\u0437\u043e\u0432 (override). \u0415\u0441\u043b\u0438 \u043d\u0435 \u0437\u0430\u0434\u0430\u043d\u043e \u2014 auto \u043f\u043e \u043c\u043e\u0434\u0435\u043b\u0438."
+                    },
+                    "topics": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "type": "string"
+                                },
+                                "type": "array",
+                                "maxItems": 100
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Topics",
+                        "description": "Batch (2026-06-20): \u0441\u043f\u0438\u0441\u043e\u043a \u0442\u0435\u043c \u0432 \u043e\u0434\u0438\u043d POST \u2192 N \u0434\u0436\u043e\u0431\u043e\u0432. \u0415\u0441\u043b\u0438 \u0437\u0430\u0434\u0430\u043d \u2014 topic \u0438\u0433\u043d\u043e\u0440\u0438\u0440\u0443\u0435\u0442\u0441\u044f."
+                    },
+                    "items": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "$ref": "#/components/schemas/GenerationBatchItem"
+                                },
+                                "type": "array",
+                                "maxItems": 100
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Items",
+                        "description": "Batch \u0441 \u044f\u0437\u044b\u043a\u043e\u043c \u043d\u0430 \u0441\u0442\u0440\u043e\u043a\u0443 (2026-06-20): [{topic, language?}, ...]. \u041f\u0440\u0438\u043e\u0440\u0438\u0442\u0435\u0442\u043d\u0435\u0435 topics/topic; \u043f\u0443\u0441\u0442\u043e\u0439 language \u0432 \u0441\u0442\u0440\u043e\u043a\u0435 \u2192 \u0431\u0435\u0440\u0451\u0442\u0441\u044f \u043e\u0431\u0449\u0438\u0439 language/\u043f\u0440\u0435\u0441\u0435\u0442."
+                    },
+                    "preset_name": {
+                        "anyOf": [
+                            {
+                                "type": "string",
+                                "maxLength": 128
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Preset Name"
+                    },
+                    "tasks": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "$ref": "#/components/schemas/GenerationLegacyTask"
+                                },
+                                "type": "array",
+                                "maxItems": 100
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Tasks"
+                    },
+                    "languages": {
+                        "anyOf": [
+                            {
+                                "items": {
+                                    "$ref": "#/components/schemas/GenerationLegacyLanguage"
+                                },
+                                "type": "array",
+                                "maxItems": 100
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Languages"
+                    },
+                    "max_threads": {
+                        "anyOf": [
+                            {
+                                "type": "integer"
+                            },
+                            {
+                                "type": "null"
+                            }
+                        ],
+                        "title": "Max Threads"
+                    },
+                    "model": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "title": "Model",
+                        "default": "gpt-4.1-nano"
+                    },
+                    "use_subscription": {
+                        "type": "boolean",
+                        "title": "Use Subscription",
+                        "default": false
+                    },
+                    "parallel": {
+                        "type": "boolean",
+                        "title": "Parallel",
+                        "default": false
+                    },
+                    "safe_text": {
+                        "type": "boolean",
+                        "title": "Safe Text",
+                        "default": false
+                    }
+                },
+                "type": "object",
+                "title": "GenerationJobRequest",
+                "description": "Round 2 (2026-05-23): single-topic flow + backward compat \u0434\u043b\u044f \u0441\u0442\u0430\u0440\u044b\u0445 \u043a\u043b\u0438\u0435\u043d\u0442\u043e\u0432.\n\n\u041d\u043e\u0432\u044b\u0439 flow \u0442\u0440\u0435\u0431\u0443\u0435\u0442 preset_id + topic (+ optional language/model/target_length_words).\n\u0421\u0442\u0430\u0440\u044b\u0439 flow \u0441 {tasks, languages, preset_name, ...} \u043f\u0440\u0438\u043d\u0438\u043c\u0430\u0435\u0442\u0441\u044f, \u0435\u0441\u043b\u0438 len(tasks)==1;\n\u043f\u0440\u0438 len(tasks) > 1 \u2192 422 (multi-task removed)."
+            },
+            "GenerationLegacyLanguage": {
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "title": "Name",
+                        "default": ""
+                    },
+                    "code": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "title": "Code",
+                        "default": ""
+                    },
+                    "display": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "title": "Display",
+                        "default": ""
+                    }
+                },
+                "type": "object",
+                "title": "GenerationLegacyLanguage"
+            },
+            "GenerationLegacyTask": {
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "maxLength": 20000,
+                        "minLength": 10,
+                        "title": "Title"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "title"
+                ],
+                "title": "GenerationLegacyTask"
+            },
+            "HTTPValidationError": {
+                "properties": {
+                    "detail": {
+                        "items": {
+                            "$ref": "#/components/schemas/ValidationError"
+                        },
+                        "type": "array",
+                        "title": "Detail"
+                    }
+                },
+                "type": "object",
+                "title": "HTTPValidationError"
+            },
+            "LanguageItem": {
+                "properties": {
+                    "canonical": {
+                        "type": "string",
+                        "title": "Canonical",
+                        "description": "Internal lang_name as stored in Job.rewrite_languages[].code",
+                        "examples": [
+                            "English"
+                        ]
+                    },
+                    "display_ru": {
+                        "type": "string",
+                        "title": "Display Ru",
+                        "description": "Russian display name (UI label)",
+                        "examples": [
+                            "\u0410\u043d\u0433\u043b\u0438\u0439\u0441\u043a\u0438\u0439"
+                        ]
+                    },
+                    "short_code": {
+                        "type": "string",
+                        "title": "Short Code",
+                        "description": "Short code used in URLs and output_files keys",
+                        "examples": [
+                            "en"
+                        ]
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "canonical",
+                    "display_ru",
+                    "short_code"
+                ],
+                "title": "LanguageItem"
+            },
+            "LanguageWarnings": {
+                "properties": {
+                    "legacy_codes": {
+                        "additionalProperties": {
+                            "type": "string"
+                        },
+                        "type": "object",
+                        "title": "Legacy Codes",
+                        "description": "Short codes that deviate from ISO 639-1; both legacy and ISO accepted on input."
+                    },
+                    "ambiguous_short_codes": {
+                        "additionalProperties": {
+                            "items": {
+                                "type": "string"
+                            },
+                            "type": "array"
+                        },
+                        "type": "object",
+                        "title": "Ambiguous Short Codes",
+                        "description": "Short codes that match >1 canonical language; rejected on input with 422 \u2014 use canonical name."
+                    }
+                },
+                "type": "object",
+                "title": "LanguageWarnings"
+            },
+            "LanguagesResponse": {
+                "properties": {
+                    "total": {
+                        "type": "integer",
+                        "title": "Total",
+                        "description": "Total number of supported languages"
+                    },
+                    "languages": {
+                        "items": {
+                            "$ref": "#/components/schemas/LanguageItem"
+                        },
+                        "type": "array",
+                        "title": "Languages"
+                    },
+                    "warnings": {
+                        "$ref": "#/components/schemas/LanguageWarnings"
+                    },
+                    "accepted_input_formats": {
+                        "items": {
+                            "type": "string"
+                        },
+                        "type": "array",
+                        "title": "Accepted Input Formats"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "total",
+                    "languages",
+                    "warnings",
+                    "accepted_input_formats"
+                ],
+                "title": "LanguagesResponse"
+            },
+            "RewriteJobRequest": {
+                "properties": {
+                    "files": {
+                        "items": {
+                            "type": "string",
+                            "maxLength": 200,
+                            "minLength": 1
+                        },
+                        "type": "array",
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Files"
+                    },
+                    "languages": {
+                        "items": {
+                            "$ref": "#/components/schemas/RewriteLanguageInput"
+                        },
+                        "type": "array",
+                        "maxItems": 100,
+                        "minItems": 1,
+                        "title": "Languages"
+                    },
+                    "model": {
+                        "type": "string",
+                        "maxLength": 128,
+                        "minLength": 1,
+                        "title": "Model",
+                        "default": "gpt-4.1-nano"
+                    },
+                    "max_threads": {
+                        "type": "integer",
+                        "title": "Max Threads",
+                        "default": 1
+                    },
+                    "chunk_size": {
+                        "type": "integer",
+                        "title": "Chunk Size",
+                        "default": 8000
+                    },
+                    "address_style": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "title": "Address Style",
+                        "default": ""
+                    },
+                    "host_name": {
+                        "type": "string",
+                        "maxLength": 200,
+                        "title": "Host Name",
+                        "default": ""
+                    },
+                    "channel_name": {
+                        "type": "string",
+                        "maxLength": 200,
+                        "title": "Channel Name",
+                        "default": ""
+                    },
+                    "use_subscription": {
+                        "type": "boolean",
+                        "title": "Use Subscription",
+                        "default": false
+                    },
+                    "parallel": {
+                        "type": "boolean",
+                        "title": "Parallel",
+                        "default": false
+                    },
+                    "safe_text": {
+                        "type": "boolean",
+                        "title": "Safe Text",
+                        "default": false
+                    },
+                    "preserve_paragraphs": {
+                        "type": "boolean",
+                        "title": "Preserve Paragraphs",
+                        "default": true
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "files",
+                    "languages"
+                ],
+                "title": "RewriteJobRequest"
+            },
+            "RewriteLanguageInput": {
+                "properties": {
+                    "code": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "minLength": 1,
+                        "title": "Code"
+                    },
+                    "display": {
+                        "type": "string",
+                        "maxLength": 64,
+                        "title": "Display",
+                        "default": ""
+                    },
+                    "host": {
+                        "type": "string",
+                        "maxLength": 200,
+                        "title": "Host",
+                        "default": ""
+                    },
+                    "channel": {
+                        "type": "string",
+                        "maxLength": 200,
+                        "title": "Channel",
+                        "default": ""
+                    },
+                    "custom_prompt": {
+                        "type": "string",
+                        "maxLength": 8000,
+                        "title": "Custom Prompt",
+                        "default": ""
+                    }
+                },
+                "additionalProperties": false,
+                "type": "object",
+                "required": [
+                    "code"
+                ],
+                "title": "RewriteLanguageInput"
+            },
+            "ValidationError": {
+                "properties": {
+                    "loc": {
+                        "items": {
+                            "anyOf": [
+                                {
+                                    "type": "string"
+                                },
+                                {
+                                    "type": "integer"
+                                }
+                            ]
+                        },
+                        "type": "array",
+                        "title": "Location"
+                    },
+                    "msg": {
+                        "type": "string",
+                        "title": "Message"
+                    },
+                    "type": {
+                        "type": "string",
+                        "title": "Error Type"
+                    },
+                    "input": {
+                        "title": "Input"
+                    },
+                    "ctx": {
+                        "type": "object",
+                        "title": "Context"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "loc",
+                    "msg",
+                    "type"
+                ],
+                "title": "ValidationError"
+            },
+            "_ApiKeyCreateRequest": {
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "title": "Name"
+                    }
+                },
+                "type": "object",
+                "required": [
+                    "name"
+                ],
+                "title": "_ApiKeyCreateRequest"
+            }
+        }
+    },
+    "tags": [
+        {
+            "name": "API v1",
+            "description": "Programmatic REST API (api-key auth)"
+        }
+    ]
+}

@@ -1,0 +1,25 @@
+{
+  "timezone": "UTC",
+  "telegram_config": "./fixtures/telegram.disabled.json",
+  "channels": [
+    {
+      "uc": "UC0000000000000000000000",
+      "name": "Synthetic Channel A",
+      "days": [0],
+      "expected_publications": 1,
+      "deadline": "23:00"
+    },
+    {
+      "uc": "UC0000000000000000000000",
+      "name": "Synthetic Channel B",
+      "days": [1],
+      "expected_publications": 1,
+      "deadline": "23:00"
+    }
+  ],
+  "notifications": {
+    "morning": "09:00",
+    "reminder": "18:00",
+    "final": "23:30"
+  }
+}

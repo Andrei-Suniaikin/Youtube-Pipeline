@@ -1,0 +1,25 @@
+{
+  "schema": "studio.stage-attempt.v1",
+  "release_id": "rel_demo_0001",
+  "stage": "tts",
+  "attempt": 2,
+  "state": "running",
+  "input_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "worker": {
+    "worker_id": "tts-agent-demo-a",
+    "capability": "lumean-tts.v2",
+    "build": "git:0123456789abcdef"
+  },
+  "claim": {
+    "fencing_token": "claim_demo_0002",
+    "leased_until": "2026-08-29T12:15:00Z",
+    "heartbeat_at": "2026-08-29T12:10:30Z"
+  },
+  "external_operation": {
+    "state": "created",
+    "provider_operation_id": "provider_demo_job_88",
+    "idempotency_key": "rel_demo_0001:tts:eeeeeeee"
+  },
+  "error": null
+}
+

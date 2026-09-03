@@ -1,0 +1,158 @@
+{
+  "schema_version": 2,
+  "fixture_kind": "synthetic_explicit_target_rewrite",
+  "target_contract": "exactly one target_channel_uc and one concrete slot per frozen plan item",
+  "ordering": "input_order ascending",
+  "bulk_batches": [
+    {
+      "batch_id": "batch-shared-aurora-guide",
+      "source_id": "synthetic-source-shared-aurora-guide",
+      "source_url": "https://donor.invalid/shared/aurora-guide",
+      "expansion_state": "expanded_before_freeze",
+      "selected_targets": [
+        {
+          "plan_item_id": "plan-shared-orion",
+          "target_channel_uc": "UCFAKE000000000000000001",
+          "schedule_id": "schedule-orion-dawn",
+          "slot_id": "slot-shared-orion-20300604",
+          "slot_date": "2030-06-04"
+        },
+        {
+          "plan_item_id": "plan-shared-archive",
+          "target_channel_uc": "UCFAKE000000000000000004",
+          "schedule_id": "schedule-archive-morning",
+          "slot_id": "slot-shared-archive-20300604",
+          "slot_date": "2030-06-04"
+        }
+      ],
+      "expanded_plan_item_ids": [
+        "plan-shared-orion",
+        "plan-shared-archive"
+      ]
+    }
+  ],
+  "plan_items": [
+    {
+      "input_order": 1,
+      "plan_item_id": "plan-related-orion",
+      "freeze_state": "frozen",
+      "origin": {
+        "kind": "direct"
+      },
+      "source_id": "synthetic-source-related-orion",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/orion-observer",
+      "target_channel_uc": "UCFAKE000000000000000001",
+      "schedule_id": "schedule-orion-dawn",
+      "slot_id": "slot-related-orion-20300603",
+      "slot_date": "2030-06-03"
+    },
+    {
+      "input_order": 2,
+      "plan_item_id": "plan-related-lyra",
+      "freeze_state": "frozen",
+      "origin": {
+        "kind": "direct"
+      },
+      "source_id": "synthetic-source-related-lyra",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/lyra-stories",
+      "target_channel_uc": "UCFAKE000000000000000002",
+      "schedule_id": "schedule-lyra-noon",
+      "slot_id": "slot-related-lyra-20300603",
+      "slot_date": "2030-06-03"
+    },
+    {
+      "input_order": 3,
+      "plan_item_id": "plan-related-nova",
+      "freeze_state": "frozen",
+      "origin": {
+        "kind": "direct"
+      },
+      "source_id": "synthetic-source-related-nova",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/nova-journal",
+      "target_channel_uc": "UCFAKE000000000000000003",
+      "schedule_id": "schedule-nova-evening",
+      "slot_id": "slot-related-nova-20300603",
+      "slot_date": "2030-06-03"
+    },
+    {
+      "input_order": 4,
+      "plan_item_id": "plan-shared-orion",
+      "freeze_state": "frozen",
+      "origin": {
+        "kind": "bulk_expansion",
+        "batch_id": "batch-shared-aurora-guide"
+      },
+      "source_id": "synthetic-source-shared-aurora-guide",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/shared/aurora-guide",
+      "target_channel_uc": "UCFAKE000000000000000001",
+      "schedule_id": "schedule-orion-dawn",
+      "slot_id": "slot-shared-orion-20300604",
+      "slot_date": "2030-06-04"
+    },
+    {
+      "input_order": 5,
+      "plan_item_id": "plan-shared-archive",
+      "freeze_state": "frozen",
+      "origin": {
+        "kind": "bulk_expansion",
+        "batch_id": "batch-shared-aurora-guide"
+      },
+      "source_id": "synthetic-source-shared-aurora-guide",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/shared/aurora-guide",
+      "target_channel_uc": "UCFAKE000000000000000004",
+      "schedule_id": "schedule-archive-morning",
+      "slot_id": "slot-shared-archive-20300604",
+      "slot_date": "2030-06-04"
+    },
+    {
+      "input_order": 6,
+      "plan_item_id": "plan-nova-weekend",
+      "freeze_state": "frozen",
+      "origin": {
+        "kind": "direct"
+      },
+      "source_id": "synthetic-source-nova-weekend",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/weekend-constellations",
+      "target_channel_uc": "UCFAKE000000000000000003",
+      "schedule_id": "schedule-nova-weekend",
+      "slot_id": "slot-nova-weekend-20300608",
+      "slot_date": "2030-06-08"
+    },
+    {
+      "input_order": 7,
+      "plan_item_id": "plan-horizon-weekly",
+      "freeze_state": "frozen",
+      "origin": {
+        "kind": "direct"
+      },
+      "source_id": "synthetic-source-horizon-tide",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/ocean-weather/tide-notes",
+      "target_channel_uc": "UCFAKE000000000000000005",
+      "schedule_id": "schedule-horizon-weekly",
+      "slot_id": "slot-horizon-weekly-20300611",
+      "slot_date": "2030-06-11"
+    },
+    {
+      "input_order": 8,
+      "plan_item_id": "plan-orion-late",
+      "freeze_state": "frozen",
+      "origin": {
+        "kind": "direct"
+      },
+      "source_id": "synthetic-source-orion-late",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/late-observation",
+      "target_channel_uc": "UCFAKE000000000000000001",
+      "schedule_id": "schedule-orion-late",
+      "slot_id": "slot-orion-late-20300605",
+      "slot_date": "2030-06-05"
+    }
+  ]
+}

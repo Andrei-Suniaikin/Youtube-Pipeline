@@ -1,0 +1,13 @@
+{
+  "schema": "studio.schedule-revision.v1",
+  "schedule_revision_id": "schedule_revision_demo_0001",
+  "release_id": "rel_demo_0001",
+  "revision": 1,
+  "predecessor_schedule_revision_id": null,
+  "reason": "initial_plan",
+  "local_wall_time": "2026-09-02T18:30:00",
+  "timezone": "Europe/Warsaw",
+  "resolved_scheduled_at": "2026-09-02T18:30:00+02:00",
+  "resolved_instant_utc": "2026-09-02T16:30:00Z",
+  "created_at": "2026-08-29T12:00:00Z"
+}

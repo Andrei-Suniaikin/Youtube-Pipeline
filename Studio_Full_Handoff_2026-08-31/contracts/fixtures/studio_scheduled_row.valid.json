@@ -1,0 +1,15 @@
+{
+  "fixture_schema_version": 1,
+  "verified_channel_uc": "UC0000000000000000000000",
+  "expected_title": "Synthetic scheduled upload",
+  "expected_scheduled_epoch": 1893585600,
+  "row": {
+    "videoId": "A1b2C3d4E5f",
+    "title": "Synthetic scheduled upload",
+    "draftStatus": "DRAFT_STATUS_NONE",
+    "privacy": "VIDEO_PRIVACY_PRIVATE",
+    "userSetVisibility": "VIDEO_USER_SET_VISIBILITY_SCHEDULED",
+    "scheduledTime": 1893585600,
+    "alteredDisclosed": true
+  }
+}

@@ -1,0 +1,16 @@
+[Unit]
+Description=VideoStudio VSGen reference service
+After=network-online.target
+
+[Service]
+Type=simple
+User=studio
+WorkingDirectory=/srv/studio/vsgen
+EnvironmentFile=/etc/studio/vsgen.env
+ExecStart=/srv/studio/venv/bin/python -m uvicorn main:app --host 127.0.0.1 --port 8800
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

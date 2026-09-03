@@ -1,0 +1,12 @@
+# Иллюстрация текущей маршрутизации. Домены тестовые, credentials отсутствуют.
+gen.example.invalid {
+    reverse_proxy 127.0.0.1:8800
+}
+
+rewrite.example.invalid {
+    reverse_proxy 127.0.0.1:8899
+}
+
+cover.example.invalid {
+    reverse_proxy 127.0.0.1:8900
+}

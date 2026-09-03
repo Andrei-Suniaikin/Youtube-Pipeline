@@ -1,0 +1,24 @@
+{
+  "schema": "studio.release.v1",
+  "release_id": "rel_demo_0001",
+  "tenant_id": "tenant_demo",
+  "plan_revision": 3,
+  "initial_schedule_revision_id": "schedule_revision_demo_0001",
+  "channel": {
+    "youtube_uc": "UCFAKE000000000000000001",
+    "upload_profile_ref": "profile_demo_12",
+    "upload_host_ref": "upload_agent_a"
+  },
+  "source": {
+    "kind": "donor_url",
+    "value": "https://www.youtube.com/watch?v=DEMO0000001",
+    "snapshot_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "presets": {
+    "rewrite": "rewrite_preset_7@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "video": "video_preset_10@sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "cover": "cover_preset_4@sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+  },
+  "frozen_at": "2026-08-29T12:00:00Z",
+  "idempotency_key": "release:tenant_demo:plan_item_42:revision_3"
+}

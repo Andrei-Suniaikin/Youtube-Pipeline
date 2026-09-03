@@ -1,0 +1,16 @@
+[Unit]
+Description=Cover Studio reference service
+After=network-online.target
+
+[Service]
+Type=simple
+User=studio
+WorkingDirectory=/srv/studio/cover
+EnvironmentFile=/etc/studio/cover.env
+ExecStart=/srv/studio/venv/bin/python -m uvicorn cover_server:app --host 127.0.0.1 --port 8900
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

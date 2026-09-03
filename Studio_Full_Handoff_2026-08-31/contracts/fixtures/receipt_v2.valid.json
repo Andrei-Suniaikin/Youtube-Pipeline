@@ -1,0 +1,23 @@
+{
+  "evidence": {
+    "normalized_title_sha256": "47b8c06009b383c214fbde0613f0a090761fb07156a3aca368715cdc37cd7aeb",
+    "row_video_id": "A1b2C3d4E5f",
+    "scheduled_time_seconds": 1893585600,
+    "studio_state": "SCHEDULED",
+    "verified_channel_uc": "UC0000000000000000000000",
+    "visibility_user_set_visibility": "VIDEO_USER_SET_VISIBILITY_SCHEDULED"
+  },
+  "expected_operational_date": "2030-01-02",
+  "manifest_name": "frozen_manifest.valid.json",
+  "manifest_sha256": "b50bab7ca5835bdd129819b6168dca4406f34189dc003556b468b818afeeb774",
+  "normalized_title_sha256": "47b8c06009b383c214fbde0613f0a090761fb07156a3aca368715cdc37cd7aeb",
+  "receipt_sha256": "5f495ab1eeb525e190a68de128202b3575801ecf4e09a805d4223c5c8b4a02fd",
+  "scheduled_at_utc": "2030-01-02T12:00:00Z",
+  "scheduled_epoch": 1893585600,
+  "schema_version": 2,
+  "source_host": "fixture-host",
+  "studio_state": "SCHEDULED",
+  "uc": "UC0000000000000000000000",
+  "verified_at": "2030-01-02T11:58:00Z",
+  "video_id": "A1b2C3d4E5f"
+}

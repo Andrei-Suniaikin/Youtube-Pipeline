@@ -1,0 +1,144 @@
+{
+  "schema_version": 2,
+  "fixture_kind": "synthetic_explicit_target_rewrite",
+  "catalog_contract": "arbitrary channel and schedule cardinality; tags are metadata only",
+  "channels": [
+    {
+      "channel_key": "synthetic-orion-observer",
+      "channel_uc": "UCFAKE000000000000000001",
+      "adspower_profile_ref": "SYNTHETIC_PROFILE_ORION",
+      "upload_host_ref": "SYNTHETIC_HOST_NORTH",
+      "schedules": [
+        {
+          "schedule_id": "schedule-orion-dawn",
+          "cadence": "daily",
+          "timezone": "UTC",
+          "local_time": "08:15:00"
+        },
+        {
+          "schedule_id": "schedule-orion-late",
+          "cadence": "weekdays",
+          "timezone": "UTC",
+          "local_time": "20:45:00"
+        }
+      ],
+      "tags": [
+        "network:synthetic-example",
+        "theme:night-sky",
+        "language:en",
+        "mode:rewrite"
+      ],
+      "existing_preset_refs": {
+        "video_studio": "EXISTING_VIDEOSTUDIO_PRESET_PLACEHOLDER_ORION",
+        "rewrite_text": "EXISTING_REWRITE_TEXT_PRESET_PLACEHOLDER_ORION",
+        "cover": "EXISTING_COVER_PRESET_PLACEHOLDER_ORION"
+      }
+    },
+    {
+      "channel_key": "synthetic-lyra-stories",
+      "channel_uc": "UCFAKE000000000000000002",
+      "adspower_profile_ref": "SYNTHETIC_PROFILE_LYRA",
+      "upload_host_ref": "SYNTHETIC_HOST_WEST",
+      "schedules": [
+        {
+          "schedule_id": "schedule-lyra-noon",
+          "cadence": "daily",
+          "timezone": "UTC",
+          "local_time": "12:20:00"
+        }
+      ],
+      "tags": [
+        "network:synthetic-example",
+        "theme:night-sky",
+        "language:es",
+        "mode:rewrite"
+      ],
+      "existing_preset_refs": {
+        "video_studio": "EXISTING_VIDEOSTUDIO_PRESET_PLACEHOLDER_LYRA",
+        "rewrite_text": "EXISTING_REWRITE_TEXT_PRESET_PLACEHOLDER_LYRA",
+        "cover": "EXISTING_COVER_PRESET_PLACEHOLDER_LYRA"
+      }
+    },
+    {
+      "channel_key": "synthetic-nova-journal",
+      "channel_uc": "UCFAKE000000000000000003",
+      "adspower_profile_ref": "SYNTHETIC_PROFILE_NOVA",
+      "upload_host_ref": "SYNTHETIC_HOST_EAST",
+      "schedules": [
+        {
+          "schedule_id": "schedule-nova-evening",
+          "cadence": "daily",
+          "timezone": "UTC",
+          "local_time": "17:05:00"
+        },
+        {
+          "schedule_id": "schedule-nova-weekend",
+          "cadence": "weekly",
+          "timezone": "UTC",
+          "local_time": "21:30:00"
+        }
+      ],
+      "tags": [
+        "network:synthetic-example",
+        "theme:night-sky",
+        "language:fr",
+        "mode:rewrite"
+      ],
+      "existing_preset_refs": {
+        "video_studio": "EXISTING_VIDEOSTUDIO_PRESET_PLACEHOLDER_NOVA",
+        "rewrite_text": "EXISTING_REWRITE_TEXT_PRESET_PLACEHOLDER_NOVA",
+        "cover": "EXISTING_COVER_PRESET_PLACEHOLDER_NOVA"
+      }
+    },
+    {
+      "channel_key": "synthetic-archive-lab",
+      "channel_uc": "UCFAKE000000000000000004",
+      "adspower_profile_ref": "SYNTHETIC_PROFILE_ARCHIVE",
+      "upload_host_ref": "SYNTHETIC_HOST_NORTH",
+      "schedules": [
+        {
+          "schedule_id": "schedule-archive-morning",
+          "cadence": "weekdays",
+          "timezone": "UTC",
+          "local_time": "09:40:00"
+        }
+      ],
+      "tags": [
+        "network:synthetic-example",
+        "theme:maker-history",
+        "language:de",
+        "mode:rewrite"
+      ],
+      "existing_preset_refs": {
+        "video_studio": "EXISTING_VIDEOSTUDIO_PRESET_PLACEHOLDER_ARCHIVE",
+        "rewrite_text": "EXISTING_REWRITE_TEXT_PRESET_PLACEHOLDER_ARCHIVE",
+        "cover": "EXISTING_COVER_PRESET_PLACEHOLDER_ARCHIVE"
+      }
+    },
+    {
+      "channel_key": "synthetic-horizon-notes",
+      "channel_uc": "UCFAKE000000000000000005",
+      "adspower_profile_ref": "SYNTHETIC_PROFILE_HORIZON",
+      "upload_host_ref": "SYNTHETIC_HOST_SOUTH",
+      "schedules": [
+        {
+          "schedule_id": "schedule-horizon-weekly",
+          "cadence": "weekly",
+          "timezone": "UTC",
+          "local_time": "06:50:00"
+        }
+      ],
+      "tags": [
+        "network:synthetic-example",
+        "theme:ocean-weather",
+        "language:ja",
+        "mode:rewrite"
+      ],
+      "existing_preset_refs": {
+        "video_studio": "EXISTING_VIDEOSTUDIO_PRESET_PLACEHOLDER_HORIZON",
+        "rewrite_text": "EXISTING_REWRITE_TEXT_PRESET_PLACEHOLDER_HORIZON",
+        "cover": "EXISTING_COVER_PRESET_PLACEHOLDER_HORIZON"
+      }
+    }
+  ]
+}

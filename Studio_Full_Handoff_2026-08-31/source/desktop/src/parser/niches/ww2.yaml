@@ -1,0 +1,294 @@
+# Профиль ниши WW2 для парсера визуала. Ниша = конфиг, движок общий.
+name: ww2
+description: "WW2 (1939-1945) documentary, authentic wartime imagery"
+era: {from: 1939, to: 1945}
+strict_era: false   # false: ч/б соседних эпох -> soft-флаг в галерею; true: reject
+
+classifier:
+  model: gpt-5-nano
+  reasoning_effort: minimal
+  batch_size: 20
+  retry_batch_size: 4  # malformed nano JSON: повторяем только пропущенные сцены
+  semantic_retry_batch_size: 4 # соседний смысл: один compact repair на группу, не call/scene
+
+clip:
+  model: ViT-B-32
+  pretrained: laion2b_s34b_b79k
+  top_k: 10          # столько лучших кандидатов идёт судье/в галерею
+  min_score: 0.18    # ниже по косинусу — кандидат отбрасывается до судьи
+
+judge:
+  model: gpt-5-nano
+  reasoning_effort: low   # minimal путал лица/детали (визуальное ревью 16.07)
+  screening_reasoning_effort: minimal # person/named затем проверяет mini; neutral stock safe по контракту
+  accept_soft: true       # 17.07 интерес>достоверность: soft-кадр идёт В КАДР (галерея пометит)
+  accept_soft_stock: true # только когда SceneContract явно разрешил neutral stock
+  accept_soft_identity: true # тот же человек, соседний год; затем обязательный mini-check
+  batch_size: 4      # четыре превью одним vision-вызовом: общий prompt/reasoning оплачивается раз
+  max_candidates: 8 # 17.07: топ-8 (2 nano-батча) — CLIP-топ4 на ч/б архиве лотерея
+  library_max_candidates: 4 # legacy path; основной путь cold library отдельно не судит
+  external_max_candidates: 8 # 17.07: вслед за max_candidates
+  broll_max_candidates: 1    # B-roll — только последний дешёвый шанс для context-сцен
+  wave_size: 4       # один shortlist = один vision-call на сцену
+  prefer_ok_across_waves: false # top soft уже nano-safe; identity soft ещё проходит mini — не платим за остальные волны
+  threads: 4         # на сцену; суммарно умножается на run.scene_workers
+  final_check:       # двухступенчатый суд: mini фильтрует, сильная модель подтверждает финал
+    enabled: true    # named + любой resolved person; video проверяется по 3 кадрам
+    model: gpt-5-mini
+    reasoning_effort: minimal # mini/minimal был точнее nano/low на golden set и заметно дешевле
+    max_completion_tokens: 800
+    max_checks: 3    # сколько кандидатов сцены может забраковать контролёр
+    types: [named]   # дорогая проверка только exact person/place/event
+    fail_open: false
+    defer_video_to_contact_sheet: true
+
+faces:               # D1/D2: face-банк (insightface buffalo_l, CPU); без пакета — гейт молча выключен
+  enabled: true
+  threshold: 0.45    # cosine same-person; калибровка на известных парах: tools/build_facebank.py --calibrate
+  margin: 0.10       # отрыв чужой персоны от named для reject до LLM
+  portraits_per_person: 6  # Commons-портретов на персону в банк (3-8)
+  persons:           # стартовый список персон ниши (~30, расширяется руками)
+    - "Adolf Hitler"
+    - "Joseph Stalin"
+    - "Ion Antonescu"
+    - "Nicolae Ciupercă"
+    - "Michael I of Romania"
+    - "Winston Churchill"
+    - "Franklin D. Roosevelt"
+    - "Benito Mussolini"
+    - "Hermann Göring"
+    - "Heinrich Himmler"
+    - "Joseph Goebbels"
+    - "Reinhard Heydrich"
+    - "Hans Frank"
+    - "Karl Hermann Frank"
+    - "Emil Hácha"
+    - "Edvard Beneš"
+    - "Jozef Tiso"
+    - "Wilhelm Keitel"
+    - "Erich von Manstein"
+    - "Heinz Guderian"
+    - "Erwin Rommel"
+    - "Friedrich Paulus"
+    - "Georgy Zhukov"
+    - "Semyon Timoshenko"
+    - "Kliment Voroshilov"
+    - "Vyacheslav Molotov"
+    - "Joachim von Ribbentrop"
+    - "Fedor von Bock"
+    - "Gerd von Rundstedt"
+    - "Ewald von Kleist"
+    - "Walther von Brauchitsch"
+    - "Władysław Sikorski"
+
+run:
+  scene_workers: 6   # G: сцен параллельно (CLIP под локом, судья/скачивания параллелятся); 8 — после недели наблюдений за 429
+
+search:
+  localized_sources: [kramerius, ddb]  # E2: национальные архивы получают localized_query первым
+  per_query_limit: 10          # кандидатов с одного источника на один запрос
+  max_candidates_per_scene: 40
+  throttle_sec: 0.7            # межзапросная пауза на источник
+  stock_sources: [pexels, pixabay]
+  stock_only_safe: true       # если modern stock разрешён контрактом, не смешивать его с random archive
+  stock_only_metaphor: true   # time/teaser transitions: stock motif, не случайный архив того же года
+  skip_exact_objects: [document] # exact ticket/form without exact metadata -> truthful card
+  source_media:
+    internet_archive: [video]  # full-film metadata walk is too slow for still search
+    archive_movies: [video]    # кинохроника: только motion-сцены, режется на клипы
+    kramerius: [image]
+  source_query_count:
+    internet_archive: 1
+    archive_movies: 1
+    nara: 2
+    ddb: 2
+    kramerius: 2
+  source_limit:
+    internet_archive: 2
+    archive_movies: 2
+    nara: 6
+    ddb: 6
+    kramerius: 6
+
+# порядок = приоритет; для reconstruction архив тоже пробуем (тематический B-roll)
+routes:
+  # named: AI-фолбэк = поведение текущего пайплайна (googler рисует личностей по имени);
+  # без фолбэка сцена остаётся без кадра = дыра в синхроне рендера
+  named:          {sources: [commons, commons_cat, europeana, loc, nara, ddb, kramerius, archive_movies], media: [image, video], ai_fallback: true}
+  generic:        {sources: [commons, commons_cat, europeana, loc, nara, internet_archive, archive_movies, pexels, pixabay], media: [image, video], ai_fallback: true}
+  reconstruction: {sources: [commons, commons_cat, europeana, archive_movies, pexels, pixabay], media: [image, video], ai_fallback: true}
+  modern_anchor:  {sources: [pexels, pixabay], media: [video, image], ai_fallback: true}
+  abstract:       {sources: [commons, commons_cat, pexels, pixabay], media: [video, image], ai_fallback: true}
+  stats:          {sources: [],                                     ai_fallback: true}
+
+# Подключаются только релевантные стране источники; список дедуплицируется роутером.
+source_packs:
+  czech:
+    match: [czech, czechoslovak, czechoslovakia, prague, bohemia, moravia, sudeten, protektorat, lidice, pankrac]
+    sources: [kramerius, ddb, europeana, commons_cat, commons]
+  german:
+    match: [germany, german, berlin, reich, wehrmacht, gestapo, ss, bundesarchiv]
+    sources: [ddb, commons_cat, europeana, commons]
+  allied_us:
+    match: [american, united states, usa, u.s., allied, signal corps, us army]
+    sources: [nara, loc, internet_archive, commons]
+
+broll:            # тематический пул кампании — последняя ступень перед AI-фолбэком
+  enabled: true
+  exact_enabled: false # exact/person сцена не получает чужое событие из общего пула
+  max_pool: 90    # максимум кандидатов пула на проект
+  min_clip: 0.20  # порог CLIP для тематического матча из пула
+  staple_fill: true   # 17.07 интерес>достоверность: эпохальный филлер лучше AI-заглушки
+  staple_min_clip: 0.14  # staple с нулевой связью со сценой хуже AI (ревью 16.07)
+  staples:            # дежурные темы Восточного фронта (17.07): всегда в пуле
+    - "Eastern Front artillery firing 1941 1942"
+    - "Wehrmacht infantry advance Eastern Front"
+    - "Red Army soldiers trench 1941"
+    - "destroyed city ruins Eastern Front WWII"
+    - "burning village smoke Eastern Front"
+    - "military convoy trucks dust road WWII Eastern Front"
+    - "refugees road war 1941"
+    - "tanks column Eastern Front 1941"
+    - "soldiers marching column WWII Eastern Front"
+    - "field kitchen soldiers rest WWII"
+  warm_on_run: true   # B4: run сам греет staple-видео, пока маркер staple_video_done.json отсутствует
+  cluster_fill: true  # B3: кластерный b-roll из библиотеки перед staple-заполнением
+  cluster_min_score: 0.22       # порог CLIP кандидата кластерной ступени
+  cluster_video_top_k: 3        # видео-квота кластерной ступени (motion-сцены)
+  cluster_video_min_score: 0.20 # кадр клипа скорит к тексту ниже фото
+  warm_per_query: 8   # B4: кандидатов с источника на один кластерный запрос
+  cluster_queries:    # B4: прогрев ФОТО-пула по кластерам (parser_worker warm --niche ww2)
+    combat:
+      - "Eastern Front infantry battle 1941"
+      - "artillery firing WWII Eastern Front"
+      - "soldiers trench combat 1942"
+      - "machine gun position WWII"
+      - "street fighting soldiers WWII"
+      - "assault attack Eastern Front 1943"
+    city_ruins:
+      - "destroyed city ruins WWII"
+      - "bombed buildings rubble 1941"
+      - "burning village Eastern Front"
+      - "ruined street after bombing WWII"
+      - "devastation aftermath WWII city"
+      - "Warsaw ruins 1944"
+    vehicles_armor:
+      - "tank column Eastern Front"
+      - "panzer tanks 1941"
+      - "military trucks convoy WWII"
+      - "T-34 tank 1942"
+      - "armored vehicles advance WWII"
+      - "half-track motorcycles Wehrmacht"
+    aviation:
+      - "Luftwaffe bombers 1941"
+      - "Soviet aircraft WWII"
+      - "air raid bombing WWII"
+      - "fighter plane airfield WWII"
+      - "Stuka dive bomber"
+      - "aircraft wreckage WWII"
+    navy_sea:
+      - "navy warship WWII"
+      - "Black Sea fleet WWII"
+      - "submarine WWII"
+      - "naval convoy WWII"
+      - "battleship 1941"
+      - "harbor port war 1941"
+    people_daily:
+      - "refugees road war 1941"
+      - "civilians wartime street"
+      - "women workers factory WWII"
+      - "children war 1941"
+      - "market queue occupation WWII"
+      - "village life wartime"
+    leaders_officials:
+      - "German generals headquarters WWII"
+      - "Soviet marshals meeting WWII"
+      - "military staff map briefing WWII"
+      - "officers conference 1941"
+      - "commanders front inspection WWII"
+      - "wartime government officials"
+    documents_print:
+      - "wartime document typewritten"
+      - "WWII newspaper front page"
+      - "military map 1941"
+      - "propaganda leaflet WWII"
+      - "wartime telegram order"
+      - "ration card occupation WWII"
+    winter:
+      - "winter warfare 1941 snow soldiers"
+      - "Moscow winter 1941"
+      - "frozen front line WWII"
+      - "soldiers winter uniforms Eastern Front"
+      - "snow trenches war 1942"
+      - "winter retreat 1941"
+    crowd_parade:
+      - "military parade 1941"
+      - "crowd rally wartime"
+      - "soldiers marching column WWII"
+      - "liberation celebration crowd WWII"
+      - "Red Square parade November 1941"
+      - "ceremony troops WWII"
+  staple_video_queries:   # прогрев библиотеки клипами кинохроники (archive_movies, один раз на фильм)
+    # 17.07: прицельные PD-запросы Восточного фронта (широкие тащили Дьепп/Манилу/Италию)
+    - "Moscow Strikes Back"            # 1942, советская хроника контрнаступления, PD mark
+    - "Big News of 1941"               # Universal Newsreel, сюжеты СССР
+    - "Universal Newsreel Russian front"
+    - "Universal Newsreel Red Army"
+    - "newsreel eastern front 1941"
+    # C3b: прицельные PD-фильмы (Capra, Why We Fight — хроника ИМЕННО Восточного фронта)
+    - "The Battle of Russia"
+    - "The Nazis Strike"
+    - "War Comes to America"
+  youtube_cc_queries:     # C3b: майнинг CC-BY с YouTube через yt-dlp (фильтр license строгий)
+    - "eastern front 1941 newsreel footage"
+    - "battle of moscow 1941 archival footage"
+    - "world war 2 eastern front original footage"
+
+video:
+  max_download_mb: 120
+  max_clip_seconds: 18
+  min_source_seconds: 1.5
+  max_source_seconds: 90   # длинным reels нужен отдельный shot index, не брать начало вслепую
+  movies_max_download_mb: 500 # 17.07: Moscow Strikes Back (PD, золотой контент для всей сетки) = 438МБ
+  max_films_per_run: 6        # бюджет: сколько НОВЫХ фильмов качаем за один прогон
+  movies_download_timeout_sec: 600 # wall-clock бюджет одной загрузки (read-stall не ловит медленный поток)
+  max_clips_per_film: 6       # сколько клипов режем из одного фильма (равномерно по таймлайну)
+  verify_contact_sheet: true  # first/middle/last после реального скачивания
+  hook_scenes: 12             # C1: первые N сцен — хук, видео-квота библиотеки до 4
+  hook_video_target: 2        # C1: цель клипов в хук-сценах (пост-добор приоритезирует их)
+  min_videos_per_project: 4   # C1: минимум клипов на ролик — иначе пост-добор
+  postfill_max_checks: 6      # C1: бюджет LLM пост-добора (contact-sheet судов на прогон)
+  rhythm_max_swaps: 6         # C2: максимум замен статики на клип за прогон
+  rhythm_max_checks: 12       # C2: бюджет LLM ритм-контроля (попыток вставки = contact-sheet судов)
+  rhythm_static_window: 5     # C2: серия статичных кадров подряд, после которой рвём клипом
+
+placeholders:
+  enabled: false  # 17.07 РЕШЕНИЕ ЮЗЕРА: карточки убраны ПОЛНОСТЬЮ — дыры уходят в ai_fallback
+  types: [named, stats]
+  claim_levels: [exact]
+  context_with_fields: false  # 17.07: карточка была у КАЖДОЙ сцены с event/date (147/181 плашек) — контекст-дыры теперь уходят в ai_fallback
+
+library:
+  enabled: true
+  path: "~/VideoStudio/parser_library"
+  min_score: 0.32   # косинус-порог хита библиотеки (0.25 тащил чужую кампанию)
+  video_top_k: 3      # 17.07: отдельная квота видео-клипов в library-хитах
+  video_min_score: 0.24 # кадр хроники скорит к тексту ниже картинок (факт: релевантный 0.30)
+  top_k: 8          # хитов на сцену к судье
+  metadata_top_k: 6 # exact full-name/initials + event/place до чистого CLIP
+
+reuse:              # повтор кадра внутри ролика (как у конкурентов, но контролируемый)
+  max_per_video: 4  # 17.07 v2: конкуренты крутят кадр десятки раз — 4 с гэпом достаточно скромно
+  min_gap: 25       # 17.07 v2
+
+warm:                 # C3b: систематический проход Universal Newsreels 1941–44 (parser_worker warm)
+  max_films_per_night: 20     # кап очереди newsreels на один warm (0 = выключить)
+  newsreel_title_match: [russia, soviet, front, war]  # токены title (префикс-матч)
+
+youtube_cc:           # C3b: CC-флаг НЕ гарантия прав — материал несёт risk contentid_possible
+  trusted_channels: []        # опционально сузить до каналов архивов/музеев (пусто = любые)
+  max_per_query: 2            # видео с одного запроса в прогрев
+
+licenses:
+  allow: ["pd", "cc0", "cc-by", "cc-by-sa", "pexels", "pixabay", "nara-unrestricted", "youtube-cc-by"]
+  include_nc: false   # NC-источники не подтягиваем (решение юзера 15.07.2026)

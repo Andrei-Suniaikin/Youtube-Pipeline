@@ -1,0 +1,19 @@
+{
+  "schema_version": 2,
+  "attempt_id": "attempt-synthetic-001",
+  "manifest_sha256": "b50bab7ca5835bdd129819b6168dca4406f34189dc003556b468b818afeeb774",
+  "key": "synthetic-row-001",
+  "uc": "UC0000000000000000000000",
+  "profile": "demo-profile",
+  "pid": "project-demo-001",
+  "normalized_title_sha256": "47b8c06009b383c214fbde0613f0a090761fb07156a3aca368715cdc37cd7aeb",
+  "video_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+  "worker_log": "state/synthetic-row-001/attempts/attempt-synthetic-001.log",
+  "phase": "video_id_known",
+  "video_id": "A1b2C3d4E5f",
+  "outcome": "accepted",
+  "manager_entered": true,
+  "result_sha256": "4444444444444444444444444444444444444444444444444444444444444444",
+  "created_at": "2030-01-02T11:30:00Z",
+  "updated_at": "2030-01-02T11:59:00Z"
+}

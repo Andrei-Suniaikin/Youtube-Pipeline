@@ -1,0 +1,19 @@
+{
+  "schema": "studio.artifact.v1",
+  "artifact_id": "art_demo_audio_0001",
+  "release_id": "rel_demo_0001",
+  "stage": "tts",
+  "slot": "narration/001",
+  "media_type": "audio/mpeg",
+  "bytes": 1234567,
+  "sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+  "producer_attempt": 2,
+  "input_fingerprint": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+  "validation": {
+    "status": "passed",
+    "duration_ms": 10000,
+    "expected_min_duration_ms": 9000,
+    "checks": ["decode", "duration", "non_silent"]
+  },
+  "published_at": "2026-08-29T12:14:00Z"
+}

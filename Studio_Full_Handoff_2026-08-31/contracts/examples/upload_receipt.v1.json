@@ -1,0 +1,19 @@
+{
+  "schema": "studio.upload-receipt.v1",
+  "release_id": "rel_demo_0001",
+  "schedule_revision_id": "schedule_revision_demo_0001",
+  "idempotency_key": "rel_demo_0001:schedule_revision_demo_0001:upload",
+  "phase": "verified_scheduled",
+  "do_not_reupload": true,
+  "channel_uc": "UCFAKE000000000000000001",
+  "video_id": "DEMO0000088",
+  "title_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+  "visibility": "SCHEDULED",
+  "expected_scheduled_at": "2026-09-02T18:30:00+02:00",
+  "observed_scheduled_epoch": 1788366600,
+  "evidence": {
+    "source": "youtube_studio_video_row",
+    "observed_at": "2026-08-29T12:30:00Z",
+    "machine_state_sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  }
+}

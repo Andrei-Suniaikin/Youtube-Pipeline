@@ -1,0 +1,16 @@
+[Unit]
+Description=Rewrite Studio reference service
+After=network-online.target
+
+[Service]
+Type=simple
+User=studio
+WorkingDirectory=/srv/studio/rewrite
+EnvironmentFile=/etc/studio/rewrite.env
+ExecStart=/srv/studio/venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8899
+Restart=on-failure
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

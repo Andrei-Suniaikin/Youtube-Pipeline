@@ -1,0 +1,48 @@
+{
+  "timezone": "UTC",
+  "publication_day_start": "00:00",
+  "telegram_config": "./fixtures/telegram.disabled.json",
+  "channels": [
+    {
+      "uc": "UC0000000000000000000000",
+      "name": "Synthetic Channel",
+      "niche": "fixture",
+      "lang": "en",
+      "days": [0, 1, 2, 3, 4, 5, 6],
+      "expected_publications": 1,
+      "deadline": "23:00",
+      "enabled": true
+    }
+  ],
+  "notifications": {
+    "morning": "09:00",
+    "reminder": "18:00",
+    "final": "23:30",
+    "slot_window_minutes": 20,
+    "failure_threshold": 3
+  },
+  "infrastructure": {
+    "health_url": "https://watchdog.invalid/healthz",
+    "vsgen_db": "./sandbox/watchdog-demo.sqlite3",
+    "disk_path": "./sandbox",
+    "min_free_gb": 1,
+    "queue_stale_hours": 3,
+    "ytcortiez_service": ""
+  },
+  "rss": {
+    "timeout_seconds": 2,
+    "workers": 1,
+    "retries": 0
+  },
+  "receipts": {
+    "enabled": true,
+    "inbox_dir": "./sandbox/receipts/inbox",
+    "max_age_hours": 72,
+    "future_skew_minutes": 5,
+    "archive_retention_days": 30,
+    "audit_retention_days": 180,
+    "diagnostic_cap": 10,
+    "allowed_source_hosts": ["fixture-host"]
+  },
+  "failure_cooldown_hours": 6
+}

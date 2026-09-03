@@ -1,0 +1,104 @@
+{
+  "schema_version": 2,
+  "fixture_kind": "synthetic_explicit_target_rewrite",
+  "derivation_contract": "one release per explicit frozen plan item; batches and tags create no releases",
+  "expected_release_count": 8,
+  "releases": [
+    {
+      "release_order": 1,
+      "release_id": "release-related-orion",
+      "plan_item_id": "plan-related-orion",
+      "source_id": "synthetic-source-related-orion",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/orion-observer",
+      "channel_uc": "UCFAKE000000000000000001",
+      "schedule_id": "schedule-orion-dawn",
+      "slot_id": "slot-related-orion-20300603",
+      "publish_at": "2030-06-03T08:15:00+00:00"
+    },
+    {
+      "release_order": 2,
+      "release_id": "release-related-lyra",
+      "plan_item_id": "plan-related-lyra",
+      "source_id": "synthetic-source-related-lyra",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/lyra-stories",
+      "channel_uc": "UCFAKE000000000000000002",
+      "schedule_id": "schedule-lyra-noon",
+      "slot_id": "slot-related-lyra-20300603",
+      "publish_at": "2030-06-03T12:20:00+00:00"
+    },
+    {
+      "release_order": 3,
+      "release_id": "release-related-nova",
+      "plan_item_id": "plan-related-nova",
+      "source_id": "synthetic-source-related-nova",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/nova-journal",
+      "channel_uc": "UCFAKE000000000000000003",
+      "schedule_id": "schedule-nova-evening",
+      "slot_id": "slot-related-nova-20300603",
+      "publish_at": "2030-06-03T17:05:00+00:00"
+    },
+    {
+      "release_order": 4,
+      "release_id": "release-shared-orion",
+      "plan_item_id": "plan-shared-orion",
+      "source_id": "synthetic-source-shared-aurora-guide",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/shared/aurora-guide",
+      "channel_uc": "UCFAKE000000000000000001",
+      "schedule_id": "schedule-orion-dawn",
+      "slot_id": "slot-shared-orion-20300604",
+      "publish_at": "2030-06-04T08:15:00+00:00"
+    },
+    {
+      "release_order": 5,
+      "release_id": "release-shared-archive",
+      "plan_item_id": "plan-shared-archive",
+      "source_id": "synthetic-source-shared-aurora-guide",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/shared/aurora-guide",
+      "channel_uc": "UCFAKE000000000000000004",
+      "schedule_id": "schedule-archive-morning",
+      "slot_id": "slot-shared-archive-20300604",
+      "publish_at": "2030-06-04T09:40:00+00:00"
+    },
+    {
+      "release_order": 6,
+      "release_id": "release-nova-weekend",
+      "plan_item_id": "plan-nova-weekend",
+      "source_id": "synthetic-source-nova-weekend",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/weekend-constellations",
+      "channel_uc": "UCFAKE000000000000000003",
+      "schedule_id": "schedule-nova-weekend",
+      "slot_id": "slot-nova-weekend-20300608",
+      "publish_at": "2030-06-08T21:30:00+00:00"
+    },
+    {
+      "release_order": 7,
+      "release_id": "release-horizon-weekly",
+      "plan_item_id": "plan-horizon-weekly",
+      "source_id": "synthetic-source-horizon-tide",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/ocean-weather/tide-notes",
+      "channel_uc": "UCFAKE000000000000000005",
+      "schedule_id": "schedule-horizon-weekly",
+      "slot_id": "slot-horizon-weekly-20300611",
+      "publish_at": "2030-06-11T06:50:00+00:00"
+    },
+    {
+      "release_order": 8,
+      "release_id": "release-orion-late",
+      "plan_item_id": "plan-orion-late",
+      "source_id": "synthetic-source-orion-late",
+      "source_mode": "rewrite",
+      "source_url": "https://donor.invalid/night-sky/late-observation",
+      "channel_uc": "UCFAKE000000000000000001",
+      "schedule_id": "schedule-orion-late",
+      "slot_id": "slot-orion-late-20300605",
+      "publish_at": "2030-06-05T20:45:00+00:00"
+    }
+  ]
+}

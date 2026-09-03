@@ -1,0 +1,22 @@
+# VideoStudio — Python-зависимости (Windows, Python 3.10–3.12)
+# Установка:  pip install -r requirements.txt
+# (openai-whisper сам подтянет torch — это ~2 ГБ, нужно для синхрона/субтитров)
+
+pillow==11.3.0
+opencv-python
+numpy==2.3.5
+ImageHash==4.3.2
+requests==2.34.2
+icrawler==0.6.10
+edge-tts==7.2.7
+langdetect==1.0.9
+imageio-ffmpeg
+psutil==7.2.2
+pyperclip
+sv-ttk==2.6.1
+openai-whisper==20250625
+six==1.17.0
+pywin32 ; sys_platform == "win32"
+
+# Примечание: если pip ругнётся на конфликт numpy 2.3.5 ↔ opencv,
+# поставь opencv поновее (pip install -U opencv-python) или numpy<2.
