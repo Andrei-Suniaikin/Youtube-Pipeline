@@ -78,6 +78,27 @@
   .ev time{color:var(--muted);flex:0 0 108px;font-variant-numeric:tabular-nums}
   .ev .step{flex:0 0 110px;color:var(--muted)}
   .empty{padding:34px 16px;text-align:center;color:var(--muted)}
+  .chgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+  .chcard{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--off);
+          border-radius:10px;padding:14px 15px;cursor:pointer}
+  .chcard:hover{border-color:#c9cdd4}
+  .chcard.active{border-left-color:var(--ok)}
+  .chcard.paused{border-left-color:var(--off);opacity:.72}
+  .chcard.problem{border-left-color:var(--bad)}
+  .chcard h3{margin:0 0 3px;font-size:15px}
+  .chcard .meta{color:var(--muted);font-size:12.5px}
+  .cal{display:flex;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);
+       align-items:flex-start}
+  .cal:last-child{border-bottom:0}
+  .cal.past{background:#fbfbfc}
+  .cal time{flex:0 0 132px;font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
+  .cal .dot{flex:0 0 20px;height:20px;border-radius:50%;display:grid;place-items:center;
+            font-size:11px;font-weight:700;margin-top:1px}
+  .cal .what{flex:1;min-width:0}
+  .cal.miss .what{color:var(--bad)}
+  .today{height:0;border-top:2px dashed var(--run);position:relative;margin:0 16px}
+  .today span{position:absolute;top:-9px;left:0;background:var(--card);padding:0 8px;
+              font-size:11px;color:var(--run);font-weight:600}
   .err{background:var(--bad-bg);color:var(--bad);padding:11px 14px;border-radius:8px;
        margin-bottom:14px}
   .res{margin-top:14px}
@@ -95,7 +116,7 @@
   <nav>
     <span class="brand">Studio</span>
     <a class="tab" href="#/releases" id="tab-releases">Выпуски</a>
-    <span class="soon">Каналы</span>
+    <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
     <span class="soon">Ключи</span>
     <span class="soon">Пресеты</span>
@@ -266,6 +287,106 @@ async function viewRelease(id){
   </div>`));
 }
 
+/* ───────────────────────────── каналы ───────────────────────────── */
+
+const CAL_TITLE = {done:'вышел', running:'в работе', blocked:'остановлен',
+                   planned:'запланирован', missed:'пропуск', free:'свободен'};
+const CAL_DOT   = {done:'✓', running:'◐', blocked:'!', planned:'·', missed:'✗', free:'○'};
+const CAL_CLS   = {done:'s-done', running:'s-running', blocked:'s-error',
+                   planned:'s-queued', missed:'s-error', free:'s-idle'};
+
+async function viewChannels(){
+  const d = await api('/ui/channels');
+  app.innerHTML = '';
+  app.append($(`<h1>Каналы</h1>
+    <p class="sub">Расписание выходов, план и история. Цвет карточки — состояние канала.</p>`));
+
+  if (!d.channels.length){
+    app.append($(`<div class="card"><div class="empty">Каналов нет.</div></div>`));
+    return;
+  }
+  const cls = c => c.status === 'active' ? 'active'
+                 : c.status === 'paused' ? 'paused'
+                 : c.status === 'problem' ? 'problem' : '';
+  const grid = $(`<div class="chgrid">${d.channels.map(c => `
+    <div class="chcard ${cls(c)}" data-id="${c.id}">
+      <h3>${esc(c.name)}</h3>
+      <div class="meta">${esc(c.handle || '—')} · ${esc(c.lang)}</div>
+      <div class="meta" style="margin-top:7px">
+        ${c.per_day} ${c.per_day === 1 ? 'выход' : 'выхода'} в неделю · горизонт ${c.horizon_days} дн
+      </div>
+      <div class="meta">готовим за ${c.lead_days} дн ·
+        ${c.has_profile ? 'профиль есть' : '<span style="color:var(--bad)">профиля нет</span>'}</div>
+      <div style="margin-top:9px"><span class="pill ${
+        c.status === 'active' ? 's-done' : c.status === 'problem' ? 's-error' : 's-idle'
+      }">${esc(c.status)}</span></div>
+    </div>`).join('')}</div>`);
+  grid.querySelectorAll('.chcard').forEach(el =>
+    el.onclick = () => location.hash = '#/channel/' + el.dataset.id);
+  app.append(grid);
+}
+
+async function viewChannel(id){
+  const d = await api('/ui/channels/' + encodeURIComponent(id) + '?history=14');
+  const c = d.channel;
+  const times = Object.entries(c.schedule)
+    .map(([day, tt]) => `${day}: ${(tt || []).join(', ')}`).join(' · ') || 'не задано';
+
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/channels">← ко всем каналам</a>
+    <h1>${esc(c.name)}</h1>
+    <p class="sub">${esc(c.handle || '')} · ${esc(c.lang)} · ${esc(c.niche || '')}</p>`));
+
+  app.append($(`<div class="card" style="margin-bottom:16px"><div class="grid">
+    <div><div class="k">Расписание</div>${esc(times)}</div>
+    <div><div class="k">Часовой пояс</div>${esc(c.tz)}</div>
+    <div><div class="k">Горизонт</div>${c.horizon_days} дн</div>
+    <div><div class="k">Готовим заранее</div>${c.lead_days} дн</div>
+    <div><div class="k">Машина</div>${esc(c.host || '—')}</div>
+    <div><div class="k">Профиль</div>${esc(c.profile || '—')}</div>
+  </div></div>`));
+
+  const counts = Object.entries(d.counts)
+    .map(([k, n]) => `<span class="pill ${CAL_CLS[k]}">${CAL_TITLE[k]}: ${n}</span>`).join(' ');
+  app.append($(`<div class="toolbar">${counts}
+    ${d.waiting_without_slot ? `<span class="pill s-queued">без даты ждут:
+      ${d.waiting_without_slot}</span>` : ''}</div>`));
+
+  if (!d.calendar.length){
+    app.append($(`<div class="card"><div class="empty">
+      Расписание не задано — выходов нет, и ссылке некуда встать.</div></div>`));
+    return;
+  }
+
+  // Черта «сейчас» между прошлым и будущим: без неё пропуск и свободный слот
+  // выглядят одинаково, а это разные вещи.
+  const rows = [];
+  let drawn = false;
+  for (const r of d.calendar){
+    if (!r.past && !drawn){ rows.push('<div class="today"><span>сейчас</span></div>'); drawn = true; }
+    const when_ = new Date(r.at * 1000).toLocaleString('ru-RU',
+      {weekday:'short', day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
+    const link = r.project_id ? `#/release/${esc(r.release_id)}` : (r.donor_url || '');
+    const title = r.donor_title || r.donor_url || (r.state === 'missed'
+      ? 'ролика не было' : 'свободен — сюда встанет следующая ссылка');
+    rows.push(`<div class="cal ${r.past ? 'past' : ''} ${r.state === 'missed' ? 'miss' : ''}">
+      <time>${when_}</time>
+      <div class="dot ${CAL_CLS[r.state]}">${CAL_DOT[r.state]}</div>
+      <div class="what">
+        ${link ? `<a href="${esc(link)}" ${r.project_id ? '' : 'target=_blank rel=noopener'}
+            style="font-weight:600">${esc(title)}</a>`
+               : `<span style="font-weight:${r.state === 'free' ? '400' : '600'}">${esc(title)}</span>`}
+        <div class="muted" style="font-size:12.5px">
+          ${esc(CAL_TITLE[r.state])}${r.phase_title ? ' · ' + esc(r.phase_title) : ''}
+          ${r.beyond_horizon ? ' · за горизонтом канала' : ''}
+        </div>
+        ${r.blocked_reason ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : ''}
+      </div></div>`);
+  }
+  if (!drawn) rows.push('<div class="today"><span>сейчас</span></div>');
+  app.append($(`<div class="card">${rows.join('')}</div>`));
+}
+
 /* ────────────────────── сквозная очередь трёх сервисов ────────────────────── */
 
 const SVC_TITLE = {vsgen:'Видео', rewrite:'Текст', cover:'Обложки'};
@@ -366,10 +487,14 @@ async function viewNew(){
 async function render(){
   const h = location.hash || '#/releases';
   const queue = h === '#/queue';
+  const chan = h === '#/channels' || h.startsWith('#/channel/');
   document.getElementById('tab-queue').classList.toggle('on', queue);
-  document.getElementById('tab-releases').classList.toggle('on', !queue);
+  document.getElementById('tab-channels').classList.toggle('on', chan);
+  document.getElementById('tab-releases').classList.toggle('on', !queue && !chan);
   try{
     if (queue) return await viewQueue();
+    if (h.startsWith('#/channel/')) return await viewChannel(decodeURIComponent(h.slice(10)));
+    if (h === '#/channels') return await viewChannels();
     if (h.startsWith('#/release/')) return await viewRelease(decodeURIComponent(h.slice(10)));
     if (h === '#/new') return await viewNew();
     return await viewReleases();

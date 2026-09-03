@@ -11,11 +11,10 @@ PY="$ROOT/.venv/bin/python"
 [ -f "$ROOT/dev/vsgen.dev.db" ] || "$PY" "$ROOT/dev/make_db.py"
 # Кабинет читает воркеры по зашитому пути ~/VideoStudio/src, поэтому ему подсовывается
 # изолированный HOME внутри проекта: dev/home/VideoStudio/src → symlink на workers/.
-[ -f "$ROOT/dev/cabinet.db" ] || cp "$ROOT/dev/vsgen.dev.db" "$ROOT/dev/cabinet.db"
 mkdir -p "$ROOT/dev/home/VideoStudio" "$ROOT/dev/data/tenants"
 [ -e "$ROOT/dev/home/VideoStudio/src" ] || ln -s ../../../workers "$ROOT/dev/home/VideoStudio/src"
 trap 'kill 0' EXIT
-( cd "$ROOT/server" && HOME="$ROOT/dev/home" VS_SERVER_DB="$ROOT/dev/cabinet.db" VS_TENANTS_DIR="$ROOT/dev/data/tenants" \
+( cd "$ROOT/server" && HOME="$ROOT/dev/home" VS_SERVER_DB="$ROOT/dev/vsgen.dev.db" VS_TENANTS_DIR="$ROOT/dev/data/tenants" \
       VS_SERVER_DISABLE_BACKGROUND=1 \
       "$PY" -m uvicorn main:app --port 8800 --log-level warning ) &
 ( cd "$ROOT/cover"   && "$PY" -m uvicorn cover_server:app --port 8900 --log-level warning ) &

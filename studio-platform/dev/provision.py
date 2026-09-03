@@ -120,9 +120,7 @@ def main() -> None:
     print(f"логин: {LOGIN}   (пароль из VS_DEV_PASSWORD)")
 
     print("\nкабинет")
-    for path in (DB, os.path.join(BASE, "dev", "cabinet.db")):
-        if os.path.exists(path):
-            cabinet_password(path)
+    cabinet_password(DB)
     c = sqlite3.connect(DB)
     now = time.time()
     try:

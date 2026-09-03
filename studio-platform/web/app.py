@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sqlite3
@@ -30,10 +31,12 @@ from fastapi import FastAPI, HTTPException                       # noqa: E402
 from fastapi.responses import FileResponse                       # noqa: E402
 from pydantic import BaseModel                                   # noqa: E402
 
+from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
+                           normalize_schedule, upcoming_slots)
 from pub_engine import PHASES, PHASE_DEADLINES                   # noqa: E402
 from pub_remote import COVER_BASE, REWRITE_BASE, get_key         # noqa: E402
 from pub_services import MEDIA_STAGES, OPTIONAL_STAGES           # noqa: E402
-from pub_tags import add_links, parse_links                      # noqa: E402
+from pub_tags import add_links, parse_links, plan_rows           # noqa: E402
 
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 TENANT = os.environ.get("VS_DEV_TENANT", "dev")
@@ -284,6 +287,106 @@ def ui_channels():
         c.close()
 
 
+# ─────────────────────────── календарь канала ───────────────────────────
+
+def past_slots(schedule: dict, tz_name: str, days: int, now=None) -> list:
+    """Слоты канала за прошедшие `days` суток, по возрастанию.
+
+    Зеркало `channel_slots.upcoming_slots()`, которое умеет только вперёд:
+    «уже прошедшие сегодня времена не возвращаются — занять их нельзя». Для плана это
+    верно, для истории — нет: именно прошедший пустой слот и есть пропуск, который
+    требует показывать ТЗ §13, и сегодня его не видно нигде.
+
+    Разбор расписания, часовой пояс и обработка несуществующего времени в ночь перевода
+    часов берутся из тех же функций, что и у прямого прохода: расписание не должно
+    читаться двумя способами.
+    """
+    plan = normalize_schedule(schedule)
+    zone = _zone(tz_name)
+    moment = (now.astimezone(zone) if now is not None else dt.datetime.now(zone))
+    out = []
+    for offset in range(days, -1, -1):
+        day = (moment - dt.timedelta(days=offset)).date()
+        key = ANY_DAY if ANY_DAY in plan else DAY_KEYS[day.weekday()]
+        for hh, mm in plan.get(key, []):
+            point = _localize(day, hh, mm, zone)
+            if point is None:
+                continue                      # этого времени в эту дату не существует
+            if point <= moment:
+                out.append(point)
+    return sorted(out)
+
+
+def _calendar(c, ch, history_days: int) -> list:
+    """Прошлое и будущее канала одной лентой.
+
+    Состояния слота:
+      done      выпуск дошёл до конца
+      running   выпуск в работе
+      blocked   выпуск остановлен
+      planned   ссылка стоит, работа ещё не начиналась
+      missed    время прошло, а ролика не было — ПРОПУСК, его и требует показывать ТЗ
+      free      будущий слот свободен, сюда и ложится следующая ссылка
+    """
+    try:
+        schedule = json.loads(ch["schedule"] or "{}")
+    except ValueError:
+        schedule = {}
+    if not schedule:
+        return []
+
+    # Строки плана по округлённому моменту — так же, как это делает pub_tags.coverage().
+    by_slot = {}
+    for r in plan_rows(c, ch["id"]):
+        if r["slot_at"] and round(r["slot_at"]) not in by_slot:
+            by_slot[round(r["slot_at"])] = r
+    rels = {r["plan_item_id"]: r for r in c.execute(
+        "SELECT * FROM pub_releases WHERE channel_id=? ORDER BY id", (ch["id"],))}
+
+    horizon = int(ch["horizon_days"] or 3)
+    tz = ch["tz"] or "Europe/Warsaw"
+    moments = ([(m, True) for m in past_slots(schedule, tz, history_days)]
+               + [(m, False) for m in upcoming_slots(schedule, tz, horizon)])
+
+    def row_for(moment, item, is_past, beyond=False):
+        rel = rels.get(item["id"]) if item else None
+        if rel is not None:
+            state = {"done": "done", "blocked": "blocked"}.get(rel["status"] or "", "running")
+        elif item is not None:
+            state = "planned"
+        else:
+            state = "missed" if is_past else "free"
+        return {
+            "at": moment.timestamp() if hasattr(moment, "timestamp") else float(moment),
+            "past": is_past,
+            "beyond_horizon": beyond,
+            "state": state,
+            "donor_title": (item["donor_title"] if item else "") or "",
+            "donor_url": (item["donor_url"] if item else "") or "",
+            "release_id": (rel["release_id"] if rel is not None else ""),
+            "phase": (rel["phase"] if rel is not None else ""),
+            "phase_title": PHASE_TITLE.get(rel["phase"], "") if rel is not None else "",
+            "project_id": (rel["project_id"] if rel is not None else "") or "",
+            "blocked_reason": (rel["blocked_reason"] if rel is not None else "") or "",
+        }
+
+    out = [row_for(m, by_slot.get(round(m.timestamp())), past) for m, past in moments]
+
+    # Строки плана ЗА горизонтом. Горизонт — это «куда класть следующую ссылку», а не
+    # «что показывать»: у канала с двумя выходами в неделю и горизонтом в трое суток
+    # ближайший выход часто оказывается за его пределами. Без этого блока выпуск,
+    # который прямо сейчас в работе, не виден в календаре вообще — интерфейс молчал бы
+    # о происходящем.
+    shown = {round(r["at"]) for r in out}
+    for ts, item in sorted(by_slot.items()):
+        if ts in shown:
+            continue
+        moment = dt.datetime.fromtimestamp(ts, dt.timezone.utc)
+        out.append(row_for(moment, item, is_past=(ts <= time.time()), beyond=True))
+    out.sort(key=lambda r: r["at"])
+    return out
+
+
 # ─────────────────────────── сквозная очередь ───────────────────────────
 
 # Оба соседа отдают одинаковую форму: {items, total, limit, offset}, элемент —
@@ -366,6 +469,60 @@ def ui_queue():
         c.close()
     rows.sort(key=lambda r: (r["created"] or 0), reverse=True)
     return {"rows": rows, "services": services}
+
+
+@app.get("/ui/channels/{channel_id}")
+def ui_channel(channel_id: int, history: int = 14):
+    """Канал: карточка, календарь с историей и пропусками, сводка.
+
+    `history` — сколько суток прошлого показывать. По умолчанию две недели: этого
+    хватает, чтобы увидеть пропуски, и мало, чтобы лента осталась читаемой.
+    """
+    history = max(0, min(90, int(history)))
+    c = db()
+    try:
+        ch = c.execute("SELECT * FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (channel_id, TENANT)).fetchone()
+        if ch is None:
+            raise HTTPException(404, "канал не найден")
+        cal = _calendar(c, ch, history)
+        waiting = c.execute(
+            "SELECT COUNT(*) n FROM pub_plan_items WHERE channel_id=? AND slot_at IS NULL "
+            "AND status NOT IN ('cancelled','done')", (channel_id,)).fetchone()["n"]
+        host = c.execute("SELECT code, title FROM pub_hosts WHERE id=?",
+                         (ch["host_id"],)).fetchone() if ch["host_id"] else None
+        prof = c.execute("SELECT serial, title FROM pub_profiles WHERE id=?",
+                         (ch["profile_id"],)).fetchone() if ch["profile_id"] else None
+        try:
+            schedule = json.loads(ch["schedule"] or "{}")
+        except ValueError:
+            schedule = {}
+        counts = {}
+        for row in cal:
+            counts[row["state"]] = counts.get(row["state"], 0) + 1
+        return {
+            "channel": {
+                "id": ch["id"], "name": ch["name"], "handle": ch["handle"] or "",
+                "uc": ch["uc"], "lang": (ch["lang"] or "").upper(),
+                "niche": ch["niche"] or "", "status": ch["status"],
+                "tz": ch["tz"], "horizon_days": ch["horizon_days"],
+                "lead_days": ch["lead_days"],
+                "deferred": bool(ch["deferred"]), "deferred_limit": ch["deferred_limit"],
+                "schedule": schedule,
+                "per_week": sum(len(v or []) for v in schedule.values()),
+                "host": (f'{host["code"]} · {host["title"]}' if host else ""),
+                "profile": (f'{prof["serial"]} · {prof["title"]}' if prof else ""),
+                "presets": {"rewrite": ch["preset_rewrite"] or "",
+                            "vsgen": ch["preset_vsgen_id"],
+                            "cover": ch["preset_cover"] or ""},
+            },
+            "calendar": cal,
+            "counts": counts,
+            "waiting_without_slot": waiting,
+            "history_days": history,
+        }
+    finally:
+        c.close()
 
 
 class LinksIn(BaseModel):

@@ -20,7 +20,7 @@ sys.path.insert(0, os.path.join(BASE, "workers"))
 
 from call_journal import CallJournal  # noqa: E402
 
-DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "cabinet.db"))
+DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 URL = os.environ.get("VS_CALLS_URL", "http://127.0.0.1:8800")
 PROJECT = "proj-dev-0001"
 

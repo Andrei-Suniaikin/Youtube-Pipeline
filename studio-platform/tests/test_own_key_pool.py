@@ -21,7 +21,7 @@ sys.path.insert(0, os.path.join(BASE, "server"))
 # setdefault здесь бесполезен — HOME уже пришёл из оболочки.
 os.environ["HOME"] = os.path.join(BASE, "dev", "home")
 os.environ["VS_SERVER_DISABLE_BACKGROUND"] = "1"
-os.environ.setdefault("VS_SERVER_DB", os.path.join(BASE, "dev", "cabinet.db"))
+os.environ.setdefault("VS_SERVER_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 os.environ.setdefault("VS_TENANTS_DIR", os.path.join(BASE, "dev", "data", "tenants"))
 
 import main  # noqa: E402

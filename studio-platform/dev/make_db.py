@@ -74,13 +74,51 @@ def seed(c) -> dict:
          "active", NOW, NOW, 2, 1, 5))
     ch_id = c.execute("SELECT id FROM pub_channels WHERE handle='@demo'").fetchone()[0]
 
-    c.execute(
-        "INSERT INTO pub_plan_items(tenant_id,channel_id,version,donor_url,position,slot_at,"
-        "slot_mode,overrides,status,frozen,created,updated,donor_title) "
-        "VALUES(?,?,1,?,0,?,'auto','{}','frozen',1,?,?,?)",
-        (TENANT, ch_id, "https://www.youtube.com/watch?v=dev0000001",
-         NOW + 2 * DAY, NOW, NOW, "Донорский ролик для разработки"))
-    item_id = c.execute("SELECT id FROM pub_plan_items ORDER BY id DESC LIMIT 1").fetchone()[0]
+    # Строки плана ставим РОВНО в слоты расписания канала, иначе календарь покажет их
+    # пропусками: он сопоставляет план со слотами по округлённому моменту, как это
+    # делает pub_tags.coverage(). Слоты считаем тем же кодом, что и кабинет.
+    sys.path.insert(0, os.path.join(ROOT, "studio-platform", "server"))
+    from channel_slots import upcoming_slots           # noqa: E402
+    import datetime as _dt
+
+    sched = {"mon": ["18:00"], "thu": ["18:00"]}
+    tz = "Europe/Warsaw"
+    now_dt = _dt.datetime.fromtimestamp(NOW, _dt.timezone.utc)
+    ahead = upcoming_slots(sched, tz, 7, now_dt)
+    # Прошлые слоты — то же расписание, отмотанное назад (зеркало upcoming_slots).
+    from channel_slots import normalize_schedule, _localize, _zone, DAY_KEYS, ANY_DAY
+    plan_days = normalize_schedule(sched)
+    zone = _zone(tz)
+    moment = now_dt.astimezone(zone)
+    behind = []
+    for off in range(14, -1, -1):
+        day = (moment - _dt.timedelta(days=off)).date()
+        key = ANY_DAY if ANY_DAY in plan_days else DAY_KEYS[day.weekday()]
+        for hh, mm in plan_days.get(key, []):
+            pt = _localize(day, hh, mm, zone)
+            if pt is not None and pt <= moment:
+                behind.append(pt)
+    behind.sort()
+
+    def add_item(slot_dt, url, title, status="planned"):
+        c.execute(
+            "INSERT INTO pub_plan_items(tenant_id,channel_id,version,donor_url,position,"
+            "slot_at,slot_mode,overrides,status,frozen,created,updated,donor_title) "
+            "VALUES(?,?,1,?,0,?,'auto','{}',?,?,?,?,?)",
+            (TENANT, ch_id, url, slot_dt.timestamp(), status,
+             1 if status != "planned" else 0, NOW, NOW, title))
+        return c.execute("SELECT id FROM pub_plan_items ORDER BY id DESC LIMIT 1").fetchone()[0]
+
+    # Прошлое: вышедший ролик, остановленный и один пропуск (слот без строки вовсе).
+    done_item = add_item(behind[-3], "https://www.youtube.com/watch?v=dev0000done",
+                         "Вышедший ролик", "done") if len(behind) >= 3 else None
+    blocked_item = add_item(behind[-1], "https://www.youtube.com/watch?v=dev000stop",
+                            "Остановленный выпуск", "frozen") if behind else None
+    # behind[-2] намеренно оставлен пустым — это и есть видимый пропуск.
+
+    # Ближайший слот: выпуск в работе, ради которого и заведён проект.
+    item_id = add_item(ahead[0], "https://www.youtube.com/watch?v=dev0000001",
+                       "Донорский ролик для разработки", "frozen")
 
     # Сам проект VideoStudio: страница /p/{id} без этой строки отдаёт заглушку.
     c.execute("INSERT INTO projects(id,tenant_id,name,dir_path,status,created,updated,settings) "
@@ -95,8 +133,24 @@ def seed(c) -> dict:
         "INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,plan_item_version,"
         "channel_id,uc,slot_at,project_id,status,phase,heartbeat,deadline,attempts,"
         "created,updated) VALUES(?,?,?,1,?,?,?,?,'running','media_ready',?,?,0,?,?)",
-        (rid, TENANT, item_id, ch_id, "UCdev0000000000000000001", NOW + 2 * DAY,
+        (rid, TENANT, item_id, ch_id, "UCdev0000000000000000001", ahead[0].timestamp(),
          "proj-dev-0001", NOW, NOW + 6 * 3600, NOW - 3600, NOW))
+
+    if done_item:
+        c.execute(
+            "INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,plan_item_version,"
+            "channel_id,uc,slot_at,project_id,status,phase,created,updated) "
+            "VALUES('rel-dev-done',?,?,1,?,?,?,'proj-dev-done','done','scheduled',?,?)",
+            (TENANT, done_item, ch_id, "UCdev0000000000000000001",
+             behind[-3].timestamp(), NOW, NOW))
+    if blocked_item:
+        c.execute(
+            "INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,plan_item_version,"
+            "channel_id,uc,slot_at,status,phase,blocked_reason,created,updated) "
+            "VALUES('rel-dev-stop',?,?,1,?,?,?,'blocked','cover_ready',"
+            "'у канала не выбран пресет обложек',?,?)",
+            (TENANT, blocked_item, ch_id, "UCdev0000000000000000001",
+             behind[-1].timestamp(), NOW, NOW))
 
     # Лента фаз: как её пишет log_phase() в pub_engine.
     for i, ph in enumerate(("created", "source_ready", "project_ready")):
