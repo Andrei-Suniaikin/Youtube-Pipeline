@@ -34,6 +34,21 @@ except ImportError:
     PIL_AVAILABLE = False
 
 
+# 03.09.2026: журнал платных вызовов. Клиент лежит в соседнем каталоге workers/,
+# пакета нет — путь добавляем точечно и в КОНЕЦ sys.path, чтобы ничего не затенить.
+# Импорт мягкий: движок обложек запускают и отдельно (CLI, ноутбук), там журнала может
+# не быть вовсе, и его отсутствие не должно ронять генерацию.
+try:
+    import sys as _sys
+    _WORKERS_DIR = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "workers")
+    if os.path.isdir(_WORKERS_DIR) and _WORKERS_DIR not in _sys.path:
+        _sys.path.append(_WORKERS_DIR)
+    from call_journal import CallJournal
+except Exception:                                                     # noqa: BLE001
+    CallJournal = None
+
+
 try:
     warnings.filterwarnings("ignore", message=".*Pydantic V1.*Python 3.14.*")
     import openai
@@ -1327,6 +1342,8 @@ def generate_image_via_fast_gen(
     log_fn=None,
     reference_images: Optional[List[str]] = None,
     cancel_check=None,
+    on_order=None,                       # 03.09.2026: журнал платных вызовов
+    resume_order_id: str = "",           # 03.09.2026: журнал платных вызовов
 ) -> Optional[Image.Image]:
     """Единая точка: по provider вызывает Flow, Flower, Whisk, Gemini, Grok или OpenAI.
     reference_images (v1.0.9) — Flow (array). v1.0.10 — Flower (single, истинный img2img).
@@ -1383,6 +1400,8 @@ def generate_image_via_fast_gen(
             prompt, api_key, p, model=model, base_url=base_url,
             aspect_ratio=aspect_ratio, max_retries=max_retries, log_fn=log_fn,
             reference_images=reference_images, cancel_check=cancel_check,
+            # 03.09.2026: только у Fast Gen v6 есть id заказа — журналируем его
+            on_order=on_order, resume_order_id=resume_order_id,
         )
     finally:
         budget.release(reserved_units)
@@ -1432,6 +1451,7 @@ def generate_image_v6(
     reference_images: Optional[List[str]] = None, seed: Optional[int] = None,
     poll_interval: float = 2.0, poll_max_wait: float = 180.0,
     max_retries: int = None, log_fn=None, cancel_check=None,
+    on_order=None, resume_order_id: str = "",
 ) -> Optional[Image.Image]:
     """v1.3.1: унифицированный Fast Gen v6. POST /api/v6/generations → poll /api/v6/generations/{id}.
     Старые /api/v4/{provider}/image/generate сняты провайдером (404). Картинка — в results[0]
@@ -1447,7 +1467,10 @@ def generate_image_v6(
         max_retries = FAST_GEN_MAX_RETRIES
 
     gen_id = None
-    for attempt in range(max_retries):
+    # 03.09.2026: журнал платных вызовов. resume_order_id — заказ уже создан и оплачен
+    # (прошлый прогон умер между POST и скачиванием); POST не повторяем, сразу поллим.
+    _resume = (resume_order_id or "").strip()
+    for attempt in range(0 if _resume else max_retries):
         if cancel_check and cancel_check():
             _last_fastgen_error.value = "Отменено пользователем"
             return None
@@ -1475,6 +1498,17 @@ def generate_image_v6(
         except Exception as e:
             _record_fastgen_error(e)
             return None
+    # 03.09.2026: id заказа известен — сообщаем журналу ДО ожидания результата,
+    # иначе падение во время поллинга сотрёт след платной генерации.
+    if _resume:
+        gen_id = _resume
+        if log_fn:
+            log_fn(f"[generate_image_v6] resume {gen_id}: жду результат ранее созданного заказа")
+    elif gen_id and on_order:
+        try:
+            on_order(gen_id)
+        except Exception:                                             # noqa: BLE001
+            pass
     if not gen_id:
         return None
 
@@ -1536,6 +1570,8 @@ def _generate_via_fast_gen_inner(
     log_fn=None,
     reference_images: Optional[List[str]] = None,
     cancel_check=None,
+    on_order=None,                       # 03.09.2026: журнал платных вызовов
+    resume_order_id: str = "",           # 03.09.2026: журнал платных вызовов
 ) -> Optional[Image.Image]:
     """Диспетчер: все провайдеры → унифицированный v6 (v1.3.1). v4 per-provider сняты."""
     import random
@@ -1546,8 +1582,181 @@ def _generate_via_fast_gen_inner(
     return generate_image_v6(
         prompt, api_key, operation, base_url=base_url, aspect_ratio=aspect_ratio,
         reference_images=reference_images, seed=seed, max_retries=max_retries, log_fn=log_fn,
-        cancel_check=cancel_check,
+        cancel_check=cancel_check, on_order=on_order, resume_order_id=resume_order_id,
     )
+
+
+# ════════════════════════════════════════════════════════
+#  ЖУРНАЛ ПЛАТНЫХ ВЫЗОВОВ (03.09.2026)
+# ════════════════════════════════════════════════════════
+# Генерация обложки — платный вызов, и на ролик их несколько (вариант на язык плюс
+# повторы неудачных). Раньше от повторной оплаты защищала только проверка «файл уже
+# есть»: падение или таймаут между «провайдер принял заказ» и «картинка скачана»
+# оплачивал обложку второй раз. Порядок обязателен: reserve() до провайдера →
+# ordered() как только известен id заказа → delivered() когда файл записан.
+#
+# Синхронные провайдеры (veononstop, gpt-image-2, xai) id заказа не выдают: у них
+# шаг ordered() пропускается, а «заказ создан» выводится из самого факта запроса.
+
+# Единственный dispatch с id заказа и опросом статуса — Fast Gen v6. Всё остальное
+# (veo, gpt_image2, xai) синхронно и id заказа не имеет; неизвестный dispatch считаем
+# синхронным намеренно — так дороже не будет.
+_JOURNAL_POLLABLE_DISPATCH = "fastgen"
+
+
+def _journal_refs_digest(reference_images) -> List[str]:
+    """Короткие хэши референсов для отпечатка: сами data URI весят мегабайты."""
+    out = []
+    for r in (reference_images or []):
+        if not r:
+            continue
+        out.append(hashlib.sha256(str(r).encode("utf-8", "replace")).hexdigest()[:16])
+    return out
+
+
+def _journal_charged(err) -> bool:
+    """Мог ли этот отказ означать списание денег.
+
+    ИСПРАВЛЕНО 03.09.2026. Раньше для трёх синхронных провайдеров ЛЮБОЙ отказ помечался
+    как «заказ был» (ordered=True). Последствие: одна опечатка в ключе давала 401, строка
+    журнала застревала в «спросить провайдера», и следующая попытка отказывалась платить —
+    обложки вставали насмерть до ручной разблокировки в кабинете. Отказ провайдера ДО
+    приёма работы деньгами не пахнет и обязан разрешать повтор.
+
+    Ложь в любую сторону стоит денег, поэтому правило простое: неизвестный отказ считаем
+    оплаченным. Бесплатным считаем только то, что провайдер назвал явно.
+    """
+    text = str(err or "")
+    low = text.lower()
+    # Провайдер отказался ДО работы: неверный ключ, слишком большой запрос, отказ
+    # валидации, документированный лимит. Денег нет, повтор безопасен.
+    for mark in ("401", "403", "413", "400 bad request", "429",
+                 "api key", "ключ не принят", "неверный/пустой"):
+        if mark in low:
+            return False
+    # Соединение не состоялось — запрос до провайдера не доехал.
+    for mark in ("connectionerror", "connection refused", "name or service not known",
+                 "failed to establish", "nameresolutionerror"):
+        if mark in low:
+            return False
+    return True
+
+
+def _journaled_generate(
+    prompt: str,
+    api_key: str,
+    *,
+    provider: str,
+    model: str = "",
+    base_url: str = FAST_GEN_API_BASE,
+    aspect_ratio: str = "16:9",
+    max_retries: int = None,
+    log_fn=None,
+    reference_images: Optional[List[str]] = None,
+    cancel_check=None,
+    unit: str = "",
+    lang: str = "",
+    preset_name: str = "",
+    result_path: str = "",
+    note: str = "",
+    log=None,
+) -> Optional[Image.Image]:
+    """generate_image_via_fast_gen + журнал платных вызовов.
+
+    Без VS_CALLS_URL/VS_JOB_ID/VS_JOB_TOKEN клиент отдаёт action="off", may_call=True —
+    поведение движка ровно прежнее (важно: обложки генерят и из CLI, без кабинета).
+    """
+    say = log or (lambda _m: None)
+    _call = lambda **kw: generate_image_via_fast_gen(                 # noqa: E731
+        prompt, api_key, provider=provider, model=model, base_url=base_url,
+        aspect_ratio=aspect_ratio, max_retries=max_retries, log_fn=log_fn,
+        reference_images=reference_images, cancel_check=cancel_check, **kw)
+
+    if CallJournal is None:
+        return _call()
+
+    journal = CallJournal(log=say)
+    if not journal.enabled:
+        return _call()
+
+    try:
+        dispatch = provider_policy(canonical_generation_provider(provider or "flow")).dispatch
+    except Exception:                                                 # noqa: BLE001
+        dispatch = ""
+    # Соотношение сторон обязано быть в отпечатке: 16:9 и 9:16 — разные картинки и разная
+    # цена. Известный дефект gpt-image-2 (16:9 → 1536x1024, то есть 3:2) здесь НЕ чиним —
+    # пишем то соотношение, которое реально ушло в вызов.
+    fingerprint = journal.fingerprint(
+        provider=provider, model=model, prompt=prompt, lang=lang,
+        preset=preset_name, aspect=_v6_aspect(aspect_ratio),
+        refs=_journal_refs_digest(reference_images), note=note,
+    )
+    decision = journal.reserve(unit=unit, fingerprint=fingerprint, kind="cover",
+                               provider=str(provider or ""), model=str(model or ""))
+
+    if decision.action == "skip":
+        # Обложка уже оплачена и получена — к провайдеру не идём.
+        path = decision.result_path or ""
+        if path and os.path.exists(path):
+            try:
+                say(f"   ⏭ журнал: обложка уже получена ранее — беру {path}")
+                return Image.open(path).convert("RGB")
+            except Exception as e:                                    # noqa: BLE001
+                say(f"   ⚠ журнал: {path} не читается ({e}) — повторно не оплачиваю")
+                return None
+        say(f"   ⏭ журнал: вызов уже оплачен и доставлен (путь: {path or 'не записан'}) — "
+            f"повторно не оплачиваю")
+        return None
+
+    if decision.action == "verify":
+        # Заказ уже создавался. Второй создавать НЕЛЬЗЯ.
+        order_id = decision.remote_order_id or ""
+        if order_id and dispatch == _JOURNAL_POLLABLE_DISPATCH:
+            say(f"   ↻ журнал: заказ {order_id} уже создан — дожидаюсь его результата без оплаты")
+            image = _call(resume_order_id=order_id)
+            if image is None:
+                journal.failed(decision.call_id, "resume: заказ не отдал картинку", ordered=True)
+                return None
+            journal.delivered(decision.call_id, result_path or "")
+            return image
+        say("   ⏭ журнал: заказ уже создавался, а синхронного провайдера опросить нечем — "
+            "пропускаю без оплаты")
+        return None
+
+    if not decision.may_call:
+        # unknown: кабинет не ответил. Не знаем, оплачен ли вызов — платить нельзя.
+        say(f"   ⏭ журнал: решение «{decision.action}» — платный вызов запрещён")
+        return None
+
+    ordered = {"v": False}
+
+    def _on_order(order_id):
+        if order_id and not ordered["v"]:
+            ordered["v"] = True
+            journal.ordered(decision.call_id, order_id)
+
+    try:
+        image = _call(on_order=_on_order)
+    except Exception as e:                                            # noqa: BLE001
+        journal.failed(decision.call_id, e,
+                       ordered=ordered["v"] or (dispatch != _JOURNAL_POLLABLE_DISPATCH
+                                                and _journal_charged(e)))
+        raise
+    if image is None:
+        # Отмена пользователем — не отказ провайдера: если заказ так и не создан, денег
+        # нет и повтор после перезапуска безопасен.
+        if cancel_check and cancel_check():
+            journal.failed(decision.call_id, "Отменено пользователем", ordered=ordered["v"])
+            return None
+        # Синхронные провайдеры без ключа идемпотентности: после таймаута/5xx неизвестно,
+        # приняли ли платную генерацию → отмечаем как «заказ был», чтобы повтор не платил.
+        err = getattr(_last_fastgen_error, "value", "") or "провайдер не отдал картинку"
+        journal.failed(decision.call_id, err,
+                       ordered=ordered["v"] or (dispatch != _JOURNAL_POLLABLE_DISPATCH
+                                                and _journal_charged(err)))
+        return None
+    journal.delivered(decision.call_id, result_path or "")
+    return image
 
 
 # ════════════════════════════════════════════════════════
@@ -1722,6 +1931,7 @@ def _generate_simple_edit(
     openai_api_key: str,
     log_fn=None,
     cancel_check=None,
+    result_path: str = "",      # 03.09.2026: куда ляжет файл — для журнала платных вызовов
 ) -> CoverResult:
     """vS: «простая генерация» — реальное превью уходит в модель на РЕДАКТИРОВАНИЕ
     (перевод текста на preset_lang.language + лёгкая смена поз/ракурса), без vision-анализа,
@@ -1792,7 +2002,10 @@ def _generate_simple_edit(
         if cancelled():
             result.error = "Отменено пользователем"
             return result
-        generated = generate_image_via_fast_gen(
+        # 03.09.2026: платный вызов идёт через журнал (reserve → ordered → delivered).
+        # Номер попытки в отпечатке: движок сознательно пересэмплирует один и тот же
+        # промпт после провала QC — это РАЗНЫЕ платные вызовы, а не дубль.
+        generated = _journaled_generate(
             prompt, fast_gen_api_key,
             provider=provider,
             model=model,
@@ -1802,6 +2015,12 @@ def _generate_simple_edit(
             log_fn=debug_log,
             reference_images=reference_images,
             cancel_check=cancel_check,
+            unit=get_lang_code(language),
+            lang=language,
+            preset_name=preset_lang.name,
+            result_path=result_path,
+            note=f"simple/attempt{attempt + 1}",
+            log=log,
         )
         if cancelled():
             result.error = "Отменено пользователем"
@@ -1855,6 +2074,7 @@ def _generate_for_language(
     skip_adapt: bool = False,
     reference_images: Optional[List[str]] = None,
     mode: str = "url",
+    result_path: str = "",      # 03.09.2026: куда ляжет файл — для журнала платных вызовов
 ) -> CoverResult:
     """
     Генерация одной обложки по уже готовым thumbnail и analysis (без повторного скачивания и анализа).
@@ -1888,6 +2108,7 @@ def _generate_for_language(
             r = _generate_simple_edit(
                 thumbnail, preset_lang, fast_gen_api_key, openai_api_key,
                 log_fn=log_fn, cancel_check=cancel_check,
+                result_path=result_path,        # 03.09.2026: журнал платных вызовов
             )
             r.analysis = analysis
             return r
@@ -1929,7 +2150,10 @@ def _generate_for_language(
             if cancelled():
                 result.error = "Отменено пользователем"
                 return result
-            generated = generate_image_via_fast_gen(
+            # 03.09.2026: платный вызов идёт через журнал (reserve → ordered → delivered).
+            # Номер попытки в отпечатке: пересэмплирование того же промпта после провала
+            # проверки текста — это РАЗНЫЕ платные вызовы, а не дубль одного.
+            generated = _journaled_generate(
                 prompt, fast_gen_api_key,
                 provider=preset_lang.generation_provider,
                 model=preset_lang.generation_model,
@@ -1939,6 +2163,12 @@ def _generate_for_language(
                 log_fn=debug_log,
                 reference_images=reference_images,
                 cancel_check=cancel_check,
+                unit=get_lang_code(preset_lang.language),
+                lang=preset_lang.language,
+                preset_name=preset_lang.name,
+                result_path=result_path,
+                note=f"{mode}/attempt{attempt + 1}",
+                log=log,
             )
             if cancelled():
                 result.error = "Отменено пользователем"
@@ -1991,7 +2221,8 @@ def _generate_for_language(
             if cancelled():
                 result.error = "Отменено пользователем"
                 return result
-            clean_img = generate_image_via_fast_gen(
+            # 03.09.2026: clean-fallback — тоже платный вызов, тоже через журнал.
+            clean_img = _journaled_generate(
                 prompt_clean, fast_gen_api_key,
                 provider=preset_lang.generation_provider,
                 model=preset_lang.generation_model,
@@ -2001,6 +2232,12 @@ def _generate_for_language(
                 log_fn=debug_log,
                 reference_images=reference_images,
                 cancel_check=cancel_check,
+                unit=get_lang_code(preset_lang.language),
+                lang=preset_lang.language,
+                preset_name=preset_lang.name,
+                result_path=result_path,
+                note=f"{mode}/clean{clean_attempt + 1}",
+                log=log,
             )
             if clean_img:
                 log(f"   ✅ Сохраняю вариант без текста (попытка {clean_attempt + 1})")
@@ -2167,6 +2404,7 @@ def _process_batch_title_mode(
             skip_adapt=True,
             reference_images=ref_list,
             mode="title",
+            result_path=full_path,          # 03.09.2026: журнал платных вызовов
         )
         if r.success and r.image:
             r.image.save(full_path, "JPEG", quality=92)
@@ -2371,7 +2609,9 @@ def _process_batch_seed_mode(
                 task_log(f"⚠ Реф-файл {os.path.basename(ref_path)} пропущен (не существует/>5MB/не картинка)")
 
         r = CoverResult()
-        img = generate_image_via_fast_gen(
+        # 03.09.2026: платный вызов идёт через журнал (reserve → ordered → delivered).
+        # unit = код языка + номер варианта: в seed-режиме вариантов на язык несколько.
+        img = _journaled_generate(
             final_prompt, fast_gen_api_key,
             provider=preset_lang.generation_provider,
             model=preset_lang.generation_model,
@@ -2381,6 +2621,12 @@ def _process_batch_seed_mode(
             log_fn=(log_fn if getattr(preset_lang, "debug_mode", False) else None),
             reference_images=ref_list,
             cancel_check=cancel_check,
+            unit=(get_lang_code(lang) if n_variants <= 1 else f"{get_lang_code(lang)}-v{v}"),
+            lang=lang,
+            preset_name=preset_lang.name,
+            result_path=full_path,
+            note="seed",
+            log=task_log,
         )
         if img is not None:
             img.save(full_path, "JPEG", quality=92)
@@ -2607,6 +2853,7 @@ def process_batch(
                     gemini_api_key, openai_api_key, fast_gen_api_key, log_fn,
                     cancel_check=cancel_check,
                     mode="url",
+                    result_path=full_path,      # 03.09.2026: журнал платных вызовов
                 )
                 if r.success and r.image:
                     _save_result(r, url, lang, analysis, i)

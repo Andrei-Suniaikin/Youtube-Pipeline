@@ -57,6 +57,16 @@ try:
 except Exception:
     prompt_llm = None
 
+# 03.09.2026: журнал платных вызовов кабинета. Один кадр = один платный заказ у провайдера,
+# и до сих пор от повторной оплаты защищала только проверка «файл уже на диске»: она не
+# закрывает окно между «провайдер принял заказ» и «файл скачан». Модуля нет или переменных
+# окружения нет → CallJournal отдаёт action="off"/may_call=True и движок работает как раньше
+# (движки запускают руками из консоли, без кабинета).
+try:
+    from call_journal import CallJournal
+except Exception:
+    CallJournal = None
+
 # Исправление кодировки для Windows
 if sys.platform == 'win32':
     try:
@@ -7551,6 +7561,10 @@ def googler_v6_generate(v6_model: str, prompt: str, aspect_ratio: Optional[str] 
     if not gid:
         print_user(f"❌ [{index}] v6: нет id в ответе ({str(resp)[:160]})", "ERROR")
         return None
+    # 03.09.2026: заказ создан и уже оплачен — фиксируем id ДО поллинга. Именно здесь
+    # раньше терялись деньги: падение/таймаут во время ожидания и кадр заказывали заново.
+    # Вне генерации кадра (видео, ручной вызов) заявки нет и это no-op.
+    _journal_note_order(gid)
     return poll_v6_generation(gid, index=index, timeout=timeout)
 
 
@@ -7770,6 +7784,8 @@ def generate_hero_reference(text: str, project_dir: str,
                 "capacity": ref_contract.reference_capacity(GOOGLER_MODEL),
                 "identity_block": "",
             },
+            # 03.09.2026: авто-герой идёт с index=0 и в журнале столкнулся бы с кадром 001.
+            journal_unit="ref-hero",
         )
         if hero_b64 and _reference_image_is_valid(hero_path):
             _commit_generated_reference_receipt(
@@ -7852,6 +7868,9 @@ def generate_character_ref(appearance: str, style: str, out_path: str,
                 "capacity": ref_contract.reference_capacity(GOOGLER_MODEL),
                 "identity_block": "",
             },
+            # 03.09.2026: реф персонажа тоже идёт с index=0 — свой unit, чтобы не
+            # смешаться в журнале с кадром 001.
+            journal_unit=f"ref-{os.path.splitext(os.path.basename(out_path))[0]}",
         )
         if image_data and _reference_image_is_valid(out_path):
             _commit_generated_reference_receipt(
@@ -10308,6 +10327,150 @@ def _base64_image_size(data_uri: str) -> Tuple[int, int]:
         raise ValueError(f"ответ не является читаемым изображением: {exc}") from exc
 
 
+# ============================================================================
+# Журнал платных вызовов (03.09.2026)
+# ============================================================================
+# Порядок обязателен и держится именно здесь, на уровне кадра (номер сцены + промпт
+# известны только тут, в HTTP-обёртке их уже нет):
+#   1) reserve()  — ДО первого обращения к провайдеру: строка появляется раньше денег;
+#   2) ordered()  — немедленно, как только известен id заказа, ДО ожидания результата;
+#   3) delivered()— когда файл реально записан на диск.
+# Между (1) и (2) и происходит потеря денег при падении/таймауте, ради этого окна всё и
+# делается. Журнал не настроен → все функции ниже возвращают «делай как раньше».
+
+_JOURNAL_FRAME = threading.local()   # состояние строки текущего кадра (поток = кадр)
+_JOURNAL_SINGLETON = None
+_JOURNAL_SINGLETON_LOCK = threading.Lock()
+
+
+class _JournalOff:
+    """Решение «журнала нет» — байт-в-байт прежнее поведение движка."""
+    action = "off"
+    call_id = 0
+    remote_order_id = ""
+    result_path = ""
+    attempts = 0
+    error = ""
+    may_call = True
+
+
+_JOURNAL_OFF = _JournalOff()
+
+
+def _journal():
+    global _JOURNAL_SINGLETON
+    if CallJournal is None:
+        return None
+    if _JOURNAL_SINGLETON is None:
+        with _JOURNAL_SINGLETON_LOCK:
+            if _JOURNAL_SINGLETON is None:
+                _JOURNAL_SINGLETON = CallJournal(log=print_user)
+    return _JOURNAL_SINGLETON
+
+
+def _journal_provider() -> str:
+    """Кто именно берёт деньги за этот кадр (цена и лимиты у них разные)."""
+    if GOOGLER_MODEL in IMAGE_MODEL_V6:
+        return "recrafter"
+    if GOOGLER_MODEL in VEO_BANANA_MODELS:
+        return "veo"
+    if GOOGLER_MODEL == "GPT_IMAGE2":
+        return "openai"
+    return "googler"
+
+
+def _journal_reserve_frame(unit, prompt, seed, aspect_ratio, reference_bundle,
+                           output_path):
+    """Заявка на платный вызов ДО обращения к провайдеру.
+
+    В отпечаток входит ровно то, что определяет результат и цену: модель, финальный
+    промпт (в нём уже собраны стиль, ракурс, identity-блок и контракт видимого текста),
+    seed, соотношение сторон и sha256 отправляемых референсов. Ничего сверх этого:
+    лишнее поле = тот же кадр будет оплачен заново.
+    """
+    _JOURNAL_FRAME.state = None
+    journal = _journal()
+    if journal is None or not journal.enabled:
+        return _JOURNAL_OFF
+    refs = []
+    for row in ((reference_bundle or {}).get("selected") or []):
+        artifact = row.get("artifact") or {}
+        refs.append("{}:{}".format(
+            row.get("slot_id") or "",
+            artifact.get("sha256") or artifact.get("fingerprint") or "",
+        ))
+    fingerprint = journal.fingerprint(
+        model=GOOGLER_MODEL, prompt=prompt, seed=seed,
+        aspect=aspect_ratio, refs=sorted(refs),
+    )
+    decision = journal.reserve(unit=str(unit), fingerprint=fingerprint, kind="images",
+                               provider=_journal_provider(), model=GOOGLER_MODEL)
+    # skip — строка уже закрыта кабинетом; повторный отчёт о доставке ей не нужен.
+    if decision.call_id and decision.action != "skip":
+        _JOURNAL_FRAME.state = {
+            "journal": journal, "call_id": decision.call_id, "order_id": "",
+            "ordered": False, "closed": False, "path": output_path or "",
+        }
+    return decision
+
+
+def _journal_note_order(order_id, post: bool = True) -> None:
+    """Заказ создан. Пишем СРАЗУ, до ожидания результата — иначе журнал бесполезен.
+
+    Кадр внутри своего цикла попыток может создать второй заказ; в строке должен
+    остаться ПОСЛЕДНИЙ, потому что именно он в полёте, когда прогон падает.
+    post=False — заказ создан прошлым прогоном (ветка verify): помечаем строку как
+    оплаченную, но повторный отчёт не отправляем.
+    """
+    state = getattr(_JOURNAL_FRAME, "state", None)
+    if not state or state["closed"] or not order_id:
+        return
+    if state["order_id"] == order_id:
+        return
+    state["order_id"] = order_id
+    state["ordered"] = True
+    if post:
+        state["journal"].ordered(state["call_id"], order_id)
+
+
+def _journal_close_frame(image_data, error: str = "") -> None:
+    state = getattr(_JOURNAL_FRAME, "state", None)
+    _JOURNAL_FRAME.state = None          # пул переиспользует потоки: чужой остаток недопустим
+    if not state or state["closed"]:
+        return
+    state["closed"] = True
+    path = state["path"]
+    if image_data and (not path or os.path.exists(path)):
+        state["journal"].delivered(state["call_id"], path)
+    else:
+        state["journal"].failed(
+            state["call_id"],
+            error or _last_gen_error() or "кадр не получен",
+            ordered=state["ordered"],
+        )
+
+
+def _journal_frame_call(function):
+    """Закрывает строку журнала на ЛЮБОМ выходе из generate_image.
+
+    Декоратор, а не правка полутора десятков `return` внутри функции: пропущенная точка
+    выхода означала бы вечно открытую строку и кадр, который больше никогда не повторят.
+    """
+    @functools.wraps(function)
+    def _wrapped(*args, **kwargs):
+        try:
+            result = function(*args, **kwargs)
+        except BaseException as exc:
+            _journal_close_frame(None, error=f"{type(exc).__name__}: {str(exc)[:200]}")
+            raise
+        _journal_close_frame(
+            result[1] if isinstance(result, tuple) and len(result) > 1 else None
+        )
+        return result
+    return _wrapped
+
+
+@_journal_frame_call   # 03.09.2026: журнал платных вызовов, см. блок выше
 def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] = None,
                    user_refs: List[str] = None, output_path: str = None,
                    aspect_ratio: str = "landscape", seed: Optional[int] = None, index: int = 0, use_legacy: bool = False,
@@ -10315,7 +10478,8 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                    style_refs: Optional[List[str]] = None,
                    bible: Optional[dict] = None, ref_image_map: Optional[dict] = None,
                    hero_subject: Optional[str] = None,
-                   reference_bundle: Optional[dict] = None) -> Tuple[int, Optional[str]]:
+                   reference_bundle: Optional[dict] = None,
+                   journal_unit: Optional[str] = None) -> Tuple[int, Optional[str]]:
     """
     Генерирует изображение через Googler API v3 с поддержкой референсов и моделью GEM_PIX_2.
 
@@ -10481,7 +10645,65 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
     print_debug(f"[{index}] Промпт: {prompt[:150]}...")
     if reference_images:
         print_debug(f"[{index}] Референсов: {len(reference_images)} ({', '.join(ref_hints)})")
-    
+
+    # 03.09.2026: заявка в журнал платных вызовов ДО первого обращения к провайдеру.
+    # Номер кадра — тот же ключ, которым уже живут receipts (f"{index+1:03d}"), чтобы
+    # строка журнала и квитанция кадра указывали на одну и ту же сцену.
+    _jrn = _journal_reserve_frame(
+        unit=(journal_unit or f"{index + 1:03d}"),
+        prompt=prompt, seed=seed, aspect_ratio=aspect_ratio,
+        reference_bundle=reference_bundle, output_path=output_path,
+    )
+    if _jrn.action == "skip":
+        # Кадр уже оплачен и получен раньше — второй заказ создавать нельзя.
+        _jrn_done = _jrn.result_path or output_path or ""
+        if _jrn_done and os.path.exists(_jrn_done):
+            print_user(f"♻️ [{index+1}] Журнал: кадр уже получен ({os.path.basename(_jrn_done)}) — "
+                       f"платный запрос не нужен", "INFO")
+            try:
+                with open(_jrn_done, "rb") as _jf:
+                    return (index, base64.b64encode(_jf.read()).decode("ascii"))
+            except OSError as _je:
+                print_user(f"⚠️ [{index+1}] Журнал: готовый файл не читается ({_je}) — "
+                           f"кадр пропущен без нового платного запроса", "ERROR")
+                return (index, None)
+        print_user(f"⛔ [{index+1}] Журнал: кадр числится оплаченным и полученным, но файла "
+                   f"«{_jrn_done}» здесь нет — пропускаю без нового платного запроса", "ERROR")
+        return (index, None)
+    if not _jrn.may_call:
+        if _jrn.action == "verify":
+            # Заказ по этому кадру уже создавался. Второй заказ = вторая оплата, поэтому
+            # либо опрашиваем существующий id, либо пропускаем кадр (его доберут две
+            # существующие добивки пропущенных).
+            _jrn_poll = (
+                poll_v6_generation if GOOGLER_MODEL in IMAGE_MODEL_V6
+                else poll_v4_operation if (GOOGLER_MODEL in FLOW_GENERATE_MODELS
+                                           or GOOGLER_MODEL in ("FLOWER", "GROK",
+                                                                "GROK_SPEED", "OPENAI"))
+                else None
+            )
+            if _jrn.remote_order_id and _jrn_poll is not None:
+                _journal_note_order(_jrn.remote_order_id, post=False)
+                print_user(f"🔎 [{index+1}] Журнал: заказ {_jrn.remote_order_id} уже создан — "
+                           f"опрашиваю его, нового не создаю", "WARNING")
+                _jrn_data = _jrn_poll(_jrn.remote_order_id, index, timeout=IMAGE_POLL_TIMEOUT)
+                if _jrn_data:
+                    if output_path:
+                        save_base64_to_file(_jrn_data, output_path)
+                    print_user(f"✅ [{index+1}] Журнал: результат забран у уже оплаченного заказа", "SUCCESS")
+                    return (index, _jrn_data)
+                print_user(f"❌ [{index+1}] Журнал: оплаченный заказ {_jrn.remote_order_id} "
+                           f"результата не дал — кадр пропущен без нового платного запроса", "ERROR")
+                return (index, None)
+            print_user(f"⛔ [{index+1}] Журнал: заказ уже создавался"
+                       f"{' (id ' + str(_jrn.remote_order_id) + ')' if _jrn.remote_order_id else ' (id неизвестен)'}, "
+                       f"опросить его нечем — пропускаю кадр без повторной оплаты", "ERROR")
+            return (index, None)
+        # unknown: кабинет не ответил, и мы не знаем, не оплачен ли кадр уже. Платить нельзя.
+        print_user(f"⛔ [{index+1}] Журнал недоступен ({_jrn.error or _jrn.action}) — "
+                   f"кадр пропущен: повторная оплата дороже пропуска", "ERROR")
+        return (index, None)
+
     # v2 endpoint dead — only v3/v4 attempts, no legacy fallback
     # VEO_BANANA (NonStop) — столько же попыток, сколько у veo-видео (VEO_MAX_ATTEMPTS); остальным моделям 5.
     # Per-key оверрайд из кабинета (GOOGLER_MAX_RETRIES) заменяет дефолт, если задан.
@@ -10644,6 +10866,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 request_data["reference_image"] = ref_img
             v4_result = googler_request_v4("flower/image/generate", data=request_data)
             op_id = v4_result.get("operation_id")
+            _journal_note_order(op_id)   # 03.09.2026: заказ оплачен — пишем id ДО поллинга
             if op_id:
                 image_data = poll_v4_operation(op_id, index, timeout=IMAGE_POLL_TIMEOUT)
                 if image_data:
@@ -10673,6 +10896,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 v4_result = googler_request_v4("grok/image/generate", data=request_data)
                 _grok_label = f"Grok generate ({grok_quality})"
             op_id = v4_result.get("operation_id")
+            _journal_note_order(op_id)   # 03.09.2026: заказ оплачен — пишем id ДО поллинга
             if op_id:
                 image_data = poll_v4_operation(op_id, index, timeout=IMAGE_POLL_TIMEOUT)
                 if image_data:
@@ -10697,6 +10921,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 request_data["seed"] = seed
             v4_result = googler_request_v4("flow/image/generate", data=request_data)
             op_id = v4_result.get("operation_id")
+            _journal_note_order(op_id)   # 03.09.2026: заказ оплачен — пишем id ДО поллинга
             if op_id:
                 image_data = poll_v4_operation(op_id, index, timeout=IMAGE_POLL_TIMEOUT)
                 if image_data:
@@ -10841,6 +11066,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 request_data["reference_images"] = ref_list
             v4_result = googler_request_v4("openai/image/generate", data=request_data)
             op_id = v4_result.get("operation_id")
+            _journal_note_order(op_id)   # 03.09.2026: заказ оплачен — пишем id ДО поллинга
             if op_id:
                 image_data = poll_v4_operation(op_id, index, timeout=IMAGE_POLL_TIMEOUT)
                 if image_data:

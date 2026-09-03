@@ -34,6 +34,41 @@ except ImportError:
     def print_error_user_friendly(error_msg, show_debug_hint=True):
         print_user(error_msg, "ERROR")
 
+# 03.09.2026: журнал платных вызовов. Импорт мягкий, по образцу i18n/logger_config выше:
+# движок запускают и из каталогов, где call_journal.py рядом не положен, и это не повод
+# падать. Заглушка отдаёт "off" — поведение ровно как до подключения журнала.
+try:
+    from call_journal import CallJournal
+except ImportError:
+    class _JournalOffDecision:
+        action = "off"
+        call_id = 0
+        remote_order_id = ""
+        result_path = ""
+        attempts = 0
+        error = ""
+        may_call = True
+
+    class CallJournal:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        @staticmethod
+        def fingerprint(**parts):
+            return ""
+
+        def reserve(self, **kwargs):
+            return _JournalOffDecision()
+
+        def ordered(self, *args, **kwargs):
+            return False
+
+        def delivered(self, *args, **kwargs):
+            return False
+
+        def failed(self, *args, **kwargs):
+            return False
+
 # Исправление кодировки для Windows
 if sys.platform == 'win32':
     try:
@@ -552,29 +587,92 @@ def process_paragraph(paragraph_data):
         print_debug(f"   Использую Lumean Model ID: {model_uuid}")
 
     identity = _receipt_identity(paragraph_text, voice_uuid, model_uuid, identity_scope)
+
+    # 03.09.2026: заявка в журнал платных вызовов ДО POST /orders — строка о вызове
+    # обязана появиться раньше денег, иначе оборванный заказ не с чем сопоставить.
+    # Экземпляр локальный: env может быть выставлен после импорта модуля, а потокам
+    # ThreadPoolExecutor общее состояние не нужно.
+    journal = CallJournal(log=lambda msg: print_user(msg, "WARNING"))
+    try:
+        speed_for_fingerprint = _canonical_speed(TTS_SPEED)
+    except ValueError:
+        speed_for_fingerprint = str(TTS_SPEED)
+    decision = journal.reserve(
+        unit=os.path.basename(output_mp3_path),
+        fingerprint=journal.fingerprint(
+            template_id=str(voice_uuid or DEFAULT_TEMPLATE_UUID or ""),
+            model_id=str(model_uuid or ""),
+            speed=speed_for_fingerprint,
+            text_sha=hashlib.sha256(paragraph_text.encode("utf-8")).hexdigest(),
+        ),
+        kind="tts",
+        provider="lumean",
+        model=str(model_uuid or ""),
+    )
+    if decision.action == "skip" and os.path.exists(output_mp3_path) and os.path.getsize(output_mp3_path) > 0:
+        # 03.09.2026: журнал уже видел доставленный результат этого отпечатка, и файл
+        # на месте — платить второй раз не за что.
+        print_debug(f"[{idx}] Журнал: вызов уже оплачен и доставлен, заказ не создаётся")
+        return True
+
     try:
         # Receipt защищает оплату, поэтому используется независимо от файлового --use_cache.
         task_id = _load_receipt(output_mp3_path, identity)
     except Exception as e:
+        # 03.09.2026: все эти ошибки означают возможный уже созданный платный заказ,
+        # поэтому строка журнала остаётся «спросить провайдера».
+        journal.failed(decision.call_id, f"receipt: {e}", ordered=True)
         print_error_user_friendly(f"Lumean: абзац {idx}: {e}")
         return False
+    if not task_id and decision.action == "verify":
+        # 03.09.2026: журнал знает, что заказ по этому отпечатку уже создавался. Второй
+        # POST /orders — двойная оплата, поэтому опрашиваем существующий заказ через
+        # тот же GET /orders/{id}, что и обычное ожидание.
+        task_id = str(decision.remote_order_id or "").strip()
+        if task_id:
+            print_user(
+                f"Lumean: абзац {idx}: журнал вернул ранее созданный заказ {task_id}; "
+                "новый платный заказ не создаётся",
+                "WARNING",
+            )
     if task_id:
         print_debug(f"[{idx}] Продолжаю ранее оплаченный Lumean-заказ {task_id}")
+        # 03.09.2026: заказ уже существует — фиксируем его id в журнале, не создавая новый.
+        journal.ordered(decision.call_id, task_id)
     else:
+        if not decision.may_call:
+            # 03.09.2026: платить нельзя. unknown — кабинет не ответил и мы не знаем,
+            # не оплачен ли этот вызов; verify/skip без id заказа и без файла — заказ
+            # уже был, и его надо искать в кабинете Lumean, а не создавать заново.
+            print_error_user_friendly(
+                f"Lumean: абзац {idx}: журнал не разрешает новый платный заказ "
+                f"(решение {decision.action}"
+                f"{'; ' + decision.error if decision.error else ''}); "
+                "проверьте заказ в кабинете Lumean, новый платный заказ не создан"
+            )
+            return False
         try:
             # POST /orders платный и не имеет idempotency key. После неопределённой
             # сетевой ошибки не создаём второй заказ молча: полученный id сразу
             # фиксируем receipt-ом, а неудавшийся POST оставляем fail-closed.
             _save_receipt(output_mp3_path, identity, state="creating")
             task_id = create_task(paragraph_text, voice_uuid=voice_uuid, model_uuid=model_uuid)
+            # 03.09.2026: id заказа уходит в журнал сразу после POST /orders и ДО ожидания
+            # готовности — деньги теряются именно в этом промежутке.
+            journal.ordered(decision.call_id, task_id)
             _save_receipt(output_mp3_path, identity, task_id)
             print_debug(f"[{idx}] Lumean-заказ создан: {task_id}")
         except Exception as e:
             # Явный 4xx/локальная валидация означает, что заказ не создан. При timeout/5xx
             # marker остаётся: повторный запуск fail-closed и не списывает деньги дважды.
-            if (isinstance(e, ValueError) or
-                    (isinstance(e, LumeanAPIError) and e.status_code < 500 and e.status_code != 408)):
+            # 03.09.2026: тот же признак отдаём журналу — условие вынесено в переменную,
+            # чтобы receipt и журнал не могли разойтись в оценке «оплачено/не оплачено».
+            rejected_before_order = (
+                isinstance(e, ValueError) or
+                (isinstance(e, LumeanAPIError) and e.status_code < 500 and e.status_code != 408))
+            if rejected_before_order:
                 _discard_creating_receipt(output_mp3_path, identity)
+            journal.failed(decision.call_id, f"create: {e}", ordered=not rejected_before_order)
             print_error_user_friendly(f"Lumean: не удалось создать заказ для абзаца {idx}: {e}")
             return False
 
@@ -582,13 +680,20 @@ def process_paragraph(paragraph_data):
         order = wait_for_audio(task_id)
     except LumeanTerminalOrderError as e:
         _save_receipt(output_mp3_path, identity, task_id, state="terminal", status=e.status)
+        # 03.09.2026: заказ существует — ordered=True, иначе журнал разрешит оплатить снова.
+        journal.failed(decision.call_id, str(e), ordered=True)
         print_error_user_friendly(str(e))
         return False
     except LumeanManualRecoveryError as e:
         _save_receipt(output_mp3_path, identity, task_id, state="manual_recovery", status="manual_recovery")
+        # 03.09.2026: оплаченный заказ ждёт ручного разбора в кабинете Lumean.
+        journal.failed(decision.call_id, str(e), ordered=True)
         print_error_user_friendly(str(e))
         return False
     except Exception as e:
+        # 03.09.2026: обрыв/таймаут/5xx уже ПОСЛЕ создания заказа — строка остаётся
+        # «спросить провайдера», повтор без проверки запрещён.
+        journal.failed(decision.call_id, f"wait: {e}", ordered=True)
         print_error_user_friendly(f"Lumean: не удалось дождаться заказа {task_id}: {e}")
         return False
 
@@ -596,9 +701,13 @@ def process_paragraph(paragraph_data):
         try:
             get_audio_result(task_id, output_mp3_path, order=order)
             print_debug(f"Абзац '{idx}' успешно обработан")
+            # 03.09.2026: mp3 лежит на диске — закрываем строку журнала.
+            journal.delivered(decision.call_id, output_mp3_path)
             return True
         except LumeanFilesExpiredError as e:
             _save_receipt(output_mp3_path, identity, task_id, state="terminal", status="files_expired")
+            # 03.09.2026: заказ был оплачен, файлы удалены по сроку хранения.
+            journal.failed(decision.call_id, str(e), ordered=True)
             print_error_user_friendly(str(e))
             return False
         except Exception as e:
@@ -606,6 +715,9 @@ def process_paragraph(paragraph_data):
             if attempt < MAX_RETRIES - 1:
                 print_user("Проблема с сетью, пробую снова...", "WARNING")
                 time.sleep(RETRY_DELAY_SECONDS)
+    # 03.09.2026: заказ оплачен, но результат не забран — строка не закрывается как
+    # доставленная и остаётся под вопросом к провайдеру.
+    journal.failed(decision.call_id, f"download: не удалось забрать заказ {task_id}", ordered=True)
     print_error_user_friendly(f"Не удалось забрать озвучку Lumean для абзаца '{idx}'")
     return False
 
