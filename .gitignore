@@ -1,23 +1,26 @@
-  .DS_Store
-  .idea/
-  __pycache__/
-  *.py[cod]
-  .venv/
-  venv/
-  # секреты и доступы — никогда
-  .env
-  *.env
-  ДОСТУП*
-  ключи*
-  secrets/
-  *.pem
-  *.key
-  cookies*.json
-  # данные и выхлоп
-  *.db
-  *.db-wal
-  *.db-shm
-  projects/
-  gen_out/
-  *.mp4
-  *.mp3
+.DS_Store
+.idea/
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+# секреты и доступы — никогда
+.env
+*.env
+ДОСТУП*
+ключи*
+secrets/
+*.pem
+*.key
+cookies*.json
+# данные и выхлоп
+*.db
+*.db-wal
+*.db-shm
+projects/
+gen_out/
+*.mp4
+*.mp3
+# генерируемое окружение разработки studio-platform
+studio-platform/dev/home/
+studio-platform/dev/data/
