@@ -26,4 +26,7 @@ echo "  кабинет  http://127.0.0.1:8800   (боевой VSGen)"
 echo "  rewrite  http://127.0.0.1:8899"
 echo "  cover    http://127.0.0.1:8900"
 echo
+echo "  ключи соседей живут в базе; после dev/make_db.py их нужно выдать заново:"
+echo "    .venv/bin/python dev/provision.py"
+echo
 wait

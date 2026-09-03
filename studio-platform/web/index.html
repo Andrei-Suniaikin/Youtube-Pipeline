@@ -118,7 +118,7 @@
     <a class="tab" href="#/releases" id="tab-releases">Выпуски</a>
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
-    <span class="soon">Ключи</span>
+    <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
     <span class="soon">Пресеты</span>
   </nav>
 </header>
@@ -285,6 +285,77 @@ async function viewRelease(id){
       </div>`).join('')}
     ${!d.events.length && !d.log.length ? '<div class="empty">Записей пока нет.</div>' : ''}
   </div>`));
+}
+
+/* ───────────────────────────── ключи ───────────────────────────── */
+
+function dur(sec){
+  if (sec == null) return '—';
+  if (sec < 60) return sec + ' с';
+  if (sec < 3600) return Math.round(sec/60) + ' мин';
+  if (sec < 86400) return Math.round(sec/3600) + ' ч';
+  return Math.round(sec/86400) + ' дн';
+}
+
+async function viewKeys(){
+  const d = await api('/ui/keys');
+  app.innerHTML = '';
+  app.append($(`<h1>Ключи</h1>
+    <p class="sub">Что занято, кто ждёт и до какого времени отдыхает ключ —
+      вместо «свободных слотов», которые ничего не говорят.</p>`));
+
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Очередь по провайдерам</div>
+    ${d.providers.length ? `<table><thead><tr>
+        <th>Провайдер</th><th>Ждут</th><th>В работе</th><th>Старейшая ждёт</th>
+      </tr></thead><tbody>${d.providers.map(p => `<tr>
+        <td style="font-weight:600">${esc(p.provider)}</td>
+        <td>${p.queued}</td><td>${p.running}</td>
+        <td class="${p.oldest_wait_sec > 6*3600 ? 'note bad' : 'muted'}">
+          ${p.queued ? dur(p.oldest_wait_sec) : '—'}
+          ${p.oldest_wait_sec > 6*3600 ? ' — дольше шести часов' : ''}</td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Очередь пуста.</div>'}
+  </div>`));
+
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Отдыхающие ключи</div>
+    ${d.resting.length ? d.resting.map(r => `<div class="stage">
+        <div class="dot s-queued">⏳</div>
+        <div class="body">
+          <div class="name">${esc(r.family)} · <span class="mono">${esc(r.mask)}</span></div>
+          <div class="facts">проснётся через ${dur(r.left_sec)}${
+            r.noticed_by_neighbour ? ' · лимит заметил соседний сервис' : ''}</div>
+          <div class="note muted">${esc(r.why)}</div>
+        </div></div>`).join('')
+      : '<div class="empty">Все ключи в строю.</div>'}
+  </div>`));
+
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Свои ключи пользователей</div>
+    ${d.own_keys.length ? `<table><thead><tr>
+        <th>Пользователь</th><th>Провайдер</th><th>Ключей</th><th>Раздача</th>
+      </tr></thead><tbody>${d.own_keys.map(o => `<tr>
+        <td>${esc(o.user)}</td><td>${esc(o.family)}</td><td>${o.count}</td>
+        <td>${o.pooled
+          ? '<span class="pill s-done">по кругу между ключами</span>'
+          : '<span class="pill s-idle">ключ один</span>'}</td>
+      </tr>`).join('')}</tbody></table>
+      <div class="sec" style="border-bottom:0;font-weight:400" class="muted">
+        Значения ключей наружу не отдаются — ни здесь, ни в API: только количество и маска.
+      </div>`
+      : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
+  </div>`));
+
+  if (d.unavailable && d.unavailable.length){
+    app.append($(`<div class="card">
+      <div class="sec">Чего отсюда не видно</div>
+      ${d.unavailable.map(u => `<div class="stage">
+        <div class="dot s-idle">?</div>
+        <div class="body"><div class="name">${esc(u.what)}</div>
+        <div class="note muted">${esc(u.why)}</div></div></div>`).join('')}
+    </div>`));
+  }
 }
 
 /* ───────────────────────────── каналы ───────────────────────────── */
@@ -488,13 +559,16 @@ async function render(){
   const h = location.hash || '#/releases';
   const queue = h === '#/queue';
   const chan = h === '#/channels' || h.startsWith('#/channel/');
+  const keys = h === '#/keys';
   document.getElementById('tab-queue').classList.toggle('on', queue);
   document.getElementById('tab-channels').classList.toggle('on', chan);
-  document.getElementById('tab-releases').classList.toggle('on', !queue && !chan);
+  document.getElementById('tab-keys').classList.toggle('on', keys);
+  document.getElementById('tab-releases').classList.toggle('on', !queue && !chan && !keys);
   try{
     if (queue) return await viewQueue();
     if (h.startsWith('#/channel/')) return await viewChannel(decodeURIComponent(h.slice(10)));
     if (h === '#/channels') return await viewChannels();
+    if (h === '#/keys') return await viewKeys();
     if (h.startsWith('#/release/')) return await viewRelease(decodeURIComponent(h.slice(10)));
     if (h === '#/new') return await viewNew();
     return await viewReleases();

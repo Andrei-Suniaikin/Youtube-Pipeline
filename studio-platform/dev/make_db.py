@@ -7,6 +7,7 @@
 
     python3 dev/make_db.py [путь_к_базе]     # по умолчанию dev/vsgen.dev.db
 """
+import json
 import os
 import re
 import sqlite3
@@ -171,6 +172,30 @@ def seed(c) -> dict:
         c.execute("INSERT INTO queue_tasks(tenant_id,project_id,kind,status,created,params,"
                   "uid,progress,stage,provider) VALUES(?,?,?,?,?,'{}',1,?,?,?)",
                   (TENANT, "proj-dev-0001", kind, status, NOW, progress, stage, provider))
+
+    # Ключи и кулдауны — чтобы экрану «Ключи» было что показывать. Значения выдуманные,
+    # формат — тот, что кабинет реально пишет в admin_state.credential_cooldown.
+    c.execute("UPDATE users SET keys=? WHERE id=1", (json.dumps({
+        "googler": ["own-key-AAAAAAAAAAAAAAAAAAAA", "own-key-BBBBBBBBBBBBBBBBBBBB"],
+        "openai": "own-openai-CCCCCCCCCCCCCCCC"}),))
+    c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES('credential_cooldown',?,?)",
+              (json.dumps({
+                  "googler:1": {"family": "googler", "mask": "fg_live_aaaa…b3gt",
+                                "until": NOW + 1800,
+                                "why": "HTTP 429 — часовой лимит картинок исчерпан"},
+                  "openai:1": {"family": "openai", "mask": "sk-proj-cccc…9f2a",
+                               "until": NOW + 240, "shared": True,
+                               "why": "лимит заметил сосед (rewrite): окно подписки исчерпано"},
+              }), NOW))
+    c.execute("INSERT OR REPLACE INTO provider_rr_cursor(provider,last_uid,updated) "
+              "VALUES('recrafter',1,?)", (NOW,))
+    # Очередь с ожиданием: старейшая задача ждёт два часа — видно на экране «Ключи».
+    for kind, prov, st, age in (("images", "recrafter", "queued", 7200),
+                                ("images", "recrafter", "queued", 900),
+                                ("tts", "lumean", "queued", 120)):
+        c.execute("INSERT INTO queue_tasks(tenant_id,project_id,kind,status,created,params,"
+                  "uid,provider) VALUES(?,?,?,?,?,'{}',1,?)",
+                  (TENANT, "proj-dev-0001", kind, st, NOW - age, prov))
 
     c.execute("INSERT INTO pub_release_log(release_id,ts,level,step,message) "
               "VALUES(?,?,'info','кадры','готово 38 из 60, две сцены в добивке')",

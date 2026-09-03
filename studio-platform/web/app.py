@@ -471,6 +471,93 @@ def ui_queue():
     return {"rows": rows, "services": services}
 
 
+@app.get("/ui/keys")
+def ui_keys():
+    """Честная картина по ключам вместо «свободных слотов» (ТЗ §12).
+
+    Что видно отсюда и откуда берётся:
+      очередь и ожидание  — queue_tasks: длина по провайдеру и возраст самой старой
+      отдыхающие ключи    — admin_state.credential_cooldown: до какого времени и почему
+      свои ключи          — users.keys, только количество и маска, значения наружу не идут
+      курсор раздачи      — provider_rr_cursor: кому выдали последним
+
+    Чего отсюда НЕ видно и почему: текущая занятость слотов живёт в памяти кабинета
+    (SERVER_CREDENTIAL_POOL._loads), а не в базе. Показывать её выдуманной нельзя —
+    это ровно то враньё интерфейса, которое мы весь день убираем. Нужен эндпоинт на
+    стороне кабинета; до тех пор поле честно помечено как недоступное.
+    """
+    now = time.time()
+    c = db()
+    try:
+        # Очередь по провайдерам: длина и возраст самой старой ожидающей задачи.
+        providers = {}
+        for q in c.execute(
+                "SELECT COALESCE(provider,'') provider, status, COUNT(*) n, MIN(created) oldest "
+                "FROM queue_tasks WHERE tenant_id=? AND status IN ('queued','running') "
+                "GROUP BY provider, status", (TENANT,)):
+            p = providers.setdefault(q["provider"] or "—",
+                                     {"provider": q["provider"] or "—", "queued": 0,
+                                      "running": 0, "oldest_wait_sec": 0})
+            p[q["status"]] = q["n"]
+            if q["status"] == "queued" and q["oldest"]:
+                p["oldest_wait_sec"] = max(p["oldest_wait_sec"], int(now - q["oldest"]))
+
+        # Отдыхающие ключи. Значение ключа наружу не отдаётся — только маска, как в кабинете.
+        resting = []
+        row = c.execute("SELECT v FROM admin_state WHERE k='credential_cooldown'").fetchone()
+        if row and row["v"]:
+            try:
+                for _sid, rec in (json.loads(row["v"]) or {}).items():
+                    until = float(rec.get("until") or 0)
+                    if until <= now:
+                        continue          # срок вышел, ключ уже проснулся
+                    resting.append({
+                        "family": rec.get("family") or "",
+                        "mask": rec.get("mask") or "—",
+                        "until": until,
+                        "left_sec": int(until - now),
+                        "why": (rec.get("why") or "")[:180],
+                        "noticed_by_neighbour": bool(rec.get("shared")),
+                    })
+            except ValueError:
+                pass
+        resting.sort(key=lambda r: r["until"])
+
+        # Свои ключи пользователей: сколько их у кого. Значения не читаем и не отдаём.
+        own = []
+        for u in c.execute("SELECT id, name, keys FROM users WHERE tenant_id=?", (TENANT,)):
+            try:
+                data = json.loads(u["keys"] or "{}")
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            for family, val in data.items():
+                items = val if isinstance(val, (list, tuple)) else ([val] if val else [])
+                uniq = [str(v) for v in items if v]
+                if not uniq:
+                    continue
+                own.append({"user": u["name"], "family": family, "count": len(set(uniq)),
+                            "pooled": len(set(uniq)) > 1})
+
+        cursor = [{"provider": r["provider"], "last_uid": r["last_uid"],
+                   "updated": r["updated"]}
+                  for r in c.execute("SELECT * FROM provider_rr_cursor ORDER BY provider")]
+    finally:
+        c.close()
+    return {
+        "providers": sorted(providers.values(), key=lambda p: -p["queued"]),
+        "resting": resting,
+        "own_keys": sorted(own, key=lambda o: (o["user"], o["family"])),
+        "rr_cursor": cursor,
+        "unavailable": [
+            {"what": "занято слотов из лимита",
+             "why": "живёт в памяти кабинета (SERVER_CREDENTIAL_POOL), в базе этого нет; "
+                    "нужен эндпоинт на стороне кабинета"},
+        ],
+    }
+
+
 @app.get("/ui/channels/{channel_id}")
 def ui_channel(channel_id: int, history: int = 14):
     """Канал: карточка, календарь с историей и пропусками, сводка.
