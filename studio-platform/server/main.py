@@ -28,6 +28,7 @@ BACKGROUND_ENABLED = os.environ.get("VS_SERVER_DISABLE_BACKGROUND", "").strip().
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import card_jobs as card_contract
+from pub_calls import ensure_calls_schema
 from pub_schema import ensure_pub_schema
 from pub_ui import register_pub_routes
 from pub_engine import tick as pub_tick
@@ -2093,6 +2094,7 @@ def init_db():
               "admin_id INTEGER, admin_name TEXT, action TEXT, target TEXT, detail TEXT, result TEXT)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_ts ON admin_audit(id DESC)")
     ensure_pub_schema(c)   # контур публикаций: каналы → план → выпуски
+    ensure_calls_schema(c)  # журнал платных вызовов: строка на ОДИН вызов провайдера
     c.execute("CREATE TABLE IF NOT EXISTS admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL)")
     c.commit()
     if not c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
