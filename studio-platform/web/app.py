@@ -38,8 +38,19 @@ from pub_remote import COVER_BASE, REWRITE_BASE, get_key         # noqa: E402
 from pub_services import MEDIA_STAGES, OPTIONAL_STAGES           # noqa: E402
 from pub_tags import add_links, parse_links, plan_rows           # noqa: E402
 
+import pub_alerts                                                # noqa: E402
+import pub_alerts_tg                                             # noqa: E402
+import pub_retention                                             # noqa: E402
+from pub_env import load_env, mask                                # noqa: E402
+
+load_env()
+
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 TENANT = os.environ.get("VS_DEV_TENANT", "dev")
+# Тот же путь, что читает кабинет (main.py TENANTS_DIR): уборка и производство должны
+# смотреть в один каталог, иначе экран покажет пустой диск при полном.
+TENANTS_DIR = (os.environ.get("VS_TENANTS_DIR")
+               or os.path.join(BASE, "dev", "data", "tenants"))
 
 PHASE_TITLE = {
     "created": "заведён",
@@ -646,3 +657,95 @@ def ui_links(body: LinksIn):
     return {"placed": [str(p) for p in res.get("placed", [])],
             "queued": res.get("queued", 0),
             "skipped": list(res.get("skipped", []))}
+
+
+# ─────────────────────────── админ: тревоги и диск ───────────────────────────
+
+@app.get("/ui/alerts")
+def ui_alerts():
+    """Что сейчас горит и сказали ли мы об этом (ТЗ §13).
+
+    Экран отвечает на три разных вопроса, и их важно не смешивать: что происходит,
+    что из этого уже отправлено в телеграм, и настроен ли телеграм вообще. Тревога,
+    которая честно определилась, но не ушла, потому что нет токена, — не то же самое,
+    что тишина.
+    """
+    now = time.time()
+    c = db()
+    try:
+        found = pub_alerts.detect(c, now, TENANT)
+        state = pub_alerts.load_state(c)
+        active = []
+        for key, a in sorted(found.items()):
+            st = state.get(key) or {}
+            active.append({
+                "key": key, "title": a.title, "text": a.text, "money": a.money,
+                "said_at": st.get("sent") or 0, "times": st.get("n") or 0,
+                "since": st.get("since") or 0,
+            })
+        # Поводы, которые уже сняты, но про которые мы обязаны сказать «починилось».
+        owed = [{"key": k, "title": (state[k] or {}).get("title") or k}
+                for k in sorted(state) if k not in found and (state[k] or {}).get("sent")]
+    finally:
+        c.close()
+    tg = pub_alerts_tg.Telegram(log=lambda *_a: None)
+    return {
+        "active": active,
+        "owed_recovered": owed,
+        "transport": {"configured": tg.enabled, "token": mask(tg.token),
+                      "chat": tg.chat or "",
+                      "how": "токен от @BotFather в .env → dev/alerts.py --whoami "
+                             "покажет chat_id → dev/alerts.py --test"},
+        "thresholds": [
+            {"what": "очередь не пустая, но ничего не завершается",
+             "value": pub_alerts.STALL_SEC},
+            {"what": "провайдер на паузе", "value": pub_alerts.RESTING_SEC},
+            {"what": "есть готовые ролики, но заливки нет", "value": pub_alerts.UPLOAD_SEC},
+            {"what": "самая старая задача ждёт", "value": pub_alerts.OLDEST_SEC},
+            {"what": "повтор одного и того же повода", "value": pub_alerts.REPEAT_SEC},
+        ],
+        "disk_min_gb": pub_alerts.DISK_MIN_GB,
+    }
+
+
+@app.get("/ui/disk")
+def ui_disk():
+    """Место, проекты и цена уборки (ТЗ §03/12).
+
+    Ничего не удаляет и не может: удаление живёт в `dev/retention.py --apply`.
+    Здесь видно ровно то, на основании чего принимается решение, включая то, сколько
+    оплаченных вызовов исчезнет вместе с файлами.
+    """
+    now = time.time()
+    c = db()
+    try:
+        pol = pub_retention.policy(c)
+        projects = pub_retention.scan(c, TENANTS_DIR, TENANT)
+        acts = pub_retention.plan(projects, pol, now)
+    finally:
+        c.close()
+    rows, freeable = [], 0
+    for p, action, why, freed in acts:
+        price = pub_retention.price_of(p, action) if action != "keep" else {
+            "calls": 0, "cost": 0.0, "detail": ""}
+        freeable += freed
+        rows.append({
+            "pid": p.pid, "name": p.name, "phase": p.phase or "",
+            "release_id": p.release_id or "", "video_id": p.video_id or "",
+            "total": p.total, "strippable": p.strippable, "sizes": p.sizes,
+            "published_at": p.published_at or 0, "busy": p.busy,
+            "action": action, "why": why, "frees": freed,
+            "paid_calls": price["calls"], "paid_cost": price["cost"],
+        })
+    rows.sort(key=lambda r: -r["total"])
+    return {
+        "space": pub_retention.free_space(TENANTS_DIR),
+        "policy": pol,
+        "policy_set": bool(pol),
+        "projects": rows,
+        "total": sum(r["total"] for r in rows),
+        "freeable": freeable,
+        "categories": [{"code": c_, "name": n, "fate": f}
+                       for c_, n, f, _pat in pub_retention.CATEGORIES],
+        "how": "срок хранения задаёт владелец: dev/retention.py --policy strip=14 drop=90",
+    }

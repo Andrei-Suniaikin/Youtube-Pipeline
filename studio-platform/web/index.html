@@ -120,6 +120,7 @@
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
     <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
     <span class="soon">Пресеты</span>
+    <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
   </nav>
 </header>
 
@@ -141,6 +142,12 @@ function when(ts){
   const d = new Date(ts * 1000);
   return d.toLocaleString('ru-RU', {day:'2-digit', month:'2-digit',
                                     hour:'2-digit', minute:'2-digit'});
+}
+function size(n){
+  n = Number(n || 0);
+  if (n < 1048576) return (n/1024).toFixed(0) + ' КБ';
+  if (n < 1073741824) return (n/1048576).toFixed(0) + ' МБ';
+  return (n/1073741824).toFixed(2) + ' ГБ';
 }
 function ago(sec){
   if (sec == null) return '';
@@ -553,26 +560,133 @@ async function viewNew(){
   };
 }
 
+/* ─────────────────────────── админ: тревоги и диск ─────────────────────────── */
+
+const FATE_TITLE = {keep:'артефакт выпуска — не удаляется', strip:'промежуточное'};
+const ACT_TITLE  = {keep:'оставить', strip:'очистить', drop:'удалить целиком'};
+const ACT_CLS    = {keep:'s-idle', strip:'s-queued', drop:'s-error'};
+
+async function viewAdmin(){
+  const [a, d] = await Promise.all([api('/ui/alerts'), api('/ui/disk')]);
+  app.innerHTML = '';
+  app.append($(`<h1>Админ</h1>
+    <p class="sub">Две вещи, из-за которых конвейер встаёт молча: некому сказать,
+      что он встал, и некому убрать за ним диск.</p>`));
+
+  /* ── тревоги ── */
+  const t = a.transport;
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Тревоги в телеграм</div>
+    <div class="stage">
+      <div class="dot ${t.configured ? 's-done' : 's-error'}">${t.configured ? '✓' : '!'}</div>
+      <div class="body">
+        <div class="name">${t.configured
+          ? 'Телеграм настроен' : 'Телеграм не настроен — тревоги никуда не уходят'}</div>
+        <div class="facts">${t.configured
+          ? `токен <span class="mono">${esc(t.token)}</span> · чат
+             <span class="mono">${esc(t.chat)}</span>`
+          : esc(t.how)}</div>
+      </div>
+    </div>
+    ${a.active.length ? a.active.map(x => `<div class="stage">
+        <div class="dot s-error">!</div>
+        <div class="body">
+          <div class="name">${esc(x.title)}</div>
+          <div class="facts">${esc(x.text).replace(/\n/g, '<br>')}</div>
+          ${x.money ? `<div class="note muted">деньги: ${esc(x.money)}</div>` : ''}
+          <div class="note ${x.said_at ? 'muted' : 'bad'}">${x.said_at
+            ? `сказано ${when(x.said_at)}${x.times > 1 ? `, раз: ${x.times}` : ''}`
+            : 'ещё не сказано'}</div>
+        </div></div>`).join('')
+      : '<div class="empty">Ни один из шести поводов не выполнен.</div>'}
+    ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
+       ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
+    <div class="sec" style="border-bottom:0">Пороги</div>
+    <table><tbody>
+      ${a.thresholds.map(th => `<tr><td>${esc(th.what)}</td>
+        <td style="text-align:right;width:120px">${dur(th.value)}</td></tr>`).join('')}
+      <tr><td>свободного места меньше</td>
+        <td style="text-align:right">${a.disk_min_gb} ГБ</td></tr>
+    </tbody></table>
+  </div>`));
+
+  /* ── диск ── */
+  const sp = d.space || {};
+  const low = sp.free_gb != null && sp.free_gb < a.disk_min_gb;
+  app.append($(`<div class="card">
+    <div class="sec">Диск</div>
+    <div class="stage">
+      <div class="dot ${low ? 's-error' : 's-done'}">${low ? '!' : '✓'}</div>
+      <div class="body">
+        <div class="name">${sp.error ? 'Место не читается'
+          : `Свободно ${sp.free_gb} ГБ из ${(sp.total/1073741824).toFixed(0)} ГБ`}</div>
+        <div class="facts mono">${esc(sp.path || sp.error || '')}</div>
+      </div>
+    </div>
+    <div class="stage">
+      <div class="dot ${d.policy_set ? 's-done' : 's-idle'}">${d.policy_set ? '✓' : '?'}</div>
+      <div class="body">
+        <div class="name">${d.policy_set
+          ? `Срок хранения: очистка через ${d.policy.strip_after_days ?? '—'} дн.,
+             удаление через ${d.policy.drop_after_days ?? '—'} дн.`
+          : 'Срок хранения владельцем не задан — ничего не удаляется'}</div>
+        <div class="note muted">${esc(d.how)}</div>
+      </div>
+    </div>
+    ${d.projects.length ? `<table><thead><tr>
+        <th>Проект</th><th>Объём</th><th>Промежуточное</th><th>Фаза</th>
+        <th>Решение</th></tr></thead><tbody>
+      ${d.projects.map(r => `<tr>
+        <td><div style="font-weight:600">${esc(r.name)}</div>
+            <div class="mono muted" style="font-size:11px">${esc(r.pid)}</div></td>
+        <td>${size(r.total)}</td>
+        <td>${size(r.strippable)}</td>
+        <td>${esc(r.phase || '—')}</td>
+        <td><span class="pill ${ACT_CLS[r.action]}">${ACT_TITLE[r.action]}</span></td>
+      </tr>
+      <tr><td colspan="5" style="padding-top:0">
+        <div class="note muted">${esc(r.why)}</div>
+        ${r.frees && r.paid_calls ? `<div class="note bad">безвозвратно теряются
+          ${r.paid_calls} оплаченных вызовов${r.paid_cost
+            ? ` на ${r.paid_cost.toFixed(0)} кр.` : ''}</div>` : ''}
+        <div class="bar" title="${Object.entries(r.sizes || {})
+            .map(([k, v]) => k + ': ' + size(v)).join(', ')}">
+          ${Object.entries(r.sizes || {}).map(([k, v]) => `<i style="float:left;width:${
+            (100 * v / Math.max(1, r.total)).toFixed(1)}%;background:${
+            d.categories.find(c => c.code === k && c.fate === 'keep')
+              ? 'var(--ok)' : 'var(--run)'}"></i>`).join('')}
+        </div>
+      </td></tr>`).join('')}
+    </tbody></table>
+    <div class="note muted">Синим — промежуточное, которое можно убрать.
+      Зелёным — пять артефактов выпуска: они остаются всегда.
+      Всего ${size(d.total)}, освободится ${size(d.freeable)}.</div>`
+      : '<div class="empty">Проектов на диске нет.</div>'}
+  </div>`));
+}
+
 /* ─────────────────────────────── роутер ─────────────────────────────── */
+
+/* Каждая строка: какая вкладка подсвечивается, как узнать свой адрес, что рисовать.
+   Раньше это была цепочка if с четырьмя булевыми переменными — при пятой вкладке
+   она начала врать о подсветке. */
+const ROUTES = [
+  ['queue',    h => h === '#/queue',              () => viewQueue()],
+  ['channels', h => h === '#/channels',           () => viewChannels()],
+  ['channels', h => h.startsWith('#/channel/'),   h  => viewChannel(decodeURIComponent(h.slice(10)))],
+  ['keys',     h => h === '#/keys',               () => viewKeys()],
+  ['admin',    h => h === '#/admin',              () => viewAdmin()],
+  ['releases', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
+  ['releases', h => h === '#/new',                () => viewNew()],
+  ['releases', () => true,                        () => viewReleases()],
+];
 
 async function render(){
   const h = location.hash || '#/releases';
-  const queue = h === '#/queue';
-  const chan = h === '#/channels' || h.startsWith('#/channel/');
-  const keys = h === '#/keys';
-  document.getElementById('tab-queue').classList.toggle('on', queue);
-  document.getElementById('tab-channels').classList.toggle('on', chan);
-  document.getElementById('tab-keys').classList.toggle('on', keys);
-  document.getElementById('tab-releases').classList.toggle('on', !queue && !chan && !keys);
-  try{
-    if (queue) return await viewQueue();
-    if (h.startsWith('#/channel/')) return await viewChannel(decodeURIComponent(h.slice(10)));
-    if (h === '#/channels') return await viewChannels();
-    if (h === '#/keys') return await viewKeys();
-    if (h.startsWith('#/release/')) return await viewRelease(decodeURIComponent(h.slice(10)));
-    if (h === '#/new') return await viewNew();
-    return await viewReleases();
-  }catch(e){ fail(e); }
+  const hit = ROUTES.find(r => r[1](h));
+  for (const id of ['releases', 'channels', 'queue', 'keys', 'admin'])
+    document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
+  try{ await hit[2](h); }catch(e){ fail(e); }
 }
 addEventListener('hashchange', render);
 render();
