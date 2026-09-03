@@ -1,0 +1,184 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Что именно уезжает на канал: название, описание, файл ролика, время выхода.
+
+Правила заданы владельцем:
+
+* **Название** — оригинальное название донора, переписанное на язык канала. Структура
+  сохраняется, дословного перевода не делаем. Один короткий вызов модели, поэтому работает
+  для любой ниши и языка, а не только для семи заготовленных брендов.
+* **Описание** дублирует название. Если у канала включены главы (`auto_chapters` в пресете
+  VideoStudio) и они собрались — снизу добавляется блок таймкодов.
+* **Время выхода** — момент слота в часовом поясе канала, строкой с обязательным смещением:
+  заливщик отказывается работать с временем без пояса, а без времени публикует немедленно.
+"""
+
+from __future__ import annotations
+
+import datetime as dt
+import json
+import os
+import re
+
+import requests
+
+MAX_TITLE = 95           # предел YouTube — 100, оставляем запас
+MAX_DESCRIPTION = 4800   # предел 5000, запас на служебные строки
+
+LANG_NAMES = {
+    "pl": "польский", "cs": "чешский", "sk": "словацкий", "ro": "румынский",
+    "hr": "хорватский", "el": "греческий", "hu": "венгерский", "ru": "русский",
+    "de": "немецкий", "fr": "французский", "it": "итальянский", "es": "испанский",
+    "pt": "португальский", "po": "португальский", "fi": "финский", "bg": "болгарский",
+    "uk": "украинский", "en": "английский", "tr": "турецкий", "nl": "нидерландский",
+}
+
+SYSTEM = (
+    "Ты переписываешь названия видео для YouTube-канала на заданном языке. "
+    "Сохраняй смысловую структуру исходного названия и его интригу, но НЕ переводи дословно: "
+    "формулируй так, как назвал бы ролик носитель языка. "
+    "Верни ТОЛЬКО готовое название одной строкой, без кавычек, без пояснений, "
+    "без хештегов и без эмодзи. Не длиннее 90 символов."
+)
+
+
+class TitleError(RuntimeError):
+    """Название сделать не удалось по вине ЭТОЙ строки (нет исходного названия и т.п.)."""
+
+
+class TitleUnavailable(RuntimeError):
+    """Генератор названий временно недоступен: нет ключа, лимит, сбой сети или сервиса.
+
+    Это отказ общего ресурса — готовый ролик должен ЖДАТЬ и повториться, а не умирать
+    в карантине из-за одного 429."""
+
+
+def clean_title(text: str) -> str:
+    """Убрать кавычки, переносы и служебный мусор из ответа модели."""
+    line = " ".join((text or "").split())
+    line = line.strip().strip('"').strip("«»").strip("'").strip()
+    line = re.sub(r"^(название|title)\s*[:—-]\s*", "", line, flags=re.I).strip()
+    if len(line) > MAX_TITLE:
+        cut = line[:MAX_TITLE]
+        if " " in cut:
+            cut = cut[:cut.rfind(" ")]
+        line = cut.rstrip(" ,;:—-")
+    return line
+
+
+def make_title(donor_title: str, lang: str, api_key: str, model: str = "gpt-4.1-mini") -> str:
+    """Название донора → название на языке канала."""
+    source = " ".join((donor_title or "").split())
+    if not source:
+        raise TitleError("у донора нет названия — не из чего делать заголовок")
+    if not api_key:
+        raise TitleUnavailable("нет ключа для генерации названия — ждём настройки")
+    language = LANG_NAMES.get((lang or "").lower(), lang or "русский")
+
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={"Authorization": f"Bearer {api_key}"},
+            json={"model": model, "temperature": 0.7, "max_tokens": 120,
+                  "messages": [
+                      {"role": "system", "content": SYSTEM},
+                      {"role": "user", "content":
+                       f"Язык канала: {language}.\nНазвание оригинала: {source}"}]},
+            timeout=45)
+    except requests.RequestException as exc:
+        raise TitleUnavailable(f"модель не ответила: {type(exc).__name__}")
+    if resp.status_code == 429 or resp.status_code >= 500:
+        raise TitleUnavailable(f"модель временно недоступна: {resp.status_code}")
+    if resp.status_code != 200:
+        raise TitleError(f"модель отвергла запрос {resp.status_code}: {resp.text[:160]}")
+    try:
+        text = resp.json()["choices"][0]["message"]["content"]
+    except Exception:
+        raise TitleError("не разобрал ответ модели")
+    title = clean_title(text)
+    if len(title) < 10:
+        raise TitleError(f"модель вернула слишком короткое название: {title!r}")
+    return title
+
+
+# ─────────────────────────── описание ───────────────────────────
+
+def chapters_enabled(preset_settings) -> bool:
+    """Включены ли главы в пресете VideoStudio канала."""
+    if isinstance(preset_settings, str):
+        try:
+            preset_settings = json.loads(preset_settings or "{}")
+        except Exception:
+            return False
+    if not isinstance(preset_settings, dict):
+        return False
+    value = preset_settings.get("auto_chapters")
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def read_chapters(project_dir: str) -> str:
+    """Блок таймкодов, который сделала стадия глав. Нет файла — пустая строка."""
+    path = os.path.join(project_dir or "", "chapters", "description.txt")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def make_description(title: str, chapters_text: str = "") -> str:
+    """Описание = название, а таймкоды блоком ниже, если они есть."""
+    parts = [(title or "").strip()]
+    if chapters_text.strip():
+        parts.append(chapters_text.strip())
+    text = "\n\n".join(p for p in parts if p)
+    return text[:MAX_DESCRIPTION]
+
+
+# ─────────────────────────── файл ролика ───────────────────────────
+
+def find_video(project_dir: str, render_job_id=None) -> str:
+    """Путь к готовому mp4 внутри папки проекта.
+
+    Сначала ищем ровно тот файл, который сделал наш этап рендера (`render/<job>.mp4`),
+    и только если его нет — самый свежий mp4 в папке render. Брать «любой mp4» без
+    попытки точного совпадения нельзя: в папке могут лежать прошлые версии.
+    """
+    render_dir = os.path.join(project_dir or "", "render")
+    if render_job_id:
+        exact = os.path.join(render_dir, f"{render_job_id}.mp4")
+        if os.path.exists(exact):
+            return exact
+    try:
+        found = [os.path.join(render_dir, n) for n in os.listdir(render_dir)
+                 if n.lower().endswith(".mp4")]
+    except Exception:
+        return ""
+    if not found:
+        return ""
+    return max(found, key=lambda p: os.path.getmtime(p))
+
+
+# ─────────────────────────── время выхода ───────────────────────────
+
+def schedule_iso(slot_at: float, tz_name: str) -> str:
+    """Момент слота → строка с обязательным смещением, минутная точность.
+
+    Заливщик принимает только такой формат; наивное время он отвергает, а без времени
+    публикует немедленно — то есть ошибка здесь означала бы ролик, вышедший не тогда.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+        zone = ZoneInfo(tz_name or "Europe/Warsaw")
+    except Exception:
+        raise TitleError(f"неизвестный часовой пояс канала: {tz_name!r}")
+    point = dt.datetime.fromtimestamp(float(slot_at), dt.timezone.utc).astimezone(zone)
+    point = point.replace(second=0, microsecond=0)
+    if point.utcoffset() is None:
+        raise TitleError("не удалось определить смещение часового пояса")
+    # Неоднозначный час (ночь перевода стрелок назад) — отказываемся ДО постановки задачи,
+    # иначе ролик уйдёт на час раньше или позже и подтверждение не сойдётся.
+    back = point.astimezone(dt.timezone.utc).astimezone(zone)
+    if back.utcoffset() != point.utcoffset():
+        raise TitleError("время выхода попало на перевод часов — сдвиньте расписание канала")
+    return point.isoformat(timespec="minutes")
