@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Телеграм как транспорт тревог. Только stdlib.
+
+Что здесь есть и чего нет: здесь нет ни одного условия срабатывания — все шесть поводов
+живут в `pub_alerts.py` и проверяются без сети. Здесь только «отправить строку».
+
+**Не настроен — значит выключен.** Нет `VS_TG_TOKEN` и `VS_TG_CHAT` — `send()` возвращает
+False, и `pub_alerts.tick()` не считает тревогу произнесённой. Это важно: молчащий
+транспорт не должен превращать аварию в «уже сообщили».
+
+Лимиты Telegram Bot API (бесплатный): около 30 сообщений в секунду суммарно, не чаще
+одного в секунду в один чат и не больше 20 в минуту в групповой чат. Наши тревоги —
+шесть поводов, не чаще раза в час каждый: это максимум ~12 сообщений в час вместе
+с «починилось». В лимиты мы не упираемся даже близко, но паузу в секунду между
+сообщениями и обработку 429 всё равно держим — очередь ошибок при развале системы
+бывает длиннее ожидаемого.
+
+    VS_TG_TOKEN=123456:AA...   токен от @BotFather
+    VS_TG_CHAT=-1001234567890  куда слать (узнать: dev/alerts.py --whoami)
+"""
+from __future__ import annotations
+
+import json
+import os
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+API = "https://api.telegram.org"
+TIMEOUT = 15
+MIN_GAP = 1.0          # не чаще одного сообщения в секунду в один чат
+LIMIT = 4096           # предел одного сообщения Telegram
+
+
+class Telegram:
+    def __init__(self, token=None, chat=None, log=print):
+        self.token = (token or os.environ.get("VS_TG_TOKEN") or "").strip()
+        self.chat = (chat or os.environ.get("VS_TG_CHAT") or "").strip()
+        self.log = log or (lambda *_a: None)
+        self._last = 0.0
+        self._warned = False
+
+    @property
+    def enabled(self) -> bool:
+        return bool(self.token and self.chat)
+
+    def _call(self, method: str, payload: dict) -> dict:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(f"{API}/bot{self.token}/{method}", data=data,
+                                     method="POST")
+        req.add_header("Content-Type", "application/json")
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}")
+
+    def send(self, text: str) -> bool:
+        """Отправить. True — Telegram подтвердил приём, и только тогда.
+
+        Никакого parse_mode: в текст попадают причины отказов провайдеров, то есть
+        произвольные строки. Разметка означала бы, что чужой текст со звёздочкой
+        ломает отправку — молча и в самый неподходящий момент.
+        """
+        if not self.enabled:
+            if not self._warned:
+                self.log("[тревоги] телеграм не настроен: нет VS_TG_TOKEN / VS_TG_CHAT")
+                self._warned = True
+            return False
+        gap = MIN_GAP - (time.time() - self._last)
+        if gap > 0:
+            time.sleep(gap)
+        body = str(text or "")[:LIMIT]
+        for attempt in (1, 2):
+            try:
+                r = self._call("sendMessage", {"chat_id": self.chat, "text": body,
+                                               "disable_web_page_preview": True})
+                self._last = time.time()
+                return bool(r.get("ok"))
+            except urllib.error.HTTPError as exc:
+                raw = exc.read().decode("utf-8", "replace")
+                wait = _retry_after(raw)
+                if exc.code == 429 and wait and attempt == 1:
+                    self.log(f"[тревоги] телеграм просит подождать {wait} с")
+                    time.sleep(min(wait, 60))
+                    continue
+                self.log(f"[тревоги] телеграм отказал: HTTP {exc.code} {raw[:200]}")
+                return False
+            except Exception as exc:                               # noqa: BLE001
+                self.log(f"[тревоги] телеграм недоступен: {type(exc).__name__}")
+                return False
+        return False
+
+    def whoami(self) -> dict:
+        """Кто этот бот и в какие чаты ему уже писали.
+
+        Нужно ровно один раз — чтобы узнать chat_id. Telegram не даёт его иначе:
+        надо написать боту (или добавить его в группу), а потом прочитать getUpdates.
+        """
+        out = {"token": bool(self.token), "me": None, "chats": [], "error": ""}
+        if not self.token:
+            out["error"] = "нет VS_TG_TOKEN"
+            return out
+        try:
+            me = self._call("getMe", {})
+            out["me"] = (me.get("result") or {}) if me.get("ok") else None
+            upd = self._call("getUpdates", {"limit": 100, "timeout": 0})
+        except urllib.error.HTTPError as exc:
+            out["error"] = f"HTTP {exc.code}: {exc.read().decode('utf-8','replace')[:200]}"
+            return out
+        except Exception as exc:                                   # noqa: BLE001
+            out["error"] = f"{type(exc).__name__}"
+            return out
+        seen = {}
+        for u in (upd.get("result") or []):
+            msg = u.get("message") or u.get("channel_post") or u.get("my_chat_member") or {}
+            chat = msg.get("chat") or {}
+            if chat.get("id") is not None:
+                seen[chat["id"]] = {
+                    "id": chat["id"], "type": chat.get("type") or "",
+                    "title": chat.get("title") or chat.get("username")
+                             or " ".join(x for x in (chat.get("first_name"),
+                                                     chat.get("last_name")) if x) or ""}
+        out["chats"] = sorted(seen.values(), key=lambda x: str(x["id"]))
+        return out
+
+
+def _retry_after(raw: str) -> int:
+    try:
+        return int(((json.loads(raw) or {}).get("parameters") or {}).get("retry_after") or 0)
+    except (ValueError, AttributeError, TypeError):
+        return 0
+
+
+def sender(log=print):
+    """Готовая функция для `pub_alerts.tick(c, send)`."""
+    return Telegram(log=log).send
