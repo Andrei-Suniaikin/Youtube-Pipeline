@@ -1551,7 +1551,13 @@ _OWN_CREDENTIAL_FAMILIES = (
     tuple(f for f in _CREDENTIAL_FAMILIES if f != "codex_home") + (OWN_CODEX_AUTH_FAMILY,)
 )
 # family провайдера → family, под которой юзер держит СВОЙ credential того же канала.
-_OWN_SOURCE_FAMILY = {"codex_home": OWN_CODEX_AUTH_FAMILY}
+# ДОБАВЛЕНО 03.09.2026 "lumean": свой ключ Lumean исторически хранится под семейством
+# "elevenlabs" (провайдер переименовался, поле в настройках осталось прежним), а серверный —
+# под "lumean". Пока Lumean показывался двумя кнопками, разницу выбирал пользователь.
+# Теперь кнопка одна, и без этой связки _task_uses_own_credential искал бы свой ключ в
+# семействе "lumean", не находил и КАЖДУЮ задачу отправлял на серверный ключ — то есть
+# молча тратил бы деньги владельца вместо ключа юзера.
+_OWN_SOURCE_FAMILY = {"codex_home": OWN_CODEX_AUTH_FAMILY, "lumean": "elevenlabs"}
 # Канал промптов → family credential этого канала (см. _provider_credential_family).
 _PROMPT_CHANNEL_FAMILY = {"openai": "openai", "claude": "claude_oauth", "codex": "codex_home",
                           "altclaude": "alt_llm"}
@@ -2365,7 +2371,11 @@ async def logout_post(request: Request):
 # ============================================================
 # B0/B1: проекты партнёра (CRUD) + экраны кабинета. Web-сессия обязательна.
 # ============================================================
-TENANTS_DIR = "/data/tenants"
+# Каталог данных. Раньше был зашит как "/data/tenants" без права выбора, из-за чего кабинет
+# запускался только там, где этот путь существует. Оверрайд сделан тем же способом, каким в
+# этом файле уже заданы DB (VS_SERVER_DB) и KEYS_PATH (VS_SERVER_KEYS_PATH); значение по
+# умолчанию прежнее, поэтому в production ничего не меняется.
+TENANTS_DIR = os.environ.get("VS_TENANTS_DIR") or "/data/tenants"
 
 _CSS = """@import url('https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700;800&family=Golos+Text:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 :root{
@@ -3402,13 +3412,26 @@ def _save_project_settings(tid, pid, updates):
 # ============================================================
 # microcopy — человеческие подписи + хелперы рендера (дизайн-система)
 # ============================================================
+# Модели, у которых seed реально доходит до провайдера. Источник правды — движок:
+# googler_worker.py:382 V6_SEED_MODELS = {"nano-banana-2", "nano-banana-pro",
+# "nano-banana-2-lite"} — allowlist, всё остальное провайдер отвергает
+# (validation.invalid_request → 100% провал прогона). Ключи кабинета сопоставлены через
+# googler_worker.py:373 IMAGE_MODEL_V6. Меняется там — поменять здесь.
+IMAGE_MODELS_WITH_SEED = {"NARWHAL", "NARWHAL_LITE", "GEM_PIX_2", "IMAGEN_3_5"}
+
 IMAGE_MODELS = {
     "OPENAI":     ("OpenAI",                "1 кр",      "recrafter"),
     "FLOWER":     ("Nano Banana 2 · Flower","1 кр",      "recrafter"),
     "NARWHAL":    ("Nano Banana 2 · Flow",  "4 кр",      "recrafter"),
     "NARWHAL_LITE": ("Nano Banana 2 Lite · Flow", "4 кр",   "recrafter"),
     "GEM_PIX_2":  ("Nano Banana Pro",       "4 кр",      "recrafter"),
-    "IMAGEN_3_5": ("Imagen 4",              "4 кр",      "recrafter"),
+    # ИСПРАВЛЕНО 03.09.2026: назывался «Imagen 4», а рисует Nano Banana Pro. Провайдер убрал
+    # Imagen из v6, и код молча подставил замену: googler_worker.py:373 —
+    # "IMAGEN_3_5": "nano-banana-pro". Списывалось при этом как за 4 кредита, то есть
+    # пользователь платил за одно, а получал другое, ничего об этом не зная.
+    # Ключ оставлен (main.py:3513 отвергает незнакомые модели, а он есть в сохранённых
+    # пресетах), но имя теперь честное.
+    "IMAGEN_3_5": ("Nano Banana Pro (бывш. Imagen 4)", "4 кр", "recrafter"),
     "GROK":       ("Grok",                  "3 кр",      "recrafter"),
     "GROK_SPEED": ("Grok Speed",            "1 кр",      "recrafter"),
     "VEO_BANANA":      ("Nano Banana Pro (Veo)",    "ключ veo",  "veo"),
@@ -3534,9 +3557,20 @@ VIDEO_METHODS = {
     "flow":   ("Flow · Veo 3.1",         "",       "recrafter"),
     "grok":   ("Grok",                   "2–4 кр", "recrafter"),
 }
+# ИСПРАВЛЕНО 03.09.2026: Lumean показывался двумя строками — «Lumean (бывш. ElevenLabs)»
+# и «Lumean · HeyGen». Провайдер один; различались они тем, на чьём ключе идёт задача.
+# Теперь это решает общий механизм _task_uses_own_credential (users.key_opts), как у всех
+# остальных провайдеров, а в списке — одна строка.
 TTS_ENGINES = {"edge": ("Edge", "Быстро, без ключа"), "voicegencore": ("VoiceGenCore", "По ключу"),
-               "voicer": ("Voicer", "По ключу"), "tts": ("Lumean (бывш. ElevenLabs)", "По ключу"),
-               "lumean": ("Lumean · HeyGen", "Серверный ключ")}
+               "voicer": ("Voicer", "По ключу"),
+               "lumean": ("Lumean", "свой ключ или серверный")}
+# Значение из старых пресетов. В пикере не показывается, но принимается и ведёт себя как
+# «lumean» — иначе сохранённые пресеты перестали бы открываться.
+TTS_ENGINES_LEGACY = {"tts": ("Lumean (бывш. ElevenLabs)", "По ключу")}
+
+
+def _tts_engine_label(eng):
+    return (TTS_ENGINES.get(eng) or TTS_ENGINES_LEGACY.get(eng) or (eng, ""))[0]
 SPLIT_TYPE = {"smart": "Умная (по смыслу)", "sentences": "По предложениям", "paragraphs": "По абзацам", "max_length": "По длине"}
 # ElevenLabs/Voicer модели (model_id) — человеческие подписи
 ELEVEN_MODELS = {
@@ -4559,7 +4593,8 @@ def project_page(pid: str, request: Request):
     # audio/clips считаны выше ровно теми же шаблонами — второй раз каталог не обходим.
     # Кнопку рисуем ТОЛЬКО когда файлы есть: кнопка, ведущая на «скачивать нечего», хуже её отсутствия.
     _dl_n = {"audio": len(audios), "clips": len(clips),
-             "images": len(_dl_items(pdir, "images")), "renders": len(_dl_items(pdir, "renders"))}
+             "images": len(_dl_items(pdir, "images")), "renders": len(_dl_items(pdir, "renders")),
+             "subs": len(_dl_items(pdir, "subs")), "chapters": len(_dl_items(pdir, "chapters"))}
     _dl_n["all"] = sum(_dl_n.values())
 
     def _dlbtn(what, label, cls="btn-ghost"):
@@ -4743,11 +4778,12 @@ es.onerror=function(){{es.close();}};</script></fieldset>"""
   </div>
 </div></form>
 <h2 style="margin-top:18px">Результат</h2>
-{(f'<div class=row style="gap:8px;flex-wrap:wrap;margin-bottom:10px">{_dlbtn("audio", "Скачать озвучку")}</div>' if _dl_n["audio"] else '')}
+{(f'<div class=row style="gap:8px;flex-wrap:wrap;margin-bottom:10px">{_dlbtn("audio", "Скачать озвучку")}{_dlbtn("subs", "Субтитры (SRT)")}{_dlbtn("chapters", "Тайм-коды")}</div>' if (_dl_n["audio"] or _dl_n["subs"] or _dl_n["chapters"]) else '')}
 {audio_html}</div>'''
 
     img_model_opts = mc_status_options(IMAGE_MODELS, s.get("model", "OPENAI"),
                                        _blocked_providers(u, IMAGE_MODELS, kind="images"))
+    seed_models_js = json.dumps(sorted(IMAGE_MODELS_WITH_SEED))
     img_aspect_opts = _opts(("landscape","portrait","square"), s.get("aspect_ratio","landscape"))
     uc_img = "0" if str(s.get("use_cache","1")).strip().lower() in ("0","off","false","no") else "1"
     uc_img_opts = (f"<option value=1{' selected' if uc_img=='1' else ''}>не перегенерировать готовое</option>"
@@ -4810,7 +4846,8 @@ es.onerror=function(){{es.close();}};</script></fieldset>"""
       <input class=input name=style value="{sval('style','minimalistic stickman, 2d, cinematic, dramatic lighting')}"></div>
     <div style="display:flex;gap:12px;margin-bottom:6px">
       <div style="flex:1"><label class=label>Предложений на картинку</label><input class=input name=sentences_per_prompt value="{sval('sentences_per_prompt','3')}" title="число или посегментно 1x100,3"></div>
-      <div style="flex:1"><label class=label>Seed — тот же результат</label><input class=input name=seed value="{sval('seed')}" placeholder="(пусто = случайный)"></div></div>
+      <div style="flex:1" id=seedFld><label class=label>Seed — тот же результат</label><input class=input name=seed id=seedInp value="{sval('seed')}" placeholder="(пусто = случайный)">
+      <div class=muted id=seedWhy style="font-size:11.5px;margin-top:3px;display:none">эта модель seed не принимает — провайдер отвергает запрос</div></div></div>
     <div class=row style="background:var(--surface2);border-radius:9px;padding:11px 13px;margin-top:6px;gap:0">
     <label class=toggle style="margin:0"><input type=hidden name=auto_hero id=ahInp value="{ah_img}"><input type=checkbox {"checked" if ah_img=="1" else ""} onchange="document.getElementById('ahInp').value=this.checked?'1':'0';refStatusUpdate()"><span class=track></span></label>
     <span style="margin-left:11px"><b style="font-size:13px">Один герой во всех кадрах</b><div class=muted style="font-size:11.5px;margin-top:2px">континуити: персонаж не меняется между сценами (+1 генерация)</div></span></div>
@@ -4852,7 +4889,22 @@ function refDrop(e,id){{
   e.preventDefault();var inp=document.getElementById(id);
   if(inp&&e.dataTransfer&&e.dataTransfer.files.length){{inp.files=e.dataTransfer.files;refUpload(inp.form);}}
 }}
+// Seed доезжает до провайдера не у всех моделей: allowlist в движке
+// (googler_worker.py:382 V6_SEED_MODELS). У остальных провайдер отвергает запрос целиком,
+// поэтому поле гаснет с причиной, а не молчит.
+var SEED_MODELS={seed_models_js};
+function seedGate(){{
+  var m=document.getElementById('imgModelSel'), f=document.getElementById('seedInp'),
+      w=document.getElementById('seedWhy'), box=document.getElementById('seedFld');
+  if(!m||!f) return;
+  var ok=SEED_MODELS.indexOf(m.value)>=0;
+  f.readOnly=!ok;                       // readOnly, а не disabled: значение должно уехать формой
+  f.title=ok?'':'эта модель seed не принимает';
+  if(w) w.style.display=ok?'none':'';
+  if(box) box.style.opacity=ok?'1':'.55';
+}}
 function refStatusUpdate(keepExact){{
+  seedGate();
   var status=document.getElementById('refStatus'),count=document.getElementById('refCount'),gate=document.getElementById('refGate');
   if(!status||!count||!gate)return;
   var raw=Number(status.dataset.raw||0),packed=Number(status.dataset.packed||0),groups=Number(status.dataset.groups||0),style=Number(status.dataset.style||0),legacy=Number(status.dataset.cacheLegacy||0);
@@ -5184,7 +5236,6 @@ document.addEventListener('keydown',function(e){{var o=document.getElementById('
     # в конфиг рендера (_render_config_from_params), просто больше не редактируются здесь.
     sync_ck = "checked" if _truthy(s.get("sync_audio", "1")) else ""       # как в десктопе: default ON
     chap_ck = "checked" if _truthy(s.get("auto_chapters"), False) else ""  # главы после рендера
-    dev_ck = "checked" if _truthy(s.get("distribute_evenly", "1")) else ""
     _mo = s.get("material_order") or "video_first"
     _mo_opts = "".join(f'<option value="{k}"{" selected" if _mo == k else ""}>{v}</option>' for k, v in
                        (("video_first", "Клипы в начале (реком.)"), ("images_first", "Картинки в начале"),
@@ -5247,10 +5298,9 @@ document.addEventListener('keydown',function(e){{var o=document.getElementById('
 <select class=select name=quality id=rf-quality style="width:auto">{_q_opts}</select></div>
 <div class=fld><label class=cap>Переходы</label><div class=segmented>
 <div class="seg{ta('none')}" onclick="rseg('transitions','none',this)">Без</div>
-<div class="seg{ta('fast')}" onclick="rseg('transitions','fast',this)">Быстрые</div>
-<div class="seg{ta('smooth')}" onclick="rseg('transitions','smooth',this)">Плавные</div></div>
+<div class="seg{ta('fast')}" onclick="rseg('transitions','fast',this)">Плавные переходы</div></div>
 <input type=hidden id=rf-transitions name=transitions value="{_tr}">
-<span class=hint style="margin-left:10px">«Быстрые» — почти все переходы за ~2&nbsp;мин · «Плавные» — все, дольше</span></div>
+<span class=hint style="margin-left:10px">кроссфейд между кадрами</span></div>
 <div class=fld><label class=cap>Плавный зум (Ken Burns)</label>
 <label class=toggle><input type=hidden name=kenburns id=kbInp value="{'1' if kb_ck else '0'}"><input type=checkbox {kb_ck} onchange="document.getElementById('kbInp').value=this.checked?'1':'0'"><span class=track></span></label></div>
 <div class=fld><label class=cap>Звук из видео-клипов</label>
@@ -5283,9 +5333,6 @@ document.addEventListener('keydown',function(e){{var o=document.getElementById('
 <div class=fld><label class=cap>Громкость озвучки % / звука клипов %</label>
 <input class=input name=main_audio_volume value="{sval('main_audio_volume','100')}" style="width:70px"> /
 <input class=input name=video_audio_volume value="{sval('video_audio_volume','100')}" style="width:70px"></div>
-<div class=fld><label class=cap>Равномерное распределение</label>
-<label class=toggle><input type=hidden name=distribute_evenly id=devInp value="{'1' if dev_ck else '0'}"><input type=checkbox {dev_ck} onchange="document.getElementById('devInp').value=this.checked?'1':'0'"><span class=track></span></label>
-<span class=hint style="margin-left:10px">без синхрона: кадры делят хронометраж поровну</span></div>
 <div class=fld><label class=cap>Масштаб медиа % / смещение X / Y</label>
 <input class=input name=media_scale_pct value="{sval('media_scale_pct','100')}" style="width:70px"> /
 <input class=input name=media_offset_x value="{sval('media_offset_x','0')}" style="width:70px"> /
@@ -5368,7 +5415,8 @@ def project_file(pid: str, fpath: str, request: Request):
 # проекты бывают на сотни МБ, а диск сервера уже забивался (инцидент 28–30.07: бэкап БД
 # падал с SQLITE_FULL). Компрессия ZIP_STORED: jpg/mp3/mp4 уже сжаты, deflate только жёг бы CPU.
 _DL_CATS = {"audio": "озвучки", "images": "картинок", "clips": "клипов",
-            "renders": "готовых mp4", "all": "материалов"}
+            "renders": "готовых mp4", "subs": "субтитров", "chapters": "тайм-кодов",
+            "all": "материалов"}
 # категория → glob-шаблоны (относительно каталога проекта, recursive?). Страница проекта
 # считает кнопки этим же списком (_dl_n), поэтому число на кнопке = число файлов в архиве
 _DL_PATTERNS = {
@@ -5381,6 +5429,13 @@ _DL_PATTERNS = {
                 (("Images", "**", "*.png"), True), (("Images", "**", "*.webp"), True)),
     "clips":   ((("googler video", "*.mp4"), False),),
     "renders": ((("render", "*.mp4"), False),),
+    # ДОБАВЛЕНО 03.09.2026: файлы создавались исправно, но кабинет их не отдавал —
+    # в списке категорий были только озвучка, картинки, клипы и готовые mp4.
+    # subtitles.srt пишет render_worker.py:2679; каталог chapters/ — chapters.py:825.
+    # VTT сознательно НЕ добавлен: он нигде не производится, а только читается как входной
+    # формат (chapters.py:110). Кнопка на несуществующий файл — та же ложь интерфейса.
+    "subs":    ((("*.srt",), False), (("**", "*.srt"), True)),
+    "chapters": ((("chapters", "*.txt"), False), (("chapters", "*.json"), False)),
 }
 
 
@@ -5389,7 +5444,7 @@ def _dl_items(pdir, what):
     по каталогу проекта (снаружи ничего не подставляется), и каждый файл дополнительно
     проверяется на выход за его пределы через realpath — это ловит и симлинки."""
     root = os.path.realpath(pdir)
-    cats = ("audio", "images", "clips", "renders") if what == "all" else (what,)
+    cats = ("audio", "images", "clips", "renders", "subs", "chapters") if what == "all" else (what,)
     out, seen = [], set()
     for cat in cats:
         for parts, rec in _DL_PATTERNS.get(cat, ()):
@@ -5706,7 +5761,9 @@ def _preset_project_payload(settings, preset_id):
 # рекурсивно и склеивает → если остались озвучки двух движков, звук задваивается. Поэтому перед
 # новой озвучкой чистим папки ДРУГИХ движков.
 _ENGINE_AUDIO_DIR = {"edge": "_FINAL_AUDIO_EDGETTS", "voicer": "_FINAL_AUDIO_VOICER",
-                     "voicegencore": "_FINAL_AUDIO_VGC", "tts": "_FINAL_AUDIO_ELEVENLABS",
+                     "voicegencore": "_FINAL_AUDIO_VGC",
+                     # legacy-значение из старых пресетов: там озвучка лежит в своей папке
+                     "tts": "_FINAL_AUDIO_ELEVENLABS",
                      "lumean": "_FINAL_AUDIO_LUMEAN"}
 
 
@@ -7264,30 +7321,27 @@ def _build_cmd(kind, projdir, params, own_threads=None, *, job_id=None, project_
             if uc:
                 argv.append("--use_cache")
             return "voicegencore_worker.py", argv
-        if engine == "lumean":
-            # Отдельная серверная дорожка: один платный order на весь текст, свой
-            # credential family и обязательная read-only проверка service=heygen
-            # внутри worker до POST /orders. Legacy engine=tts не меняем.
-            vu = (params.get("voice_uuid") or params.get("voice") or "").strip()
-            if not _is_lumean_template_id(vu):
-                raise RuntimeError(
-                    "Lumean · HeyGen требует UUID Template ID из библиотеки Lumean, "
-                    "а не внешний Voice ID"
-                )
-            argv = ["--source_file", src, "--project_dir", projdir, "--speed", speed,
-                    "--template_id", vu, "--full_text",
-                    "--required_service", "heygen",
-                    "--audio_dir_name", "_FINAL_AUDIO_LUMEAN"]
-            if str(params.get("model_uuid") or "").strip():
-                argv += ["--model_id", str(params["model_uuid"]).strip()]
-            if uc:
-                argv.append("--use_cache")
-            return "tts_worker.py", argv
-        # tts (Lumean; legacy provider slug elevenlabs) → template_id/model_id
-        argv = ["--source_file", src, "--project_dir", projdir, "--speed", speed]
+        # Lumean. Провайдер один, дорожки две, и выбирает между ними НЕ пользователь
+        # в списке движков (там теперь одна строка), а общий механизм своих ключей:
+        # own_threads не None ровно тогда, когда задача идёт на СВОЙ ключ юзера
+        # (см. docstring _build_cmd). Серверная дорожка сохраняет предохранитель
+        # --required_service heygen: проверку service шаблона ДО создания платного
+        # заказа, добавленную 02–03.09.2026 (tts_worker.require_template_service).
+        on_own_key = own_threads is not None
         vu = (params.get("voice_uuid") or params.get("voice") or "").strip()
+        if not on_own_key and not _is_lumean_template_id(vu):
+            raise RuntimeError(
+                "На серверном ключе Lumean принимает только UUID Template ID из своей "
+                "библиотеки, а не внешний Voice ID. Укажите шаблон либо свой ключ."
+            )
+        # Папка результата одна на обе дорожки: _clear_other_audio_dirs держит ровно один
+        # каталог на движок, и два имени под одной кнопкой снесли бы готовую озвучку.
+        argv = ["--source_file", src, "--project_dir", projdir, "--speed", speed,
+                "--audio_dir_name", "_FINAL_AUDIO_LUMEAN"]
         if vu:
             argv += ["--template_id", vu]
+        if not on_own_key:
+            argv += ["--full_text", "--required_service", "heygen"]
         if str(params.get("model_uuid") or "").strip():
             argv += ["--model_id", str(params["model_uuid"]).strip()]
         if uc:
@@ -12053,7 +12107,7 @@ def _preset_summary(s):
     except ImageModeContractError as exc:
         return "ошибка режима картинок: " + html.escape(str(exc))
     eng = s.get("engine", "edge")
-    eng_lbl = TTS_ENGINES.get(eng, (eng, ""))[0]
+    eng_lbl = _tts_engine_label(eng)
     voice = s.get("voice") or s.get("voice_uuid") or "авто по языку"
     image_label = ("Поиск Bing" if s["image_mode"] == _IMAGE_MODE_BING else
                    IMAGE_MODELS[s["model"]][0])
@@ -12225,29 +12279,54 @@ async def preset_edit_page(prid: int, request: Request):
 <label class=cap style="width:auto">первых сцен (0=все):</label>{_p_num('t2v_first_n', '0')}</div></div>
 <div class=panel><div class=panel-title><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Рендер</div>
 <div class=fld><label class=cap>Качество</label>{_p_sel('quality', ((q, q) for q in _QUALITY_OK), 'auto', None)}</div>
-<div class=fld><label class=cap>Переходы</label>{_p_seg('transitions', (('none', 'Без'), ('fast', 'Быстрые'), ('smooth', 'Плавные')), 'fast')}
+<div class=fld><label class=cap>Переходы</label>{_p_seg('transitions', (('none', 'Без'), ('fast', 'Плавные переходы')), 'fast')}
 <span class=hint style="margin-left:10px">«Быстрые» — почти все переходы за ~2&nbsp;мин · «Плавные» — все, дольше</span></div>
 <div class=fld><label class=cap>Плавный зум (Ken Burns)</label>{_p_bool('kenburns')}</div>
 <div class=fld><label class=cap>Звук из видео-клипов</label>{_p_bool('use_video_audio', False, 'аудио клипов (veo) подмешается в озвучку на их сценах')}</div>
-<div class=fld><label class=cap>🎧 Фон и эффекты автоматически</label>{_p_bool('auto_sound', False, 'по тексту ролика подбирается фоновый звук (лес, дождь, огонь, комната…), он приседает под голосом')}</div>
 <div class=fld><label class=cap><svg class="ic" viewBox="0 0 24 24"><use href="#ic-target"/></svg> Синхрон с озвучкой</label>{_p_bool('sync_audio', True, 'кадры переключаются по предложениям озвучки (whisper); выкл = равномерно')}</div>
 <div class=fld><label class=cap>Главы (таймкоды в описание)</label>{_p_bool('auto_chapters', False, 'после рендера — разбивка на главы по 2–4 мин с заголовками; нужен «Синхрон с озвучкой»')}</div>
 <div class=fld><label class=cap>Субтитры</label>{_p_bool('subtitles')}
 <select class=select name=subtitle_lang style="width:auto;margin-left:10px">{_sub_opts}</select></div>
 <details style="margin:6px 0"><summary class=muted style="cursor:pointer;font-size:13px">Расширенные настройки</summary>
-<div class=fld style="margin-top:8px"><label class=cap>сек/кадр мин–макс</label>{_p_num('min_image_duration', '2.0')} – {_p_num('max_image_duration', '30.0')}</div>
+<div class=fld style="margin-top:8px" data-needs-nosync=1><label class=cap>сек/кадр мин–макс</label>{_p_num('min_image_duration', '2.0')} – {_p_num('max_image_duration', '30.0')}
+<span class=hint style="margin-left:10px" data-nosync-why>при включённом синхроне не действует: длительности считает синхрон</span></div>
 <div class=fld><label class=cap>Порядок материалов</label>{_p_sel('material_order', (('video_first', 'Клипы в начале (реком.)'), ('images_first', 'Картинки в начале'), ('alternate', 'Чередовать клип–картинка'), ('alphabetical', 'По алфавиту'), ('random', 'Случайный')), 'auto', None)}
 <span class=hint style="margin-left:10px">клипы = анимированные первые сцены; менять только осознанно</span></div>
 <div class=fld><label class=cap>Fade, сек</label>{_p_num('fade_duration', '0.5')}
 <label class=cap style="margin-left:14px">Ken Burns зум</label>{_p_num('kenburns_zoom', '1.1')}</div>
-<div class=fld><label class=cap>Пауза, сек / каждые N фраз</label>{_p_num('pause_duration', '0')} / {_p_num('pause_interval', '0')}
-<span class=hint style="margin-left:10px">0 = без пауз</span></div>
+<div class=fld data-needs-nosync=1><label class=cap>Пауза, сек / каждые N фраз</label>{_p_num('pause_duration', '0')} / {_p_num('pause_interval', '0')}
+<span class=hint style="margin-left:10px">0 = без пауз</span>
+<span class=hint style="margin-left:10px" data-nosync-why>на сервере не действует: пауза вставляется между файлами озвучки, а файл один</span></div>
 <div class=fld><label class=cap>Громкость озвучки % / звука клипов %</label>{_p_num('main_audio_volume', '100')} / {_p_num('video_audio_volume', '100')}</div>
-<div class=fld><label class=cap>Равномерное распределение</label>{_p_bool('distribute_evenly', True, 'без синхрона: кадры делят хронометраж поровну')}</div>
 <div class=fld><label class=cap>Масштаб медиа % / смещение X / Y</label>{_p_num('media_scale_pct', '100')} / {_p_num('media_offset_x', '0')} / {_p_num('media_offset_y', '0')}
 <span class=hint style="margin-left:10px">глобальный зум/сдвиг всех кадров</span></div></details>
 <p class=hint>Пустое числовое поле = настройка не задаётся, применится серверный дефолт. Применение пресета ЗАМЕНЯЕТ настройки проекта целиком, а не дополняет их.</p></div>
-<script>function pseg(n,v,el){{var ss=el.parentNode.querySelectorAll('.seg');for(var i=0;i<ss.length;i++)ss[i].classList.remove('active');el.classList.add('active');document.getElementById('pf_'+n).value=v;}}</script>
+<script>function pseg(n,v,el){{var ss=el.parentNode.querySelectorAll('.seg');for(var i=0;i<ss.length;i++)ss[i].classList.remove('active');el.classList.add('active');document.getElementById('pf_'+n).value=v;}}
+// Синхрон заменяет расчёт длительностей целиком (render_worker._compute_synced_image_durations —
+// мин/макс там не упоминаются ни разу), а пауза вставляется между файлами озвучки, которых
+// на сервере один. Поэтому при включённом синхроне эти поля гаснут с объяснением, а не
+// делают вид, что работают.
+(function(){{
+  var sync=document.getElementById('pf_sync_audio');
+  if(!sync) return;
+  var rows=document.querySelectorAll('[data-needs-nosync]');
+  function apply(){{
+    var on=sync.value==='1';
+    for(var i=0;i<rows.length;i++){{
+      var r=rows[i];
+      r.style.opacity=on?'.45':'';
+      var f=r.querySelectorAll('input.input');
+      // readOnly, а не disabled: disabled-поля не отправляются формой, и сохранение
+      // пресета при включённом синхроне стёрло бы мин/макс из настроек.
+      for(var j=0;j<f.length;j++){{f[j].readOnly=on;f[j].title=on?'не действует при включённом синхроне':'';}}
+      var why=r.querySelector('[data-nosync-why]');
+      if(why) why.style.display=on?'':'none';
+    }}
+  }}
+  var box=sync.parentNode.querySelector('input[type=checkbox]');
+  if(box) box.addEventListener('change',function(){{setTimeout(apply,0);}});
+  apply();
+}})();</script>
 <button class="btn btn-primary"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Сохранить пресет</button></form></div>"""
     return _page("Пресет", body)
 
@@ -12669,7 +12748,13 @@ def _render_config_from_params(p):
     q = (p.get("quality") or "1080p").strip()
     if q not in _QUALITY_OK:
         q = "1080p"
-    tr = (p.get("transitions") or "fast").strip()   # none | fast | smooth
+    tr = (p.get("transitions") or "fast").strip()   # none | fast
+    # ИСПРАВЛЕНО 03.09.2026: режимов было три, а различались два. «Быстрые» и «Плавные»
+    # давали одно и то же — ниже единственное использование tr: enable_fade = tr != "none".
+    # Разницы в коде не существовало (комментарий про замер 03.08 объясняет почему).
+    # Старое значение "smooth" в сохранённых пресетах читается как «переходы включены».
+    if tr == "smooth":
+        tr = "fast"
     # «Плавные» переходы отключены осознанно (замер 03.08): они пересобирали ВЕСЬ ролик ради
     # стыков пачек (×3.4 по времени) и съедали по fade на каждом стыке — картинки уезжали
     # вперёд накопительно. Настоящие кроссфейды делаются ВНУТРИ пачек и одинаковы в обоих
@@ -12704,7 +12789,10 @@ def _render_config_from_params(p):
         "use_video_audio": _truthy(p.get("use_video_audio"), False),
         # дефолты True — как у воркера/десктопа: старые задачи без ключей ведут себя по-прежнему
         "sync_audio": _truthy(p.get("sync_audio"), True),
-        "distribute_evenly": _truthy(p.get("distribute_evenly"), True),
+        # УБРАНО 03.09.2026 «distribute_evenly»: значение доезжало до рендера и не читалось
+        # (render_worker.py:971 — единственное упоминание, только присваивание). Настройка,
+        # которая ничего не делает, — это правило №2 ТЗ. Само присваивание в воркере
+        # снимается на этапе чистки движков; здесь убран транспорт.
         "randomize_metadata": _truthy(p.get("randomize_metadata"), False),
         "vintage_effect": _truthy(p.get("vintage_effect"), False),
         "render_settings": rs,
@@ -12869,19 +12957,13 @@ async def render_assets(jid: int, request: Request):
     if t["status"] != "running":
         raise HTTPException(409, "render job уже не активен")
     proj = _project_dir(t["tenant_id"], t["project_id"])
-    # 🎧 Автозвук: план фона готовим ЗДЕСЬ — на рендер-ноде сети нет, а тут проект
-    # ещё целиком под рукой. Повторный вызов дешёвый: готовый план не пересчитывается.
-    try:
-        _c2 = db()
-        _row = _c2.execute("SELECT settings FROM projects WHERE id=? AND tenant_id=?",
-                           (t["project_id"], t["tenant_id"])).fetchone()
-        _c2.close()
-        _st = json.loads((_row["settings"] if _row else "") or "{}")
-        if _truthy(_st.get("auto_sound"), False):
-            import auto_sound
-            auto_sound.prepare(proj, log=lambda m: print("[render %s] %s" % (jid, m)))
-    except Exception as _e:
-        print("[render %s] автозвук пропущен: %s" % (jid, _e))
+    # 🎧 Автозвук ОТКЛЮЧЁН 03.09.2026 — фича выкачена наполовину.
+    # Серверная половина работала: auto_sound.prepare() платно ходит в модель (codex exec),
+    # подбирает mp3 и пишет _RENDER_MEDIA/sfx/sound_plan.json. Но боевой рендерер на Минске
+    # (render_worker.py, 6117 строк) про этот файл не знает: ни _load_sound_plan,
+    # ни _apply_auto_sound в нём нет — они есть только в маковской версии на 6210 строк,
+    # которая на ноду не залита. Итог: один оплаченный вызов на проект в никуда.
+    # Включать обратно ТОЛЬКО вместе с выкаткой рендерера на Минск (см. auto_sound.py).
     # «googler video» — сгенерированные видео-клипы: БЕЗ них рендер на боксе соберёт слайдшоу без видео (audit 02.07)
     items = [d for d in ("googler", "Images", "googler video", "_ASSETS", "_RENDER_MEDIA") if os.path.isdir(os.path.join(proj, d))]
     items += [os.path.basename(p) for p in glob.glob(os.path.join(proj, "_FINAL_AUDIO_*")) if os.path.isdir(p)]
@@ -14062,7 +14144,7 @@ def _run_worker_job(jid, uid, worker, args, files, files_b64=None):
         c.close()
         # A5: файловая изоляция — sandbox строго под каталогом ТЕНАНТА (партнёра), не в общем GEN_DIR
         _tid = (u["tenant_id"] if (u and u["tenant_id"]) else str(uid))
-        sandbox = os.path.join("/data/tenants", _tid, "jobs", f"rw_{jid}")
+        sandbox = os.path.join(TENANTS_DIR, _tid, "jobs", f"rw_{jid}")
         proj = os.path.join(sandbox, "project")
         os.makedirs(proj, exist_ok=True)
         written = {}

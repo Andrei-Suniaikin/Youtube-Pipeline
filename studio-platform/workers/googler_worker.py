@@ -352,7 +352,7 @@ def _assert_googler_key():
                               "Останавливаюсь.")
 
 # Проверяем что ключ не старый
-if GOOGLER_API_KEY == "D8RAfhXE4CcJfLfaibk3CtOpffuCcJGH":
+if GOOGLER_API_KEY == os.environ.get("GOOGLER_EXPIRED_KEY_MARKER", ""):
     print_user("⚠️ ВНИМАНИЕ: Обнаружен старый истекший API ключ Googler!", "WARNING")
     print_user("   Установите новый ключ через настройки в приложении (Настройки → API ключи)", "WARNING")
     print_user("   Новый ключ будет сохранен в файл конфигурации", "WARNING")
