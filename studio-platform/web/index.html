@@ -590,7 +590,9 @@ async function viewNew(){
         · ${c.per_day} в неделю · горизонт ${c.horizon_days} дн</option>`).join('')}</select>
     <label class="k" style="display:block;margin-bottom:6px">Ссылки на доноров, по одной в строке</label>
     <textarea id="links" placeholder="https://www.youtube.com/watch?v=…"></textarea>
-    <div style="margin-top:14px"><button id="go">Поставить в план</button></div>
+    <div style="margin-top:14px">
+      <button class="ghost" id="peek">Показать, что будет</button>
+      <button id="go">Поставить в план</button></div>
     <div id="res"></div>
   </div>`);
   app.append(form);
@@ -598,15 +600,43 @@ async function viewNew(){
   const errBox = form.querySelector('#err');
   const resBox = form.querySelector('#res');
   const btn = form.querySelector('#go');
+  const peek = form.querySelector('#peek');
+  const payload = () => ({channel_id: Number(form.querySelector('#ch').value),
+                          links: form.querySelector('#links').value});
+
+  /* Предпросмотр считает та же раскладка, что и постановка, — в откатываемой
+     транзакции. Смысл кнопки: ссылка на удалённый пресет и переполненный горизонт
+     видны ДО того, как начнётся платная работа, а не после. */
+  peek.onclick = async () => {
+    errBox.innerHTML = ''; resBox.innerHTML = ''; peek.disabled = true;
+    try{
+      const p = await post('/ui/links/preview', payload());
+      const mark = x => x.exists === false
+        ? '<span class="pill s-error">не найден</span>'
+        : x.exists === null ? '<span class="pill s-idle">сервис не ответил</span>' : '';
+      resBox.innerHTML = `<div class="res">
+        <h3>Чем будет сделано</h3>
+        <ul>${p.presets.map(x => `<li>${esc(x.what)}: <b>${esc(x.name)}</b>
+          <span class="muted">(${esc(x.where)})</span> ${mark(x)}</li>`).join('')}
+          <li>язык канала: <b>${esc(p.channel.lang || '—')}</b>,
+              часовой пояс ${esc(p.channel.tz)}</li></ul>
+        ${p.placed.length ? `<h3>Встанет на выходы</h3><ul>${
+          p.placed.map(i => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}
+        ${p.queued ? `<h3>Без даты</h3><ul><li>${p.queued} шт. — в горизонте
+          ${p.channel.horizon_days} дн свободных выходов не осталось</li></ul>` : ''}
+        ${p.skipped.length ? `<h3>Пропустится как дубль</h3><ul>${
+          p.skipped.map(i => `<li>${esc(i)}</li>`).join('')}</ul>` : ''}
+        <div class="note muted">${esc(p.note)}. Ничего пока не записано.</div>
+      </div>`;
+    }catch(e){
+      errBox.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    }finally{ peek.disabled = false; }
+  };
 
   btn.onclick = async () => {
     errBox.innerHTML = ''; resBox.innerHTML = ''; btn.disabled = true;
     try{
-      const out = await api('/ui/links', {
-        method:'POST', headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({channel_id: Number(form.querySelector('#ch').value),
-                              links: form.querySelector('#links').value}),
-      });
+      const out = await post('/ui/links', payload());
       const block = (title, items) => items.length
         ? `<h3>${title}</h3><ul>${items.map(i => `<li>${esc(i)}</li>`).join('')}</ul>` : '';
       resBox.innerHTML = `<div class="res">

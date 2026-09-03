@@ -1085,3 +1085,75 @@ def ui_action(service: str, job_id: str, action: str, request: Request):
         raise HTTPException(502, f"сервис «{service}» не отвечает: {type(exc).__name__}")
     return {"ok": True, "service": service, "job_id": job_id, "action": action,
             "answer": body}
+
+
+@app.post("/ui/links/preview")
+def ui_links_preview(body: LinksIn):
+    """Что произойдёт, если поставить эти ссылки. Ничего не записывает.
+
+    Раскладку считает **та же** `add_links`, что и настоящая постановка, — в открытой
+    транзакции, которая затем откатывается. Написать отдельный «предпросчёт» значило бы
+    завести вторую раскладку, и она разошлась бы с первой на первом же граничном случае:
+    дубль, занятый слот, конец горизонта.
+
+    Пресеты и язык здесь **показываются, а не выбираются**. Они берутся из канала, и
+    выбор на этой форме был бы настройкой, которую никто не читает: колонка
+    `pub_plan_items.overrides` в схеме есть, но за неё во всём кабинете не держится
+    ни одна строка кода. Настройка либо работает, либо её нет.
+    """
+    urls = parse_links(body.links or "")
+    if not urls:
+        raise HTTPException(400, "в поле нет ни одной ссылки")
+    c = db()
+    try:
+        ch = c.execute("SELECT * FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (body.channel_id, TENANT)).fetchone()
+        if not ch:
+            raise HTTPException(404, "канал не найден")
+        try:
+            res = add_links(c, TENANT, ch, urls, time.time(), slot=body.slot,
+                            titles={u: "" for u in urls})
+        finally:
+            c.rollback()          # предпросмотр не оставляет следов ни при каком исходе
+        presets = _channel_presets(c, ch)
+    finally:
+        c.close()
+    return {
+        "channel": {"id": ch["id"], "name": ch["name"], "lang": ch["lang"] or "",
+                    "tz": ch["tz"], "horizon_days": ch["horizon_days"],
+                    "lead_days": ch["lead_days"]},
+        "presets": presets,
+        "placed": [str(p) for p in res.get("placed", [])],
+        "queued": res.get("queued", 0),
+        "skipped": list(res.get("skipped", [])),
+        "note": "пресеты и язык берутся из канала — поменять их можно в самом канале",
+    }
+
+
+def _channel_presets(c, ch) -> list:
+    """Чем именно будет сделан ролик — и существуют ли эти пресеты на самом деле.
+
+    Ссылка на удалённый пресет сегодня выясняется в момент генерации, то есть после
+    того, как конвейер встал. Здесь она видна до нажатия кнопки.
+    """
+    out = []
+    row = c.execute("SELECT name FROM presets WHERE id=? AND tenant_id=?",
+                    (ch["preset_vsgen_id"], TENANT)).fetchone() \
+        if ch["preset_vsgen_id"] else None
+    out.append({"what": "производство", "name": (row["name"] if row else
+                                                 str(ch["preset_vsgen_id"] or "—")),
+                "exists": bool(row), "where": "кабинет"})
+    keys = {n: get_key(c, n) for n in ("rewrite", "cover")}
+    body, _err = _neighbour_get(REWRITE_BASE, "/api/v1/presets", keys["rewrite"])
+    have_rew = set((body or {}).get("rewrite") or {})
+    out.append({"what": "рерайт", "name": ch["preset_rewrite"] or "—",
+                "exists": (None if body is None
+                           else bool(ch["preset_rewrite"] in have_rew)),
+                "where": "rewrite"})
+    body, _err = _neighbour_get(COVER_BASE, "/presets", keys["cover"])
+    have_cov = set(body or {}) if isinstance(body, dict) else None
+    out.append({"what": "обложка", "name": ch["preset_cover"] or "—",
+                "exists": (None if have_cov is None
+                           else bool(ch["preset_cover"] in have_cov)),
+                "where": "cover"})
+    return out
