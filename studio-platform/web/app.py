@@ -41,6 +41,7 @@ from pub_tags import add_links, parse_links, plan_rows           # noqa: E402
 import pub_alerts                                                # noqa: E402
 import pub_alerts_tg                                             # noqa: E402
 import pub_retention                                             # noqa: E402
+import pub_verify                                                # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
 
 load_env()
@@ -875,3 +876,59 @@ def _preset_facts(settings) -> list:
         if len(facts) >= 4:
             break
     return facts
+
+
+@app.get("/ui/public")
+def ui_public():
+    """Вышел ли ролик на самом деле (ТЗ §11).
+
+    Отдельно от всего остального, потому что это единственное место, где видно
+    разницу между «расписание подтверждено» и «ролик вышел». Сегодня интерфейс
+    называет публикацией первое.
+
+    Проверка ничего не отменяет и не перезаливает — она только повышает запись
+    `scheduled` → `published`. Поэтому здесь нет ни одной кнопки, меняющей выпуск.
+    """
+    now = time.time()
+    c = db()
+    try:
+        key = pub_verify.api_key(c)
+        due = [{"release_id": r["release_id"], "video_id": r["video_id"],
+                "slot_at": r["slot_at"],
+                "late_hours": round((now - float(r["slot_at"] or now)) / 3600, 1)}
+               for r in pub_verify.due(c, TENANT, now)]
+        checked = []
+        for e in c.execute(
+                "SELECT e.release_id, e.payload, e.created, r.phase, r.blocked_reason "
+                "FROM pub_release_events e JOIN pub_releases r "
+                "  ON r.release_id = e.release_id "
+                "WHERE e.phase='public_check' AND r.tenant_id=? "
+                "ORDER BY e.created DESC LIMIT 40", (TENANT,)):
+            try:
+                payload = json.loads(e["payload"] or "{}")
+            except ValueError:
+                payload = {}
+            checked.append({"release_id": e["release_id"], "at": e["created"],
+                            "state": payload.get("state") or "",
+                            "privacy": payload.get("privacy") or "",
+                            "error": payload.get("error") or "",
+                            "phase": e["phase"], "blocked": e["blocked_reason"] or ""})
+        confirmed = c.execute(
+            "SELECT COUNT(*) FROM pub_releases WHERE tenant_id=? AND phase='published'",
+            (TENANT,)).fetchone()[0]
+        scheduled = c.execute(
+            "SELECT COUNT(*) FROM pub_releases WHERE tenant_id=? AND phase='scheduled'",
+            (TENANT,)).fetchone()[0]
+    finally:
+        c.close()
+    return {
+        "key_set": bool(key), "key": mask(key),
+        "due": due, "checked": checked,
+        "confirmed": confirmed, "scheduled": scheduled,
+        "grace_min": pub_verify.GRACE_SEC // 60,
+        "how": "ключ YouTube Data API v3: dev/verify_public.py --save-key ... "
+               "или VS_YT_API_KEY в .env. Проход: dev/verify_public.py --run",
+        "blind_spot": "Ключ API видит только публичные и доступные по ссылке ролики. "
+                      "Запланированный (ещё приватный) и удалённый выглядят одинаково — "
+                      "пустым ответом. Различить их может только OAuth-токен канала.",
+    }

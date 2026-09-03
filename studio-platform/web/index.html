@@ -616,8 +616,14 @@ const FATE_TITLE = {keep:'артефакт выпуска — не удаляе�
 const ACT_TITLE  = {keep:'оставить', strip:'очистить', drop:'удалить целиком'};
 const ACT_CLS    = {keep:'s-idle', strip:'s-queued', drop:'s-error'};
 
+const PUB_TITLE = {public:'вышел', unlisted:'только по ссылке',
+                   not_public:'ключ не видит', unknown:'ответа нет'};
+const PUB_CLS   = {public:'s-done', unlisted:'s-error',
+                   not_public:'s-queued', unknown:'s-idle'};
+
 async function viewAdmin(){
-  const [a, d] = await Promise.all([api('/ui/alerts'), api('/ui/disk')]);
+  const [a, d, pb] = await Promise.all([api('/ui/alerts'), api('/ui/disk'),
+                                        api('/ui/public')]);
   app.innerHTML = '';
   app.append($(`<h1>Админ</h1>
     <p class="sub">Две вещи, из-за которых конвейер встаёт молча: некому сказать,
@@ -712,6 +718,43 @@ async function viewAdmin(){
       Зелёным — пять артефактов выпуска: они остаются всегда.
       Всего ${size(d.total)}, освободится ${size(d.freeable)}.</div>`
       : '<div class="empty">Проектов на диске нет.</div>'}
+  </div>`));
+
+  /* ── вышел ли ролик на самом деле ── */
+  app.append($(`<div class="card" style="margin-top:16px">
+    <div class="sec">Выход в свет</div>
+    <div class="stage">
+      <div class="dot ${pb.key_set ? 's-done' : 's-idle'}">${pb.key_set ? '✓' : '?'}</div>
+      <div class="body">
+        <div class="name">${pb.key_set
+          ? `Ключ YouTube Data API задан (${esc(pb.key)})`
+          : 'Ключа YouTube Data API нет — выход подтвердить нечем'}</div>
+        <div class="facts">подтверждённо вышли: ${pb.confirmed} ·
+          стоят в расписании: ${pb.scheduled}</div>
+        <div class="note muted">${esc(pb.how)}</div>
+      </div>
+    </div>
+    ${pb.due.length ? `<div class="sec" style="border-bottom:0">Пора спросить</div>
+      ${pb.due.map(r => `<div class="stage">
+        <div class="dot s-queued">·</div>
+        <div class="body">
+          <div class="name"><a href="#/release/${encodeURIComponent(r.release_id)}"
+            >${esc(r.release_id)}</a> · <span class="mono">${esc(r.video_id)}</span></div>
+          <div class="facts">слот прошёл ${r.late_hours} ч назад</div>
+        </div></div>`).join('')}`
+      : `<div class="note muted">Спрашивать пока некого: слоты прошли меньше
+         ${pb.grace_min} мин назад либо всё уже подтверждено.</div>`}
+    ${pb.checked.length ? `<div class="sec" style="border-bottom:0">Что ответил YouTube</div>
+      ${pb.checked.map(x => `<div class="stage">
+        <div class="dot ${PUB_CLS[x.state] || 's-idle'}">${
+          x.state === 'public' ? '✓' : x.state === 'unlisted' ? '!' : '·'}</div>
+        <div class="body">
+          <div class="name">${esc(x.release_id)} — ${PUB_TITLE[x.state] || esc(x.state)}</div>
+          <div class="facts">${when(x.at)}${x.privacy ? ' · ' + esc(x.privacy) : ''}</div>
+          ${x.error ? `<div class="note muted">${esc(x.error)}</div>` : ''}
+          ${x.blocked ? `<div class="note bad">${esc(x.blocked)}</div>` : ''}
+        </div></div>`).join('')}` : ''}
+    <div class="note muted">${esc(pb.blind_spot)}</div>
   </div>`));
 }
 

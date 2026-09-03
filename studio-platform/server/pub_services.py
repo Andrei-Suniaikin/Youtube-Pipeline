@@ -654,9 +654,26 @@ class PubServices:
         """Проверка фактического выхода — отдельным проходом, позже.
 
         До неё выпуск уже закрыт по подтверждённому расписанию, поэтому сюда движок
-        обычно не заходит вовсе.
+        обычно не заходит вовсе; основной проход живёт в `pub_verify.run()`.
+
+        Доказательство — ответ YouTube Data API, а не разбор страницы: браузер
+        результат не доказывает. Нет ключа или нет ответа — ждём, а не выдумываем:
+        отсутствие ответа не является ответом.
         """
-        raise ResourceDown("проверка публикации", "проверка выхода в PUBLIC пока не подключена")
+        import pub_verify
+        key = pub_verify.api_key(c)
+        if not key:
+            raise ResourceDown("проверка публикации",
+                               "нет ключа YouTube Data API "
+                               "(admin_state.youtube_api_key или VS_YT_API_KEY)")
+        res = pub_verify.check(rel["video_id"] or "", key)
+        if res["state"] == pub_verify.PUBLIC:
+            return {"video_id": rel["video_id"] or "",
+                    "evidence": {"public_check": res}}
+        if res["state"] == pub_verify.UNLISTED:
+            raise ItemFailed("ролик доступен только по ссылке, а должен быть публичным")
+        raise ResourceDown("проверка публикации",
+                           res.get("error") or "выход пока не подтверждён")
 
     def _openai_key(self, c) -> str:
         """Ключ для рерайта названия. Нет ключа — ждём настройки, а не портим название."""

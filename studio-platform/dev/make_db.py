@@ -147,8 +147,12 @@ def seed(c) -> dict:
     if done_item:
         c.execute(
             "INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,plan_item_version,"
-            "channel_id,uc,slot_at,project_id,status,phase,created,updated) "
-            "VALUES('rel-dev-done',?,?,1,?,?,?,'proj-dev-done','done','scheduled',?,?)",
+            "channel_id,uc,slot_at,project_id,status,phase,video_id,created,updated) "
+            # video_id есть у всякого выпуска, дошедшего до подтверждённого расписания:
+            # его возвращает сама Studio. Без него поздняя проверка выхода не имеет
+            # что спрашивать, и экран показывал бы пустоту вместо работы.
+            "VALUES('rel-dev-done',?,?,1,?,?,?,'proj-dev-done','done','scheduled',"
+            "'dQw4w9WgXcQ',?,?)",
             (TENANT, done_item, ch_id, "UCdev0000000000000000001",
              behind[-3].timestamp(), NOW, NOW))
     if blocked_item:
