@@ -19,7 +19,11 @@ trap 'kill 0' EXIT
       "$PY" -m uvicorn main:app --port 8800 --log-level warning ) &
 ( cd "$ROOT/cover"   && "$PY" -m uvicorn cover_server:app --port 8900 --log-level warning ) &
 ( cd "$ROOT/rewrite" && "$PY" -m uvicorn server:app       --port 8899 --log-level warning ) &
-( cd "$ROOT"         && "$PY" -m uvicorn web.app:app      --port 8010 --log-level warning ) &
+# VS_DEV_INSECURE_COOKIE: пульт по умолчанию ставит куку Secure — правильно за Caddy,
+# но по http://127.0.0.1 её сохранит не всякий браузер. Снимать защиту должен тот,
+# кто знает, что он в песочнице, поэтому послабление живёт здесь, а не в коде.
+( cd "$ROOT"         && VS_DEV_INSECURE_COOKIE=1 \
+      "$PY" -m uvicorn web.app:app      --port 8010 --log-level warning ) &
 # Тревоги — отдельный процесс, а не поток внутри пульта: в бою это systemd-таймер,
 # и падение опроса не должно уносить с собой интерфейс. Запускается только когда
 # телеграм настроен, иначе крутить цикл в пустоту незачем.
@@ -36,7 +40,8 @@ echo "  кабинет  http://127.0.0.1:8800   (боевой VSGen)"
 echo "  rewrite  http://127.0.0.1:8899"
 echo "  cover    http://127.0.0.1:8900"
 echo
-echo "  ключи соседей живут в базе; после dev/make_db.py их нужно выдать заново:"
+echo "  вход в пульт — логин и пароль кабинета (dev / VS_DEV_PASSWORD)."
+echo "  ключи соседей и пароль живут в базе; после dev/make_db.py их нужно выдать заново:"
 echo "    .venv/bin/python dev/provision.py"
 echo
 wait

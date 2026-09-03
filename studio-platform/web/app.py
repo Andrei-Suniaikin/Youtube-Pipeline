@@ -27,9 +27,12 @@ BASE = os.path.abspath(os.path.join(HERE, ".."))
 SERVER = os.path.join(BASE, "server")
 sys.path.insert(0, SERVER)
 
-from fastapi import FastAPI, HTTPException                       # noqa: E402
-from fastapi.responses import FileResponse                       # noqa: E402
+from fastapi import FastAPI, HTTPException, Request, Response    # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse          # noqa: E402
 from pydantic import BaseModel                                   # noqa: E402
+
+sys.path.insert(0, HERE)
+import auth                                                      # noqa: E402
 
 from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
                            normalize_schedule, upcoming_slots)
@@ -48,6 +51,7 @@ load_env()
 
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 TENANT = os.environ.get("VS_DEV_TENANT", "dev")
+CABINET_BASE = os.environ.get("VS_CABINET_BASE") or "http://127.0.0.1:8800"
 # Тот же путь, что читает кабинет (main.py TENANTS_DIR): уборка и производство должны
 # смотреть в один каталог, иначе экран покажет пустой диск при полном.
 TENANTS_DIR = (os.environ.get("VS_TENANTS_DIR")
@@ -80,6 +84,78 @@ TERMINAL_OK = ("done",)
 TERMINAL_BAD = ("error", "cancelled", "failed")
 
 app = FastAPI(title="Studio Platform — оболочка разработки", docs_url="/docs")
+
+# Открыто без входа ровно то, без чего в него не войти.
+PUBLIC_PATHS = ("/", "/ui/login", "/ui/me", "/docs", "/openapi.json", "/redoc")
+
+
+@app.middleware("http")
+async def require_session(request: Request, call_next):
+    """Ни один экран и ни одно действие не работают без входа.
+
+    Раньше пульт не спрашивал вообще ничего: он слушает 127.0.0.1, и казалось, что
+    этого довольно. Не довольно — на той же машине живут и соседние сервисы, и любой
+    процесс пользователя. Данные здесь настоящие: каналы, выпуски, состояние ключей.
+    """
+    if request.url.path in PUBLIC_PATHS or not request.url.path.startswith("/ui/"):
+        return await call_next(request)
+    sid = request.cookies.get(auth.COOKIE) or ""
+    c = db()
+    try:
+        user = auth.who(c, sid)
+    finally:
+        c.close()
+    if user is None:
+        return JSONResponse({"detail": "нужен вход"}, status_code=401)
+    request.state.sid = sid
+    request.state.user = user
+    return await call_next(request)
+
+
+@app.post("/ui/login")
+async def ui_login(request: Request, response: Response):
+    """Пароль проверяет кабинет, не мы. Своего списка пользователей у пульта нет."""
+    body = await request.json()
+    try:
+        sid = auth.login(CABINET_BASE, str(body.get("login") or ""),
+                         str(body.get("password") or ""))
+    except auth.LoginFailed as exc:
+        raise HTTPException(401, str(exc))
+    c = db()
+    try:
+        user = auth.who(c, sid)
+    finally:
+        c.close()
+    if user is None:
+        # Кабинет выдал сессию, а мы её не видим — значит смотрим в разные базы.
+        # Сказать об этом прямо дешевле, чем оставить «неверный пароль» при верном.
+        raise HTTPException(500, "кабинет выдал сессию, но её нет в базе пульта — "
+                                 "проверьте, что VS_SERVER_DB и VS_DEV_DB это один файл")
+    response.set_cookie(auth.COOKIE, sid, httponly=True, samesite="lax",
+                        secure=not auth.INSECURE, max_age=30 * 86400)
+    return {"name": user["name"], "tenant": user["tenant_id"] or str(user["id"])}
+
+
+@app.post("/ui/logout")
+def ui_logout(request: Request, response: Response):
+    auth.logout(CABINET_BASE, getattr(request.state, "sid", ""))
+    response.delete_cookie(auth.COOKIE)
+    return {"ok": True}
+
+
+@app.get("/ui/me")
+def ui_me(request: Request):
+    """Кто вошёл. Единственный экран-независимый ответ: 401 здесь — не ошибка,
+    а нормальный ответ «ещё не вошёл», по которому фронт рисует форму входа."""
+    c = db()
+    try:
+        user = auth.who(c, request.cookies.get(auth.COOKIE) or "")
+    finally:
+        c.close()
+    if user is None:
+        raise HTTPException(401, "нужен вход")
+    return {"name": user["name"], "tenant": user["tenant_id"] or str(user["id"]),
+            "role": user["role"] if "role" in user.keys() else ""}
 
 
 # ───────────────────────────────── данные ─────────────────────────────────

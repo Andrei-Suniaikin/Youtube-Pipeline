@@ -23,6 +23,14 @@
             border-bottom:2px solid transparent;white-space:nowrap}
   nav a.tab.on{color:var(--ink);border-bottom-color:var(--ink);font-weight:550}
   nav span.soon{padding:13px 12px;color:#b4b8bf;cursor:not-allowed;white-space:nowrap}
+  nav .who{padding:13px 0 13px 14px;color:var(--muted);font-size:12px;white-space:nowrap}
+  nav .who a{color:var(--muted)}
+  .login{max-width:340px;margin:12vh auto;background:var(--surface);border:1px solid var(--border);
+         border-radius:10px;padding:26px 24px}
+  .login h1{margin:0 0 4px;font-size:19px}
+  .login input{width:100%;box-sizing:border-box;padding:9px 11px;margin-top:10px;
+               border:1px solid var(--border);border-radius:7px;font:inherit}
+  .login button{width:100%;margin-top:14px}
   nav span.soon::after{content:" скоро";font-size:11px;opacity:.8}
   main{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
   h1{font-size:20px;margin:0 0 4px}
@@ -121,6 +129,7 @@
     <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
     <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
+    <span class="who" id="who"></span>
   </nav>
 </header>
 
@@ -156,11 +165,18 @@ function ago(sec){
   if (sec < 86400) return Math.round(sec/3600) + ' ч';
   return Math.round(sec/86400) + ' дн';
 }
+class NeedLogin extends Error {}
+
 async function api(path, opts){
   const r = await fetch(path, opts);
   const body = await r.json().catch(() => ({detail:'ответ не разобран'}));
+  if (r.status === 401) throw new NeedLogin(body.detail || 'нужен вход');
   if (!r.ok) throw new Error(body.detail || body.error || ('HTTP ' + r.status));
   return body;
+}
+async function post(path, payload){
+  return api(path, {method:'POST', headers:{'Content-Type':'application/json'},
+                    body: JSON.stringify(payload || {})});
 }
 function fail(e){
   app.innerHTML = '';
@@ -560,6 +576,54 @@ async function viewNew(){
   };
 }
 
+/* ─────────────────────────────── вход ─────────────────────────────── */
+
+let ME = null;
+
+function viewLogin(why){
+  document.querySelector('nav').style.visibility = 'hidden';
+  app.innerHTML = '';
+  const box = $(`<div class="login">
+    <h1>Studio</h1>
+    <p class="sub" style="margin:0">Логин и пароль — те же, что в кабинете.
+      Своей учётной записи у пульта нет.</p>
+    <input id="lg" placeholder="логин" autocomplete="username" autofocus>
+    <input id="pw" type="password" placeholder="пароль" autocomplete="current-password">
+    <button id="go">Войти</button>
+    <div id="err" style="margin-top:12px"></div>
+  </div>`);
+  app.append(box);
+  const err = box.querySelector('#err');
+  if (why) err.innerHTML = `<div class="err">${esc(why)}</div>`;
+  const go = async () => {
+    err.innerHTML = '';
+    try{
+      ME = await post('/ui/login', {login: box.querySelector('#lg').value,
+                                    password: box.querySelector('#pw').value});
+      document.querySelector('nav').style.visibility = '';
+      location.hash = location.hash && location.hash !== '#/login'
+        ? location.hash : '#/releases';
+      await render();
+    }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  };
+  box.querySelector('#go').onclick = go;
+  for (const id of ['lg', 'pw'])
+    box.querySelector('#' + id).onkeydown = e => { if (e.key === 'Enter') go(); };
+}
+
+function showWho(){
+  const el = document.getElementById('who');
+  el.innerHTML = ME
+    ? `${esc(ME.name)} · <a href="#" id="out">выйти</a>` : '';
+  const out = document.getElementById('out');
+  if (out) out.onclick = async e => {
+    e.preventDefault();
+    await post('/ui/logout').catch(() => {});
+    ME = null;
+    viewLogin('');
+  };
+}
+
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
 async function viewPresets(){
@@ -776,11 +840,22 @@ const ROUTES = [
 ];
 
 async function render(){
+  if (!ME){
+    try{ ME = await api('/ui/me'); }
+    catch(e){ return viewLogin(e instanceof NeedLogin ? '' : e.message); }
+  }
+  document.querySelector('nav').style.visibility = '';
+  showWho();
   const h = location.hash || '#/releases';
   const hit = ROUTES.find(r => r[1](h));
   for (const id of ['releases', 'channels', 'queue', 'keys', 'presets', 'admin'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
-  try{ await hit[2](h); }catch(e){ fail(e); }
+  try{ await hit[2](h); }
+  catch(e){
+    // Сессия могла истечь посреди работы: это не ошибка экрана, а «войдите снова».
+    if (e instanceof NeedLogin){ ME = null; return viewLogin(''); }
+    fail(e);
+  }
 }
 addEventListener('hashchange', render);
 render();
