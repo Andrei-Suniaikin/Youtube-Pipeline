@@ -1,0 +1,151 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Пульт: вход обязателен, предпросмотр ничего не пишет, действия пересылаются.
+
+Требует поднятого стенда (dev/run.sh) и пароля кабинета из VS_DEV_PASSWORD.
+Провайдеров не трогает: все проверки — про доступ и про то, кто выполняет работу.
+
+    .venv/bin/python tests/test_web_pult.py
+"""
+from __future__ import annotations
+
+import http.cookiejar
+import json
+import os
+import sqlite3
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+BASE = os.path.abspath(os.path.join(HERE, ".."))
+
+PULT = os.environ.get("VS_PULT_URL", "http://127.0.0.1:8010")
+DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
+LOGIN = os.environ.get("VS_DEV_LOGIN", "dev")
+PASSWORD = os.environ.get("VS_DEV_PASSWORD", "dev-local-only")
+
+SCREENS = ("releases", "channels", "queue", "keys", "presets", "alerts", "disk", "public")
+FAILS = []
+
+
+def check(label, got, want):
+    if got == want:
+        print(f"  OK   {label}")
+    else:
+        print(f"  FAIL {label}\n        ожидалось: {want!r}\n        получено:  {got!r}")
+        FAILS.append(label)
+
+
+class Client:
+    """Браузер на минималках: помнит куки, отдаёт код и тело."""
+
+    def __init__(self):
+        self.jar = http.cookiejar.CookieJar()
+        self.opener = urllib.request.build_opener(
+            urllib.request.HTTPCookieProcessor(self.jar))
+
+    def go(self, path, payload=None, method=None):
+        data = json.dumps(payload).encode("utf-8") if payload is not None else None
+        # Кириллица в пути: браузер кодирует её сам, urllib — нет.
+        req = urllib.request.Request(PULT + urllib.parse.quote(path, safe="/?&="),
+                                     data=data,
+                                     method=method or ("POST" if data is not None else "GET"))
+        req.add_header("Content-Type", "application/json")
+        try:
+            with self.opener.open(req, timeout=15) as resp:
+                raw = resp.read().decode("utf-8")
+                return resp.status, (json.loads(raw) if raw.startswith(("{", "[")) else raw)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            try:
+                return exc.code, json.loads(raw or "{}")
+            except ValueError:
+                return exc.code, raw[:200]
+        except urllib.error.URLError as exc:
+            raise SystemExit(f"пульт {PULT} не отвечает: {exc.reason}. Сначала: dev/run.sh")
+
+    @property
+    def has_session(self) -> bool:
+        return any(ck.name == "vs_session" for ck in self.jar)
+
+
+def plan_rows(url_like: str) -> int:
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        return c.execute("SELECT COUNT(*) FROM pub_plan_items WHERE donor_url LIKE ?",
+                         (f"%{url_like}%",)).fetchone()[0]
+    finally:
+        c.close()
+
+
+def main() -> int:
+    anon = Client()
+    print("Без входа не работает ничего")
+    for screen in SCREENS:
+        code, _ = anon.go(f"/ui/{screen}")
+        if code != 401:
+            check(f"/ui/{screen} закрыт", code, 401)
+    check("все экраны закрыты", [c for c in (anon.go(f"/ui/{s}")[0] for s in SCREENS)
+                                 if c != 401], [])
+    check("страница-оболочка открыта", anon.go("/")[0], 200)
+    check("«кто я» отвечает 401, а не ошибкой", anon.go("/ui/me")[0], 401)
+    check("действие тоже закрыто", anon.go("/ui/actions/vsgen/1/cancel", {})[0], 401)
+
+    print("\nВход")
+    code, body = anon.go("/ui/login", {"login": LOGIN, "password": "не тот"})
+    check("неверный пароль не пускает", code, 401)
+    check("и не рассказывает, что именно не так",
+          body.get("detail"), "неверный логин или пароль")
+    check("сессии не появилось", anon.has_session, False)
+
+    me = Client()
+    code, body = me.go("/ui/login", {"login": LOGIN, "password": PASSWORD})
+    if code != 200:
+        raise SystemExit(f"вход не удался ({code}): {body}. "
+                         f"Задайте VS_DEV_PASSWORD или запустите dev/provision.py")
+    check("верный пароль пускает", code, 200)
+    check("сессия выдана", me.has_session, True)
+    check("кто вошёл", me.go("/ui/me")[1].get("name"), LOGIN)
+
+    print("\nС сессией открыты все экраны")
+    bad = [s for s in SCREENS if me.go(f"/ui/{s}")[0] != 200]
+    check("ни один экран не отказал", bad, [])
+
+    print("\nПредпросмотр не оставляет следов")
+    mark = "test-preview-does-not-write"
+    before = plan_rows(mark)
+    code, body = me.go("/ui/links/preview",
+                       {"channel_id": 1, "links": f"https://youtu.be/{mark}"})
+    check("предпросмотр отвечает", code, 200)
+    check("сказано, чем будет сделано", len(body.get("presets") or []), 3)
+    check("в базе ничего не прибавилось", plan_rows(mark), before)
+
+    print("\nДействия пересылаются, а не выполняются здесь")
+    code, body = me.go("/ui/actions/vsgen/99999999/cancel", {})
+    check("чужая задача не отменяется", code in (403, 404), True)
+    code, body = me.go("/ui/actions/vsgen/1/удалить", {})
+    check("несуществующее действие отвергнуто", code, 404)
+    code, body = me.go("/ui/actions/наш-сервис/1/cancel", {})
+    check("несуществующий сервис отвергнут", code, 404)
+    code, body = me.go("/ui/actions/rewrite/нет-такой/cancel", {})
+    check("ответ соседа пересказан как есть", code, 404)
+    check("и его словами", body.get("detail"), "job not found")
+
+    print("\nВыход")
+    check("выход принят", me.go("/ui/logout", {})[0], 200)
+    check("после выхода снова закрыто", me.go("/ui/releases")[0], 401)
+
+    print()
+    if FAILS:
+        print(f"ПРОВАЛЕНО: {len(FAILS)}")
+        for f in FAILS:
+            print("  -", f)
+        return 1
+    print("все проверки прошли")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
