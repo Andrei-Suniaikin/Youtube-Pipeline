@@ -29,6 +29,7 @@ if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import card_jobs as card_contract
 from pub_calls import ensure_calls_schema
+from pub_calls_api import register_calls_routes
 from pub_schema import ensure_pub_schema
 from pub_ui import register_pub_routes
 from pub_engine import tick as pub_tick
@@ -2416,6 +2417,12 @@ async def logout_post(request: Request):
 # этом файле уже заданы DB (VS_SERVER_DB) и KEYS_PATH (VS_SERVER_KEYS_PATH); значение по
 # умолчанию прежнее, поэтому в production ничего не меняется.
 TENANTS_DIR = os.environ.get("VS_TENANTS_DIR") or "/data/tenants"
+
+# Куда движок-подпроцесс стучится за журналом платных вызовов. По умолчанию — сам
+# кабинет на loopback: движки запускаются им же и на той же машине. Порт вынесен в
+# переменную, чтобы локальный кабинет на другом порту не требовал правки кода.
+CALLS_BASE_URL = (os.environ.get("VS_CALLS_URL")
+                  or f"http://127.0.0.1:{os.environ.get('VS_SERVER_PORT', '8800')}")
 
 _CSS = """@import url('https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700;800&family=Golos+Text:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
 :root{
@@ -9617,6 +9624,14 @@ def _run_task(t):
             credential_overrides=credential_overrides,
             prompt_provider=prompt_provider,
         )
+        # Журнал платных вызовов. Токен идёт ОКРУЖЕНИЕМ, а не argv: argv видно в ps
+        # любому пользователю машины. Без этих трёх переменных клиент в движке
+        # выключается и работа идёт как до журнала — так движки остаются запускаемыми
+        # руками из командной строки, без поднятого кабинета.
+        job_env["VS_CALLS_URL"] = CALLS_BASE_URL
+        job_env["VS_JOB_ID"] = str(jid)
+        job_env["VS_JOB_TOKEN"] = str(claim_token or "")
+
         if t["kind"] == "cards":
             # Defense in depth: _task_provider already hard-locks the queue lane and
             # card_jobs.py asserts these values before calling prompt_llm.
@@ -17158,6 +17173,13 @@ register_upload_routes(app, {
     "_now": _now,
     "upload_token": _upload_token,
     "log": log_info,
+})
+
+# Журнал платных вызовов. Токен задачи (queue_tasks.claim_token) уже защищает её от
+# чужого heartbeat — им же движок и представляется, отдельный общий секрет не заводим.
+register_calls_routes(app, {
+    "db": db,
+    "_now": _now,
 })
 
 register_pub_routes(app, {
