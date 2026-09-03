@@ -86,7 +86,10 @@ class Telegram:
                 self.log(f"[тревоги] телеграм отказал: HTTP {exc.code} {raw[:200]}")
                 return False
             except Exception as exc:                               # noqa: BLE001
-                self.log(f"[тревоги] телеграм недоступен: {type(exc).__name__}")
+                # Причину печатаем целиком: «URLError» без текста одинаково выглядит
+                # и когда нет интернета, и когда закрыт исходящий трафик, и когда
+                # api.telegram.org не резолвится. Разбираться с этим будет человек.
+                self.log(f"[тревоги] телеграм недоступен: {type(exc).__name__}: {exc}")
                 return False
         return False
 
@@ -108,7 +111,7 @@ class Telegram:
             out["error"] = f"HTTP {exc.code}: {exc.read().decode('utf-8','replace')[:200]}"
             return out
         except Exception as exc:                                   # noqa: BLE001
-            out["error"] = f"{type(exc).__name__}"
+            out["error"] = f"{type(exc).__name__}: {exc}"
             return out
         seen = {}
         for u in (upd.get("result") or []):
