@@ -3,13 +3,16 @@
 
 Кабинет ходит к Rewrite и Cover с заголовком `Authorization: Bearer <key>`, а сам ключ
 хранит в своей таблице `admin_state` под именами `pub_key_rewrite` и `pub_key_cover`
-(см. `server/pub_remote.py:63` — `get_key()` / `set_key()`).
+(см. `server/pub_remote.py` — `get_key()` / `set_key()`).
 
-Здесь то же самое, только локально: заводим админа в каждом соседе, логинимся, просим
-у него API-ключ и кладём в нашу базу. Пароль берётся из окружения; значение по умолчанию
-годится только для локальной базы без реальных данных.
+ПЕРЕПИСАНО 04.09.2026. Раньше скрипт заводил у каждого соседа отдельную учётку и
+логинился в неё своим паролем — то есть держал три пароля на одного человека. После
+слияния личности этого не нужно: сессия кабинета открывает всех соседей (единый вход),
+и ключ создаётся ею. Один пароль, один вход, три ключа.
 
     VS_DEV_PASSWORD=... .venv/bin/python dev/provision.py
+
+Требует поднятого стенда: ключи выдают сами соседи, а не мы за них.
 """
 from __future__ import annotations
 
@@ -18,7 +21,9 @@ import os
 import sqlite3
 import sys
 import time
+import http.cookies
 import urllib.error
+import urllib.parse
 import urllib.request
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -28,13 +33,30 @@ DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 LOGIN = os.environ.get("VS_DEV_LOGIN", "dev")
 PASSWORD = os.environ.get("VS_DEV_PASSWORD", "dev-local-only")
 
-# Адреса берутся из окружения: в единой платформе соседи живут под префиксами того же
-# порта, при раздельном запуске — на своих. Зашивать выбор нельзя, оба варианта живы.
+PLATFORM = os.environ.get("VS_PLATFORM_BASE") or "http://127.0.0.1:8080"
+
+# Где искать соседа. Порядок: что сказали в окружении → единая платформа под префиксом
+# → старый отдельный порт. Пробуем по очереди, а не гадаем: оба способа запуска живы,
+# и требовать от человека помнить, каким он поднял стенд, — лишняя работа.
+def _base(name: str, own_port: int) -> str:
+    said = os.environ.get(f"VS_{name.upper()}_BASE")
+    if said:
+        return said.rstrip("/")
+    for candidate in (f"{PLATFORM.rstrip('/')}/{name}", f"http://127.0.0.1:{own_port}"):
+        try:
+            req = urllib.request.Request(candidate + "/auth/status")
+            with urllib.request.urlopen(req, timeout=3) as resp:
+                if resp.status == 200:
+                    return candidate
+        except Exception:                                          # noqa: BLE001
+            continue
+    return f"http://127.0.0.1:{own_port}"      # ничего не ответило — скажем об этом внятно
+
+
 SERVICES = (
     # имя ключа, адрес, путь создания ключа
-    ("rewrite", os.environ.get("VS_REWRITE_BASE") or "http://127.0.0.1:8899",
-     "/api/keys/create"),
-    ("cover", os.environ.get("VS_COVER_BASE") or "http://127.0.0.1:8900", "/api-keys"),
+    ("rewrite", _base("rewrite", 8899), "/api/keys/create"),
+    ("cover", _base("cover", 8900), "/api-keys"),
 )
 
 
@@ -54,27 +76,44 @@ def call(url: str, payload=None, headers=None, method=None):
         except ValueError:
             return exc.code, {"error": body[:200]}
     except urllib.error.URLError as exc:
-        raise SystemExit(f"  {url} не отвечает: {exc.reason}. Сначала: dev/run.sh")
+        raise SystemExit(f"  {url} не отвечает: {exc.reason}.\n"
+                         f"  Сначала поднимите стенд: dev/run.sh\n"
+                         f"  Если он на другом адресе: VS_PLATFORM_BASE=http://…:ПОРТ")
 
 
-def session_for(base: str) -> str:
-    """Сессия в соседе: первичная настройка, иначе вход, иначе разовая установка пароля."""
-    _, status = call(base + "/auth/status")
-    if status.get("needs_setup"):
-        code, body = call(base + "/auth/setup", {"username": LOGIN, "password": PASSWORD})
-        if code == 200 and body.get("session_id"):
-            return body["session_id"]
-        raise SystemExit(f"  первичная настройка не прошла: {body}")
+def cabinet_session() -> str:
+    """Войти в кабинет и получить его сессию. Ею же открываются соседи.
 
-    code, body = call(base + "/auth/login-password", {"username": LOGIN, "password": PASSWORD})
-    if code == 200 and body.get("session_id"):
-        return body["session_id"]
+    Кабинет на успешный вход отвечает 302 с Set-Cookie, на неуспешный — 200 со
+    страницей входа. Различаем по этому, а не по тексту.
+    """
+    data = urllib.parse.urlencode({"login": LOGIN, "password": PASSWORD}).encode("utf-8")
+    req = urllib.request.Request(PLATFORM.rstrip("/") + "/login", data=data,
+                                 method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
 
-    # Учётка есть, пароль неизвестен: у обоих соседей для этого предусмотрен разовый claim.
-    code, body = call(base + "/auth/claim-password", {"username": LOGIN, "password": PASSWORD})
-    if code == 200 and body.get("session_id"):
-        return body["session_id"]
-    raise SystemExit(f"  вход не удался: {body}. Задайте VS_DEV_LOGIN / VS_DEV_PASSWORD")
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *_a, **_k):
+            return None
+
+    try:
+        with urllib.request.build_opener(_NoRedirect).open(req, timeout=15) as resp:
+            headers = resp.headers.get_all("Set-Cookie") or []
+    except urllib.error.HTTPError as exc:
+        headers = exc.headers.get_all("Set-Cookie") or []
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"  кабинет {PLATFORM} не отвечает: {exc.reason}\n"
+                         f"  Сначала поднимите стенд: dev/run.sh")
+    for raw in headers:
+        jar = http.cookies.SimpleCookie()
+        try:
+            jar.load(raw)
+        except http.cookies.CookieError:
+            continue
+        if "vs_session" in jar:
+            return jar["vs_session"].value
+    raise SystemExit(f"  вход в кабинет не удался. Пароль задаётся тем же запуском: "
+                     f"VS_DEV_PASSWORD=... dev/provision.py")
 
 
 def api_key(base: str, path: str, sid: str) -> str:
@@ -82,7 +121,9 @@ def api_key(base: str, path: str, sid: str) -> str:
     # переиспользовать старый — берём новое имя. Старые ключи остаются валидными; чистить
     # их незачем, база локальная.
     name = f"studio-platform-{int(time.time())}"
-    code, body = call(base + path, {"name": name}, {"X-Session-Id": sid})
+    # Соседа открывает кука кабинета: после слияния личности он узнаёт человека
+    # по ней, а своей сессии у него для нас больше нет.
+    code, body = call(base + path, {"name": name}, {"Cookie": f"vs_session={sid}"})
     if code != 200:
         raise SystemExit(f"  ключ не выдан ({code}): {body}")
     for field in ("key", "api_key", "plain", "plain_key", "token", "secret"):
@@ -124,13 +165,14 @@ def main() -> None:
 
     print("\nкабинет")
     cabinet_password(DB)
+    sid = cabinet_session()
+    print(f"  вход выполнен, сессия получена")
+
     c = sqlite3.connect(DB)
     now = time.time()
     try:
         for name, base, path in SERVICES:
             print(f"\n{name}  {base}")
-            sid = session_for(base)
-            print(f"  сессия получена")
             key = api_key(base, path, sid)
             c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES(?,?,?)",
                       (f"pub_key_{name}", key, now))
