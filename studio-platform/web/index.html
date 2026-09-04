@@ -1690,6 +1690,21 @@ async function viewAdmin(){
         <div class="facts mono">${esc(sp.path || sp.error || '')}</div>
       </div>
     </div>
+    ${(d.nodes || []).map(n => `<div class="stage">
+      <div class="dot ${n.stale ? 's-idle'
+        : n.free_gb != null && n.free_gb < a.disk_min_gb ? 's-error' : 's-done'}">${
+        n.stale ? '?' : n.free_gb != null && n.free_gb < a.disk_min_gb ? '!' : '✓'}</div>
+      <div class="body">
+        <div class="name">${esc(n.host)}${
+          n.role ? ` · ${n.role === 'render' ? 'рендер' : n.role === 'upload'
+            ? 'заливка' : esc(n.role)}` : ''}</div>
+        <div class="facts">${n.stale
+          ? `молчит ${Math.round(n.age_sec / 60)} мин — сведения устарели`
+          : `свободно ${n.free_gb} ГБ${n.total_gb ? ` из ${n.total_gb}` : ''}`}</div>
+        ${!n.stale && n.free_gb != null && n.free_gb < a.disk_min_gb
+          ? '<div class="note bad">Эта машина чистит за собой после каждой задачи. Если '
+            + 'место кончается — значит задачи падают, не доходя до вердикта.</div>' : ''}
+      </div></div>`).join('')}
     <div class="stage">
       <div class="dot ${d.policy_set ? 's-done' : 's-idle'}">${d.policy_set ? '✓' : '?'}</div>
       <div class="body">

@@ -50,6 +50,7 @@ import pub_ui                                                    # noqa: E402
 
 import pub_alerts                                                # noqa: E402
 import pub_alerts_tg                                             # noqa: E402
+import pub_calls                                                 # noqa: E402
 import pub_retention                                             # noqa: E402
 import pub_verify                                                # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
@@ -954,8 +955,17 @@ def ui_disk():
             "paid_calls": price["calls"], "paid_cost": price["cost"],
         })
     rows.sort(key=lambda r: -r["total"])
+    c2 = db()
+    try:
+        nodes = pub_calls.node_disk(c2, now)
+    finally:
+        c2.close()
     return {
         "space": pub_retention.free_space(TENANTS_DIR),
+        # Рендер и заливка идут на другой машине. Она чистит за собой после каждой
+        # задачи, поэтому место там должно быть транзитным — и если кончается,
+        # это симптом, а не переполнение.
+        "nodes": nodes,
         "policy": pol,
         "policy_set": bool(pol),
         "projects": rows,

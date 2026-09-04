@@ -210,7 +210,14 @@ def check_missed_slots(c, now, tenant=None) -> list:
 
 
 def check_disk(c, now, tenant=None, path=None) -> list:
-    """§5. На диске меньше 100 ГБ."""
+    """§5. На диске меньше 100 ГБ — и говорим, на КАКОЙ машине.
+
+    Раньше смотрели только на свой диск. Рендер и заливка идут на другой машине,
+    и «мало места» без указания машины посылает человека проверять не тот компьютер.
+    Ноды сообщают своё место при каждом опросе очереди (`pub_calls.note_node_disk`);
+    если машина молчит дольше четверти часа, её сведения считаются протухшими и
+    тревогу мы по ним не поднимаем — иначе выключенная на ночь нода кричала бы вечно.
+    """
     target = path or os.environ.get("VS_TENANTS_DIR") or "/data/tenants"
     # Каталога проектов может ещё не быть — например, на свежей машине или на ноутбуке
     # разработчика. Место всё равно надо мерить: поднимаемся до ближайшего существующего
@@ -228,15 +235,40 @@ def check_disk(c, now, tenant=None, path=None) -> list:
                       f"{probe}: {exc}",
                       money="Неизвестно: пока не знаем, сколько места осталось.")]
     free_gb = usage.free / GB
-    if free_gb >= DISK_MIN_GB:
+    out = []
+    if free_gb < DISK_MIN_GB:
+        out.append(Alert(
+            "disk_low",
+            "Мало места на сервере",
+            f"Свободно {free_gb:.1f} ГБ из {usage.total / GB:.0f} ГБ ({probe}).\n"
+            f"Порог тревоги — {DISK_MIN_GB:.0f} ГБ.",
+            money="Место кончится — встанет и производство, и заливка. "
+                  "Что можно убрать, показывает экран «Диск»."))
+    return out + _check_nodes(c, now)
+
+
+def _check_nodes(c, now) -> list:
+    """Место на машинах рендера и заливки — по их же сообщениям."""
+    try:
+        from pub_calls import node_disk
+        nodes = node_disk(c, now)
+    except Exception:                                              # noqa: BLE001
         return []
-    return [Alert(
-        "disk_low",
-        "Мало места на диске",
-        f"Свободно {free_gb:.1f} ГБ из {usage.total / GB:.0f} ГБ ({probe}).\n"
-        f"Порог тревоги — {DISK_MIN_GB:.0f} ГБ.",
-        money="Место кончится — встанет и производство, и заливка. "
-              "Что можно убрать, показывает экран «Диск».")]
+    out = []
+    for n in nodes:
+        if n["stale"] or n["free_gb"] is None or n["free_gb"] >= DISK_MIN_GB:
+            continue
+        role = {"render": "рендера", "upload": "заливки"}.get(n["role"], n["role"] or "")
+        out.append(Alert(
+            f"disk_low_node:{n['host']}",
+            f"Мало места на машине {n['host']}",
+            f"Машина {role}: свободно {n['free_gb']:.1f} ГБ"
+            + (f" из {n['total_gb']:.0f} ГБ" if n["total_gb"] else "")
+            + f".\nПорог тревоги — {DISK_MIN_GB:.0f} ГБ.",
+            money="Эта машина чистит за собой после каждой задачи. Если место всё "
+                  "равно кончается — значит задачи падают, не доходя до вердикта, "
+                  "и мусор остаётся. Деньги за них уже потрачены."))
+    return out
 
 
 def check_oldest_task(c, now, tenant=None) -> list:

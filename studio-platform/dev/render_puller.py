@@ -15,12 +15,16 @@ render_puller — агент рендера на GPU-боксе.
 """
 import os, sys, io, time, json, tarfile, subprocess, shutil, re, signal, threading
 from collections import deque
+import shutil
 import requests
 
 SERVER = os.environ.get("VSGEN_SERVER", "https://gen.13.140.129.66.sslip.io").rstrip("/")
 TOKEN = os.environ.get("PULLER_TOKEN", "")
 RENDER_WORKER = os.environ.get("RENDER_WORKER", "/workspace/render_worker.py")
 WORK = os.environ.get("PULLER_WORK", "/workspace/render_jobs")
+# Имя машины: под ним свободное место показывается в тревоге и на экране «Админ».
+# Без него сообщение «мало места» не говорит, ГДЕ именно мало.
+HOST = os.environ.get("RENDER_HOST", "render")
 POLL = int(os.environ.get("PULLER_POLL", "8"))
 # Параллельных рендеров на ноде. x264-энкод CPU-bound (20 потоков делятся), но whisper-фаза
 # (GPU, ~105с/джоб) и скачивание/заливка (сеть) у параллельных джобов перекрываются →
@@ -41,8 +45,24 @@ def _log(*a):
     print(time.strftime("%H:%M:%S"), *a, flush=True)
 
 
+def _free_space() -> dict:
+    """Сколько места на ЭТОЙ машине. Опрос очереди и так идёт постоянно — цепляем сюда.
+
+    Нода чистит за собой после каждого вердикта, поэтому место здесь должно быть
+    транзитным. Если оно кончается — это симптом: задачи падают, не доходя до вердикта,
+    и мусор остаётся. Со стороны сервера этого не видно никак, и раньше не было видно.
+    """
+    try:
+        u = shutil.disk_usage(WORK if os.path.isdir(WORK) else os.path.dirname(WORK) or "/")
+        return {"free_gb": round(u.free / 1024 ** 3, 1),
+                "total_gb": round(u.total / 1024 ** 3, 1)}
+    except Exception:
+        return {}
+
+
 def claim():
-    r = requests.post(f"{SERVER}/api/render/claim", headers=H, timeout=30, verify=True)
+    r = requests.post(f"{SERVER}/api/render/claim", headers=H, timeout=30, verify=True,
+                      json={"host": HOST, "role": "render", **_free_space()})
     r.raise_for_status()
     return r.json().get("job")
 

@@ -71,6 +71,20 @@ def register_upload_routes(app, ctx):
         except Exception:
             pass
         host = str(body.get("host") or "").strip()[:40] or "unknown"
+        # 04.09.2026: машина заливки сообщает своё свободное место тем же опросом —
+        # см. pub_calls.note_node_disk. Старый пуллер его не шлёт, и это не ошибка.
+        if body.get("free_gb") is not None:
+            try:
+                from pub_calls import note_node_disk
+                _c = db()
+                try:
+                    note_node_disk(_c, host, "upload", body.get("free_gb"),
+                                   body.get("total_gb"))
+                    _c.commit()
+                finally:
+                    _c.close()
+            except Exception:                                      # noqa: BLE001
+                pass
         # Рабочее место ноды. Без него одна машина смогла бы держать только одну заливку,
         # и правило «разные профили льются параллельно» не работало бы.
         worker = str(body.get("worker") or "1").strip()[:20]

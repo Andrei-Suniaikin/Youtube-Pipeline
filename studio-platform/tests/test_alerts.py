@@ -150,6 +150,31 @@ def main() -> int:
     c.execute("UPDATE queue_tasks SET status='running'")
     check("начатая задача сюда не считается", "oldest_task" in keys(c), False)
 
+    print("\nМесто на машинах рендера и заливки")
+    c = fresh()
+    from pub_calls import ensure_calls_schema, note_node_disk
+    ensure_calls_schema(c)
+    note_node_disk(c, "minsk", "upload", free_gb=3.0, total_gb=500.0, now=NOW)
+    note_node_disk(c, "render", "render", free_gb=400.0, total_gb=500.0, now=NOW)
+    c.commit()
+    os.environ["VS_ALERT_DISK_GB"] = "100"
+    import importlib
+    importlib.reload(A)
+    got = sorted(A.detect(c, NOW))
+    check("тревога про машину, где мало", got, ["disk_low_node:minsk"])
+    check("и сказано, какая это машина",
+          "minsk" in A.detect(c, NOW)["disk_low_node:minsk"].title, True)
+    check("сказано, что это симптом, а не просто полный диск",
+          "мусор остаётся" in A.detect(c, NOW)["disk_low_node:minsk"].money, True)
+
+    print("\n  молчащая машина не кричит вечно")
+    note_node_disk(c, "minsk", "upload", free_gb=3.0, total_gb=500.0,
+                   now=NOW - 2 * 3600)
+    c.commit()
+    check("сведения протухли — тревоги нет", sorted(A.detect(c, NOW)), [])
+    os.environ["VS_ALERT_DISK_GB"] = "0"
+    importlib.reload(A)
+
     print("\nПодача: одно сообщение на случай")
     c = fresh()
     c.execute("INSERT INTO queue_tasks VALUES(1,'dev','images','running',?,NULL)",

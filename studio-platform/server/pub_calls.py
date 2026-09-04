@@ -197,3 +197,60 @@ def project_summary(c: sqlite3.Connection, project_id: str) -> dict:
         out["calls"] += r["n"]
         out["cost"] += float(r["c"] or 0)
     return out
+
+
+# ─────────────────────────── свободное место на нодах ───────────────────────────
+
+# Тревога про диск смотрела только на сервер. Рендер и заливка идут на другой машине,
+# и про её место сервер не знал ничего — а «мало места» без указания машины посылает
+# человека проверять не тот компьютер.
+NODE_DISK_KEY = "node_disk"
+# Через сколько молчания сведения о машине считаются протухшими. Ноды опрашивают
+# очередь раз в двадцать секунд, так что четверть часа тишины — это уже тишина.
+NODE_DISK_STALE = 900
+
+
+def note_node_disk(c: sqlite3.Connection, host: str, role: str, free_gb, total_gb,
+                   now: float | None = None) -> None:
+    """Запомнить, сколько места на машине. Молча игнорирует неполные сведения:
+    старый пуллер их не шлёт, и это не повод падать."""
+    if not host or free_gb is None:
+        return
+    now = time.time() if now is None else now
+    try:
+        data = json.loads(_state_raw(c, NODE_DISK_KEY) or "{}")
+        if not isinstance(data, dict):
+            data = {}
+    except ValueError:
+        data = {}
+    data[str(host)[:40]] = {"role": str(role or "")[:20], "at": now,
+                            "free_gb": float(free_gb),
+                            "total_gb": float(total_gb or 0)}
+    c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES(?,?,?)",
+              (NODE_DISK_KEY, json.dumps(data, ensure_ascii=False), now))
+
+
+def node_disk(c: sqlite3.Connection, now: float | None = None) -> list:
+    """Что известно про машины: [{host, role, free_gb, total_gb, age_sec, stale}]."""
+    now = time.time() if now is None else now
+    try:
+        data = json.loads(_state_raw(c, NODE_DISK_KEY) or "{}")
+    except ValueError:
+        return []
+    out = []
+    for host, rec in sorted((data or {}).items()):
+        if not isinstance(rec, dict):
+            continue
+        age = now - float(rec.get("at") or 0)
+        out.append({"host": host, "role": rec.get("role") or "",
+                    "free_gb": rec.get("free_gb"), "total_gb": rec.get("total_gb"),
+                    "age_sec": int(age), "stale": age > NODE_DISK_STALE})
+    return out
+
+
+def _state_raw(c: sqlite3.Connection, key: str):
+    try:
+        row = c.execute("SELECT v FROM admin_state WHERE k=?", (key,)).fetchone()
+    except Exception:                                              # noqa: BLE001
+        return None
+    return row[0] if row else None

@@ -94,6 +94,16 @@ def download(release_id: str, kind: str, claim: str, dest: str) -> str:
     return dest
 
 
+def _free_space() -> dict:
+    """Сколько места на ЭТОЙ машине — цепляем к опросу очереди, он и так идёт постоянно."""
+    try:
+        u = shutil.disk_usage(WORK if os.path.isdir(WORK) else os.path.dirname(WORK) or "/")
+        return {"free_gb": round(u.free / 1024 ** 3, 1),
+                "total_gb": round(u.total / 1024 ** 3, 1)}
+    except Exception:
+        return {}
+
+
 def say(release_id: str, claim: str, phase: str = "", stdout: str = "") -> None:
     """Сообщить серверу фазу и вывод. Молчание дороже: по нему нас снимут по сроку.
 
@@ -266,7 +276,9 @@ def main() -> None:
     resend_saved()          # вердикты, не доехавшие в прошлой жизни
     while True:
         try:
-            got = call("/api/upload/claim", {"host": HOST, "worker": WORKER})
+            got = call("/api/upload/claim",
+                       {"host": HOST, "worker": WORKER, "role": "upload",
+                        **_free_space()})
             task = got.get("task")
             if task:
                 if task.get("repeat"):

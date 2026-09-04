@@ -28,7 +28,7 @@ BACKGROUND_ENABLED = os.environ.get("VS_SERVER_DISABLE_BACKGROUND", "").strip().
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import card_jobs as card_contract
-from pub_calls import ensure_calls_schema
+from pub_calls import ensure_calls_schema, node_disk, note_node_disk
 from pub_calls_api import register_calls_routes
 from pub_schema import ensure_pub_schema
 from pub_ui import register_pub_routes
@@ -12966,6 +12966,22 @@ async def render_claim(request: Request):
         _RENDER_POLL["peer"] = (request.client.host if request.client else "") or ""
     except Exception:
         pass
+    # 04.09.2026: нода сообщает своё свободное место тем же опросом. Раньше сервер
+    # знал только про свой диск, и тревога «мало места» не говорила, на какой машине.
+    try:
+        said = await request.json()
+    except Exception:
+        said = {}
+    if isinstance(said, dict) and said.get("free_gb") is not None:
+        _c = db()
+        try:
+            note_node_disk(_c, said.get("host") or "render", said.get("role") or "render",
+                           said.get("free_gb"), said.get("total_gb"))
+            _c.commit()
+        except Exception:
+            log_exc("render_claim/node_disk")
+        finally:
+            _c.close()
     # Пауза из админ-панели: нода продолжает опрашивать ручку, но заданий не получает.
     # Уже начатый на ноде рендер идёт до конца — его результат примут как обычно.
     if _queue_paused("render"):
