@@ -341,6 +341,54 @@ def _set(c, rid: str, now: float, guard: bool = True, **fields) -> bool:
     return cur.rowcount > 0
 
 
+def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -> dict:
+    """Вернуть выпуск из разбора в работу.
+
+    ДОБАВЛЕНО 04.09.2026. Карантин был односторонней дверью: движок помечал выпуск
+    «сбой» и больше его не трогал, а вернуть в работу было нечем — ни кнопки, ни
+    эндпоинта. Единственным выходом оставалась правка базы руками.
+
+    Что делаем и чего НЕ делаем:
+
+    * фазу не откатываем — работа, которая уже сделана и оплачена, остаётся сделанной.
+      Движок продолжит с того шага, где остановился;
+    * попытки обнуляем: человек посмотрел и решил, что причина устранена, — считать
+      ему старые провалы значит через два тика снова уронить выпуск в разбор.
+      `keep_attempts=True` оставляет счётчик, если возврат делается вслепую;
+    * из необратимой фазы не возвращаем. Если загрузка уже начиналась, повтор
+      запрещён навсегда — это правило заливки, и обходить его отсюда нельзя;
+    * строку плана возвращаем из `error` в `running`: иначе календарь так и будет
+      показывать пропуск на месте работающего выпуска.
+    """
+    now = time.time() if now is None else now
+    rel = c.execute("SELECT * FROM pub_releases WHERE release_id=?",
+                    (release_id,)).fetchone()
+    if rel is None:
+        return {"ok": False, "why": "выпуск не найден"}
+    if rel["status"] != "blocked":
+        return {"ok": False, "why": f"выпуск не в разборе (сейчас «{rel['status']}»)"}
+    if reached_irreversible(c, release_id):
+        return {"ok": False,
+                "why": "загрузка уже начиналась — повтор запрещён навсегда, "
+                       "нужен разбор вручную"}
+    fields = {"status": "pending", "blocked_reason": None,
+              "deadline": now + PHASE_DEADLINES.get(rel["phase"], DEFAULT_DEADLINE)}
+    if not keep_attempts:
+        fields["attempts"] = 0
+    # guard=False сознательно: охрана `_set` пропускает только живые выпуски
+    # («pending», «running»), а мы как раз оживляем неживой. Статус уже проверен выше —
+    # возвращаем только из «blocked» и только не из необратимой фазы.
+    if not _set(c, release_id, now, guard=False, **fields):
+        return {"ok": False, "why": "выпуск не обновился — возможно, он удалён"}
+    c.execute("UPDATE pub_plan_items SET status='running', updated=? WHERE id=? "
+              "AND status='error'", (now, rel["plan_item_id"]))
+    log_line(c, release_id, "движок",
+             f"возвращён в работу с фазы «{rel['phase']}»"
+             + ("" if keep_attempts else ", счётчик попыток обнулён"), now=now)
+    log_phase(c, release_id, "revived", now, payload={"from_phase": rel["phase"]})
+    return {"ok": True, "phase": rel["phase"]}
+
+
 def quarantine(c, rel, now: float, reason: str) -> None:
     """Увести строку в карантин: остальные продолжают идти.
 

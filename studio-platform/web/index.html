@@ -104,6 +104,17 @@
   .bar{height:5px;background:var(--card-2);border-radius:4px;overflow:hidden;margin-top:8px;
        max-width:230px}
   .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc-hi))}
+  /* Полоска по этапам: семь отрезков вместо одной шкалы «сколько процентов».
+     Процент по выпуску — выдумка: этапы разной длины и часть из них необязательна. */
+  .segs{display:flex;gap:3px;margin-top:7px;max-width:260px}
+  .segs i{flex:1;height:5px;border-radius:2px;background:var(--off-bg);cursor:default}
+  .segs i.done{background:var(--ok)}
+  .segs i.running{background:linear-gradient(90deg,var(--acc),var(--acc-hi));
+                  animation:pulse 1.6s ease-in-out infinite}
+  .segs i.queued{background:var(--wait);opacity:.55}
+  .segs i.error{background:var(--bad)}
+  .segs i.off{background:transparent;border:1px dashed var(--line-2)}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
 
   .stage{display:flex;gap:14px;padding:15px 18px;border-bottom:1px solid var(--line)}
   .stage:last-child{border-bottom:0}
@@ -313,6 +324,15 @@ async function viewReleases(){
     return;
   }
 
+  // Подпись отрезка: название этапа плюс его состояние. Обещать «осталось столько-то»
+  // мы не можем — система знает не время до готовности, а срок, после которого этап
+  // считается зависшим. Показывать первое вместо второго значило бы соврать.
+  const SEG_STATE = {done:'готово', running:'идёт', queued:'в очереди',
+                     error:'ошибка', idle:'не начато', off:'не участвует'};
+  const segs = r => `<div class="segs">${(r.bar || []).map(b =>
+    `<i class="${b.state}" title="${esc(b.title)} — ${SEG_STATE[b.state] || b.state}"></i>`
+    ).join('')}</div>`;
+
   const rows = data.releases.map(r => `
     <tr class="row" data-id="${esc(r.release_id)}">
       <td>
@@ -326,8 +346,7 @@ async function viewReleases(){
           : r.status === 'blocked' ? 'error'
           : r.status === 'running' ? 'running' : 'queued'}">${esc(r.phase_title)}</span>
         <div class="muted" style="margin-top:4px">шаг ${r.phase_index + 1} из ${r.phase_total}</div>
-        <div class="bar"><i style="width:${
-          Math.round((r.phase_index + 1) / r.phase_total * 100)}%"></i></div>
+        ${segs(r)}
       </td>
       <td class="muted">${ago(r.idle_sec)}${r.attempts ? `<div>попыток ${r.attempts}</div>` : ''}
         ${r.blocked_reason ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : ''}</td>
@@ -362,7 +381,10 @@ async function viewRelease(id){
       <div><div class="k">Ролик</div>${r.video_id ? esc(r.video_id) : '—'}</div>
     </div>
     ${r.blocked_reason ? `<div class="sec" style="color:var(--bad)">
-        Остановлен: ${esc(r.blocked_reason)}</div>` : ''}
+        Остановлен: ${esc(r.blocked_reason)}
+        ${r.status === 'blocked'
+          ? '<button class="ghost" id="revive" style="margin-left:10px">Вернуть в работу</button>'
+          : ''}</div>` : ''}
     ${d.stages.map(s => `
       <div class="stage ${s.state === 'off' ? 'off' : ''}">
         <div class="dot s-${s.state}">${DOT[s.state] || ''}</div>
@@ -383,6 +405,19 @@ async function viewRelease(id){
   // Повтор одного этапа не трогает соседние: кнопка обращается ровно к той задаче,
   // на которой этап держится, и в тот сервис, которому она принадлежит.
   wireActions(head);
+
+  // Возврат из разбора. Фазу не откатываем: сделанное и оплаченное остаётся сделанным,
+  // движок продолжит с того шага, где остановился.
+  const rev = head.querySelector('#revive');
+  if (rev) rev.onclick = async () => {
+    if (!confirm('Вернуть выпуск в работу? Движок продолжит с фазы «'
+                 + r.phase_title + '».')) return;
+    rev.disabled = true;
+    try{
+      await post(`/ui/releases/${encodeURIComponent(r.release_id)}/revive`);
+      await render();
+    }catch(e){ rev.disabled = false; alert(e.message); }
+  };
 
   app.append($(`<div class="card">
     <div class="sec">Что происходило</div>

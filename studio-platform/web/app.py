@@ -39,6 +39,7 @@ import pult_auth as auth                                       # noqa: E402
 from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
                            normalize_schedule, upcoming_slots)
 from pub_engine import PHASES, PHASE_DEADLINES                   # noqa: E402
+from pub_engine import revive as pub_engine_revive                # noqa: E402
 from pub_remote import (COVER_BASE, REWRITE_BASE, donor_text,     # noqa: E402
                         get_key, video_id)
 from pub_services import MEDIA_STAGES, OPTIONAL_STAGES           # noqa: E402
@@ -214,8 +215,10 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
     sql += " ORDER BY r.slot_at"
 
     now = time.time()
+    rows = list(c.execute(sql, args))
+    bars = _stage_bars(c, rows)
     out = []
-    for r in c.execute(sql, args):
+    for r in rows:
         ph = r["phase"] or "created"
         out.append({
             "release_id": r["release_id"],
@@ -233,10 +236,93 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
             "status": r["status"],
             "attempts": r["attempts"] or 0,
             "blocked_reason": r["blocked_reason"] or "",
+            # Полоска по этапам: семь отрезков вместо одной шкалы «сколько процентов».
+            # Процент по выпуску — выдумка: этапы разной длины и часть из них
+            # необязательна. Отрезок честнее: он говорит, что сделано, что идёт
+            # и что ещё не начиналось.
+            "bar": bars.get(r["release_id"], []),
             "video_id": r["video_id"] or "",
             "project_id": r["project_id"] or "",
             "idle_sec": max(0, int(now - (r["updated"] or now))),
         })
+    return out
+
+
+def _stage_bars(c, rows) -> dict:
+    """Состояние семи этапов сразу для всех выпусков списка.
+
+    Одним запросом на источник, а не по три на выпуск: пятьдесят выпусков в списке
+    превратились бы в полтораста обращений к базе на каждое открытие экрана.
+    """
+    ids = [r["release_id"] for r in rows]
+    projects = [r["project_id"] for r in rows if r["project_id"]]
+    if not ids:
+        return {}
+
+    def _chunks(seq, size=400):
+        for i in range(0, len(seq), size):
+            yield seq[i:i + size]
+
+    remote = {}          # release_id → {service: статус}
+    for part in _chunks(ids):
+        marks = ",".join("?" * len(part))
+        for j in c.execute(
+                f"SELECT release_id, service, kind, status FROM pub_release_jobs "
+                f"WHERE release_id IN ({marks})", part):
+            remote.setdefault(j["release_id"], {})[(j["service"], j["kind"])] = j["status"]
+
+    queue = {}           # project_id → {kind: статус}
+    for part in _chunks(projects):
+        marks = ",".join("?" * len(part))
+        for q in c.execute(
+                f"SELECT project_id, kind, status FROM queue_tasks "
+                f"WHERE project_id IN ({marks}) ORDER BY job_id", part):
+            queue.setdefault(q["project_id"], {})[q["kind"]] = q["status"]
+
+    upload = {}
+    for part in _chunks(ids):
+        marks = ",".join("?" * len(part))
+        for u in c.execute(
+                f"SELECT release_id, status FROM pub_upload_jobs "
+                f"WHERE release_id IN ({marks})", part):
+            upload[u["release_id"]] = u["status"]
+
+    # Какой фазой закрывается каждый этап. Фаза авторитетнее записей задач: строку
+    # задачи могли вычистить кнопкой «очистить очередь», а фаза остаётся. Без этого
+    # у опубликованного выпуска вся полоска показывала «не начато» — при том, что
+    # ролик вышел.
+    stage_phase = {"script": "source_ready", "tts": "media_ready",
+                   "images": "media_ready", "video": "media_ready",
+                   "render": "media_ready", "cover": "cover_ready",
+                   # Заливка закрыта, когда Studio подтвердила расписание. «published»
+                   # тут не годится: это последняя фаза, и её никогда не «пройти».
+                   "upload": "upload_running"}
+    order = {p: i for i, p in enumerate(PHASES)}
+
+    out = {}
+    for r in rows:
+        rid, pid = r["release_id"], r["project_id"]
+        mine, qs = remote.get(rid, {}), queue.get(pid or "", {})
+        here = order.get(r["phase"] or "created", 0)
+        bar = []
+        for key, title, source in STAGES:
+            if source.startswith("remote:"):
+                svc = source.split(":", 1)[1]
+                got = next((v for (s_, _k), v in mine.items() if s_ == svc), None)
+                state = _state(got) if got is not None else "idle"
+            elif source.startswith("queue:"):
+                kind = source.split(":", 1)[1]
+                if kind not in MEDIA_STAGES:
+                    state = "off"            # клипы автоконвейер не ставит
+                else:
+                    got = qs.get(kind) or mine.get(("vsgen", kind))
+                    state = _state(got) if got is not None else "idle"
+            else:
+                state = _state(upload.get(rid)) if rid in upload else "idle"
+            if state in ("idle", "queued") and here > order.get(stage_phase[key], 99):
+                state = "done"      # фазу прошли — значит этап позади, чем бы его ни делали
+            bar.append({"key": key, "title": title, "state": state})
+        out[rid] = bar
     return out
 
 
@@ -2145,4 +2231,24 @@ def _project_files(mod, pid: str) -> list:
                     # Имена относительные — их же ждёт отдача файла кабинетом.
                     "names": [rel for _full, rel in items[:60]],
                     "more": max(0, len(items) - 60)})
+    return out
+
+
+@app.post("/ui/releases/{release_id}/revive")
+def ui_release_revive(release_id: str):
+    """Вернуть выпуск из разбора в работу.
+
+    Карантин был односторонней дверью: движок помечал выпуск «сбой» и больше его не
+    трогал, а вернуть в работу было нечем. Здесь эта дверь открывается — но не насквозь:
+    фаза не откатывается (сделанное и оплаченное остаётся сделанным), а из необратимой
+    фазы возврата нет вовсе, потому что повтор заливки запрещён навсегда.
+    """
+    c = db()
+    try:
+        out = pub_engine_revive(c, release_id)
+        if not out["ok"]:
+            raise HTTPException(409, out["why"])
+        c.commit()
+    finally:
+        c.close()
     return out
