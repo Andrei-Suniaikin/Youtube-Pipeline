@@ -136,6 +136,7 @@
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
     <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
     <a class="tab" href="#/text" id="tab-text">Текст</a>
+    <a class="tab" href="#/covers" id="tab-covers">Обложки</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
     <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
     <span class="who" id="who"></span>
@@ -851,6 +852,181 @@ async function viewText(){
   wireActions(list);
 }
 
+/* ─────────────────────────────── обложки ─────────────────────────────── */
+
+/* Стратегия выбирается ДО показа полей (ТЗ §10). Раньше это была одна простыня, где
+   половина полей молча не работала: они относились к другой стратегии. */
+let COVER_FORM = {mode:'url', langs:new Set(), preset:'', option:0,
+                  edit:false, n:3};
+
+async function viewCovers(){
+  const d = await api('/ui/covers');
+  app.innerHTML = '';
+  app.append($(`<h1>Обложки</h1>
+    <p class="sub">Сначала стратегия, потом её поля. ${esc(d.note)}.</p>`));
+
+  const mode = () => d.modes.find(m => m.key === COVER_FORM.mode) || d.modes[0];
+  const opt = d.options[COVER_FORM.option] || d.options[0] || {};
+  const langs = [...COVER_FORM.langs];
+
+  const form = $(`<div class="card" style="padding:16px;margin-bottom:16px">
+    <div id="err"></div>
+    <div class="modes">${d.modes.map((m, i) => `
+      <button data-mode="${m.key}" class="${m.key === COVER_FORM.mode ? 'on' : ''}"
+        >${esc(m.title)}</button>`).join('')}</div>
+    <div class="note muted" style="margin-bottom:10px">${esc(mode().note)}</div>
+
+    <div id="fields"></div>
+
+    <div style="margin-top:12px">
+      <label class="k" style="display:block;margin-bottom:6px">Пресет</label>
+      <select id="preset" style="min-width:280px">
+        <option value="">— без пресета —</option>
+        ${d.presets.map(p => `<option ${p === COVER_FORM.preset ? 'selected' : ''}
+          >${esc(p)}</option>`).join('')}</select>
+    </div>
+
+    <div style="margin-top:12px">
+      <label class="k" style="display:block;margin-bottom:6px">Чем генерировать</label>
+      <select id="option" style="min-width:280px">${d.options.map((o, i) =>
+        `<option value="${i}" ${i === COVER_FORM.option ? 'selected' : ''}>${esc(o.label)}${
+          o.admin_only ? ' — платит владелец' : ''}</option>`).join('')}</select>
+    </div>
+
+    <div style="margin-top:12px">
+      <label class="k" style="display:block">Языки</label>
+      <div class="langs" id="langs">${d.languages.map(l => `
+        <label data-code="${esc(l)}"><input type="checkbox"
+          ${COVER_FORM.langs.has(l) ? 'checked' : ''}>${esc(l)}</label>`).join('')}
+      </div>
+    </div>
+
+    <div id="edit-box" style="margin-top:12px"></div>
+
+    <div class="note muted" style="margin-top:12px">Соотношение сторон —
+      <b>${esc(d.aspect)}</b>, всегда. У обложки YouTube оно одно, поэтому его здесь
+      не спрашивают и не дают выбрать; в задачу оно уходит явно, а не «по умолчанию».</div>
+
+    <div style="margin-top:14px"><button id="go">Запустить</button></div>
+    <div id="res"></div>
+  </div>`);
+  app.append(form);
+
+  const fields = form.querySelector('#fields');
+  const editBox = form.querySelector('#edit-box');
+
+  function paintFields(){
+    const m = COVER_FORM.mode;
+    if (m === 'url'){
+      fields.innerHTML = `<label class="k" style="display:block;margin-bottom:6px"
+        >Ссылки на доноров, по одной в строке</label>
+        <textarea id="urls" placeholder="https://www.youtube.com/watch?v=…"></textarea>`;
+    } else if (m === 'title'){
+      fields.innerHTML = langs.length
+        ? `<label class="k" style="display:block;margin-bottom:6px">Заголовок на каждый язык</label>
+           ${langs.map(l => `<div style="display:flex;gap:8px;align-items:center;margin-bottom:6px">
+             <span class="muted" style="min-width:120px">${esc(l)}</span>
+             <input data-lang="${esc(l)}" class="title-in" placeholder="Текст на обложке"
+               style="flex:1;padding:8px 10px;border:1px solid var(--border);
+                      border-radius:7px;font:inherit"></div>`).join('')}
+           <label class="k" style="display:block;margin:10px 0 6px">Дополнение к промпту</label>
+           <input id="extra" style="width:100%;box-sizing:border-box;padding:9px 11px;
+             border:1px solid var(--border);border-radius:7px;font:inherit">`
+        : '<div class="note">Сначала выберите языки — заголовок задаётся на каждый отдельно.</div>';
+    } else {
+      fields.innerHTML = `<label class="k" style="display:block;margin-bottom:6px">Семя</label>
+        <textarea id="seed" placeholder="Описание сцены, из которого рождаются варианты"></textarea>
+        <label class="k" style="display:block;margin:10px 0 6px">Вариантов на язык</label>
+        <input id="n" type="number" min="1" max="8" value="${COVER_FORM.n}"
+          style="width:90px;padding:8px 10px;border:1px solid var(--border);
+                 border-radius:7px;font:inherit">`;
+    }
+
+    // Редактирование превью — ОТДЕЛЬНЫЙ выбор, а не следствие приложенного референса.
+    // Пока это следствие, человек прикладывает картинку «для стиля» и незаметно
+    // выключает половину пресета.
+    const killed = d.rules.find(r => r.when === 'edit');
+    editBox.innerHTML = COVER_FORM.mode === 'url'
+      ? `<label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
+           <input type="checkbox" id="edit" ${COVER_FORM.edit ? 'checked' : ''}>
+           <span><b>Редактировать превью моделью</b>
+             <div class="note muted">Превью донора уходит в модель целиком.
+               ${COVER_FORM.edit ? `Тогда НЕ действуют: ${killed.kills.join(', ')} —
+                 ${esc(killed.why)}.` : ''}</div></span></label>`
+      : `<div class="note muted">${esc((d.rules.find(r => r.when === 'not_url') || {}).why || '')}.</div>`;
+    const box = editBox.querySelector('#edit');
+    if (box) box.onchange = e => { COVER_FORM.edit = e.target.checked; paintFields(); };
+  }
+  paintFields();
+
+  form.querySelectorAll('.modes button').forEach(b => b.onclick = () => {
+    COVER_FORM.mode = b.dataset.mode; render();
+  });
+  form.querySelectorAll('#langs label').forEach(l => {
+    const box = l.querySelector('input');
+    const sync = () => { l.classList.toggle('on', box.checked);
+      box.checked ? COVER_FORM.langs.add(l.dataset.code)
+                  : COVER_FORM.langs.delete(l.dataset.code); };
+    sync();
+    box.onchange = () => { sync(); if (COVER_FORM.mode === 'title') render(); };
+  });
+  form.querySelector('#preset').onchange = e => COVER_FORM.preset = e.target.value;
+  form.querySelector('#option').onchange = e => COVER_FORM.option = Number(e.target.value);
+
+  const errBox = form.querySelector('#err');
+  const resBox = form.querySelector('#res');
+  const btn = form.querySelector('#go');
+  btn.onclick = async () => {
+    errBox.innerHTML = ''; resBox.innerHTML = ''; btn.disabled = true;
+    btn.textContent = 'Отправляю…';
+    try{
+      const body = {mode: COVER_FORM.mode, preset: COVER_FORM.preset,
+                    languages: [...COVER_FORM.langs],
+                    provider: opt.provider || '', model: opt.model || '',
+                    edit_preview: COVER_FORM.edit};
+      if (COVER_FORM.mode === 'url'){
+        body.urls = (form.querySelector('#urls').value || '')
+          .split(/\s+/).map(x => x.trim()).filter(Boolean);
+      } else if (COVER_FORM.mode === 'title'){
+        body.titles = {};
+        form.querySelectorAll('.title-in').forEach(i => {
+          if (i.value.trim()) body.titles[i.dataset.lang] = i.value.trim();
+        });
+        body.extra_prompt = (form.querySelector('#extra') || {}).value || '';
+      } else {
+        body.seed = form.querySelector('#seed').value;
+        body.n_variants = Number(form.querySelector('#n').value) || 3;
+      }
+      await post('/ui/covers', body);
+      resBox.innerHTML = '<div class="res">Задача создана.</div>';
+      setTimeout(render, 600);
+    }catch(e){
+      errBox.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    }finally{ btn.disabled = false; btn.textContent = 'Запустить'; }
+  };
+
+  const list = $(`<div class="card">
+    <div class="sec">Задачи обложек</div>
+    ${d.jobs.length ? `<table><thead><tr>
+      <th>Задача</th><th>Состояние</th><th>Готово</th><th>Создана</th><th></th>
+      </tr></thead><tbody>${d.jobs.map(j => `<tr>
+        <td><div style="font-weight:600">${esc(j.title)}</div>
+            <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
+        <td><span class="pill s-${j.state}">${STATE_TITLE[j.state]}</span>
+            ${j.detail ? `<div class="muted" style="margin-top:4px">${esc(j.detail)}</div>` : ''}
+            ${j.progress != null ? `<div class="bar"><i style="width:${
+              Math.round(j.progress * 100)}%"></i></div>` : ''}</td>
+        <td>${j.results || '—'}</td>
+        <td class="muted">${when(j.created)}</td>
+        <td style="white-space:nowrap">${actions({service:'cover', id:j.id,
+                                                  state:j.state, status:j.status})}</td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Задач обложек пока нет.</div>'}
+  </div>`);
+  app.append(list);
+  wireActions(list);
+}
+
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
 async function viewPresets(){
@@ -1060,6 +1236,7 @@ const ROUTES = [
   ['channels', h => h.startsWith('#/channel/'),   h  => viewChannel(decodeURIComponent(h.slice(10)))],
   ['keys',     h => h === '#/keys',               () => viewKeys()],
   ['text',     h => h === '#/text',               () => viewText()],
+  ['covers',   h => h === '#/covers',             () => viewCovers()],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
   ['admin',    h => h === '#/admin',              () => viewAdmin()],
   ['releases', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
@@ -1076,7 +1253,8 @@ async function render(){
   showWho();
   const h = location.hash || '#/releases';
   const hit = ROUTES.find(r => r[1](h));
-  for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'presets', 'admin'])
+  for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'covers',
+                    'presets', 'admin'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
   try{ await hit[2](h); }
   catch(e){

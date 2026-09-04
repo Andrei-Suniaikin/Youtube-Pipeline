@@ -1174,6 +1174,16 @@ TEXT_MODES = (
 )
 
 
+def _pass_code(code: int) -> int:
+    """Какой код вернуть наружу, получив его от соседа.
+
+    Отказ соседа — это ответ, а не наш сбой: 4xx и «не настроено» (503) проходят
+    как есть. Прятать «не настроен ключ» под 502 «сосед не отвечает» значит послать
+    человека чинить сеть вместо ключа.
+    """
+    return code if (400 <= code < 500 or code == 503) else 502
+
+
 def _rw(path: str, sid: str, payload=None, method=None, raw=None, ctype=None):
     """Запрос к Rewrite от имени вошедшего. Возвращает (код, тело)."""
     data = raw
@@ -1307,7 +1317,7 @@ def ui_text_create(body: TextIn, request: Request):
             "languages": [{"code": x, "display": x} for x in langs],
             "model": body.model or "gpt-4.1-nano"})
         if code >= 400:
-            raise HTTPException(code if code in (400, 403, 404, 409, 422) else 502, out)
+            raise HTTPException(_pass_code(code), out)
         return {"ok": True, "job": out}
 
     if mode == "link":
@@ -1330,7 +1340,7 @@ def ui_text_create(body: TextIn, request: Request):
     code, out = _rw("/upload", sid, raw=raw,
                     ctype=f"multipart/form-data; boundary={boundary}")
     if code >= 400:
-        raise HTTPException(code if code in (400, 413) else 502, out)
+        raise HTTPException(_pass_code(code), out)
     stored = (out or {}).get("filename") or (out or {}).get("file") or name
 
     code, out = _rw("/jobs/rewrite", sid, {
@@ -1338,5 +1348,178 @@ def ui_text_create(body: TextIn, request: Request):
         "languages": [{"code": x, "display": x} for x in langs],
         "model": body.model or "gpt-4.1-nano"})
     if code >= 400:
-        raise HTTPException(code if code in (400, 403, 404, 409, 413, 422) else 502, out)
+        raise HTTPException(_pass_code(code), out)
     return {"ok": True, "job": out, "chars": len(text)}
+
+
+# ──────────────────────────────── обложки ────────────────────────────────
+
+# Стратегия выбирается ДО показа полей (ТЗ §10): каждая берёт свой источник, и поля
+# у них разные. Раньше это была одна простыня, где половина полей молча не работала.
+COVER_MODES = (
+    ("url", "По превью донора", "ссылка на ролик — берём его обложку и переделываем"),
+    ("title", "По заголовку", "обложки нет, есть текст заголовка на каждый язык"),
+    ("seed", "По семени", "шаблон ниши плюс семя — несколько вариантов на язык"),
+)
+
+# Что перестаёт действовать при каком выборе. Каждая строка проверена по коду, а не
+# выведена из названий полей: интерфейс гасит поле только там, где движок его не читает.
+COVER_RULES = (
+    {"when": "edit",
+     "kills": ["style_prompt", "use_auto_style", "analysis_provider", "analysis_model"],
+     "why": "превью уходит в модель на редактирование целиком: vision-анализ и сборка "
+            "промпта пропускаются (cover_core.py:1879)"},
+    {"when": "not_url",
+     "kills": ["reference_image", "simple_mode"],
+     "why": "редактирование превью возможно только когда превью есть — то есть в режиме "
+            "«по превью донора» (cover_core.py:2107)"},
+)
+
+
+def _cover(path: str, sid: str, payload=None, method=None):
+    """Запрос к Cover от имени вошедшего — его же кукой, а не общим ключом."""
+    data = json.dumps(payload, ensure_ascii=False).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(COVER_BASE + path, data=data,
+                                 method=method or ("POST" if data is not None else "GET"))
+    req.add_header("Cookie", f"{auth.COOKIE}={sid}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 5) as resp:
+            body = resp.read().decode("utf-8")
+            return resp.status, (json.loads(body) if body.startswith(("{", "[")) else body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(body or "{}")
+            detail = parsed.get("detail") or parsed.get("error") or body[:200]
+        except ValueError:
+            detail = body[:200]
+        return exc.code, detail
+    except Exception as exc:                                     # noqa: BLE001
+        return 502, f"обложки не отвечают: {type(exc).__name__}"
+
+
+def _cover_options(is_admin: bool) -> list:
+    """Варианты генерации — из самого Cover, а не переписанные у нас.
+
+    `GENERATION_OPTIONS` там и есть источник правды: по нему же Cover проверяет пару
+    provider+model на входе. Список, разъехавшийся с проверкой, обещал бы то, что
+    сервер отвергнет.
+    """
+    mod = sys.modules.get("cover_server")
+    core = sys.modules.get("cover_core")
+    if core is None or not hasattr(core, "GENERATION_OPTIONS"):
+        return []
+    admin_only = getattr(mod, "ADMIN_ONLY_PROVIDERS", set()) if mod else set()
+    out = []
+    for label, provider, model in core.GENERATION_OPTIONS:
+        if provider in admin_only and not is_admin:
+            continue          # платит с личного счёта владельца — не показываем чужим
+        out.append({"label": label, "provider": provider, "model": model,
+                    "admin_only": provider in admin_only})
+    return out
+
+
+@app.get("/ui/covers")
+def ui_covers(request: Request):
+    """Экран обложек: стратегия, поля этой стратегии и что в ней не действует."""
+    sid = getattr(request.state, "sid", "")
+    user = getattr(request.state, "user", None)
+    is_admin = bool(user is not None and (user["role"] if "role" in user.keys() else "")
+                    == "admin")
+    code, jobs = _cover("/jobs?page=1&page_size=50", sid)
+    items = (jobs.get("items") if isinstance(jobs, dict) else jobs) or []
+    rows = []
+    for j in (items if isinstance(items, list) else []):
+        pct = j.get("progress") or j.get("progress_percent")
+        rows.append({
+            "id": str(j.get("id") or ""),
+            "title": j.get("name") or j.get("preset_name") or str(j.get("id") or ""),
+            "status": str(j.get("status") or ""),
+            "state": _state(j.get("status")),
+            "progress": (float(pct) / 100 if isinstance(pct, (int, float)) else None),
+            "detail": j.get("detail") or j.get("progress_detail") or "",
+            "results": j.get("results_count") or 0,
+            "created": j.get("created_at"),
+        })
+    _c, presets = _cover("/presets", sid)
+    # Языки берём у Cover его же справочником: он ждёт ОТОБРАЖАЕМОЕ имя («Русский»),
+    # а не код. Подставить сюда список Rewrite значило бы слать ему «ru» и получать
+    # отказ на каждой второй задаче.
+    core = sys.modules.get("cover_core")
+    languages = sorted(getattr(core, "LANG_DISPLAY_TO_CODE", {}) or {}) if core else []
+    return {
+        "jobs": rows,
+        "languages": languages,
+        "modes": [{"key": k, "title": t, "note": n} for k, t, n in COVER_MODES],
+        "presets": sorted(presets) if isinstance(presets, dict) else [],
+        "options": _cover_options(is_admin),
+        "rules": list(COVER_RULES),
+        "aspect": "16:9",
+        "note": "задачи и результаты — ваши: пульт обращается к обложкам вашей же сессией",
+    }
+
+
+class CoverIn(BaseModel):
+    mode: str
+    preset: str = ""
+    languages: list = []
+    provider: str = ""
+    model: str = ""
+    urls: list = []
+    titles: dict = {}
+    seed: str = ""
+    n_variants: int = 3
+    extra_prompt: str = ""
+    edit_preview: bool = False       # явный выбор, а не побочный эффект приложенного файла
+
+
+@app.post("/ui/covers")
+def ui_covers_create(body: CoverIn, request: Request):
+    """Создать задачу обложек.
+
+    Соотношение сторон не спрашиваем и не даём выбрать: у обложки YouTube оно одно.
+    Оно уходит в пресет явно, а не «по умолчанию, если никто не переопределил».
+    """
+    sid = getattr(request.state, "sid", "")
+    mode = (body.mode or "").strip()
+    if mode not in {k for k, _t, _n in COVER_MODES}:
+        raise HTTPException(400, f"неизвестная стратегия «{mode}»")
+    langs = [str(x).strip() for x in (body.languages or []) if str(x).strip()]
+    if not langs:
+        raise HTTPException(400, "не выбран ни один язык")
+
+    preset_data = {"aspect_ratio": "16:9"}
+    if body.provider:
+        preset_data["generation_provider"] = body.provider
+        preset_data["generation_model"] = body.model or ""
+    # Редактирование превью — отдельная галочка, а не следствие приложенного файла.
+    # Приложенный референс сам по себе режим не меняет: это требование ТЗ §10, и до
+    # сих пор оно нарушалось — reference_image молча уводил в другую ветку движка.
+    if mode == "url":
+        preset_data["simple_mode"] = bool(body.edit_preview)
+
+    payload = {"languages": langs, "mode": mode,
+               "preset_name": body.preset or "", "preset_data": preset_data}
+    if mode == "url":
+        urls = [u.strip() for u in (body.urls or []) if str(u).strip()]
+        if not urls:
+            raise HTTPException(400, "нет ни одной ссылки на донора")
+        payload["urls"] = urls
+    elif mode == "title":
+        titles = {k: v for k, v in (body.titles or {}).items() if str(v).strip()}
+        if not titles:
+            raise HTTPException(400, "не задан заголовок ни для одного языка")
+        payload["titles_per_lang"] = titles
+        payload["extra_prompt"] = body.extra_prompt or ""
+    else:
+        if not (body.seed or "").strip():
+            raise HTTPException(400, "семя пустое — генерировать не из чего")
+        payload["seeds_per_lang"] = {lang: body.seed for lang in langs}
+        payload["n_variants"] = max(1, min(8, int(body.n_variants or 3)))
+
+    code, out = _cover("/jobs/cover", sid, payload)
+    if code >= 400:
+        raise HTTPException(_pass_code(code), out)
+    return {"ok": True, "job": out}
