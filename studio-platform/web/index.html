@@ -179,8 +179,17 @@ function ago(sec){
 }
 class NeedLogin extends Error {}
 
+// ИСПРАВЛЕНО 04.09.2026: пульт зовёт свой API абсолютным путём «/ui/…», а живёт он
+// под префиксом /studio. Из браузера такой путь уходит в КОРЕНЬ платформы, то есть
+// в кабинет, и возвращается 404 — включая вход, так что зайти было нельзя вообще.
+// Соседям это уже чинилось; свою же страницу я проверял curl'ом сразу по полному
+// адресу и потому не увидел.
+// База берётся из адреса страницы, а не из настройки: одна сборка годится и под
+// префиксом, и при запуске пульта отдельно.
+const API = (location.pathname.match(/^\/studio(?=\/|$)/) || [''])[0];
+
 async function api(path, opts){
-  const r = await fetch(path, opts);
+  const r = await fetch(API + path, opts);
   const body = await r.json().catch(() => ({detail:'ответ не разобран'}));
   if (r.status === 401) throw new NeedLogin(body.detail || 'нужен вход');
   if (!r.ok) throw new Error(body.detail || body.error || ('HTTP ' + r.status));
@@ -724,7 +733,8 @@ async function paintResults(service, jobId, host){
   try{
     const d = await api(`/ui/files/${encodeURIComponent(service)}/${encodeURIComponent(jobId)}`);
     if (!d.files.length){ host.innerHTML = '<span class="muted">Файлов пока нет.</span>'; return; }
-    const url = f => `/ui/files/${encodeURIComponent(service)}/${
+    // Ссылки и <img src> идут мимо api() — префикс им нужен свой.
+    const url = f => `${API}/ui/files/${encodeURIComponent(service)}/${
       encodeURIComponent(jobId)}/${encodeURIComponent(f.name)}`;
     const imgs = d.files.filter(f => f.kind === 'image');
     const rest = d.files.filter(f => f.kind !== 'image');

@@ -24,6 +24,8 @@ BASE = os.path.abspath(os.path.join(HERE, ".."))
 PULT = os.environ.get("VS_PULT_URL", "http://127.0.0.1:8080/studio")
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 LOGIN = os.environ.get("VS_DEV_LOGIN", "dev")
+# Пароль стенда задаётся тем же способом, что и в dev/provision.py — одним значением
+# на оба. Разойтись им нельзя: тест логинится ровно той учёткой, которую provision завёл.
 PASSWORD = os.environ.get("VS_DEV_PASSWORD", "dev-local-only")
 
 SCREENS = ("releases", "channels", "queue", "keys", "presets", "alerts", "disk", "public")
@@ -132,6 +134,18 @@ def main() -> int:
     code, body = me.go("/ui/actions/rewrite/нет-такой/cancel", {})
     check("ответ соседа пересказан как есть", code, 404)
     check("и его словами", body.get("detail"), "job not found")
+
+    print("\nСтраница зовёт API по своему адресу, а не по корню платформы")
+    # Тот самый случай, который сломал вход и не ловился curl'ом: страница живёт под
+    # /studio, а зовёт «/ui/…». Браузер резолвит такой путь от корня — то есть в кабинет.
+    code, page = me.go("/")
+    check("страница отдаётся", code, 200)
+    check("база API берётся из адреса", "const API = (location.pathname.match" in page,
+          True)
+    bare = [line.strip()[:70] for line in page.splitlines()
+            if ("fetch(" in line and "API + " not in line and "fetch(API" not in line)
+            or ("'/ui/files/" in line and "${API}" not in line)]
+    check("ни одного вызова мимо базы", bare, [])
 
     print("\nВыход")
     check("выход принят", me.go("/ui/logout", {})[0], 200)
