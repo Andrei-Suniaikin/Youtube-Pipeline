@@ -141,6 +141,7 @@
     <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
     <a class="tab" href="#/text" id="tab-text">Текст</a>
     <a class="tab" href="#/covers" id="tab-covers">Обложки</a>
+    <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
     <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
     <a class="tab" href="/" id="tab-old" title="Старые экраны кабинета: проекты, голоса, лимиты"
@@ -809,6 +810,121 @@ function showWho(){
     ME = null;
     viewLogin('');
   };
+}
+
+/* ───────────────────────────── проекты ───────────────────────────── */
+
+/* Проект — то, что делает выпуск: папка с кадрами, озвучкой, рендером и субтитрами.
+   Заводить их руками пульт не даёт и не будет: их создаёт выпуск. А смотреть, что
+   получилось, и забирать нужно каждый день — ради этого не должно приходиться уходить
+   в кабинет. Ссылки на файлы ведут в кабинет: он отдаёт их с проверкой пути и с
+   миниатюрами, и второй такой отдачи заводить незачем. */
+
+async function viewProjects(){
+  const d = await api('/ui/projects');
+  app.innerHTML = '';
+  app.append($(`<h1>Проекты</h1>
+    <p class="sub">${esc(d.note)}.</p>`));
+
+  if (!d.projects.length){
+    app.append($(`<div class="card"><div class="empty">Проектов нет.</div></div>`));
+    return;
+  }
+  const mark = (ok, txt) => `<span class="pill ${ok ? 's-done' : 's-idle'}">${txt}</span>`;
+  const card = $(`<div class="card"><table>
+    <thead><tr><th>Проект</th><th>Готово</th><th>Выпуск</th><th>Изменён</th></tr></thead>
+    <tbody>${d.projects.map(p => `<tr class="row" data-id="${esc(p.id)}">
+      <td><div style="font-weight:600">${esc(p.name)}</div>
+          <div class="muted mono" style="font-size:11px">${esc(p.id)}</div></td>
+      <td>${mark(p.ready.text, 'текст')}
+          ${mark(p.ready.audio, 'озвучка')}
+          ${mark(p.ready.images > 0, `кадры ${p.ready.images}${
+            p.ready.images_expected ? '/' + p.ready.images_expected : ''}`)}
+          ${p.ready.clips ? mark(true, `клипы ${p.ready.clips}`) : ''}
+          ${mark(p.ready.render, 'ролик')}
+          ${p.busy ? `<span class="pill s-running">в работе: ${p.busy}</span>` : ''}</td>
+      <td>${p.release_id
+        ? `<a href="#/release/${encodeURIComponent(p.release_id)}">${esc(p.phase)}</a>`
+        : '<span class="muted">—</span>'}</td>
+      <td class="muted">${when(p.updated)}</td>
+    </tr>`).join('')}</tbody></table></div>`);
+  card.querySelectorAll('tr.row').forEach(tr =>
+    tr.onclick = () => location.hash = '#/project/' + encodeURIComponent(tr.dataset.id));
+  app.append(card);
+}
+
+async function viewProject(id){
+  const d = await api('/ui/projects/' + encodeURIComponent(id));
+  const p = d.project;
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/projects">← ко всем проектам</a>
+    <h1>${esc(p.name)}</h1>
+    <p class="sub"><span class="mono">${esc(p.id)}</span>
+      ${p.release_id ? ` · выпуск <a href="#/release/${
+        encodeURIComponent(p.release_id)}">${esc(p.release_id)}</a> · фаза ${
+        esc(p.phase)}` : ''}</p>`));
+
+  if (d.paid.length){
+    app.append($(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">Во что обошёлся</div>
+      ${d.paid.map(x => `<div class="stage"><div class="dot s-done">✓</div>
+        <div class="body"><div class="name">${esc(x.kind)}: ${x.delivered} оплаченных
+          вызовов${x.cost ? ` · ${x.cost.toFixed(0)} кр.` : ''}</div></div></div>`).join('')}
+      <div class="note muted">Это то, что будет выброшено, если проект убрать с диска.</div>
+    </div>`));
+  }
+
+  if (d.jobs.length){
+    const jc = $(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">Задачи проекта</div>
+      <table><thead><tr><th>Этап</th><th>Состояние</th><th>Создана</th><th></th></tr>
+      </thead><tbody>${d.jobs.map(j => `<tr>
+        <td>${esc(j.kind)}<div class="muted mono" style="font-size:11px">#${j.id}</div></td>
+        <td><span class="pill s-${j.state}">${STATE_TITLE[j.state]}</span>
+          ${j.stage ? `<div class="muted">${esc(j.stage)}</div>` : ''}
+          ${j.progress != null ? `<div class="bar"><i style="width:${
+            Math.round(j.progress * 100)}%"></i></div>` : ''}
+          ${j.error ? `<div class="note bad">${esc(j.error)}</div>` : ''}</td>
+        <td class="muted">${when(j.created)}</td>
+        <td style="white-space:nowrap">${actions({service:'vsgen', id:j.id,
+                                                  state:j.state, status:j.status})}</td>
+      </tr>`).join('')}</tbody></table></div>`);
+    app.append(jc);
+    wireActions(jc);
+  }
+
+  for (const g of d.files){
+    const url = n => d.file_base + n.split('/').map(encodeURIComponent).join('/');
+    app.append($(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">${esc(g.title)} · ${g.count}
+        <a class="ghost" href="${d.zip_base}${esc(g.code)}"
+           style="float:right;padding:3px 10px;border:1px solid var(--line);
+                  border-radius:6px;text-decoration:none;font-size:12px"
+           >Скачать архивом</a></div>
+      ${g.kind === 'image'
+        ? `<div style="display:flex;flex-wrap:wrap;gap:6px">${g.names.map(n =>
+            `<a href="${url(n)}" target="_blank" title="${esc(n)}"><img src="${
+              url(n)}?w=160" loading="lazy" style="height:78px;border-radius:5px;
+              border:1px solid var(--line);display:block"></a>`).join('')}</div>`
+        : g.kind === 'audio'
+        ? g.names.map(n => `<audio controls preload="none" src="${url(n)}"
+            style="width:100%;margin-top:6px"></audio>`).join('')
+        : g.kind === 'video'
+        ? g.names.slice(0, 4).map(n => `<video controls preload="none" src="${url(n)}"
+            style="max-width:320px;border-radius:6px;margin:6px 6px 0 0"></video>`).join('')
+          + (g.names.length > 4 ? `<div class="note muted">и ещё ${
+              g.names.length - 4} — в архиве</div>` : '')
+        : `<div style="display:flex;flex-wrap:wrap;gap:8px">${g.names.map(n =>
+            `<a href="${url(n)}" target="_blank"
+              style="padding:4px 10px;border:1px solid var(--line);border-radius:6px;
+                     text-decoration:none;font-size:12px">${esc(n)}</a>`).join('')}</div>`}
+      ${g.more ? `<div class="note muted">показаны первые ${g.names.length},
+        всего ${g.count} — остальные в архиве</div>` : ''}
+    </div>`));
+  }
+  if (!d.files.length){
+    app.append($(`<div class="card"><div class="empty">Файлов пока нет.</div></div>`));
+  }
 }
 
 /* ───────────────────────── свои ключи ───────────────────────── */
@@ -1572,6 +1688,8 @@ const ROUTES = [
   ['keys',     h => h === '#/keys',               () => viewKeys()],
   ['text',     h => h === '#/text',               () => viewText()],
   ['covers',   h => h === '#/covers',             () => viewCovers()],
+  ['projects', h => h === '#/projects',           () => viewProjects()],
+  ['projects', h => h.startsWith('#/project/'),   h  => viewProject(decodeURIComponent(h.slice(10)))],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
   ['admin',    h => h === '#/admin',              () => viewAdmin()],
   ['releases', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
@@ -1590,7 +1708,7 @@ async function render(){
   const hit = ROUTES.find(r => r[1](h));
   // «Кабинет ↗» в этот список не входит: это ссылка наружу, а не вкладка пульта.
   for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'covers',
-                    'presets', 'admin'])
+                    'projects', 'presets', 'admin'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
   try{ await hit[2](h); }
   catch(e){

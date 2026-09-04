@@ -1982,3 +1982,133 @@ def ui_channels_import(body: ImportIn):
     finally:
         c.close()
     return out
+
+
+# ──────────────────────────────── проекты ────────────────────────────────
+
+# Проект — то, что делает выпуск: папка с кадрами, озвучкой, рендером и субтитрами.
+# В целевой навигации ТЗ отдельного раздела «Проекты» нет, и заводить их руками пульт
+# не даёт: их создаёт выпуск. Но посмотреть, что получилось, и забрать — нужно каждый
+# день, и ради этого не должно приходиться уходить в кабинет.
+#
+# Счётчики и список файлов считает кабинет своими же функциями (`_project_status`,
+# `_dl_items`): они знают, где что лежит, включая исторические раскладки папок.
+
+@app.get("/ui/projects")
+def ui_projects(limit: int = 50):
+    """Проекты и то, насколько каждый готов."""
+    mod = sys.modules.get("main")
+    c = db()
+    try:
+        rows = []
+        for p in c.execute("SELECT id, name, status, created, updated FROM projects "
+                           "WHERE tenant_id=? ORDER BY updated DESC LIMIT ?",
+                           (TENANT, max(1, min(200, limit)))):
+            rel = c.execute("SELECT release_id, phase FROM pub_releases "
+                            "WHERE project_id=? ORDER BY updated DESC LIMIT 1",
+                            (p["id"],)).fetchone()
+            busy = c.execute("SELECT COUNT(*) FROM queue_tasks WHERE project_id=? "
+                             "AND status IN ('queued','running')", (p["id"],)).fetchone()[0]
+            st = {}
+            if mod is not None and hasattr(mod, "_project_status"):
+                try:
+                    st = mod._project_status(TENANT, p["id"]) or {}
+                except Exception:                                  # noqa: BLE001
+                    st = {}
+            rows.append({
+                "id": p["id"], "name": p["name"] or p["id"], "status": p["status"] or "",
+                "updated": p["updated"], "busy": busy,
+                "release_id": (rel["release_id"] if rel else ""),
+                "phase": (rel["phase"] if rel else ""),
+                "ready": {"text": bool(st.get("text")), "audio": bool(st.get("audio")),
+                          "images": st.get("images") or 0,
+                          "images_expected": st.get("images_expected"),
+                          "clips": st.get("clips") or 0,
+                          "render": bool(st.get("render"))},
+            })
+    finally:
+        c.close()
+    return {"projects": rows,
+            "note": "проекты заводит выпуск — здесь их смотрят и забирают"}
+
+
+@app.get("/ui/projects/{pid}")
+def ui_project(pid: str):
+    """Один проект: что в нём есть, чем он занят и что можно забрать."""
+    mod = sys.modules.get("main")
+    c = db()
+    try:
+        p = c.execute("SELECT * FROM projects WHERE id=? AND tenant_id=?",
+                      (pid, TENANT)).fetchone()
+        if not p:
+            raise HTTPException(404, "проект не найден")
+        rel = c.execute("SELECT release_id, phase, status FROM pub_releases "
+                        "WHERE project_id=? ORDER BY updated DESC LIMIT 1",
+                        (pid,)).fetchone()
+        jobs = [{"id": q["job_id"], "kind": q["kind"], "status": q["status"],
+                 "state": _state(q["status"]),
+                 "progress": (float(q["progress"]) if q["progress"] is not None else None),
+                 "stage": q["stage"] or "", "error": q["error"] or "",
+                 "created": q["created"]}
+                for q in c.execute(
+                    "SELECT job_id, kind, status, progress, stage, error, created "
+                    "FROM queue_tasks WHERE project_id=? ORDER BY job_id DESC LIMIT 30",
+                    (pid,))]
+        paid = [{"kind": r["kind"], "delivered": r["n"], "cost": r["s"] or 0.0}
+                for r in c.execute(
+                    "SELECT kind, COUNT(*) n, SUM(COALESCE(cost,0)) s FROM provider_calls "
+                    "WHERE project_id=? AND status='delivered' GROUP BY kind", (pid,))]
+    finally:
+        c.close()
+
+    st = {}
+    if mod is not None and hasattr(mod, "_project_status"):
+        try:
+            st = mod._project_status(TENANT, pid) or {}
+        except Exception:                                          # noqa: BLE001
+            st = {}
+    groups = _project_files(mod, pid)
+    return {
+        "project": {"id": p["id"], "name": p["name"] or p["id"],
+                    "status": p["status"] or "", "created": p["created"],
+                    "updated": p["updated"],
+                    "release_id": (rel["release_id"] if rel else ""),
+                    "phase": (rel["phase"] if rel else "")},
+        "ready": st, "jobs": jobs, "files": groups, "paid": paid,
+        # Ссылки на файлы и архивы — кабинета: он отдаёт их с проверкой, что путь
+        # не выводит за пределы проекта, и с миниатюрами по ?w=.
+        "file_base": f"/p/{urllib.parse.quote(pid)}/file/",
+        "zip_base": f"/api/projects/{urllib.parse.quote(pid)}/download/",
+    }
+
+
+_FILE_GROUPS = (("images", "кадры"), ("clips", "клипы"), ("renders", "готовый ролик"),
+                ("audio", "озвучка"), ("subs", "субтитры"), ("chapters", "тайм-коды"))
+
+
+def _project_files(mod, pid: str) -> list:
+    """Файлы проекта по группам — теми же шаблонами, что и скачивание в кабинете.
+
+    Свой список шаблонов здесь завёлся бы отдельной правдой: экран показывал бы одно,
+    а архив отдавал другое. Уже случалось — субтитры и тайм-коды лежали на диске,
+    а кабинет их не отдавал, потому что их не было в его списке категорий.
+    """
+    if mod is None or not hasattr(mod, "_dl_items"):
+        return []
+    pdir = mod._project_dir(TENANT, pid)
+    out = []
+    for code, title in _FILE_GROUPS:
+        try:
+            items = mod._dl_items(pdir, code)
+        except Exception:                                          # noqa: BLE001
+            items = []
+        if not items:
+            continue
+        out.append({"code": code, "title": title, "count": len(items),
+                    "kind": ("image" if code == "images" else
+                             "video" if code in ("clips", "renders") else
+                             "audio" if code == "audio" else "text"),
+                    # Имена относительные — их же ждёт отдача файла кабинетом.
+                    "names": [rel for _full, rel in items[:60]],
+                    "more": max(0, len(items) - 60)})
+    return out
