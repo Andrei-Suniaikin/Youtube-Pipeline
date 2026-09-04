@@ -94,10 +94,19 @@ class Telegram:
         return False
 
     def whoami(self) -> dict:
-        """Кто этот бот и в какие чаты ему уже писали.
+        """Кто этот бот и куда он может писать.
 
-        Нужно ровно один раз — чтобы узнать chat_id. Telegram не даёт его иначе:
-        надо написать боту (или добавить его в группу), а потом прочитать getUpdates.
+        Нужно ровно один раз — чтобы узнать chat_id. Telegram не даёт его иначе.
+        Три случая, и они разные:
+
+        * **личный чат** — написать боту любое сообщение;
+        * **группа** — добавить бота и отправить туда `/start` (обычный текст он может
+          не увидеть: у ботов по умолчанию включён privacy mode, и в группах им видны
+          только команды и обращения);
+        * **канал** — боту не пишут, его делают АДМИНИСТРАТОРОМ с правом публикации.
+          В этот момент Telegram присылает `my_chat_member`, и канал появляется здесь.
+
+        Для публичного канала chat_id вообще не нужен: годится `@имя_канала`.
         """
         out = {"token": bool(self.token), "me": None, "chats": [], "error": ""}
         if not self.token:
@@ -115,14 +124,22 @@ class Telegram:
             return out
         seen = {}
         for u in (upd.get("result") or []):
-            msg = u.get("message") or u.get("channel_post") or u.get("my_chat_member") or {}
+            msg = (u.get("message") or u.get("channel_post")
+                   or u.get("my_chat_member") or u.get("chat_member") or {})
             chat = msg.get("chat") or {}
-            if chat.get("id") is not None:
-                seen[chat["id"]] = {
-                    "id": chat["id"], "type": chat.get("type") or "",
-                    "title": chat.get("title") or chat.get("username")
-                             or " ".join(x for x in (chat.get("first_name"),
-                                                     chat.get("last_name")) if x) or ""}
+            if chat.get("id") is None:
+                continue
+            username = chat.get("username") or ""
+            seen[chat["id"]] = {
+                "id": chat["id"], "type": chat.get("type") or "",
+                "username": username,
+                # Публичный канал или группу можно адресовать по имени — это устойчивее
+                # числового id и читается человеком.
+                "as_name": f"@{username}" if username else "",
+                "title": chat.get("title")
+                         or " ".join(x for x in (chat.get("first_name"),
+                                                 chat.get("last_name")) if x)
+                         or username or ""}
         out["chats"] = sorted(seen.values(), key=lambda x: str(x["id"]))
         return out
 

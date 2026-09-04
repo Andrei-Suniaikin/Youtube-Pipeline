@@ -4,12 +4,17 @@
 
 Утром порядок такой:
 
-    1. @BotFather → /newbot → токен
-    2. написать боту любое сообщение (или добавить его в группу)
-    3. положить токен в .env:  VS_TG_TOKEN=...
-    4. .venv/bin/python dev/alerts.py --whoami     ← покажет chat_id
-    5. дописать в .env:        VS_TG_CHAT=...
-    6. .venv/bin/python dev/alerts.py --test       ← придёт сообщение
+    1. @BotFather → /newbot → токен, положить в .env: VS_TG_TOKEN=...
+    2. открыть боту дорогу — смотря куда слать:
+         личный чат — написать боту любое сообщение;
+         группа     — добавить бота и отправить туда /start;
+         канал      — сделать бота АДМИНИСТРАТОРОМ с правом публикации.
+       Найти своего бота проще всего через @BotFather → /mybots: там ссылка t.me.
+    3. .venv/bin/python dev/alerts.py --whoami     ← покажет адрес
+    4. дописать в .env:        VS_TG_CHAT=...
+    5. .venv/bin/python dev/alerts.py --test       ← придёт сообщение
+
+Для публичного канала числовой id не нужен: годится VS_TG_CHAT=@имя_канала.
 
 Дальше:
 
@@ -94,14 +99,27 @@ def main() -> int:
         me = info["me"] or {}
         print(f"бот: @{me.get('username') or '?'}  ({me.get('first_name') or ''})")
         if not info["chats"]:
-            print("\nchat_id пока не видно. Напишите боту любое сообщение "
-                  "(или добавьте его в группу) и повторите.")
-            print("Важно: getUpdates отдаёт только свежие апдейты и только если "
-                  "у бота не задан webhook.")
+            print("\nПока ничего не видно. Что сделать — смотря куда слать:")
+            print("  личный чат — написать боту любое сообщение;")
+            print("  группа     — добавить бота и отправить туда /start"
+                  " (обычный текст он может не увидеть);")
+            print("  канал      — сделать бота АДМИНИСТРАТОРОМ с правом публикации.")
+            print("\nПотом повторить эту команду.")
+            print("\nЕсли всё сделано, а список пуст: у бота задан webhook — тогда "
+                  "getUpdates всегда пустой.")
+            print("Снять: https://api.telegram.org/bot<ТОКЕН>/deleteWebhook")
+            print("Ещё: Telegram хранит апдейты около суток — если писали давно, "
+                  "напишите заново.")
             return 1
-        print("\nдоступные chat_id:")
+        print("\nдоступные адреса:")
         for ch in info["chats"]:
-            print(f"  VS_TG_CHAT={ch['id']:<16} {ch['type']:<10} {ch['title']}")
+            kind = {"private": "личный чат", "group": "группа",
+                    "supergroup": "группа", "channel": "канал"}.get(ch["type"],
+                                                                    ch["type"])
+            print(f"  VS_TG_CHAT={ch['id']:<16} {kind:<12} {ch['title']}")
+            if ch.get("as_name"):
+                print(f"  VS_TG_CHAT={ch['as_name']:<16} {'то же самое, по имени':<12} "
+                      f"(устойчивее числа и читается)")
         return 0
 
     if args.test:
