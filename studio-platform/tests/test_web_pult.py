@@ -21,7 +21,7 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
 
-PULT = os.environ.get("VS_PULT_URL", "http://127.0.0.1:8010")
+PULT = os.environ.get("VS_PULT_URL", "http://127.0.0.1:8080/studio")
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 LOGIN = os.environ.get("VS_DEV_LOGIN", "dev")
 PASSWORD = os.environ.get("VS_DEV_PASSWORD", "dev-local-only")

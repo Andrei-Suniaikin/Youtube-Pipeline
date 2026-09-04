@@ -840,7 +840,10 @@
   <script>
     // Security migration must run before auth/session flow or any early return.
     try { localStorage.removeItem('cover_keys'); } catch (_) {}
-    const API = '';
+    // ДОБАВЛЕНО 04.09.2026: сервис может работать и сам по себе, и внутри единой
+    // платформы под префиксом. Базу берём из адреса страницы, а не из настройки:
+    // одна и та же сборка тогда годится в обоих случаях.
+    const API = (location.pathname.match(/^\/cover(?=\/|$)/) || [''])[0];
     const GENERATION_OPTIONS = [
       ['Flow — Nano Pro', 'flow', 'GEM_PIX_2'],
       ['Flow — Nano Banana 2', 'flow', 'NARWHAL'],

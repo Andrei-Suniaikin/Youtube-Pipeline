@@ -835,6 +835,11 @@
 
 <script>
 // ==================== STATE ====================
+// ДОБАВЛЕНО 04.09.2026: сервис может работать и сам по себе, и внутри единой
+// платформы под префиксом /rewrite. Базу берём из адреса страницы, а не из настройки:
+// одна и та же сборка тогда годится в обоих случаях.
+const API = (location.pathname.match(/^\/rewrite(?=\/|$)/) || [''])[0];
+
 let SESSION_ID = localStorage.getItem('session_id') || '';
 let USER_NAME = localStorage.getItem('user_name') || '';
 let USER_ID   = localStorage.getItem('user_id') || '';
@@ -881,7 +886,7 @@ function confirmAction(msg) { return window.confirm(msg); }
 async function apiFetch(url, options = {}) {
   const headers = { 'Content-Type': 'application/json', 'X-Session-Id': SESSION_ID, ...(options.headers || {}) };
   if (options.body instanceof FormData) { delete headers['Content-Type']; }
-  const resp = await fetch(url, { ...options, headers });
+  const resp = await fetch(API + url, { ...options, headers });
   if (resp.status === 401) { showLoginScreen(); throw new Error('Сессия истекла'); }
   if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || err.detail || `HTTP ${resp.status}`); }
   return resp.json();
@@ -910,7 +915,7 @@ async function _authPost(url, payload, btn, btnLabel, errEl) {
   errEl.classList.add('hidden');
   btn.disabled = true; btn.textContent = 'Подождите...';
   try {
-    const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const resp = await fetch(API + url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
     const data = await resp.json();
     if (!resp.ok) throw new Error(data.error || 'Ошибка');
     _applyLoginSuccess(data);
@@ -984,7 +989,7 @@ async function deleteAccount(usernameEnc) {
 }
 
 async function doLogout() {
-  try { await fetch('/auth/logout', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID } }); } catch (e) {}
+  try { await fetch(API + '/auth/logout', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID } }); } catch (e) {}
   SESSION_ID = ''; USER_NAME = ''; USER_ID = '';
   localStorage.removeItem('session_id'); localStorage.removeItem('user_name'); localStorage.removeItem('user_id');
   if (pingInterval) clearInterval(pingInterval);
@@ -1050,7 +1055,7 @@ function showLoginScreen() {
   document.getElementById('app').classList.add('hidden');
   // FIX-2026-07-02: если в системе ещё нет аккаунтов — показать первичную настройку (setup),
   // иначе обычный вход. /auth/status — публичный.
-  fetch('/auth/status').then(r => r.json())
+  fetch(API + '/auth/status').then(r => r.json())
     .then(d => showAuthForm(d && d.needs_setup ? 'setup' : 'login'))
     .catch(() => showAuthForm('login'));
 }
@@ -1819,7 +1824,7 @@ async function loadGenerationOutput(jobId) {
   let preview = '', title = '', logUpdate = [], modelUsed = '', skipPP = false;
   if (metaFile) {
     try {
-      const metaResp = await fetch('/jobs/' + encodeURIComponent(jobId) + '/files/' + encodeURIComponent(metaFile), {
+      const metaResp = await fetch(API + '/jobs/' + encodeURIComponent(jobId) + '/files/' + encodeURIComponent(metaFile), {
         headers: { 'X-Session-Id': SESSION_ID },
       });
       if (metaResp.ok) {
@@ -1835,7 +1840,7 @@ async function loadGenerationOutput(jobId) {
   let scriptText = '';
   if (scriptFile) {
     try {
-      const scriptResp = await fetch('/jobs/' + encodeURIComponent(jobId) + '/files/' + encodeURIComponent(scriptFile), {
+      const scriptResp = await fetch(API + '/jobs/' + encodeURIComponent(jobId) + '/files/' + encodeURIComponent(scriptFile), {
         headers: { 'X-Session-Id': SESSION_ID },
       });
       if (scriptResp.ok) scriptText = await scriptResp.text();
@@ -1886,7 +1891,7 @@ async function handleFiles(fileList) {
     try {
       const formData = new FormData();
       formData.append('file', file);
-      const resp = await fetch('/upload', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID }, body: formData });
+      const resp = await fetch(API + '/upload', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID }, body: formData });
       if (!resp.ok) {
         // Показываем detail сервера (тип файла, размер, кодировка) — раньше глотался.
         let d = '';
@@ -2348,7 +2353,7 @@ async function downloadJobZip(id) {
   try {
     const files = await apiFetch(`/jobs/${id}/files`);
     if (!files.length) { toast('Нет файлов для скачивания', 'warn'); return; }
-    const resp = await fetch(`/jobs/${id}/download-zip`, { headers: { 'X-Session-Id': SESSION_ID } });
+    const resp = await fetch(API + `/jobs/${id}/download-zip`, { headers: { 'X-Session-Id': SESSION_ID } });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const blob = await resp.blob();
     const a = document.createElement('a');
@@ -2411,7 +2416,7 @@ function downloadSelectedJobsZip() {
 async function downloadJobsZipBulk(idsArr) {
   const ids = idsArr.join(',');
   try {
-    const resp = await fetch(`/jobs/download-zip-bulk?ids=${encodeURIComponent(ids)}`, { headers: { 'X-Session-Id': SESSION_ID } });
+    const resp = await fetch(API + `/jobs/download-zip-bulk?ids=${encodeURIComponent(ids)}`, { headers: { 'X-Session-Id': SESSION_ID } });
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     const blob = await resp.blob();
     const a = document.createElement('a');
@@ -3019,7 +3024,7 @@ function debounce(fn, ms) {
 // ==================== INIT ====================
 (function init() {
   if (SESSION_ID) {
-    fetch('/auth/ping', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID } })
+    fetch(API + '/auth/ping', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID } })
       .then(r => { if (r.ok) { startPing(); showApp(); } else { showLoginScreen(); } })
       .catch(() => showLoginScreen());
   } else {

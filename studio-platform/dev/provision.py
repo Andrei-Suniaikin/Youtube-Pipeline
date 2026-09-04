@@ -28,10 +28,13 @@ DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 LOGIN = os.environ.get("VS_DEV_LOGIN", "dev")
 PASSWORD = os.environ.get("VS_DEV_PASSWORD", "dev-local-only")
 
+# Адреса берутся из окружения: в единой платформе соседи живут под префиксами того же
+# порта, при раздельном запуске — на своих. Зашивать выбор нельзя, оба варианта живы.
 SERVICES = (
-    # имя ключа, адрес, путь создания ключа, как достать сам ключ из ответа
-    ("rewrite", "http://127.0.0.1:8899", "/api/keys/create"),
-    ("cover", "http://127.0.0.1:8900", "/api-keys"),
+    # имя ключа, адрес, путь создания ключа
+    ("rewrite", os.environ.get("VS_REWRITE_BASE") or "http://127.0.0.1:8899",
+     "/api/keys/create"),
+    ("cover", os.environ.get("VS_COVER_BASE") or "http://127.0.0.1:8900", "/api-keys"),
 )
 
 

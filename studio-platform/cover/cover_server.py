@@ -217,7 +217,7 @@ def _get_preset_manager(user_id: str) -> PresetManager:
 
 
 try:
-    from auth import LicenseManager
+    from cover_auth import LicenseManager
     license_mgr = LicenseManager()
 except ImportError:
     license_mgr = None
@@ -763,7 +763,7 @@ async def auth_claim_password(request: Request):
 
 
 def _require_admin(request: Request):
-    from auth import ADMIN_USER_ID
+    from cover_auth import ADMIN_USER_ID
     if getattr(request.state, "user_id", "") != ADMIN_USER_ID:
         raise HTTPException(status_code=403, detail="Только для администратора")
 
@@ -877,7 +877,7 @@ async def auth_change_password(request: Request):
     target = (body.get("username") or "").strip()
     if not target:
         return JSONResponse(status_code=400, content={"error": "username обязателен"})
-    from auth import ADMIN_USER_ID
+    from cover_auth import ADMIN_USER_ID
     me_uid = getattr(request.state, "user_id", "")
     acc = next((a for a in license_mgr.list_accounts() if a["username"] == target), None)
     if not acc:

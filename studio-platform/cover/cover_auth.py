@@ -28,7 +28,11 @@ from argon2.low_level import Type
 
 SESSION_TIMEOUT = int(os.environ.get("COVER_SESSION_TIMEOUT", "7200"))  # v2.0: 2ч роллинг (было 5 мин)
 SESSION_PING_THROTTLE = 30      # last_ping обновляем не чаще раза в 30с (меньше записей в SQLite)
-SESSION_DB = os.environ.get("COVER_SESSION_DB", "cover_sessions.db")
+# ИСПРАВЛЕНО 04.09.2026: путь считался от РАБОЧЕГО каталога процесса.
+# В трёх сервисах это скрывал systemd WorkingDirectory; в одном процессе
+# скрывать нечем — сервис открывал бы чужую или пустую базу.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+SESSION_DB = os.environ.get("COVER_SESSION_DB") or os.path.join(_HERE, "cover_sessions.db")
 PBKDF2_ITERATIONS = 200_000     # только для проверки и миграции старых хэшей
 PASSWORD_HASHER = PasswordHasher(
     time_cost=3,

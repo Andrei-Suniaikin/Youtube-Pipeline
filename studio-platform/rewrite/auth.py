@@ -20,7 +20,11 @@ SESSION_TIMEOUT = int(os.environ.get("REWRITE_SESSION_TIMEOUT", "2592000"))
 # История: 600с → 401-шторм; C9 FIX-2026-07-02: 7200 — всё равно вылет после 2ч простоя.
 SESSION_PING_THROTTLE = 30  # C9: last_ping в validate обновляем не чаще раза в 30с (не долбить БД на каждый запрос)
 PBKDF2_ITERATIONS = 200_000  # хеш паролей аккаунтов (pbkdf2_hmac sha256, stdlib — без внешних зависимостей)
-SESSION_DB = os.environ.get("SESSION_DB", "sessions.db")
+# ИСПРАВЛЕНО 04.09.2026: путь считался от РАБОЧЕГО каталога процесса.
+# В трёх сервисах это скрывал systemd WorkingDirectory; в одном процессе
+# скрывать нечем — сервис открывал бы чужую или пустую базу.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+SESSION_DB = os.environ.get("SESSION_DB") or os.path.join(_HERE, "sessions.db")
 # Админ-тенант: аккаунт с этим user_id = админ (наследует существующие пресеты/токены/данные).
 # Согласовано с server.py / api.py / index.html.
 ADMIN_USER_ID = "REDACTED_ADMIN_USER_ID"

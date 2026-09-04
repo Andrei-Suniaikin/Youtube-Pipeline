@@ -2,6 +2,10 @@
 # -*- coding: utf-8 -*-
 """Вход в пульт — это вход в кабинет.
 
+Имя файла не `auth.py` намеренно: в одном процессе рядом живёт `rewrite/auth.py`,
+и два модуля с одинаковым именем на sys.path — это молчаливая подмена одного другим
+в зависимости от порядка импорта.
+
 Своего списка пользователей у пульта нет и не будет. Три сервиса сегодня опознают
 человека по-разному, и главный нерешённый вопрос переписывания — кто из них хозяин
 личности (`docs/01_TASKS.md`, C1–C3). Завести здесь четвёртую учётную запись значило
@@ -21,6 +25,7 @@ from __future__ import annotations
 import datetime
 import http.cookies
 import os
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,8 +42,47 @@ class LoginFailed(Exception):
     pass
 
 
+def cabinet_module():
+    """Кабинет как модуль, если он уже загружен в этом же процессе.
+
+    В единой платформе он загружен всегда: `web/platform.py` импортирует его первым.
+    Тогда вход — обычный вызов функции. Ходить при этом по HTTP на самого себя нельзя:
+    обработчик занимает поток событий, а ответ ждёт освобождения того же потока —
+    получается зависание до таймаута, а не ошибка.
+    """
+    mod = sys.modules.get("main")
+    return mod if mod is not None and hasattr(mod, "create_session") else None
+
+
 def login(base: str, name: str, password: str) -> str:
-    """Спросить кабинет. Возвращает id сессии либо бросает LoginFailed.
+    """Спросить кабинет. Возвращает id сессии либо бросает LoginFailed."""
+    mod = cabinet_module()
+    if mod is not None:
+        return _login_here(mod, name, password)
+    return _login_over_http(base, name, password)
+
+
+def _login_here(mod, name: str, password: str) -> str:
+    """Тот же путь, что у `POST /login`, но вызовами его же функций.
+
+    Не копия алгоритма: `verify_password`, `_row_disabled` и `create_session` — это
+    ровно то, что зовёт сам роут. Разойтись им не с чем.
+    """
+    c = mod.db()
+    try:
+        u = c.execute("SELECT * FROM users WHERE name=?", (name,)).fetchone()
+    finally:
+        c.close()
+    if not u or not u["password_hash"] or not mod.verify_password(password,
+                                                                  u["password_hash"]):
+        raise LoginFailed("неверный логин или пароль")
+    if mod._row_disabled(u):
+        raise LoginFailed("аккаунт заблокирован — обратитесь к владельцу сервиса")
+    return mod.create_session(u["id"])
+
+
+def _login_over_http(base: str, name: str, password: str) -> str:
+    """Пульт запущен отдельно от кабинета: спрашиваем по сети.
 
     Кабинет на успешный вход отвечает 302 с Set-Cookie, на неуспешный — 200 со
     страницей входа. Различаем именно по этому, а не по тексту ответа.
@@ -112,6 +156,13 @@ def _disabled(row) -> bool:
 def logout(base: str, sid: str) -> None:
     """Погасить сессию там же, где она заведена. Молча: выход не должен падать."""
     if not sid:
+        return
+    mod = cabinet_module()
+    if mod is not None:
+        try:
+            mod.delete_session(sid)
+        except Exception:                                          # noqa: BLE001
+            pass
         return
     req = urllib.request.Request(f"{base.rstrip('/')}/logout", data=b"", method="POST")
     req.add_header("Cookie", f"{COOKIE}={sid}")

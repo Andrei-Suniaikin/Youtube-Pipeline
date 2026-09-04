@@ -33,7 +33,7 @@ from fastapi.responses import FileResponse, JSONResponse          # noqa: E402
 from pydantic import BaseModel                                   # noqa: E402
 
 sys.path.insert(0, HERE)
-import auth                                                      # noqa: E402
+import pult_auth as auth                                       # noqa: E402
 
 from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
                            normalize_schedule, upcoming_slots)

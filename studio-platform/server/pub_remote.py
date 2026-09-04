@@ -26,8 +26,12 @@ import requests
 
 from pub_engine import ItemFailed, ResourceDown
 
-REWRITE_BASE = "http://127.0.0.1:8899"
-COVER_BASE = "http://127.0.0.1:8900"
+# Адреса соседей. По умолчанию — три отдельных сервиса, как в production сегодня.
+# В единой платформе они живут в том же процессе под префиксами, и тогда адрес задаётся
+# окружением: VS_REWRITE_BASE=http://127.0.0.1:8080/rewrite. Зашивать выбор в код нельзя —
+# оба варианта существуют одновременно, пока идёт переезд.
+REWRITE_BASE = os.environ.get("VS_REWRITE_BASE") or "http://127.0.0.1:8899"
+COVER_BASE = os.environ.get("VS_COVER_BASE") or "http://127.0.0.1:8900"
 
 TIMEOUT = 30
 # YouTube не отдаёт субтитры адресам облачных провайдеров, а каждый домашний адрес
