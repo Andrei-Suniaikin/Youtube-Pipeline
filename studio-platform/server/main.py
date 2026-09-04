@@ -2418,6 +2418,17 @@ async def logout_post(request: Request):
 # умолчанию прежнее, поэтому в production ничего не меняется.
 TENANTS_DIR = os.environ.get("VS_TENANTS_DIR") or "/data/tenants"
 
+# Куда ведут ссылки на соседей и на пульт из шапки кабинета. В единой платформе это
+# префиксы того же адреса; при раздельном запуске — прежние домены. Зашивать нельзя:
+# оба варианта существуют одновременно, пока идёт переезд.
+_NEIGHBOUR_LINKS = {
+    "rewrite": os.environ.get("VS_REWRITE_LINK")
+    or os.environ.get("VS_REWRITE_BASE") or "https://rewrite.13.140.129.66.sslip.io",
+    "cover": os.environ.get("VS_COVER_LINK")
+    or os.environ.get("VS_COVER_BASE") or "https://cover.13.140.129.66.sslip.io",
+}
+_STUDIO_LINK = os.environ.get("VS_STUDIO_LINK") or "/studio/"
+
 # Куда движок-подпроцесс стучится за журналом платных вызовов. По умолчанию — сам
 # кабинет на loopback: движки запускаются им же и на той же машине. Порт вынесен в
 # переменную, чтобы локальный кабинет на другом порту не требовал правки кода.
@@ -3814,8 +3825,11 @@ def _header(u, active=""):
         # лимиты СЕРВЕРНЫХ ключей — вход со страницы /keys (только у админа):
         # ещё один пункт в этой строке не влезает в 1280px и даёт горизонтальный скролл
         + '<span style="width:1px;height:18px;background:var(--line,#3a332c);margin:0 4px;align-self:center"></span>'
-        + '<a class="nav-link" href="https://rewrite.13.140.129.66.sslip.io" title="Rewrite Studio — рерайт текста"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-edit"/></svg> Текст</a>'
-        + '<a class="nav-link" href="https://cover.13.140.129.66.sslip.io" title="Cover Generator — обложки"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-image"/></svg> Обложки</a>'
+        # 04.09.2026: соседи живут в той же платформе под префиксами, а не на своих
+        # доменах. Адреса берутся из окружения — раздельный запуск остаётся возможным.
+        + f'<a class="nav-link" href="{html.escape(_NEIGHBOUR_LINKS["rewrite"])}" title="Rewrite Studio — рерайт текста"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-edit"/></svg> Текст</a>'
+        + f'<a class="nav-link" href="{html.escape(_NEIGHBOUR_LINKS["cover"])}" title="Cover Generator — обложки"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-image"/></svg> Обложки</a>'
+        + f'<a class="nav-link" href="{html.escape(_STUDIO_LINK)}" title="Единый пульт: выпуски, каналы, очередь, ключи">◆ Пульт</a>'
         + '</nav><span class="sp"></span>'
         + run_badge
         + f'<span class="muted" style="font-size:13px">{name}</span>'
