@@ -2049,9 +2049,14 @@ def ui_project(pid: str):
                  "state": _state(q["status"]),
                  "progress": (float(q["progress"]) if q["progress"] is not None else None),
                  "stage": q["stage"] or "", "error": q["error"] or "",
-                 "created": q["created"]}
+                 "created": q["created"],
+                 # Правило 6 ТЗ: настройки замораживаются в момент запуска, и в
+                 # интерфейсе должно быть видно, КАКИЕ применились. Снимок лежит
+                 # в queue_tasks.params с постановки; правка пресета его не меняет,
+                 # и именно поэтому показывать надо его, а не текущий пресет.
+                 "applied": _applied_params(q["params"])}
                 for q in c.execute(
-                    "SELECT job_id, kind, status, progress, stage, error, created "
+                    "SELECT job_id, kind, status, progress, stage, error, created, params "
                     "FROM queue_tasks WHERE project_id=? ORDER BY job_id DESC LIMIT 30",
                     (pid,))]
         paid = [{"kind": r["kind"], "delivered": r["n"], "cost": r["s"] or 0.0}
@@ -2080,6 +2085,36 @@ def ui_project(pid: str):
         "file_base": f"/p/{urllib.parse.quote(pid)}/file/",
         "zip_base": f"/api/projects/{urllib.parse.quote(pid)}/download/",
     }
+
+
+# Служебные ключи снимка: они про механику постановки, а не про то, чем сделан ролик.
+# Показывать их — значит утопить настройки в шуме.
+_PARAM_SKIP = ("token", "key", "secret", "claim", "_bundle", "callback", "deferred")
+
+
+def _applied_params(raw) -> list:
+    """Настройки, с которыми задача РЕАЛЬНО пошла в работу.
+
+    Не текущий пресет: он мог измениться после постановки, и показать его значило бы
+    соврать про то, что применилось. Правило 6 ТЗ именно об этом.
+    """
+    try:
+        data = json.loads(raw or "{}")
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(data, dict):
+        return []
+    out = []
+    for k, v in sorted(data.items()):
+        low = str(k).lower()
+        if any(mark in low for mark in _PARAM_SKIP):
+            continue
+        if isinstance(v, (dict, list)):
+            v = f"{len(v)} шт."
+        if v in (None, "", False):
+            continue
+        out.append({"name": k, "value": str(v)[:120]})
+    return out
 
 
 _FILE_GROUPS = (("images", "кадры"), ("clips", "клипы"), ("renders", "готовый ролик"),

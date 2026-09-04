@@ -884,7 +884,14 @@ async function viewProject(id){
           ${j.stage ? `<div class="muted">${esc(j.stage)}</div>` : ''}
           ${j.progress != null ? `<div class="bar"><i style="width:${
             Math.round(j.progress * 100)}%"></i></div>` : ''}
-          ${j.error ? `<div class="note bad">${esc(j.error)}</div>` : ''}</td>
+          ${j.error ? `<div class="note bad">${esc(j.error)}</div>` : ''}
+          ${(j.applied || []).length ? `<details style="margin-top:6px">
+            <summary class="muted" style="cursor:pointer;font-size:12px"
+              >с какими настройками пошла</summary>
+            <div class="note muted">${j.applied.map(a =>
+              `${esc(a.name)}: <b>${esc(a.value)}</b>`).join(' · ')}</div>
+            <div class="note muted">Это снимок момента запуска — правка пресета
+              его не меняет.</div></details>` : ''}</td>
         <td class="muted">${when(j.created)}</td>
         <td style="white-space:nowrap">${actions({service:'vsgen', id:j.id,
                                                   state:j.state, status:j.status})}</td>
