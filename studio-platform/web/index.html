@@ -31,6 +31,14 @@
   .login input{width:100%;box-sizing:border-box;padding:9px 11px;margin-top:10px;
                border:1px solid var(--border);border-radius:7px;font:inherit}
   .login button{width:100%;margin-top:14px}
+  .langs{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;max-height:132px;overflow:auto;
+         border:1px solid var(--line);border-radius:8px;padding:8px}
+  .langs label{display:inline-flex;align-items:center;gap:5px;font-size:12px;
+               border:1px solid var(--line);border-radius:16px;padding:3px 9px;cursor:pointer}
+  .langs label.on{background:var(--ok-bg);border-color:var(--ok);color:var(--ok)}
+  .modes{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+  .modes button{background:transparent;color:var(--muted);border:1px solid var(--line)}
+  .modes button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
   nav span.soon::after{content:" скоро";font-size:11px;opacity:.8}
   main{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
   h1{font-size:20px;margin:0 0 4px}
@@ -127,6 +135,7 @@
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
     <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
+    <a class="tab" href="#/text" id="tab-text">Текст</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
     <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
     <span class="who" id="who"></span>
@@ -701,6 +710,147 @@ function showWho(){
   };
 }
 
+/* ─────────────────────────────── текст ─────────────────────────────── */
+
+/* Рерайт и генерация с нуля — один экран (ТЗ §05). Разница между ними только
+   в источнике: ссылка, свой текст или тема. Три разных экрана для трёх источников
+   одной и той же работы — это и была «разбивка на тысячу интерфейсов». */
+let TEXT_FORM = {mode:'link', langs:new Set(), model:'', preset:''};
+
+async function viewText(){
+  const d = await api('/ui/text');
+  app.innerHTML = '';
+  app.append($(`<h1>Текст</h1>
+    <p class="sub">Рерайт по ссылке, рерайт своего текста и генерация с нуля — одна форма.
+      ${esc(d.note)}.</p>`));
+
+  if (!TEXT_FORM.model && d.models.length) TEXT_FORM.model = d.models[0].value;
+  const mode = () => d.modes.find(m => m.key === TEXT_FORM.mode) || d.modes[0];
+
+  const form = $(`<div class="card" style="padding:16px;margin-bottom:16px">
+    <div id="err"></div>
+    <div class="modes">${d.modes.map(m => `
+      <button data-mode="${m.key}" class="${m.key === TEXT_FORM.mode ? 'on' : ''}"
+        >${esc(m.title)}</button>`).join('')}</div>
+    <div class="note muted" style="margin-bottom:10px">${esc(mode().note)}</div>
+
+    <label class="k" style="display:block;margin-bottom:6px" id="src-label"></label>
+    <input id="src-one" placeholder="https://www.youtube.com/watch?v=…"
+           style="width:100%;box-sizing:border-box;padding:9px 11px;
+                  border:1px solid var(--border);border-radius:7px;font:inherit">
+    <textarea id="src-many" placeholder="Вставьте текст"></textarea>
+
+    <div id="preset-box" style="margin-top:12px">
+      <label class="k" style="display:block;margin-bottom:6px">Бриф</label>
+      <select id="preset" style="min-width:280px">
+        <option value="">— выберите бриф —</option>
+        ${d.presets.generation.map(p => `<option>${esc(p)}</option>`).join('')}
+      </select>
+      ${d.presets.generation.length ? '' :
+        '<div class="note muted">Брифов нет. Создать их можно в разделе Rewrite.</div>'}
+    </div>
+
+    <div style="margin-top:12px">
+      <label class="k" style="display:block;margin-bottom:6px">Модель</label>
+      <select id="model" style="min-width:280px">${d.models.map(m =>
+        `<option value="${esc(m.value)}" ${m.value === TEXT_FORM.model ? 'selected' : ''}
+          >${esc(m.label)}</option>`).join('')}</select>
+      <div class="note muted">${d.models.length
+        ? 'Показаны только модели, под которые у вас есть ключ или подписка.'
+        : 'Ни одной доступной модели: нет ни своего ключа, ни серверного.'}</div>
+    </div>
+
+    <div style="margin-top:12px">
+      <label class="k" style="display:block">Языки</label>
+      <div class="langs" id="langs">${d.languages.map(l => `
+        <label data-code="${esc(l.code)}"><input type="checkbox"
+          ${TEXT_FORM.langs.has(l.code) ? 'checked' : ''}>${esc(l.title)}</label>`).join('')}
+      </div>
+    </div>
+
+    <div style="margin-top:14px"><button id="go">Запустить</button></div>
+    <div id="res"></div>
+  </div>`);
+  app.append(form);
+
+  const one = form.querySelector('#src-one');
+  const many = form.querySelector('#src-many');
+  const presetBox = form.querySelector('#preset-box');
+  const label = form.querySelector('#src-label');
+
+  function paint(){
+    const m = TEXT_FORM.mode;
+    label.textContent = m === 'link' ? 'Ссылка на ролик-донор'
+                      : m === 'text' ? 'Текст' : 'Тема';
+    one.hidden = (m === 'text');
+    many.hidden = (m !== 'text');
+    presetBox.hidden = (m !== 'topic');
+    one.placeholder = m === 'link' ? 'https://www.youtube.com/watch?v=…'
+                                   : 'О чём должен быть ролик';
+  }
+  paint();
+
+  form.querySelectorAll('.modes button').forEach(b => b.onclick = () => {
+    TEXT_FORM.mode = b.dataset.mode;
+    render();
+  });
+  form.querySelectorAll('#langs label').forEach(l => {
+    const box = l.querySelector('input');
+    const sync = () => { l.classList.toggle('on', box.checked);
+      box.checked ? TEXT_FORM.langs.add(l.dataset.code)
+                  : TEXT_FORM.langs.delete(l.dataset.code); };
+    sync();
+    box.onchange = sync;
+  });
+  form.querySelector('#model').onchange = e => TEXT_FORM.model = e.target.value;
+  form.querySelector('#preset').onchange = e => TEXT_FORM.preset = e.target.value;
+
+  const errBox = form.querySelector('#err');
+  const resBox = form.querySelector('#res');
+  const btn = form.querySelector('#go');
+  btn.onclick = async () => {
+    errBox.innerHTML = ''; resBox.innerHTML = ''; btn.disabled = true;
+    btn.textContent = 'Отправляю…';
+    try{
+      const out = await post('/ui/text', {
+        mode: TEXT_FORM.mode,
+        source: (TEXT_FORM.mode === 'text' ? many.value : one.value),
+        languages: [...TEXT_FORM.langs],
+        model: TEXT_FORM.model,
+        preset: TEXT_FORM.preset,
+      });
+      resBox.innerHTML = `<div class="res">Задача создана${
+        out.chars ? ` · текста ${out.chars} знаков` : ''}.</div>`;
+      one.value = ''; many.value = '';
+      setTimeout(render, 600);
+    }catch(e){
+      errBox.innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    }finally{ btn.disabled = false; btn.textContent = 'Запустить'; }
+  };
+
+  const list = $(`<div class="card">
+    <div class="sec">Задачи текста</div>
+    ${d.jobs.length ? `<table><thead><tr>
+      <th>Задача</th><th>Вид</th><th>Языки</th><th>Состояние</th><th>Создана</th><th></th>
+      </tr></thead><tbody>${d.jobs.map(j => `<tr>
+        <td><div style="font-weight:600">${esc(j.title)}</div>
+            <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
+        <td>${j.kind === 'generation' ? 'с нуля' : 'рерайт'}</td>
+        <td>${(Array.isArray(j.langs) ? j.langs : [j.langs]).map(esc).join(', ') || '—'}</td>
+        <td><span class="pill s-${j.state}">${STATE_TITLE[j.state]}</span>
+            ${j.detail ? `<div class="muted" style="margin-top:4px">${esc(j.detail)}</div>` : ''}
+            ${j.progress != null ? `<div class="bar"><i style="width:${
+              Math.round(j.progress * 100)}%"></i></div>` : ''}</td>
+        <td class="muted">${when(j.created)}</td>
+        <td style="white-space:nowrap">${actions({service:'rewrite', id:j.id,
+                                                  state:j.state, status:j.status})}</td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Задач текста пока нет.</div>'}
+  </div>`);
+  app.append(list);
+  wireActions(list);
+}
+
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
 async function viewPresets(){
@@ -909,6 +1059,7 @@ const ROUTES = [
   ['channels', h => h === '#/channels',           () => viewChannels()],
   ['channels', h => h.startsWith('#/channel/'),   h  => viewChannel(decodeURIComponent(h.slice(10)))],
   ['keys',     h => h === '#/keys',               () => viewKeys()],
+  ['text',     h => h === '#/text',               () => viewText()],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
   ['admin',    h => h === '#/admin',              () => viewAdmin()],
   ['releases', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
@@ -925,7 +1076,7 @@ async function render(){
   showWho();
   const h = location.hash || '#/releases';
   const hit = ROUTES.find(r => r[1](h));
-  for (const id of ['releases', 'channels', 'queue', 'keys', 'presets', 'admin'])
+  for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'presets', 'admin'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
   try{ await hit[2](h); }
   catch(e){

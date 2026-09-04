@@ -16,6 +16,7 @@ from __future__ import annotations
 import datetime as dt
 import json
 import os
+import secrets
 import sqlite3
 import sys
 import time
@@ -38,7 +39,8 @@ import pult_auth as auth                                       # noqa: E402
 from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
                            normalize_schedule, upcoming_slots)
 from pub_engine import PHASES, PHASE_DEADLINES                   # noqa: E402
-from pub_remote import COVER_BASE, REWRITE_BASE, get_key         # noqa: E402
+from pub_remote import (COVER_BASE, REWRITE_BASE, donor_text,     # noqa: E402
+                        get_key, video_id)
 from pub_services import MEDIA_STAGES, OPTIONAL_STAGES           # noqa: E402
 from pub_tags import add_links, parse_links, plan_rows           # noqa: E402
 
@@ -1157,3 +1159,184 @@ def _channel_presets(c, ch) -> list:
                            else bool(ch["preset_cover"] in have_cov)),
                 "where": "cover"})
     return out
+
+
+# ──────────────────────────────── текст ────────────────────────────────
+
+# Экран рерайта и генерации — один на оба (ТЗ §05). Пульт здесь ничего не делает сам:
+# он пересылает запрос Rewrite'у ОТ ИМЕНИ вошедшего человека, его же кукой. Ключ
+# доступа не годится: ключ принадлежит одному человеку, и партнёр создавал бы задачи
+# от чужого имени, а видел бы чужие результаты.
+TEXT_MODES = (
+    ("link", "Ссылка на YouTube", "текст берётся из субтитров ролика"),
+    ("text", "Вставленный текст", "свой текст, без донора"),
+    ("topic", "С нуля по теме", "текста нет, есть тема и бриф"),
+)
+
+
+def _rw(path: str, sid: str, payload=None, method=None, raw=None, ctype=None):
+    """Запрос к Rewrite от имени вошедшего. Возвращает (код, тело)."""
+    data = raw
+    headers = {"Cookie": f"{auth.COOKIE}={sid}"}
+    if payload is not None:
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    elif ctype:
+        headers["Content-Type"] = ctype
+    req = urllib.request.Request(REWRITE_BASE + path, data=data,
+                                 method=method or ("POST" if data is not None else "GET"))
+    for k, v in headers.items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 5) as resp:
+            body = resp.read().decode("utf-8")
+            return resp.status, (json.loads(body) if body.startswith(("{", "[")) else body)
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        try:
+            parsed = json.loads(body or "{}")
+            detail = parsed.get("detail") or parsed.get("error") or body[:200]
+        except ValueError:
+            detail = body[:200]
+        return exc.code, detail
+    except Exception as exc:                                     # noqa: BLE001
+        return 502, f"рерайт не отвечает: {type(exc).__name__}"
+
+
+@app.get("/ui/text")
+def ui_text(request: Request):
+    """Экран текста: что уже сделано и чем можно сделать ещё.
+
+    Модели спрашиваем у Rewrite, а не перечисляем сами: он показывает только те, под
+    которые у этого человека есть рабочий ключ или подписка. Список, в котором половина
+    пунктов отвечает «503», — это ровно та ложь интерфейса, которую мы убираем.
+    """
+    sid = getattr(request.state, "sid", "")
+    code, jobs = _rw("/jobs", sid)
+    if code != 200:
+        jobs = []
+    _c, models = _rw("/models", sid)
+    # Пресеты берём сессионными путями, а не /api/v1/presets: тот требует ключ или
+    # заголовок X-Session-Id, а у нас кука — по ней Rewrite узнаёт человека только
+    # в middleware, куда /api/v1/* не заходит. Сессионные пути отдают ровно то же.
+    _c, settings = _rw("/settings/keys", sid)
+    _c, gen = _rw("/presets", sid)
+    # Список языков не зависит от человека — это справочник, и его можно спросить общим
+    # ключом. Разница принципиальная: данные человека берём его сессией, справочники —
+    # ключом сервиса. Смешивать эти два способа и есть тот дефект, из-за которого
+    # партнёр однажды увидел бы чужие пресеты.
+    c0 = db()
+    try:
+        langs_body, _err = _neighbour_get(REWRITE_BASE, "/api/v1/languages",
+                                          get_key(c0, "rewrite"))
+    finally:
+        c0.close()
+    languages = [{"code": x.get("short_code") or x.get("canonical"),
+                  "title": x.get("display_ru") or x.get("canonical")}
+                 for x in ((langs_body or {}).get("languages") or [])
+                 if x.get("canonical")]
+    rows = []
+    for j in (jobs if isinstance(jobs, list) else []):
+        pct = j.get("progress")
+        rows.append({
+            "id": str(j.get("id") or ""),
+            "kind": str(j.get("type") or ""),
+            "title": j.get("name") or j.get("preset_name") or str(j.get("id") or ""),
+            "status": str(j.get("status") or ""),
+            "state": _state(j.get("status")),
+            "progress": (float(pct) / 100 if isinstance(pct, (int, float)) else None),
+            "detail": j.get("detail") or "",
+            "langs": j.get("langs") or [],
+            "created": j.get("created_at"),
+        })
+    rows.sort(key=lambda r: -(r["created"] or 0))
+    c = db()
+    try:
+        channels = [{"id": r["id"], "name": r["name"], "lang": r["lang"] or "",
+                     "preset_rewrite": r["preset_rewrite"] or ""}
+                    for r in c.execute("SELECT id, name, lang, preset_rewrite "
+                                       "FROM pub_channels WHERE tenant_id=? ORDER BY name",
+                                       (TENANT,))]
+    finally:
+        c.close()
+    return {
+        "jobs": rows,
+        "modes": [{"key": k, "title": t, "note": n} for k, t, n in TEXT_MODES],
+        "models": models if isinstance(models, (list, dict)) else [],
+        "presets": {
+            "rewrite": sorted((settings or {}).get("rew_presets") or {})
+            if isinstance(settings, dict) else [],
+            "generation": sorted(gen or {}) if isinstance(gen, dict) else [],
+        },
+        "channels": channels,
+        "languages": languages,
+        "note": "задачи и результаты — ваши: пульт обращается к рерайту вашей же сессией",
+    }
+
+
+class TextIn(BaseModel):
+    mode: str
+    source: str = ""                 # ссылка, текст или тема — по режиму
+    languages: list = []
+    model: str = ""
+    preset: str = ""
+    channel_id: int | None = None
+
+
+@app.post("/ui/text")
+def ui_text_create(body: TextIn, request: Request):
+    """Создать задачу текста. Три источника, один экран.
+
+    Ссылка превращается в текст здесь, кабинетом: `donor_text` уже умеет доставать
+    субтитры, ходит по нескольким выходам при исчерпанной квоте и кэширует результат
+    для соседних каналов. Дублировать это в интерфейсе незачем.
+    """
+    sid = getattr(request.state, "sid", "")
+    mode = (body.mode or "").strip()
+    if mode not in {k for k, _t, _n in TEXT_MODES}:
+        raise HTTPException(400, f"неизвестный режим «{mode}»")
+    langs = [str(x).strip() for x in (body.languages or []) if str(x).strip()]
+    if not langs:
+        raise HTTPException(400, "не выбран ни один язык")
+
+    if mode == "topic":
+        if not body.preset:
+            raise HTTPException(400, "для генерации с нуля нужен бриф (пресет)")
+        code, out = _rw("/jobs/generation", sid, {
+            "preset_name": body.preset, "topic": body.source,
+            "languages": [{"code": x, "display": x} for x in langs],
+            "model": body.model or "gpt-4.1-nano"})
+        if code >= 400:
+            raise HTTPException(code if code in (400, 403, 404, 409, 422) else 502, out)
+        return {"ok": True, "job": out}
+
+    if mode == "link":
+        try:
+            text = donor_text(body.source)
+        except Exception as exc:                                 # noqa: BLE001
+            raise HTTPException(400, f"текст ролика не получен: {exc}")
+        name = (video_id(body.source) or "донор") + ".txt"
+    else:
+        text = body.source or ""
+        name = "вставленный.txt"
+    if not text.strip():
+        raise HTTPException(400, "текста нет — рерайтить нечего")
+
+    boundary = "----studio" + secrets.token_hex(8)
+    part = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
+            f"Content-Type: text/plain; charset=utf-8\r\n\r\n").encode("utf-8")
+    raw = part + text.encode("utf-8") + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    code, out = _rw("/upload", sid, raw=raw,
+                    ctype=f"multipart/form-data; boundary={boundary}")
+    if code >= 400:
+        raise HTTPException(code if code in (400, 413) else 502, out)
+    stored = (out or {}).get("filename") or (out or {}).get("file") or name
+
+    code, out = _rw("/jobs/rewrite", sid, {
+        "files": [stored],
+        "languages": [{"code": x, "display": x} for x in langs],
+        "model": body.model or "gpt-4.1-nano"})
+    if code >= 400:
+        raise HTTPException(code if code in (400, 403, 404, 409, 413, 422) else 502, out)
+    return {"ok": True, "job": out, "chars": len(text)}

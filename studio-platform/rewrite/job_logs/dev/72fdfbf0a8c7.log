@@ -1,0 +1,62 @@
+[14:02:09] 📊 pl: Analyzing text structure...
+[14:02:09] ⚠️ Analysis failed, using defaults (CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN))
+[14:02:09] 📐 pl: режим сохранения абзацев — 1 абзацев → 1 чанков
+[14:02:09] 🌍 pl: начинаю (1 частей)
+[14:02:09] 🔧 pl: model='codex:gpt-5.5', provider='codex_subscription', use_sub=False, key_source=server
+[14:02:09]   🔑 System prompt: hash=bb124c3a, длина=13815 символов (~3453 токенов)
+[14:02:09]   🔑 lang_name='Polish', lang_display='pl' (должны быть одинаковыми для всех чанков)
+[14:02:09] ❌ pl: часть 1 - CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN)
+[14:02:09] 📐 pl: постпроцесс Pass A/B/C/D пропущен (режим сохранения абзацев)
+[14:02:09] ⚠️ pl: 1 чанков провалились — файл НЕ сохранён (не отдаём брак со вставками [ОШИБКА:…]). Жми «🔁 Повторить незавершённые» чтобы дозалить только их.
+🔁 авто-ретрай таски 2/3: дозалив упавших чанков (resume)
+[14:02:28] 📊 pl: Analyzing text structure...
+[14:02:28] ⚠️ Analysis failed, using defaults (CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN))
+[14:02:28] 📐 pl: режим сохранения абзацев — 1 абзацев → 1 чанков
+[14:02:28] 🌍 pl: начинаю (1 частей)
+[14:02:28] 🔧 pl: model='codex:gpt-5.5', provider='codex_subscription', use_sub=False, key_source=server
+[14:02:28]   🔑 System prompt: hash=bb124c3a, длина=13815 символов (~3453 токенов)
+[14:02:28]   🔑 lang_name='Polish', lang_display='pl' (должны быть одинаковыми для всех чанков)
+[14:02:28] ❌ pl: часть 1 - CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN)
+[14:02:28] 📐 pl: постпроцесс Pass A/B/C/D пропущен (режим сохранения абзацев)
+[14:02:28] ⚠️ pl: 1 чанков провалились — файл НЕ сохранён (не отдаём брак со вставками [ОШИБКА:…]). Жми «🔁 Повторить незавершённые» чтобы дозалить только их.
+🔁 авто-ретрай таски 2/3: дозалив упавших чанков (resume)
+[14:02:48] 📊 pl: анализ из кэша (файл уже обработан)
+[14:02:48] 📐 pl: режим сохранения абзацев — 1 абзацев → 1 чанков
+[14:02:48] 🌍 pl: начинаю (1 частей)
+[14:02:48] 🔧 pl: model='codex:gpt-5.5', provider='codex_subscription', use_sub=False, key_source=server
+[14:02:48]   🔑 System prompt: hash=bb124c3a, длина=13815 символов (~3453 токенов)
+[14:02:48]   🔑 lang_name='Polish', lang_display='pl' (должны быть одинаковыми для всех чанков)
+[14:02:48] ❌ pl: часть 1 - CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN)
+[14:02:48] 📐 pl: постпроцесс Pass A/B/C/D пропущен (режим сохранения абзацев)
+[14:02:48] ⚠️ pl: 1 чанков провалились — файл НЕ сохранён (не отдаём брак со вставками [ОШИБКА:…]). Жми «🔁 Повторить незавершённые» чтобы дозалить только их.
+🔁 авто-ретрай таски 3/3: дозалив упавших чанков (resume)
+[14:03:04] 📊 pl: Analyzing text structure...
+[14:03:04] ⚠️ Analysis failed, using defaults (CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN))
+[14:03:04] 📐 pl: режим сохранения абзацев — 1 абзацев → 1 чанков
+[14:03:04] 🌍 pl: начинаю (1 частей)
+[14:03:04] 🔧 pl: model='codex:gpt-5.5', provider='codex_subscription', use_sub=False, key_source=server
+[14:03:04]   🔑 System prompt: hash=bb124c3a, длина=13815 символов (~3453 токенов)
+[14:03:04]   🔑 lang_name='Polish', lang_display='pl' (должны быть одинаковыми для всех чанков)
+[14:03:04] ❌ pl: часть 1 - CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN)
+[14:03:04] 📐 pl: постпроцесс Pass A/B/C/D пропущен (режим сохранения абзацев)
+[14:03:04] ⚠️ pl: 1 чанков провалились — файл НЕ сохранён (не отдаём брак со вставками [ОШИБКА:…]). Жми «🔁 Повторить незавершённые» чтобы дозалить только их.
+🔁 авто-ретрай таски 2/3: дозалив упавших чанков (resume)
+[14:03:24] 📊 pl: анализ из кэша (файл уже обработан)
+[14:03:24] 📐 pl: режим сохранения абзацев — 1 абзацев → 1 чанков
+[14:03:24] 🌍 pl: начинаю (1 частей)
+[14:03:24] 🔧 pl: model='codex:gpt-5.5', provider='codex_subscription', use_sub=False, key_source=server
+[14:03:24]   🔑 System prompt: hash=bb124c3a, длина=13815 символов (~3453 токенов)
+[14:03:24]   🔑 lang_name='Polish', lang_display='pl' (должны быть одинаковыми для всех чанков)
+[14:03:24] ❌ pl: часть 1 - CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN)
+[14:03:24] 📐 pl: постпроцесс Pass A/B/C/D пропущен (режим сохранения абзацев)
+[14:03:24] ⚠️ pl: 1 чанков провалились — файл НЕ сохранён (не отдаём брак со вставками [ОШИБКА:…]). Жми «🔁 Повторить незавершённые» чтобы дозалить только их.
+🔁 авто-ретрай таски 3/3: дозалив упавших чанков (resume)
+[14:03:44] 📊 pl: анализ из кэша (файл уже обработан)
+[14:03:44] 📐 pl: режим сохранения абзацев — 1 абзацев → 1 чанков
+[14:03:44] 🌍 pl: начинаю (1 частей)
+[14:03:44] 🔧 pl: model='codex:gpt-5.5', provider='codex_subscription', use_sub=False, key_source=server
+[14:03:44]   🔑 System prompt: hash=bb124c3a, длина=13815 символов (~3453 токенов)
+[14:03:44]   🔑 lang_name='Polish', lang_display='pl' (должны быть одинаковыми для всех чанков)
+[14:03:44] ❌ pl: часть 1 - CODEX_ERROR: codex CLI not found (set REWRITE_CODEX_BIN)
+[14:03:44] 📐 pl: постпроцесс Pass A/B/C/D пропущен (режим сохранения абзацев)
+[14:03:44] ⚠️ pl: 1 чанков провалились — файл НЕ сохранён (не отдаём брак со вставками [ОШИБКА:…]). Жми «🔁 Повторить незавершённые» чтобы дозалить только их.
