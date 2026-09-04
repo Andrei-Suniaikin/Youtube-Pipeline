@@ -50,6 +50,7 @@ import pub_ui                                                    # noqa: E402
 
 import pub_alerts                                                # noqa: E402
 import pub_alerts_tg                                             # noqa: E402
+import accounts                                                  # noqa: E402
 import pub_calls                                                 # noqa: E402
 import pub_retention                                             # noqa: E402
 import pub_verify                                                # noqa: E402
@@ -2455,3 +2456,117 @@ def ui_regen(what: str, body: RegenIn, request: Request):
         raise HTTPException(_pass_code(exc.code), detail or f"кабинет ответил {exc.code}")
     except Exception as exc:                                     # noqa: BLE001
         raise HTTPException(502, f"кабинет не отвечает: {type(exc).__name__}")
+
+
+# ─────────────────────────── учётные записи ───────────────────────────
+
+# Заводить людей раньше можно было только из командной строки (`create_partner.py`)
+# либо через админ-панель кабинета по статичному токену в теле формы. Ни то ни другое
+# не годится для ежедневной работы: первое требует доступа к серверу, второе — знания,
+# что такой токен вообще есть.
+#
+# Сам список и правила живут в `server/accounts.py` — одном месте на кабинет и пульт.
+# Хэширование пароля берём у кабинета: второго алгоритма в системе быть не должно.
+
+def _require_admin(request) -> dict:
+    """Управление людьми — только администратору.
+
+    Проверяем на сервере, а не прятанием кнопки: запрос может прислать кто угодно.
+    """
+    user = getattr(request.state, "user", None)
+    role = (user["role"] if user is not None and "role" in user.keys() else "") or ""
+    if role != "admin":
+        raise HTTPException(403, "управление учётными записями — только администратору")
+    return {"id": user["id"], "name": user["name"]}
+
+
+def _hash_password():
+    mod = sys.modules.get("main")
+    if mod is None or not hasattr(mod, "hash_password"):
+        raise HTTPException(503, "кабинет не поднят — задать пароль нечем")
+    return mod.hash_password
+
+
+@app.get("/ui/accounts")
+def ui_accounts(request: Request):
+    """Кто есть в системе. Ни пароля, ни его хэша, ни API-токена здесь нет."""
+    _require_admin(request)
+    c = db()
+    try:
+        users = accounts.list_users(c)
+        admins = accounts.admin_count(c)
+    finally:
+        c.close()
+    me = getattr(request.state, "user", None)
+    return {
+        "users": users,
+        "me": (me["id"] if me is not None else None),
+        "admins": admins,
+        "roles": [{"key": "admin", "title": "администратор"},
+                  {"key": "user", "title": "пользователь"}],
+        "note": "вход у человека один на всю платформу: кабинет, пульт, тексты и обложки",
+    }
+
+
+class AccountIn(BaseModel):
+    login: str = ""
+    password: str = ""
+    role: str = "user"
+    quota: str = ""
+
+
+@app.post("/ui/accounts")
+def ui_account_create(body: AccountIn, request: Request):
+    """Завести человека: учётка, тенант, каталог — всё три или ничего.
+
+    Заводить его у соседей не нужно: после слияния личности Rewrite и Cover узнают
+    человека по сессии кабинета, а его данные создаются при первом обращении.
+    """
+    _require_admin(request)
+    c = db()
+    try:
+        out = accounts.create_user(c, body.login, body.password, _hash_password(),
+                                   role=body.role, quota=body.quota,
+                                   tenants_dir=TENANTS_DIR)
+    except accounts.AccountError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        c.close()
+    return {"ok": True, **out}
+
+
+class AccountEditIn(BaseModel):
+    disabled: bool | None = None
+    role: str | None = None
+    password: str | None = None
+    quota: str | None = None
+
+
+@app.post("/ui/accounts/{uid:int}")
+def ui_account_edit(uid: int, body: AccountEditIn, request: Request):
+    """Заблокировать, сменить роль, задать пароль, поменять квоту.
+
+    По одному изменению за запрос — так понятнее и в интерфейсе, и в отказе: «это
+    последний администратор» относится к конкретному действию, а не к пачке.
+    """
+    me = _require_admin(request)
+    c = db()
+    try:
+        done = {}
+        if body.disabled is not None:
+            done["disabled"] = accounts.set_disabled(c, uid, body.disabled,
+                                                     actor_id=me["id"])
+        if body.role is not None:
+            done["role"] = accounts.set_role(c, uid, body.role, actor_id=me["id"])
+        if body.password is not None:
+            done["password"] = accounts.set_password(c, uid, body.password,
+                                                     _hash_password())
+        if body.quota is not None:
+            done["quota"] = accounts.set_quota(c, uid, body.quota)
+        if not done:
+            raise HTTPException(400, "нечего менять")
+    except accounts.AccountError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        c.close()
+    return {"ok": True, "done": sorted(done)}

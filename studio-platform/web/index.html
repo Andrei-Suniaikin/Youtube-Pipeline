@@ -1745,6 +1745,95 @@ function wirePresets(root){
   });
 }
 
+/* ─────────────────────────── учётные записи ─────────────────────────── */
+
+/* Вход у человека один на всю платформу: кабинет, пульт, тексты и обложки. Поэтому
+   и управление людьми одно — заводить их в трёх местах больше не нужно. */
+async function accountsCard(){
+  let d;
+  try{ d = await api('/ui/accounts'); }
+  catch(e){ return null; }        // не администратор — раздела просто нет
+
+  const card = $(`<div class="card" style="margin-top:16px">
+    <div class="sec">Люди</div>
+    <table><thead><tr>
+      <th>Логин</th><th>Роль</th><th>Тенант</th><th>Квота</th><th>Состояние</th><th></th>
+    </tr></thead><tbody>${d.users.map(u => `<tr>
+      <td><div style="font-weight:600">${esc(u.name)}${
+        u.id === d.me ? ' <span class="muted">— это вы</span>' : ''}</div>
+        <div class="muted mono" style="font-size:11px">#${u.id}</div></td>
+      <td><select class="urole" data-id="${u.id}">${d.roles.map(r =>
+        `<option value="${esc(r.key)}" ${r.key === u.role ? 'selected' : ''}
+          >${esc(r.title)}</option>`).join('')}</select></td>
+      <td class="mono">${esc(u.tenant_id)}</td>
+      <td><input class="uquota" data-id="${u.id}" value="${u.quota ?? ''}"
+            placeholder="без лимита" style="width:110px"></td>
+      <td><span class="pill ${u.disabled ? 's-error' : 's-done'}">${
+        u.disabled ? 'заблокирован' : 'работает'}</span>
+        ${u.has_password ? '' : '<div class="note bad">пароль не задан</div>'}</td>
+      <td style="white-space:nowrap">
+        <button class="ghost upw" data-id="${u.id}" data-name="${esc(u.name)}"
+          >Пароль</button>
+        ${u.id === d.me ? '' : `<button class="ghost ublock" data-id="${u.id}"
+          data-name="${esc(u.name)}" data-to="${u.disabled ? '0' : '1'}"
+          >${u.disabled ? 'Вернуть' : 'Заблокировать'}</button>`}
+      </td>
+    </tr>`).join('')}</tbody></table>
+
+    <div class="sec" style="border-bottom:0">Завести человека</div>
+    <div id="uerr"></div>
+    <div class="fldrow"><label>Логин</label>
+      <input id="n-login" style="width:200px" autocomplete="off">
+      <label style="min-width:auto">Пароль</label>
+      <input id="n-pw" type="password" style="width:200px" autocomplete="new-password">
+    </div>
+    <div class="fldrow"><label>Роль и квота</label>
+      <select id="n-role">${d.roles.map(r =>
+        `<option value="${esc(r.key)}">${esc(r.title)}</option>`).join('')}</select>
+      <input id="n-quota" placeholder="без лимита" style="width:120px">
+      <button id="n-go">Завести</button>
+    </div>
+    <div class="note muted">${esc(d.note)}. Заводить его в Rewrite и Cover не нужно —
+      они узнают человека по этому же входу.</div>
+  </div>`);
+
+  const err = card.querySelector('#uerr');
+  const act = async (fn) => {
+    err.innerHTML = '';
+    try{ await fn(); await render(); }
+    catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  };
+
+  card.querySelector('#n-go').onclick = () => act(() => post('/ui/accounts', {
+    login: card.querySelector('#n-login').value,
+    password: card.querySelector('#n-pw').value,
+    role: card.querySelector('#n-role').value,
+    quota: card.querySelector('#n-quota').value}));
+
+  card.querySelectorAll('button.ublock').forEach(b => b.onclick = () => {
+    const off = b.dataset.to === '1';
+    if (!confirm(off
+      ? `Заблокировать «${b.dataset.name}»? Открытые вкладки закроются сразу.`
+      : `Вернуть доступ «${b.dataset.name}»?`)) return;
+    act(() => post(`/ui/accounts/${b.dataset.id}`, {disabled: off}));
+  });
+
+  card.querySelectorAll('button.upw').forEach(b => b.onclick = () => {
+    const pw = prompt(`Новый пароль для «${b.dataset.name}».\n`
+                      + `Открытые вкладки этого человека закроются.`, '');
+    if (!pw) return;
+    act(() => post(`/ui/accounts/${b.dataset.id}`, {password: pw}));
+  });
+
+  card.querySelectorAll('select.urole').forEach(sel => sel.onchange = () =>
+    act(() => post(`/ui/accounts/${sel.dataset.id}`, {role: sel.value})));
+
+  card.querySelectorAll('input.uquota').forEach(inp => inp.onchange = () =>
+    act(() => post(`/ui/accounts/${inp.dataset.id}`, {quota: inp.value})));
+
+  return card;
+}
+
 /* ─────────────────────────── админ: тревоги и диск ─────────────────────────── */
 
 const FATE_TITLE = {keep:'артефакт выпуска — не удаляется', strip:'промежуточное'};
@@ -1905,6 +1994,11 @@ async function viewAdmin(){
         </div></div>`).join('')}` : ''}
     <div class="note muted">${esc(pb.blind_spot)}</div>
   </div>`));
+
+  // Раздел людей появляется только у администратора: обычному он не показывается
+  // и не отвечает — проверка стоит на сервере, а не на прятании кнопки.
+  const people = await accountsCard();
+  if (people) app.append(people);
 }
 
 /* ─────────────────────────────── роутер ─────────────────────────────── */
