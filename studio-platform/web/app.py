@@ -88,6 +88,21 @@ STAGES = (
     ("upload", "Публикация", "upload"),
 )
 
+# Виды задач по-русски. ТЗ §13: внутренние слова наружу не показываются.
+KIND_TITLE = {
+    "tts": "озвучка", "images": "кадры", "prompts": "промпты", "regen": "перегенерация",
+    "video": "клипы", "regen_video": "перегенерация клипов", "render": "сборка",
+    "chapters": "тайм-коды", "cards": "карточка", "pipeline": "весь конвейер",
+}
+
+# Состояния по-русски и одинаковые везде. «Готово частично» и «нужно действие» ТЗ
+# требует отдельно: первое бывает у рерайта, второе — у выпуска в разборе.
+STATE_TITLE = {
+    "done": "готово", "running": "в работе", "queued": "в очереди",
+    "partial": "готово частично", "error": "ошибка", "cancelled": "остановлено",
+    "blocked": "нужно действие", "idle": "не начато", "off": "не участвует",
+}
+
 TERMINAL_OK = ("done",)
 TERMINAL_BAD = ("error", "cancelled", "failed")
 
@@ -187,6 +202,10 @@ def _state(status) -> str:
     s = (status or "").lower()
     if s in TERMINAL_OK:
         return "done"
+    if s == "partial":
+        return "partial"        # рерайт умеет «сделал часть языков» — это не ошибка
+    if s == "cancelled":
+        return "cancelled"      # остановлено человеком — тоже не ошибка
     if s in TERMINAL_BAD:
         return "error"
     if s in ("running", "claimed", "in_progress"):
@@ -341,10 +360,39 @@ def _stages(c, rel: dict) -> list:
             queue[q["kind"]] = q          # последняя задача этого вида — она и актуальна
     upload = c.execute("SELECT * FROM pub_upload_jobs WHERE release_id = ?", (rid,)).fetchone()
 
+    # Материалы проекта — по группам, теми же шаблонами, что и скачивание. ТЗ §14
+    # требует на каждой стадии не строку статуса, а сам результат: миниатюры кадров,
+    # плеер озвучки, готовые файлы сборки. Всё это уже посчитано для карточки проекта;
+    # здесь оно раскладывается по стадиям.
+    mod = sys.modules.get("main")
+    pid = rel.get("project_id") if isinstance(rel, dict) else rel["project_id"]
+    groups = {g["code"]: g for g in (_project_files(mod, pid) if pid else [])}
+    ready = {}
+    if pid and mod is not None and hasattr(mod, "_project_status"):
+        try:
+            ready = mod._project_status(TENANT, pid) or {}
+        except Exception:                                          # noqa: BLE001
+            ready = {}
+    file_base = f"/p/{urllib.parse.quote(pid)}/file/" if pid else ""
+    # Какой этап каким материалом доказывается. «Готово» без файла — не готово.
+    STAGE_FILES = {"tts": ("audio",), "images": ("images",), "video": ("clips",),
+                   "render": ("renders", "subs", "chapters")}
+
     out = []
     for key, title, source in STAGES:
         row = {"key": key, "title": title, "state": "idle", "facts": [], "note": "",
-               "job": None}
+               "job": None, "files": [], "file_base": file_base}
+        for code in STAGE_FILES.get(key, ()):
+            g = groups.get(code)
+            if g:
+                row["files"].append({"code": code, "title": g["title"],
+                                     "kind": g["kind"], "count": g["count"],
+                                     "names": g["names"][:12]})
+        # Правило 3 ТЗ: «готово» — когда результат создан и открывается. Файл на диске
+        # доказывает этап надёжнее записи в очереди: запись могли вычистить кнопкой
+        # «очистить очередь», а файл остался. Поэтому материал поднимает состояние,
+        # но никогда не понижает — идущий этап остаётся идущим.
+        row["_has_files"] = bool(row["files"])
 
         if source.startswith("remote:"):
             service = source.split(":", 1)[1]
@@ -393,6 +441,12 @@ def _stages(c, rel: dict) -> list:
                         row["note"] = q["error"]
                 elif job is not None and job["remote_job_id"]:
                     row["facts"].append(f'задача {job["remote_job_id"]}')
+            if kind == "images":
+                # «Готово 38 из 60» — ровно та формулировка, которую просит ТЗ §14.
+                got, want = ready.get("images") or 0, ready.get("images_expected")
+                if got or want:
+                    row["facts"].insert(0, f"готово {got}"
+                                        + (f" из {want}" if want else ""))
             if kind in OPTIONAL_STAGES:
                 row["facts"].append("необязательный этап")
             if kind == "render":
@@ -415,6 +469,12 @@ def _stages(c, rel: dict) -> list:
                         row["facts"].append(f"{label} {value}")
                 if upload["error"]:
                     row["note"] = upload["error"]
+        # Только из «не начато»: если задача стоит в очереди или идёт, файлы на диске
+        # могли остаться от прошлого прогона, и назвать этап готовым было бы враньём
+        # в обратную сторону. Поймано на фикстурах: озвучка в очереди показывалась
+        # готовой из-за старого mp3.
+        if row.pop("_has_files", False) and row["state"] == "idle":
+            row["state"] = "done"
         out.append(row)
     return out
 
@@ -642,24 +702,45 @@ def _neighbour_jobs(name: str, base: str, key: str) -> tuple:
 
 
 @app.get("/ui/queue")
-def ui_queue():
-    """Одна очередь на три сервиса. Свои задачи из базы, чужие — по HTTP.
+def ui_queue(service: str | None = None, channel: int | None = None,
+             state: str | None = None, since: str | None = None):
+    """Одна очередь на три сервиса, с фильтрами (ТЗ §13).
+
+    Имя задачи — название ролика, а не идентификатор проекта: «proj-dev-0001» ничего
+    не говорит человеку, который смотрит на очередь из сорока пяти каналов. Рядом
+    контекст, который ТЗ требует поимённо: сервис, канал, язык, текущий этап.
 
     Сосед, который не отвечает, показывается отдельной строкой состояния, а не роняет
     экран и не притворяется пустой очередью: «нет задач» и «не смогли спросить» — разное.
     """
     c = db()
     try:
+        # Название и канал берём одним запросом: очередь на сотню строк не должна
+        # превращаться в сотню обращений за именем ролика.
         rows = []
         for q in c.execute(
-                "SELECT job_id, kind, status, created, progress, stage, provider, error, "
-                "       project_id "
-                "FROM queue_tasks WHERE tenant_id=? ORDER BY job_id DESC LIMIT 100",
+                "SELECT q.job_id, q.kind, q.status, q.created, q.progress, q.stage, "
+                "       q.provider, q.error, q.project_id, q.uid, "
+                "       r.release_id, ch.id ch_id, ch.name ch_name, ch.lang lang, "
+                "       p.donor_title, p.donor_url, u.name user_name "
+                "FROM queue_tasks q "
+                "LEFT JOIN pub_releases r ON r.project_id = q.project_id "
+                "LEFT JOIN pub_channels ch ON ch.id = r.channel_id "
+                "LEFT JOIN pub_plan_items p ON p.id = r.plan_item_id "
+                "LEFT JOIN users u ON u.id = q.uid "
+                "WHERE q.tenant_id=? ORDER BY q.job_id DESC LIMIT 100",
                 (TENANT,)):
             rows.append({
                 "service": "vsgen", "id": str(q["job_id"]),
-                "title": q["project_id"] or str(q["job_id"]),
+                "title": (q["donor_title"] or q["donor_url"] or q["project_id"]
+                          or str(q["job_id"])),
+                "channel": q["ch_name"] or "", "channel_id": q["ch_id"],
+                "lang": (q["lang"] or "").upper(),
+                "release_id": q["release_id"] or "",
+                "project_id": q["project_id"] or "",
+                "user": q["user_name"] or "",
                 "kind": q["kind"] or "",
+                "kind_title": KIND_TITLE.get(q["kind"] or "", q["kind"] or ""),
                 "status": q["status"] or "",
                 "state": _state(q["status"]),
                 "progress": (float(q["progress"]) if q["progress"] is not None else None),
@@ -675,10 +756,38 @@ def ui_queue():
             rows.extend(got)
             services.append({"key": name, "title": title, "ok": not err,
                              "error": err, "count": len(got)})
+        channels = [{"id": r["id"], "name": r["name"]} for r in c.execute(
+            "SELECT id, name FROM pub_channels WHERE tenant_id=? ORDER BY name",
+            (TENANT,))]
     finally:
         c.close()
+
+    total = len(rows)
+    if service:
+        rows = [r for r in rows if r["service"] == service]
+    if channel:
+        rows = [r for r in rows if r.get("channel_id") == int(channel)]
+    if state:
+        rows = [r for r in rows if r["state"] == state]
+    if since:
+        try:
+            edge = time.time() - {"1h": 3600, "24h": 86400, "7d": 7 * 86400}[since]
+            rows = [r for r in rows if (r.get("created") or 0) >= edge]
+        except KeyError:
+            pass
+
     rows.sort(key=lambda r: (r["created"] or 0), reverse=True)
-    return {"rows": rows, "services": services}
+    return {
+        "rows": rows, "services": services, "channels": channels,
+        "total": total, "shown": len(rows),
+        "states": [{"key": k, "title": v} for k, v in STATE_TITLE.items()],
+        "periods": [{"key": "1h", "title": "за час"},
+                    {"key": "24h", "title": "за сутки"},
+                    {"key": "7d", "title": "за неделю"}],
+        # Канал и язык есть только у задач, рождённых выпуском. Ручная задача их не
+        # имеет, и это не пробел данных, а другое происхождение — так и показываем.
+        "note": "канал и язык видны у задач, созданных выпуском",
+    }
 
 
 @app.get("/ui/keys")

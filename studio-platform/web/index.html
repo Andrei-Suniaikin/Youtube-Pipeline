@@ -225,9 +225,17 @@
 const $ = (h, ...kids) => { const e = document.createElement('div'); e.innerHTML = h; return e; };
 const app = document.getElementById('app');
 
-const STATE_TITLE = {done:'готово', running:'идёт', queued:'в очереди',
-                     error:'ошибка', idle:'не начато', off:'не участвует'};
-const DOT = {done:'✓', running:'◐', queued:'·', error:'!', idle:'', off:'–'};
+// Состояния по-русски и одинаковые везде — ТЗ §13. «Готово частично» и «остановлено»
+// не ошибки, и красить их красным было бы враньём.
+const STATE_TITLE = {done:'готово', running:'в работе', queued:'в очереди',
+                     partial:'готово частично', cancelled:'остановлено',
+                     blocked:'нужно действие', error:'ошибка', idle:'не начато',
+                     off:'не участвует'};
+const STATE_CLS = {done:'s-done', running:'s-running', queued:'s-queued',
+                   partial:'s-queued', cancelled:'s-idle', blocked:'s-error',
+                   error:'s-error', idle:'s-idle', off:'s-off'};
+const DOT = {done:'✓', running:'◐', queued:'·', partial:'◑', cancelled:'–',
+             blocked:'!', error:'!', idle:'', off:'–'};
 
 function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -387,14 +395,15 @@ async function viewRelease(id){
           : ''}</div>` : ''}
     ${d.stages.map(s => `
       <div class="stage ${s.state === 'off' ? 'off' : ''}">
-        <div class="dot s-${s.state}">${DOT[s.state] || ''}</div>
+        <div class="dot ${STATE_CLS[s.state]}">${DOT[s.state] || ''}</div>
         <div class="body">
           <div class="name">${esc(s.title)}
-            <span class="pill s-${s.state}" style="margin-left:6px">${STATE_TITLE[s.state]}</span>
+            <span class="pill ${STATE_CLS[s.state]}" style="margin-left:6px">${STATE_TITLE[s.state]}</span>
           </div>
           ${s.facts.length ? `<div class="facts">${s.facts.map(esc).join(' · ')}</div>` : ''}
           ${s.note ? `<div class="note ${s.state === 'error' ? 'bad' : 'muted'}"
             >${esc(s.note)}</div>` : ''}
+          ${stageFiles(s)}
         </div>
         <div style="white-space:nowrap;align-self:center">${
           s.job ? actions({service: s.job.service, id: s.job.id,
@@ -709,8 +718,11 @@ async function viewChannel(id){
 
 const SVC_TITLE = {vsgen:'Видео', rewrite:'Текст', cover:'Обложки'};
 
+let QFILTER = {service:'', channel:'', state:'', since:''};
+
 async function viewQueue(){
-  const d = await api('/ui/queue');
+  const q = new URLSearchParams(Object.entries(QFILTER).filter(([,v]) => v)).toString();
+  const d = await api('/ui/queue' + (q ? '?' + q : ''));
 
   app.innerHTML = '';
   app.append($(`<h1>Очередь</h1>
@@ -719,6 +731,30 @@ async function viewQueue(){
   app.append($(`<div class="toolbar">${d.services.map(s => `
     <span class="pill ${s.ok ? 's-done' : 's-error'}" title="${esc(s.error)}">
       ${esc(s.title)}: ${s.ok ? s.count : 'нет связи'}</span>`).join('')}</div>`));
+
+  const bar = $(`<div class="toolbar">
+    <select id="q-svc"><option value="">все сервисы</option>${d.services.map(s =>
+      `<option value="${esc(s.key)}" ${QFILTER.service === s.key ? 'selected' : ''}
+        >${esc(s.title)}</option>`).join('')}</select>
+    <select id="q-ch"><option value="">все каналы</option>${d.channels.map(c =>
+      `<option value="${c.id}" ${QFILTER.channel == c.id ? 'selected' : ''}
+        >${esc(c.name)}</option>`).join('')}</select>
+    <select id="q-st"><option value="">любое состояние</option>${d.states.map(x =>
+      `<option value="${esc(x.key)}" ${QFILTER.state === x.key ? 'selected' : ''}
+        >${esc(x.title)}</option>`).join('')}</select>
+    <select id="q-since"><option value="">за всё время</option>${d.periods.map(x =>
+      `<option value="${esc(x.key)}" ${QFILTER.since === x.key ? 'selected' : ''}
+        >${esc(x.title)}</option>`).join('')}</select>
+    <span style="flex:1"></span>
+    <span class="muted">${d.shown === d.total ? `задач ${d.total}`
+      : `показано ${d.shown} из ${d.total}`}</span>
+  </div>`);
+  app.append(bar);
+  const bindQ = (id, key) => bar.querySelector(id).onchange = e => {
+    QFILTER[key] = e.target.value; render();
+  };
+  bindQ('#q-svc','service'); bindQ('#q-ch','channel');
+  bindQ('#q-st','state'); bindQ('#q-since','since');
 
   const down = d.services.filter(s => !s.ok);
   if (down.length) app.append($(`<div class="err">${down.map(s =>
@@ -737,10 +773,13 @@ async function viewQueue(){
       <tr>
         <td><span class="pill s-idle">${esc(SVC_TITLE[r.service] || r.service)}</span></td>
         <td><div style="font-weight:600">${esc(r.title)}</div>
-            <div class="muted mono">${esc(r.id)}</div></td>
-        <td>${esc(r.kind || '—')}
+            <div class="muted" style="font-size:12px">${
+              [r.channel && esc(r.channel), r.lang && esc(r.lang),
+               r.user && esc(r.user)].filter(Boolean).join(' · ')
+              || `<span class="mono">${esc(r.id)}</span>`}</div></td>
+        <td>${esc(r.kind_title || r.kind || '—')}
             ${r.provider ? `<div class="muted">${esc(r.provider)}</div>` : ''}</td>
-        <td><span class="pill s-${r.state}">${STATE_TITLE[r.state]}</span>
+        <td><span class="pill ${STATE_CLS[r.state]}">${STATE_TITLE[r.state]}</span>
             ${r.stage ? `<div class="muted" style="margin-top:4px">${esc(r.stage)}</div>` : ''}
             ${r.progress != null ? `<div class="bar"><i style="width:${
               Math.round(r.progress * 100)}%"></i></div>` : ''}
@@ -917,6 +956,33 @@ function showWho(){
   };
 }
 
+/* Материалы прямо в строке этапа — ТЗ §14 просит на каждом этапе не статус, а сам
+   результат: миниатюры кадров, плеер озвучки, готовые файлы сборки. Ссылки ведут
+   в кабинет: он проверяет, что путь не выводит за пределы проекта, и умеет отдавать
+   уменьшенные копии по ?w=. */
+function stageFiles(s){
+  if (!s.files || !s.files.length) return '';
+  const url = n => s.file_base + n.split('/').map(encodeURIComponent).join('/');
+  return s.files.map(g => {
+    if (g.kind === 'image') return `<div style="display:flex;flex-wrap:wrap;gap:5px;
+      margin-top:7px">${g.names.map(n => `<a href="${url(n)}" target="_blank"
+      title="${esc(n)}"><img src="${url(n)}?w=120" loading="lazy" style="height:52px;
+      border-radius:4px;border:1px solid var(--line);display:block"></a>`).join('')}
+      ${g.count > g.names.length
+        ? `<span class="muted" style="align-self:center;font-size:12px">и ещё ${
+            g.count - g.names.length}</span>` : ''}</div>`;
+    if (g.kind === 'audio') return g.names.map(n => `<audio controls preload="none"
+      src="${url(n)}" style="width:100%;max-width:340px;margin-top:7px"></audio>`).join('');
+    if (g.kind === 'video') return g.names.slice(0, 2).map(n => `<video controls
+      preload="none" src="${url(n)}" style="max-width:260px;border-radius:6px;
+      margin:7px 6px 0 0"></video>`).join('');
+    return `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:7px">${
+      g.names.map(n => `<a href="${url(n)}" target="_blank" style="padding:3px 9px;
+      border:1px solid var(--line);border-radius:6px;text-decoration:none;font-size:12px"
+      >${esc(n.split('/').pop())}</a>`).join('')}</div>`;
+  }).join('');
+}
+
 /* ───────────────────────────── проекты ───────────────────────────── */
 
 /* Проект — то, что делает выпуск: папка с кадрами, озвучкой, рендером и субтитрами.
@@ -985,7 +1051,7 @@ async function viewProject(id){
       <table><thead><tr><th>Этап</th><th>Состояние</th><th>Создана</th><th></th></tr>
       </thead><tbody>${d.jobs.map(j => `<tr>
         <td>${esc(j.kind)}<div class="muted mono" style="font-size:11px">#${j.id}</div></td>
-        <td><span class="pill s-${j.state}">${STATE_TITLE[j.state]}</span>
+        <td><span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
           ${j.stage ? `<div class="muted">${esc(j.stage)}</div>` : ''}
           ${j.progress != null ? `<div class="bar"><i style="width:${
             Math.round(j.progress * 100)}%"></i></div>` : ''}
@@ -1359,7 +1425,7 @@ async function viewText(){
             <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
         <td>${j.kind === 'generation' ? 'с нуля' : 'рерайт'}</td>
         <td>${(Array.isArray(j.langs) ? j.langs : [j.langs]).map(esc).join(', ') || '—'}</td>
-        <td><span class="pill s-${j.state}">${STATE_TITLE[j.state]}</span>
+        <td><span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
             ${j.detail ? `<div class="muted" style="margin-top:4px">${esc(j.detail)}</div>` : ''}
             ${j.progress != null ? `<div class="bar"><i style="width:${
               Math.round(j.progress * 100)}%"></i></div>` : ''}</td>
@@ -1535,7 +1601,7 @@ async function viewCovers(){
       </tr></thead><tbody>${d.jobs.map(j => `<tr data-job="${esc(j.id)}">
         <td><div style="font-weight:600">${esc(j.title)}</div>
             <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
-        <td><span class="pill s-${j.state}">${STATE_TITLE[j.state]}</span>
+        <td><span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
             ${j.detail ? `<div class="muted" style="margin-top:4px">${esc(j.detail)}</div>` : ''}
             ${j.progress != null ? `<div class="bar"><i style="width:${
               Math.round(j.progress * 100)}%"></i></div>` : ''}</td>
