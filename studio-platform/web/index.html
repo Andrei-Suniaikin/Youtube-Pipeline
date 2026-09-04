@@ -114,6 +114,15 @@
   .segs i.queued{background:var(--wait);opacity:.55}
   .segs i.error{background:var(--bad)}
   .segs i.off{background:transparent;border:1px dashed var(--line-2)}
+  /* Переделать один кадр — ТЗ §14. Кнопка появляется на самой миниатюре: искать
+     номер сцены в отдельном поле человек не станет, он смотрит на картинку. */
+  .thumb{position:relative;display:inline-block;line-height:0}
+  .thumb img{display:block;border-radius:5px;border:1px solid var(--line)}
+  .thumb .again{position:absolute;right:3px;bottom:3px;opacity:0;transition:opacity .12s;
+                background:rgba(13,11,18,.82);color:#fff;border:0;border-radius:5px;
+                padding:2px 7px;font-size:11px;font-weight:650;cursor:pointer;line-height:1.5}
+  .thumb:hover .again{opacity:1}
+  .thumb .again:hover{background:var(--acc)}
   @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
 
   .stage{display:flex;gap:14px;padding:15px 18px;border-bottom:1px solid var(--line)}
@@ -403,7 +412,7 @@ async function viewRelease(id){
           ${s.facts.length ? `<div class="facts">${s.facts.map(esc).join(' · ')}</div>` : ''}
           ${s.note ? `<div class="note ${s.state === 'error' ? 'bad' : 'muted'}"
             >${esc(s.note)}</div>` : ''}
-          ${stageFiles(s)}
+          ${stageFiles(s, r.project_id)}
         </div>
         <div style="white-space:nowrap;align-self:center">${
           s.job ? actions({service: s.job.service, id: s.job.id,
@@ -414,6 +423,7 @@ async function viewRelease(id){
   // Повтор одного этапа не трогает соседние: кнопка обращается ровно к той задаче,
   // на которой этап держится, и в тот сервис, которому она принадлежит.
   wireActions(head);
+  wireRegen(head);
 
   // Возврат из разбора. Фазу не откатываем: сделанное и оплаченное остаётся сделанным,
   // движок продолжит с того шага, где остановился.
@@ -960,22 +970,52 @@ function showWho(){
    результат: миниатюры кадров, плеер озвучки, готовые файлы сборки. Ссылки ведут
    в кабинет: он проверяет, что путь не выводит за пределы проекта, и умеет отдавать
    уменьшенные копии по ?w=. */
-function stageFiles(s){
+/* Миниатюра с кнопкой «переделать». Один кадр вместо всего этапа: повтор этапа
+   целиком переделывает и то, что получилось, а это уже оплаченная работа. */
+function thumb(src, full, name, height, pid){
+  return `<span class="thumb"><a href="${full}" target="_blank" title="${esc(name)}"
+    ><img src="${src}" loading="lazy" style="height:${height}px"></a>${pid
+    ? `<button class="again" data-regen="image" data-pid="${esc(pid)}"
+         data-name="${esc(name)}">переделать</button>` : ''}</span>`;
+}
+
+function wireRegen(root){
+  root.querySelectorAll('button[data-regen]').forEach(b => b.onclick = async ev => {
+    ev.preventDefault(); ev.stopPropagation();
+    const what = b.dataset.regen;
+    const prompt_ = prompt(what === 'image'
+      ? `Переделать кадр «${b.dataset.name}».\nСвой промпт — по желанию, пусто = как было:`
+      : `Переделать клип «${b.dataset.name}».\nСвой промпт движения — по желанию:`, '');
+    if (prompt_ === null) return;          // отменили
+    b.disabled = true; b.textContent = '…';
+    try{
+      await post(`/ui/regen/${what}`, {project_id: b.dataset.pid,
+                                       name: b.dataset.name, prompt: prompt_});
+      await render();
+    }catch(e){
+      b.disabled = false; b.textContent = 'переделать';
+      alert(e.message);
+    }
+  });
+}
+
+function stageFiles(s, pid){
   if (!s.files || !s.files.length) return '';
   const url = n => s.file_base + n.split('/').map(encodeURIComponent).join('/');
   return s.files.map(g => {
     if (g.kind === 'image') return `<div style="display:flex;flex-wrap:wrap;gap:5px;
-      margin-top:7px">${g.names.map(n => `<a href="${url(n)}" target="_blank"
-      title="${esc(n)}"><img src="${url(n)}?w=120" loading="lazy" style="height:52px;
-      border-radius:4px;border:1px solid var(--line);display:block"></a>`).join('')}
+      margin-top:7px">${g.names.map(n => thumb(url(n) + '?w=120', url(n), n, 52,
+        pid)).join('')}
       ${g.count > g.names.length
         ? `<span class="muted" style="align-self:center;font-size:12px">и ещё ${
             g.count - g.names.length}</span>` : ''}</div>`;
     if (g.kind === 'audio') return g.names.map(n => `<audio controls preload="none"
       src="${url(n)}" style="width:100%;max-width:340px;margin-top:7px"></audio>`).join('');
-    if (g.kind === 'video') return g.names.slice(0, 2).map(n => `<video controls
-      preload="none" src="${url(n)}" style="max-width:260px;border-radius:6px;
-      margin:7px 6px 0 0"></video>`).join('');
+    if (g.kind === 'video') return g.names.slice(0, 2).map(n => `<div class="thumb"
+      style="margin:7px 6px 0 0"><video controls preload="none" src="${url(n)}"
+      style="max-width:260px;border-radius:6px"></video>${pid
+        ? `<button class="again" data-regen="clip" data-pid="${esc(pid)}"
+             data-name="${esc(n)}">переделать</button>` : ''}</div>`).join('');
     return `<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:7px">${
       g.names.map(n => `<a href="${url(n)}" target="_blank" style="padding:3px 9px;
       border:1px solid var(--line);border-radius:6px;text-decoration:none;font-size:12px"
@@ -1073,7 +1113,7 @@ async function viewProject(id){
 
   for (const g of d.files){
     const url = n => d.file_base + n.split('/').map(encodeURIComponent).join('/');
-    app.append($(`<div class="card" style="margin-bottom:16px">
+    const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)} · ${g.count}
         <a class="ghost" href="${d.zip_base}${esc(g.code)}"
            style="float:right;padding:3px 10px;border:1px solid var(--line);
@@ -1081,15 +1121,16 @@ async function viewProject(id){
            >Скачать архивом</a></div>
       ${g.kind === 'image'
         ? `<div style="display:flex;flex-wrap:wrap;gap:6px">${g.names.map(n =>
-            `<a href="${url(n)}" target="_blank" title="${esc(n)}"><img src="${
-              url(n)}?w=160" loading="lazy" style="height:78px;border-radius:5px;
-              border:1px solid var(--line);display:block"></a>`).join('')}</div>`
+            thumb(url(n) + '?w=160', url(n), n, 78, p.id)).join('')}</div>`
         : g.kind === 'audio'
         ? g.names.map(n => `<audio controls preload="none" src="${url(n)}"
             style="width:100%;margin-top:6px"></audio>`).join('')
         : g.kind === 'video'
-        ? g.names.slice(0, 4).map(n => `<video controls preload="none" src="${url(n)}"
-            style="max-width:320px;border-radius:6px;margin:6px 6px 0 0"></video>`).join('')
+        ? g.names.slice(0, 4).map(n => `<div class="thumb" style="margin:6px 6px 0 0"
+            ><video controls preload="none" src="${url(n)}"
+            style="max-width:320px;border-radius:6px"></video>
+            <button class="again" data-regen="clip" data-pid="${esc(p.id)}"
+              data-name="${esc(n)}">переделать</button></div>`).join('')
           + (g.names.length > 4 ? `<div class="note muted">и ещё ${
               g.names.length - 4} — в архиве</div>` : '')
         : `<div style="display:flex;flex-wrap:wrap;gap:8px">${g.names.map(n =>
@@ -1098,7 +1139,9 @@ async function viewProject(id){
                      text-decoration:none;font-size:12px">${esc(n)}</a>`).join('')}</div>`}
       ${g.more ? `<div class="note muted">показаны первые ${g.names.length},
         всего ${g.count} — остальные в архиве</div>` : ''}
-    </div>`));
+    </div>`);
+    app.append(card);
+    wireRegen(card);
   }
   if (!d.files.length){
     app.append($(`<div class="card"><div class="empty">Файлов пока нет.</div></div>`));

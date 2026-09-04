@@ -12623,6 +12623,19 @@ async def project_images_delete(pid: str, request: Request):
     return RedirectResponse(f"/p/{pid}?tab=img", 302)
 
 
+def _regen_reply(request: Request, jid, redirect: str, why: str = ""):
+    """Ответ на перегенерацию одного кадра или клипа.
+
+    ДОБАВЛЕНО 04.09.2026: пульт зовёт эти же роуты и ждёт ответа, а не редиректа
+    на страницу кабинета. Признак «это fetch» — тот же, что у отмены и повтора.
+    """
+    if request.headers.get("x-requested-with") == "fetch":
+        if jid is None:
+            raise HTTPException(409, why or "перегенерация уже идёт")
+        return {"ok": True, "job_id": jid}
+    return RedirectResponse(redirect, 302)
+
+
 @app.post("/api/projects/{pid}/images/regen")
 async def project_images_regen(pid: str, request: Request):
     """Перегенерация одной картинки (опц. свой промпт). Модель/стиль/aspect/seed — из настроек проекта.
@@ -12632,7 +12645,8 @@ async def project_images_regen(pid: str, request: Request):
     if not p:
         raise HTTPException(404, "нет проекта")
     if _active_image_mutation(tid, pid):
-        return RedirectResponse(f"/p/{pid}?imgbusy=1&tab=img", 302)
+        return _regen_reply(request, None, f"/p/{pid}?imgbusy=1&tab=img",
+                            "картинки проекта уже меняются другой задачей")
     d = await _form(request)
     rel = (d.get("image_rel") or "").strip()
     if not _gallery_regen_image_ok(_project_dir(tid, pid), rel.replace("\\", "/")):
@@ -12668,10 +12682,12 @@ async def project_images_regen(pid: str, request: Request):
         raise HTTPException(400, str(exc))
     if jid is None:
         conflict = _active_image_mutation(tid, pid)
-        return RedirectResponse(
-            f"/p/{pid}?{'imgbusy=1' if conflict else 'dup=regen'}&tab=img", 302
-        )
-    return RedirectResponse(f"/p/{pid}?job={jid}&tab=img", 302)
+        return _regen_reply(
+            request, None,
+            f"/p/{pid}?{'imgbusy=1' if conflict else 'dup=regen'}&tab=img",
+            "картинки проекта уже меняются другой задачей" if conflict
+            else "этот кадр уже стоит в очереди на перегенерацию")
+    return _regen_reply(request, jid, f"/p/{pid}?job={jid}&tab=img")
 
 
 def _prune_video_references(projdir, deleted_clips):
@@ -12741,8 +12757,9 @@ async def project_videos_regen(pid: str, request: Request):
     _assert_provider_available(u, "regen_video", params, project_id=pid)
     jid = _enqueue(u["id"], tid, pid, "regen_video", params)
     if jid is None:
-        return RedirectResponse(f"/p/{pid}?dup=regen_video&tab=vid", 302)
-    return RedirectResponse(f"/p/{pid}?job={jid}&tab=vid", 302)
+        return _regen_reply(request, None, f"/p/{pid}?dup=regen_video&tab=vid",
+                            "этот клип уже стоит в очереди на перегенерацию")
+    return _regen_reply(request, jid, f"/p/{pid}?job={jid}&tab=vid")
 
 
 @app.post("/api/projects/{pid}/{kind}")

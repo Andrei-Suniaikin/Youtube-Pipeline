@@ -2402,3 +2402,56 @@ def ui_release_revive(release_id: str):
     finally:
         c.close()
     return out
+
+
+# ─────────────────────── перегенерация одного кадра или клипа ───────────────────────
+
+# ТЗ §14: «повторить один кадр», «повторить выбранные клипы». Повтор этапа целиком
+# переделывает всё — и то, что получилось. Здесь пересоздаётся ровно один файл.
+#
+# Пульт этого не делает: у кабинета есть свои роуты со всеми проверками — путь внутри
+# проекта, доступность провайдера, контракт референсов, запрет второй правки картинок
+# одновременно. Мы их пересылаем кукой человека, как отмену и повтор задач.
+REGEN = {
+    "image": ("/api/projects/{pid}/images/regen", "image_rel"),
+    "clip": ("/api/projects/{pid}/videos/regen", "video_rel"),
+}
+
+
+class RegenIn(BaseModel):
+    project_id: str
+    name: str                 # путь файла внутри проекта, как его отдаёт список
+    prompt: str = ""          # свой промпт — необязательно
+
+
+@app.post("/ui/regen/{what}")
+def ui_regen(what: str, body: RegenIn, request: Request):
+    """Переделать один кадр или один клип."""
+    plan = REGEN.get(what)
+    if not plan:
+        raise HTTPException(404, f"нечего переделывать: «{what}»")
+    path, field = plan
+    if not body.name.strip():
+        raise HTTPException(400, "не указан файл")
+
+    fields = [(field, body.name.strip())]
+    if body.prompt.strip():
+        fields.append(("prompt", body.prompt.strip()))
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    url = CABINET_BASE + path.format(pid=urllib.parse.quote(body.project_id))
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Cookie", f"{auth.COOKIE}={getattr(request.state, 'sid', '')}")
+    req.add_header("X-Requested-With", "fetch")
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 3) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            detail = (json.loads(raw or "{}") or {}).get("detail") or raw[:200]
+        except ValueError:
+            detail = raw[:200]
+        raise HTTPException(_pass_code(exc.code), detail or f"кабинет ответил {exc.code}")
+    except Exception as exc:                                     # noqa: BLE001
+        raise HTTPException(502, f"кабинет не отвечает: {type(exc).__name__}")
