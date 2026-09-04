@@ -24,3 +24,6 @@ gen_out/
 # генерируемое окружение разработки studio-platform
 studio-platform/dev/home/
 studio-platform/dev/data/
+# состояние миграции личности: журнал переносов и бэкапы баз — не код
+studio-platform/dev/identity_migration.json
+studio-platform/dev/backup/
