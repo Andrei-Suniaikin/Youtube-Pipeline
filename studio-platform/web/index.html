@@ -386,12 +386,16 @@ async function viewKeys(){
       : '<div class="empty">Все ключи в строю.</div>'}
   </div>`));
 
-  app.append($(`<div class="card" style="margin-bottom:16px">
+  const ownCard = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Свои ключи пользователей</div>
     ${d.own_keys.length ? `<table><thead><tr>
         <th>Пользователь</th><th>Провайдер</th><th>Ключей</th><th>Раздача</th>
       </tr></thead><tbody>${d.own_keys.map(o => `<tr>
-        <td>${esc(o.user)}</td><td>${esc(o.family)}</td><td>${o.count}</td>
+        <td>${esc(o.user)}</td><td>${esc(o.family)}</td>
+        <td>${(o.items || []).map(i => `<span class="mono"
+          style="margin-right:8px">${esc(i.mask)}${o.mine ? ` <a href="#"
+          class="dropkey" data-f="${esc(o.family)}" data-i="${i.index}"
+          title="снять этот ключ">×</a>` : ''}</span>`).join('') || o.count}</td>
         <td>${o.pooled
           ? '<span class="pill s-done">по кругу между ключами</span>'
           : '<span class="pill s-idle">ключ один</span>'}</td>
@@ -400,7 +404,11 @@ async function viewKeys(){
         Значения ключей наружу не отдаются — ни здесь, ни в API: только количество и маска.
       </div>`
       : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
-  </div>`));
+    <div id="keyedit"></div>
+    <div style="margin-top:10px"><button class="ghost" id="addkey">Добавить ключ</button></div>
+  </div>`);
+  app.append(ownCard);
+  wireKeys(ownCard, d);
 
   if (d.unavailable && d.unavailable.length){
     app.append($(`<div class="card">
@@ -763,6 +771,49 @@ function showWho(){
     await post('/ui/logout').catch(() => {});
     ME = null;
     viewLogin('');
+  };
+}
+
+/* ───────────────────────── свои ключи ───────────────────────── */
+
+/* Значения ключей сюда не приходят и не уходят: снять можно по номеру в списке,
+   добавить — вписав новый. На экране только маска. Разбор и запись делает кабинет
+   своим же обработчиком: там ключи правятся по одному, каждый несёт свой лимит,
+   и ёмкость дорожки пересчитывается сразу. */
+async function wireKeys(root, d){
+  const box = root.querySelector('#keyedit');
+
+  root.querySelectorAll('a.dropkey').forEach(a => a.onclick = async ev => {
+    ev.preventDefault();
+    if (!confirm('Снять этот ключ? Он перестанет использоваться сразу.')) return;
+    try{
+      await post('/ui/keys', {drop: {[a.dataset.f]: [Number(a.dataset.i)]}});
+      await render();
+    }catch(e){ alert(e.message); }
+  });
+
+  root.querySelector('#addkey').onclick = async () => {
+    if (box.innerHTML){ box.innerHTML = ''; return; }
+    const ref = await api('/ui/keys/families');
+    box.innerHTML = `
+      <div id="kerr"></div>
+      <div class="fldrow"><label>Провайдер</label>
+        <select id="kfam">${ref.families.map(f =>
+          `<option value="${esc(f.key)}">${esc(f.title)}</option>`).join('')}</select></div>
+      <div class="fldrow"><label>Ключ</label>
+        <input id="kval" style="width:340px" autocomplete="off"></div>
+      <div class="note muted">${esc(ref.note)}</div>
+      <div style="margin-top:10px"><button id="ksave">Сохранить</button></div>`;
+    box.querySelector('#ksave').onclick = async () => {
+      const err = box.querySelector('#kerr');
+      err.innerHTML = '';
+      const val = box.querySelector('#kval').value.trim();
+      if (!val){ err.innerHTML = '<div class="err">Ключ пустой.</div>'; return; }
+      try{
+        await post('/ui/keys', {add: {[box.querySelector('#kfam').value]: [val]}});
+        await render();
+      }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+    };
   };
 }
 

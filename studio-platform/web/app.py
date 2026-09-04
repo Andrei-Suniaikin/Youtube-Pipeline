@@ -118,13 +118,20 @@ async def require_session(request: Request, call_next):
     return await call_next(request)
 
 
+class LoginIn(BaseModel):
+    login: str = ""
+    password: str = ""
+
+
 @app.post("/ui/login")
-async def ui_login(request: Request, response: Response):
-    """Пароль проверяет кабинет, не мы. Своего списка пользователей у пульта нет."""
-    body = await request.json()
+def ui_login(body: LoginIn, response: Response):
+    """Пароль проверяет кабинет, не мы. Своего списка пользователей у пульта нет.
+
+    Обработчик синхронный сознательно: при отдельном запуске пульта вход уходит
+    к кабинету по HTTP, и на потоке событий такой вызов повесил бы процесс.
+    """
     try:
-        sid = auth.login(CABINET_BASE, str(body.get("login") or ""),
-                         str(body.get("password") or ""))
+        sid = auth.login(CABINET_BASE, body.login, body.password)
     except auth.LoginFailed as exc:
         raise HTTPException(401, str(exc))
     c = db()
@@ -641,7 +648,8 @@ def ui_keys():
 
         # Свои ключи пользователей: сколько их у кого. Значения не читаем и не отдаём.
         own = []
-        for u in c.execute("SELECT id, name, keys FROM users WHERE tenant_id=?", (TENANT,)):
+        for u in c.execute("SELECT id, name, keys, tenant_id FROM users WHERE tenant_id=?",
+                           (TENANT,)):
             try:
                 data = json.loads(u["keys"] or "{}")
             except ValueError:
@@ -653,8 +661,15 @@ def ui_keys():
                 uniq = [str(v) for v in items if v]
                 if not uniq:
                     continue
-                own.append({"user": u["name"], "family": family, "count": len(set(uniq)),
-                            "pooled": len(set(uniq)) > 1})
+                seen_vals = list(dict.fromkeys(uniq))
+                own.append({
+                    "user": u["name"], "user_id": u["id"], "family": family,
+                    "count": len(seen_vals), "pooled": len(seen_vals) > 1,
+                    "mine": str(u["tenant_id"] or u["id"]) == TENANT,
+                    # Позиция нужна, чтобы ключ можно было снять поимённо, не отдавая
+                    # его значения: снаружи видно «второй ключ googler», а не сам ключ.
+                    "items": [{"index": i, "mask": _mask_key(v)}
+                              for i, v in enumerate(seen_vals)]})
 
         cursor = [{"provider": r["provider"], "last_uid": r["last_uid"],
                    "updated": r["updated"]}
@@ -964,6 +979,12 @@ def ui_presets():
     return {"groups": groups, "broken": broken,
             "unavailable": [] if all(not g["error"] for g in groups) else
             [{"what": g["title"], "why": g["error"]} for g in groups if g["error"]]}
+
+
+def _mask_key(value: str) -> str:
+    """Показать, что ключ есть, не показав ключа. Тот же приём, что в кабинете."""
+    v = str(value or "")
+    return f"{v[:4]}…{v[-4:]}" if len(v) > 12 else "…" * 3
 
 
 def _preset_facts(settings) -> list:
@@ -1865,3 +1886,73 @@ def ui_channel_status(cid: int, body: dict):
     finally:
         c.close()
     return {"ok": True}
+
+
+# ─────────────────────────── свои ключи: добавить и убрать ───────────────────────────
+
+class KeysIn(BaseModel):
+    add: dict = {}
+    drop: dict = {}
+
+
+# ВАЖНО, и уже дважды укусило: обработчик, который ходит по HTTP в свой же процесс,
+# обязан быть `def`, а не `async def`. FastAPI выполняет синхронный обработчик в
+# отдельном потоке, и поток событий остаётся свободен обслужить внутренний запрос.
+# Асинхронный делает блокирующий вызов прямо на потоке событий — запрос уходит,
+# ответить некому, и всё висит до таймаута. Первый раз так завис вход, второй —
+# сохранение ключей: запись при этом проходила, а ответ не возвращался.
+@app.post("/ui/keys")
+def ui_keys_save(body: KeysIn, request: Request):
+    """Добавить или убрать свой ключ провайдера.
+
+    Разбор формы делает кабинет своим же `/api/my/keys/web` — тем самым, что и его
+    страница. Логика там нетривиальная: ключи правятся по одному, каждый несёт свой
+    лимит, ёмкость дорожки пересчитывается сразу, а негодный codex-auth не должен
+    стать credential'ом. Вторая её реализация здесь была бы вторым набором правил
+    для тех же денег.
+
+    Тело: {"add": {"googler": ["ключ", …]}, "drop": {"googler": [0, 2]}}.
+    Индексы в `drop` — позиции в списке ключей провайдера, как их отдаёт `/ui/keys`.
+    """
+    fields = []
+    for family, values in (body.add or {}).items():
+        for v in (values if isinstance(values, list) else [values]):
+            if str(v).strip():
+                fields.append((f"add_{family}", str(v).strip()))
+    for family, idx in (body.drop or {}).items():
+        for i in (idx if isinstance(idx, list) else [idx]):
+            fields.append((f"drop_{family}", str(int(i))))
+    if not fields:
+        raise HTTPException(400, "нечего сохранять: ни одного ключа не добавлено и не снято")
+
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(CABINET_BASE + "/api/my/keys/web", data=data,
+                                 method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Cookie", f"{auth.COOKIE}={getattr(request.state, 'sid', '')}")
+    req.add_header("X-Requested-With", "fetch")
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 3) as resp:
+            out = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(_pass_code(exc.code),
+                            exc.read().decode("utf-8", "replace")[:200])
+    except Exception as exc:                                     # noqa: BLE001
+        raise HTTPException(502, f"кабинет не отвечает: {type(exc).__name__}")
+    if out.get("bad_codex_auth"):
+        raise HTTPException(400, "путь к codex-auth не похож на файл авторизации — "
+                                 "ключ не сохранён")
+    if out.get("bad_prompt_channel"):
+        raise HTTPException(400, "выбранный канал промптов недоступен — не сохранён")
+    return {"ok": True}
+
+
+@app.get("/ui/keys/families")
+def ui_key_families():
+    """Каким провайдерам можно задать свой ключ. Список — из кабинета, не переписан."""
+    mod = sys.modules.get("main")
+    families = getattr(mod, "_KEY_PROVIDERS", []) if mod else []
+    return {"families": [{"key": k, "title": title, "group": group}
+                         for k, title, group in families],
+            "note": "значения ключей наружу не отдаются — ни здесь, ни на экране: "
+                    "только количество и маска"}

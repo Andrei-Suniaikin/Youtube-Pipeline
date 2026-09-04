@@ -15006,6 +15006,12 @@ async def my_keys_web(request: Request):
     c.commit(); c.close()
     _UOPTS_CACHE.pop(u["id"], None)   # сброс кэша → настройки применяются сразу
     _OWN_CRED_CACHE.pop(u["id"], None)
+    # 04.09.2026: пульт зовёт этот же обработчик и ждёт ответа, а не редиректа на
+    # страницу кабинета. Отметка «это fetch» — тот же признак, что уже используют
+    # отмена и повтор задач.
+    if request.headers.get("x-requested-with") == "fetch":
+        return {"ok": not (bad_codex or bad_channel),
+                "bad_codex_auth": bad_codex, "bad_prompt_channel": bad_channel}
     dest = ("/keys?err=codex_auth" if bad_codex else
             "/keys?err=prompt_channel" if bad_channel else "/keys")
     return RedirectResponse(dest, 302)
