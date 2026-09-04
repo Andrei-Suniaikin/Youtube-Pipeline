@@ -175,7 +175,7 @@ def ui_me(request: Request):
 
 def db() -> sqlite3.Connection:
     if not os.path.exists(DB):
-        raise HTTPException(503, f"нет базы {DB} — сначала: python3 dev/make_db.py")
+        raise HTTPException(503, "хранилище недоступно")
     c = sqlite3.connect(DB, timeout=5)
     c.row_factory = sqlite3.Row
     return c
@@ -683,8 +683,8 @@ def ui_keys():
         "rr_cursor": cursor,
         "unavailable": [
             {"what": "занято слотов из лимита",
-             "why": "живёт в памяти кабинета (SERVER_CREDENTIAL_POOL), в базе этого нет; "
-                    "нужен эндпоинт на стороне кабинета"},
+             "why": "это состояние живёт только в памяти работающего сервиса; "
+                    "показать его точно пока нечем, а показывать примерно нельзя"},
         ],
     }
 
@@ -824,8 +824,8 @@ def ui_alerts():
         "owed_recovered": owed,
         "transport": {"configured": tg.enabled, "token": mask(tg.token),
                       "chat": tg.chat or "",
-                      "how": "токен от @BotFather в .env → dev/alerts.py --whoami "
-                             "покажет chat_id → dev/alerts.py --test"},
+                      "how": "нужны токен бота и адрес чата — их выдаёт @BotFather; "
+                             "порядок описан в инструкции к системе"},
         "thresholds": [
             {"what": "очередь не пустая, но ничего не завершается",
              "value": pub_alerts.STALL_SEC},
@@ -877,7 +877,8 @@ def ui_disk():
         "freeable": freeable,
         "categories": [{"code": c_, "name": n, "fate": f}
                        for c_, n, f, _pat in pub_retention.CATEGORIES],
-        "how": "срок хранения задаёт владелец: dev/retention.py --policy strip=14 drop=90",
+        "how": "сроки хранения задаёт владелец: через сколько дней после публикации "
+               "убирать промежуточные файлы и через сколько удалять проект целиком",
     }
 
 
@@ -1061,8 +1062,7 @@ def ui_public():
         "due": due, "checked": checked,
         "confirmed": confirmed, "scheduled": scheduled,
         "grace_min": pub_verify.GRACE_SEC // 60,
-        "how": "ключ YouTube Data API v3: dev/verify_public.py --save-key ... "
-               "или VS_YT_API_KEY в .env. Проход: dev/verify_public.py --run",
+        "how": "нужен ключ YouTube Data API — без него подтвердить выход нечем",
         "blind_spot": "Ключ API видит только публичные и доступные по ссылке ролики. "
                       "Запланированный (ещё приватный) и удалённый выглядят одинаково — "
                       "пустым ответом. Различить их может только OAuth-токен канала.",
@@ -1176,7 +1176,7 @@ def ui_links_preview(body: LinksIn):
         "placed": [str(p) for p in res.get("placed", [])],
         "queued": res.get("queued", 0),
         "skipped": list(res.get("skipped", [])),
-        "note": "пресеты и язык берутся из канала — поменять их можно в самом канале",
+        "note": "пресеты и язык берутся из настроек канала",
     }
 
 
@@ -1328,7 +1328,7 @@ def ui_text(request: Request):
         },
         "channels": channels,
         "languages": languages,
-        "note": "задачи и результаты — ваши: пульт обращается к рерайту вашей же сессией",
+        "note": "показаны ваши задачи и ваши результаты",
     }
 
 
@@ -1416,11 +1416,11 @@ COVER_RULES = (
     {"when": "edit",
      "kills": ["style_prompt", "use_auto_style", "analysis_provider", "analysis_model"],
      "why": "превью уходит в модель на редактирование целиком: vision-анализ и сборка "
-            "промпта пропускаются (cover_core.py:1879)"},
+            "промпта пропускаются"},
     {"when": "not_url",
      "kills": ["reference_image", "simple_mode"],
      "why": "редактирование превью возможно только когда превью есть — то есть в режиме "
-            "«по превью донора» (cover_core.py:2107)"},
+            "«по превью донора»"},
 )
 
 
@@ -1505,7 +1505,7 @@ def ui_covers(request: Request):
         "options": _cover_options(is_admin),
         "rules": list(COVER_RULES),
         "aspect": "16:9",
-        "note": "задачи и результаты — ваши: пульт обращается к обложкам вашей же сессией",
+        "note": "показаны ваши задачи и ваши результаты",
     }
 
 
@@ -1955,8 +1955,7 @@ def ui_key_families():
     families = getattr(mod, "_KEY_PROVIDERS", []) if mod else []
     return {"families": [{"key": k, "title": title, "group": group}
                          for k, title, group in families],
-            "note": "значения ключей наружу не отдаются — ни здесь, ни на экране: "
-                    "только количество и маска"}
+            "note": "значение ключа нигде не показывается — только его хвост"}
 
 
 class ImportIn(BaseModel):
@@ -2029,7 +2028,7 @@ def ui_projects(limit: int = 50):
     finally:
         c.close()
     return {"projects": rows,
-            "note": "проекты заводит выпуск — здесь их смотрят и забирают"}
+            "note": "материалы роликов: кадры, озвучка, готовые файлы"}
 
 
 @app.get("/ui/projects/{pid}")

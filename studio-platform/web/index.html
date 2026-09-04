@@ -3,138 +3,196 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Studio — выпуски</title>
+<title>Studio</title>
 <style>
+  /* Тёмная тема с фиолетовым акцентом. Правила, по которым она собрана, а не просто
+     подобрана на глаз:
+
+     — три уровня глубины и не больше: фон, поверхность, приподнятая поверхность.
+       Больше уровней в тёмной теме читаются как грязь, а не как иерархия;
+     — фиолетовый только для действия и текущего места. Состояния (готово, идёт,
+       ошибка) остаются своими цветами: если акцент раскрасить всё, статус перестаёт
+       быть заметным, а он здесь важнее красоты;
+     — на тёмном чистый белый текст «звенит», поэтому основной — чуть приглушённый,
+       а белый оставлен заголовкам и активным элементам;
+     — состояния на тёмном строятся как цветной текст на его же полупрозрачной
+       заливке: так они читаются и не спорят с фоном. */
   :root{
-    --bg:#f6f7f9; --card:#fff; --ink:#16181d; --muted:#6b7280; --line:#e3e6ea;
-    --ok:#127a3d; --ok-bg:#e8f5ec; --run:#1257a8; --run-bg:#e7f0fb;
-    --wait:#8a5a00; --wait-bg:#fdf3e0; --bad:#a41d1d; --bad-bg:#fbeaea;
-    --off:#7a7f88; --off-bg:#f0f1f3;
+    --bg:#0d0b12;            /* почти чёрный с фиолетовым подтоном */
+    --card:#16131d;          /* поверхность */
+    --card-2:#1d1929;        /* приподнятая: строки таблиц при наведении, поля ввода */
+    --line:#2a2438;
+    --line-2:#3a3150;
+    --ink:#eceaf2;           /* основной текст */
+    --ink-hi:#ffffff;        /* заголовки и активное */
+    --muted:#9d96b5;
+    --acc:#8b5cf6;           /* фиолетовый: действие и текущее место */
+    --acc-hi:#a78bfa;
+    --acc-dim:rgba(139,92,246,.16);
+    --ok:#4ade80;    --ok-bg:rgba(74,222,128,.13);
+    --run:#60a5fa;   --run-bg:rgba(96,165,250,.14);
+    --wait:#fbbf24;  --wait-bg:rgba(251,191,36,.14);
+    --bad:#f87171;   --bad-bg:rgba(248,113,113,.14);
+    --off:#7c748f;   --off-bg:rgba(124,116,143,.15);
+    --surface:var(--card); --border:var(--line);
+    --r:12px;
   }
   *{box-sizing:border-box}
+  ::selection{background:var(--acc);color:#fff}
   body{margin:0;background:var(--bg);color:var(--ink);
-       font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
-  a{color:inherit}
-  header{background:var(--card);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
-  nav{display:flex;gap:2px;align-items:center;padding:0 16px;max-width:1080px;margin:0 auto;
+       font:15px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",
+            Inter,Roboto,system-ui,sans-serif;
+       font-weight:450;-webkit-font-smoothing:antialiased;letter-spacing:-.005em}
+  a{color:var(--acc-hi);text-decoration:none}
+  a:hover{color:var(--ink-hi)}
+  ::-webkit-scrollbar{width:10px;height:10px}
+  ::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:6px}
+  ::-webkit-scrollbar-track{background:transparent}
+
+  header{background:rgba(13,11,18,.86);backdrop-filter:saturate(160%) blur(12px);
+         border-bottom:1px solid var(--line);position:sticky;top:0;z-index:5}
+  nav{display:flex;gap:2px;align-items:center;padding:0 20px;max-width:1180px;margin:0 auto;
       flex-wrap:wrap}
-  nav .brand{font-weight:650;margin-right:18px;padding:13px 0;letter-spacing:.02em}
-  nav a.tab{padding:13px 12px;color:var(--muted);text-decoration:none;
-            border-bottom:2px solid transparent;white-space:nowrap}
-  nav a.tab.on{color:var(--ink);border-bottom-color:var(--ink);font-weight:550}
-  nav span.soon{padding:13px 12px;color:#b4b8bf;cursor:not-allowed;white-space:nowrap}
-  nav .who{padding:13px 0 13px 14px;color:var(--muted);font-size:12px;white-space:nowrap}
-  nav .who a{color:var(--muted)}
-  .login{max-width:340px;margin:12vh auto;background:var(--surface);border:1px solid var(--border);
-         border-radius:10px;padding:26px 24px}
-  .login h1{margin:0 0 4px;font-size:19px}
-  .login input{width:100%;box-sizing:border-box;padding:9px 11px;margin-top:10px;
-               border:1px solid var(--border);border-radius:7px;font:inherit}
-  .login button{width:100%;margin-top:14px}
-  .langs{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;max-height:132px;overflow:auto;
-         border:1px solid var(--line);border-radius:8px;padding:8px}
-  .langs label{display:inline-flex;align-items:center;gap:5px;font-size:12px;
-               border:1px solid var(--line);border-radius:16px;padding:3px 9px;cursor:pointer}
-  .langs label.on{background:var(--ok-bg);border-color:var(--ok);color:var(--ok)}
-  .modes{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
-  .modes button{background:transparent;color:var(--muted);border:1px solid var(--line)}
-  .modes button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
-  .fldrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
-  .fldrow>label:first-child{min-width:170px;color:var(--muted);font-size:12px}
-  .fldrow input,.fldrow select{padding:7px 9px;border:1px solid var(--border);
-                               border-radius:7px;font:inherit}
+  nav .brand{font-weight:800;margin-right:22px;padding:15px 0;letter-spacing:-.02em;
+             font-size:17px;color:var(--ink-hi)}
+  nav .brand b{color:var(--acc-hi)}
+  nav a.tab{padding:15px 13px;color:var(--muted);text-decoration:none;font-weight:550;
+            border-bottom:2px solid transparent;white-space:nowrap;transition:color .15s}
+  nav a.tab:hover{color:var(--ink)}
+  nav a.tab.on{color:var(--ink-hi);border-bottom-color:var(--acc)}
+  nav span.soon{padding:15px 13px;color:#5a5470;cursor:not-allowed;white-space:nowrap}
   nav span.soon::after{content:" скоро";font-size:11px;opacity:.8}
-  main{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
-  h1{font-size:20px;margin:0 0 4px}
-  .sub{color:var(--muted);margin:0 0 18px}
-  .card{background:var(--card);border:1px solid var(--line);border-radius:10px}
-  .toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:14px}
+  nav .who{padding:15px 0 15px 16px;color:var(--muted);font-size:13px;white-space:nowrap}
+
+  main{max-width:1180px;margin:0 auto;padding:26px 20px 70px}
+  h1{font-size:26px;margin:0 0 5px;font-weight:750;letter-spacing:-.02em;color:var(--ink-hi)}
+  .sub{color:var(--muted);margin:0 0 22px;font-size:14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r)}
+  .toolbar{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
+
   select,input,textarea,button{font:inherit;color:inherit}
-  select,input,textarea{background:var(--card);border:1px solid var(--line);
-                        border-radius:7px;padding:7px 9px}
-  textarea{width:100%;min-height:120px;resize:vertical;font-family:ui-monospace,Menlo,monospace;
-           font-size:13px}
-  button{background:var(--ink);color:#fff;border:0;border-radius:7px;padding:8px 14px;
-         cursor:pointer;font-weight:550}
-  button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line)}
-  button:disabled{opacity:.5;cursor:default}
+  select,input,textarea{background:var(--card-2);border:1px solid var(--line-2);
+                        border-radius:9px;padding:9px 11px;color:var(--ink)}
+  select:focus,input:focus,textarea:focus{outline:0;border-color:var(--acc);
+                                          box-shadow:0 0 0 3px var(--acc-dim)}
+  textarea{width:100%;min-height:120px;resize:vertical;
+           font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:13px}
+  button{background:var(--acc);color:#fff;border:0;border-radius:9px;padding:9px 16px;
+         cursor:pointer;font-weight:650;letter-spacing:-.01em;transition:background .15s}
+  button:hover{background:var(--acc-hi)}
+  button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line-2)}
+  button.ghost:hover{background:var(--card-2);color:var(--ink-hi)}
+  button:disabled{opacity:.45;cursor:default}
+
   table{width:100%;border-collapse:collapse}
-  th{text-align:left;font-size:12px;text-transform:uppercase;letter-spacing:.04em;
-     color:var(--muted);font-weight:600;padding:11px 14px;border-bottom:1px solid var(--line)}
-  td{padding:12px 14px;border-bottom:1px solid var(--line);vertical-align:top}
+  th{text-align:left;font-size:11px;text-transform:uppercase;letter-spacing:.07em;
+     color:var(--muted);font-weight:700;padding:12px 16px;border-bottom:1px solid var(--line)}
+  td{padding:13px 16px;border-bottom:1px solid var(--line);vertical-align:top}
   tr:last-child td{border-bottom:0}
-  tr.row:hover{background:#fafbfc;cursor:pointer}
-  .pill{display:inline-block;padding:2px 9px;border-radius:20px;font-size:12px;font-weight:600}
+  tr.row:hover,tr[data-job]:hover{background:var(--card-2);cursor:pointer}
+
+  .pill{display:inline-block;padding:3px 10px;border-radius:20px;font-size:12px;
+        font-weight:650;letter-spacing:-.01em}
   .s-done{background:var(--ok-bg);color:var(--ok)}
   .s-running{background:var(--run-bg);color:var(--run)}
   .s-queued{background:var(--wait-bg);color:var(--wait)}
   .s-error{background:var(--bad-bg);color:var(--bad)}
   .s-idle{background:var(--off-bg);color:var(--off)}
-  .s-off{background:transparent;color:var(--off);border:1px dashed #c9cdd4}
+  .s-off{background:transparent;color:var(--off);border:1px dashed var(--line-2)}
   .muted{color:var(--muted)}
-  .mono{font-family:ui-monospace,Menlo,monospace;font-size:12px}
-  .bar{height:4px;background:var(--off-bg);border-radius:3px;overflow:hidden;margin-top:7px;
-       max-width:220px}
-  .bar i{display:block;height:100%;background:var(--run)}
-  .stage{display:flex;gap:13px;padding:14px 16px;border-bottom:1px solid var(--line)}
+  .mono{font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:12px}
+  .bar{height:5px;background:var(--card-2);border-radius:4px;overflow:hidden;margin-top:8px;
+       max-width:230px}
+  .bar i{display:block;height:100%;background:linear-gradient(90deg,var(--acc),var(--acc-hi))}
+
+  .stage{display:flex;gap:14px;padding:15px 18px;border-bottom:1px solid var(--line)}
   .stage:last-child{border-bottom:0}
-  .stage .dot{flex:0 0 22px;height:22px;border-radius:50%;display:grid;place-items:center;
-              font-size:12px;font-weight:700;margin-top:1px}
+  .stage .dot{flex:0 0 24px;height:24px;border-radius:50%;display:grid;place-items:center;
+              font-size:12px;font-weight:800;margin-top:1px}
   .stage .body{flex:1;min-width:0}
-  .stage .name{font-weight:600}
+  .stage .name{font-weight:650;color:var(--ink-hi)}
   .stage.off .name{color:var(--off)}
-  .facts{color:var(--muted);font-size:13px;margin-top:2px}
-  .note{margin-top:3px;font-size:13px}
+  .facts{color:var(--muted);font-size:13.5px;margin-top:3px}
+  .note{margin-top:4px;font-size:13px;color:var(--muted)}
   .note.bad{color:var(--bad)}
-  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:0;
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:0;
         border-bottom:1px solid var(--line)}
-  .grid div{padding:13px 16px;border-right:1px solid var(--line)}
+  .grid div{padding:14px 18px;border-right:1px solid var(--line)}
   .grid div:last-child{border-right:0}
-  .grid .k{font-size:11px;text-transform:uppercase;letter-spacing:.04em;color:var(--muted);
-           font-weight:600;margin-bottom:3px}
-  .sec{padding:14px 16px;border-bottom:1px solid var(--line);font-weight:600;font-size:13px}
-  .ev{display:flex;gap:12px;padding:9px 16px;border-bottom:1px solid var(--line);font-size:13px}
+  .grid .k{font-size:11px;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);
+           font-weight:700;margin-bottom:4px}
+  .sec{padding:15px 18px;border-bottom:1px solid var(--line);font-weight:700;font-size:13px;
+       color:var(--ink-hi);letter-spacing:-.01em}
+  .ev{display:flex;gap:13px;padding:10px 18px;border-bottom:1px solid var(--line);font-size:13px}
   .ev:last-child{border-bottom:0}
-  .ev time{color:var(--muted);flex:0 0 108px;font-variant-numeric:tabular-nums}
-  .ev .step{flex:0 0 110px;color:var(--muted)}
-  .empty{padding:34px 16px;text-align:center;color:var(--muted)}
-  .chgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
-  .chcard{background:var(--card);border:1px solid var(--line);border-left:4px solid var(--off);
-          border-radius:10px;padding:14px 15px;cursor:pointer}
-  .chcard:hover{border-color:#c9cdd4}
+  .ev time{color:var(--muted);flex:0 0 112px;font-variant-numeric:tabular-nums}
+  .ev .step{flex:0 0 112px;color:var(--muted)}
+  .empty{padding:44px 18px;text-align:center;color:var(--muted)}
+
+  .chgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(258px,1fr));gap:13px}
+  .chcard{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--off);
+          border-radius:var(--r);padding:16px 17px;cursor:pointer;transition:border-color .15s}
+  .chcard:hover{border-color:var(--line-2);border-left-color:var(--acc)}
   .chcard.active{border-left-color:var(--ok)}
-  .chcard.paused{border-left-color:var(--off);opacity:.72}
+  .chcard.paused{border-left-color:var(--off);opacity:.65}
   .chcard.problem{border-left-color:var(--bad)}
-  .chcard h3{margin:0 0 3px;font-size:15px}
-  .chcard .meta{color:var(--muted);font-size:12.5px}
-  .cal{display:flex;gap:12px;padding:10px 16px;border-bottom:1px solid var(--line);
+  .chcard h3{margin:0 0 4px;font-size:16px;font-weight:700;color:var(--ink-hi)}
+  .chcard .meta{color:var(--muted);font-size:13px}
+
+  .cal{display:flex;gap:13px;padding:11px 18px;border-bottom:1px solid var(--line);
        align-items:flex-start}
   .cal:last-child{border-bottom:0}
-  .cal.past{background:#fbfbfc}
-  .cal time{flex:0 0 132px;font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
-  .cal .dot{flex:0 0 20px;height:20px;border-radius:50%;display:grid;place-items:center;
-            font-size:11px;font-weight:700;margin-top:1px}
+  .cal.past{background:rgba(255,255,255,.02)}
+  .cal time{flex:0 0 136px;font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
+  .cal .dot{flex:0 0 21px;height:21px;border-radius:50%;display:grid;place-items:center;
+            font-size:11px;font-weight:800;margin-top:1px}
   .cal .what{flex:1;min-width:0}
   .cal.miss .what{color:var(--bad)}
-  .today{height:0;border-top:2px dashed var(--run);position:relative;margin:0 16px}
-  .today span{position:absolute;top:-9px;left:0;background:var(--card);padding:0 8px;
-              font-size:11px;color:var(--run);font-weight:600}
-  .err{background:var(--bad-bg);color:var(--bad);padding:11px 14px;border-radius:8px;
-       margin-bottom:14px}
-  .res{margin-top:14px}
-  .res h3{font-size:13px;margin:0 0 6px;text-transform:uppercase;letter-spacing:.04em;
-          color:var(--muted)}
+  .today{height:0;border-top:2px dashed var(--acc);position:relative;margin:0 18px}
+  .today span{position:absolute;top:-9px;left:0;background:var(--card);padding:0 9px;
+              font-size:11px;color:var(--acc-hi);font-weight:700}
+
+  .err{background:var(--bad-bg);color:var(--bad);padding:12px 15px;border-radius:9px;
+       margin-bottom:14px;border:1px solid rgba(248,113,113,.25)}
+  .res{margin-top:15px}
+  .res h3{font-size:11px;margin:0 0 7px;text-transform:uppercase;letter-spacing:.07em;
+          color:var(--muted);font-weight:700}
   .res ul{margin:0 0 14px;padding-left:20px}
-  .back{display:inline-block;margin-bottom:12px;color:var(--muted);text-decoration:none}
-  .back:hover{color:var(--ink)}
-  @media (max-width:640px){ .grid{grid-template-columns:1fr 1fr} .ev time{flex-basis:74px} }
+  .back{display:inline-block;margin-bottom:13px;color:var(--muted);text-decoration:none}
+  .back:hover{color:var(--ink-hi)}
+
+  .login{max-width:380px;margin:14vh auto;background:var(--card);
+         border:1px solid var(--line);border-radius:16px;padding:34px 32px;
+         box-shadow:0 24px 60px -20px rgba(0,0,0,.6)}
+  .login .logo{font-size:30px;font-weight:800;letter-spacing:-.03em;color:var(--ink-hi);
+               margin-bottom:6px}
+  .login .logo b{color:var(--acc-hi)}
+  .login h1{font-size:19px;margin:0 0 22px;font-weight:650;color:var(--ink)}
+  .login input{width:100%;margin-top:11px;padding:11px 13px}
+  .login button{width:100%;margin-top:18px;padding:11px}
+
+  .langs{display:flex;flex-wrap:wrap;gap:7px;margin-top:9px;max-height:140px;overflow:auto;
+         border:1px solid var(--line-2);border-radius:10px;padding:10px}
+  .langs label{display:inline-flex;align-items:center;gap:6px;font-size:12.5px;
+               border:1px solid var(--line-2);border-radius:16px;padding:4px 10px;
+               cursor:pointer;transition:all .12s}
+  .langs label:hover{border-color:var(--acc)}
+  .langs label.on{background:var(--acc-dim);border-color:var(--acc);color:var(--acc-hi)}
+  .modes{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
+  .modes button{background:transparent;color:var(--muted);border:1px solid var(--line-2)}
+  .modes button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+  .fldrow{display:flex;gap:9px;align-items:center;margin-top:10px;flex-wrap:wrap}
+  .fldrow>label:first-child{min-width:175px;color:var(--muted);font-size:12.5px;font-weight:550}
+
+  @media (max-width:640px){ .grid{grid-template-columns:1fr 1fr} .ev time{flex-basis:76px} }
 </style>
 </head>
 <body>
 
 <header>
   <nav>
-    <span class="brand">Studio</span>
+    <span class="brand">Studio<b>.</b></span>
     <a class="tab" href="#/releases" id="tab-releases">Выпуски</a>
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
@@ -207,7 +265,7 @@ async function post(path, payload){
 function fail(e){
   app.innerHTML = '';
   app.append($(`<div class="err">${esc(e.message)}</div>
-    <p class="muted">Проверьте, что база создана: <span class="mono">python3 dev/make_db.py</span></p>`));
+    <p class="muted">Обновите страницу. Если не помогло — сервис недоступен.</p>`));
 }
 
 /* ─────────────────────────── список выпусков ─────────────────────────── */
@@ -357,8 +415,7 @@ async function viewKeys(){
   const d = await api('/ui/keys');
   app.innerHTML = '';
   app.append($(`<h1>Ключи</h1>
-    <p class="sub">Что занято, кто ждёт и до какого времени отдыхает ключ —
-      вместо «свободных слотов», которые ничего не говорят.</p>`));
+    <p class="sub">Кто ждёт, сколько ждёт и когда снова заработает.</p>`));
 
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Очередь по провайдерам</div>
@@ -402,7 +459,7 @@ async function viewKeys(){
           : '<span class="pill s-idle">ключ один</span>'}</td>
       </tr>`).join('')}</tbody></table>
       <div class="sec" style="border-bottom:0;font-weight:400" class="muted">
-        Значения ключей наружу не отдаются — ни здесь, ни в API: только количество и маска.
+        Значение ключа нигде не показывается — только его хвост.
       </div>`
       : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
     <div id="keyedit"></div>
@@ -608,7 +665,7 @@ async function viewQueue(){
 
   app.innerHTML = '';
   app.append($(`<h1>Очередь</h1>
-    <p class="sub">Задачи трёх сервисов в одном списке. Свои — из базы, чужие — по HTTP.</p>`));
+    <p class="sub">Всё, что сейчас делается, в одном списке.</p>`));
 
   app.append($(`<div class="toolbar">${d.services.map(s => `
     <span class="pill ${s.ok ? 's-done' : 's-error'}" title="${esc(s.error)}">
@@ -772,11 +829,10 @@ function viewLogin(why){
   document.querySelector('nav').style.visibility = 'hidden';
   app.innerHTML = '';
   const box = $(`<div class="login">
-    <h1>Studio</h1>
-    <p class="sub" style="margin:0">Логин и пароль — те же, что в кабинете.
-      Своей учётной записи у пульта нет.</p>
-    <input id="lg" placeholder="логин" autocomplete="username" autofocus>
-    <input id="pw" type="password" placeholder="пароль" autocomplete="current-password">
+    <div class="logo">Studio<b>.</b></div>
+    <h1>Добро пожаловать</h1>
+    <input id="lg" placeholder="Логин" autocomplete="username" autofocus>
+    <input id="pw" type="password" placeholder="Пароль" autocomplete="current-password">
     <button id="go">Войти</button>
     <div id="err" style="margin-top:12px"></div>
   </div>`);
@@ -824,7 +880,7 @@ async function viewProjects(){
   const d = await api('/ui/projects');
   app.innerHTML = '';
   app.append($(`<h1>Проекты</h1>
-    <p class="sub">${esc(d.note)}.</p>`));
+    <p class="sub">Материалы роликов: кадры, озвучка, готовые файлы.</p>`));
 
   if (!d.projects.length){
     app.append($(`<div class="card"><div class="empty">Проектов нет.</div></div>`));
@@ -1139,8 +1195,7 @@ async function viewText(){
   const d = await api('/ui/text');
   app.innerHTML = '';
   app.append($(`<h1>Текст</h1>
-    <p class="sub">Рерайт по ссылке, рерайт своего текста и генерация с нуля — одна форма.
-      ${esc(d.note)}.</p>`));
+    <p class="sub">Рерайт по ссылке, рерайт своего текста и генерация с нуля.</p>`));
 
   if (!TEXT_FORM.model && d.models.length) TEXT_FORM.model = d.models[0].value;
   const mode = () => d.modes.find(m => m.key === TEXT_FORM.mode) || d.modes[0];
@@ -1264,7 +1319,7 @@ async function viewText(){
                                                   state:j.state, status:j.status})}</td>
       </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Задач текста пока нет.</div>'}
-    ${d.jobs.length ? '<div class="note muted">Строка раскрывается: там результат.</div>' : ''}
+    ${d.jobs.length ? '<div class="note muted">Нажмите на строку — покажется результат.</div>' : ''}
   </div>`);
   app.append(list);
   wireActions(list);
@@ -1282,7 +1337,7 @@ async function viewCovers(){
   const d = await api('/ui/covers');
   app.innerHTML = '';
   app.append($(`<h1>Обложки</h1>
-    <p class="sub">Сначала стратегия, потом её поля. ${esc(d.note)}.</p>`));
+    <p class="sub">Сначала выберите, как делаем обложку.</p>`));
 
   const mode = () => d.modes.find(m => m.key === COVER_FORM.mode) || d.modes[0];
   const opt = d.options[COVER_FORM.option] || d.options[0] || {};
@@ -1441,7 +1496,7 @@ async function viewCovers(){
                                                   state:j.state, status:j.status})}</td>
       </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Задач обложек пока нет.</div>'}
-    ${d.jobs.length ? '<div class="note muted">Строка раскрывается: там готовые обложки.</div>' : ''}
+    ${d.jobs.length ? '<div class="note muted">Нажмите на строку — покажутся готовые обложки.</div>' : ''}
   </div>`);
   app.append(list);
   wireActions(list);
@@ -1454,8 +1509,7 @@ async function viewPresets(){
   const d = await api('/ui/presets');
   app.innerHTML = '';
   app.append($(`<h1>Пресеты</h1>
-    <p class="sub">Один список вместо трёх. Всё берётся по HTTP с ключом — не чтением
-      чужих файлов.</p>`));
+    <p class="sub">Настройки, которыми делаются ролики.</p>`));
 
   if (d.broken.length){
     app.append($(`<div class="card" style="margin-bottom:16px">
@@ -1504,9 +1558,7 @@ async function viewPresets(){
     app.append(card);
     wirePresets(card);
   }
-  app.append($(`<div class="note muted">Копия и удаление — целые действия. Правка полей
-    осталась в самом сервисе: у пресета обложек их больше двадцати, и половинчатый
-    редактор показывал бы поля, которых движок не читает.</div>`));
+  app.append($(`<div class="note muted">Полная правка настроек пресета — в разделе того сервиса, которому он принадлежит.</div>`));
 }
 
 function wirePresets(root){
@@ -1551,8 +1603,7 @@ async function viewAdmin(){
                                         api('/ui/public')]);
   app.innerHTML = '';
   app.append($(`<h1>Админ</h1>
-    <p class="sub">Две вещи, из-за которых конвейер встаёт молча: некому сказать,
-      что он встал, и некому убрать за ним диск.</p>`));
+    <p class="sub">Состояние системы: что мешает работе и сколько осталось места.</p>`));
 
   /* ── тревоги ── */
   const t = a.transport;
