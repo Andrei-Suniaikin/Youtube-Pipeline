@@ -27,7 +27,11 @@ _HERE = os.path.dirname(os.path.abspath(__file__))
 SESSION_DB = os.environ.get("SESSION_DB") or os.path.join(_HERE, "sessions.db")
 # Админ-тенант: аккаунт с этим user_id = админ (наследует существующие пресеты/токены/данные).
 # Согласовано с server.py / api.py / index.html.
-ADMIN_USER_ID = "REDACTED_ADMIN_USER_ID"
+# ИСПРАВЛЕНО 04.09.2026: было литералом. После слияния личности id админа —
+# это tenant_id кабинета, и зашитое значение перестаёт совпадать: админ
+# молча теряет права. Cover читал его из окружения давно, здесь так же.
+# Правильный конец истории — роль из users.role кабинета, а не отдельный id.
+ADMIN_USER_ID = os.environ.get("REWRITE_ADMIN_USER_ID") or "REDACTED_ADMIN_USER_ID"
 
 
 class LicenseManager:

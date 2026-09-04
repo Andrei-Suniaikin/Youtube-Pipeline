@@ -589,6 +589,14 @@ async def sanitized_request_validation_error(
     )
 
 
+# ДОБАВЛЕНО 04.09.2026: единый вход. Модуль есть только когда сервис поднят внутри
+# единой платформы; при раздельном запуске вход остаётся свой.
+try:
+    from platform_sso import cabinet_user
+except ImportError:                       # pragma: no cover
+    def cabinet_user(_request):
+        return None
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
@@ -614,6 +622,16 @@ async def auth_middleware(request: Request, call_next):
                     request.state.user_id = license_mgr.get_user_id(session_id)
                     request.state.user_name = session_info["user_name"]
                     request.state.auth_mode = "session"
+        return await call_next(request)
+
+    # ДОБАВЛЕНО 04.09.2026: единый вход. Кука кабинета проверяется САМИМ кабинетом —
+    # это не доверенный заголовок. Свой вход ниже остаётся рабочим: он нужен при
+    # раздельном запуске и как запасной путь, пока переезд не закончен.
+    _who = cabinet_user(request)
+    if _who:
+        request.state.user_id = _who["user_id"]
+        request.state.user_name = _who["user_name"]
+        request.state.auth_mode = "cabinet"
         return await call_next(request)
 
     session_id = request.headers.get("X-Session-Id", "") or request.query_params.get("sid", "")
@@ -921,8 +939,15 @@ def auth_delete_account(username: str, request: Request):
 
 @app.post("/auth/ping")
 async def auth_ping(request: Request):
+    """«Я ещё в системе?» — теперь на это есть два способа ответить «да».
+
+    Путь публичный (иначе экран входа не смог бы спросить), поэтому единый вход
+    проверяется здесь явно: middleware для публичных путей состояние не заполняет.
+    """
     if not license_mgr:
         return {"status": "ok"}
+    if cabinet_user(request):                 # ДОБАВЛЕНО 04.09.2026: единый вход
+        return {"status": "ok", "via": "cabinet"}
     session_id = request.headers.get("X-Session-Id", "")
     if session_id and license_mgr.ping(session_id):
         return {"status": "ok"}

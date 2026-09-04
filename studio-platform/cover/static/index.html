@@ -2658,11 +2658,16 @@
       }
     }, 60000);
 
-    if (sessionId) {
-      fetch(API + '/auth/ping', { method: 'POST', headers: headers() }).then(r => { if (r.ok) showMain(); else showLogin(); }).catch(() => showLogin());
-    } else {
-      showLogin();
-    }
+    // ДОБАВЛЕНО 04.09.2026: единый вход. Спрашиваем сервер, а не localStorage: если
+    // платформа уже опознала нас по сессии кабинета, своя форма входа не нужна.
+    // Своя сессия проверяется вторым — она остаётся рабочей при раздельном запуске.
+    fetch(API + '/auth/ping', { method: 'POST' }).then(r => {
+      if (r.ok) { showMain(); return; }
+      if (!sessionId) { showLogin(); return; }
+      fetch(API + '/auth/ping', { method: 'POST', headers: headers() })
+        .then(r2 => { if (r2.ok) showMain(); else showLogin(); })
+        .catch(() => showLogin());
+    }).catch(() => showLogin());
   </script>
 <script>
 (function () {

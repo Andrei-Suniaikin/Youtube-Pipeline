@@ -1709,6 +1709,14 @@ async def json_body_limit_middleware(request: Request, call_next):
     return await call_next(request)
 
 
+# ДОБАВЛЕНО 04.09.2026: единый вход. Модуль есть только когда сервис поднят внутри
+# единой платформы; при раздельном запуске вход остаётся свой.
+try:
+    from platform_sso import cabinet_user
+except ImportError:                       # pragma: no cover
+    def cabinet_user(_request):
+        return None
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     path = request.url.path
@@ -1720,6 +1728,16 @@ async def auth_middleware(request: Request, call_next):
     # /api/v1/* — собственный api-key auth через Depends(get_api_user) внутри router'а.
     # Middleware пропускает; внутри router'а возврат 401 если ключ невалиден.
     if path.startswith("/api/v1/") or path == "/api/v1":
+        return await call_next(request)
+
+    # ДОБАВЛЕНО 04.09.2026: единый вход. Кука кабинета проверяется САМИМ кабинетом —
+    # это не доверенный заголовок. Свой вход ниже остаётся рабочим: он нужен при
+    # раздельном запуске и как запасной путь, пока переезд не закончен.
+    _who = cabinet_user(request)
+    if _who:
+        request.state.user_id = _who["user_id"]
+        request.state.user_name = _who["user_name"]
+        request.state.auth_mode = "cabinet"
         return await call_next(request)
 
     # Авторизация веб-интерфейса: только X-Session-Id (лицензия).
@@ -1762,6 +1780,14 @@ async def auth_setup(request: Request):
 
 @app.post("/auth/ping")
 async def auth_ping(request: Request):
+    """«Я ещё в системе?» — теперь на это есть два способа ответить «да».
+
+    Первый способ ставит middleware по сессии кабинета (единый вход), второй — своя
+    сессия. Второй остаётся рабочим: он нужен при раздельном запуске.
+    """
+    if getattr(request.state, "auth_mode", "") == "cabinet":
+        return {"status": "ok", "via": "cabinet",
+                "user_id": getattr(request.state, "user_id", "")}
     session_id = request.headers.get("X-Session-Id", "")
     if session_id and license_mgr.ping(session_id):
         # user_id отдаём, чтобы фронт мог восстановить gate при resume-сессии без relogin.

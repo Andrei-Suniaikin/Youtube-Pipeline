@@ -35,6 +35,10 @@ export VS_SERVER_DISABLE_BACKGROUND=1
 # её сохранит не всякий браузер. Снимать защиту должен тот, кто знает, что он
 # в песочнице, поэтому послабление живёт здесь, а не в коде.
 export VS_DEV_INSECURE_COOKIE=1
+# После слияния личности админ у соседей опознаётся по общему id (tenant_id кабинета),
+# а не по зашитому литералу. Значения должны совпадать, иначе админ теряет права молча.
+export REWRITE_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
+export COVER_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
 
 trap 'kill 0' EXIT
 ( cd "$ROOT" && "$PY" -m uvicorn web.platform:app --port "$PORT" --log-level warning ) &
