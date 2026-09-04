@@ -1848,7 +1848,8 @@ def ui_channel_create(body: ChannelIn):
     return {"ok": True, "id": cid}
 
 
-@app.post("/ui/channels/{cid}")
+# {cid:int} — иначе этот путь перехватывает «/ui/channels/import».
+@app.post("/ui/channels/{cid:int}")
 def ui_channel_edit(cid: int, body: dict):
     """Сохранить настройки канала.
 
@@ -1873,7 +1874,7 @@ def ui_channel_edit(cid: int, body: dict):
     return {"ok": True}
 
 
-@app.post("/ui/channels/{cid}/status")
+@app.post("/ui/channels/{cid:int}/status")
 def ui_channel_status(cid: int, body: dict):
     """Включить, поставить на паузу, убрать в архив."""
     c = db()
@@ -1956,3 +1957,28 @@ def ui_key_families():
                          for k, title, group in families],
             "note": "значения ключей наружу не отдаются — ни здесь, ни на экране: "
                     "только количество и маска"}
+
+
+class ImportIn(BaseModel):
+    payload: str = ""
+
+
+@app.post("/ui/channels/import")
+def ui_channels_import(body: ImportIn):
+    """Перенести каналы списком: JSON-массив или CSV с заголовком.
+
+    Разбор и запись — кабинета (`pub_ui.import_channels`). Главное правило переноса,
+    «пустая колонка ничего не затирает», живёт в `read_import_row` и должно остаться
+    единственным: иначе один интерфейс стирал бы то, что бережёт другой.
+
+    Отклонённые строки возвращаются поимённо с причиной. Молчаливый импорт, который
+    «прошёл», а половину строк выбросил, — худший исход, чем отказ.
+    """
+    c = db()
+    try:
+        out = pub_ui.import_channels(c, TENANT, body.payload or "")
+    except pub_ui.ChannelError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        c.close()
+    return out

@@ -436,8 +436,45 @@ async function viewChannels(){
     <p class="sub">Расписание выходов, план и история. Цвет карточки — состояние канала.</p>`));
 
   const bar = $(`<div class="toolbar"><span style="flex:1"></span>
+    <button class="ghost" id="impch">Перенести списком</button>
     <button id="newch">Новый канал</button></div>`);
   app.append(bar);
+
+  bar.querySelector('#impch').onclick = () => {
+    if (document.getElementById('imp-form')) return;
+    const form = $(`<div class="card" id="imp-form" style="padding:16px;margin-bottom:16px">
+      <div class="sec">Перенести каналы списком</div>
+      <div id="err"></div>
+      <div class="note muted">JSON-массив или CSV с заголовком. Обязательны
+        <b>uc</b> и <b>name</b>. Пустая колонка ничего не затирает — так можно
+        дополнять уже заведённые каналы.</div>
+      <textarea id="pl" rows="10" style="font-family:ui-monospace,monospace;font-size:12px"
+        placeholder='[{"uc":"UC…","name":"Канал","lang":"pl","times":"10:00, 18:00"}]'></textarea>
+      <div style="margin-top:12px"><button id="go">Перенести</button>
+        <button class="ghost" id="no">Отмена</button></div>
+      <div id="res"></div>
+    </div>`);
+    bar.after(form);
+    const err = form.querySelector('#err');
+    const res = form.querySelector('#res');
+    form.querySelector('#no').onclick = () => form.remove();
+    form.querySelector('#go').onclick = async () => {
+      err.innerHTML = ''; res.innerHTML = '';
+      try{
+        const out = await post('/ui/channels/import',
+                               {payload: form.querySelector('#pl').value});
+        // Отклонённые строки показываем поимённо: импорт, который «прошёл», а половину
+        // выбросил молча, хуже отказа.
+        res.innerHTML = `<div class="res">
+          Заведено новых: <b>${out.created}</b> · обновлено: <b>${out.updated}</b>
+          · отклонено: <b>${out.rejected.length}</b>
+          ${out.rejected.length ? `<h3>Что отклонено и почему</h3><ul>${
+            out.rejected.map(r => `<li>${esc(r)}</li>`).join('')}</ul>` : ''}
+          <button class="ghost" id="again">Обновить список</button></div>`;
+        res.querySelector('#again').onclick = () => render();
+      }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+    };
+  };
   bar.querySelector('#newch').onclick = () => {
     if (document.getElementById('newch-form')) return;
     const form = $(`<div class="card" id="newch-form" style="padding:16px;margin-bottom:16px">

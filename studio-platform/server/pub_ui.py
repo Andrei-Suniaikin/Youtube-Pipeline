@@ -202,6 +202,50 @@ def read_channel_form(form: dict) -> dict:
     }
 
 
+def import_channels(c, tenant_id: str, payload: str, now: float = None) -> dict:
+    """Перенести каналы списком. Возвращает {created, updated, rejected: [строки]}.
+
+    ВЫНЕСЕНО 04.09.2026 из роута: тот же перенос делает пульт. Правило «пустая колонка
+    ничего не затирает» живёт в `read_import_row` и должно остаться единственным —
+    иначе один интерфейс будет стирать то, что другой бережёт.
+    """
+    import time as _t
+    now = _t.time() if now is None else now
+    items = parse_import(payload)
+    created = updated = 0
+    rejected = []
+    for idx, item in enumerate(items, 1):
+        try:
+            uc, fields = read_import_row(item)
+        except (ChannelError, ScheduleError) as exc:
+            rejected.append(f"строка {idx}: {exc}")
+            continue
+        old = c.execute("SELECT id, tenant_id FROM pub_channels WHERE uc=?",
+                        (uc,)).fetchone()
+        if old:
+            if old["tenant_id"] != tenant_id:
+                rejected.append(f"строка {idx}: канал заведён другим пользователем")
+                continue
+            if not fields:
+                rejected.append(f"строка {idx}: нечего обновлять")
+                continue
+            sets = ", ".join(f"{k}=?" for k in fields)
+            c.execute(f"UPDATE pub_channels SET {sets}, updated=? WHERE id=? AND tenant_id=?",
+                      (*fields.values(), now, old["id"], tenant_id))
+            updated += 1
+        else:
+            if not fields.get("name"):
+                rejected.append(f"строка {idx}: у нового канала обязательно название")
+                continue
+            cols = ["tenant_id", "uc", *fields.keys(), "created", "updated"]
+            c.execute(f"INSERT INTO pub_channels({','.join(cols)}) "
+                      f"VALUES({','.join('?' * len(cols))})",
+                      (tenant_id, uc, *fields.values(), now, now))
+            created += 1
+    c.commit()
+    return {"created": created, "updated": updated, "rejected": rejected}
+
+
 def create_channel(c, tenant_id: str, uc: str, name: str, lang: str = "",
                    niche: str = "", now: float = None) -> int:
     """Завести канал. Возвращает его id.
@@ -1118,44 +1162,14 @@ placeholder='[{"uc":"UC...","name":"Канал","lang":"pl","times":"10:00, 18:0
     async def channel_import(request: Request):
         u = require_web_user(request)
         form = await form_multi(request)
-        try:
-            items = parse_import(one(form, "payload"))
-        except ChannelError as exc:
-            return _err_page(u, str(exc), "/channels/import")
-
-        created = updated = 0
-        rejected = []
-        tid, now = _tid(u), _now()
         c = db()
-        for idx, item in enumerate(items, 1):
-            try:
-                uc, fields = read_import_row(item)
-            except (ChannelError, ScheduleError) as exc:
-                rejected.append(f"строка {idx}: {exc}")
-                continue
-            old = c.execute("SELECT id, tenant_id FROM pub_channels WHERE uc=?", (uc,)).fetchone()
-            if old:
-                if old["tenant_id"] != tid:
-                    rejected.append(f"строка {idx}: канал заведён другим пользователем")
-                    continue
-                if not fields:
-                    rejected.append(f"строка {idx}: нечего обновлять")
-                    continue
-                sets = ", ".join(f"{k}=?" for k in fields)
-                c.execute(f"UPDATE pub_channels SET {sets}, updated=? WHERE id=? AND tenant_id=?",
-                          (*fields.values(), now, old["id"], tid))
-                updated += 1
-            else:
-                if not fields.get("name"):
-                    rejected.append(f"строка {idx}: у нового канала обязательно название")
-                    continue
-                cols = ["tenant_id", "uc", *fields.keys(), "created", "updated"]
-                c.execute(f"INSERT INTO pub_channels({','.join(cols)}) "
-                          f"VALUES({','.join('?' * len(cols))})",
-                          (tid, uc, *fields.values(), now, now))
-                created += 1
-        c.commit()
+        try:
+            out = import_channels(c, _tid(u), one(form, "payload"), _now())
+        except ChannelError as exc:
+            c.close()
+            return _err_page(u, str(exc), "/channels/import")
         c.close()
+        created, updated, rejected = out["created"], out["updated"], out["rejected"]
 
         rej = ("".join(f"<div class=muted style='font-size:12.5px'>{e(r)}</div>"
                        for r in rejected[:50]) or "<span class=muted>нет</span>")
