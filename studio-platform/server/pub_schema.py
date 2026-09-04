@@ -39,6 +39,12 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
               "profile_id INTEGER, host_id INTEGER, tz TEXT NOT NULL DEFAULT 'Europe/Warsaw', "
               "schedule TEXT NOT NULL DEFAULT '{}', horizon_days INTEGER NOT NULL DEFAULT 3, "
               "preset_rewrite TEXT, preset_vsgen_id INTEGER, preset_cover TEXT, "
+              # video_mode: МЁРТВАЯ КОЛОНКА (проверено 04.09.2026 — не читает никто).
+              # Канал как бы объявляет, каким должен быть ролик, и объявление никуда
+              # не доходит: автоконвейер клипов не ставит вовсе, а ручной берёт режим
+              # из параметров задачи. Из схемы не убрана намеренно: она есть в боевой
+              # базе, и ALTER ради мёртвого поля — риск ради красоты. Оживлять её имеет
+              # смысл только вместе с клипами в автовыпусках (docs/КОНВЕЙЕР_граф.md).
               "collaborator TEXT, video_mode TEXT NOT NULL DEFAULT 'slideshow', "
               "t2v_first_n INTEGER NOT NULL DEFAULT 0, "
               "status TEXT NOT NULL DEFAULT 'active', note TEXT, "

@@ -30,7 +30,10 @@ export HOME="$ROOT/dev/home"
 export VS_SERVER_DB="$ROOT/dev/vsgen.dev.db"
 export VS_DEV_DB="$ROOT/dev/vsgen.dev.db"
 export VS_TENANTS_DIR="$ROOT/dev/data/tenants"
-export VS_SERVER_DISABLE_BACKGROUND=1
+# Планировщик по умолчанию ВЫКЛЮЧЕН: здесь разбирают интерфейс, а не тратят деньги.
+# Задачи стоят в очереди и никто их не берёт. Боевой прогон — dev/run-live.sh,
+# он выставляет эту переменную пустой и планировщик поднимается.
+export VS_SERVER_DISABLE_BACKGROUND="${VS_SERVER_DISABLE_BACKGROUND-1}"
 # Пульт по умолчанию ставит куку Secure — правильно за Caddy, но по http://127.0.0.1
 # её сохранит не всякий браузер. Снимать защиту должен тот, кто знает, что он
 # в песочнице, поэтому послабление живёт здесь, а не в коде.
