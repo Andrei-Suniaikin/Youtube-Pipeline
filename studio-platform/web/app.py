@@ -30,7 +30,7 @@ SERVER = os.path.join(BASE, "server")
 sys.path.insert(0, SERVER)
 
 from fastapi import FastAPI, HTTPException, Request, Response    # noqa: E402
-from fastapi.responses import FileResponse, JSONResponse          # noqa: E402
+from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
 from pydantic import BaseModel                                   # noqa: E402
 
 sys.path.insert(0, HERE)
@@ -1523,3 +1523,78 @@ def ui_covers_create(body: CoverIn, request: Request):
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
     return {"ok": True, "job": out}
+
+
+# ──────────────────────────── результаты задач ────────────────────────────
+
+# Один путь на оба сервиса: у Rewrite и Cover эндпоинты результатов совпадают по
+# форме — `/jobs/{id}/files` отдаёт список имён, `/jobs/{id}/files/{имя}` сам файл.
+# Проверку владельца делают они сами, каждый по своей задаче; пульт её не повторяет
+# и не может ослабить — он ходит кукой человека, а не общим ключом.
+RESULT_BASES = {"rewrite": REWRITE_BASE, "cover": COVER_BASE}
+
+_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+         ".webp": "image/webp", ".gif": "image/gif", ".txt": "text/plain; charset=utf-8",
+         ".md": "text/markdown; charset=utf-8", ".json": "application/json",
+         ".srt": "text/plain; charset=utf-8", ".zip": "application/zip"}
+
+
+@app.get("/ui/files/{service}/{job_id}")
+def ui_files(service: str, job_id: str, request: Request):
+    """Что получилось у задачи. Пустой список — это «ничего не сделано», а не ошибка."""
+    base = RESULT_BASES.get(service)
+    if not base:
+        raise HTTPException(404, f"нет сервиса «{service}»")
+    code, body = _proxy_get(base, f"/jobs/{urllib.parse.quote(job_id)}/files",
+                            getattr(request.state, "sid", ""))
+    if code >= 400:
+        raise HTTPException(_pass_code(code), body)
+    names = [str(x) for x in body] if isinstance(body, list) else []
+    return {"service": service, "job_id": job_id,
+            "files": [{"name": n, "kind": _file_kind(n)} for n in names]}
+
+
+@app.get("/ui/files/{service}/{job_id}/{name:path}")
+def ui_file(service: str, job_id: str, name: str, request: Request):
+    """Сам файл. Пульт его только передаёт: ни имени, ни пути он не конструирует."""
+    base = RESULT_BASES.get(service)
+    if not base:
+        raise HTTPException(404, f"нет сервиса «{service}»")
+    url = (f"{base}/jobs/{urllib.parse.quote(job_id)}/files/"
+           f"{urllib.parse.quote(name)}")
+    req = urllib.request.Request(url)
+    req.add_header("Cookie", f"{auth.COOKIE}={getattr(request.state, 'sid', '')}")
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 5) as resp:
+            data = resp.read()
+            ctype = resp.headers.get("Content-Type")
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(_pass_code(exc.code), exc.read().decode("utf-8", "replace")[:200])
+    except Exception as exc:                                     # noqa: BLE001
+        raise HTTPException(502, f"сервис «{service}» не отвечает: {type(exc).__name__}")
+    ext = os.path.splitext(name)[1].lower()
+    return Response(content=data, media_type=(_MIME.get(ext) or ctype
+                                              or "application/octet-stream"))
+
+
+def _proxy_get(base: str, path: str, sid: str) -> tuple:
+    req = urllib.request.Request(base + path)
+    req.add_header("Cookie", f"{auth.COOKIE}={sid}")
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 5) as resp:
+            raw = resp.read().decode("utf-8")
+            return resp.status, (json.loads(raw) if raw.startswith(("{", "[")) else raw)
+    except urllib.error.HTTPError as exc:
+        return exc.code, exc.read().decode("utf-8", "replace")[:200]
+    except Exception as exc:                                     # noqa: BLE001
+        return 502, f"не отвечает: {type(exc).__name__}"
+
+
+def _file_kind(name: str) -> str:
+    """Картинку показываем, текст даём прочитать, остальное — только скачать."""
+    ext = os.path.splitext(name)[1].lower()
+    if ext in (".png", ".jpg", ".jpeg", ".webp", ".gif"):
+        return "image"
+    if ext in (".txt", ".md", ".srt", ".json"):
+        return "text"
+    return "file"

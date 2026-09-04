@@ -711,6 +711,57 @@ function showWho(){
   };
 }
 
+/* ────────────────────────── результаты задачи ────────────────────────── */
+
+/* Один блок на оба сервиса: у Rewrite и Cover результаты устроены одинаково —
+   список имён и файл по имени. Смысл в том, чтобы не уходить с экрана: увидеть,
+   что получилось, и забрать — там же, где задача. */
+const RESULT_OPEN = new Set();
+
+async function paintResults(service, jobId, host){
+  try{
+    const d = await api(`/ui/files/${encodeURIComponent(service)}/${encodeURIComponent(jobId)}`);
+    if (!d.files.length){ host.innerHTML = '<span class="muted">Файлов пока нет.</span>'; return; }
+    const url = f => `/ui/files/${encodeURIComponent(service)}/${
+      encodeURIComponent(jobId)}/${encodeURIComponent(f.name)}`;
+    const imgs = d.files.filter(f => f.kind === 'image');
+    const rest = d.files.filter(f => f.kind !== 'image');
+    host.innerHTML = `
+      ${imgs.length ? `<div style="display:flex;flex-wrap:wrap;gap:8px;margin-bottom:8px">
+        ${imgs.map(f => `<a href="${url(f)}" target="_blank" title="${esc(f.name)}"
+          ><img src="${url(f)}" style="height:96px;border-radius:6px;
+          border:1px solid var(--line);display:block"></a>`).join('')}</div>` : ''}
+      ${rest.length ? `<div style="display:flex;flex-wrap:wrap;gap:8px">
+        ${rest.map(f => `<a href="${url(f)}" target="_blank"
+          style="display:inline-block;padding:4px 10px;border:1px solid var(--line);
+                 border-radius:6px;text-decoration:none;font-size:12px"
+          >${esc(f.name)}</a>`).join('')}</div>` : ''}`;
+  }catch(e){
+    host.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+  }
+}
+
+function wireResults(root, service){
+  root.querySelectorAll('tr[data-job]').forEach(tr => {
+    tr.style.cursor = 'pointer';
+    tr.onclick = ev => {
+      if (ev.target.closest('button, a')) return;   // кнопки строки — не раскрытие
+      const id = tr.dataset.job;
+      const key = service + ':' + id;
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains('res-row')){
+        next.remove(); RESULT_OPEN.delete(key); return;
+      }
+      RESULT_OPEN.add(key);
+      tr.insertAdjacentHTML('afterend',
+        '<tr class="res-row"><td colspan="9" style="padding-top:0">' +
+        '<div class="muted">загрузка…</div></td></tr>');
+      paintResults(service, id, tr.nextElementSibling.querySelector('div'));
+    };
+    if (RESULT_OPEN.has(service + ':' + tr.dataset.job)) tr.click();
+  });
+}
+
 /* ─────────────────────────────── текст ─────────────────────────────── */
 
 /* Рерайт и генерация с нуля — один экран (ТЗ §05). Разница между ними только
@@ -833,7 +884,7 @@ async function viewText(){
     <div class="sec">Задачи текста</div>
     ${d.jobs.length ? `<table><thead><tr>
       <th>Задача</th><th>Вид</th><th>Языки</th><th>Состояние</th><th>Создана</th><th></th>
-      </tr></thead><tbody>${d.jobs.map(j => `<tr>
+      </tr></thead><tbody>${d.jobs.map(j => `<tr data-job="${esc(j.id)}">
         <td><div style="font-weight:600">${esc(j.title)}</div>
             <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
         <td>${j.kind === 'generation' ? 'с нуля' : 'рерайт'}</td>
@@ -847,9 +898,11 @@ async function viewText(){
                                                   state:j.state, status:j.status})}</td>
       </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Задач текста пока нет.</div>'}
+    ${d.jobs.length ? '<div class="note muted">Строка раскрывается: там результат.</div>' : ''}
   </div>`);
   app.append(list);
   wireActions(list);
+  wireResults(list, 'rewrite');
 }
 
 /* ─────────────────────────────── обложки ─────────────────────────────── */
@@ -1009,7 +1062,7 @@ async function viewCovers(){
     <div class="sec">Задачи обложек</div>
     ${d.jobs.length ? `<table><thead><tr>
       <th>Задача</th><th>Состояние</th><th>Готово</th><th>Создана</th><th></th>
-      </tr></thead><tbody>${d.jobs.map(j => `<tr>
+      </tr></thead><tbody>${d.jobs.map(j => `<tr data-job="${esc(j.id)}">
         <td><div style="font-weight:600">${esc(j.title)}</div>
             <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
         <td><span class="pill s-${j.state}">${STATE_TITLE[j.state]}</span>
@@ -1022,9 +1075,11 @@ async function viewCovers(){
                                                   state:j.state, status:j.status})}</td>
       </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Задач обложек пока нет.</div>'}
+    ${d.jobs.length ? '<div class="note muted">Строка раскрывается: там готовые обложки.</div>' : ''}
   </div>`);
   app.append(list);
   wireActions(list);
+  wireResults(list, 'cover');
 }
 
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
