@@ -1504,6 +1504,17 @@ class _ServerCredentialPool:
         with self._lock:
             return dict(self._loads.get(family, {}))
 
+    def lanes(self):
+        """Занятость по дорожкам: {дорожка: {слот: занято}}.
+
+        Дорожка — это не семья ключей: серверные задачи идут по имени провайдера,
+        свои ключи — по «byok:провайдер». Раньше это состояние жило только в памяти
+        процесса и наружу не отдавалось, поэтому экран «Ключи» честно писал, что
+        занятость слотов ему не видна. Теперь видна.
+        """
+        with self._lock:
+            return {lane: dict(loads) for lane, loads in self._loads.items() if loads}
+
 
 SERVER_CREDENTIAL_POOL = _ServerCredentialPool()
 
@@ -6299,24 +6310,78 @@ def _provider_call_budget(prov):
     return max(1, min(int(hard), int(base)))
 
 
-def _server_threads_setting(prov, default, hard):
+# Сколько задач провайдера идёт прямо сейчас. Кэш на две секунды: значение читается
+# на каждом запуске задачи, а меняется медленнее.
+_ACTIVE_JOBS_CACHE = {}
+
+
+def _provider_active_jobs(prov: str) -> int:
+    """Идущие задачи этого провайдера — БЕЗ той, которую сейчас запускаем.
+
+    Запускаемая ещё не в статусе running, поэтому себя мы здесь не считаем; за неё
+    отвечает «+1» у вызывающего.
+    """
+    now = time.time()
+    got = _ACTIVE_JOBS_CACHE.get(prov)
+    if got and now - got[0] < 2.0:
+        return got[1]
+    try:
+        c = db()
+        try:
+            n = c.execute("SELECT COUNT(*) FROM queue_tasks "
+                          "WHERE status='running' AND provider=?", (prov,)).fetchone()[0]
+        finally:
+            c.close()
+    except Exception:                                              # noqa: BLE001
+        n = 0
+    _ACTIVE_JOBS_CACHE[prov] = (now, int(n or 0))
+    return int(n or 0)
+
+
+# Куда записывается уже принятое решение о числе потоков. Ключ приватный: он попадает
+# в снимок настроек задачи и не должен выглядеть пользовательской настройкой.
+_GRANTED_THREADS_KEY = "_threads_granted"
+
+
+def _server_threads_setting(prov, default, hard, params=None):
     """«Потоков на проект» серверного ключа: админ-настройка (_concurrency.threads) вместо
     зашитого дефолта, но НИКОГДА выше код-потолка hard, ёмкости credential slot и
-    бюджета ВЫЗОВОВ ключа (задачи × потоки ≤ _provider_call_budget)."""
+    бюджета ВЫЗОВОВ ключа (задачи × потоки ≤ _provider_call_budget).
+
+    ИЗМЕНЕНО 04.09.2026: бюджет вызовов делится на ФАКТИЧЕСКОЕ число задач, а не на
+    настроенное число слотов. Раньше при четырёх настроенных слотах одинокая задача
+    получала четверть бюджета и ключ простаивал на три четверти. Теперь одна задача
+    берёт столько, сколько разрешают потолки, три — делят между собой.
+
+    Решение принимается ОДИН раз и запоминается в `params`: выдача слота и сборка
+    команды воркера зовут эту функцию в разные моменты, и если между ними другая
+    задача завершится, воркер получил бы больше потоков, чем под него зарезервировано.
+    Это ровно тот перебор, из-за которого провайдер отвечает 429.
+    """
+    if isinstance(params, dict):
+        granted = params.get(_GRANTED_THREADS_KEY)
+        if isinstance(granted, dict) and granted.get(prov):
+            return int(granted[prov])
+
     val = _provider_limit_opt(prov, "threads")
     base = max(1, min(int(hard), int(val or default)))
     if prov in _SLOT_CLAMPED_THREAD_PROVIDERS:
         base = max(1, min(base, _provider_slot_capacity_units(prov)))
     call_budget = _provider_call_budget(prov)
     if call_budget:
-        base = max(1, min(base, call_budget // max(1, _provider_job_slots(prov))))
+        # Делитель: сколько задач будет соревноваться за ключ, считая нашу. Сверху
+        # ограничен настроенным числом слотов — больше их всё равно не запустится.
+        rivals = max(1, min(_provider_job_slots(prov), _provider_active_jobs(prov) + 1))
+        base = max(1, min(base, call_budget // rivals))
+    if isinstance(params, dict):
+        params.setdefault(_GRANTED_THREADS_KEY, {})[prov] = base
     return base
 
 
 def _server_image_threads(params):
     provider = _task_provider("images", params)
     base = _server_threads_setting(provider, SHARED_IMAGE_THREADS_PER_JOB,
-                                   SHARED_IMAGE_THREADS_HARD)
+                                   SHARED_IMAGE_THREADS_HARD, params)
     # Делить потоки на цену модели нельзя (см. _task_capacity_units): из-за этого
     # NARWHAL_LITE получал 5 потоков вместо 8, хотя ключ тянет 25 любой моделью.
     if provider in ("recrafter", "veo"):
@@ -6327,7 +6392,7 @@ def _server_image_threads(params):
 def _server_video_threads(params):
     provider = _task_provider("video", params)
     base = _server_threads_setting(provider, SHARED_VIDEO_THREADS_PER_JOB,
-                                   SHARED_VIDEO_THREADS_HARD)
+                                   SHARED_VIDEO_THREADS_HARD, params)
     if provider in ("recrafter", "veo"):
         return max(1, min(base, _provider_budget_units(provider)))
     return base

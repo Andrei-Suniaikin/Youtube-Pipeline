@@ -761,6 +761,7 @@ def ui_keys():
         cursor = [{"provider": r["provider"], "last_uid": r["last_uid"],
                    "updated": r["updated"]}
                   for r in c.execute("SELECT * FROM provider_rr_cursor ORDER BY provider")]
+        busy = _pool_load()
     finally:
         c.close()
     return {
@@ -768,12 +769,42 @@ def ui_keys():
         "resting": resting,
         "own_keys": sorted(own, key=lambda o: (o["user"], o["family"])),
         "rr_cursor": cursor,
-        "unavailable": [
-            {"what": "занято слотов из лимита",
-             "why": "это состояние живёт только в памяти работающего сервиса; "
-                    "показать его точно пока нечем, а показывать примерно нельзя"},
-        ],
+        "busy": busy,
+        "unavailable": [],
     }
+
+
+def _pool_load() -> list:
+    """Сколько потоков занято прямо сейчас и сколько всего можно.
+
+    Это то самое, чего экран раньше не показывал: занятость жила в памяти сервиса.
+    Теперь кабинет и пульт — один процесс, и число можно спросить у самого пула,
+    а не выдумывать.
+    """
+    mod = sys.modules.get("main")
+    if mod is None or not hasattr(mod, "SERVER_CREDENTIAL_POOL"):
+        return []
+    try:
+        lanes = mod.SERVER_CREDENTIAL_POOL.lanes()
+    except Exception:                                              # noqa: BLE001
+        return []
+    out = []
+    for lane, loads in sorted(lanes.items()):
+        provider = lane.split(":", 1)[-1]
+        try:
+            capacity = int(mod._provider_slot_capacity_units(provider))
+        except Exception:                                          # noqa: BLE001
+            capacity = 0
+        used = sum(int(v or 0) for v in loads.values())
+        total = capacity * max(1, len(loads))
+        out.append({
+            "lane": lane, "provider": provider,
+            "own": lane.startswith("byok:"),
+            "slots": len(loads), "used": used, "capacity": capacity,
+            "total": total,
+            "percent": (round(100 * used / total) if total else 0),
+        })
+    return out
 
 
 # {channel_id:int} — не украшение: без указания типа этот путь перехватывает и

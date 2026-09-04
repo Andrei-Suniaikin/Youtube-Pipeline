@@ -453,6 +453,20 @@ async function viewKeys(){
     <p class="sub">Кто ждёт, сколько ждёт и когда снова заработает.</p>`));
 
   app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Занято прямо сейчас</div>
+    ${(d.busy || []).length ? d.busy.map(b => `<div class="stage">
+        <div class="dot ${b.percent >= 90 ? 's-error' : b.percent > 0 ? 's-running'
+          : 's-idle'}">${b.percent >= 90 ? '!' : b.percent > 0 ? '◐' : '·'}</div>
+        <div class="body">
+          <div class="name">${esc(b.provider)}${b.own ? ' · свои ключи' : ''}</div>
+          <div class="facts">${b.used} из ${b.total} потоков${
+            b.slots > 1 ? ` · ключей ${b.slots}` : ''}</div>
+          <div class="bar"><i style="width:${Math.min(100, b.percent)}%"></i></div>
+        </div></div>`).join('')
+      : '<div class="empty">Сейчас никто не работает — все потоки свободны.</div>'}
+  </div>`));
+
+  app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Очередь по провайдерам</div>
     ${d.providers.length ? `<table><thead><tr>
         <th>Провайдер</th><th>Ждут</th><th>В работе</th><th>Старейшая ждёт</th>
