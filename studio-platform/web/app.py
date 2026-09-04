@@ -42,7 +42,10 @@ from pub_engine import PHASES, PHASE_DEADLINES                   # noqa: E402
 from pub_remote import (COVER_BASE, REWRITE_BASE, donor_text,     # noqa: E402
                         get_key, video_id)
 from pub_services import MEDIA_STAGES, OPTIONAL_STAGES           # noqa: E402
+from pub_neighbors import (cover_presets, rewrite_presets,        # noqa: E402
+                           vsgen_presets)
 from pub_tags import add_links, parse_links, plan_rows           # noqa: E402
+import pub_ui                                                    # noqa: E402
 
 import pub_alerts                                                # noqa: E402
 import pub_alerts_tg                                             # noqa: E402
@@ -671,7 +674,9 @@ def ui_keys():
     }
 
 
-@app.get("/ui/channels/{channel_id}")
+# {channel_id:int} — не украшение: без указания типа этот путь перехватывает и
+# «/ui/channels/new», объявленный ниже, и форма заведения канала отвечает 422.
+@app.get("/ui/channels/{channel_id:int}")
 def ui_channel(channel_id: int, history: int = 14):
     """Канал: карточка, календарь с историей и пропусками, сводка.
 
@@ -704,6 +709,7 @@ def ui_channel(channel_id: int, history: int = 14):
             "channel": {
                 "id": ch["id"], "name": ch["name"], "handle": ch["handle"] or "",
                 "uc": ch["uc"], "lang": (ch["lang"] or "").upper(),
+                "lang_raw": ch["lang"] or "",
                 "niche": ch["niche"] or "", "status": ch["status"],
                 "tz": ch["tz"], "horizon_days": ch["horizon_days"],
                 "lead_days": ch["lead_days"],
@@ -715,6 +721,13 @@ def ui_channel(channel_id: int, history: int = 14):
                 "presets": {"rewrite": ch["preset_rewrite"] or "",
                             "vsgen": ch["preset_vsgen_id"],
                             "cover": ch["preset_cover"] or ""},
+                # Сырые значения — для формы настройки: она подставляет их в поля
+                # и отдаёт обратно теми же именами, что у формы кабинета.
+                "note": ch["note"] or "",
+                "profile_id": ch["profile_id"], "host_id": ch["host_id"],
+                "preset_vsgen_id": ch["preset_vsgen_id"],
+                "preset_rewrite": ch["preset_rewrite"] or "",
+                "preset_cover": ch["preset_cover"] or "",
             },
             "calendar": cal,
             "counts": counts,
@@ -1753,3 +1766,102 @@ def _preset_store(service: str, sid: str, request):
         return dict(body), put
 
     raise HTTPException(404, f"нет сервиса «{service}»")
+
+
+# ─────────────────────────── каналы: завести и настроить ───────────────────────────
+
+# Проверку полей и запись делает кабинет своими же функциями (`pub_ui.read_channel_form`,
+# `create_channel`, `update_channel`): расписание, часовой пояс, горизонт и лимиты
+# разбираются там по одним правилам для обоих интерфейсов. Вторая копия этих правил
+# разошлась бы с первой на первом же новом поле.
+
+@app.get("/ui/channels/new")
+def ui_channel_new():
+    """Из чего выбирать при заведении канала: пресеты, машины, профили, часовые пояса."""
+    c = db()
+    try:
+        profiles = [{"id": r["id"], "title": r["title"] or r["serial"],
+                     "serial": r["serial"]}
+                    for r in c.execute("SELECT id, serial, title FROM pub_profiles "
+                                       "WHERE tenant_id=? AND status='active' "
+                                       "ORDER BY serial", (TENANT,))]
+        hosts = [{"id": r["id"], "title": r["title"] or r["code"], "code": r["code"]}
+                 for r in c.execute("SELECT id, code, title FROM pub_hosts "
+                                    "WHERE tenant_id=? AND status='active' "
+                                    "ORDER BY code", (TENANT,))]
+        vsgen = [{"id": pid, "name": name} for pid, name in vsgen_presets(c, TENANT)]
+        rew = rewrite_presets(TENANT)
+        cov = cover_presets(TENANT)
+    finally:
+        c.close()
+    return {
+        "profiles": profiles, "hosts": hosts,
+        "presets": {"vsgen": vsgen, "rewrite": rew, "cover": cov},
+        "days": list(DAY_KEYS), "any_day": ANY_DAY,
+        "statuses": [{"key": k, "title": v} for k, v in pub_ui.STATUS_TITLES.items()],
+        "note": "остальное настраивается в карточке канала — она откроется сразу",
+    }
+
+
+class ChannelIn(BaseModel):
+    uc: str = ""
+    name: str = ""
+    lang: str = ""
+    niche: str = ""
+
+
+@app.post("/ui/channels")
+def ui_channel_create(body: ChannelIn):
+    """Завести канал. Полей четыре — остальное в карточке, как и в кабинете."""
+    c = db()
+    try:
+        cid = pub_ui.create_channel(c, TENANT, body.uc, body.name, body.lang, body.niche)
+    except pub_ui.ChannelError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:                                     # noqa: BLE001
+        if "UNIQUE" in str(exc):
+            raise HTTPException(409, "такой канал уже заведён")
+        raise
+    finally:
+        c.close()
+    return {"ok": True, "id": cid}
+
+
+@app.post("/ui/channels/{cid}")
+def ui_channel_edit(cid: int, body: dict):
+    """Сохранить настройки канала.
+
+    Тело — те же имена полей, что у формы кабинета: их разбирает его же
+    `read_channel_form`, вместе со всеми проверками и нормализацией расписания.
+    """
+    form = {k: (v if isinstance(v, list) else [v]) for k, v in (body or {}).items()}
+    c = db()
+    try:
+        row = c.execute("SELECT id FROM pub_channels WHERE id=? AND tenant_id=?",
+                        (cid, TENANT)).fetchone()
+        if not row:
+            raise HTTPException(404, "канал не найден")
+        try:
+            data = pub_ui.read_channel_form(form)
+        except (pub_ui.ChannelError, pub_ui.ScheduleError) as exc:
+            raise HTTPException(400, str(exc))
+        pub_ui.update_channel(c, TENANT, cid, data)
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True}
+
+
+@app.post("/ui/channels/{cid}/status")
+def ui_channel_status(cid: int, body: dict):
+    """Включить, поставить на паузу, убрать в архив."""
+    c = db()
+    try:
+        try:
+            pub_ui.set_channel_status(c, TENANT, cid, str((body or {}).get("status") or ""))
+        except pub_ui.ChannelError as exc:
+            raise HTTPException(400, str(exc))
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True}

@@ -202,6 +202,51 @@ def read_channel_form(form: dict) -> dict:
     }
 
 
+def create_channel(c, tenant_id: str, uc: str, name: str, lang: str = "",
+                   niche: str = "", now: float = None) -> int:
+    """Завести канал. Возвращает его id.
+
+    ВЫНЕСЕНО 04.09.2026 из роута: ту же запись делает пульт, и вторая её копия
+    разошлась бы с первой на первом же новом столбце.
+    """
+    import time as _t
+    now = _t.time() if now is None else now
+    uc = clean_uc(uc)
+    name = (name or "").strip()
+    if not name:
+        raise ChannelError("название канала обязательно")
+    cur = c.execute(
+        "INSERT INTO pub_channels(tenant_id,uc,name,lang,niche,created,updated)"
+        " VALUES(?,?,?,?,?,?,?)",
+        (tenant_id, uc, name, (lang or "").lower()[:8], (niche or "").strip(), now, now))
+    c.commit()
+    return cur.lastrowid
+
+
+def update_channel(c, tenant_id: str, cid: int, data: dict, now: float = None) -> None:
+    """Сохранить настройки канала. `data` — то, что вернул `read_channel_form`."""
+    import time as _t
+    now = _t.time() if now is None else now
+    c.execute(
+        "UPDATE pub_channels SET name=?,handle=?,lang=?,niche=?,profile_id=?,host_id=?,tz=?,"
+        "schedule=?,horizon_days=?,lead_days=?,deferred=?,deferred_limit=?,"
+        "preset_rewrite=?,preset_vsgen_id=?,"
+        "preset_cover=?,collaborator=?,note=?,updated=? WHERE id=? AND tenant_id=?",
+        (data["name"], data["handle"], data["lang"], data["niche"], data["profile_id"],
+         data["host_id"], data["tz"], data["schedule"], data["horizon_days"],
+         data["lead_days"], data["deferred"], data["deferred_limit"],
+         data["preset_rewrite"], data["preset_vsgen_id"],
+         data["preset_cover"], data["collaborator"], data["note"], now, cid, tenant_id))
+
+
+def set_channel_status(c, tenant_id: str, cid: int, status: str, now: float = None) -> None:
+    if status not in STATUS_TITLES:
+        raise ChannelError("неизвестный статус канала")
+    import time as _t
+    c.execute("UPDATE pub_channels SET status=?, updated=? WHERE id=? AND tenant_id=?",
+              (status, _t.time() if now is None else now, cid, tenant_id))
+
+
 IMPORT_FIELDS = ("name", "handle", "lang", "niche", "profile_id", "host_id", "tz", "note")
 
 
@@ -942,15 +987,10 @@ placeholder='[{"uc":"UC...","name":"Канал","lang":"pl","times":"10:00, 18:0
                 raise ChannelError("название канала обязательно")
         except ChannelError as exc:
             return _err_page(u, str(exc), "/channels/new")
-        now = _now()
         c = db()
         try:
-            cur = c.execute(
-                "INSERT INTO pub_channels(tenant_id,uc,name,lang,niche,created,updated)"
-                " VALUES(?,?,?,?,?,?,?)",
-                (_tid(u), uc, name, one(form, "lang").lower()[:8], one(form, "niche"), now, now))
-            c.commit()
-            new_id = cur.lastrowid
+            new_id = create_channel(c, _tid(u), uc, name, one(form, "lang"),
+                                    one(form, "niche"), _now())
         except Exception as exc:
             c.close()
             if "UNIQUE" in str(exc):
@@ -972,16 +1012,7 @@ placeholder='[{"uc":"UC...","name":"Канал","lang":"pl","times":"10:00, 18:0
             return _page("Ошибка", _card_html(u, row, str(exc)))
         now = _now()
         c = db()
-        c.execute(
-            "UPDATE pub_channels SET name=?,handle=?,lang=?,niche=?,profile_id=?,host_id=?,tz=?,"
-            "schedule=?,horizon_days=?,lead_days=?,deferred=?,deferred_limit=?,"
-            "preset_rewrite=?,preset_vsgen_id=?,"
-            "preset_cover=?,collaborator=?,note=?,updated=? WHERE id=? AND tenant_id=?",
-            (data["name"], data["handle"], data["lang"], data["niche"], data["profile_id"],
-             data["host_id"], data["tz"], data["schedule"], data["horizon_days"],
-             data["lead_days"], data["deferred"], data["deferred_limit"],
-             data["preset_rewrite"], data["preset_vsgen_id"],
-             data["preset_cover"], data["collaborator"], data["note"], now, cid, _tid(u)))
+        update_channel(c, _tid(u), cid, data, now)
         set_tags(c, _tid(u), cid, parse_tags(one(form, "tags")), now)
         c.commit()
         c.close()
@@ -995,8 +1026,7 @@ placeholder='[{"uc":"UC...","name":"Канал","lang":"pl","times":"10:00, 18:0
         if status not in STATUS_TITLES:
             raise HTTPException(400, "неизвестный статус канала")
         c = db()
-        c.execute("UPDATE pub_channels SET status=?, updated=? WHERE id=? AND tenant_id=?",
-                  (status, _now(), cid, _tid(u)))
+        set_channel_status(c, _tid(u), cid, status, _now())
         c.commit()
         c.close()
         # Из меню в каталоге возвращаемся в тот же список; чужие адреса не принимаем,

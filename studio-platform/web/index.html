@@ -39,6 +39,10 @@
   .modes{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
   .modes button{background:transparent;color:var(--muted);border:1px solid var(--line)}
   .modes button.on{background:var(--ink);color:#fff;border-color:var(--ink)}
+  .fldrow{display:flex;gap:8px;align-items:center;margin-top:8px;flex-wrap:wrap}
+  .fldrow>label:first-child{min-width:170px;color:var(--muted);font-size:12px}
+  .fldrow input,.fldrow select{padding:7px 9px;border:1px solid var(--border);
+                               border-radius:7px;font:inherit}
   nav span.soon::after{content:" скоро";font-size:11px;opacity:.8}
   main{max-width:1080px;margin:0 auto;padding:20px 16px 60px}
   h1{font-size:20px;margin:0 0 4px}
@@ -423,8 +427,42 @@ async function viewChannels(){
   app.append($(`<h1>Каналы</h1>
     <p class="sub">Расписание выходов, план и история. Цвет карточки — состояние канала.</p>`));
 
+  const bar = $(`<div class="toolbar"><span style="flex:1"></span>
+    <button id="newch">Новый канал</button></div>`);
+  app.append(bar);
+  bar.querySelector('#newch').onclick = () => {
+    if (document.getElementById('newch-form')) return;
+    const form = $(`<div class="card" id="newch-form" style="padding:16px;margin-bottom:16px">
+      <div class="sec">Новый канал</div>
+      <div id="err"></div>
+      <div class="fldrow"><label>ID канала</label>
+        <input id="uc" placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" style="width:340px"></div>
+      <div class="fldrow"><label>Название</label><input id="nm" style="width:340px"></div>
+      <div class="fldrow"><label>Язык / ниша</label>
+        <input id="lg" placeholder="pl" style="width:70px">
+        <input id="nc" style="width:240px"></div>
+      <div class="note muted">Расписание, пресеты и профиль — в карточке,
+        она откроется сразу.</div>
+      <div style="margin-top:12px"><button id="go">Создать</button>
+        <button class="ghost" id="no">Отмена</button></div>
+    </div>`);
+    bar.after(form);
+    const err = form.querySelector('#err');
+    form.querySelector('#no').onclick = () => form.remove();
+    form.querySelector('#go').onclick = async () => {
+      err.innerHTML = '';
+      try{
+        const out = await post('/ui/channels', {
+          uc: form.querySelector('#uc').value, name: form.querySelector('#nm').value,
+          lang: form.querySelector('#lg').value, niche: form.querySelector('#nc').value});
+        location.hash = '#/channel/' + out.id;
+      }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+    };
+  };
+
   if (!d.channels.length){
-    app.append($(`<div class="card"><div class="empty">Каналов нет.</div></div>`));
+    app.append($(`<div class="card"><div class="empty">Каналов нет.
+      Заведите первый — кнопка выше.</div></div>`));
     return;
   }
   const cls = c => c.status === 'active' ? 'active'
@@ -459,14 +497,20 @@ async function viewChannel(id){
     <h1>${esc(c.name)}</h1>
     <p class="sub">${esc(c.handle || '')} · ${esc(c.lang)} · ${esc(c.niche || '')}</p>`));
 
-  app.append($(`<div class="card" style="margin-bottom:16px"><div class="grid">
+  const head = $(`<div class="card" style="margin-bottom:16px"><div class="grid">
     <div><div class="k">Расписание</div>${esc(times)}</div>
     <div><div class="k">Часовой пояс</div>${esc(c.tz)}</div>
     <div><div class="k">Горизонт</div>${c.horizon_days} дн</div>
     <div><div class="k">Готовим заранее</div>${c.lead_days} дн</div>
     <div><div class="k">Машина</div>${esc(c.host || '—')}</div>
     <div><div class="k">Профиль</div>${esc(c.profile || '—')}</div>
-  </div></div>`));
+  </div>
+  <div class="sec" style="border-bottom:0;padding-bottom:0">
+    <button class="ghost" id="edit">Настроить</button>
+    <span id="statusbtns"></span></div>
+  <div id="editbox"></div></div>`);
+  app.append(head);
+  wireChannelEdit(head, c);
 
   const counts = Object.entries(d.counts)
     .map(([k, n]) => `<span class="pill ${CAL_CLS[k]}">${CAL_TITLE[k]}: ${n}</span>`).join(' ');
@@ -719,6 +763,105 @@ function showWho(){
     await post('/ui/logout').catch(() => {});
     ME = null;
     viewLogin('');
+  };
+}
+
+/* ───────────────────────── настройка канала ───────────────────────── */
+
+/* Поля и их проверка — кабинета: имена совпадают с его формой, а разбирает их его же
+   read_channel_form. Расписание, часовой пояс, горизонт и лимиты живут по одним
+   правилам в обоих интерфейсах; вторая копия правил разошлась бы на первом же поле. */
+const DAY_TITLE = {mon:'пн', tue:'вт', wed:'ср', thu:'чт', fri:'пт', sat:'сб', sun:'вс'};
+
+async function wireChannelEdit(root, c){
+  const box = root.querySelector('#editbox');
+  const ref = await api('/ui/channels/new');
+
+  root.querySelector('#statusbtns').innerHTML = ref.statuses
+    .filter(s => s.key !== c.status)
+    .map(s => `<button class="ghost chst" data-s="${s.key}">${esc(s.title)}</button>`)
+    .join('');
+  root.querySelectorAll('button.chst').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try{ await post(`/ui/channels/${c.id}/status`, {status: b.dataset.s}); await render(); }
+    catch(e){ b.disabled = false; alert(e.message); }
+  });
+
+  root.querySelector('#edit').onclick = () => {
+    if (box.innerHTML){ box.innerHTML = ''; return; }
+    const picked = new Set(Object.keys(c.schedule || {}));
+    const times = [...new Set(Object.values(c.schedule || {}).flat())].join(', ');
+    const sel = (id, items, cur, label) => `<div class="fldrow"><label>${label}</label>
+      <select id="${id}"><option value="">— не выбран —</option>${items.map(i =>
+        `<option value="${esc(String(i.value))}" ${String(i.value) === String(cur ?? '')
+          ? 'selected' : ''}>${esc(i.title)}</option>`).join('')}</select></div>`;
+    box.innerHTML = `
+      <div id="cherr"></div>
+      <div class="fldrow"><label>Название</label>
+        <input id="f-name" value="${esc(c.name)}" style="width:300px"></div>
+      <div class="fldrow"><label>Хэндл / язык / ниша</label>
+        <input id="f-handle" value="${esc(c.handle || '')}" style="width:150px">
+        <input id="f-lang" value="${esc(c.lang_raw ?? c.lang ?? '')}" style="width:60px">
+        <input id="f-niche" value="${esc(c.niche || '')}" style="width:180px"></div>
+      <div class="fldrow"><label>Дни</label>
+        <span class="langs" style="max-height:none;border:0;padding:0">${
+          ref.days.filter(x => x !== ref.any_day).map(dk =>
+            `<label data-day="${dk}" class="${picked.has(dk) ? 'on' : ''}"><input
+              type="checkbox" ${picked.has(dk) ? 'checked' : ''}>${DAY_TITLE[dk] || dk}
+            </label>`).join('')}</span></div>
+      <div class="fldrow"><label>Время выходов</label>
+        <input id="f-times" value="${esc(times)}" placeholder="10:00, 18:00"
+          style="width:220px"></div>
+      <div class="fldrow"><label>Часовой пояс</label>
+        <input id="f-tz" value="${esc(c.tz)}" style="width:200px"></div>
+      <div class="fldrow"><label>Горизонт / заранее</label>
+        <input id="f-hor" type="number" min="1" max="90" value="${c.horizon_days}"
+          style="width:80px"> дн
+        <input id="f-lead" type="number" min="0" max="30" value="${c.lead_days}"
+          style="width:80px"> дн</div>
+      <div class="fldrow"><label>Отложенные</label>
+        <label style="font-weight:400"><input type="checkbox" id="f-def"
+          ${c.deferred ? 'checked' : ''}> копить</label>
+        <input id="f-deflim" type="number" min="1" max="200"
+          value="${c.deferred_limit ?? 5}" style="width:80px"> шт</div>
+      ${sel('f-prof', ref.profiles.map(p => ({value: p.id, title: p.title})),
+            c.profile_id, 'Профиль AdsPower')}
+      ${sel('f-host', ref.hosts.map(h => ({value: h.id, title: h.title})),
+            c.host_id, 'Машина заливки')}
+      ${sel('f-pv', ref.presets.vsgen.map(p => ({value: p.id, title: p.name})),
+            c.preset_vsgen_id, 'Пресет производства')}
+      ${sel('f-pr', ref.presets.rewrite.map(n => ({value: n, title: n})),
+            c.preset_rewrite, 'Пресет рерайта')}
+      ${sel('f-pc', ref.presets.cover.map(n => ({value: n, title: n})),
+            c.preset_cover, 'Пресет обложки')}
+      <div class="fldrow"><label>Заметка</label>
+        <input id="f-note" value="${esc(c.note || '')}" style="width:100%"></div>
+      <div style="margin-top:12px"><button id="save">Сохранить</button></div>`;
+
+    box.querySelectorAll('span.langs label').forEach(l => {
+      const cb = l.querySelector('input');
+      cb.onchange = () => l.classList.toggle('on', cb.checked);
+    });
+    box.querySelector('#save').onclick = async () => {
+      const err = box.querySelector('#cherr');
+      err.innerHTML = '';
+      const days = [...box.querySelectorAll('span.langs label')]
+        .filter(l => l.querySelector('input').checked).map(l => l.dataset.day);
+      const v = id => box.querySelector('#' + id).value;
+      try{
+        await post(`/ui/channels/${c.id}`, {
+          name: v('f-name'), handle: v('f-handle'), lang: v('f-lang'),
+          niche: v('f-niche'), tz: v('f-tz'), times: v('f-times'), days,
+          horizon_days: v('f-hor'), lead_days: v('f-lead'),
+          deferred: box.querySelector('#f-def').checked ? '1' : '',
+          deferred_limit: v('f-deflim'),
+          profile_id: v('f-prof'), host_id: v('f-host'),
+          preset_vsgen_id: v('f-pv'), preset_rewrite: v('f-pr'),
+          preset_cover: v('f-pc'), note: v('f-note'),
+        });
+        await render();
+      }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+    };
   };
 }
 
