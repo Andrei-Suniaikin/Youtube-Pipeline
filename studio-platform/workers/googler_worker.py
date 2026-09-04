@@ -371,13 +371,18 @@ if GOOGLER_API_KEY == os.environ.get("GOOGLER_EXPIRED_KEY_MARKER", ""):
 # API URLs
 # 2026-06-12: API переехал app.recrafter.fun → googler.fast-gen.ai (старый хост = 502 Bad Gateway).
 # Эндпоинты, auth (X-API-Key), контракт (operation_id-поллинг) идентичны — сменился только хост.
-GOOGLER_BASE_URL_V4 = "https://googler.fast-gen.ai/api/v4"
-GOOGLER_BASE_URL_V3 = "https://googler.fast-gen.ai/api/v3"
-GOOGLER_BASE_URL_V2 = "https://googler.fast-gen.ai/api/v2"
+# 04.09.2026: хост вынесен в окружение. Значение по умолчанию прежнее, поведение
+# в бою не меняется. Нужно это для песочницы: без подменяемого адреса единственный
+# способ проверить путь к провайдеру — заплатить за настоящий вызов.
+GOOGLER_HOST = (os.environ.get("VS_GOOGLER_BASE")
+                or "https://googler.fast-gen.ai").rstrip("/")
+GOOGLER_BASE_URL_V4 = f"{GOOGLER_HOST}/api/v4"
+GOOGLER_BASE_URL_V3 = f"{GOOGLER_HOST}/api/v3"
+GOOGLER_BASE_URL_V2 = f"{GOOGLER_HOST}/api/v2"
 # 2026-06-27: провайдер мигрировал v4→v6 (старые per-provider /api/v4/*/image/* = 404). Новый
 # унифицированный эндпоинт POST /api/v6/generations (model+prompt+inputs+seed) → поллинг
 # GET /api/v6/generations/{id} → results[].download_url. Маппинг старых имён моделей → v6 id:
-GOOGLER_BASE_URL_V6 = "https://googler.fast-gen.ai/api/v6"
+GOOGLER_BASE_URL_V6 = f"{GOOGLER_HOST}/api/v6"
 IMAGE_MODEL_V6 = {
     "OPENAI": "openai-image", "FLOWER": "flower-image", "NARWHAL": "nano-banana-2",
     "NARWHAL_LITE": "nano-banana-2-lite",  # Nano Banana 2 Lite (flow, HARBOR_SEAL) — добавлена 2026-07-04
@@ -392,7 +397,8 @@ IMAGE_MODEL_V6 = {
 V6_SEED_MODELS = {"nano-banana-2", "nano-banana-pro", "nano-banana-2-lite"}
 VIDEO_METHOD_V6 = {"flower": "flower-video", "flow": "flow-video-fast", "grok": "grok-video"}  # veo (VeoNonStop) — отдельно
 GOOGLER_BASE_URL_V1 = GOOGLER_BASE_URL_V2  # Для обратной совместимости
-VEO_BASE_URL = "https://veononstop.org/api/v1"  # VeoNonStop — отдельный провайдер видео (X-API-Key: veo_...)
+VEO_BASE_URL = ((os.environ.get("VS_VEO_BASE") or "https://veononstop.org").rstrip("/")
+                + "/api/v1")  # VeoNonStop — отдельный провайдер видео (X-API-Key: veo_...)
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 
 # Модели
