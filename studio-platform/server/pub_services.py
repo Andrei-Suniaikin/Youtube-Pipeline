@@ -15,9 +15,11 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 
+import pub_calls
 from pub_engine import ItemFailed, ResourceDown
 from pub_log import add as log_line
 from pub_neighbors import rewrite_preset_config
@@ -199,11 +201,68 @@ class PubServices:
 
         if known is None:
             text = donor_text(rel["donor_url"])
-            file_id = client.upload_text(text, filename=f'{rel["release_id"]}.txt')
+            # 04.09.2026: рерайт подключён к журналу платных вызовов — на уровне
+            # (выпуск, язык), а не куска текста. Это ровно та единица, за которую платит
+            # кабинет: одна задача рерайта. Внутри неё Rewrite сам не переплачивает —
+            # у него есть пофрагментное продолжение (PROGRESS_MANAGER, «обрабатываем
+            # только незавершённые чанки»). А вот между запусками защиты не было:
+            # тот же текст, тот же пресет, новая задача — и оплата заново.
+            lang = rel["lang"] or "ru"
             # 04.09.2026: по общему идентификатору, а не по логину владельца тенанта.
             preset = rewrite_preset_config(rel["tenant_id"], rel["preset_rewrite"] or "")
-            job_id = client.create_job(file_id, rel["lang"] or "ru", preset,
-                                       channel_name=rel["ch_name"] or "")
+            fp = pub_calls.fingerprint(
+                text=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                lang=lang, preset=rel["preset_rewrite"] or "",
+                model=(preset or {}).get("model") or "")
+            decision = pub_calls.reserve(
+                c, tenant_id=rel["tenant_id"], project_id=rel["project_id"] or "",
+                release_id=rel["release_id"], kind="text", unit=lang, fp=fp,
+                provider="rewrite", model=(preset or {}).get("model") or "")
+            c.commit()
+            if decision["action"] == "skip":
+                # Тот же текст с теми же настройками уже оплачен и получен. Второй заказ
+                # был бы вторыми деньгами за тот же результат.
+                done = (decision["row"]["result_path"]
+                        or decision["row"]["remote_order_id"] or "")
+                log_line(c, rel["release_id"], "рерайт",
+                         f"этот текст на «{lang}» уже оплачен раньше "
+                         f"(задача {done or 'неизвестна'}) — новый заказ не создаю",
+                         level="warn")
+                if done:
+                    self._remember_remote(c, rel["release_id"], "rewrite", done,
+                                          rel["updated"])
+                    return {"wait": True}
+                raise ItemFailed("рерайт числится оплаченным, но задача не записана — "
+                                 "нужен разбор, повторно платить нельзя")
+            if decision["action"] == "verify":
+                # Заказ создавался, а результата мы не видели. Второй заказ — вторые
+                # деньги, поэтому подхватываем существующий по его id.
+                was = decision["row"]["remote_order_id"] or ""
+                if not was:
+                    raise ResourceDown("рерайт", "заказ создавался, id неизвестен — "
+                                                 "повторно платить нельзя до разбора")
+                log_line(c, rel["release_id"], "рерайт",
+                         f"задача {was} уже заказана раньше — подхватываю её, "
+                         f"нового заказа не создаю", level="warn")
+                self._remember_remote(c, rel["release_id"], "rewrite", was,
+                                      rel["updated"])
+                return {"wait": True}
+            file_id = client.upload_text(text, filename=f'{rel["release_id"]}.txt')
+            try:
+                job_id = client.create_job(file_id, lang, preset,
+                                           channel_name=rel["ch_name"] or "")
+            except Exception as exc:
+                # Заказа нет — денег нет: строку открываем заново, повтор безопасен.
+                pub_calls.mark_failed(c, decision["call_id"], str(exc)[:400],
+                                      ordered=False)
+                c.commit()
+                raise
+            # Задача создана — с этого момента она стоит денег, и её id это чек.
+            # «Готово» ставится позже, когда текст действительно забран: заказ и
+            # результат — разные события, и путать их значит потерять разницу между
+            # «оплачено» и «получено».
+            pub_calls.mark_ordered(c, decision["call_id"], job_id)
+            c.commit()
             self._remember_remote(c, rel["release_id"], "rewrite", job_id, rel["updated"])
             log_line(c, rel["release_id"], "рерайт",
                      f"субтитры донора {len(text)} символов, заказал задачу {job_id}, "
@@ -214,6 +273,7 @@ class PubServices:
         state = str(info.get("status") or "").lower()
         if state in ("error", "failed", "cancelled"):
             reason = "рерайт не справился: " + str(info.get("error") or state)
+            self._close_text_call(c, rel, error=reason)
             self._finish_remote(c, rel["release_id"], "rewrite", "error", reason)
             raise ItemFailed(reason)
         if state not in ("done", "completed", "finished", "success"):
@@ -226,11 +286,39 @@ class PubServices:
                 raise ItemFailed("рерайт вернул слишком короткий текст")
             self.store_source_text(c, rel["release_id"], text, rel["updated"])
         except Exception as exc:
+            self._close_text_call(c, rel, error=str(exc))
             self._finish_remote(c, rel["release_id"], "rewrite", "error", str(exc))
             raise
+        self._close_text_call(c, rel, result=known["remote_job_id"])
         self._finish_remote(c, rel["release_id"], "rewrite", "done")
         log_line(c, rel["release_id"], "рерайт", f"текст готов, {len(text)} символов")
         return {"payload": {"chars": len(text)}}
+
+    def _close_text_call(self, c, rel, result: str = "", error: str = "") -> None:
+        """Закрыть строку журнала за этот текст: получено или не получено.
+
+        Строку ищем по выпуску и языку, а не по отпечатку: на этом тике исходного
+        текста уже нет под рукой, а пара (выпуск, язык) определяет её однозначно.
+
+        Отказ закрывается как `ordered=True`: заказ был создан, деньги потрачены.
+        Повтор должен спросить про существующий заказ, а не создать новый.
+        """
+        lang = rel["lang"] or "ru"
+        try:
+            row = c.execute(
+                "SELECT id FROM provider_calls WHERE release_id=? AND kind='text' "
+                "AND unit=? ORDER BY id DESC LIMIT 1",
+                (rel["release_id"], lang)).fetchone()
+            if not row:
+                return
+            if result:
+                pub_calls.mark_delivered(c, row["id"], result)
+            else:
+                pub_calls.mark_failed(c, row["id"], (error or "текст не получен")[:400],
+                                      ordered=True)
+            c.commit()
+        except Exception:                                          # noqa: BLE001
+            pass          # журнал не должен ронять сам выпуск
 
     def do_project_ready(self, c, rel):
         """Завести проект VideoStudio из готового текста и запомнить его за выпуском."""
