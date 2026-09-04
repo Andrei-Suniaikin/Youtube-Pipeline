@@ -672,11 +672,12 @@ def register_pub_routes(app, ctx):
         ups = upload_jobs_by_release(c, row["id"])
         c.close()
 
-        name = u["name"]
-        rew = preset_field("preset_rewrite", [(x, x) for x in rewrite_presets(name)],
+        # 04.09.2026: спрашиваем по общему идентификатору, а не по логину. Логин
+        # сопоставлял людей на глаз; tenant_id — это один и тот же человек во всех трёх.
+        rew = preset_field("preset_rewrite", [(x, x) for x in rewrite_presets(tid)],
                            row["preset_rewrite"], REWRITE_URL, "Создать")
         vs = preset_field("preset_vsgen_id", vs_items, row["preset_vsgen_id"], "/presets", "Создать")
-        cov = preset_field("preset_cover", [(x, x) for x in cover_presets(name)],
+        cov = preset_field("preset_cover", [(x, x) for x in cover_presets(tid)],
                            row["preset_cover"], COVER_URL, "Создать")
 
         sched = json.loads(row["schedule"] or "{}")

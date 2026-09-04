@@ -61,14 +61,6 @@ class PubServices:
         self.default_username = ctx.get("username") or ""
         self.openai_key = ctx.get("openai_key") or (lambda: "")
 
-    def _username(self, c, tenant_id: str) -> str:
-        """Имя входа владельца кабинета — по нему ищутся его пресеты у соседей."""
-        if self.default_username:
-            return self.default_username
-        row = c.execute("SELECT name FROM users WHERE tenant_id=? ORDER BY id LIMIT 1",
-                        (tenant_id,)).fetchone()
-        return (row[0] if row else "") or ""
-
     def _uid(self, c, tenant_id: str):
         """Чьим именем ставить задачи в очередь: владелец этого кабинета."""
         if self.owner_uid:
@@ -208,8 +200,8 @@ class PubServices:
         if known is None:
             text = donor_text(rel["donor_url"])
             file_id = client.upload_text(text, filename=f'{rel["release_id"]}.txt')
-            preset = rewrite_preset_config(self._username(c, rel["tenant_id"]),
-                                           rel["preset_rewrite"] or "")
+            # 04.09.2026: по общему идентификатору, а не по логину владельца тенанта.
+            preset = rewrite_preset_config(rel["tenant_id"], rel["preset_rewrite"] or "")
             job_id = client.create_job(file_id, rel["lang"] or "ru", preset,
                                        channel_name=rel["ch_name"] or "")
             self._remember_remote(c, rel["release_id"], "rewrite", job_id, rel["updated"])

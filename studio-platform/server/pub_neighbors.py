@@ -2,109 +2,75 @@
 # -*- coding: utf-8 -*-
 """Списки пресетов соседних сервисов (Rewrite и Cover) для карточки канала.
 
-Все три сервиса живут на одной машине под одним владельцем, поэтому списки читаются
-прямо из их хранилищ — без ключей, токенов и сетевых вызовов. Только чтение.
+ПЕРЕПИСАНО 04.09.2026. Раньше этот модуль открывал чужие SQLite и чужие JSON прямо
+с диска и сопоставлял людей сравнением логинов. Это был анти-контракт: он держался
+на том, что соседи никогда не поменяют схему, и на том, что никто не заведёт двух
+разных людей с одинаковым логином.
 
-Пользователи у сервисов свои, общего идентификатора нет; связка идёт по ИМЕНИ входа
-(`Morbie` в кабинете = `Morbie` в рерайте = `Morbie` в обложках).
+Теперь всё иначе по двум причинам. Личность общая — `tenant_id` кабинета одинаков во
+всех трёх сервисах после `dev/migrate_identity.py`. И сервисы живут в одном процессе
+(`web/platform.py`), поэтому у соседа можно спросить его же функцией, а не читать его
+хранилище. Схема соседа снова принадлежит соседу.
 
-Любая ошибка — пустой список, а не исключение: карточка канала не должна падать из-за
-того, что сосед переехал или остановлен. Пустой список интерфейс показывает как
-«список недоступен» и оставляет ручной ввод.
+Ключ доступа для этого не нужен и сознательно не используется: ключ принадлежит одному
+человеку и отдал бы ЕГО пресеты. Карточка канала партнёра показывала бы пресеты
+владельца — молча и правдоподобно, худший вид ошибки.
+
+Если сосед не в этом процессе (сервисы подняты по старинке, порознь), список пуст.
+Интерфейс показывает это как «список недоступен» и оставляет ручной ввод — так же,
+как раньше вёл себя остановленный сосед.
 """
 
 from __future__ import annotations
 
-import json
 import os
-import sqlite3
-
-REWRITE_DIR = os.environ.get("VS_REWRITE_DIR", "/root/rewrite-server")
-COVER_DIR = os.environ.get("VS_COVER_DIR", "/root/cover_tool")
+import sys
 
 REWRITE_URL = os.environ.get("VS_REWRITE_URL", "https://rewrite.13.140.129.66.sslip.io")
 COVER_URL = os.environ.get("VS_COVER_URL", "https://cover.13.140.129.66.sslip.io")
 
 
-def _user_id(db_path: str, username: str) -> str:
-    """Найти идентификатор пользователя соседа по имени входа."""
-    if not username or not os.path.exists(db_path):
-        return ""
-    try:
-        c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
-        try:
-            row = c.execute(
-                "SELECT user_id FROM users WHERE username=? COLLATE NOCASE LIMIT 1",
-                (username,)).fetchone()
-        finally:
-            c.close()
-        return row[0] if row else ""
-    except Exception:
-        return ""
+def _neighbour(module: str):
+    """Модуль соседа, если он поднят в этом же процессе. Иначе None."""
+    return sys.modules.get(module)
 
 
-def _names_from_json(path: str, key: str = "") -> list:
-    """Достать имена пресетов из файла соседа. Формат у сервисов разный."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        return []
-    if key:
-        data = data.get(key) or {}
-    if isinstance(data, dict):
-        names = list(data.keys())
-    elif isinstance(data, list):
-        names = [x.get("name") for x in data if isinstance(x, dict) and x.get("name")]
-    else:
-        return []
-    return sorted((n for n in names if isinstance(n, str) and n.strip()), key=str.lower)
-
-
-def rewrite_presets(username: str) -> list:
+def rewrite_presets(user_id: str) -> list:
     """Пресеты РЕРАЙТА (не генерации!).
 
-    Живут в sessions.db → user_keys.rew_presets, а не в presets/<uid>/generation.json:
-    там лежат брифы для создания текста с нуля, к рерайту по ссылке они отношения не имеют.
+    Разница существенная: пресеты рерайта по ссылке и брифы создания текста с нуля
+    живут в разных хранилищах и означают разное. Канал ссылается именно на первые.
     """
-    return sorted(_rewrite_preset_map(username).keys(), key=str.lower)
+    return sorted(_rewrite_preset_map(user_id).keys(), key=str.lower)
 
 
-def rewrite_preset_config(username: str, name: str) -> dict:
+def rewrite_preset_config(user_id: str, name: str) -> dict:
     """Содержимое пресета рерайта: модель, потоки, размер куска, стиль обращения."""
-    got = _rewrite_preset_map(username).get(name)
+    got = _rewrite_preset_map(user_id).get(name)
     return got if isinstance(got, dict) else {}
 
 
-def _rewrite_preset_map(username: str) -> dict:
-    db_path = os.path.join(REWRITE_DIR, "sessions.db")
-    uid = _user_id(db_path, username)
-    if not uid or not os.path.exists(db_path):
+def _rewrite_preset_map(user_id: str) -> dict:
+    mod = _neighbour("server")
+    if not user_id or mod is None or not hasattr(mod, "_api_presets"):
         return {}
     try:
-        c = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
-        try:
-            row = c.execute("SELECT rew_presets FROM user_keys WHERE user_id=?",
-                            (uid,)).fetchone()
-        finally:
-            c.close()
-    except Exception:
-        return {}
-    if not row or not row[0]:
-        return {}
-    try:
-        data = json.loads(row[0])
-    except Exception:
+        data = (mod._api_presets(str(user_id)) or {}).get("rewrite") or {}
+    except Exception:                                              # noqa: BLE001
         return {}
     return data if isinstance(data, dict) else {}
 
 
-def cover_presets(username: str) -> list:
-    """Пресеты Cover Generator: presets/<uid>/presets.json — словарь имя → настройки."""
-    uid = _user_id(os.path.join(COVER_DIR, "cover_sessions.db"), username)
-    if not uid:
+def cover_presets(user_id: str) -> list:
+    """Пресеты Cover Generator — именами, как их видит сам Cover."""
+    mod = _neighbour("cover_server")
+    if not user_id or mod is None or not hasattr(mod, "_get_preset_manager"):
         return []
-    return _names_from_json(os.path.join(COVER_DIR, "presets", uid, "presets.json"))
+    try:
+        names = list((mod._get_preset_manager(str(user_id))._presets or {}).keys())
+    except Exception:                                              # noqa: BLE001
+        return []
+    return sorted((n for n in names if isinstance(n, str) and n.strip()), key=str.lower)
 
 
 def vsgen_presets(db_conn, tenant_id: str) -> list:
