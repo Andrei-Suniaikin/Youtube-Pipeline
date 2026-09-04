@@ -1107,7 +1107,7 @@ async function viewPresets(){
   }
 
   for (const g of d.groups){
-    app.append($(`<div class="card" style="margin-bottom:16px">
+    const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)}</div>
       ${g.error
         ? `<div class="stage"><div class="dot s-error">!</div><div class="body">
@@ -1125,11 +1125,48 @@ async function viewPresets(){
                    ? 'каналы: ' + i.channels.map(ch =>
                        `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')
                    : 'ни один канал им не пользуется'}</div>
+             </div>
+             <div style="white-space:nowrap;align-self:center">
+               <button class="ghost pcopy" data-svc="${esc(g.service)}"
+                 data-name="${esc(i.name)}">Копия</button>
+               <button class="ghost pdel" data-svc="${esc(g.service)}"
+                 data-name="${esc(i.name)}">Удалить</button>
              </div></div>`).join('')
            : '<div class="empty">Пресетов нет.</div>')}
       ${g.note ? `<div class="note muted">${esc(g.note)}</div>` : ''}
-    </div>`));
+    </div>`);
+    app.append(card);
+    wirePresets(card);
   }
+  app.append($(`<div class="note muted">Копия и удаление — целые действия. Правка полей
+    осталась в самом сервисе: у пресета обложек их больше двадцати, и половинчатый
+    редактор показывал бы поля, которых движок не читает.</div>`));
+}
+
+function wirePresets(root){
+  const ask = async (b, fn) => {
+    b.disabled = true;
+    try{ await fn(); await render(); }
+    catch(e){
+      b.disabled = false;
+      const box = document.createElement('div');
+      box.className = 'note bad';
+      box.textContent = e.message;
+      b.parentElement.appendChild(box);
+    }
+  };
+  root.querySelectorAll('button.pcopy').forEach(b => b.onclick = () => {
+    const to = prompt(`Имя копии пресета «${b.dataset.name}»:`,
+                      b.dataset.name + ' — копия');
+    if (!to) return;
+    ask(b, () => post(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/copy`,
+                      {from: b.dataset.name, to}));
+  });
+  root.querySelectorAll('button.pdel').forEach(b => b.onclick = () => {
+    if (!confirm(`Удалить пресет «${b.dataset.name}»?`)) return;
+    ask(b, () => api(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/${
+      encodeURIComponent(b.dataset.name)}`, {method: 'DELETE'}));
+  });
 }
 
 /* ─────────────────────────── админ: тревоги и диск ─────────────────────────── */

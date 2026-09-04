@@ -1598,3 +1598,144 @@ def _file_kind(name: str) -> str:
     if ext in (".txt", ".md", ".srt", ".json"):
         return "text"
     return "file"
+
+
+# ────────────────────────── пресеты: копия и удаление ──────────────────────────
+
+# Копирование и удаление — целые операции: пресет либо появился целиком, либо нет.
+# Редактора полей здесь сознательно НЕТ. У пресета обложек их больше двадцати,
+# и половинчатый редактор — это ровно та ложь интерфейса, которую мы убираем:
+# поле показано, а движок его не читает. Правка полей остаётся в самом сервисе,
+# ссылка на него рядом. Копия закрывает то, что нужно каждый день, — «такой же,
+# но для другого канала».
+
+@app.post("/ui/presets/{service}/copy")
+def ui_preset_copy(service: str, body: dict, request: Request):
+    """Сделать копию пресета под новым именем. Существующее имя не затирается."""
+    src = str(body.get("from") or "").strip()
+    dst = str(body.get("to") or "").strip()
+    if not src or not dst:
+        raise HTTPException(400, "нужны имя источника и имя копии")
+    if src == dst:
+        raise HTTPException(400, "имя копии совпадает с исходным")
+    sid = getattr(request.state, "sid", "")
+    store, put = _preset_store(service, sid, request)
+    if src not in store:
+        raise HTTPException(404, f"пресета «{src}» нет")
+    if dst in store:
+        raise HTTPException(409, f"пресет «{dst}» уже есть — выберите другое имя")
+    store[dst] = _renamed(store[src], dst)
+    put(store)
+    return {"ok": True, "name": dst}
+
+
+@app.delete("/ui/presets/{service}/{name}")
+def ui_preset_delete(service: str, name: str, request: Request):
+    """Удалить пресет. Если на него ссылается канал — сначала сказать, какой."""
+    sid = getattr(request.state, "sid", "")
+    c = db()
+    try:
+        column = {"vsgen": "preset_vsgen_id", "rewrite": "preset_rewrite",
+                  "cover": "preset_cover"}.get(service)
+        used = []
+        if column:
+            used = [r["name"] for r in c.execute(
+                f"SELECT name FROM pub_channels WHERE tenant_id=? AND {column}=?",
+                (TENANT, name))]
+    finally:
+        c.close()
+    if used:
+        raise HTTPException(409, "на него ссылаются каналы: " + ", ".join(used)
+                            + ". Сначала переключите их — иначе они встанут в момент "
+                              "генерации, а не сейчас.")
+    store, put = _preset_store(service, sid, request)
+    if name not in store:
+        raise HTTPException(404, f"пресета «{name}» нет")
+    store.pop(name)
+    put(store)
+    return {"ok": True}
+
+
+def _renamed(preset, name: str):
+    """Копия с новым именем. Имя лежит и внутри значения — иначе копия зовётся старым."""
+    if isinstance(preset, dict):
+        out = dict(preset)
+        if "name" in out:
+            out["name"] = name
+        out.pop("id", None)          # id пересоздаст сам сервис: копия — не тот же пресет
+        return out
+    return preset
+
+
+def _preset_store(service: str, sid: str, request):
+    """(словарь пресетов, как его записать обратно) для одного из трёх сервисов.
+
+    Запись у соседей идёт полной заменой — так же, как это делает их собственный
+    интерфейс. Поэтому читаем весь набор, меняем и отдаём целиком: частичная запись
+    поверх чужой правки потеряла бы её молча.
+    """
+    if service == "vsgen":
+        c = db()
+        try:
+            rows = {r["name"]: {"name": r["name"], "settings": r["settings"],
+                                "id": r["id"]}
+                    for r in c.execute("SELECT id, name, settings FROM presets "
+                                       "WHERE tenant_id=?", (TENANT,))}
+        finally:
+            c.close()
+
+        def put(store):
+            now = time.time()
+            c2 = db()
+            try:
+                have = {r["name"]: r["id"] for r in c2.execute(
+                    "SELECT id, name FROM presets WHERE tenant_id=?", (TENANT,))}
+                for name, val in store.items():
+                    if name not in have:
+                        c2.execute("INSERT INTO presets(tenant_id,name,settings,created) "
+                                   "VALUES(?,?,?,?)",
+                                   (TENANT, name, (val or {}).get("settings") or "{}", now))
+                for name, pid in have.items():
+                    if name not in store:
+                        c2.execute("DELETE FROM presets WHERE id=? AND tenant_id=?",
+                                   (pid, TENANT))
+                c2.commit()
+            finally:
+                c2.close()
+        return rows, put
+
+    if service == "cover":
+        code, body = _cover("/presets", sid)
+        if code >= 400 or not isinstance(body, dict):
+            raise HTTPException(_pass_code(code), body or "список пресетов не получен")
+
+        def put(store):
+            code2, out = _cover("/presets/sync", sid, {"presets": store})
+            if code2 >= 400:
+                raise HTTPException(_pass_code(code2), out)
+        return dict(body), put
+
+    if service == "rewrite":
+        code, body = _rw("/settings/keys", sid)
+        if code >= 400 or not isinstance(body, dict):
+            raise HTTPException(_pass_code(code), body or "настройки не получены")
+        store = dict(body.get("rew_presets") or {})
+
+        def put(s):
+            code2, out = _rw("/settings/presets", sid, {"rew_presets": s})
+            if code2 >= 400:
+                raise HTTPException(_pass_code(code2), out)
+        return store, put
+
+    if service == "rewrite_gen":
+        code, body = _rw("/presets", sid)
+        if code >= 400 or not isinstance(body, dict):
+            raise HTTPException(_pass_code(code), body or "брифы не получены")
+
+        def put(s):
+            code2, out = _rw("/presets/sync", sid, {"presets": s})
+            if code2 >= 400:
+                raise HTTPException(_pass_code(code2), out)
+        return dict(body), put
+
+    raise HTTPException(404, f"нет сервиса «{service}»")
