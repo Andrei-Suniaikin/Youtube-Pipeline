@@ -1070,7 +1070,9 @@ def ui_alerts():
 def ui_disk():
     """Место, проекты и цена уборки (ТЗ §03/12).
 
-    Ничего не удаляет и не может: удаление живёт в `dev/retention.py --apply`.
+    Ничего не удаляет и не может: удаление живёт в уборщике (`dev/retention.py`), а
+    решение о сроке — в `.env` владельца. Из интерфейса чужие файлы не удаляются
+    нажатием кнопки: слишком дёшево для необратимого действия.
     Здесь видно ровно то, на основании чего принимается решение, включая то, сколько
     оплаченных вызовов исчезнет вместе с файлами.
     """
@@ -1080,6 +1082,7 @@ def ui_disk():
         pol = pub_retention.policy(c)
         projects = pub_retention.scan(c, TENANTS_DIR, TENANT)
         acts = pub_retention.plan(projects, pol, now)
+        last = pub_retention.last_sweep(c)
     finally:
         c.close()
     rows, freeable = [], 0
@@ -1109,13 +1112,22 @@ def ui_disk():
         "nodes": nodes,
         "policy": pol,
         "policy_set": bool(pol),
+        # Кто задал срок и убирает ли система сама. Это разные вопросы: срок может быть
+        # задан, а уборка выключена — тогда экран показывает счёт, но ничего не тронуто.
+        "source": pol.get("source", ""),
+        "auto": pub_retention.auto_enabled(),
+        "every_sec": pub_retention.every_sec(),
+        "env": {"strip": pub_retention.ENV_STRIP, "drop": pub_retention.ENV_DROP,
+                "auto": pub_retention.ENV_AUTO},
+        "last": last,
         "projects": rows,
         "total": sum(r["total"] for r in rows),
         "freeable": freeable,
         "categories": [{"code": c_, "name": n, "fate": f}
                        for c_, n, f, _pat in pub_retention.CATEGORIES],
-        "how": "сроки хранения задаёт владелец: через сколько дней после публикации "
-               "убирать промежуточные файлы и через сколько удалять проект целиком",
+        "how": "сроки хранения задаёт владелец в .env: через сколько дней после "
+               "публикации убирать промежуточные файлы и через сколько удалять проект "
+               "целиком. Пока VS_RETENTION_AUTO не выставлен — только счёт, без уборки",
     }
 
 

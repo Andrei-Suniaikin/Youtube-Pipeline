@@ -56,6 +56,20 @@ else
   ALERTS="  тревоги  выключены: нет VS_TG_TOKEN / VS_TG_CHAT в .env (см. .env.example)"
 fi
 
+# Уборка диска — тоже отдельным процессом (в бою systemd-таймер). Крутится всегда, когда
+# задан срок хранения: без VS_RETENTION_AUTO проход только считает и пишет отчёт для
+# экрана «Админ → Диск», ничего не удаляя.
+if grep -qE '^VS_RETENTION_(STRIP|DROP)_DAYS=[0-9]+' "$ROOT/.env" 2>/dev/null; then
+  ( cd "$ROOT" && "$PY" dev/retention.py --loop ) &
+  if grep -qE '^VS_RETENTION_AUTO=(1|yes|on|true)' "$ROOT/.env" 2>/dev/null; then
+    CLEAN="  уборка  ВКЛЮЧЕНА: старые проекты будут удаляться сами"
+  else
+    CLEAN="  уборка  только считает: нет VS_RETENTION_AUTO=1 (см. Админ → Диск)"
+  fi
+else
+  CLEAN="  уборка  срок хранения не задан: VS_RETENTION_STRIP_DAYS / _DROP_DAYS в .env"
+fi
+
 echo
 echo "  пульт    http://127.0.0.1:$PORT/studio/    (новый единый интерфейс)"
 echo "  кабинет  http://127.0.0.1:$PORT/           (боевой VSGen, пути прежние)"
@@ -63,6 +77,7 @@ echo "  rewrite  http://127.0.0.1:$PORT/rewrite/"
 echo "  cover    http://127.0.0.1:$PORT/cover/"
 echo "  что смонтировано: http://127.0.0.1:$PORT/_platform"
 echo "$ALERTS"
+echo "$CLEAN"
 echo
 echo "  вход — логин и пароль кабинета (dev / VS_DEV_PASSWORD)."
 echo "  ключи соседей и пароль живут в базе; после dev/make_db.py их нужно выдать заново:"

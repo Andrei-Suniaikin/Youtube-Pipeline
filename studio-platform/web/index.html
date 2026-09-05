@@ -1918,12 +1918,25 @@ async function viewAdmin(){
             + 'место кончается — значит задачи падают, не доходя до вердикта.</div>' : ''}
       </div></div>`).join('')}
     <div class="stage">
-      <div class="dot ${d.policy_set ? 's-done' : 's-idle'}">${d.policy_set ? '✓' : '?'}</div>
+      <div class="dot ${!d.policy_set ? 's-idle' : d.auto ? 's-done' : 's-queued'}">${
+        !d.policy_set ? '?' : d.auto ? '✓' : '·'}</div>
       <div class="body">
         <div class="name">${d.policy_set
           ? `Срок хранения: очистка через ${d.policy.strip_after_days ?? '—'} дн.,
              удаление через ${d.policy.drop_after_days ?? '—'} дн.`
-          : 'Срок хранения владельцем не задан — ничего не удаляется'}</div>
+          : 'Срок хранения не задан — ничего не удаляется'}</div>
+        <div class="facts">${d.policy_set
+          ? `${d.source === 'env' ? 'из .env' : 'из базы (запасной путь)'} · проверка раз в
+             ${Math.round(d.every_sec / 60)} мин`
+          : `задаётся в .env: <span class="mono">${esc(d.env.strip)}</span>,
+             <span class="mono">${esc(d.env.drop)}</span>`}</div>
+        ${d.policy_set && !d.auto ? `<div class="note">Уборка выключена: система только
+           считает, что было бы удалено. Чтобы убирала сама —
+           <span class="mono">${esc(d.env.auto)}=1</span> в .env.</div>` : ''}
+        ${d.last && d.last.at ? `<div class="note ${d.last.errors && d.last.errors.length
+            ? 'bad' : 'muted'}">последний проход ${when(d.last.at)}:
+           ${esc(d.last.line || '')}${(d.last.errors || []).length
+             ? ` · ошибок: ${d.last.errors.length}` : ''}</div>` : ''}
         <div class="note muted">${esc(d.how)}</div>
       </div>
     </div>

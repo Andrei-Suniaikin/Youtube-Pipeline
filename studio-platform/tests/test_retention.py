@@ -204,6 +204,73 @@ def main() -> int:
         check("отказ записан", len(out["errors"]), 1)
         check("каталог цел", os.path.exists(strange), True)
 
+        print("\nСрок хранения из .env")
+        c = fresh_db([("dev", "p4")])
+        check("пусто — значит не задано", R.env_policy({}), {})
+        check("пустая строка — не ноль дней",
+              R.env_policy({R.ENV_STRIP: "", R.ENV_DROP: "  "}), {})
+        check("мусор — не задано", R.env_policy({R.ENV_STRIP: "две недели"}), {})
+        check("отрицательное — не задано", R.env_policy({R.ENV_DROP: "-5"}), {})
+        check("число прочитано",
+              R.env_policy({R.ENV_STRIP: "14", R.ENV_DROP: "90"}),
+              {"strip_after_days": 14, "drop_after_days": 90})
+        check("ноль — это ноль, а не «не задано»",
+              R.env_policy({R.ENV_STRIP: "0"}), {"strip_after_days": 0})
+
+        print("\n  .env выигрывает у базы, и не наполовину")
+        c.execute("INSERT INTO admin_state VALUES('retention',?,0)",
+                  (json.dumps({"strip_after_days": 3, "drop_after_days": 5}),))
+        pol = R.policy(c, {R.ENV_STRIP: "14"})
+        check("срок из .env", pol["strip_after_days"], 14)
+        check("срок из базы не подмешался", "drop_after_days" in pol, False)
+        check("источник назван", pol["source"], "env")
+        check("без .env работает база", R.policy(c, {})["strip_after_days"], 3)
+        check("и это видно", R.policy(c, {})["source"], "db")
+
+        print("\n  выключатель уборки понимает только явное «да»")
+        for v, want in (("1", True), ("yes", True), ("on", True), ("true", True),
+                        ("", False), ("0", False), ("no", False), ("позже", False)):
+            check(f"{R.ENV_AUTO}={v!r} → {want}", R.auto_enabled({R.ENV_AUTO: v}), want)
+        check("период по умолчанию", R.every_sec({}), R.EVERY_DEFAULT)
+        check("период читается", R.every_sec({R.ENV_EVERY: "600"}), 600)
+        check("чаще пяти минут не бывает",
+              R.every_sec({R.ENV_EVERY: "5"}), R.EVERY_MIN)
+        check("мусор не роняет период",
+              R.every_sec({R.ENV_EVERY: "часто"}), R.EVERY_DEFAULT)
+
+        print("\nПроход уборки: срок задан, VS_RETENTION_AUTO не выставлен")
+        d4 = make_project(root, "dev", "p4", frames=10, clips=1)
+        c = fresh_db([("dev", "p4")], calls=10)
+        env = {R.ENV_STRIP: "7"}
+        res = R.sweep(c, root, now=NOW, env=env, log=lambda *_a: None)
+        check("проход считает, а не убирает", res["dry_run"], True)
+        check("нашёл, что убрать", res["planned"], 1)
+        check("кадры на месте", os.path.isdir(os.path.join(d4, "googler")), True)
+        check("названа цена решения", res["lost_calls"], 10)
+        check("сказано, почему ничего не произошло",
+              R.ENV_AUTO in res["line"], True)
+        check("отчёт записан", R.last_sweep(c)["planned"], 1)
+
+        print("\n  та же настройка плюс VS_RETENTION_AUTO=1 — уборка идёт")
+        env[R.ENV_AUTO] = "1"
+        res = R.sweep(c, root, now=NOW, env=env, log=lambda *_a: None)
+        check("проход настоящий", res["dry_run"], False)
+        check("очищен один проект", res["strip"], 1)
+        check("кадров нет", os.path.isdir(os.path.join(d4, "googler")), False)
+        check("готовый ролик цел",
+              os.path.exists(os.path.join(d4, "render", "out.mp4")), True)
+        check("освобождённое посчитано", res["freed"] > 0, True)
+        check("ошибок нет", res["errors"], [])
+        last = R.last_sweep(c)
+        check("отчёт перезаписан", last["dry_run"], False)
+        check("и помнит источник срока", last["source"], "env")
+
+        print("\n  срока нет — проход не делает ничего и говорит об этом")
+        c = fresh_db([("dev", "p5")])
+        res = R.sweep(c, root, now=NOW, env={}, log=lambda *_a: None)
+        check("ничего не запланировано", res["planned"], 0)
+        check("причина названа", "срок хранения не задан" in res["line"], True)
+
         print("\nПропавший каталог не ломает разбор")
         c = fresh_db([("dev", "нет-такого")])
         acts = R.plan(R.scan(c, root), {"drop_after_days": 0}, now=NOW)

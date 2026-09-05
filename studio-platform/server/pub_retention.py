@@ -10,9 +10,9 @@
   решить      — по правилу владельца, а не по нашему вкусу
   сделать     — с проверкой каждого пути, и по умолчанию не делая ничего
 
-**Правила по умолчанию нет.** Пока владелец не назвал сроки (`admin_state.retention`),
-`plan()` возвращает «оставить» для всего и говорит почему. Придумывать срок хранения
-за владельца нельзя: ошибка здесь необратима и стоит денег.
+**Правила по умолчанию нет.** Пока владелец не назвал сроки, `plan()` возвращает
+«оставить» для всего и говорит почему. Придумывать срок хранения за владельца нельзя:
+ошибка здесь необратима и стоит денег.
 
 Два уровня уборки, и разница между ними принципиальна:
 
@@ -25,6 +25,21 @@
 
 Условие для обоих — фаза `published`. Не `done` и не `scheduled`: `done` в этой системе
 означает «расписание проверено», а не «ролик вышел» (известная ловушка проекта).
+
+Сроки задаются в `.env` — их меняет владелец на своём сервере, без нас и без базы:
+
+    VS_RETENTION_STRIP_DAYS=14   через сколько дней после публикации убрать промежуточное
+    VS_RETENTION_DROP_DAYS=90    через сколько удалить проект целиком
+    VS_RETENTION_AUTO=1          уборка идёт сама; без этого — только показывает
+
+`.env` выигрывает у базы намеренно: правило хранения — это решение владельца о его
+деньгах и его диске, и оно должно меняться там, куда он имеет доступ, а не кнопкой
+в интерфейсе, которую можно нажать случайно. Значение из базы (`dev/retention.py
+--policy`) остаётся как запасной путь и работает, только пока `.env` молчит.
+
+Автоуборка по умолчанию ВЫКЛЮЧЕНА, и это не перестраховка: сроки без `VS_RETENTION_AUTO`
+дают отчёт «что было бы удалено», по которому видно цену решения до того, как оно
+станет необратимым.
 """
 from __future__ import annotations
 
@@ -35,8 +50,17 @@ import shutil
 import time
 
 STATE_KEY = "retention"
+LAST_KEY = "retention_last"        # что сделала последняя уборка — для интерфейса
 GB = 1024 ** 3
 MB = 1024 ** 2
+
+ENV_STRIP = "VS_RETENTION_STRIP_DAYS"
+ENV_DROP = "VS_RETENTION_DROP_DAYS"
+ENV_AUTO = "VS_RETENTION_AUTO"
+ENV_EVERY = "VS_RETENTION_EVERY_SEC"
+
+EVERY_DEFAULT = 3600
+EVERY_MIN = 300                    # чаще смысла нет: проекты стареют днями, не минутами
 
 # Что внутри проекта чем является. Порядок важен: первая подходящая категория выигрывает,
 # поэтому «готовый mp4» стоит раньше «клипов» — оба .mp4, но лежат в разных папках.
@@ -165,14 +189,55 @@ def scan(c, tenants_dir: str, tenant=None) -> list:
 
 # ─────────────────────────────── решить ───────────────────────────────
 
-def policy(c) -> dict:
-    """Правило владельца. Пустое — значит правила нет, и это не то же самое, что ноль."""
+def db_policy(c) -> dict:
+    """Что записано в базу (`dev/retention.py --policy`). Запасной путь, не главный."""
     row = c.execute("SELECT v FROM admin_state WHERE k=?", (STATE_KEY,)).fetchone()
     try:
         data = json.loads(row[0]) if row and row[0] else {}
     except ValueError:
         data = {}
     return data if isinstance(data, dict) else {}
+
+
+def env_policy(env=None) -> dict:
+    """Что задано в `.env`. Пустая переменная — это «не задано», а не «ноль дней»."""
+    env = os.environ if env is None else env
+    out = {}
+    for key, name in (("strip_after_days", ENV_STRIP), ("drop_after_days", ENV_DROP)):
+        days = _days(env.get(name))
+        if days is not None:
+            out[key] = days
+    return out
+
+
+def policy(c=None, env=None) -> dict:
+    """Действующее правило. `.env` выигрывает у базы; ключ `source` говорит, чьё оно.
+
+    Смешивать источники нельзя: срок очистки из `.env` и срок удаления из базы дали бы
+    правило, которого никто не задавал. Поэтому если `.env` сказал хоть слово — база
+    молчит целиком, и интерфейс это показывает.
+    """
+    env_pol = env_policy(env)
+    if env_pol:
+        return env_pol | {"source": "env"}
+    db_pol = db_policy(c) if c is not None else {}
+    return (db_pol | {"source": "db"}) if db_pol else {}
+
+
+def auto_enabled(env=None) -> bool:
+    """Убирать ли на самом деле. Всё, кроме явного «да», означает «нет»."""
+    env = os.environ if env is None else env
+    return str(env.get(ENV_AUTO, "")).strip().lower() in ("1", "yes", "on", "true", "да")
+
+
+def every_sec(env=None) -> int:
+    """Как часто проверять. Ниже пяти минут не опускаемся: проекты стареют днями."""
+    env = os.environ if env is None else env
+    try:
+        n = int(str(env.get(ENV_EVERY, "")).strip())
+    except ValueError:
+        return EVERY_DEFAULT
+    return max(EVERY_MIN, n)
 
 
 def plan(projects, pol: dict, now=None) -> list:
@@ -309,6 +374,77 @@ def _inside(root: str, tid: str, pid: str) -> bool:
     parts = root.rstrip(os.sep).split(os.sep)
     return len(parts) >= 3 and parts[-1] == pid and parts[-2] == "projects" \
         and parts[-3] == tid
+
+
+def sweep(c, tenants_dir: str, tenant=None, now=None, dry_run=None, env=None,
+          log=print) -> dict:
+    """Один проход автоуборки: посмотреть, решить, сделать — и записать, что вышло.
+
+    `dry_run` по умолчанию берётся из `VS_RETENTION_AUTO`: без него проход только считает.
+    Итог кладётся в базу (`admin_state.retention_last`) — чтобы в интерфейсе было видно,
+    когда убирали в последний раз и сколько оплаченного при этом исчезло. Без этой записи
+    автоуборка была бы единственным местом системы, которое тратит чужое и не отчитывается.
+    """
+    now = now or time.time()
+    auto = auto_enabled(env)
+    if dry_run is None:
+        dry_run = not auto
+    pol = policy(c, env)
+    acts = plan(scan(c, tenants_dir, tenant), pol, now)
+    lost_calls, lost_cost = 0, 0.0
+    for p, action, _why, _freed in acts:
+        if action == KEEP:
+            continue
+        price = price_of(p, action)
+        lost_calls += price["calls"]
+        lost_cost += price["cost"]
+    out = apply(c, acts, dry_run=dry_run, log=log)
+    res = {
+        "at": now, "dry_run": bool(dry_run), "auto": auto,
+        "policy": {k: v for k, v in pol.items() if k != "source"},
+        "source": pol.get("source", ""),
+        "planned": sum(1 for _p, a, _w, _f in acts if a != KEEP),
+        "strip": out["strip"], "drop": out["drop"], "freed": out["freed"],
+        "lost_calls": lost_calls, "lost_cost": lost_cost,
+        "errors": out["errors"], "tenant": tenant or "",
+    }
+    res["line"] = sweep_line(res)
+    _save_last(c, res)
+    return res
+
+
+def sweep_line(res: dict) -> str:
+    """Одна строка для человека — она же уходит в телеграм."""
+    if not res.get("policy"):
+        return "срок хранения не задан — ничего не убирается"
+    if not res["planned"]:
+        return "убирать нечего"
+    price = (f"; безвозвратно ушло {res['lost_calls']} оплаченных вызовов"
+             if res["lost_calls"] else "")
+    if res["dry_run"]:
+        return (f"под очистку {res['strip']}, под удаление {res['drop']}, "
+                f"освободилось бы {_size(res['freed'])}{price}. "
+                f"Ничего не тронуто: {ENV_AUTO} выключен")
+    return (f"очищено {res['strip']}, удалено {res['drop']}, "
+            f"освобождено {_size(res['freed'])}{price}")
+
+
+def _save_last(c, res: dict) -> None:
+    try:
+        c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES(?,?,?)",
+                  (LAST_KEY, json.dumps(res, ensure_ascii=False), res["at"]))
+        c.commit()
+    except Exception:                                              # noqa: BLE001
+        pass          # уборка уже сделана; неудачная запись отчёта её не отменяет
+
+
+def last_sweep(c) -> dict:
+    row = c.execute("SELECT v FROM admin_state WHERE k=?", (LAST_KEY,)).fetchone()
+    try:
+        data = json.loads(row[0]) if row and row[0] else {}
+    except ValueError:
+        data = {}
+    return data if isinstance(data, dict) else {}
 
 
 def free_space(tenants_dir: str) -> dict:
