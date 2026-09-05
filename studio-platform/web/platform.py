@@ -50,6 +50,14 @@ for path in (HERE, os.path.join(BASE, "server"), os.path.join(BASE, "rewrite"),
     if path not in sys.path:
         sys.path.append(path)
 
+from pub_env import load_env                                      # noqa: E402
+
+# .env читается ДО импорта частей, а не внутри пульта: кабинет разбирает своё окружение
+# на импорте (PULLER_TOKEN, пути, лимиты), и загрузка после него означала бы, что часть
+# настроек из .env молча не применилась. Уже заданное окружение load_env не трогает —
+# systemd и dev/run.sh по-прежнему выигрывают у файла.
+load_env()
+
 from fastapi import FastAPI                                       # noqa: E402
 from fastapi.responses import RedirectResponse                    # noqa: E402
 

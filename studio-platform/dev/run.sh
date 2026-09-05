@@ -42,6 +42,10 @@ export VS_DEV_INSECURE_COOKIE=1
 # а не по зашитому литералу. Значения должны совпадать, иначе админ теряет права молча.
 export REWRITE_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
 export COVER_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
+# Рендер делает отдельная машина, опрашивая /api/render/claim с этим токеном. Пустой
+# токен сервер отвергает всегда, поэтому локально даётся значение по умолчанию — то же,
+# что берёт dev/render-node.sh. В бою токен настоящий и живёт в .env.
+export PULLER_TOKEN="${PULLER_TOKEN:-dev-render-node}"
 
 trap 'kill 0' EXIT
 ( cd "$ROOT" && "$PY" -m uvicorn web.platform:app --port "$PORT" --log-level warning ) &
@@ -78,6 +82,7 @@ echo "  cover    http://127.0.0.1:$PORT/cover/"
 echo "  что смонтировано: http://127.0.0.1:$PORT/_platform"
 echo "$ALERTS"
 echo "$CLEAN"
+echo "  рендер   отдельной машиной: dev/render-node.sh во втором окне"
 echo
 echo "  вход — логин и пароль кабинета (dev / VS_DEV_PASSWORD)."
 echo "  ключи соседей и пароль живут в базе; после dev/make_db.py их нужно выдать заново:"
