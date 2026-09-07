@@ -1034,11 +1034,41 @@ function stageFiles(s, pid){
 async function viewProjects(){
   const d = await api('/ui/projects');
   app.innerHTML = '';
-  app.append($(`<h1>Проекты</h1>
-    <p class="sub">Материалы роликов: кадры, озвучка, готовые файлы.</p>`));
+  const bar = $(`<h1>Проекты <button id="newp" style="float:right">Новый проект</button></h1>
+    <p class="sub">Материалы роликов: кадры, озвучка, готовые файлы.</p>`);
+  app.append(bar);
+
+  document.getElementById('newp').onclick = () => {
+    if (document.getElementById('npform')) return;
+    const form = $(`<div class="card" id="npform" style="margin-bottom:16px">
+      <div class="sec">Новый проект</div>
+      <div id="err"></div>
+      <div class="row"><label>Название</label>
+        <input id="nm" placeholder="как называть ролик" style="width:100%"></div>
+      <div class="row" style="margin-top:8px"><label>Текст</label>
+        <textarea id="tx" rows="10" style="width:100%"
+          placeholder="Текст, который будет озвучен. По нему же строятся кадры."></textarea></div>
+      <div class="note muted">Название и текст — разные поля: название не читается вслух.
+        Пустое название возьмётся из первой строки.</div>
+      <div style="margin-top:12px"><button id="go">Завести</button>
+        <button class="ghost" id="no">Отмена</button></div>
+    </div>`);
+    bar.after(form);
+    const err = form.querySelector('#err');
+    form.querySelector('#no').onclick = () => form.remove();
+    form.querySelector('#go').onclick = async () => {
+      err.innerHTML = '';
+      try{
+        const out = await post('/ui/projects', {name: form.querySelector('#nm').value,
+                                                text: form.querySelector('#tx').value});
+        location.hash = '#/project/' + encodeURIComponent(out.id);
+      }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+    };
+  };
 
   if (!d.projects.length){
-    app.append($(`<div class="card"><div class="empty">Проектов нет.</div></div>`));
+    app.append($(`<div class="card"><div class="empty">Проектов нет.
+      Заведите первый — кнопка выше.</div></div>`));
     return;
   }
   const mark = (ok, txt) => `<span class="pill ${ok ? 's-done' : 's-idle'}">${txt}</span>`;
@@ -1074,6 +1104,46 @@ async function viewProject(id){
       ${p.release_id ? ` · выпуск <a href="#/release/${
         encodeURIComponent(p.release_id)}">${esc(p.release_id)}</a> · фаза ${
         esc(p.phase)}` : ''}</p>`));
+
+  const run = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Сделать всё</div>
+    <div id="rerr"></div>
+    <div class="row" style="gap:12px;flex-wrap:wrap">
+      <div><label>Предложений на кадр</label>
+        <input id="r-spp" value="" placeholder="как в проекте" style="width:110px"></div>
+      <div><label>Модель кадров</label>
+        <input id="r-model" value="" placeholder="как в проекте" style="width:150px"></div>
+      <div><label>Озвучка</label>
+        <input id="r-engine" value="" placeholder="как в проекте" style="width:120px"></div>
+      <div><label>Качество</label>
+        <input id="r-quality" value="" placeholder="как в проекте" style="width:110px"></div>
+    </div>
+    <div class="note muted">Пустое поле = как в настройках проекта. Озвучка и кадры
+      пойдут параллельно, сборка дождётся материалов сама.</div>
+    <div class="note muted">Сборку делает отдельная машина. Если рендер-нода не
+      запущена, проект дойдёт до сборки и остановится.</div>
+    <div style="margin-top:12px"><button id="rgo">Запустить</button></div></div>`);
+  app.append(run);
+  const rerr = run.querySelector('#rerr');
+  run.querySelector('#rgo').onclick = async () => {
+    const btn = run.querySelector('#rgo');
+    rerr.innerHTML = ''; btn.disabled = true;
+    try{
+      const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/run`, {
+        sentences_per_prompt: run.querySelector('#r-spp').value,
+        model: run.querySelector('#r-model').value,
+        engine: run.querySelector('#r-engine').value,
+        quality: run.querySelector('#r-quality').value});
+      // Кабинет отвечает счётчиками, а не «ок»: поставленное, отложенное и пропущенное —
+      // разные вещи, и «поставлено 0» без объяснения выглядит как несработавшая кнопка.
+      rerr.innerHTML = `<div class="note ${out.enqueued ? 'muted' : 'bad'}">поставлено: ${
+        out.enqueued}${out.deferred ? `, отложено: ${out.deferred}` : ''}${
+        out.skipped ? `, пропущено (уже идёт): ${out.skipped}` : ''}${
+        out.block_reason ? ' — ' + esc(out.block_reason) : ''}</div>`;
+      setTimeout(() => viewProject(p.id), 1200);
+    }catch(e){ rerr.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+    finally{ btn.disabled = false; }
+  };
 
   if (d.paid.length){
     app.append($(`<div class="card" style="margin-bottom:16px">

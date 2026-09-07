@@ -1337,6 +1337,32 @@ ACTIONS = {
 BASES = {"vsgen": None, "rewrite": REWRITE_BASE, "cover": COVER_BASE}
 
 
+def _cabinet_form(path: str, fields, request, timeout: float = 0.0) -> dict:
+    """POST формой в кабинет от имени вошедшего человека.
+
+    Кабинет отвечает JSON только на пометку «это fetch» — иначе он шлёт редирект на
+    свою собственную страницу, показывать которую пульту нечем. Отказ пересказываем
+    как есть: «повтор доступен только для ошибочной задачи» — это ответ, а не сбой.
+    """
+    data = urllib.parse.urlencode(fields).encode("utf-8")
+    req = urllib.request.Request(CABINET_BASE + path, data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Cookie", f"{auth.COOKIE}={getattr(request.state, 'sid', '')}")
+    req.add_header("X-Requested-With", "fetch")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout or NEIGHBOUR_TIMEOUT * 3) as resp:
+            return json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        raw = exc.read().decode("utf-8", "replace")
+        try:
+            detail = (json.loads(raw or "{}") or {}).get("detail") or raw[:200]
+        except ValueError:
+            detail = raw[:200]
+        raise HTTPException(_pass_code(exc.code), detail or f"кабинет ответил {exc.code}")
+    except Exception as exc:                                     # noqa: BLE001
+        raise HTTPException(502, f"кабинет не отвечает: {type(exc).__name__}")
+
+
 @app.post("/ui/actions/{service}/{job_id}/{action}")
 def ui_action(service: str, job_id: str, action: str, request: Request):
     """Отменить или повторить задачу — в том сервисе, которому она принадлежит.
@@ -2397,6 +2423,65 @@ def _project_files(mod, pid: str) -> list:
     return out
 
 
+class ProjectNew(BaseModel):
+    name: str = ""
+    text: str = ""
+
+
+@app.post("/ui/projects")
+def ui_project_new(body: ProjectNew, request: Request):
+    """Завести проект из вставленного текста.
+
+    Проект заводит сам кабинет (`_create_project`) — своей таблицы проектов у пульта
+    нет, и второй способ их создавать означал бы вторую правду о том, что такое проект.
+    Поэтому не HTTP-прокси, а прямой вызов: он возвращает номер нового проекта, а
+    форма кабинета отвечает редиректом на свою страницу и номер теряет.
+
+    Название и текст здесь разные поля. В кабинете первая строка блока служит и тем и
+    другим — название потом читается вслух вместе с текстом. Повторять это не за чем.
+    """
+    mod = sys.modules.get("main")
+    if mod is None or not hasattr(mod, "_create_project"):
+        raise HTTPException(503, "кабинет не поднят — заводить проект нечем")
+    text = (body.text or "").strip()
+    if not text:
+        raise HTTPException(400, "пустой текст: нечего озвучивать и не из чего делать кадры")
+    name = (body.name or "").strip() or text.splitlines()[0].strip()[:80] or "Без названия"
+    pid = mod._create_project(TENANT, name, text)
+    return {"id": pid, "name": name}
+
+
+# Поля запуска. Пустое значение = «как в проекте»: кабинет кладёт настройки проекта
+# базой и накрывает только непустыми полями формы (`batch_run`). Список намеренно
+# короткий — это то, что человек решает перед конкретным прогоном, а не весь пресет.
+class RunIn(BaseModel):
+    sentences_per_prompt: str = ""   # сколько предложений на один кадр
+    model: str = ""                  # модель картинок
+    engine: str = ""                 # движок озвучки
+    quality: str = ""                # качество сборки
+    transitions: str = ""            # переходы между кадрами
+    sync_audio: str = ""             # подгонять кадры под озвучку
+    subtitles: str = ""              # вшивать субтитры
+
+
+@app.post("/ui/projects/{pid}/run")
+def ui_project_run(pid: str, body: RunIn, request: Request):
+    """Сделать всё: озвучка, кадры и сборка одной командой.
+
+    Здесь именно прокси, а не прямой вызов: постановка в очередь проверяет ключи,
+    лимиты и уже идущие задачи того же вида, и повторять эти проверки на своей
+    стороне значит однажды разойтись с кабинетом и поставить оплачиваемую задачу
+    дважды.
+
+    Сборку берёт отдельная машина: планировщик кабинета выдаёт себе всё, кроме
+    `render`. Без рендер-ноды проект дойдёт до сборки и остановится — молча, поэтому
+    об этом сказано на экране.
+    """
+    fields = [("pid", pid)]
+    fields += [(k, v.strip()) for k, v in body.model_dump().items() if str(v).strip()]
+    return _cabinet_form("/api/batch/pipeline", fields, request)
+
+
 @app.post("/ui/releases/{release_id}/revive")
 def ui_release_revive(release_id: str):
     """Вернуть выпуск из разбора в работу.
@@ -2450,24 +2535,8 @@ def ui_regen(what: str, body: RegenIn, request: Request):
     fields = [(field, body.name.strip())]
     if body.prompt.strip():
         fields.append(("prompt", body.prompt.strip()))
-    data = urllib.parse.urlencode(fields).encode("utf-8")
-    url = CABINET_BASE + path.format(pid=urllib.parse.quote(body.project_id))
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("Content-Type", "application/x-www-form-urlencoded")
-    req.add_header("Cookie", f"{auth.COOKIE}={getattr(request.state, 'sid', '')}")
-    req.add_header("X-Requested-With", "fetch")
-    try:
-        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 3) as resp:
-            return json.loads(resp.read().decode("utf-8") or "{}")
-    except urllib.error.HTTPError as exc:
-        raw = exc.read().decode("utf-8", "replace")
-        try:
-            detail = (json.loads(raw or "{}") or {}).get("detail") or raw[:200]
-        except ValueError:
-            detail = raw[:200]
-        raise HTTPException(_pass_code(exc.code), detail or f"кабинет ответил {exc.code}")
-    except Exception as exc:                                     # noqa: BLE001
-        raise HTTPException(502, f"кабинет не отвечает: {type(exc).__name__}")
+    return _cabinet_form(path.format(pid=urllib.parse.quote(body.project_id)),
+                         fields, request)
 
 
 # ─────────────────────────── учётные записи ───────────────────────────

@@ -12,6 +12,7 @@ from __future__ import annotations
 import http.cookiejar
 import json
 import os
+import shutil
 import sqlite3
 import sys
 import urllib.error
@@ -82,6 +83,28 @@ def plan_rows(url_like: str) -> int:
         c.close()
 
 
+def project_row(pid: str):
+    c = sqlite3.connect(DB, timeout=5)
+    c.row_factory = sqlite3.Row
+    try:
+        return c.execute("SELECT name, dir_path FROM projects WHERE id=?", (pid,)).fetchone()
+    finally:
+        c.close()
+
+
+def drop_project(pid: str) -> None:
+    """Убрать за собой: тест не должен оставлять проекты на стенде."""
+    row = project_row(pid)
+    if row and row["dir_path"]:
+        shutil.rmtree(row["dir_path"], ignore_errors=True)
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        c.execute("DELETE FROM projects WHERE id=?", (pid,))
+        c.commit()
+    finally:
+        c.close()
+
+
 def main() -> int:
     anon = Client()
     print("Без входа не работает ничего")
@@ -134,6 +157,29 @@ def main() -> int:
     code, body = me.go("/ui/actions/rewrite/нет-такой/cancel", {})
     check("ответ соседа пересказан как есть", code, 404)
     check("и его словами", body.get("detail"), "job not found")
+
+    print("\nПроект заводится в пульте, а работу ставит кабинет")
+    check("пустой текст не принимается", me.go("/ui/projects", {"text": "   "})[0], 400)
+    check("завести проект без входа нельзя",
+          anon.go("/ui/projects", {"text": "раз два три"})[0], 401)
+    name = "тест пульта: не удалять руками"
+    code, body = me.go("/ui/projects", {"name": name, "text": "Первая фраза. Вторая фраза."})
+    check("проект заведён", code, 200)
+    pid = str((body or {}).get("id") or "")
+    check("номер вернулся", pid.startswith("p_"), True)
+    if pid:
+        row = project_row(pid)
+        check("проект лежит в базе кабинета", row is not None, True)
+        # Кабинет берёт название из первой строки текста и её же озвучивает. В пульте
+        # это два разных поля, и название не должно подменяться текстом.
+        check("название своё, а не первая строка", row["name"] if row else "", name)
+        check("запуск закрыт без входа", anon.go(f"/ui/projects/{pid}/run", {})[0], 401)
+        drop_project(pid)
+        check("проект убран за собой", project_row(pid) is None, True)
+    # Несуществующий проект: кабинет отвечает как обычно и не ставит ничего. Это
+    # проверка, что запуск действительно уходит к нему, а не решается здесь.
+    code, body = me.go("/ui/projects/нет-такого-проекта/run", {})
+    check("чужой проект ничего не ставит", (code, (body or {}).get("enqueued")), (200, 0))
 
     print("\nСтраница зовёт API по своему адресу, а не по корню платформы")
     # Тот самый случай, который сломал вход и не ловился curl'ом: страница живёт под
