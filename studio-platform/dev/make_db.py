@@ -184,11 +184,14 @@ def seed(c) -> dict:
                   "uid,progress,stage,provider) VALUES(?,?,?,?,?,'{}',1,?,?,?)",
                   (TENANT, "proj-dev-0001", kind, status, NOW, progress, stage, provider))
 
-    # Ключи и кулдауны — чтобы экрану «Ключи» было что показывать. Значения выдуманные,
+    # Кулдауны — чтобы экрану «Ключи» было что показывать. Значения выдуманные,
     # формат — тот, что кабинет реально пишет в admin_state.credential_cooldown.
-    c.execute("UPDATE users SET keys=? WHERE id=1", (json.dumps({
-        "googler": ["own-key-AAAAAAAAAAAAAAAAAAAA", "own-key-BBBBBBBBBBBBBBBBBBBB"],
-        "openai": "own-openai-CCCCCCCCCCCCCCCC"}),))
+    #
+    # Выдуманные СВОИ ключи сюда больше не кладутся. У админа свои ключи ложатся
+    # ПОВЕРХ серверных (`resolve_keys`), поэтому засеянная выдумка молча перекрывала
+    # настоящий ~/video_studio_api_keys.json: первый же боевой прогон упал на
+    # «Incorrect API key provided: own-open***CCCC», и по экрану «Ключи» это выглядело
+    # как подключённый рабочий ключ. Пустое поле честнее: экран покажет серверные.
     c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES('credential_cooldown',?,?)",
               (json.dumps({
                   "googler:1": {"family": "googler", "mask": "fg_live_aaaa…b3gt",
