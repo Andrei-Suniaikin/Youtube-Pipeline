@@ -29,6 +29,23 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   exit 1
 fi
 
+# ffmpeg 8 выбросил ключ -vsync, который боевой рендерер передаёт в девяти местах.
+# На такой версии падает КАЖДАЯ пачка картинок, рендерер молча подставляет чёрный фон
+# и рапортует об успехе: ролик нужной длины, со звуком и без единой картинки. Ровно
+# это и случилось 07.09 на маке с ffmpeg 9.0.1. Подставляем прослойку -vsync→-fps_mode,
+# а движок оставляем побайтово минским.
+export VS_REAL_FFMPEG="${VS_REAL_FFMPEG:-$(command -v ffmpeg)}"
+FFMPEG_MAJOR="$("$VS_REAL_FFMPEG" -version 2>/dev/null | head -1 | sed -E 's/^ffmpeg version n?([0-9]+).*/\1/')"
+FFMPEG_NOTE="$VS_REAL_FFMPEG"
+case "$FFMPEG_MAJOR" in
+  ''|*[!0-9]*) : ;;                                  # версию не разобрали — не вмешиваемся
+  *) if [ "$FFMPEG_MAJOR" -ge 8 ]; then
+       PATH="$ROOT/dev/ffmpeg-compat:$PATH"
+       export PATH
+       FFMPEG_NOTE="$VS_REAL_FFMPEG (v$FFMPEG_MAJOR, через прослойку -vsync→-fps_mode)"
+     fi ;;
+esac
+
 # Токен общий с платформой. Пустой токен сервер отвергает всегда (main.py:12856),
 # поэтому значение по умолчанию здесь такое же, как в dev/run.sh.
 if [ -z "$PULLER_TOKEN" ] && [ -f "$ROOT/.env" ]; then
@@ -46,7 +63,7 @@ echo "  РЕНДЕР-НОДА"
 echo "  платформа  $VSGEN_SERVER"
 echo "  рендерер   $(basename "$WORKER")"
 echo "  работа в   $PULLER_WORK"
-echo "  ffmpeg     $(command -v ffmpeg)"
+echo "  ffmpeg     $FFMPEG_NOTE"
 echo
 echo "  Готовый ролик уедет обратно на платформу сам: Проекты → карточка → «Сборка»."
 echo
