@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Тревоги: шесть поводов и три правила подачи.
+"""Тревоги: семь поводов и три правила подачи.
 
 Сети здесь нет вообще: `pub_alerts` отправку не делает, а транспорт подменён списком.
 Поэтому тест гоняется где угодно, включая машину без телеграма и без интернета.
@@ -42,7 +42,9 @@ def fresh() -> sqlite3.Connection:
     c.executescript("""
       CREATE TABLE admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL);
       CREATE TABLE queue_tasks(job_id INTEGER PRIMARY KEY, tenant_id TEXT, kind TEXT,
-                               status TEXT, created REAL, finished REAL);
+                               status TEXT, created REAL, finished REAL,
+                               project_id TEXT, error TEXT);
+      CREATE TABLE projects(id TEXT PRIMARY KEY, name TEXT);
       CREATE TABLE pub_upload_jobs(id INTEGER PRIMARY KEY, tenant_id TEXT, status TEXT,
                                    created REAL, finished REAL);
       CREATE TABLE pub_releases(id INTEGER PRIMARY KEY, tenant_id TEXT, plan_item_id INT,
@@ -50,6 +52,10 @@ def fresh() -> sqlite3.Connection:
       CREATE TABLE pub_plan_items(id INTEGER PRIMARY KEY, tenant_id TEXT, slot_at REAL,
                                   status TEXT);
     """)
+    # Журнал платных вызовов заводим НЕ своей копией схемы: §7 спрашивает у него,
+    # потрачены ли деньги, и расхождение с боевой таблицей тест бы не поймал.
+    from pub_calls import ensure_calls_schema
+    ensure_calls_schema(c)
     return c
 
 
@@ -77,12 +83,12 @@ def keys(c, now=NOW):
 def main() -> int:
     print("Повод 1 — очередь встала")
     c = fresh()
-    c.execute("INSERT INTO queue_tasks VALUES(1,'dev','images','running',?,NULL)",
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished) VALUES(1,'dev','images','running',?,NULL)",
               (NOW - 10 * 60,))
     check("свежая задача поводом не является", keys(c), [])
     c.execute("UPDATE queue_tasks SET created=?", (NOW - 40 * 60,))
     check("ждёт дольше порога и ничего не завершалось", keys(c), ["queue_stalled"])
-    c.execute("INSERT INTO queue_tasks VALUES(2,'dev','tts','done',?,?)",
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished) VALUES(2,'dev','tts','done',?,?)",
               (NOW - 60 * 60, NOW - 5 * 60))
     check("недавнее завершение снимает повод", keys(c), [])
 
@@ -144,7 +150,7 @@ def main() -> int:
 
     print("\nПовод 6 — задача ждёт слишком долго")
     c = fresh()
-    c.execute("INSERT INTO queue_tasks VALUES(1,'dev','images','queued',?,NULL)",
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished) VALUES(1,'dev','images','queued',?,NULL)",
               (NOW - 7 * HOUR,))
     check("семь часов в очереди", "oldest_task" in keys(c), True)
     c.execute("UPDATE queue_tasks SET status='running'")
@@ -177,7 +183,7 @@ def main() -> int:
 
     print("\nПодача: одно сообщение на случай")
     c = fresh()
-    c.execute("INSERT INTO queue_tasks VALUES(1,'dev','images','running',?,NULL)",
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished) VALUES(1,'dev','images','running',?,NULL)",
               (NOW - 2 * HOUR,))
     bag = Bag()
     A.tick(c, bag, now=NOW)
@@ -199,7 +205,7 @@ def main() -> int:
 
     print("\nПодача: молчащий телеграм не съедает тревогу")
     c = fresh()
-    c.execute("INSERT INTO queue_tasks VALUES(1,'dev','images','running',?,NULL)",
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished) VALUES(1,'dev','images','running',?,NULL)",
               (NOW - 2 * HOUR,))
     dead, alive = Bag(ok=False), Bag()
     A.tick(c, dead, now=NOW)
@@ -228,9 +234,76 @@ def main() -> int:
     A.tick(c, bag, now=NOW)
     check("два ключа — два сообщения", len(bag.sent), 2)
 
+    print("\nПовод 7 — задача упала")
+    c = fresh()
+    c.execute("INSERT INTO projects VALUES('p_1','Рассвет в горах')")
+    def failed(job_id, kind, when, error="rc=2"):
+        c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,"
+                  "finished,project_id,error) VALUES(?,'dev',?,'error',?,?,'p_1',?)",
+                  (job_id, kind, when - 5, when, error))
+    check("падений нет — повода нет", keys(c), [])
+    failed(1, "prompts", NOW - 10 * 60)
+    check("свежее падение — повод сразу, без выдержки", keys(c), ["failed:1"])
+    c.execute("UPDATE queue_tasks SET finished=? WHERE job_id=1", (NOW - 30 * HOUR,))
+    c.execute("UPDATE queue_tasks SET created=? WHERE job_id=1", (NOW - 30 * HOUR,))
+    check("старое падение из окна вышло", keys(c), [])
+
+    print("\nПро падение говорят один раз")
+    c = fresh()
+    c.execute("INSERT INTO projects VALUES('p_1','Рассвет в горах')")
+    failed(1, "prompts", NOW - 10 * 60, "OpenAI-ключ невалиден (HTTP 401)")
+    bag = Bag()
+    A.tick(c, bag, now=NOW)
+    check("сказали сразу", len(bag.sent), 1)
+    check("в тексте есть причина", "HTTP 401" in bag.sent[0], True)
+    check("и название проекта", "Рассвет в горах" in bag.sent[0], True)
+    # Остальные поводы через час повторяются: беда растёт. У падения ничего не растёт.
+    A.tick(c, bag, now=NOW + 3 * HOUR)
+    check("через три часа не повторили", len(bag.sent), 1)
+    # Повтор задачи убирает её из повода — но это не «починилось»: так же выглядит
+    # отмена и старение. Обещать, что стало хорошо, мы не вправе.
+    c.execute("UPDATE queue_tasks SET status='cancelled' WHERE job_id=1")
+    A.tick(c, bag, now=NOW + 4 * HOUR)
+    check("«починилось» не отправлено", [m for m in bag.sent if "ПОЧИНИЛОСЬ" in m], [])
+    check("и вообще ничего нового", len(bag.sent), 1)
+
+    print("\nПачка падений не заваливает канал")
+    c = fresh()
+    c.execute("INSERT INTO projects VALUES('p_1','Рассвет в горах')")
+    for i in range(1, 13):
+        failed(i, "images", NOW - i * 60)
+    ks = keys(c)
+    check("поимённо не больше потолка", len([k for k in ks if k.startswith("failed:")
+                                             and k != "failed:ещё"]), A.FAILED_MAX)
+    check("и одна строка про остальные", "failed:ещё" in ks, True)
+    bag = Bag()
+    A.tick(c, bag, now=NOW)
+    check("сообщений столько же", len(bag.sent), A.FAILED_MAX + 1)
+    check("названы самые свежие", "#1 " in " ".join(bag.sent), True)
+    check("а самое старое — нет", "#12 " in " ".join(bag.sent), False)
+
+    print("\nДеньги названы прямо")
+    c = fresh()
+    c.execute("INSERT INTO projects VALUES('p_1','Рассвет в горах')")
+    failed(1, "images", NOW - 60)
+    bag = Bag(); A.tick(c, bag, now=NOW)
+    check("без журнала — так и сказано",
+          "Оплаченных вызовов по этому этапу не записано" in bag.sent[0], True)
+    c = fresh()
+    c.execute("INSERT INTO projects VALUES('p_1','Рассвет в горах')")
+    failed(1, "images", NOW - 60)
+    for i in range(3):
+        c.execute("INSERT INTO provider_calls(tenant_id,project_id,kind,unit,fingerprint,"
+                  "provider,status,cost,created,updated) "
+                  "VALUES('dev','p_1','images',?,?,'googler','delivered',1,?,?)",
+                  (str(i), f"fp{i}", NOW, NOW))
+    bag = Bag(); A.tick(c, bag, now=NOW)
+    check("с журналом — сколько уже оплачено",
+          "До падения оплачено вызовов: 3" in bag.sent[0], True)
+
     print("\nПамять переживает перезапуск")
     c = fresh()
-    c.execute("INSERT INTO queue_tasks VALUES(1,'dev','images','running',?,NULL)",
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished) VALUES(1,'dev','images','running',?,NULL)",
               (NOW - 2 * HOUR,))
     bag = Bag()
     A.tick(c, bag, now=NOW)

@@ -11,6 +11,10 @@
   5. на диске меньше 100 ГБ
   6. самая старая задача ждёт дольше 6 часов
 
+Седьмой повод добавлен владельцем 07.09.2026, в ТЗ его нет:
+
+7. задача упала с ошибкой — говорится один раз, без повтора и без «починилось»
+
 Три правила подачи, тоже из ТЗ: одно сообщение на случай, повтор не чаще раза в час,
 обязательное сообщение «починилось».
 
@@ -45,6 +49,13 @@ STALL_SEC = _sec("VS_ALERT_STALL_SEC", 30 * 60)          # §1
 RESTING_SEC = _sec("VS_ALERT_RESTING_SEC", 60 * 60)      # §2
 UPLOAD_SEC = _sec("VS_ALERT_UPLOAD_SEC", 3 * 3600)       # §3
 OLDEST_SEC = _sec("VS_ALERT_OLDEST_SEC", 6 * 3600)       # §6
+# §7 — не из ТЗ, добавлен владельцем 07.09.2026. Окно нужно не как порог, а чтобы
+# включение тревог не выкатило разом всю историю падений: говорим только про свежие.
+FAILED_SEC = _sec("VS_ALERT_FAILED_SEC", 24 * 3600)      # §7
+# Сколько падений называем поимённо. Общий ключ или сдохший провайдер валят задачи
+# пачкой — на 45 каналах это десятки сообщений подряд, после которых тревоги перестают
+# читать. Про остальные говорим одной строкой: важен факт, а разбирают их на экране.
+FAILED_MAX = _sec("VS_ALERT_FAILED_MAX", 5)              # §7
 REPEAT_SEC = _sec("VS_ALERT_REPEAT_SEC", 60 * 60)        # повтор не чаще раза в час
 DISK_MIN_GB = float(os.environ.get("VS_ALERT_DISK_GB") or 100)
 
@@ -80,7 +91,7 @@ class Alert:
         return f"<Alert {self.key}>"
 
 
-# ─────────────────────────────── шесть поводов ───────────────────────────────
+# ─────────────────────────────── семь поводов ────────────────────────────────
 
 def check_queue_stalled(c, now, tenant=None) -> list:
     """§1. Очередь не пустая, но за 30 минут ничего не завершилось.
@@ -287,13 +298,69 @@ def check_oldest_task(c, now, tenant=None) -> list:
         money="Денег не потрачено — задача не начата.")]
 
 
+def check_failed_tasks(c, now, tenant=None) -> list:
+    """§7. Задача упала с ошибкой.
+
+    Поводов ТЗ шесть, и все они про то, что работа ИДЁТ СЛИШКОМ ДОЛГО: очередь стоит,
+    провайдер отдыхает, заливка молчит, задача ждёт. Упавшая задача не подходит ни под
+    один: она умирает за секунды, очередь после неё пуста, ждать нечему. Ровно так
+    07.09 прогон встал на невалидном ключе — и по всем шести поводам было «спокойно».
+
+    Отсюда две особенности подачи, обе намеренные (см. NO_REPEAT / NO_FIXED):
+
+    • не повторяем. Остальные поводы с каждым часом означают всё большую беду, и
+      «ВСЁ ЕЩЁ (3)» несёт новость. У падения новостей нет: оно уже случилось, и
+      ежечасное напоминание — шум, из-за которого перестают читать и настоящие тревоги.
+    • не говорим «починилось». Задача уходит из повода, когда её повторили, отменили
+      или она состарилась за окном. Ни одно из этого не значит, что стало хорошо.
+    """
+    where, args = _tenant_where(tenant, "tenant_id")
+    rows = c.execute(
+        f"SELECT q.job_id, q.kind, q.error, q.finished, q.project_id, p.name "
+        f"FROM queue_tasks q LEFT JOIN projects p ON p.id = q.project_id "
+        f"WHERE q.status='error' AND COALESCE(q.finished, q.created) >= ?{where} "
+        f"ORDER BY COALESCE(q.finished, q.created) DESC", (now - FAILED_SEC,) + args).fetchall()
+    out = []
+    for job_id, kind, error, finished, project_id, name in rows[:FAILED_MAX]:
+        # Деньги считаем по журналу вызовов: у падения этап известен, а вот потратил
+        # ли он что-нибудь до падения — нет. Правило ТЗ §14 требует ответить прямо.
+        paid = c.execute(
+            "SELECT COUNT(*), COALESCE(SUM(cost), 0) FROM provider_calls "
+            "WHERE project_id=? AND kind=? AND status='delivered'",
+            (project_id, kind)).fetchone() if project_id else (0, 0)
+        n, cost = (paid[0] or 0), (paid[1] or 0)
+        out.append(Alert(
+            f"failed:{job_id}",
+            f"Задача упала: {kind}",
+            f"Задача #{job_id} ({kind}) проекта «{name or project_id or '—'}» "
+            f"остановилась с ошибкой.\n{(error or 'причина не записана').strip()[:400]}",
+            since_hint=finished,
+            money=(f"До падения оплачено вызовов: {n}"
+                   + (f" на {cost:.0f} кр." if cost else ".")
+                   if n else "Оплаченных вызовов по этому этапу не записано.")))
+    if len(rows) > FAILED_MAX:
+        out.append(Alert(
+            "failed:ещё",
+            "Упало сразу много задач",
+            f"За последние {_human(FAILED_SEC)} упало задач: {len(rows)}. "
+            f"Поимённо названы {FAILED_MAX} самых свежих, остальные — на экране очереди.\n"
+            f"Столько разом обычно значит одну причину на всех: ключ, провайдер или диск.",
+            money="Деньги считаются по каждой задаче отдельно — смотрите её карточку."))
+    return out
+
+
 CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
-          check_missed_slots, check_disk, check_oldest_task)
+          check_missed_slots, check_disk, check_oldest_task, check_failed_tasks)
 
 # Сколько повод должен продержаться, прежде чем о нём говорят. Там, где длительность
 # и есть суть повода (§2), она проверяется здесь; остальные поводы уже содержат свой
 # порог внутри запроса, и держать их дополнительно значило бы удваивать ожидание.
 MIN_HOLD = {"provider_resting": RESTING_SEC}
+
+# Поводы-события, а не состояния: сказать один раз и не возвращаться. Повтор и
+# «починилось» осмысленны, только когда повод описывает то, что тянется.
+NO_REPEAT = {"failed"}
+NO_FIXED = {"failed"}
 
 
 def detect(c, now=None, tenant=None) -> dict:
@@ -345,7 +412,7 @@ def tick(c, send, now=None, tenant=None) -> list:
         if held < MIN_HOLD.get(key.split(":")[0], 0):
             continue
         last_sent = _f(st.get("sent"))
-        if last_sent and now - last_sent < REPEAT_SEC:
+        if last_sent and (key.split(":")[0] in NO_REPEAT or now - last_sent < REPEAT_SEC):
             continue
         kind = "repeat" if last_sent else "alarm"
         text = _format(alert, kind, held, int(st.get("n") or 0) + 1)
@@ -359,6 +426,8 @@ def tick(c, send, now=None, tenant=None) -> list:
         st = state.pop(key)
         if not isinstance(st, dict) or not _f(st.get("sent")):
             continue        # тревога не звучала — «починилось» было бы про что-то новое
+        if key.split(":")[0] in NO_FIXED:
+            continue        # событие: уход из повода не значит, что стало хорошо
         text = (f"ПОЧИНИЛОСЬ · {st.get('title') or key}\n"
                 f"Длилось {_human(now - _f(st.get('since')))}.")
         if not send(text):
