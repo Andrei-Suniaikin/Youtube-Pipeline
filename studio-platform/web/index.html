@@ -181,6 +181,23 @@
   .res ul{margin:0 0 14px;padding-left:20px}
   .back{display:inline-block;margin-bottom:13px;color:var(--muted);text-decoration:none}
   .back:hover{color:var(--ink-hi)}
+  button.small{padding:6px 13px;border-radius:8px;font-size:13px}
+  .head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
+  .head h1{margin-bottom:5px}
+  .head > button{margin-top:3px;flex:0 0 auto}   /* по верхней строке заголовка */
+
+  /* Тосты: ошибка действия видна там, где смотрит глаз, и не перекрывает работу.
+     Раньше это был alert() — он останавливает страницу и требует нажать «ОК». */
+  #toasts{position:fixed;top:16px;right:16px;z-index:99;display:flex;flex-direction:column;
+          gap:9px;max-width:min(420px,calc(100vw - 32px));pointer-events:none}
+  #toasts .toast{pointer-events:auto;background:var(--card);border:1px solid var(--line-2);
+          border-left:3px solid var(--acc);border-radius:9px;padding:11px 14px;font-size:13px;
+          box-shadow:0 16px 40px -14px rgba(0,0,0,.7);cursor:pointer;
+          animation:toast-in .18s ease-out}
+  #toasts .toast.bad{border-left-color:var(--bad);color:var(--bad)}
+  #toasts .toast.ok{border-left-color:var(--ok)}
+  #toasts .toast.out{opacity:0;transform:translateX(12px);transition:opacity .2s,transform .2s}
+  @keyframes toast-in{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
 
   .login{max-width:380px;margin:14vh auto;background:var(--card);
          border:1px solid var(--line);border-radius:16px;padding:34px 32px;
@@ -290,6 +307,30 @@ async function post(path, payload){
   return api(path, {method:'POST', headers:{'Content-Type':'application/json'},
                     body: JSON.stringify(payload || {})});
 }
+// Сообщение о неудавшемся действии. Пять секунд, потом уходит само; клик убирает
+// раньше. До этого здесь был alert(): он останавливает страницу, требует нажать «ОК»
+// и не даёт ни перечитать текст, ни сравнить два подряд.
+const TOAST_MS = 5000;
+function toast(text, kind){
+  let box = document.getElementById('toasts');
+  if (!box){
+    box = document.createElement('div');
+    box.id = 'toasts';
+    document.body.append(box);
+  }
+  const el = document.createElement('div');
+  el.className = 'toast ' + (kind || 'bad');
+  el.textContent = String(text || 'что-то пошло не так');
+  const kill = () => {
+    if (!el.isConnected) return;
+    el.classList.add('out');
+    setTimeout(() => el.remove(), 220);
+  };
+  el.onclick = kill;
+  box.append(el);
+  setTimeout(kill, TOAST_MS);
+}
+
 function fail(e){
   app.innerHTML = '';
   app.append($(`<div class="err">${esc(e.message)}</div>
@@ -435,7 +476,7 @@ async function viewRelease(id){
     try{
       await post(`/ui/releases/${encodeURIComponent(r.release_id)}/revive`);
       await render();
-    }catch(e){ rev.disabled = false; alert(e.message); }
+    }catch(e){ rev.disabled = false; toast(e.message); }
   };
 
   app.append($(`<div class="card">
@@ -994,7 +1035,7 @@ function wireRegen(root){
       await render();
     }catch(e){
       b.disabled = false; b.textContent = 'переделать';
-      alert(e.message);
+      toast(e.message);
     }
   });
 }
@@ -1034,8 +1075,11 @@ function stageFiles(s, pid){
 async function viewProjects(){
   const d = await api('/ui/projects');
   app.innerHTML = '';
-  const bar = $(`<h1>Проекты <button id="newp" style="float:right">Новый проект</button></h1>
-    <p class="sub">Материалы роликов: кадры, озвучка, готовые файлы.</p>`);
+  const bar = $(`<div class="head">
+      <div><h1>Проекты</h1>
+        <p class="sub">Материалы роликов: кадры, озвучка, готовые файлы.</p></div>
+      <button id="newp" class="small">Новый проект</button>
+    </div>`);
   app.append(bar);
 
   document.getElementById('newp').onclick = () => {
@@ -1098,8 +1142,7 @@ async function viewProject(id){
   const d = await api('/ui/projects/' + encodeURIComponent(id));
   const p = d.project;
   app.innerHTML = '';
-  app.append($(`<a class="back" href="#/projects">← ко всем проектам</a>
-    <h1>${esc(p.name)}</h1>
+  app.append($(`<h1>${esc(p.name)}</h1>
     <p class="sub"><span class="mono">${esc(p.id)}</span>
       ${p.release_id ? ` · выпуск <a href="#/release/${
         encodeURIComponent(p.release_id)}">${esc(p.release_id)}</a> · фаза ${
@@ -1141,7 +1184,7 @@ async function viewProject(id){
         out.skipped ? `, пропущено (уже идёт): ${out.skipped}` : ''}${
         out.block_reason ? ' — ' + esc(out.block_reason) : ''}</div>`;
       setTimeout(() => viewProject(p.id), 1200);
-    }catch(e){ rerr.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+    }catch(e){ toast(e.message); }
     finally{ btn.disabled = false; }
   };
 
@@ -1233,7 +1276,7 @@ async function wireKeys(root, d){
     try{
       await post('/ui/keys', {drop: {[a.dataset.f]: [Number(a.dataset.i)]}});
       await render();
-    }catch(e){ alert(e.message); }
+    }catch(e){ toast(e.message); }
   });
 
   root.querySelector('#addkey').onclick = async () => {
@@ -1279,7 +1322,7 @@ async function wireChannelEdit(root, c){
   root.querySelectorAll('button.chst').forEach(b => b.onclick = async () => {
     b.disabled = true;
     try{ await post(`/ui/channels/${c.id}/status`, {status: b.dataset.s}); await render(); }
-    catch(e){ b.disabled = false; alert(e.message); }
+    catch(e){ b.disabled = false; toast(e.message); }
   });
 
   root.querySelector('#edit').onclick = () => {

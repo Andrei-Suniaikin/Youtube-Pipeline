@@ -314,7 +314,10 @@ def check_failed_tasks(c, now, tenant=None) -> list:
     • не говорим «починилось». Задача уходит из повода, когда её повторили, отменили
       или она состарилась за окном. Ни одно из этого не значит, что стало хорошо.
     """
-    where, args = _tenant_where(tenant, "tenant_id")
+    # Колонка обязательно с префиксом таблицы: `projects` тоже имеет tenant_id, и без
+    # него запрос падает на «ambiguous column name» — но только когда тенант задан,
+    # то есть на экране тревог, а не в проходе рассылки.
+    where, args = _tenant_where(tenant, "q.tenant_id")
     rows = c.execute(
         f"SELECT q.job_id, q.kind, q.error, q.finished, q.project_id, p.name "
         f"FROM queue_tasks q LEFT JOIN projects p ON p.id = q.project_id "

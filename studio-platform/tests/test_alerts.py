@@ -244,6 +244,10 @@ def main() -> int:
     check("падений нет — повода нет", keys(c), [])
     failed(1, "prompts", NOW - 10 * 60)
     check("свежее падение — повод сразу, без выдержки", keys(c), ["failed:1"])
+    # С тенантом ходит экран тревог. Раньше запрос падал здесь и нигде больше.
+    check("с фильтром по тенанту тоже",
+          sorted(A.detect(c, NOW, "dev").keys()), ["failed:1"])
+    check("чужой тенант не видит", sorted(A.detect(c, NOW, "чужой").keys()), [])
     c.execute("UPDATE queue_tasks SET finished=? WHERE job_id=1", (NOW - 30 * HOUR,))
     c.execute("UPDATE queue_tasks SET created=? WHERE job_id=1", (NOW - 30 * HOUR,))
     check("старое падение из окна вышло", keys(c), [])
