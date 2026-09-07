@@ -11,7 +11,9 @@ from __future__ import annotations
 import os
 import secrets
 import sqlite3
+import subprocess
 import sys
+import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +67,34 @@ def cleanup(jid):
         c.commit()
     finally:
         c.close()
+
+
+def calls_base(cabinet="", calls="") -> str:
+    """Чему равен CALLS_BASE_URL кабинета при таком окружении.
+
+    Отдельным процессом: константа читается на импорте, и подменять её в уже
+    загруженном модуле значило бы проверять не то, что происходит в бою.
+    """
+    env = dict(os.environ)
+    for name in ("VS_CALLS_URL", "VS_CABINET_BASE", "VS_SERVER_PORT"):
+        env.pop(name, None)
+    if cabinet:
+        env["VS_CABINET_BASE"] = cabinet
+    if calls:
+        env["VS_CALLS_URL"] = calls
+    with tempfile.TemporaryDirectory() as tmp:
+        env["VS_SERVER_DB"] = os.path.join(tmp, "t.db")
+        env["VS_TENANTS_DIR"] = os.path.join(tmp, "tenants")
+        # Движки кабинет ищет в ~/VideoStudio/src; для теста хватает прямого пути —
+        # проверяем одну константу, а не то, как стенд раскладывает каталоги.
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; sys.path[:0] = [%r, %r]; import main; print(main.CALLS_BASE_URL)"
+             % (os.path.join(BASE, "server"), os.path.join(BASE, "workers"))],
+            capture_output=True, text=True, env=env, timeout=180)
+    if out.returncode != 0:
+        return f"импорт не удался: {out.stderr.strip()[-200:]}"
+    return (out.stdout.strip().splitlines() or [""])[-1]
 
 
 def main() -> int:
@@ -128,6 +158,18 @@ def main() -> int:
     d_down = down.reserve(unit="test-z", fingerprint=fp)
     check("решение unknown", d_down.action, "unknown")
     check("обращаться к провайдеру НЕЛЬЗЯ", d_down.may_call, False)
+
+    print("\nАдрес журнала для движка")
+    # Ровно та поломка, из-за которой 07.09 пропустились все кадры: в единой платформе
+    # кабинет не слушает 8800, а дефолт вёл туда. Движок получал URLError и, по правилу
+    # «не платить, если нечем записать», пропускал кадр за кадром — молча.
+    check("берётся адрес кабинета, а не зашитый порт",
+          calls_base(cabinet="http://127.0.0.1:8080"), "http://127.0.0.1:8080")
+    check("явный VS_CALLS_URL сильнее",
+          calls_base(cabinet="http://127.0.0.1:8080", calls="http://127.0.0.1:9999"),
+          "http://127.0.0.1:9999")
+    check("без обоих — прежнее поведение",
+          calls_base(), "http://127.0.0.1:8800")
 
     cleanup(jid)
     print()
