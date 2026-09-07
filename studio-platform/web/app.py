@@ -2392,7 +2392,8 @@ def _applied_params(raw) -> list:
 
 
 _FILE_GROUPS = (("images", "кадры"), ("clips", "клипы"), ("renders", "готовый ролик"),
-                ("audio", "озвучка"), ("subs", "субтитры"), ("chapters", "тайм-коды"))
+                ("audio", "озвучка"), ("subs", "субтитры"), ("chapters", "тайм-коды"),
+                ("scenes", "план сцен и промпты"))
 
 
 def _project_files(mod, pid: str) -> list:

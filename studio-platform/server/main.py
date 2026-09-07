@@ -5494,7 +5494,7 @@ def project_file(pid: str, fpath: str, request: Request):
 # падал с SQLITE_FULL). Компрессия ZIP_STORED: jpg/mp3/mp4 уже сжаты, deflate только жёг бы CPU.
 _DL_CATS = {"audio": "озвучки", "images": "картинок", "clips": "клипов",
             "renders": "готовых mp4", "subs": "субтитров", "chapters": "тайм-кодов",
-            "all": "материалов"}
+            "scenes": "плана сцен", "all": "материалов"}
 # категория → glob-шаблоны (относительно каталога проекта, recursive?). Страница проекта
 # считает кнопки этим же списком (_dl_n), поэтому число на кнопке = число файлов в архиве
 _DL_PATTERNS = {
@@ -5514,6 +5514,12 @@ _DL_PATTERNS = {
     # формат (chapters.py:110). Кнопка на несуществующий файл — та же ложь интерфейса.
     "subs":    ((("*.srt",), False), (("**", "*.srt"), True)),
     "chapters": ((("chapters", "*.txt"), False), (("chapters", "*.json"), False)),
+    # ДОБАВЛЕНО 07.09.2026: план сцен и промпты к кадрам. За них уже заплачено моделью,
+    # они лежат на диске с первого прогона — и забрать их было нечем. Спросили ровно так:
+    # «а как скачать промпты, которые сделались».
+    "scenes":  ((("googler", "scenes.json"), False),
+                (("googler", "scenes.meta.json"), False),
+                (("googler", "prompts.json"), False)),
 }
 
 
@@ -5522,7 +5528,8 @@ def _dl_items(pdir, what):
     по каталогу проекта (снаружи ничего не подставляется), и каждый файл дополнительно
     проверяется на выход за его пределы через realpath — это ловит и симлинки."""
     root = os.path.realpath(pdir)
-    cats = ("audio", "images", "clips", "renders", "subs", "chapters") if what == "all" else (what,)
+    cats = (("audio", "images", "clips", "renders", "subs", "chapters", "scenes")
+            if what == "all" else (what,))
     out, seen = [], set()
     for cat in cats:
         for parts, rec in _DL_PATTERNS.get(cat, ()):
