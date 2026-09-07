@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import os
+import ssl
 import time
 import urllib.error
 import urllib.parse
@@ -32,6 +33,22 @@ API = "https://api.telegram.org"
 TIMEOUT = 15
 MIN_GAP = 1.0          # не чаще одного сообщения в секунду в один чат
 LIMIT = 4096           # предел одного сообщения Telegram
+
+
+def _ssl_context():
+    """Доверенные корни: сначала certifi, если он есть, иначе системные.
+
+    На Linux системного набора хватает, поэтому в бою это ничего не меняет. А вот
+    framework-Python на macOS идёт БЕЗ заполненного хранилища, пока вручную не запущен
+    «Install Certificates.command», и `urlopen` падает на «self-signed certificate in
+    certificate chain». Выглядело это как «телеграм недоступен» — то есть тревоги
+    молчали ровно там, где их и проверяют.
+    """
+    try:
+        import certifi
+    except ImportError:
+        return None                     # системные корни: как было
+    return ssl.create_default_context(cafile=certifi.where())
 
 
 class Telegram:
@@ -51,7 +68,7 @@ class Telegram:
         req = urllib.request.Request(f"{API}/bot{self.token}/{method}", data=data,
                                      method="POST")
         req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+        with urllib.request.urlopen(req, timeout=TIMEOUT, context=_ssl_context()) as resp:
             return json.loads(resp.read().decode("utf-8") or "{}")
 
     def send(self, text: str) -> bool:
