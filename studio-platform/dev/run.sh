@@ -46,6 +46,10 @@ export COVER_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
 # токен сервер отвергает всегда, поэтому локально даётся значение по умолчанию — то же,
 # что берёт dev/render-node.sh. В бою токен настоящий и живёт в .env.
 export PULLER_TOKEN="${PULLER_TOKEN:-dev-render-node}"
+# Субтитры YouTube. На VPS они идут через туннель (облачные адреса YouTube не обслуживает),
+# на домашней машине — напрямую. Без этого значения стенд пытался бы лезть в туннель,
+# которого здесь нет, и отвечал «Missing dependencies for SOCKS support».
+export VS_SUBS_PROXIES="${VS_SUBS_PROXIES:-direct}"
 
 trap 'kill 0' EXIT
 ( cd "$ROOT" && "$PY" -m uvicorn web.platform:app --port "$PORT" --log-level warning ) &

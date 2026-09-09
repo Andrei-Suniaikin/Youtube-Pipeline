@@ -37,8 +37,15 @@ TIMEOUT = 30
 # YouTube не отдаёт субтитры адресам облачных провайдеров, а каждый домашний адрес
 # держит лишь несколько десятков скачиваний в час и потом отвечает 429. Поэтому выходов
 # несколько (туннели с наших машин), и на отказ мы отвечаем сменой выхода, а не ожиданием.
-SUBS_PROXIES = [p.strip() for p in os.environ.get(
-    "VS_SUBS_PROXIES", "socks5h://127.0.0.1:1080").split(",") if p.strip()]
+# «direct» (или «-») — выход без туннеля, напрямую с этой машины. Нужен не для красоты:
+# на VPS без туннеля YouTube субтитры не отдаёт, а на домашнем адресе отдаёт прекрасно,
+# и до появления этого значения сказать «иди напрямую» было нечем — пустая переменная
+# означала «выходов нет вообще».
+DIRECT = ("direct", "-", "none", "нет")
+SUBS_PROXIES = ["" if p.strip().lower() in DIRECT else p.strip()
+                for p in os.environ.get("VS_SUBS_PROXIES",
+                                        "socks5h://127.0.0.1:1080").split(",")
+                if p.strip()]
 # Cookies владельца: с ними YouTube отвечает как обычному зрителю, а не как анониму.
 SUBS_COOKIES = os.environ.get("VS_SUBS_COOKIES", "/root/.vs_yt_cookies.txt")
 # Выход, ответивший отказом, отдыхает — но очередь идёт дальше через остальные.
@@ -176,6 +183,22 @@ def _transcript_api(proxy: str):
     return YouTubeTranscriptApi(http_client=_subs_session(proxy))
 
 
+def _proxy_unusable(exc) -> str:
+    """Туннель задан, но пойти в него нечем — это настройка, а не квота.
+
+    `requests` отвечает на socks5-адрес без установленного PySocks исключением
+    `InvalidSchema: Missing dependencies for SOCKS support` — по нему невозможно
+    догадаться, что дело в туннеле. Отправить такой выход «отдыхать» было бы хуже
+    вдвойне: через полчаса система сказала бы «все выходы исчерпали квоту», хотя
+    квота ни при чём.
+    """
+    if not isinstance(exc, requests.exceptions.InvalidSchema):
+        return ""
+    return ("выход субтитров задан туннелем, но SOCKS-поддержка не установлена "
+            "(pip install 'requests[socks]'), либо туннель не поднят. "
+            "Ходить напрямую: VS_SUBS_PROXIES=direct")
+
+
 def _no_subtitles(exc) -> bool:
     """У ролика действительно нет субтитров — это приговор строке, а не нашей стороне.
 
@@ -302,6 +325,9 @@ def donor_text(url: str) -> str:
         except (ItemFailed, ResourceDown):
             raise
         except Exception as exc:                       # noqa: BLE001
+            why = _proxy_unusable(exc)
+            if why:
+                raise ResourceDown("субтитры", why)
             if _is_exit_fault(exc):
                 _subs_rest(proxy)      # этот выход исчерпан — пробуем следующий
                 last_block = exc
