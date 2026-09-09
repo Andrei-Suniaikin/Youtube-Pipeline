@@ -245,6 +245,7 @@
     <a class="tab" href="#/covers" id="tab-covers">Обложки</a>
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
+    <a class="tab" href="#/voices" id="tab-voices">Голоса</a>
     <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
     <span class="who" id="who"></span>
   </nav>
@@ -1170,7 +1171,9 @@ async function viewProject(id){
       пойдут параллельно, сборка дождётся материалов сама.</div>
     <div class="note muted">Сборку делает отдельная машина. Если рендер-нода не
       запущена, проект дойдёт до сборки и остановится.</div>
-    <div style="margin-top:12px"><button id="rgo">Запустить</button></div></div>`);
+    <div style="margin-top:12px"><button id="rgo">Запустить</button>
+      <a class="ghost" href="#/project/${encodeURIComponent(p.id)}/settings"
+         style="color:var(--muted);margin-left:10px">Все настройки проекта →</a></div></div>`);
   app.append(run);
   const rerr = run.querySelector('#rerr');
   run.querySelector('#rgo').onclick = async () => {
@@ -1781,21 +1784,89 @@ async function viewCovers(){
 
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
+/* ─────────────────────────── голоса ─────────────────────────── */
+
+async function viewVoices(){
+  const d = await api('/ui/voices');
+  app.innerHTML = '';
+  app.append($(`<h1>Голоса</h1><p class="sub">${esc(d.note)}</p>`));
+
+  const mine = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Свои голоса Lumean</div>
+    ${d.mine.length ? `<table><thead><tr><th>Название</th><th>Voice / Template ID</th>
+      <th>Модель</th><th></th></tr></thead><tbody>${d.mine.map(v => `<tr>
+      <td>${esc(v.name)}</td>
+      <td class="mono muted" style="font-size:12px">${esc(v.voice_id)}</td>
+      <td class="muted">${esc(v.model_id) || '—'}</td>
+      <td><button class="ghost vdel" data-id="${v.id}">Удалить</button></td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Своих голосов нет.</div>'}
+    <div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap">
+      <input id="v-name" placeholder="название" style="width:180px">
+      <input id="v-id" placeholder="Voice / Template ID" style="width:250px">
+      <input id="v-model" placeholder="модель (необязательно)" style="width:190px">
+      <button id="v-add" class="small">Добавить</button>
+    </div></div>`);
+  app.append(mine);
+  mine.querySelectorAll('button.vdel').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try{ await api('/ui/voices/' + b.dataset.id, {method: 'DELETE'}); await render(); }
+    catch(e){ toast(e.message); b.disabled = false; }
+  });
+  mine.querySelector('#v-add').onclick = async () => {
+    try{
+      await post('/ui/voices', {name: mine.querySelector('#v-name').value,
+                                voice_id: mine.querySelector('#v-id').value,
+                                model_id: mine.querySelector('#v-model').value});
+      await render();
+    }catch(e){ toast(e.message); }
+  };
+
+  const langs = Object.keys(d.edge);
+  if (langs.length){
+    app.append($(`<div class="card">
+      <div class="sec">Голоса Edge · ${langs.length} языков</div>
+      <div class="note muted">Бесплатны и ключа не требуют. Имя голоса вставляется
+        в поле «Голос» пресета или проекта.</div>
+      ${langs.map(l => `<details style="margin-top:8px">
+        <summary class="muted" style="cursor:pointer">${esc(l)} · ${d.edge[l].length}</summary>
+        <div class="note mono" style="font-size:12px">${d.edge[l].map(esc).join(', ')}</div>
+      </details>`).join('')}</div>`));
+  }
+}
+
+/* ─────────────────────────── серверные лимиты ─────────────────────────── */
+
+async function viewLimits(){
+  const d = await api('/ui/limits');
+  app.innerHTML = '';
+  app.append($(`<h1>Серверные лимиты</h1><p class="sub">${esc(d.note)}</p>`));
+  if (!d.rows.length){
+    app.append($(`<div class="card"><div class="empty">Лимиты не заданы —
+      действуют значения из кода.</div></div>`));
+    return;
+  }
+  app.append($(`<div class="card"><table>
+    <thead><tr><th>Провайдер</th><th>Настройки</th></tr></thead>
+    <tbody>${d.rows.map(r => `<tr>
+      <td style="font-weight:600">${esc(r.provider)}</td>
+      <td class="muted">${Object.entries(r.values).map(([k, v]) =>
+        `${esc(k)}: <b>${esc(String(v))}</b>${
+          d.bounds[k] ? ` <span class="muted">(${d.bounds[k][0]}–${d.bounds[k][1]})</span>` : ''}`
+      ).join(' · ') || '—'}</td></tr>`).join('')}</tbody></table>
+    <div class="note muted">Правка — в файле ключей, блок «_concurrency». Форму сюда
+      не переносим: значения обрезаются на чтении, и поле, показывающее 64 там, где
+      применится 12, врало бы ровно так, как ТЗ запрещает.</div></div>`));
+}
+
 /* ─────────────────────────── редактор пресета ─────────────────────────── */
 
-async function viewPreset(id){
-  const d = await api('/ui/presets/vsgen/' + encodeURIComponent(id));
-  app.innerHTML = '';
-  app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
-    <h1>${esc(d.name)}</h1>
-    <p class="sub">${esc(d.note)}</p>`));
-
-  const form = $(`<form id="pf"></form>`);
-  form.append($(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Название</div>
-    <input id="p-name" value="${esc(d.name)}" style="width:100%;max-width:420px"></div>`));
-
-  for (const g of d.groups){
+// Форма настроек. Одна и та же для пресета и для проекта: это один набор полей —
+// пресет лишь заготовка, проект — его копия в момент заведения. Описание приходит с
+// сервера (server/preset_fields.py), здесь только отрисовка.
+function fieldForm(groups){
+  const form = $(`<form></form>`);
+  for (const g of groups){
     const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)}</div>
       <div class="fields">${g.fields.map(f => {
@@ -1826,28 +1897,62 @@ async function viewPreset(id){
       }).join('')}</div></div>`);
     form.append(card);
   }
-  app.append(form);
-
-  const bar = $(`<div style="display:flex;gap:10px;align-items:center">
-    <button id="save">Сохранить</button>
-    <a class="ghost" href="#/presets" style="color:var(--muted)">Отмена</a></div>`);
-  app.append(bar);
-  bar.querySelector('#save').onclick = async () => {
-    const b = bar.querySelector('#save');
-    b.disabled = true;
+  // Отключённые поля браузер не отправил бы сам; мы их и не читаем — значение
+  // останется таким, каким было, а не обнулится молча.
+  form.read = () => {
     const values = {};
-    // Отключённые поля браузер не отправил бы сам; мы их и не читаем — значение
-    // останется в пресете таким, каким было.
     form.querySelectorAll('[data-key]').forEach(el => {
       if (!el.disabled) values[el.dataset.key] = el.value;
     });
+    return values;
+  };
+  return form;
+}
+
+function saveBar(back, onSave){
+  const bar = $(`<div style="display:flex;gap:10px;align-items:center">
+    <button id="save">Сохранить</button>
+    <a class="ghost" href="${back}" style="color:var(--muted)">Отмена</a></div>`);
+  const b = bar.querySelector('#save');
+  b.onclick = async () => {
+    b.disabled = true;
     try{
-      await post('/ui/presets/vsgen/' + encodeURIComponent(id),
-                 {name: form.querySelector('#p-name').value, values});
+      await onSave();
       toast('Сохранено', 'ok');
-      location.hash = '#/presets';
+      location.hash = back;
     }catch(e){ toast(e.message); b.disabled = false; }
   };
+  return bar;
+}
+
+async function viewPreset(id){
+  const d = await api('/ui/presets/vsgen/' + encodeURIComponent(id));
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
+    <h1>${esc(d.name)}</h1>
+    <p class="sub">${esc(d.note)}</p>`));
+  const name = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Название</div>
+    <input id="p-name" value="${esc(d.name)}" style="width:100%;max-width:420px"></div>`);
+  app.append(name);
+  const form = fieldForm(d.groups);
+  app.append(form);
+  app.append(saveBar('#/presets', () => post(
+    '/ui/presets/vsgen/' + encodeURIComponent(id),
+    {name: name.querySelector('#p-name').value, values: form.read()})));
+}
+
+async function viewProjectSettings(id){
+  const d = await api('/ui/projects/' + encodeURIComponent(id) + '/settings');
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/project/${encodeURIComponent(id)}"
+      >← к проекту</a>
+    <h1>${esc(d.name)}</h1>
+    <p class="sub">${esc(d.note)}</p>`));
+  const form = fieldForm(d.groups);
+  app.append(form);
+  app.append(saveBar('#/project/' + encodeURIComponent(id), () => post(
+    '/ui/projects/' + encodeURIComponent(id) + '/settings', {values: form.read()})));
 }
 
 async function viewPresets(){
@@ -2059,7 +2164,8 @@ async function viewAdmin(){
                                         api('/ui/public')]);
   app.innerHTML = '';
   app.append($(`<h1>Админ</h1>
-    <p class="sub">Состояние системы: что мешает работе и сколько осталось места.</p>`));
+    <p class="sub">Состояние системы: что мешает работе и сколько осталось места.
+      <a href="#/limits" style="margin-left:8px">Серверные лимиты →</a></p>`));
 
   /* ── тревоги ── */
   const t = a.transport;
@@ -2236,7 +2342,12 @@ const ROUTES = [
   ['text',     h => h === '#/text',               () => viewText()],
   ['covers',   h => h === '#/covers',             () => viewCovers()],
   ['projects', h => h === '#/projects',           () => viewProjects()],
+  ['projects', h => h.startsWith('#/project/') && h.endsWith('/settings'),
+                                                  h  => viewProjectSettings(
+                                                          decodeURIComponent(h.slice(10, -9)))],
   ['projects', h => h.startsWith('#/project/'),   h  => viewProject(decodeURIComponent(h.slice(10)))],
+  ['voices',   h => h === '#/voices',             () => viewVoices()],
+  ['admin',    h => h === '#/limits',             () => viewLimits()],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
   ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(decodeURIComponent(h.slice(9)))],
   ['admin',    h => h === '#/admin',              () => viewAdmin()],
@@ -2255,7 +2366,7 @@ async function render(){
   const h = location.hash || '#/releases';
   const hit = ROUTES.find(r => r[1](h));
   for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'covers',
-                    'projects', 'presets', 'admin'])
+                    'projects', 'presets', 'voices', 'admin'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
   try{ await hit[2](h); }
   catch(e){

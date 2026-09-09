@@ -29,7 +29,8 @@ LOGIN = os.environ.get("VS_DEV_LOGIN", "dev")
 # на оба. Разойтись им нельзя: тест логинится ровно той учёткой, которую provision завёл.
 PASSWORD = os.environ.get("VS_DEV_PASSWORD", "dev-local-only")
 
-SCREENS = ("releases", "channels", "queue", "keys", "presets", "alerts", "disk", "public")
+SCREENS = ("releases", "channels", "queue", "keys", "presets", "alerts", "disk",
+           "public", "voices", "limits")
 FAILS = []
 
 
@@ -238,6 +239,37 @@ def main() -> int:
         drop_preset(prid)
         check("пресет убран за собой", preset_row(prid) is None, True)
     check("чужого пресета нет", me.go("/ui/presets/vsgen/999999")[0], 404)
+
+    print("\nНастройки проекта — той же формой, что и пресет")
+    code, d = me.go("/ui/projects/p_a4ffcac9da/settings")
+    if code == 404:
+        print("  — пропущено: проекта p_a4ffcac9da на стенде нет")
+    else:
+        check("поля пришли", code, 200)
+        check("группы те же, что у пресета",
+              [g["title"] for g in d.get("groups", [])],
+              ["Озвучка", "Картинки", "Клипы", "Сборка"])
+        check("чужое поле отвергнуто",
+              me.go("/ui/projects/p_a4ffcac9da/settings", {"values": {"нет_поля": "1"}})[0],
+              400)
+        check("пустое сохранение отвергнуто",
+              me.go("/ui/projects/p_a4ffcac9da/settings", {"values": {}})[0], 400)
+    check("нет проекта — 404", me.go("/ui/projects/p_yok/settings")[0], 404)
+
+    print("\nГолоса заводятся и удаляются здесь")
+    before = len(me.go("/ui/voices")[1].get("mine") or [])
+    check("без идентификатора не заводится",
+          me.go("/ui/voices", {"name": "тест"})[0], 400)
+    check("голос заведён",
+          me.go("/ui/voices", {"name": "тест пульта", "voice_id": "tpl_test"})[0], 200)
+    mine = me.go("/ui/voices")[1]["mine"]
+    check("появился в списке", len(mine), before + 1)
+    added = [v for v in mine if v["voice_id"] == "tpl_test"]
+    if added:
+        check("удаление принято",
+              me.go(f"/ui/voices/{added[0]['id']}", {}, method="DELETE")[0], 200)
+        check("и он исчез", len(me.go("/ui/voices")[1]["mine"]), before)
+    check("голоса Edge на месте", len(me.go("/ui/voices")[1].get("edge") or {}) > 10, True)
 
     print("\nСтраница зовёт API по своему адресу, а не по корню платформы")
     # Тот самый случай, который сломал вход и не ловился curl'ом: страница живёт под
