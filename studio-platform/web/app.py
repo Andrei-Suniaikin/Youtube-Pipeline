@@ -2669,8 +2669,13 @@ def ui_project_settings(pid: str):
     except ValueError:
         settings = {}
     mod = sys.modules.get("main")
+    # Пятая группа («Текст и обложка») в проект не идёт: какими пресетами Rewrite и
+    # Cover делают текст и обложку, решает КАНАЛ, а не отдельный проект. Показать здесь
+    # эти поля значило бы предложить настройку, которую никто не прочитает.
+    groups = [g for g in preset_fields.describe(mod, settings)
+              if g["title"] != "Текст и обложка"]
     return {"id": r["id"], "name": r["name"] or r["id"],
-            "groups": preset_fields.describe(mod, settings, _neighbour_preset_names()),
+            "groups": groups,
             "note": ("Пустое поле означает «как по умолчанию». Настройки уже стоящих "
                      "в очереди задач эта правка не меняет — они заморожены в момент "
                      "запуска (правило 6 ТЗ).")}
