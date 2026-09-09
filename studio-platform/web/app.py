@@ -42,6 +42,7 @@ from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
 from pub_engine import PHASES, PHASE_DEADLINES                   # noqa: E402
 from pub_engine import revive as pub_engine_revive                # noqa: E402
 import preset_fields                                             # noqa: E402
+from pub_engine import channel_presets                            # noqa: E402
 from pub_remote import (COVER_BASE, REWRITE_BASE, donor_text,     # noqa: E402
                         get_key, video_id)
 from pub_services import MEDIA_STAGES, OPTIONAL_STAGES           # noqa: E402
@@ -947,6 +948,9 @@ def ui_channel(channel_id: int, history: int = 14):
             schedule = json.loads(ch["schedule"] or "{}")
         except ValueError:
             schedule = {}
+        _res_rew, _res_cov = channel_presets(c, ch["preset_vsgen_id"],
+                                             ch["preset_rewrite"] or "",
+                                             ch["preset_cover"] or "")
         counts = {}
         for row in cal:
             counts[row["state"]] = counts.get(row["state"], 0) + 1
@@ -977,9 +981,11 @@ def ui_channel(channel_id: int, history: int = 14):
                 "per_week": sum(len(v or []) for v in schedule.values()),
                 "host": (f'{host["code"]} · {host["title"]}' if host else ""),
                 "profile": (f'{prof["serial"]} · {prof["title"]}' if prof else ""),
-                "presets": {"rewrite": ch["preset_rewrite"] or "",
-                            "vsgen": ch["preset_vsgen_id"],
-                            "cover": ch["preset_cover"] or ""},
+                # Текст и обложка приходят из пресета производства — с 09.09 он
+                # единственное место, где они задаются (`pub_engine.channel_presets`).
+                # Сырые колонки канала ниже остаются для формы и для отката.
+                "presets": {"rewrite": _res_rew, "vsgen": ch["preset_vsgen_id"],
+                            "cover": _res_cov},
                 # Сырые значения — для формы настройки: она подставляет их в поля
                 # и отдаёт обратно теми же именами, что у формы кабинета.
                 "note": ch["note"] or "",
@@ -1187,9 +1193,14 @@ def ui_presets():
         for ch in c.execute("SELECT id, name, preset_rewrite, preset_vsgen_id, "
                             "preset_cover FROM pub_channels WHERE tenant_id=? "
                             "ORDER BY name", (TENANT,)):
-            for kind, val in (("rewrite", ch["preset_rewrite"]),
+            # Кто чем пользуется — считаем ПОСЛЕ разрешения через пресет производства.
+            # Иначе пресет обложки, заданный в пресете, выглядел бы никому не нужным,
+            # а экран для того и сделан, чтобы находить ссылки в никуда.
+            rew, cov = channel_presets(c, ch["preset_vsgen_id"],
+                                       ch["preset_rewrite"] or "", ch["preset_cover"] or "")
+            for kind, val in (("rewrite", rew),
                               ("vsgen", ch["preset_vsgen_id"]),
-                              ("cover", ch["preset_cover"])):
+                              ("cover", cov)):
                 if val in (None, ""):
                     continue
                 used[kind].setdefault(str(val), []).append(

@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import preset_fields
 import hashlib
 import json
 import os
@@ -345,6 +346,13 @@ class PubServices:
                          "проект уйдёт на умолчаниях кабинета", level="warn")
                 settings = {}
             settings["_applied_preset"] = rel["preset_vsgen_id"]
+            # Голос по языку канала — правило ТЗ §06 «язык → провайдер → идентификатор».
+            # Разрешаем здесь, а не в воркере: язык знает выпуск, а воркер получает уже
+            # готовый проект. Настройка, которую некому прочитать, — это то же, что её
+            # отсутствие, только выглядит рабочей.
+            chosen = preset_fields.voice_for(settings, rel["lang"] or "")
+            if chosen:
+                settings["voice"] = chosen
         c.commit()      # создание проекта откроет своё соединение — наш замок отпустить
         pid = self.create_project(rel["tenant_id"], rel["ch_name"] or "выпуск",
                                   source_text=text, settings=settings)

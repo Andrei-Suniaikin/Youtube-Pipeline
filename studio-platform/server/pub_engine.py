@@ -313,8 +313,40 @@ def materialize(c, now: float) -> list:
 
 # ─────────────────────────── продвижение ───────────────────────────
 
+def preset_settings(c, preset_id) -> dict:
+    """Настройки пресета производства. Пусто — если пресета нет или он повреждён."""
+    if not preset_id:
+        return {}
+    row = c.execute("SELECT settings FROM presets WHERE id=?", (preset_id,)).fetchone()
+    if not row or not row["settings"]:
+        return {}
+    try:
+        data = json.loads(row["settings"])
+    except ValueError:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def channel_presets(c, preset_vsgen_id, preset_rewrite="", preset_cover="") -> tuple:
+    """Какими пресетами делаются текст и обложка. Решает ПРЕСЕТ ПРОИЗВОДСТВА.
+
+    Решение владельца 09.09.2026: канал указывает на один пресет, и текст с обложкой
+    берутся оттуда. До этого канал держал три ссылки на три сервиса, и один ролик
+    настраивался в трёх местах — ровно то, что ТЗ §04 просит свести в одно.
+
+    Колонки канала остаются как запасной путь: у каналов, заведённых раньше, пресет
+    производства про соседей ещё ничего не знает, и молча обнулить им текст и обложку
+    значило бы остановить их выпуски. Пустое поле в пресете — это «не задано», а не
+    «убрать»: у нас нет способа отличить одно от другого, а цена ошибки разная.
+    """
+    s = preset_settings(c, preset_vsgen_id)
+    rew = str(s.get("preset_rewrite") or "").strip() or (preset_rewrite or "")
+    cov = str(s.get("preset_cover") or "").strip() or (preset_cover or "")
+    return rew, cov
+
+
 def live_releases(c) -> list:
-    return c.execute(
+    rows = c.execute(
         "SELECT r.*, ch.name ch_name, ch.tz tz, ch.profile_id profile_id, ch.host_id host_id, "
         "ch.preset_rewrite preset_rewrite, ch.preset_vsgen_id preset_vsgen_id, "
         "ch.preset_cover preset_cover, ch.collaborator collaborator, ch.lang lang, "
@@ -323,6 +355,17 @@ def live_releases(c) -> list:
         "FROM pub_releases r JOIN pub_channels ch ON ch.id=r.channel_id "
         "JOIN pub_plan_items p ON p.id=r.plan_item_id "
         "WHERE r.status IN ('pending','running') ORDER BY r.slot_at").fetchall()
+    # Строки превращаются в словари: значения пресетов подменяются, а sqlite3.Row
+    # неизменяем. Читатели обращаются по имени (`rel["preset_cover"]`) — для словаря
+    # это работает так же.
+    out = []
+    for r in rows:
+        d = dict(r)
+        d["preset_rewrite"], d["preset_cover"] = channel_presets(
+            c, d.get("preset_vsgen_id"), d.get("preset_rewrite") or "",
+            d.get("preset_cover") or "")
+        out.append(d)
+    return out
 
 
 LIVE_STATES = ("pending", "running")

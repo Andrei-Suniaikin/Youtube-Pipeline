@@ -262,7 +262,6 @@
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
-    <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
     <a class="tab" href="#/profile" id="tab-profile" style="margin-left:auto">Профиль</a>
     <span class="who" id="who"></span>
   </nav>
@@ -530,6 +529,8 @@ function dur(sec){
 }
 
 async function viewKeys(){
+  // Ключи живут в профиле: это про человека, а не про производство. Вкладки в топбаре
+  // у них больше нет — обратный путь должен быть виден со страницы.
   const d = await api('/ui/keys');
   app.innerHTML = '';
   app.append($(`<h1>Ключи</h1>
@@ -1555,11 +1556,12 @@ async function wireChannelEdit(root, c){
       ${sel('f-host', ref.hosts.map(h => ({value: h.id, title: h.title})),
             c.host_id, 'Машина заливки')}
       ${sel('f-pv', ref.presets.vsgen.map(p => ({value: p.id, title: p.name})),
-            c.preset_vsgen_id, 'Пресет производства')}
-      ${sel('f-pr', ref.presets.rewrite.map(n => ({value: n, title: n})),
-            c.preset_rewrite, 'Пресет рерайта')}
-      ${sel('f-pc', ref.presets.cover.map(n => ({value: n, title: n})),
-            c.preset_cover, 'Пресет обложки')}
+            c.preset_vsgen_id, 'Пресет')}
+      <div class="note muted">Текст и обложка берутся из него же — группа
+        «Текст и обложка» внутри пресета. Сейчас: рерайт
+        «${esc(c.presets.rewrite || 'не задан')}», обложка
+        «${esc(c.presets.cover || 'не задана')}».${c.preset_vsgen_id
+          ? ` <a href="#/preset/${c.preset_vsgen_id}">Открыть пресет →</a>` : ''}</div>
       <div class="fldrow"><label>Заметка</label>
         <input id="f-note" value="${esc(c.note || '')}" style="width:100%"></div>
       <div style="margin-top:12px"><button id="save">Сохранить</button></div>`;
@@ -1582,8 +1584,11 @@ async function wireChannelEdit(root, c){
           deferred: box.querySelector('#f-def').checked ? '1' : '',
           deferred_limit: v('f-deflim'),
           profile_id: v('f-prof'), host_id: v('f-host'),
-          preset_vsgen_id: v('f-pv'), preset_rewrite: v('f-pr'),
-          preset_cover: v('f-pc'), note: v('f-note'),
+          // Текст и обложку канал больше не хранит: их держит пресет. Старые значения
+          // отправляем как есть — обнулить их значило бы остановить выпуски каналов,
+          // у которых пресет про соседей ещё не знает.
+          preset_vsgen_id: v('f-pv'), preset_rewrite: c.preset_rewrite || '',
+          preset_cover: c.preset_cover || '', note: v('f-note'),
         });
         await render();
       }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
@@ -1976,9 +1981,10 @@ async function viewProfile(){
     <p class="sub">${esc(me.name || '')}${me.role ? ' · ' + esc(me.role) : ''}</p>`));
 
   app.append($(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Ключи провайдеров</div>
+    <div class="sec">Ключи провайдеров
+      <a class="mklink" href="#/keys">открыть →</a></div>
     <div class="note muted">Ключи принадлежат человеку, а не системе: свой ключ тратит
-      свои деньги. Отдельный экран — <a href="#/keys">Ключи</a>.</div></div>`));
+      свои деньги, серверный — деньги владельца.</div></div>`));
 
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Система</div>
@@ -2495,7 +2501,7 @@ const ROUTES = [
   ['queue',    h => h === '#/queue',              () => viewQueue()],
   ['channels', h => h.startsWith('#/channel/'),
                                                  h  => viewChannel(h.split('/')[2])],
-  ['keys',     h => h === '#/keys',               () => viewKeys()],
+  ['profile',  h => h === '#/keys',               () => viewKeys()],
   ['projects', h => h === '#/text',               () => viewText()],
   ['projects', h => h === '#/covers',             () => viewCovers()],
   ['projects', h => h === '#/projects',           () => viewProjects()],
@@ -2526,7 +2532,7 @@ async function render(){
   const hit = ROUTES.find(r => r[1](h));
   // Экранов больше, чем вкладок: «Выпуски», «Текст», «Обложки» и «Админ» живут внутри
   // каналов, проектов и профиля. Подсвечиваем ту вкладку, в чей раздел попал маршрут.
-  for (const id of ['channels', 'projects', 'queue', 'presets', 'keys', 'profile'])
+  for (const id of ['channels', 'projects', 'queue', 'presets', 'profile'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
   try{ await hit[2](h); }
   catch(e){

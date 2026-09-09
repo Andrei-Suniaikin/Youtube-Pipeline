@@ -139,8 +139,13 @@ GROUPS = (
     ("Озвучка", (
         Field("engine", "Движок", "select", options=_engines),
         Field("speed", "Скорость", "text", placeholder="1.0", hint="1.0 — как есть"),
-        Field("voice", "Голос", "text", placeholder="пусто = по языку текста",
-              hint="правило: язык → провайдер → идентификатор голоса"),
+        Field("voice_by_lang", "Голоса по языкам", "text",
+              placeholder="ru: тут-id, en: другой-id",
+              hint="правило ТЗ §06: язык → провайдер → идентификатор. "
+                   "Язык берётся у канала выпуска"),
+        Field("voice", "Голос по умолчанию", "text",
+              placeholder="пусто = подберётся по языку текста",
+              hint="используется, когда языка нет в списке выше"),
         Field("model_id", "Модель Voicer", "text", off=_tts_off("voicer")),
         Field("split_type", "Разбивка", "text", placeholder="по абзацам"),
         Field("stability", "Стабильность", "text", off=_tts_off("voicegencore")),
@@ -237,3 +242,34 @@ def keys() -> set:
     """Все поля, которыми управляет эта форма. Кабинет на сохранении делает merge,
     поэтому чужие ключи пресета (их там больше) не затираются."""
     return {f.key for _t, fields in GROUPS for f in fields}
+
+
+def parse_voice_map(raw) -> dict:
+    """«ru: id, en: другой» → {"ru": "id", "en": "другой"}.
+
+    Формат нарочно простой: список языков у канала короткий, а таблица в отдельном
+    экране — это ровно тот раздел «Голоса», который ТЗ §06 велит убрать. Разделители
+    принимаем и запятую, и перевод строки: человек напишет так, как ему удобнее, и
+    угадывать его форму — не его работа.
+    """
+    out = {}
+    for chunk in str(raw or "").replace("\n", ",").split(","):
+        lang, sep, voice = chunk.partition(":")
+        if not sep:
+            continue
+        lang, voice = lang.strip().lower(), voice.strip()
+        if lang and voice:
+            out[lang] = voice
+    return out
+
+
+def voice_for(settings: dict, lang: str) -> str:
+    """Голос для этого языка, иначе голос по умолчанию, иначе пусто.
+
+    Пусто — это не отказ: движок озвучки сам подберёт голос по языку текста. Отказ был
+    бы неправ: у Edge голоса встроены, и требовать идентификатор незачем.
+    """
+    s = settings if isinstance(settings, dict) else {}
+    code = str(lang or "").strip().lower()
+    got = parse_voice_map(s.get("voice_by_lang")).get(code) if code else ""
+    return got or str(s.get("voice") or "").strip()
