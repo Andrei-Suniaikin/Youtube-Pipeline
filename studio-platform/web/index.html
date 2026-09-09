@@ -245,7 +245,6 @@
     <a class="tab" href="#/covers" id="tab-covers">Обложки</a>
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
-    <a class="tab" href="#/voices" id="tab-voices">Голоса</a>
     <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
     <span class="who" id="who"></span>
   </nav>
@@ -1784,57 +1783,6 @@ async function viewCovers(){
 
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
-/* ─────────────────────────── голоса ─────────────────────────── */
-
-async function viewVoices(){
-  const d = await api('/ui/voices');
-  app.innerHTML = '';
-  app.append($(`<h1>Голоса</h1><p class="sub">${esc(d.note)}</p>`));
-
-  const mine = $(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Свои голоса Lumean</div>
-    ${d.mine.length ? `<table><thead><tr><th>Название</th><th>Voice / Template ID</th>
-      <th>Модель</th><th></th></tr></thead><tbody>${d.mine.map(v => `<tr>
-      <td>${esc(v.name)}</td>
-      <td class="mono muted" style="font-size:12px">${esc(v.voice_id)}</td>
-      <td class="muted">${esc(v.model_id) || '—'}</td>
-      <td><button class="ghost vdel" data-id="${v.id}">Удалить</button></td>
-      </tr>`).join('')}</tbody></table>`
-      : '<div class="empty">Своих голосов нет.</div>'}
-    <div class="row" style="gap:8px;margin-top:12px;flex-wrap:wrap">
-      <input id="v-name" placeholder="название" style="width:180px">
-      <input id="v-id" placeholder="Voice / Template ID" style="width:250px">
-      <input id="v-model" placeholder="модель (необязательно)" style="width:190px">
-      <button id="v-add" class="small">Добавить</button>
-    </div></div>`);
-  app.append(mine);
-  mine.querySelectorAll('button.vdel').forEach(b => b.onclick = async () => {
-    b.disabled = true;
-    try{ await api('/ui/voices/' + b.dataset.id, {method: 'DELETE'}); await render(); }
-    catch(e){ toast(e.message); b.disabled = false; }
-  });
-  mine.querySelector('#v-add').onclick = async () => {
-    try{
-      await post('/ui/voices', {name: mine.querySelector('#v-name').value,
-                                voice_id: mine.querySelector('#v-id').value,
-                                model_id: mine.querySelector('#v-model').value});
-      await render();
-    }catch(e){ toast(e.message); }
-  };
-
-  const langs = Object.keys(d.edge);
-  if (langs.length){
-    app.append($(`<div class="card">
-      <div class="sec">Голоса Edge · ${langs.length} языков</div>
-      <div class="note muted">Бесплатны и ключа не требуют. Имя голоса вставляется
-        в поле «Голос» пресета или проекта.</div>
-      ${langs.map(l => `<details style="margin-top:8px">
-        <summary class="muted" style="cursor:pointer">${esc(l)} · ${d.edge[l].length}</summary>
-        <div class="note mono" style="font-size:12px">${d.edge[l].map(esc).join(', ')}</div>
-      </details>`).join('')}</div>`));
-  }
-}
-
 /* ─────────────────────────── серверные лимиты ─────────────────────────── */
 
 async function viewLimits(){
@@ -2346,7 +2294,6 @@ const ROUTES = [
                                                   h  => viewProjectSettings(
                                                           decodeURIComponent(h.slice(10, -9)))],
   ['projects', h => h.startsWith('#/project/'),   h  => viewProject(decodeURIComponent(h.slice(10)))],
-  ['voices',   h => h === '#/voices',             () => viewVoices()],
   ['admin',    h => h === '#/limits',             () => viewLimits()],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
   ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(decodeURIComponent(h.slice(9)))],
@@ -2366,7 +2313,7 @@ async function render(){
   const h = location.hash || '#/releases';
   const hit = ROUTES.find(r => r[1](h));
   for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'covers',
-                    'projects', 'presets', 'voices', 'admin'])
+                    'projects', 'presets', 'admin'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
   try{ await hit[2](h); }
   catch(e){

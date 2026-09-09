@@ -39,7 +39,16 @@ class Field:
 
 
 def _engines(m):
-    return [(k, v[0] + (f" · {v[1]}" if v[1] else "")) for k, v in m.TTS_ENGINES.items()]
+    """Движки озвучки в порядке ТЗ §06: VoiceGenCore → Lumean → Voicer → Edge.
+
+    Порядок словаря `TTS_ENGINES` другой (edge первым), и взять его как есть значило бы
+    показать не тот список, который просили. Незнакомые движки, если появятся, идут
+    следом: молча потерять пункт хуже, чем показать его не на своём месте.
+    """
+    order = ("voicegencore", "lumean", "voicer", "edge")
+    items = dict(m.TTS_ENGINES)
+    keys_ = [k for k in order if k in items] + [k for k in items if k not in order]
+    return [(k, items[k][0] + (f" · {items[k][1]}" if items[k][1] else "")) for k in keys_]
 
 
 def _image_models(m):
@@ -55,10 +64,15 @@ def _quality(m):
 
 
 def _orders(m):
-    titles = {"video_first": "сначала клипы", "images_first": "сначала кадры",
-              "alternate": "вперемешку", "alphabetical": "по имени файла",
-              "random": "случайно"}
-    return [(k, titles.get(k, k)) for k in sorted(m._MATERIAL_ORDERS)]
+    """Порядок материалов. ТЗ §09 убирает случайный и алфавитный — их здесь нет.
+
+    Список задан прямо, а не отфильтрован из `_MATERIAL_ORDERS`: движок обязан и дальше
+    принимать старые значения из сохранённых пресетов, а вот предлагать их человеку
+    больше нельзя. Это два разных вопроса, и решать их одним списком — ошибка.
+    """
+    titles = (("video_first", "сначала клипы"), ("images_first", "сначала кадры"),
+              ("alternate", "вперемешку"))
+    return [(k, t) for k, t in titles if k in m._MATERIAL_ORDERS]
 
 
 def _sub_langs(m):
@@ -66,7 +80,8 @@ def _sub_langs(m):
 
 
 def _seed_off(m, s):
-    """Seed принимают три модели из двенадцати — у остальных провайдер отвергает запрос.
+    """Seed принимают четыре модели семейства Nano Banana — у остальных провайдер
+    отвергает запрос целиком (ТЗ §07, «починить»).
 
     Источник правды — движок (`googler_worker.V6_SEED_MODELS`), кабинет держит его
     отражение в `IMAGE_MODELS_WITH_SEED`. Здесь мы только спрашиваем.
@@ -78,41 +93,73 @@ def _seed_off(m, s):
     return "эта модель seed не принимает — провайдер отвергает запрос целиком"
 
 
-def _bing_off(m, s):
-    if str(s.get("image_mode") or "ai") == "bing":
+def _truthy(v) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "on", "yes", "да")
+
+
+def _sync_off(m, s):
+    """Мин/макс секунд на кадр при включённом синхроне не действуют (ТЗ §09, «починить»).
+
+    Синхрон заменяет расчёт длительностей целиком: в функции синхрона
+    (`render_worker._compute_synced_image_durations`, 188 строк) мин и макс не
+    упоминаются ни разу. Поле, которое доезжает до движка и там не читается, — ровно то,
+    что запрещает правило 2.
+    """
+    if not _truthy(s.get("sync_audio")):
         return ""
-    return "только для источника «Поиск Bing»"
+    return "при синхроне длительность считает звук — эти поля не действуют"
 
 
-def _ai_off(m, s):
-    if str(s.get("image_mode") or "ai") == "ai":
-        return ""
-    return "только для источника «AI-генерация»"
+def _tts_off(*supported):
+    """Поле видно только у тех движков озвучки, которые его поддерживают (ТЗ §06).
+
+    «Показывать только те настройки, которые выбранный провайдер действительно
+    поддерживает» — иначе человек заполняет stability для Edge и ждёт эффекта.
+    """
+    def rule(m, s):
+        eng = str(s.get("engine") or "edge").strip().lower()
+        if eng in supported:
+            return ""
+        return "этот движок настройку не поддерживает — она есть у: " + ", ".join(supported)
+    return rule
 
 
+# Убрано по ТЗ и сюда не возвращается:
+#   §06 вторая строка Lumean — провайдер один, кнопка одна;
+#       отдельный раздел «Голоса» — голос живёт в пресете правилом
+#       «язык → провайдер → идентификатор»;
+#   §07 источник «Поиск Bing» целиком, а вместе с ним поля `tags` и `num_images`;
+#       галка «Авто-герой» (`auto_hero`) — дублирует разбор персонажей и конфликтует
+#       с ручными референсами (в движке она и работает только когда ни того, ни другого
+#       нет: googler_worker.py:8854);
+#   §09 «Равномерное распределение»; режимы переходов «быстрые/плавные» вместо да/нет;
+#       случайный и алфавитный порядок материалов; масштаб, смещение, интро, наложения;
+#       автозвук — выключен до выкатки рендерера на Минск.
 GROUPS = (
     ("Озвучка", (
         Field("engine", "Движок", "select", options=_engines),
         Field("speed", "Скорость", "text", placeholder="1.0", hint="1.0 — как есть"),
-        Field("voice", "Голос / Voice ID", "text", placeholder="пусто = по языку"),
-        Field("model_id", "Модель озвучки", "text", placeholder="пусто = по умолчанию"),
+        Field("voice", "Голос", "text", placeholder="пусто = по языку текста",
+              hint="правило: язык → провайдер → идентификатор голоса"),
+        Field("model_id", "Модель Voicer", "text", off=_tts_off("voicer")),
         Field("split_type", "Разбивка", "text", placeholder="по абзацам"),
-        Field("stability", "Стабильность", "text"),
+        Field("stability", "Стабильность", "text", off=_tts_off("voicegencore")),
+        Field("voice_uuid", "Lumean template_id", "text", off=_tts_off("lumean")),
     )),
     ("Картинки", (
-        Field("image_mode", "Источник", "select",
-              options=lambda m: [("ai", "AI-генерация"), ("bing", "Поиск Bing")]),
-        Field("model", "Модель", "select", options=_image_models, off=_ai_off),
+        Field("model", "Модель", "select", options=_image_models),
         Field("aspect_ratio", "Соотношение", "text", placeholder="landscape"),
         Field("style", "Стиль", "text", placeholder="пусто = без стиля"),
-        Field("sentences_per_prompt", "Предложений на кадр", "number", placeholder="3"),
+        Field("sentences_per_prompt", "Предложений на кадр", "text", placeholder="3",
+              hint="можно переменным шагом: 1x40,3 — первые сорок по одному, дальше по три"),
         Field("seed", "Seed — тот же результат", "text",
               placeholder="пусто = случайный", off=_seed_off),
-        Field("auto_hero", "Разбор персонажей и мест", "switch",
-              hint="континуити между кадрами"),
+        Field("analyze_story", "Разбор персонажей и мест", "switch",
+              hint="канон внешности, чтобы герой не менялся от кадра к кадру"),
+        Field("split_long_sentences", "Дробить длинные предложения", "switch"),
         Field("max_solo_scene_seconds", "Сек на кадр, примерно", "number"),
-        Field("tags", "Теги для Bing", "text", off=_bing_off),
-        Field("custom_prompts", "Кастом-промты", "text"),
+        Field("custom_prompts", "Кастом-промты", "text",
+              placeholder="по одному в строке; пусто = промпты пишет модель"),
     )),
     ("Клипы", (
         Field("video_method", "Метод", "select", options=_video_methods),
@@ -122,16 +169,16 @@ GROUPS = (
     ("Сборка", (
         Field("quality", "Качество", "select", options=_quality),
         Field("transitions", "Переходы", "select",
-              options=lambda m: [("none", "без переходов"), ("fast", "плавные")]),
+              options=lambda m: [("none", "нет"), ("fast", "да")]),
         Field("sync_audio", "Синхрон по озвучке", "switch",
-              hint="длительность кадра считается по звуку"),
+              hint="длительность кадра считается по звуку; без него — по мин/макс"),
         Field("kenburns", "Плавный зум", "switch"),
         Field("subtitles", "Субтитры", "switch"),
         Field("subtitle_lang", "Язык субтитров", "select", options=_sub_langs),
         Field("chapters", "Тайм-коды в описание", "switch"),
         Field("material_order", "Порядок материалов", "select", options=_orders),
-        Field("min_image_duration", "Сек на кадр, минимум", "number"),
-        Field("max_image_duration", "Сек на кадр, максимум", "number"),
+        Field("min_image_duration", "Сек на кадр, минимум", "number", off=_sync_off),
+        Field("max_image_duration", "Сек на кадр, максимум", "number", off=_sync_off),
     )),
 )
 

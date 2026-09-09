@@ -2584,60 +2584,6 @@ def ui_project_run(pid: str, body: RunIn, request: Request):
     return _cabinet_form("/api/batch/pipeline", fields, request)
 
 
-@app.get("/ui/voices")
-def ui_voices():
-    """Свои голоса Lumean и список бесплатных Edge.
-
-    Два разных списка: `voice_lib` — то, что человек завёл сам (Template ID Lumean, за
-    них платят), Edge — встроенный набор движка, ключа не требует. Показываем оба, но
-    не смешиваем: удалить можно только своё.
-    """
-    mod = sys.modules.get("main")
-    c = db()
-    try:
-        mine = [{"id": r["id"], "name": r["name"], "voice_id": r["voice_id"] or "",
-                 "model_id": r["model_id"] or ""}
-                for r in c.execute("SELECT id, name, voice_id, model_id FROM voice_lib "
-                                   "WHERE tenant_id=? ORDER BY name COLLATE NOCASE",
-                                   (TENANT,))]
-    finally:
-        c.close()
-    edge = {}
-    if mod is not None and hasattr(mod, "_voices_by_lang"):
-        try:
-            edge = {lang: sorted(v)[:60] for lang, v in sorted(mod._voices_by_lang().items())}
-        except Exception:                                          # noqa: BLE001
-            edge = {}
-    return {"mine": mine, "edge": edge,
-            "note": ("Свои голоса — Template ID Lumean, они платные. Голоса Edge "
-                     "встроены в движок и ключа не требуют.")}
-
-
-class VoiceIn(BaseModel):
-    name: str = ""
-    voice_id: str = ""
-    model_id: str = ""
-
-
-@app.post("/ui/voices")
-def ui_voice_add(body: VoiceIn, request: Request):
-    name = (body.name or "").strip()[:60]
-    vid = (body.voice_id or "").strip()[:80]
-    if not name or not vid:
-        raise HTTPException(400, "нужны название и Voice / Template ID")
-    _cabinet_form("/api/voices/add",
-                  [("name", name), ("voice_id", vid),
-                   ("model_id", (body.model_id or "").strip()[:80])],
-                  request, expect_json=False)
-    return {"ok": True}
-
-
-@app.delete("/ui/voices/{vid:int}")
-def ui_voice_del(vid: int, request: Request):
-    _cabinet_form(f"/api/voices/{vid}/delete", [], request, expect_json=False)
-    return {"ok": True}
-
-
 @app.get("/ui/limits")
 def ui_limits(request: Request):
     """Лимиты серверных ключей: сколько задач и потоков разрешено провайдеру.
