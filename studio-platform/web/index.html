@@ -239,8 +239,6 @@
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
     <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
-    <a class="tab" href="/" id="tab-old" title="Старые экраны кабинета: проекты, голоса, лимиты"
-       style="color:var(--muted)">Кабинет ↗</a>
     <span class="who" id="who"></span>
   </nav>
 </header>
@@ -2157,7 +2155,6 @@ async function render(){
   showWho();
   const h = location.hash || '#/releases';
   const hit = ROUTES.find(r => r[1](h));
-  // «Кабинет ↗» в этот список не входит: это ссылка наружу, а не вкладка пульта.
   for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'covers',
                     'projects', 'presets', 'admin'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
