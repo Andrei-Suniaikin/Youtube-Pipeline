@@ -40,6 +40,7 @@ from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
                            normalize_schedule, upcoming_slots)
 from pub_engine import PHASES, PHASE_DEADLINES                   # noqa: E402
 from pub_engine import revive as pub_engine_revive                # noqa: E402
+import preset_fields                                             # noqa: E402
 from pub_remote import (COVER_BASE, REWRITE_BASE, donor_text,     # noqa: E402
                         get_key, video_id)
 from pub_services import MEDIA_STAGES, OPTIONAL_STAGES           # noqa: E402
@@ -1191,8 +1192,7 @@ def ui_presets():
     # нельзя: раньше экран говорил «правка — в разделе того сервиса» и не говорил,
     # где этот раздел.
     groups = [{"service": "vsgen", "title": "Производство (кабинет)", "items": vsgen,
-               "error": "", "note": "ключ пресета — число, а не имя",
-               "home": CABINET_BASE + "/presets", "home_title": "кабинете"}]
+               "error": "", "note": "ключ пресета — число, а не имя"}]
 
     body, err = _neighbour_get(REWRITE_BASE, "/api/v1/presets", keys["rewrite"])
     rew = (body or {}).get("rewrite") or {}
@@ -1346,12 +1346,17 @@ ACTIONS = {
 BASES = {"vsgen": None, "rewrite": REWRITE_BASE, "cover": COVER_BASE}
 
 
-def _cabinet_form(path: str, fields, request, timeout: float = 0.0) -> dict:
+def _cabinet_form(path: str, fields, request, timeout: float = 0.0,
+                  expect_json: bool = True) -> dict:
     """POST формой в кабинет от имени вошедшего человека.
 
     Кабинет отвечает JSON только на пометку «это fetch» — иначе он шлёт редирект на
     свою собственную страницу, показывать которую пульту нечем. Отказ пересказываем
     как есть: «повтор доступен только для ошибочной задачи» — это ответ, а не сбой.
+
+    `expect_json=False` — для ручек, которые про «это fetch» не знают и отвечают
+    редиректом всегда (формы пресетов). Тогда нам важен только код ответа: прошло или
+    нет. Разбирать их HTML мы не станем — это не контракт, а страница.
     """
     data = urllib.parse.urlencode(fields).encode("utf-8")
     req = urllib.request.Request(CABINET_BASE + path, data=data, method="POST")
@@ -1360,7 +1365,10 @@ def _cabinet_form(path: str, fields, request, timeout: float = 0.0) -> dict:
     req.add_header("X-Requested-With", "fetch")
     try:
         with urllib.request.urlopen(req, timeout=timeout or NEIGHBOUR_TIMEOUT * 3) as resp:
-            return json.loads(resp.read().decode("utf-8") or "{}")
+            body = resp.read().decode("utf-8", "replace")
+            if not expect_json:
+                return {"ok": True}
+            return json.loads(body or "{}")
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")
         try:
@@ -1940,6 +1948,90 @@ def _file_kind(name: str) -> str:
 # поле показано, а движок его не читает. Правка полей остаётся в самом сервисе,
 # ссылка на него рядом. Копия закрывает то, что нужно каждый день, — «такой же,
 # но для другого канала».
+
+class PresetNew(BaseModel):
+    name: str = ""
+
+
+@app.post("/ui/presets/vsgen")
+def ui_preset_create(body: PresetNew, request: Request):
+    """Завести пресет производства. Возвращает номер — чтобы сразу открыть редактор."""
+    name = (body.name or "").strip()[:80]
+    if not name:
+        raise HTTPException(400, "у пресета должно быть имя")
+    c = db()
+    try:
+        exists = c.execute("SELECT 1 FROM presets WHERE tenant_id=? AND name=?",
+                           (TENANT, name)).fetchone()
+    finally:
+        c.close()
+    if exists:
+        raise HTTPException(409, f"пресет «{name}» уже есть")
+    # Заводит кабинет: у него и таблица, и умолчания, и нумерация. Здесь только форма.
+    _cabinet_form("/api/presets/create", [("name", name)], request,
+                  expect_json=False)
+    c = db()
+    try:
+        r = c.execute("SELECT id FROM presets WHERE tenant_id=? AND name=? "
+                      "ORDER BY id DESC LIMIT 1", (TENANT, name)).fetchone()
+    finally:
+        c.close()
+    if not r:
+        raise HTTPException(502, "кабинет не завёл пресет")
+    return {"id": r["id"], "name": name}
+
+
+@app.get("/ui/presets/vsgen/{prid:int}")
+def ui_preset_get(prid: int):
+    """Поля пресета и их текущие значения.
+
+    Список полей приходит из `server/preset_fields.py` — одного описания на кабинет и
+    пульт. Своей копии формы здесь нет намеренно: разойдясь, две формы начнут показывать
+    разные настройки одного и того же пресета.
+    """
+    c = db()
+    try:
+        r = c.execute("SELECT id, name, settings FROM presets WHERE id=? AND tenant_id=?",
+                      (prid, TENANT)).fetchone()
+    finally:
+        c.close()
+    if not r:
+        raise HTTPException(404, "нет такого пресета")
+    try:
+        settings = json.loads(r["settings"] or "{}")
+    except ValueError:
+        settings = {}
+    mod = sys.modules.get("main")
+    return {"id": r["id"], "name": r["name"] or f"пресет {r['id']}",
+            "groups": preset_fields.describe(mod, settings),
+            "note": ("Пустое поле означает «как по умолчанию». Проверку значений делает "
+                     "кабинет при сохранении — теми же контрактами, что и всегда.")}
+
+
+class PresetSave(BaseModel):
+    name: str = ""
+    values: dict = {}
+
+
+@app.post("/ui/presets/vsgen/{prid:int}")
+def ui_preset_save(prid: int, body: PresetSave, request: Request):
+    """Сохранить пресет.
+
+    Уходит в кабинет его же формой: там значения проходят контракты
+    (`_canonical_image_params`, `_normalize_lumean_settings`) и там же делается merge —
+    ключи, которых в этой форме нет, не затираются. Повторять проверки здесь значило бы
+    завести вторую, отстающую версию правил.
+    """
+    known = preset_fields.keys()
+    unknown = sorted(set(body.values) - known)
+    if unknown:
+        raise HTTPException(400, "неизвестные поля: " + ", ".join(unknown))
+    fields = [("name", (body.name or "").strip()[:80])]
+    fields += [(k, "" if v is None else str(v)) for k, v in body.values.items()]
+    _cabinet_form(f"/api/presets/{prid}/edit", fields, request,
+                  expect_json=False)
+    return {"ok": True}
+
 
 @app.post("/ui/presets/{service}/copy")
 def ui_preset_copy(service: str, body: dict, request: Request):

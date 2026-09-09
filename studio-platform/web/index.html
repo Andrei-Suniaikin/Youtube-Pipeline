@@ -179,6 +179,10 @@
   .res h3{font-size:11px;margin:0 0 7px;text-transform:uppercase;letter-spacing:.07em;
           color:var(--muted);font-weight:700}
   .res ul{margin:0 0 14px;padding-left:20px}
+  .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
+  .fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
+  .fld input,.fld select{width:100%}
+  .fld input[readonly]{opacity:.55}
   .sec .mklink{float:right;font-weight:500;font-size:12px;text-transform:none;
                letter-spacing:0;color:var(--acc-hi);text-decoration:none}
   .sec .mklink:hover{text-decoration:underline}
@@ -1777,11 +1781,92 @@ async function viewCovers(){
 
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
+/* ─────────────────────────── редактор пресета ─────────────────────────── */
+
+async function viewPreset(id){
+  const d = await api('/ui/presets/vsgen/' + encodeURIComponent(id));
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
+    <h1>${esc(d.name)}</h1>
+    <p class="sub">${esc(d.note)}</p>`));
+
+  const form = $(`<form id="pf"></form>`);
+  form.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Название</div>
+    <input id="p-name" value="${esc(d.name)}" style="width:100%;max-width:420px"></div>`));
+
+  for (const g of d.groups){
+    const card = $(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">${esc(g.title)}</div>
+      <div class="fields">${g.fields.map(f => {
+        const id = 'f-' + f.key;
+        // Поле, отменённое другой настройкой, не прячем и не отключаем: readOnly
+        // оставляет значение в форме (disabled-поля не отправляются, и сохранение
+        // стёрло бы их), а причина написана рядом — правило 2 ТЗ.
+        const off = f.off ? ' readonly title="' + esc(f.off) + '"' : '';
+        const body = f.kind === 'select'
+          ? `<select id="${id}" data-key="${esc(f.key)}"${f.off ? ' disabled' : ''}>
+               <option value="">— как по умолчанию —</option>
+               ${f.options.map(o => `<option value="${esc(o.value)}"${
+                 String(f.value) === String(o.value) ? ' selected' : ''
+               }>${esc(o.title)}</option>`).join('')}</select>`
+          : f.kind === 'switch'
+          ? `<select id="${id}" data-key="${esc(f.key)}"${f.off ? ' disabled' : ''}>
+               <option value=""${f.value === '' ? ' selected' : ''}>— как по умолчанию —</option>
+               <option value="1"${['1','true','on','да'].includes(String(f.value).toLowerCase()) ? ' selected' : ''}>включено</option>
+               <option value="0"${['0','false','off','нет'].includes(String(f.value).toLowerCase()) ? ' selected' : ''}>выключено</option>
+             </select>`
+          : `<input id="${id}" data-key="${esc(f.key)}" value="${esc(f.value)}"
+                 placeholder="${esc(f.placeholder)}"${off}>`;
+        return `<div class="fld"><label for="${id}">${esc(f.label)}</label>
+          ${body}
+          ${f.off ? `<div class="note bad">${esc(f.off)}</div>`
+                  : (f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : '')}
+        </div>`;
+      }).join('')}</div></div>`);
+    form.append(card);
+  }
+  app.append(form);
+
+  const bar = $(`<div style="display:flex;gap:10px;align-items:center">
+    <button id="save">Сохранить</button>
+    <a class="ghost" href="#/presets" style="color:var(--muted)">Отмена</a></div>`);
+  app.append(bar);
+  bar.querySelector('#save').onclick = async () => {
+    const b = bar.querySelector('#save');
+    b.disabled = true;
+    const values = {};
+    // Отключённые поля браузер не отправил бы сам; мы их и не читаем — значение
+    // останется в пресете таким, каким было.
+    form.querySelectorAll('[data-key]').forEach(el => {
+      if (!el.disabled) values[el.dataset.key] = el.value;
+    });
+    try{
+      await post('/ui/presets/vsgen/' + encodeURIComponent(id),
+                 {name: form.querySelector('#p-name').value, values});
+      toast('Сохранено', 'ok');
+      location.hash = '#/presets';
+    }catch(e){ toast(e.message); b.disabled = false; }
+  };
+}
+
 async function viewPresets(){
   const d = await api('/ui/presets');
   app.innerHTML = '';
-  app.append($(`<h1>Пресеты</h1>
-    <p class="sub">Настройки, которыми делаются ролики.</p>`));
+  const head = $(`<div class="head">
+      <div><h1>Пресеты</h1>
+        <p class="sub">Настройки, которыми делаются ролики.</p></div>
+      <button id="newpr" class="small">Новый пресет</button>
+    </div>`);
+  app.append(head);
+  head.querySelector('#newpr').onclick = async () => {
+    const name = prompt('Название пресета:');
+    if (!name || !name.trim()) return;
+    try{
+      const out = await post('/ui/presets/vsgen', {name});
+      location.hash = '#/preset/' + out.id;
+    }catch(e){ toast(e.message); }
+  };
 
   if (d.broken.length){
     app.append($(`<div class="card" style="margin-bottom:16px">
@@ -1821,6 +1906,8 @@ async function viewPresets(){
                    : 'ни один канал им не пользуется'}</div>
              </div>
              <div style="white-space:nowrap;align-self:center">
+               ${g.service === 'vsgen' ? `<button class="ghost pedit"
+                 data-key="${esc(i.key)}">Править</button>` : ''}
                <button class="ghost pcopy" data-svc="${esc(g.service)}"
                  data-name="${esc(i.name)}">Копия</button>
                <button class="ghost pdel" data-svc="${esc(g.service)}"
@@ -1851,6 +1938,8 @@ function wirePresets(root){
       b.parentElement.appendChild(box);
     }
   };
+  root.querySelectorAll('button.pedit').forEach(b => b.onclick =
+    () => { location.hash = '#/preset/' + encodeURIComponent(b.dataset.key); });
   root.querySelectorAll('button.pcopy').forEach(b => b.onclick = () => {
     const to = prompt(`Имя копии пресета «${b.dataset.name}»:`,
                       b.dataset.name + ' — копия');
@@ -2149,6 +2238,7 @@ const ROUTES = [
   ['projects', h => h === '#/projects',           () => viewProjects()],
   ['projects', h => h.startsWith('#/project/'),   h  => viewProject(decodeURIComponent(h.slice(10)))],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
+  ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(decodeURIComponent(h.slice(9)))],
   ['admin',    h => h === '#/admin',              () => viewAdmin()],
   ['releases', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
   ['releases', h => h === '#/new',                () => viewNew()],

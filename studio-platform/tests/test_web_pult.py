@@ -105,6 +105,23 @@ def drop_project(pid: str) -> None:
         c.close()
 
 
+def preset_row(prid: int):
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        return c.execute("SELECT id FROM presets WHERE id=?", (prid,)).fetchone()
+    finally:
+        c.close()
+
+
+def drop_preset(prid: int) -> None:
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        c.execute("DELETE FROM presets WHERE id=?", (prid,))
+        c.commit()
+    finally:
+        c.close()
+
+
 def main() -> int:
     anon = Client()
     print("Без входа не работает ничего")
@@ -180,6 +197,47 @@ def main() -> int:
     # проверка, что запуск действительно уходит к нему, а не решается здесь.
     code, body = me.go("/ui/projects/нет-такого-проекта/run", {})
     check("чужой проект ничего не ставит", (code, (body or {}).get("enqueued")), (200, 0))
+
+    print("\nПресет заводится и правится здесь, а проверяют его контракты кабинета")
+    pname = "тест пульта: пресет"
+    code, body = me.go("/ui/presets/vsgen", {"name": pname})
+    check("пресет заведён", code, 200)
+    prid = (body or {}).get("id")
+    check("номер вернулся", isinstance(prid, int), True)
+    check("второй с тем же именем не заводится",
+          me.go("/ui/presets/vsgen", {"name": pname})[0], 409)
+    check("без имени не заводится", me.go("/ui/presets/vsgen", {"name": "  "})[0], 400)
+    if prid:
+        code, d = me.go(f"/ui/presets/vsgen/{prid}")
+        check("поля пришли", code, 200)
+        fields = {f["key"]: f for g in d.get("groups", []) for f in g.get("fields", [])}
+        # Варианты выбора берутся из констант кабинета. Пустой список значил бы, что
+        # описание оторвалось от кабинета и показывает выдуманное.
+        check("модели картинок непустые", len(fields["model"]["options"]) > 3, True)
+        check("движки озвучки непустые", len(fields["engine"]["options"]) > 1, True)
+        # Поле, которого форма не знает, не должно молча уехать в настройки пресета.
+        check("чужое поле отвергнуто",
+              me.go(f"/ui/presets/vsgen/{prid}", {"name": pname,
+                                                  "values": {"нет_такого": "1"}})[0], 400)
+        check("сохранение принято",
+              me.go(f"/ui/presets/vsgen/{prid}",
+                    {"name": pname, "values": {"model": "NARWHAL",
+                                               "sentences_per_prompt": "4"}})[0], 200)
+        back = {f["key"]: f["value"] for g in me.go(f"/ui/presets/vsgen/{prid}")[1]["groups"]
+                for f in g["fields"]}
+        check("значение сохранилось", back.get("sentences_per_prompt"), "4")
+        # Правило 2 ТЗ: seed принимают не все модели, и поле обязано об этом сказать.
+        check("seed у модели, которая его принимает, жив",
+              me.go(f"/ui/presets/vsgen/{prid}")[1] and
+              [f for g in me.go(f"/ui/presets/vsgen/{prid}")[1]["groups"]
+               for f in g["fields"] if f["key"] == "seed"][0]["off"], "")
+        me.go(f"/ui/presets/vsgen/{prid}", {"name": pname, "values": {"model": "OPENAI"}})
+        off = [f for g in me.go(f"/ui/presets/vsgen/{prid}")[1]["groups"]
+               for f in g["fields"] if f["key"] == "seed"][0]["off"]
+        check("а у той, что не принимает, гаснет с причиной", bool(off), True)
+        drop_preset(prid)
+        check("пресет убран за собой", preset_row(prid) is None, True)
+    check("чужого пресета нет", me.go("/ui/presets/vsgen/999999")[0], 404)
 
     print("\nСтраница зовёт API по своему адресу, а не по корню платформы")
     # Тот самый случай, который сломал вход и не ловился curl'ом: страница живёт под
