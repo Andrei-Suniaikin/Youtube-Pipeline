@@ -1998,6 +1998,25 @@ def ui_preset_create(body: PresetNew, request: Request):
     return {"id": r["id"], "name": name}
 
 
+def _neighbour_preset_names() -> dict:
+    """Имена пресетов соседей — для пятой группы общего пресета.
+
+    Спрашиваем у соседей, а не читаем их хранилища: список принадлежит тому, кто им
+    управляет. Сосед молчит — группа останется без вариантов, и это честнее выдуманного
+    списка: пустой выбор видно, а выдуманный выглядит рабочим.
+    """
+    c = db()
+    try:
+        keys_ = {name: get_key(c, name) for name in ("rewrite", "cover")}
+    finally:
+        c.close()
+    body, _err = _neighbour_get(REWRITE_BASE, "/api/v1/presets", keys_["rewrite"])
+    rew = sorted((body or {}).get("rewrite") or {}) if isinstance(body, dict) else []
+    body, _err = _neighbour_get(COVER_BASE, "/presets", keys_["cover"])
+    cov = sorted(body or {}) if isinstance(body, dict) else []
+    return {"preset_rewrite": rew, "preset_cover": cov}
+
+
 @app.get("/ui/presets/vsgen/{prid:int}")
 def ui_preset_get(prid: int):
     """Поля пресета и их текущие значения.
@@ -2020,7 +2039,7 @@ def ui_preset_get(prid: int):
         settings = {}
     mod = sys.modules.get("main")
     return {"id": r["id"], "name": r["name"] or f"пресет {r['id']}",
-            "groups": preset_fields.describe(mod, settings),
+            "groups": preset_fields.describe(mod, settings, _neighbour_preset_names()),
             "note": ("Пустое поле означает «как по умолчанию». Проверку значений делает "
                      "кабинет при сохранении — теми же контрактами, что и всегда.")}
 
@@ -2651,7 +2670,7 @@ def ui_project_settings(pid: str):
         settings = {}
     mod = sys.modules.get("main")
     return {"id": r["id"], "name": r["name"] or r["id"],
-            "groups": preset_fields.describe(mod, settings),
+            "groups": preset_fields.describe(mod, settings, _neighbour_preset_names()),
             "note": ("Пустое поле означает «как по умолчанию». Настройки уже стоящих "
                      "в очереди задач эта правка не меняет — они заморожены в момент "
                      "запуска (правило 6 ТЗ).")}

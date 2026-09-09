@@ -14,6 +14,7 @@
 Седьмой повод добавлен владельцем 07.09.2026, в ТЗ его нет:
 
 7. задача упала с ошибкой — говорится один раз, без повтора и без «починилось»
+8. ключ провайдера исчерпан — отказ про деньги, а не про частоту; говорится сразу
 
 Три правила подачи, тоже из ТЗ: одно сообщение на случай, повтор не чаще раза в час,
 обязательное сообщение «починилось».
@@ -91,7 +92,18 @@ class Alert:
         return f"<Alert {self.key}>"
 
 
-# ─────────────────────────────── семь поводов ────────────────────────────────
+# ────────────────────────────── восемь поводов ───────────────────────────────
+
+# Слова, по которым отказ провайдера означает «ключ кончился», а не «слишком часто».
+# Список закрытый и совпадает с тем, по которому воркер останавливает прогон
+# (`googler_worker._LLM_EXHAUSTED_PATTERNS`): одна формулировка — одно решение.
+EXHAUSTED_WORDS = (
+    "insufficient_quota", "credit_balance_exhausted", "no credits remaining",
+    "exceeded your current quota", "quota exceeded", "billing_not_active",
+    "billing hard limit", "usage limit", "кончился лимит аккаунта",
+    "исчерпан", "401", "403", "невалиден", "invalid api key",
+)
+
 
 def check_queue_stalled(c, now, tenant=None) -> list:
     """§1. Очередь не пустая, но за 30 минут ничего не завершилось.
@@ -140,6 +152,8 @@ def check_providers_resting(c, now, tenant=None) -> list:
         until = _f(rec.get("until"))
         if until <= now:
             continue
+        if _is_exhausted(rec.get("why")):
+            continue      # про этот ключ скажет §8, и скажет сразу, а не через час
         family = str(rec.get("family") or "?")
         left = until - now
         # Пауза известна вперёд — это и есть доказательство её длины.
@@ -298,6 +312,45 @@ def check_oldest_task(c, now, tenant=None) -> list:
         money="Денег не потрачено — задача не начата.")]
 
 
+def _is_exhausted(why) -> bool:
+    low = str(why or "").lower()
+    return any(w in low for w in EXHAUSTED_WORDS)
+
+
+def check_key_exhausted(c, now, tenant=None) -> list:
+    """§8. Ключ кончился — не «слишком часто», а «платить нечем».
+
+    Почему отдельно от §2. Пауза провайдера — это троттлинг: он проходит сам, и о нём
+    говорят через час, чтобы не дёргать по каждому 429. Исчерпанный ключ сам не
+    пройдёт: пока его не пополнят или не заменят, каждая следующая задача упрётся в то
+    же. Ждать час, чтобы сказать об этом, — терять час.
+
+    Остатка на ключе система не знает и знать не может: у FastGen в API нет ни баланса,
+    ни лимитов аккаунта (22 пути, проверено 08.09). Поэтому здесь не «осталось 15%», а
+    факт: провайдер ответил отказом, который означает деньги. Выдуманный процент был бы
+    той самой молчаливой подстановкой, которую запрещает правило 1.
+    """
+    raw = _state_row(c, "credential_cooldown")
+    out = []
+    for _sid, rec in sorted((raw or {}).items()):
+        if not isinstance(rec, dict) or _f(rec.get("until")) <= now:
+            continue
+        why = str(rec.get("why") or "")
+        if not _is_exhausted(why):
+            continue
+        family = str(rec.get("family") or "?")
+        out.append(Alert(
+            f"key_exhausted:{family}",
+            f"Ключ {family} исчерпан",
+            f"Ключ {rec.get('mask') or '—'} отвечает отказом, который означает деньги, "
+            f"а не троттлинг.\nПровайдер сказал: {why[:180]}"
+            + ("\nЗамечено соседним сервисом." if rec.get("shared") else ""),
+            money=("Пока ключ не пополнен или не заменён, каждая следующая задача этого "
+                   "провайдера упрётся в тот же отказ. Уже оплаченное не теряется — "
+                   "задачи ждут в очереди.")))
+    return out
+
+
 def check_failed_tasks(c, now, tenant=None) -> list:
     """§7. Задача упала с ошибкой.
 
@@ -353,7 +406,8 @@ def check_failed_tasks(c, now, tenant=None) -> list:
 
 
 CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
-          check_missed_slots, check_disk, check_oldest_task, check_failed_tasks)
+          check_missed_slots, check_disk, check_oldest_task, check_failed_tasks,
+          check_key_exhausted)
 
 # Сколько повод должен продержаться, прежде чем о нём говорят. Там, где длительность
 # и есть суть повода (§2), она проверяется здесь; остальные поводы уже содержат свой

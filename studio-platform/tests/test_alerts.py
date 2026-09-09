@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Тревоги: семь поводов и три правила подачи.
+"""Тревоги: восемь поводов и три правила подачи.
 
 Сети здесь нет вообще: `pub_alerts` отправку не делает, а транспорт подменён списком.
 Поэтому тест гоняется где угодно, включая машину без телеграма и без интернета.
@@ -9,6 +9,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import sys
@@ -233,6 +234,31 @@ def main() -> int:
     bag = Bag()
     A.tick(c, bag, now=NOW)
     check("два ключа — два сообщения", len(bag.sent), 2)
+
+    print("\nПовод 8 — ключ исчерпан")
+    c = fresh()
+    def cooldown(why, family="openai", mask="sk-p…9f2a"):
+        rec = {f"{family}:1": {"family": family, "mask": mask,
+                               "until": NOW + 10 * 60, "why": why}}
+        c.execute("INSERT OR REPLACE INTO admin_state VALUES('credential_cooldown',?,0)",
+                  (json.dumps(rec, ensure_ascii=False),))
+    cooldown("HTTP 429 — часовой лимит картинок", family="googler", mask="fg_l…b3gt")
+    check("троттлинг ключом исчерпанным не считается",
+          [k for k in keys(c) if k.startswith("key_exhausted")], [])
+    cooldown("insufficient_quota: You exceeded your current quota")
+    # §2 про этот же ключ молчит: одна беда — одно сообщение, и говорит о ней тот
+    # повод, который знает причину.
+    check("отказ про деньги — повод, и только он", keys(c), ["key_exhausted:openai"])
+    bag = Bag()
+    A.tick(c, bag, now=NOW)
+    # §2 ждёт час, прежде чем сказать. Исчерпанный ключ сам не пройдёт — ждать нечего.
+    check("сказано сразу, без выдержки", len(bag.sent), 1)
+    check("в тексте — слова провайдера", "insufficient_quota" in bag.sent[0], True)
+    check("и что это про деньги", "означает деньги" in bag.sent[0], True)
+    c.execute("UPDATE admin_state SET v='{}' WHERE k='credential_cooldown'")
+    A.tick(c, bag, now=NOW + 5 * 60)
+    check("ключ заменили — сказали «починилось»",
+          any("ПОЧИНИЛОСЬ" in m for m in bag.sent), True)
 
     print("\nПовод 7 — задача упала")
     c = fresh()

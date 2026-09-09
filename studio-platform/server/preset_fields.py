@@ -183,7 +183,21 @@ GROUPS = (
 )
 
 
-def describe(mod, settings: dict) -> list:
+# Пятая группа. ТЗ §04: «пресеты 3 → 1» — человек настраивает ролик один раз, а не
+# трижды в трёх сервисах. Варианты сюда приходят снаружи (`extra`), потому что списки
+# пресетов рерайта и обложек принадлежат соседям, а не кабинету: спрашивать их надо у
+# них, а не держать копию.
+GROUPS = GROUPS + (
+    ("Текст и обложка", (
+        Field("preset_rewrite", "Пресет рерайта", "select",
+              hint="каким пресетом Rewrite Studio делает текст"),
+        Field("preset_cover", "Пресет обложки", "select",
+              hint="каким пресетом Cover Studio делает обложку"),
+    )),
+)
+
+
+def describe(mod, settings: dict, extra: dict = None) -> list:
     """Группы полей с текущими значениями — то, из чего рисуется форма.
 
     `mod` — модуль кабинета (`main`). Без него варианты выбора неоткуда взять, и это
@@ -195,8 +209,12 @@ def describe(mod, settings: dict) -> list:
         items = []
         for f in fields:
             try:
-                options = [{"value": v, "title": t} for v, t in f.options(mod)] \
-                    if (f.options and mod is not None) else []
+                if f.key in (extra or {}):
+                    options = [{"value": v, "title": v} for v in (extra or {})[f.key]]
+                elif f.options and mod is not None:
+                    options = [{"value": v, "title": t} for v, t in f.options(mod)]
+                else:
+                    options = []
             except Exception:                                      # noqa: BLE001
                 options = []
             if f.kind == "select" and not options:

@@ -63,7 +63,7 @@ def show(c, now):
           f"ожидание {A.OLDEST_SEC // 3600} ч · диск {A.DISK_MIN_GB:.0f} ГБ · "
           f"повтор раз в {A.REPEAT_SEC // 60} мин")
     if not found:
-        print("\nвсё спокойно: ни один из семи поводов не выполнен")
+        print("\nвсё спокойно: ни один из восьми поводов не выполнен")
     for key, a in sorted(found.items()):
         st = state.get(key) or {}
         said = ("сказано " + time.strftime("%H:%M", time.localtime(st["sent"]))
