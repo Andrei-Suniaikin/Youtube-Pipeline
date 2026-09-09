@@ -258,15 +258,12 @@
 <header>
   <nav>
     <span class="brand">Studio<b>.</b></span>
-    <a class="tab" href="#/releases" id="tab-releases">Выпуски</a>
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
-    <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
-    <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
-    <a class="tab" href="#/text" id="tab-text">Текст</a>
-    <a class="tab" href="#/covers" id="tab-covers">Обложки</a>
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
+    <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
-    <a class="tab" href="#/admin" id="tab-admin" style="margin-left:auto">Админ</a>
+    <a class="tab" href="#/keys" id="tab-keys">Ключи</a>
+    <a class="tab" href="#/profile" id="tab-profile" style="margin-left:auto">Профиль</a>
     <span class="who" id="who"></span>
   </nav>
 </header>
@@ -811,6 +808,8 @@ async function channelReleases(id, d){
     return;
   }
   app.append(calendarFeed(d));
+  app.append($(`<div class="note muted" style="margin-top:10px">
+    <a href="#/releases">Все выпуски по всем каналам →</a></div>`));
 }
 
 async function viewChannel(id){
@@ -1403,10 +1402,16 @@ function projectTab(d, tab){
   const mine = d.files.filter(g => groups.includes(g.code));
   for (const g of mine) app.append(fileCard(d, g));
   if (!mine.length && !jobs.length){
-    app.append($(`<div class="card"><div class="empty">${
-      tab === 'oblozhka'
-        ? 'Обложки у проекта пока нет. Она делается в разделе «Обложки» и приезжает сюда.'
-        : 'Здесь пока пусто — этот этап ещё не отработал.'}</div></div>`));
+    app.append($(`<div class="card"><div class="empty">
+      Здесь пока пусто — этот этап ещё не отработал.</div></div>`));
+  }
+  // Куда пойти, чтобы этот этап сделать. Без этих ссылок вкладка — тупик: «Текста нет»
+  // и ни слова о том, где он берётся.
+  const MAKE = {tekst: ['#/text', 'Сделать текст: рерайт по ссылке или с нуля'],
+                oblozhka: ['#/covers', 'Сделать обложку']};
+  if (MAKE[tab]){
+    app.append($(`<div class="note muted" style="margin-top:4px">
+      <a href="${MAKE[tab][0]}">${esc(MAKE[tab][1])} →</a></div>`));
   }
 }
 
@@ -1959,6 +1964,34 @@ async function viewCovers(){
 
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
+/* ─────────────────────────── профиль ─────────────────────────── */
+
+// Всё, что про человека и про машину, а не про ролики: учётные записи, состояние
+// системы, лимиты. Раньше это была вкладка «Админ» в одном ряду с производством —
+// то есть настройка соседствовала с ежедневной работой.
+async function viewProfile(){
+  const me = ME || await api('/ui/me');
+  app.innerHTML = '';
+  app.append($(`<h1>Профиль</h1>
+    <p class="sub">${esc(me.name || '')}${me.role ? ' · ' + esc(me.role) : ''}</p>`));
+
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Ключи провайдеров</div>
+    <div class="note muted">Ключи принадлежат человеку, а не системе: свой ключ тратит
+      свои деньги. Отдельный экран — <a href="#/keys">Ключи</a>.</div></div>`));
+
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Система</div>
+    <div class="note muted">
+      <a href="#/admin">Состояние: тревоги, диск, публикации</a> ·
+      <a href="#/limits">Серверные лимиты</a></div></div>`));
+
+  // Раздел людей появляется только у администратора: проверка стоит на сервере,
+  // а не на прятании кнопки — запрос может прислать кто угодно.
+  const people = await accountsCard();
+  if (people) app.append(people);
+}
+
 /* ─────────────────────────── серверные лимиты ─────────────────────────── */
 
 async function viewLimits(){
@@ -2463,21 +2496,23 @@ const ROUTES = [
   ['channels', h => h.startsWith('#/channel/'),
                                                  h  => viewChannel(h.split('/')[2])],
   ['keys',     h => h === '#/keys',               () => viewKeys()],
-  ['text',     h => h === '#/text',               () => viewText()],
-  ['covers',   h => h === '#/covers',             () => viewCovers()],
+  ['projects', h => h === '#/text',               () => viewText()],
+  ['projects', h => h === '#/covers',             () => viewCovers()],
   ['projects', h => h === '#/projects',           () => viewProjects()],
   ['projects', h => h.startsWith('#/project/') && h.endsWith('/settings'),
                                                   h  => viewProjectSettings(
                                                           decodeURIComponent(h.split('/')[2]))],
   ['projects', h => h.startsWith('#/project/'),   h  => viewProject(
                                                           decodeURIComponent(h.split('/')[2]))],
-  ['admin',    h => h === '#/limits',             () => viewLimits()],
+  ['profile',  h => h === '#/limits',             () => viewLimits()],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
   ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(decodeURIComponent(h.slice(9)))],
-  ['admin',    h => h === '#/admin',              () => viewAdmin()],
-  ['releases', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
-  ['releases', h => h === '#/new',                () => viewNew()],
-  ['releases', () => true,                        () => viewReleases()],
+  ['profile',  h => h === '#/admin',              () => viewAdmin()],
+  ['channels', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
+  ['channels', h => h === '#/new',                () => viewNew()],
+  ['channels', h => h === '#/releases',           () => viewReleases()],
+  ['profile',  h => h === '#/profile',            () => viewProfile()],
+  ['channels', () => true,                        () => viewChannels()],
 ];
 
 async function render(){
@@ -2489,8 +2524,9 @@ async function render(){
   showWho();
   const h = location.hash || '#/channels';
   const hit = ROUTES.find(r => r[1](h));
-  for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'covers',
-                    'projects', 'presets', 'admin'])
+  // Экранов больше, чем вкладок: «Выпуски», «Текст», «Обложки» и «Админ» живут внутри
+  // каналов, проектов и профиля. Подсвечиваем ту вкладку, в чей раздел попал маршрут.
+  for (const id of ['channels', 'projects', 'queue', 'presets', 'keys', 'profile'])
     document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
   try{ await hit[2](h); }
   catch(e){
