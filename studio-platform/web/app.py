@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import zoneinfo
 import json
 import os
 import secrets
@@ -949,6 +950,20 @@ def ui_channel(channel_id: int, history: int = 14):
         counts = {}
         for row in cal:
             counts[row["state"]] = counts.get(row["state"], 0) + 1
+        # Сводка по дням для календаря-сетки: сколько роликов вышло, сколько ещё в
+        # работе и сколько пропущено. Считаем здесь, а не в браузере: часовой пояс
+        # канала знает сервер, и «вышло 12 сентября» в Варшаве и в Минске — разные дни.
+        by_day = {}
+        tzname = ch["tz"] or "Europe/Warsaw"
+        try:
+            zone = zoneinfo.ZoneInfo(tzname)
+        except Exception:                                          # noqa: BLE001
+            zone = dt.timezone.utc
+        for row in cal:
+            day = dt.datetime.fromtimestamp(row["at"], zone).strftime("%Y-%m-%d")
+            box = by_day.setdefault(day, {"done": 0, "running": 0, "missed": 0,
+                                          "planned": 0, "free": 0, "blocked": 0})
+            box[row["state"]] = box.get(row["state"], 0) + 1
         return {
             "channel": {
                 "id": ch["id"], "name": ch["name"], "handle": ch["handle"] or "",
@@ -975,6 +990,8 @@ def ui_channel(channel_id: int, history: int = 14):
             },
             "calendar": cal,
             "counts": counts,
+            "by_day": by_day,
+            "tz": tzname,
             "waiting_without_slot": waiting,
             "history_days": history,
         }

@@ -179,6 +179,27 @@
   .res h3{font-size:11px;margin:0 0 7px;text-transform:uppercase;letter-spacing:.07em;
           color:var(--muted);font-weight:700}
   .res ul{margin:0 0 14px;padding-left:20px}
+  .subtabs{display:flex;gap:4px;margin:0 0 16px;border-bottom:1px solid var(--line)}
+  .subtabs a{padding:8px 14px;color:var(--muted);text-decoration:none;font-weight:550;
+             font-size:13px;border-bottom:2px solid transparent;margin-bottom:-1px}
+  .subtabs a:hover{color:var(--ink)}
+  .subtabs a.on{color:var(--ink-hi);border-bottom-color:var(--acc)}
+
+  /* Месяцы рядом, а не в столбик: канал с расписанием на квартал должен читаться
+     одним взглядом, без прокрутки. */
+  #months{display:grid;grid-template-columns:repeat(auto-fill,minmax(268px,1fr));gap:20px}
+  .mname{font-weight:650;margin-bottom:8px;text-transform:capitalize;font-size:13px}
+  .dow,.grid7{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
+  .dow span{font-size:10px;color:var(--muted);text-align:center;padding-bottom:3px}
+  .day{position:relative;height:34px;border:1px solid var(--line);border-radius:6px;
+       padding:3px 5px;font-size:11px}
+  .day.out{opacity:.32;border-style:dashed}
+  .day.miss{border-color:rgba(248,113,113,.45)}
+  .day .n{color:var(--muted)}
+  .day .cnt{position:absolute;top:2px;right:4px;font-weight:700;font-size:11px;
+            color:var(--ok)}
+  .day .cnt.work{color:var(--acc-hi)}
+  .day .cnt.bad{color:var(--bad)}
   .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
   .fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
   .fld input,.fld select{width:100%}
@@ -703,6 +724,95 @@ async function viewChannels(){
   app.append(grid);
 }
 
+// Календарь месяцами: в каждом дне справа сверху — сколько роликов вышло. Лента по
+// слотам остаётся ниже: сетка отвечает «сколько и когда», лента — «что именно».
+function monthGrid(byDay, tz){
+  const days = Object.keys(byDay).sort();
+  if (!days.length) return $('<div></div>');
+  const box = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Календарь <span class="muted"
+      style="font-weight:400;text-transform:none;letter-spacing:0">· ${esc(tz)}</span></div>
+    <div id="months"></div></div>`);
+  const months = {};
+  for (const d of days) months[d.slice(0, 7)] = true;
+  const out = [];
+  for (const m of Object.keys(months).sort()){
+    const [y, mm] = m.split('-').map(Number);
+    const first = new Date(Date.UTC(y, mm - 1, 1));
+    const total = new Date(Date.UTC(y, mm, 0)).getUTCDate();
+    // Понедельник первым: в русском календаре неделя начинается с него.
+    const shift = (first.getUTCDay() + 6) % 7;
+    const cells = [];
+    for (let i = 0; i < shift; i++) cells.push('<div class="day out"></div>');
+    for (let dnum = 1; dnum <= total; dnum++){
+      const key = `${m}-${String(dnum).padStart(2, '0')}`;
+      const b = byDay[key];
+      const done = b ? b.done : 0;
+      const bad = b ? b.missed : 0;
+      const work = b ? (b.running + b.planned) : 0;
+      cells.push(`<div class="day ${b ? '' : 'out'} ${bad ? 'miss' : ''}">
+        <span class="n">${dnum}</span>
+        ${done ? `<span class="cnt">${done}</span>` : ''}
+        ${!done && work ? '<span class="cnt work">·</span>' : ''}
+        ${!done && !work && bad ? '<span class="cnt bad">—</span>' : ''}</div>`);
+    }
+    out.push(`<div class="mon"><div class="mname">${new Date(Date.UTC(y, mm - 1, 1))
+      .toLocaleString('ru-RU', {month: 'long', year: 'numeric', timeZone: 'UTC'})}</div>
+      <div class="dow">${['пн','вт','ср','чт','пт','сб','вс']
+        .map(x => `<span>${x}</span>`).join('')}</div>
+      <div class="grid7">${cells.join('')}</div></div>`);
+  }
+  box.querySelector('#months').innerHTML = out.join('');
+  return box;
+}
+
+async function channelReleases(id, d){
+  app.append(monthGrid(d.by_day || {}, d.tz || ''));
+
+  const counts = Object.entries(d.counts)
+    .map(([k, n]) => `<span class="pill ${CAL_CLS[k]}">${CAL_TITLE[k]}: ${n}</span>`).join(' ');
+  app.append($(`<div class="toolbar">${counts}
+    ${d.waiting_without_slot ? `<span class="pill s-queued">без даты ждут:
+      ${d.waiting_without_slot}</span>` : ''}</div>`));
+
+  // Флоу создания: ссылки встают в ближайшие свободные слоты. Это и есть «залить
+  // видосы» — дальше конвейер делает их сам по расписанию канала.
+  const add = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Поставить ролики</div>
+    <textarea id="lk" rows="4" style="width:100%"
+      placeholder="ссылки на доноров, по одной в строке — разложатся по свободным датам"></textarea>
+    <div style="margin-top:10px"><button id="prev" class="small">Показать, что будет</button>
+      <button id="go" class="small" style="margin-left:8px" disabled>Поставить</button></div>
+    <div id="pv"></div></div>`);
+  app.append(add);
+  const pv = add.querySelector('#pv');
+  add.querySelector('#prev').onclick = async () => {
+    pv.innerHTML = '';
+    try{
+      const out = await post('/ui/links/preview',
+                             {channel_id: Number(id), links: add.querySelector('#lk').value});
+      pv.innerHTML = `<div class="note muted">${(out.items || []).map(i =>
+        `${esc(i.when || '—')} · ${esc(i.title || i.url || '')}`).join('<br>')
+        || 'ничего не разобрано'}</div>`;
+      add.querySelector('#go').disabled = !(out.items || []).length;
+    }catch(e){ toast(e.message); }
+  };
+  add.querySelector('#go').onclick = async () => {
+    try{
+      await post('/ui/links', {channel_id: Number(id), links: add.querySelector('#lk').value});
+      toast('Поставлено', 'ok');
+      await render();
+    }catch(e){ toast(e.message); }
+  };
+
+  if (!d.calendar.length){
+    app.append($(`<div class="card"><div class="empty">
+      Расписание не задано — выходов нет, и ссылке некуда встать.</div></div>`));
+    return;
+  }
+  app.append(calendarFeed(d));
+}
+
 async function viewChannel(id){
   const d = await api('/ui/channels/' + encodeURIComponent(id) + '?history=14');
   const c = d.channel;
@@ -713,6 +823,19 @@ async function viewChannel(id){
   app.append($(`<a class="back" href="#/channels">← ко всем каналам</a>
     <h1>${esc(c.name)}</h1>
     <p class="sub">${esc(c.handle || '')} · ${esc(c.lang)} · ${esc(c.niche || '')}</p>`));
+
+  // Две вкладки: «Ролики» — то, чем занимаются каждый день, «Настройки» — то, что
+  // трогают раз в месяц. Ролики первыми: канал открывают, чтобы посмотреть выпуски,
+  // а не расписание.
+  const tab = (location.hash.split('/')[3] || 'roliki');
+  const tabs = $(`<div class="subtabs">
+    <a href="#/channel/${encodeURIComponent(id)}/roliki"
+       class="${tab === 'roliki' ? 'on' : ''}">Ролики</a>
+    <a href="#/channel/${encodeURIComponent(id)}/nastroyki"
+       class="${tab === 'nastroyki' ? 'on' : ''}">Настройки</a></div>`);
+  app.append(tabs);
+
+  if (tab === 'roliki'){ await channelReleases(id, d); return; }
 
   const head = $(`<div class="card" style="margin-bottom:16px"><div class="grid">
     <div><div class="k">Расписание</div>${esc(times)}</div>
@@ -729,18 +852,9 @@ async function viewChannel(id){
   app.append(head);
   wireChannelEdit(head, c);
 
-  const counts = Object.entries(d.counts)
-    .map(([k, n]) => `<span class="pill ${CAL_CLS[k]}">${CAL_TITLE[k]}: ${n}</span>`).join(' ');
-  app.append($(`<div class="toolbar">${counts}
-    ${d.waiting_without_slot ? `<span class="pill s-queued">без даты ждут:
-      ${d.waiting_without_slot}</span>` : ''}</div>`));
+}
 
-  if (!d.calendar.length){
-    app.append($(`<div class="card"><div class="empty">
-      Расписание не задано — выходов нет, и ссылке некуда встать.</div></div>`));
-    return;
-  }
-
+function calendarFeed(d){
   // Черта «сейчас» между прошлым и будущим: без неё пропуск и свободный слот
   // выглядят одинаково, а это разные вещи.
   const rows = [];
@@ -767,8 +881,9 @@ async function viewChannel(id){
       </div></div>`);
   }
   if (!drawn) rows.push('<div class="today"><span>сейчас</span></div>');
-  app.append($(`<div class="card">${rows.join('')}</div>`));
+  return $(`<div class="card">${rows.join('')}</div>`);
 }
+
 
 /* ────────────────────── сквозная очередь трёх сервисов ────────────────────── */
 
@@ -2284,8 +2399,8 @@ async function viewAdmin(){
    она начала врать о подсветке. */
 const ROUTES = [
   ['queue',    h => h === '#/queue',              () => viewQueue()],
-  ['channels', h => h === '#/channels',           () => viewChannels()],
-  ['channels', h => h.startsWith('#/channel/'),   h  => viewChannel(decodeURIComponent(h.slice(10)))],
+  ['channels', h => h.startsWith('#/channel/'),
+                                                 h  => viewChannel(h.split('/')[2])],
   ['keys',     h => h === '#/keys',               () => viewKeys()],
   ['text',     h => h === '#/text',               () => viewText()],
   ['covers',   h => h === '#/covers',             () => viewCovers()],
@@ -2310,7 +2425,7 @@ async function render(){
   }
   document.querySelector('nav').style.visibility = '';
   showWho();
-  const h = location.hash || '#/releases';
+  const h = location.hash || '#/channels';
   const hit = ROUTES.find(r => r[1](h));
   for (const id of ['releases', 'channels', 'queue', 'keys', 'text', 'covers',
                     'projects', 'presets', 'admin'])
