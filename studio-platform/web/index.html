@@ -1258,15 +1258,41 @@ async function viewProjects(){
   app.append(card);
 }
 
+// Проект по составляющим. Раньше всё лежало одной лентой: запуск, задачи, кадры,
+// озвучка, ролик, субтитры — и чтобы посмотреть обложку, надо было проскроллить сто
+// картинок. Вкладка на каждую составляющую: у них разные вопросы и разные кнопки.
+const PROJ_TABS = [
+  ['obzor',   'Обзор',    []],
+  ['tekst',   'Текст',    ['scenes']],
+  ['ozvuchka','Озвучка',  ['audio']],
+  ['kadry',   'Кадры',    ['images']],
+  ['klipy',   'Клипы',    ['clips']],
+  ['sborka',  'Сборка',   ['renders', 'subs', 'chapters']],
+  ['oblozhka','Обложка',  []],
+];
+const PROJ_KINDS = {tekst: ['prompts'], ozvuchka: ['tts'], kadry: ['images', 'regen'],
+                    klipy: ['video', 'regen_video'], sborka: ['render', 'chapters'],
+                    oblozhka: ['cover']};
+
 async function viewProject(id){
   const d = await api('/ui/projects/' + encodeURIComponent(id));
   const p = d.project;
+  const tab = location.hash.split('/')[3] || 'obzor';
   app.innerHTML = '';
   app.append($(`<h1>${esc(p.name)}</h1>
     <p class="sub"><span class="mono">${esc(p.id)}</span>
       ${p.release_id ? ` · выпуск <a href="#/release/${
         encodeURIComponent(p.release_id)}">${esc(p.release_id)}</a> · фаза ${
         esc(p.phase)}` : ''}</p>`));
+  app.append($(`<div class="subtabs">${PROJ_TABS.map(([k, title, groups]) => {
+      const n = d.files.filter(g => groups.includes(g.code))
+                       .reduce((a, g) => a + g.count, 0);
+      return `<a href="#/project/${encodeURIComponent(id)}/${k}"
+        class="${tab === k ? 'on' : ''}">${esc(title)}${n ? ` <span class="muted">${n}</span>` : ''}</a>`;
+    }).join('')}<a href="#/project/${encodeURIComponent(id)}/settings"
+      class="${tab === 'settings' ? 'on' : ''}" style="margin-left:auto">Настройки</a></div>`));
+
+  if (tab !== 'obzor'){ projectTab(d, tab); return; }
 
   const run = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Сделать всё</div>
@@ -1346,8 +1372,47 @@ async function viewProject(id){
     wireActions(jc);
   }
 
-  for (const g of d.files){
-    const url = n => d.file_base + n.split('/').map(encodeURIComponent).join('/');
+  if (!d.files.length){
+    app.append($(`<div class="card"><div class="empty">Файлов пока нет —
+      проект ещё ничего не сделал.</div></div>`));
+  }
+}
+
+// Одна вкладка проекта: файлы своей составляющей и задачи, которые её делали.
+function projectTab(d, tab){
+  const p = d.project;
+  const groups = (PROJ_TABS.find(t => t[0] === tab) || [null, '', []])[2];
+  const kinds = PROJ_KINDS[tab] || [];
+  const jobs = (d.jobs || []).filter(j => kinds.includes(j.kind));
+  if (jobs.length){
+    const jc = $(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">Задачи этого этапа</div>
+      <table><thead><tr><th>Этап</th><th>Состояние</th><th>Создана</th><th></th></tr></thead>
+      <tbody>${jobs.map(j => `<tr>
+        <td>${esc(j.kind)}<div class="muted mono" style="font-size:11px">#${j.id}</div></td>
+        <td><span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
+          ${j.stage ? `<div class="muted">${esc(j.stage)}</div>` : ''}
+          ${j.error ? `<div class="note bad">${esc(j.error)}</div>` : ''}</td>
+        <td class="muted">${when(j.created)}</td>
+        <td style="white-space:nowrap">${actions({service: 'vsgen', id: j.id,
+                                                  state: j.state, status: j.status})}</td>
+      </tr>`).join('')}</tbody></table></div>`);
+    app.append(jc);
+    wireActions(jc);
+  }
+  const mine = d.files.filter(g => groups.includes(g.code));
+  for (const g of mine) app.append(fileCard(d, g));
+  if (!mine.length && !jobs.length){
+    app.append($(`<div class="card"><div class="empty">${
+      tab === 'oblozhka'
+        ? 'Обложки у проекта пока нет. Она делается в разделе «Обложки» и приезжает сюда.'
+        : 'Здесь пока пусто — этот этап ещё не отработал.'}</div></div>`));
+  }
+}
+
+function fileCard(d, g){
+  const p = d.project;
+  const url = n => d.file_base + n.split('/').map(encodeURIComponent).join('/');
     const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)} · ${g.count}
         <a class="ghost" href="${d.zip_base}${esc(g.code)}"
@@ -1375,12 +1440,8 @@ async function viewProject(id){
       ${g.more ? `<div class="note muted">показаны первые ${g.names.length},
         всего ${g.count} — остальные в архиве</div>` : ''}
     </div>`);
-    app.append(card);
-    wireRegen(card);
-  }
-  if (!d.files.length){
-    app.append($(`<div class="card"><div class="empty">Файлов пока нет.</div></div>`));
-  }
+  wireRegen(card);
+  return card;
 }
 
 /* ───────────────────────── свои ключи ───────────────────────── */
@@ -2407,8 +2468,9 @@ const ROUTES = [
   ['projects', h => h === '#/projects',           () => viewProjects()],
   ['projects', h => h.startsWith('#/project/') && h.endsWith('/settings'),
                                                   h  => viewProjectSettings(
-                                                          decodeURIComponent(h.slice(10, -9)))],
-  ['projects', h => h.startsWith('#/project/'),   h  => viewProject(decodeURIComponent(h.slice(10)))],
+                                                          decodeURIComponent(h.split('/')[2]))],
+  ['projects', h => h.startsWith('#/project/'),   h  => viewProject(
+                                                          decodeURIComponent(h.split('/')[2]))],
   ['admin',    h => h === '#/limits',             () => viewLimits()],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
   ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(decodeURIComponent(h.slice(9)))],
