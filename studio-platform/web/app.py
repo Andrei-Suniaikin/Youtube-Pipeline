@@ -1185,14 +1185,21 @@ def ui_presets():
     finally:
         c.close()
 
+    # Куда идти, чтобы завести пресет с нуля. Заводить его здесь нечем и не нужно:
+    # пресет — это два-три десятка полей своего сервиса, и повторять их форму значит
+    # заводить вторую правду о том, из чего состоит пресет. Но и тупик оставлять
+    # нельзя: раньше экран говорил «правка — в разделе того сервиса» и не говорил,
+    # где этот раздел.
     groups = [{"service": "vsgen", "title": "Производство (кабинет)", "items": vsgen,
-               "error": "", "note": "ключ пресета — число, а не имя"}]
+               "error": "", "note": "ключ пресета — число, а не имя",
+               "home": CABINET_BASE + "/presets", "home_title": "кабинете"}]
 
     body, err = _neighbour_get(REWRITE_BASE, "/api/v1/presets", keys["rewrite"])
     rew = (body or {}).get("rewrite") or {}
     groups.append({
         "service": "rewrite", "title": "Рерайт по ссылке", "error": err,
         "note": "канал ссылается именно на этот набор, а не на брифы генерации",
+        "home": REWRITE_BASE, "home_title": "Rewrite Studio",
         "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
                   for name, cfg in sorted(rew.items(), key=lambda kv: kv[0].lower())]})
     gen = (body or {}).get("generation") or {}
@@ -1200,6 +1207,7 @@ def ui_presets():
         groups.append({
             "service": "rewrite_gen", "title": "Брифы генерации с нуля", "error": "",
             "note": "к рерайту по ссылке отношения не имеют — отдельное хранилище",
+            "home": REWRITE_BASE, "home_title": "Rewrite Studio",
             "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
                       for name, cfg in sorted(gen.items(), key=lambda kv: kv[0].lower())]})
 
@@ -1207,6 +1215,7 @@ def ui_presets():
     cov = body if isinstance(body, dict) else {}
     groups.append({
         "service": "cover", "title": "Обложки", "error": err, "note": "",
+        "home": COVER_BASE, "home_title": "Cover Studio",
         "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
                   for name, cfg in sorted(cov.items(), key=lambda kv: kv[0].lower())]})
 

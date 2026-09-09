@@ -179,6 +179,9 @@
   .res h3{font-size:11px;margin:0 0 7px;text-transform:uppercase;letter-spacing:.07em;
           color:var(--muted);font-weight:700}
   .res ul{margin:0 0 14px;padding-left:20px}
+  .sec .mklink{float:right;font-weight:500;font-size:12px;text-transform:none;
+               letter-spacing:0;color:var(--acc-hi);text-decoration:none}
+  .sec .mklink:hover{text-decoration:underline}
   .back{display:inline-block;margin-bottom:13px;color:var(--muted);text-decoration:none}
   .back:hover{color:var(--ink-hi)}
   button.small{padding:6px 13px;border-radius:8px;font-size:13px}
@@ -1797,7 +1800,9 @@ async function viewPresets(){
 
   for (const g of d.groups){
     const card = $(`<div class="card" style="margin-bottom:16px">
-      <div class="sec">${esc(g.title)}</div>
+      <div class="sec">${esc(g.title)}${g.home
+        ? ` <a class="mklink" href="${esc(g.home)}" target="_blank" rel="noopener"
+             >завести в ${esc(g.home_title)} ↗</a>` : ''}</div>
       ${g.error
         ? `<div class="stage"><div class="dot s-error">!</div><div class="body">
              <div class="name">Список не получен — ${esc(g.error)}</div>
@@ -1827,7 +1832,11 @@ async function viewPresets(){
     app.append(card);
     wirePresets(card);
   }
-  app.append($(`<div class="note muted">Полная правка настроек пресета — в разделе того сервиса, которому он принадлежит.</div>`));
+  app.append($(`<div class="note muted">Быстрее всего новый пресет получается копией
+    похожего: «Копия» рядом с ним, потом правка полей. Завести с нуля и править
+    настройки — в том сервисе, которому пресет принадлежит: ссылки в заголовках выше.
+    Здесь их формы не повторяются намеренно — у обложек полей больше двадцати, и вторая
+    копия формы разошлась бы с первой.</div>`));
 }
 
 function wirePresets(root){
