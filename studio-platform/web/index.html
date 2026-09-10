@@ -179,6 +179,9 @@
   .res h3{font-size:11px;margin:0 0 7px;text-transform:uppercase;letter-spacing:.07em;
           color:var(--muted);font-weight:700}
   .res ul{margin:0 0 14px;padding-left:20px}
+  .upsteps{display:flex;align-items:center;gap:5px;margin:5px 0 3px}
+  .upstep{width:26px;height:3px;border-radius:2px;background:var(--line-2)}
+  .upstep.on{background:var(--acc)}
   .inline-ask{display:inline-flex;gap:6px;align-items:center;margin-left:8px;
               padding:4px 8px;background:var(--card-2);border:1px solid var(--line-2);
               border-radius:8px;font-size:13px}
@@ -815,8 +818,44 @@ async function channelReleases(id, d){
     return;
   }
   app.append(calendarFeed(d));
+  if ((d.uploads || []).length) app.append(uploadsCard(d.uploads));
   app.append($(`<div class="note muted" style="margin-top:10px">
     <a href="#/releases">Все выпуски по всем каналам →</a></div>`));
+}
+
+// Заливка на YouTube. Кнопки «залить ещё раз» здесь нет намеренно: начиная со стадии
+// «файл ушёл в форму» повторная заливка запрещена навсегда — второй заход создаст на
+// канале дубль. Разрешено только найти начатый ролик и довести его, и это делает сам
+// заливщик. Экран показывает состояние, а не предлагает недопустимое действие.
+function uploadsCard(rows){
+  return $(`<div class="card" style="margin-top:16px">
+    <div class="sec">Заливка на YouTube</div>
+    ${rows.map(u => `<div class="stage">
+      <div class="dot ${u.verdict === 'scheduled' || u.verdict === 'published' ? 's-done'
+                      : u.error ? 's-error'
+                      : u.phase_rank >= 2 ? 's-running' : 's-queued'}">${
+        u.verdict === 'scheduled' || u.verdict === 'published' ? '✓'
+        : u.error ? '!' : u.phase_rank >= 2 ? '↑' : '·'}</div>
+      <div class="body">
+        <div class="name">${u.url
+          ? `<a href="${esc(u.url)}" target="_blank" rel="noopener">${esc(u.title)}</a>`
+          : esc(u.title)}</div>
+        <div class="upsteps">${u.phases.map(f =>
+          `<span class="upstep ${f.done ? 'on' : ''}" title="${esc(f.title)}"></span>`).join('')}
+          <span class="muted" style="font-size:12px">${esc(u.phase_title)}</span></div>
+        <div class="facts">${[
+            u.verdict_title && ('вердикт: ' + u.verdict_title),
+            u.video_id && ('ролик ' + u.video_id),
+            u.visibility && ('видимость: ' + u.visibility),
+            u.schedule_iso && ('выход: ' + u.schedule_iso),
+          ].filter(Boolean).map(esc).join(' · ') || '—'}</div>
+        ${u.no_reupload ? `<div class="note muted">файл уже у YouTube —
+          повторная заливка запрещена, только продолжение начатого</div>` : ''}
+        ${u.error ? `<div class="note bad">${esc(u.error)}</div>` : ''}
+      </div></div>`).join('')}
+    <div class="note muted">Вердикт читается из состояния строки в YouTube Studio, а не
+      из текста на странице: для запланированного ролика Studio пишет «Video published».</div>
+  </div>`);
 }
 
 async function viewChannel(id){

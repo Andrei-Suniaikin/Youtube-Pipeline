@@ -921,6 +921,70 @@ def _pool_load() -> list:
 
 
 # {channel_id:int} — не украшение: без указания типа этот путь перехватывает и
+# Четыре стадии заливки, только вперёд. Начиная с третьей повторная заливка запрещена
+# навсегда: файл уже ушёл в форму YouTube, и второй заход создаст дубль на канале
+# (`upload_contract.PHASES`, `phase_requires_no_reupload`).
+UPLOAD_PHASES = ("preflight", "profile_opened", "upload_started", "video_id_known")
+UPLOAD_PHASE_TITLE = {
+    "preflight": "проверка профиля и канала",
+    "profile_opened": "браузер профиля запущен",
+    "upload_started": "файл ушёл в форму",
+    "video_id_known": "идентификатор ролика известен",
+}
+# Вердикт — не слово «успех», а состояние строки в YouTube Studio. Текст на странице
+# врёт: 07.08 проверка по тексту объявила провальными тринадцать прошедших заливок.
+UPLOAD_VERDICT_TITLE = {
+    "scheduled": "запланирован", "published": "опубликован",
+    "draft": "остался черновиком", "duplicate": "уже был залит",
+    "failed": "не удалось", "already": "уже был вердикт",
+}
+
+
+def _uploads(c, channel_id: int) -> list:
+    """Заливки канала: стадия, вердикт и доказательства.
+
+    Кнопки «залить ещё раз» здесь нет и не будет. После стадии `upload_started` файл
+    уже у YouTube, и единственное разрешённое действие — найти начатый ролик и довести
+    его. Показываем состояние, а не предлагаем действие, которого делать нельзя.
+    """
+    rows = []
+    try:
+        got = c.execute(
+            "SELECT u.release_id, u.status, u.phase, u.verdict, u.video_id, u.error, "
+            "       u.visibility, u.schedule_iso, u.title, u.updated, p.donor_title "
+            "FROM pub_upload_jobs u "
+            "LEFT JOIN pub_releases r ON r.release_id = u.release_id "
+            "LEFT JOIN pub_plan_items p ON p.id = r.plan_item_id "
+            "WHERE u.channel_id=? ORDER BY u.slot_at DESC LIMIT 40",
+            (channel_id,)).fetchall()
+    except sqlite3.Error:
+        return rows
+    for r in got:
+        phase = str(r["phase"] or "preflight")
+        rank = UPLOAD_PHASES.index(phase) if phase in UPLOAD_PHASES else 0
+        rows.append({
+            "release_id": r["release_id"],
+            "title": r["donor_title"] or r["title"] or r["release_id"],
+            "status": r["status"] or "",
+            "phase": phase,
+            "phase_title": UPLOAD_PHASE_TITLE.get(phase, phase),
+            "phase_rank": rank,
+            "phases": [{"key": k, "title": UPLOAD_PHASE_TITLE[k], "done": i <= rank}
+                       for i, k in enumerate(UPLOAD_PHASES)],
+            # Признак из контракта, а не наша догадка: с этой стадии повтор запрещён.
+            "no_reupload": rank >= UPLOAD_PHASES.index("upload_started"),
+            "verdict": r["verdict"] or "",
+            "verdict_title": UPLOAD_VERDICT_TITLE.get(r["verdict"] or "", r["verdict"] or ""),
+            "video_id": r["video_id"] or "",
+            "url": (f"https://youtu.be/{r['video_id']}" if r["video_id"] else ""),
+            "visibility": r["visibility"] or "",
+            "schedule_iso": r["schedule_iso"] or "",
+            "error": r["error"] or "",
+            "updated": r["updated"],
+        })
+    return rows
+
+
 # «/ui/channels/new», объявленный ниже, и форма заведения канала отвечает 422.
 @app.get("/ui/channels/{channel_id:int}")
 def ui_channel(channel_id: int, history: int = 14):
@@ -996,6 +1060,7 @@ def ui_channel(channel_id: int, history: int = 14):
             },
             "calendar": cal,
             "counts": counts,
+            "uploads": _uploads(c, channel_id),
             "by_day": by_day,
             "tz": tzname,
             "waiting_without_slot": waiting,
