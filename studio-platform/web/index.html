@@ -179,6 +179,10 @@
   .res h3{font-size:11px;margin:0 0 7px;text-transform:uppercase;letter-spacing:.07em;
           color:var(--muted);font-weight:700}
   .res ul{margin:0 0 14px;padding-left:20px}
+  .inline-ask{display:inline-flex;gap:6px;align-items:center;margin-left:8px;
+              padding:4px 8px;background:var(--card-2);border:1px solid var(--line-2);
+              border-radius:8px;font-size:13px}
+  .inline-ask .ask-in{width:210px}
   .subtabs{display:flex;gap:4px;margin:0 0 16px;border-bottom:1px solid var(--line)}
   .subtabs a{padding:8px 14px;color:var(--muted);text-decoration:none;font-weight:550;
              font-size:13px;border-bottom:2px solid transparent;margin-bottom:-1px}
@@ -200,10 +204,13 @@
             color:var(--ok)}
   .day .cnt.work{color:var(--acc-hi)}
   .day .cnt.bad{color:var(--bad)}
-  .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(240px,1fr));gap:14px}
-  .fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:5px}
-  .fld input,.fld select{width:100%}
+  .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
+          gap:22px 20px;padding:6px 0 4px}
+  .fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px;
+             line-height:1.3}
+  .fld input,.fld select{width:100%;padding:8px 10px}
   .fld input[readonly]{opacity:.55}
+  .fld .note{margin-top:6px;line-height:1.45}
   .sec .mklink{float:right;font-weight:500;font-size:12px;text-transform:none;
                letter-spacing:0;color:var(--acc-hi);text-decoration:none}
   .sec .mklink:hover{text-decoration:underline}
@@ -491,15 +498,14 @@ async function viewRelease(id){
   // Возврат из разбора. Фазу не откатываем: сделанное и оплаченное остаётся сделанным,
   // движок продолжит с того шага, где остановился.
   const rev = head.querySelector('#revive');
-  if (rev) rev.onclick = async () => {
-    if (!confirm('Вернуть выпуск в работу? Движок продолжит с фазы «'
-                 + r.phase_title + '».')) return;
+  if (rev) rev.onclick = () => confirmInline(rev,
+      `Вернуть в работу с фазы «${r.phase_title}»?`, async () => {
     rev.disabled = true;
     try{
       await post(`/ui/releases/${encodeURIComponent(r.release_id)}/revive`);
       await render();
     }catch(e){ rev.disabled = false; toast(e.message); }
-  };
+  });
 
   app.append($(`<div class="card">
     <div class="sec">Что происходило</div>
@@ -1144,10 +1150,11 @@ function wireRegen(root){
   root.querySelectorAll('button[data-regen]').forEach(b => b.onclick = async ev => {
     ev.preventDefault(); ev.stopPropagation();
     const what = b.dataset.regen;
-    const prompt_ = prompt(what === 'image'
-      ? `Переделать кадр «${b.dataset.name}».\nСвой промпт — по желанию, пусто = как было:`
-      : `Переделать клип «${b.dataset.name}».\nСвой промпт движения — по желанию:`, '');
-    if (prompt_ === null) return;          // отменили
+    // Промпт необязателен: пусто = переделать как было. Поэтому кнопка «Переделать»
+    // в поле ввода, а не «Готово» — видно, что можно просто нажать.
+    askInline(b, {ok: 'Переделать', placeholder: what === 'image'
+        ? 'свой промпт — по желанию' : 'промпт движения — по желанию'},
+      async (prompt_) => {
     b.disabled = true; b.textContent = '…';
     try{
       await post(`/ui/regen/${what}`, {project_id: b.dataset.pid,
@@ -1157,6 +1164,7 @@ function wireRegen(root){
       b.disabled = false; b.textContent = 'переделать';
       toast(e.message);
     }
+    });
   });
 }
 
@@ -1459,13 +1467,15 @@ function fileCard(d, g){
 async function wireKeys(root, d){
   const box = root.querySelector('#keyedit');
 
-  root.querySelectorAll('a.dropkey').forEach(a => a.onclick = async ev => {
+  root.querySelectorAll('a.dropkey').forEach(a => a.onclick = ev => {
     ev.preventDefault();
-    if (!confirm('Снять этот ключ? Он перестанет использоваться сразу.')) return;
-    try{
-      await post('/ui/keys', {drop: {[a.dataset.f]: [Number(a.dataset.i)]}});
-      await render();
-    }catch(e){ toast(e.message); }
+    // Ключ снимается сразу и без отмены — спросить обязаны, но не попапом.
+    confirmInline(a, 'Снять ключ? Перестанет использоваться сразу.', async () => {
+      try{
+        await post('/ui/keys', {drop: {[a.dataset.f]: [Number(a.dataset.i)]}});
+        await render();
+      }catch(e){ toast(e.message); }
+    });
   });
 
   root.querySelector('#addkey').onclick = async () => {
@@ -1969,6 +1979,53 @@ async function viewCovers(){
 
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
+/* ───────────────── спросить, не выходя из страницы ───────────────── */
+// Браузерные prompt() и confirm() останавливают страницу целиком, выглядят чужими и на
+// части браузеров блокируются вместе с попапами. Спрашиваем там же, где нажали.
+
+function inlineBox(btn){
+  let box = btn.parentElement.querySelector('.inline-ask');
+  if (box) box.remove();
+  box = document.createElement('div');
+  box.className = 'inline-ask';
+  btn.parentElement.insertBefore(box, btn.nextSibling);
+  return box;
+}
+
+// Вместо prompt(): поле рядом с кнопкой. Enter — принять, Esc — отменить.
+function askInline(btn, opts, onOk){
+  const box = inlineBox(btn);
+  box.innerHTML = `<input class="ask-in" placeholder="${esc(opts.placeholder || '')}"
+      value="${esc(opts.value || '')}">
+    <button class="small ask-ok">${esc(opts.ok || 'Готово')}</button>
+    <button class="ghost small ask-no">Отмена</button>`;
+  const input = box.querySelector('.ask-in');
+  input.focus();
+  input.select();
+  const done = () => box.remove();
+  box.querySelector('.ask-no').onclick = done;
+  box.querySelector('.ask-ok').onclick = async () => {
+    const v = input.value.trim();
+    if (!v) return input.focus();
+    done();
+    await onOk(v);
+  };
+  input.onkeydown = e => {
+    if (e.key === 'Enter'){ e.preventDefault(); box.querySelector('.ask-ok').click(); }
+    if (e.key === 'Escape') done();
+  };
+}
+
+// Вместо confirm(): вопрос рядом с кнопкой. Нужен только там, где действие необратимо.
+function confirmInline(btn, text, onOk){
+  const box = inlineBox(btn);
+  box.innerHTML = `<span class="muted">${esc(text)}</span>
+    <button class="small ask-ok">Да</button>
+    <button class="ghost small ask-no">Нет</button>`;
+  box.querySelector('.ask-no').onclick = () => box.remove();
+  box.querySelector('.ask-ok').onclick = async () => { box.remove(); await onOk(); };
+}
+
 /* ─────────────────────────── профиль ─────────────────────────── */
 
 // Всё, что про человека и про машину, а не про ролики: учётные записи, состояние
@@ -2088,8 +2145,50 @@ function saveBar(back, onSave){
   return bar;
 }
 
+// Заведение пресета — своя страница, а не браузерный попап: имя видно рядом с тем,
+// куда попадёшь, и опечатку можно исправить, не начиная заново.
+const PRESET_SLUG = {'Озвучка': 'ozvuchka', 'Картинки': 'kadry', 'Клипы': 'klipy',
+                     'Сборка': 'sborka', 'Текст и обложка': 'tekst'};
+
+async function viewPresetNew(){
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
+    <h1>Новый пресет</h1>
+    <p class="sub">Настройки, которыми делаются ролики этого канала: озвучка, кадры,
+      клипы, сборка, текст и обложка.</p>`));
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Название</div>
+    <input id="p-name" placeholder="например: длинные ролики, польский"
+      style="width:100%;max-width:420px">
+    <div class="note muted">Дальше откроется редактор полей. Пустое поле означает
+      «как по умолчанию» — заполнять всё сразу не нужно.</div></div>`);
+  app.append(card);
+  const bar = $(`<div style="display:flex;gap:10px;align-items:center">
+    <button id="go">Завести</button>
+    <a class="ghost" href="#/presets" style="color:var(--muted)">Отмена</a></div>`);
+  app.append(bar);
+  const create = async () => {
+    const b = bar.querySelector('#go');
+    b.disabled = true;
+    try{
+      const out = await post('/ui/presets/vsgen',
+                             {name: card.querySelector('#p-name').value});
+      location.hash = '#/preset/' + out.id;
+    }catch(e){ toast(e.message); b.disabled = false; }
+  };
+  bar.querySelector('#go').onclick = create;
+  const input = card.querySelector('#p-name');
+  input.focus();
+  input.onkeydown = e => { if (e.key === 'Enter'){ e.preventDefault(); create(); } };
+}
+
 async function viewPreset(id){
   const d = await api('/ui/presets/vsgen/' + encodeURIComponent(id));
+  // Группы — вкладками, а не одной простынёй: полей три десятка, и «поменять голос»
+  // не должно означать прокрутку мимо сборки и обложки.
+  const slug = t => PRESET_SLUG[t] || 'ostalnoe';
+  const tabs = d.groups.map(g => [slug(g.title), g.title]);
+  const cur = location.hash.split('/')[3] || (tabs[0] || ['', ''])[0];
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
     <h1>${esc(d.name)}</h1>
@@ -2098,7 +2197,11 @@ async function viewPreset(id){
     <div class="sec">Название</div>
     <input id="p-name" value="${esc(d.name)}" style="width:100%;max-width:420px"></div>`);
   app.append(name);
-  const form = fieldForm(d.groups);
+  app.append($(`<div class="subtabs">${tabs.map(([k, title]) =>
+    `<a href="#/preset/${encodeURIComponent(id)}/${k}"
+        class="${cur === k ? 'on' : ''}">${esc(title)}</a>`).join('')}</div>`));
+  const shown = d.groups.filter(g => slug(g.title) === cur);
+  const form = fieldForm(shown.length ? shown : d.groups.slice(0, 1));
   app.append(form);
   app.append(saveBar('#/presets', () => post(
     '/ui/presets/vsgen/' + encodeURIComponent(id),
@@ -2127,14 +2230,7 @@ async function viewPresets(){
       <button id="newpr" class="small">Новый пресет</button>
     </div>`);
   app.append(head);
-  head.querySelector('#newpr').onclick = async () => {
-    const name = prompt('Название пресета:');
-    if (!name || !name.trim()) return;
-    try{
-      const out = await post('/ui/presets/vsgen', {name});
-      location.hash = '#/preset/' + out.id;
-    }catch(e){ toast(e.message); }
-  };
+  head.querySelector('#newpr').onclick = () => { location.hash = '#/preset/new'; };
 
   if (d.broken.length){
     app.append($(`<div class="card" style="margin-bottom:16px">
@@ -2209,16 +2305,14 @@ function wirePresets(root){
   root.querySelectorAll('button.pedit').forEach(b => b.onclick =
     () => { location.hash = '#/preset/' + encodeURIComponent(b.dataset.key); });
   root.querySelectorAll('button.pcopy').forEach(b => b.onclick = () => {
-    const to = prompt(`Имя копии пресета «${b.dataset.name}»:`,
-                      b.dataset.name + ' — копия');
-    if (!to) return;
-    ask(b, () => post(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/copy`,
-                      {from: b.dataset.name, to}));
+    askInline(b, {value: b.dataset.name + ' — копия', ok: 'Скопировать'}, to =>
+      ask(b, () => post(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/copy`,
+                        {from: b.dataset.name, to})));
   });
   root.querySelectorAll('button.pdel').forEach(b => b.onclick = () => {
-    if (!confirm(`Удалить пресет «${b.dataset.name}»?`)) return;
-    ask(b, () => api(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/${
-      encodeURIComponent(b.dataset.name)}`, {method: 'DELETE'}));
+    confirmInline(b, `Удалить «${b.dataset.name}»?`, () =>
+      ask(b, () => api(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/${
+        encodeURIComponent(b.dataset.name)}`, {method: 'DELETE'})));
   });
 }
 
@@ -2289,17 +2383,17 @@ async function accountsCard(){
 
   card.querySelectorAll('button.ublock').forEach(b => b.onclick = () => {
     const off = b.dataset.to === '1';
-    if (!confirm(off
-      ? `Заблокировать «${b.dataset.name}»? Открытые вкладки закроются сразу.`
-      : `Вернуть доступ «${b.dataset.name}»?`)) return;
-    act(() => post(`/ui/accounts/${b.dataset.id}`, {disabled: off}));
+    confirmInline(b, off
+      ? `Заблокировать «${b.dataset.name}»? Вкладки закроются сразу.`
+      : `Вернуть доступ «${b.dataset.name}»?`,
+      () => act(() => post(`/ui/accounts/${b.dataset.id}`, {disabled: off})));
   });
 
   card.querySelectorAll('button.upw').forEach(b => b.onclick = () => {
-    const pw = prompt(`Новый пароль для «${b.dataset.name}».\n`
-                      + `Открытые вкладки этого человека закроются.`, '');
-    if (!pw) return;
-    act(() => post(`/ui/accounts/${b.dataset.id}`, {password: pw}));
+    // Пароль вводится в поле на странице, а не в браузерном окне: попап не даёт
+    // ни увидеть, чей это пароль, ни исправить опечатку до отправки.
+    askInline(b, {ok: 'Задать', placeholder: `новый пароль для «${b.dataset.name}»`},
+      pw => act(() => post(`/ui/accounts/${b.dataset.id}`, {password: pw})));
   });
 
   card.querySelectorAll('select.urole').forEach(sel => sel.onchange = () =>
@@ -2512,7 +2606,9 @@ const ROUTES = [
                                                           decodeURIComponent(h.split('/')[2]))],
   ['profile',  h => h === '#/limits',             () => viewLimits()],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
-  ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(decodeURIComponent(h.slice(9)))],
+  ['presets',  h => h === '#/preset/new',          () => viewPresetNew()],
+  ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(
+                                                          decodeURIComponent(h.split('/')[2]))],
   ['profile',  h => h === '#/admin',              () => viewAdmin()],
   ['channels', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
   ['channels', h => h === '#/new',                () => viewNew()],

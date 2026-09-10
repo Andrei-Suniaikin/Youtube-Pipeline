@@ -89,6 +89,50 @@ def main() -> int:
     # встроены, требовать идентификатор там незачем.
     check("без карты работает старое поле", PF.voice_for({"voice": "один"}, "ru"), "один")
 
+    print("\nНастройки чужого движка не показываются, а не гаснут")
+
+    class Cabinet:
+        """Заглушка кабинета: описанию нужны только списки вариантов."""
+        TTS_ENGINES = {"edge": ("Edge", "бесплатно"), "voicegencore": ("VGC", "ключ"),
+                       "voicer": ("Voicer", "ключ"), "lumean": ("Lumean", "ключ")}
+        IMAGE_MODELS = {"OPENAI": ("OpenAI", "1 кр", "r"), "NARWHAL": ("NB2", "4 кр", "r")}
+        VIDEO_METHODS = {"veo": ("Veo", "", "v")}
+        _QUALITY_OK = ("720p", "1080p")
+        _MATERIAL_ORDERS = {"video_first", "images_first", "alternate"}
+        _SUB_LANG_OK = {"Russian"}
+        IMAGE_MODELS_WITH_SEED = {"NARWHAL"}
+
+    def voice_fields(engine):
+        g = PF.describe(Cabinet, {"engine": engine})
+        return [f["key"] for f in g[0]["fields"]]
+
+    check("у Edge нет ни stability, ни template_id",
+          [k for k in ("stability", "voice_uuid", "model_id") if k in voice_fields("edge")],
+          [])
+    check("у VoiceGenCore есть stability", "stability" in voice_fields("voicegencore"), True)
+    check("у Lumean есть template_id", "voice_uuid" in voice_fields("lumean"), True)
+    check("у Voicer есть своя модель", "model_id" in voice_fields("voicer"), True)
+
+    # ТЗ различает два случая, и мы вместе с ним. Настройки чужого движка не существует —
+    # её не показываем (§06). Настройку, отменённую другой настройкой, показываем с
+    # объяснением: человек её заполнял, и молча выбросить его работу нельзя (§09).
+    def build_field(key, settings):
+        for g in PF.describe(Cabinet, settings):
+            for f in g["fields"]:
+                if f["key"] == key:
+                    return f
+        return None
+
+    check("мин/макс при синхроне остаётся на месте",
+          bool(build_field("min_image_duration", {"sync_audio": "1"})), True)
+    check("и объясняет, почему не действует",
+          "не действуют" in build_field("min_image_duration", {"sync_audio": "1"})["off"],
+          True)
+    check("без синхрона объяснения нет",
+          build_field("min_image_duration", {"sync_audio": "0"})["off"], "")
+    check("seed у неподходящей модели тоже объясняется, а не прячется",
+          bool(build_field("seed", {"model": "OPENAI"})["off"]), True)
+
     print("\nФорма пресета знает эти поля")
     keys = PF.keys()
     for k in ("preset_rewrite", "preset_cover", "voice_by_lang", "voice"):

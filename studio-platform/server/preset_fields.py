@@ -23,10 +23,10 @@ from __future__ import annotations
 
 
 class Field:
-    __slots__ = ("key", "label", "kind", "hint", "options", "off", "placeholder")
+    __slots__ = ("key", "label", "kind", "hint", "options", "off", "hide", "placeholder")
 
     def __init__(self, key, label, kind="text", hint="", options=None, off=None,
-                 placeholder=""):
+                 hide=None, placeholder=""):
         self.key = key
         self.label = label
         self.kind = kind                  # text | number | select | switch
@@ -35,6 +35,15 @@ class Field:
         self.options = options
         # Правило гашения: функция от текущих настроек → причина или "".
         self.off = off
+        # Правило сокрытия: функция от настроек → True, если поля здесь быть не должно.
+        #
+        # Разница с `off` не косметическая. `off` — «настройку отменяет другая
+        # настройка», и ТЗ §09 прямо требует показать её с объяснением: человек её
+        # заполнил, и молча выбросить его работу нельзя. `hide` — «у этого провайдера
+        # такой настройки не существует», и ТЗ §06 так же прямо требует её не
+        # показывать. Красный текст на месте настройки, которой у Edge отродясь не
+        # было, — это шум, а не честность.
+        self.hide = hide
         self.placeholder = placeholder
 
 
@@ -110,17 +119,16 @@ def _sync_off(m, s):
     return "при синхроне длительность считает звук — эти поля не действуют"
 
 
-def _tts_off(*supported):
-    """Поле видно только у тех движков озвучки, которые его поддерживают (ТЗ §06).
+def _tts_only(*supported):
+    """Поле есть только у этих движков озвучки (ТЗ §06).
 
     «Показывать только те настройки, которые выбранный провайдер действительно
-    поддерживает» — иначе человек заполняет stability для Edge и ждёт эффекта.
+    поддерживает» — значит у остальных поля просто нет. Не гасить с объяснением, а не
+    показывать: у Edge нет и не было ни stability, ни template_id, и сообщать об этом
+    на каждом открытии формы незачем.
     """
     def rule(m, s):
-        eng = str(s.get("engine") or "edge").strip().lower()
-        if eng in supported:
-            return ""
-        return "этот движок настройку не поддерживает — она есть у: " + ", ".join(supported)
+        return str(s.get("engine") or "edge").strip().lower() not in supported
     return rule
 
 
@@ -146,10 +154,10 @@ GROUPS = (
         Field("voice", "Голос по умолчанию", "text",
               placeholder="пусто = подберётся по языку текста",
               hint="используется, когда языка нет в списке выше"),
-        Field("model_id", "Модель Voicer", "text", off=_tts_off("voicer")),
+        Field("model_id", "Модель Voicer", "text", hide=_tts_only("voicer")),
         Field("split_type", "Разбивка", "text", placeholder="по абзацам"),
-        Field("stability", "Стабильность", "text", off=_tts_off("voicegencore")),
-        Field("voice_uuid", "Lumean template_id", "text", off=_tts_off("lumean")),
+        Field("stability", "Стабильность", "text", hide=_tts_only("voicegencore")),
+        Field("voice_uuid", "Lumean template_id", "text", hide=_tts_only("lumean")),
     )),
     ("Картинки", (
         Field("model", "Модель", "select", options=_image_models),
@@ -224,6 +232,11 @@ def describe(mod, settings: dict, extra: dict = None) -> list:
                 options = []
             if f.kind == "select" and not options:
                 continue          # список неоткуда взять — поля не будет, а не вранья
+            try:
+                if f.hide and f.hide(mod, s):
+                    continue
+            except Exception:                                      # noqa: BLE001
+                pass          # правило сломалось — лучше показать поле, чем потерять
             try:
                 off = f.off(mod, s) if f.off else ""
             except Exception:                                      # noqa: BLE001
