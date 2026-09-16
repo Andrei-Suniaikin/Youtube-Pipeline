@@ -1259,14 +1259,39 @@ async function viewProjects(){
       <div class="row" style="margin-top:8px"><label>Текст</label>
         <textarea id="tx" rows="10" style="width:100%"
           placeholder="Текст, который будет озвучен. По нему же строятся кадры."></textarea></div>
+      <div class="row" style="margin-top:8px"><label>Или файл .txt</label>
+        <input id="txfile" type="file" accept=".txt,text/plain"></div>
       <div class="note muted">Название и текст — разные поля: название не читается вслух.
-        Пустое название возьмётся из первой строки.</div>
+        Пустое название возьмётся из первой строки, а при загрузке файла — из его имени.
+        Ручку на сервере файл не заводит новую: браузер сам читает его в поле текста.</div>
       <div style="margin-top:12px"><button id="go">Завести</button>
         <button class="ghost" id="no">Отмена</button></div>
     </div>`);
     bar.after(form);
     const err = form.querySelector('#err');
     form.querySelector('#no').onclick = () => form.remove();
+    // Файл читается в браузере, а не отправляется отдельной ручкой: серверу всё равно
+    // не нужен файл сам по себе, ему нужен текст, а он и так едет полем формы.
+    // TextDecoder с fatal:true — единственный способ узнать, что байты не UTF-8, а не
+    // молча подставить кракозябры вместо текста, который потом озвучат.
+    form.querySelector('#txfile').onchange = async (e) => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      try{
+        const buf = await file.arrayBuffer();
+        const text = new TextDecoder('utf-8', {fatal: true}).decode(buf);
+        form.querySelector('#tx').value = text;
+        const nm = form.querySelector('#nm');
+        if (!nm.value.trim()) nm.value = file.name.replace(/\.[^./\\]+$/, '');
+      }catch(readErr){
+        // Имя не err: снаружи уже есть переменная err — контейнер сообщений об ошибке
+        // формы; одноимённый catch её тут не трогает, но следующая правка внутри catch
+        // легко написала бы не туда по невнимательности.
+        toast(`файл «${file.name}» не в UTF-8 — пересохраните его в этой кодировке`);
+      }finally{
+        e.target.value = '';
+      }
+    };
     form.querySelector('#go').onclick = async () => {
       err.innerHTML = '';
       try{
@@ -1283,9 +1308,20 @@ async function viewProjects(){
     return;
   }
   const mark = (ok, txt) => `<span class="pill ${ok ? 's-done' : 's-idle'}">${txt}</span>`;
+  const batch = $(`<div class="card" style="margin-bottom:16px">
+    <button id="batchgo" class="small" disabled>Сделать всё для отмеченных</button>
+    <span class="muted" id="batchn" style="margin-left:10px">отмечено: 0</span>
+    <div class="note muted">Кнопка ставит существующую задачу «сделать всё» по каждому
+      отмеченному проекту — с его собственными настройками, без общих переопределений.
+      Кнопка «Запустить» внутри проекта остаётся: там можно подставить свои поля
+      для одного прогона.</div></div>`);
+  app.append(batch);
   const card = $(`<div class="card"><table>
-    <thead><tr><th>Проект</th><th>Готово</th><th>Выпуск</th><th>Изменён</th></tr></thead>
+    <thead><tr><th style="width:26px"><input type="checkbox" id="pickall"></th>
+      <th>Проект</th><th>Готово</th><th>Выпуск</th><th>Изменён</th></tr></thead>
     <tbody>${d.projects.map(p => `<tr class="row" data-id="${esc(p.id)}">
+      <td onclick="event.stopPropagation()"><input type="checkbox" class="pick"
+          data-id="${esc(p.id)}"></td>
       <td><div style="font-weight:600">${esc(p.name)}</div>
           <div class="muted mono" style="font-size:11px">${esc(p.id)}</div></td>
       <td>${mark(p.ready.text, 'текст')}
@@ -1302,6 +1338,64 @@ async function viewProjects(){
     </tr>`).join('')}</tbody></table></div>`);
   card.querySelectorAll('tr.row').forEach(tr =>
     tr.onclick = () => location.hash = '#/project/' + encodeURIComponent(tr.dataset.id));
+
+  const goBtn = batch.querySelector('#batchgo');
+  const countEl = batch.querySelector('#batchn');
+  const picks = () => [...card.querySelectorAll('input.pick:checked')].map(cb => cb.dataset.id);
+  const refreshCount = () => {
+    const n = picks().length;
+    countEl.textContent = `отмечено: ${n}`;
+    goBtn.disabled = n === 0;
+  };
+  card.querySelectorAll('input.pick').forEach(cb => cb.onchange = refreshCount);
+  card.querySelector('#pickall').onchange = (e) => {
+    card.querySelectorAll('input.pick').forEach(cb => cb.checked = e.target.checked);
+    refreshCount();
+  };
+  goBtn.onclick = async () => {
+    const ids = picks();
+    goBtn.disabled = true;
+    // Одним тостом на весь пакет: «поставлено 0» без объяснения выглядело бы как
+    // несработавшая кнопка (тот же принцип, что и у одиночного «Запустить» выше).
+    let enq = 0, def = 0, skip = 0;
+    // Причина — на счётчик, а не на список строк: отметив двадцать проектов одного
+    // канала без ключа, человек получал бы одну и ту же фразу
+    // двадцать раз в тосте, который живёт пять секунд и не читается построчно. Здесь
+    // одинаковые причины схлопываются, и рядом остаётся число проектов.
+    const reasons = new Map();
+    for (const pid of ids){
+      try{
+        const out = await post(`/ui/projects/${encodeURIComponent(pid)}/run`, {});
+        enq += out.enqueued || 0;
+        def += out.deferred || 0;
+        skip += out.skipped || 0;
+        // out.block_reason у этой ручки в успешный ответ не попадает: при одиночном
+        // pid (а батч зовёт /run по одному) полная блокировка всегда отвечает кодом
+        // 400 (server/main.py:4529-4530), а не 200 с заполненным block_reason — этот
+        // случай приходит ниже, через catch.
+      }catch(e){
+        // Сессия истекла посреди пакета — это не «причина отказа» проекта, а «войдите
+        // снова»: тот же случай и тот же уход на экран входа, что и в render() при
+        // обычной навигации. Остаток пакета не имеет смысла продолжать без сессии.
+        if (e instanceof NeedLogin){ ME = null; return viewLogin(''); }
+        skip += 1;
+        reasons.set(e.message, (reasons.get(e.message) || 0) + 1);
+      }
+    }
+    const reasonText = [...reasons].map(([text, n]) =>
+      n > 1 ? `${text} (×${n})` : text).join('; ');
+    // «Проектов» и «задач» — разные единицы (один проект даёт до двух поставленных и
+    // ровно две отложенные задачи, server/main.py:4512-4525): назвать их отдельно,
+    // иначе «из 3: поставлено 6» читается как ошибка арифметики.
+    toast(`проектов: ${ids.length} — поставлено задач: ${enq}${def ? `, отложено: ${def}` : ''}${
+      skip ? `, пропущено: ${skip}` : ''}${
+      reasonText ? ' — ' + reasonText : ''}`, enq ? 'ok' : 'bad');
+    // Та же пауза, что у одиночного «Запустить» (rgo, выше по файлу): кабинету нужно
+    // время записать статусы после постановки задач, и немедленное перечитывание после
+    // пакета с большей вероятностью показало бы ещё старый список.
+    setTimeout(() => viewProjects(), 1200);
+  };
+
   app.append(card);
 }
 
@@ -2120,6 +2214,23 @@ async function viewLimits(){
 
 /* ─────────────────────────── редактор пресета ─────────────────────────── */
 
+// Дыра, которую закрывает эта функция: убрать модель из выпадающего списка (2.2, 3.1)
+// не значит стереть её из движка (правило 2 ТЗ). Но `<select>` без "selected" ни на
+// одном варианте браузер рисует так, будто выбран первый пункт — «как по умолчанию» —
+// и следующее сохранение формы молча заменило бы GROK или grok пустой строкой,
+// хотя движок их прекрасно принимает. Лишний вариант с самим сохранённым значением
+// не даёт этому случиться, пока человек не выберет что-то из предложенного явно.
+function selectOptionsHtml(f){
+  const known = (f.options || []).some(o => String(o.value) === String(f.value));
+  const stray = (f.value && !known)
+    ? `<option value="${esc(f.value)}" selected>${esc(f.value)} — нет в списке, но сохранено</option>`
+    : '';
+  return `<option value="">— как по умолчанию —</option>${stray}${
+    (f.options || []).map(o => `<option value="${esc(o.value)}"${
+      String(f.value) === String(o.value) ? ' selected' : ''
+    }>${esc(o.title)}</option>`).join('')}`;
+}
+
 // Форма настроек. Одна и та же для пресета и для проекта: это один набор полей —
 // пресет лишь заготовка, проект — его копия в момент заведения. Описание приходит с
 // сервера (server/preset_fields.py), здесь только отрисовка.
@@ -2134,12 +2245,18 @@ function fieldForm(groups){
         // оставляет значение в форме (disabled-поля не отправляются, и сохранение
         // стёрло бы их), а причина написана рядом — правило 2 ТЗ.
         const off = f.off ? ' readonly title="' + esc(f.off) + '"' : '';
-        const body = f.kind === 'select'
+        const body = f.kind === 'langmap'
+          // Строки собираются в JS после вставки в DOM (wireLangMap): им нужен список
+          // языков поля и значение соседнего поля «Движок» из этой же группы. Хранит
+          // итог тот же скрытый input с data-key — form.read() не меняется вообще.
+          ? `<div class="langmap" id="${id}-box">
+               <input type="hidden" id="${id}" data-key="${esc(f.key)}" value="${esc(f.value)}">
+               <div class="langmap-rows"></div>
+               <button type="button" class="ghost small langmap-add">+ строка</button>
+             </div>`
+          : f.kind === 'select'
           ? `<select id="${id}" data-key="${esc(f.key)}"${f.off ? ' disabled' : ''}>
-               <option value="">— как по умолчанию —</option>
-               ${f.options.map(o => `<option value="${esc(o.value)}"${
-                 String(f.value) === String(o.value) ? ' selected' : ''
-               }>${esc(o.title)}</option>`).join('')}</select>`
+               ${selectOptionsHtml(f)}</select>`
           : f.kind === 'switch'
           ? `<select id="${id}" data-key="${esc(f.key)}"${f.off ? ' disabled' : ''}>
                <option value=""${f.value === '' ? ' selected' : ''}>— как по умолчанию —</option>
@@ -2148,13 +2265,18 @@ function fieldForm(groups){
              </select>`
           : `<input id="${id}" data-key="${esc(f.key)}" value="${esc(f.value)}"
                  placeholder="${esc(f.placeholder)}"${off}>`;
-        return `<div class="fld"><label for="${id}">${esc(f.label)}</label>
+        // Подпись у langmap ведёт на видимый блок строк (`-box`), а не на скрытый
+        // input с самим значением — клик по подписи на скрытом поле не делал ничего,
+        // это была подпись в никуда.
+        return `<div class="fld"${f.kind === 'langmap' ? ' style="grid-column:1/-1"' : ''}>
+          <label for="${f.kind === 'langmap' ? id + '-box' : id}">${esc(f.label)}</label>
           ${body}
           ${f.off ? `<div class="note bad">${esc(f.off)}</div>`
                   : (f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : '')}
         </div>`;
       }).join('')}</div></div>`);
     form.append(card);
+    g.fields.filter(f => f.kind === 'langmap').forEach(f => wireLangMap(card, f, g));
   }
   // Отключённые поля браузер не отправил бы сам; мы их и не читаем — значение
   // останется таким, каким было, а не обнулится молча.
@@ -2166,6 +2288,83 @@ function fieldForm(groups){
     return values;
   };
   return form;
+}
+
+// «ru: id, en: id2» → [[ "ru","id" ], [ "en","id2" ]] — зеркало preset_fields.parse_voice_map
+// в браузере. Только для отрисовки строк; на сервер уезжает та же строка, собранная
+// функцией sync() внутри wireLangMap(), и разбирает её по-прежнему сама функция кабинета.
+function parseVoiceMapRows(raw){
+  const out = [];
+  String(raw || '').replace(/\n/g, ',').split(',').forEach(chunk => {
+    const i = chunk.indexOf(':');
+    if (i < 0) return;
+    const lang = chunk.slice(0, i).trim().toLowerCase();
+    const voice = chunk.slice(i + 1).trim();
+    if (lang && voice) out.push([lang, voice]);
+  });
+  return out;
+}
+
+// Собрать виджет «голоса по языкам»: строка = язык из выпадающего списка + текстовое
+// поле идентификатора + крестик. Движок и формат хранения не меняются — это только
+// удобная отрисовка одной и той же строки настроек.
+function wireLangMap(card, f, group){
+  const hidden = card.querySelector('#f-' + f.key);
+  const box = card.querySelector('#f-' + f.key + '-box');
+  const rows = box.querySelector('.langmap-rows');
+  const langs = f.options || [];
+  // Случай Lumean (ТЗ, батч 16.09.2026): у него идентификатор строки — id пресета
+  // Lumean (template_id), а не голос. Значение движка читается здесь один раз, при
+  // отрисовке формы, и не пересчитывается при смене «Движка» до сохранения — это
+  // принятое ограничение формы, а не побочный эффект приёма: все правила off/hide в
+  // этой форме так же статичны до сохранения и перезагрузки, карта голосов не
+  // исключение.
+  const engineField = (group.fields || []).find(x => x.key === 'engine');
+  const isLumean = !!engineField && String(engineField.value || '').toLowerCase() === 'lumean';
+  const idPlaceholder = isLumean ? 'id пресета Lumean (template_id)' : 'id голоса';
+
+  // Тот же приём, что и у selectOptionsHtml() выше, доведённый до строк карты: язык,
+  // введённый до появления этого выпадающего списка (диалектный код вида `pt-br`,
+  // или код, которого не стало после правки `_LANG_NAMES`), не входит
+  // в `langs` — без отдельного пункта браузер выбрал бы первый вариант «— язык —», и
+  // sync() ниже отправил бы строку с пустым языком, то есть выбросил бы её. Отдельный
+  // выбранный пункт с пометкой сохраняет код ровно так же, как для моделей и методов.
+  const langOptionsHtml = cur => {
+    const known = langs.some(o => String(o.value) === cur);
+    const stray = (cur && !known)
+      ? `<option value="${esc(cur)}" selected>${esc(cur)} — нет в списке, но сохранено</option>`
+      : '';
+    return `<option value="">— язык —</option>${stray}${langs.map(o =>
+      `<option value="${esc(o.value)}"${String(o.value) === cur ? ' selected' : ''}>${
+        esc(o.title)}</option>`).join('')}`;
+  };
+
+  const sync = () => {
+    const parts = [];
+    rows.querySelectorAll('.langmap-row').forEach(r => {
+      const lang = r.querySelector('.lm-lang').value.trim();
+      const voice = r.querySelector('.lm-voice').value.trim();
+      if (lang && voice) parts.push(`${lang}: ${voice}`);
+    });
+    hidden.value = parts.join(', ');
+  };
+
+  const addRow = (lang, voice) => {
+    const wrap = $(`<div class="langmap-row" style="display:flex;gap:8px;margin-bottom:6px">
+      <select class="lm-lang" style="width:180px;flex:0 0 auto">${langOptionsHtml(lang || '')}</select>
+      <input class="lm-voice" style="flex:1;width:auto;min-width:0"
+             placeholder="${esc(idPlaceholder)}" value="${esc(voice || '')}">
+      <button type="button" class="ghost small lm-del" title="убрать строку">×</button>
+    </div>`);
+    wrap.querySelector('.lm-lang').onchange = sync;
+    wrap.querySelector('.lm-voice').oninput = sync;
+    wrap.querySelector('.lm-del').onclick = () => { wrap.remove(); sync(); };
+    rows.append(wrap);
+  };
+
+  parseVoiceMapRows(f.value).forEach(([lang, voice]) => addRow(lang, voice));
+  box.querySelector('.langmap-add').onclick = () => addRow('', '');
+  sync();
 }
 
 function saveBar(back, onSave){

@@ -240,6 +240,60 @@ def main() -> int:
         check("пресет убран за собой", preset_row(prid) is None, True)
     check("чужого пресета нет", me.go("/ui/presets/vsgen/999999")[0], 404)
 
+    print("\nБатч 16.09.2026: списки короче, движок — нет")
+    pname2 = "тест пульта: батч 16.09"
+    code, body = me.go("/ui/presets/vsgen", {"name": pname2})
+    check("пресет для батча заведён", code, 200)
+    prid2 = (body or {}).get("id")
+    if prid2:
+        code, d = me.go(f"/ui/presets/vsgen/{prid2}")
+        fields = {f["key"]: f for g in d.get("groups", []) for f in g.get("fields", [])}
+        model_values = [o["value"] for o in fields["model"]["options"]]
+        check("GROK нет в списке моделей картинок", "GROK" in model_values, False)
+        check("GROK_SPEED нет в списке моделей картинок",
+              "GROK_SPEED" in model_values, False)
+        method_values = [o["value"] for o in fields["video_method"]["options"]]
+        check("grok нет в списке методов клипов", "grok" in method_values, False)
+        method_titles = " ".join(o["title"] for o in fields["video_method"]["options"])
+        check("у методов клипов подписан провайдер",
+              ("NonStop" in method_titles) and ("FastGen" in method_titles), True)
+        check("aspect_ratio — выпадающий список", fields["aspect_ratio"]["kind"], "select")
+        check("aspect_ratio приходит с непустым списком вариантов",
+              len(fields["aspect_ratio"]["options"]) > 0, True)
+        check("custom_prompts убран из формы", "custom_prompts" in fields, False)
+
+        # Сохранение уходит в кабинет его же ручкой (_canonical_image_params) — она и
+        # решает, принять ли старое значение. GROK там знакомый ключ, просто убранный
+        # из списка для человека, поэтому сохранение обязано пройти, а не отвергнуться.
+        check("сохранение с GROK из старого пресета принято",
+              me.go(f"/ui/presets/vsgen/{prid2}",
+                    {"name": pname2, "values": {"model": "GROK"}})[0], 200)
+        back = {f["key"]: f["value"] for g in me.go(f"/ui/presets/vsgen/{prid2}")[1]["groups"]
+                for f in g["fields"]}
+        check("сохранённый GROK не потерялся", back.get("model"), "GROK")
+
+        check("сохранение с grok из старого пресета принято",
+              me.go(f"/ui/presets/vsgen/{prid2}",
+                    {"name": pname2, "values": {"video_method": "grok"}})[0], 200)
+        back = {f["key"]: f["value"] for g in me.go(f"/ui/presets/vsgen/{prid2}")[1]["groups"]
+                for f in g["fields"]}
+        check("сохранённый grok не потерялся", back.get("video_method"), "grok")
+
+        # Строка «язык → id» собирается браузером из виджета langmap, но на сервер
+        # уезжает и обратно читается той же строкой, что и раньше — parse_voice_map
+        # её не заметит другой.
+        check("сохранение карты голосов, собранной браузером, принято",
+              me.go(f"/ui/presets/vsgen/{prid2}",
+                    {"name": pname2,
+                     "values": {"voice_by_lang": "ru: id-1, en: id-2"}})[0], 200)
+        back = {f["key"]: f["value"] for g in me.go(f"/ui/presets/vsgen/{prid2}")[1]["groups"]
+                for f in g["fields"]}
+        check("карта голосов по-прежнему разбирается parse_voice_map",
+              back.get("voice_by_lang"), "ru: id-1, en: id-2")
+
+        drop_preset(prid2)
+        check("пресет батча убран за собой", preset_row(prid2) is None, True)
+
     print("\nНастройки проекта — той же формой, что и пресет")
     code, d = me.go("/ui/projects/p_a4ffcac9da/settings")
     if code == 404:

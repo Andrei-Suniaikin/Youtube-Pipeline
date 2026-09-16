@@ -28,8 +28,17 @@ class Field:
     def __init__(self, key, label, kind="text", hint="", options=None, off=None,
                  hide=None, placeholder=""):
         self.key = key
+        # Подпись обычно строка, но у «голосов по языкам» меняется вместе с движком:
+        # для Lumean идентификатор — id пресета, а не голос, и заголовок поля обязан
+        # сказать это так же прямо, как уже говорит подсказка.
+        # Тогда сюда кладётся функция (модуль кабинета, настройки) → строка — тем же
+        # контрактом, что и у `hint`/`off`/`hide`, а не своим отдельным.
         self.label = label
-        self.kind = kind                  # text | number | select | switch
+        self.kind = kind                  # text | number | select | switch | langmap
+        # Подсказка обычно строка, но иногда зависит от другого поля — например у
+        # голосов по языкам она разная для Lumean (там id — это template_id, а не
+        # голос). Тогда сюда кладётся функция (модуль кабинета, настройки) → строка,
+        # тем же контрактом, что и у `off`/`hide`, а не своим отдельным.
         self.hint = hint
         # Варианты: функция от модуля кабинета — чтобы список жил там, где он живёт.
         self.options = options
@@ -60,12 +69,66 @@ def _engines(m):
     return [(k, items[k][0] + (f" · {items[k][1]}" if items[k][1] else "")) for k in keys_]
 
 
+# Чёрный список, а не образец `_orders` (список для человека задан прямо, отфильтрован
+# по константе для совместимости). Решение сознательное: у моделей картинок список
+# кабинета живой и растёт, а тут убираются только эти два ключа по решению владельца —
+# если завтра появится третья модель, она обязана
+# показаться в форме сама, без новой правки этого файла. `_orders`, наоборот, закрытый
+# список из трёх пунктов ТЗ §09, которому автопоявление новых значений не нужно и не
+# обещано.
+_HIDDEN_IMAGE_MODELS = {"GROK", "GROK_SPEED"}
+
+
 def _image_models(m):
-    return [(k, f"{v[0]} · {v[1]}") for k, v in m.IMAGE_MODELS.items()]
+    """Модели картинок для выбора человеком.
+
+    GROK и GROK_SPEED убраны из списка (батч 16.09.2026, решение владельца) — но не из
+    движка: `main.py:3612` отвергает только по-настоящему незнакомые ключи, эти два в
+    их числе не значатся, и старый пресет с GROK обязан продолжать работать. Ключ,
+    которого нет в списке для человека, — не то же самое, что ключ, которого нет вовсе.
+    """
+    return [(k, f"{v[0]} · {v[1]}") for k, v in m.IMAGE_MODELS.items()
+            if k not in _HIDDEN_IMAGE_MODELS]
+
+
+# Тот же чёрный список по той же причине, что и у моделей картинок выше: методы
+# клипов в кабинете тоже растут, а решение владельца — про один конкретный ключ
+# `grok`, не про то, что список методов впредь надо перечислять для человека вручную.
+_HIDDEN_VIDEO_METHODS = {"grok"}
+# Провайдер, который реально исполняет метод, — третий элемент кортежа
+# `VIDEO_METHODS`, не наш отдельный список: два списка одного и того же факта
+# разошлись бы первыми же (googler_worker.py:11610 — veo это VeoNonStop,
+# recrafter.fun это FastGen).
+#
+# Подписи — свой короткий словарь, а не `main.PROVIDER_LABELS`: в кабинете
+# (`main.py:3628`) эти подписи длинные и служебные — «VeoNonStop», «Recrafter /
+# FastGen · кредиты» — они делают понятным весь список
+# провайдеров кабинета. Здесь же подпись — это третье слово в узкой строке метода
+# («Flower · Veo 3.1 · FastGen · 1 кр», ТЗ п. 3.2 просит именно короткие «NonStop» и
+# «FastGen»), и подставить туда длинную форму значило бы захламить строку, которую и
+# так читают в таблице. Это выбор человеческого текста для тесного места, а не второй
+# список факта «кто провайдер» — сам факт (какой ключ у какого метода) по-прежнему
+# берётся из кортежа `VIDEO_METHODS`, а не отсюда.
+_VIDEO_PROVIDER_TITLE = {"veo": "NonStop", "recrafter": "FastGen"}
 
 
 def _video_methods(m):
-    return [(k, v[0] + (f" · {v[1]}" if v[1] else "")) for k, v in m.VIDEO_METHODS.items()]
+    """Методы клипов для выбора человеком, с подписанным провайдером (батч 16.09.2026).
+
+    `grok` убран из списка тем же способом, что и модели картинок выше: движок обязан
+    принимать его из старых пресетов и дальше.
+    """
+    out = []
+    for k, v in m.VIDEO_METHODS.items():
+        if k in _HIDDEN_VIDEO_METHODS:
+            continue
+        label, price = v[0], (v[1] if len(v) > 1 else "")
+        provider = v[2] if len(v) > 2 else ""
+        parts = [label, _VIDEO_PROVIDER_TITLE.get(provider, provider)]
+        if price:
+            parts.append(price)
+        out.append((k, " · ".join(p for p in parts if p)))
+    return out
 
 
 def _quality(m):
@@ -86,6 +149,58 @@ def _orders(m):
 
 def _sub_langs(m):
     return [(x, x) for x in sorted(m._SUB_LANG_OK)]
+
+
+def _aspect_ratio(m):
+    """Три соотношения кадра, слово в слово как в форме кабинета.
+
+    В кабинете (`main.py:4124`) эти три варианта вписаны прямо в HTML формы, а не в
+    отдельную константу модуля — там неоткуда взять список через `options=`, как у
+    остальных полей. Задаём его здесь напрямую и подписываем ссылкой на источник, чтобы
+    расхождение было видно при следующей правке той строки.
+    """
+    return [("landscape", "Горизонтальное 16:9"), ("portrait", "Вертикальное 9:16"),
+            ("square", "Квадрат")]
+
+
+def _lang_options(m):
+    """Языки для строк карты «голоса по языкам» (батч 16.09.2026).
+
+    Задача называла `_SUB_LANGS_ALL` и `LANGUAGE_CODES` — ни один не подошёл:
+    `_SUB_LANGS_ALL` в studio-platform хранит не двухбуквенные коды, а полные
+    английские названия языков субтитров, а `LANGUAGE_CODES` здесь не существует
+    вовсе. `_LANG_NAMES` (`main.py:7275`) — тот же формат «код → имя», в котором и
+    хранится сам `voice_by_lang` («ru: id, en: id2»), поэтому источник — он.
+    """
+    names = getattr(m, "_LANG_NAMES", None) or {}
+    return [(code, f"{code} — {name}") for code, name in sorted(names.items())]
+
+
+def _voice_by_lang_label(m, s):
+    """Подпись поля — тем же контрактом, что и подсказка ниже.
+
+    Раньше про Lumean говорила только подсказка под полем, а заголовок оставался
+    «Голоса по языкам» — человек, настроивший Lumean, читал в заголовке слово «голоса»,
+    хотя строка — это id пресета, а не голос. Заголовок и подсказка обязаны говорить
+    одно и то же.
+    """
+    if str(s.get("engine") or "edge").strip().lower() == "lumean":
+        return "Пресеты Lumean по языкам"
+    return "Голоса по языкам"
+
+
+def _voice_by_lang_hint(m, s):
+    """Подсказка меняется для Lumean: идентификатор там — не голос, а свой пресет.
+
+    Провайдер один на строку — движок берёт `voice_uuid`/`voice_by_lang` как id шаблона
+    Lumean, а не как голос TTS, и подсказка обязана сказать это прямо, а не оставить
+    человека гадать, что писать в текстовое поле каждой строки.
+    """
+    if str(s.get("engine") or "edge").strip().lower() == "lumean":
+        return ("для Lumean это id пресета Lumean (template_id), а не голос — то же "
+                "правило «язык → провайдер → идентификатор» ТЗ §06")
+    return ("правило ТЗ §06: язык → провайдер → идентификатор. "
+            "Язык берётся у канала выпуска")
 
 
 def _seed_off(m, s):
@@ -143,14 +258,21 @@ def _tts_only(*supported):
 #   §09 «Равномерное распределение»; режимы переходов «быстрые/плавные» вместо да/нет;
 #       случайный и алфавитный порядок материалов; масштаб, смещение, интро, наложения;
 #       автозвук — выключен до выкатки рендерера на Минск.
+#   16.09.2026 «Кастом-промты» (custom_prompts) — только из формы: ключ в настройках не
+#       трогаем, движок продолжает читать его у тех, кто уже заполнил, решение владельца
+#       ещё не принято по остальным полям текста/обложки в проекте (см. task-spec.md);
+#       GROK/GROK_SPEED и `grok` — из выпадающих списков (см. `_image_models`,
+#       `_video_methods`), из движка нет — старые пресеты продолжают работать.
 GROUPS = (
     ("Озвучка", (
         Field("engine", "Движок", "select", options=_engines),
         Field("speed", "Скорость", "text", placeholder="1.0", hint="1.0 — как есть"),
-        Field("voice_by_lang", "Голоса по языкам", "text",
-              placeholder="ru: тут-id, en: другой-id",
-              hint="правило ТЗ §06: язык → провайдер → идентификатор. "
-                   "Язык берётся у канала выпуска"),
+        # kind="langmap": строки «язык → идентификатор» вместо одной текстовой строки
+        # (батч 16.09.2026). Хранение не меняется — на сервер по-прежнему уезжает строка
+        # вида "ru: id, en: id2", её же продолжает разбирать parse_voice_map: заводить
+        # вторую форму хранения одного и того же значило бы разойтись с движком.
+        Field("voice_by_lang", _voice_by_lang_label, "langmap",
+              options=_lang_options, hint=_voice_by_lang_hint),
         Field("voice", "Голос по умолчанию", "text",
               placeholder="пусто = подберётся по языку текста",
               hint="используется, когда языка нет в списке выше"),
@@ -161,7 +283,9 @@ GROUPS = (
     )),
     ("Картинки", (
         Field("model", "Модель", "select", options=_image_models),
-        Field("aspect_ratio", "Соотношение", "text", placeholder="landscape"),
+        # kind="select": варианты и подписи дословно из формы кабинета (main.py:4124) —
+        # своей константы под них в кабинете нет, задаём в `_aspect_ratio` (батч 16.09.2026).
+        Field("aspect_ratio", "Соотношение", "select", options=_aspect_ratio),
         Field("style", "Стиль", "text", placeholder="пусто = без стиля"),
         Field("sentences_per_prompt", "Предложений на кадр", "text", placeholder="3",
               hint="можно переменным шагом: 1x40,3 — первые сорок по одному, дальше по три"),
@@ -171,8 +295,8 @@ GROUPS = (
               hint="канон внешности, чтобы герой не менялся от кадра к кадру"),
         Field("split_long_sentences", "Дробить длинные предложения", "switch"),
         Field("max_solo_scene_seconds", "Сек на кадр, примерно", "number"),
-        Field("custom_prompts", "Кастом-промты", "text",
-              placeholder="по одному в строке; пусто = промпты пишет модель"),
+        # "Кастом-промты" убраны из формы 16.09.2026 (решение владельца) — ключ
+        # `custom_prompts` в настройках не трогаем, движок его читает как читал.
     )),
     ("Клипы", (
         Field("video_method", "Метод", "select", options=_video_methods),
@@ -230,7 +354,14 @@ def describe(mod, settings: dict, extra: dict = None) -> list:
                     options = []
             except Exception:                                      # noqa: BLE001
                 options = []
-            if f.kind == "select" and not options:
+            # `langmap` — та же защита, что и у `select`: если модуль кабинета не
+            # поднят или `_LANG_NAMES` не прочитался, вариантов языка
+            # взять неоткуда, и раньше поле рисовалось пустым выпадающим списком, который
+            # при открытии-сохранении формы вычищал сохранённую карту целиком (у select
+            # такой дыры не было — там пустой список тоже прятал поле). Лучше не
+            # показывать строки вовсе: без поля в форме ключ не уедет в `form.read()`, и
+            # кабинет при сохранении (merge) сохранённую карту не тронет.
+            if f.kind in ("select", "langmap") and not options:
                 continue          # список неоткуда взять — поля не будет, а не вранья
             try:
                 if f.hide and f.hide(mod, s):
@@ -241,9 +372,17 @@ def describe(mod, settings: dict, extra: dict = None) -> list:
                 off = f.off(mod, s) if f.off else ""
             except Exception:                                      # noqa: BLE001
                 off = ""
+            try:
+                hint = f.hint(mod, s) if callable(f.hint) else f.hint
+            except Exception:                                      # noqa: BLE001
+                hint = ""          # правило подсказки сломалось — молчание лучше вранья
+            try:
+                label = f.label(mod, s) if callable(f.label) else f.label
+            except Exception:                                      # noqa: BLE001
+                label = f.key          # правило подписи сломалось — ключ лучше пустоты
             value = s.get(f.key)
-            items.append({"key": f.key, "label": f.label, "kind": f.kind,
-                          "hint": f.hint, "placeholder": f.placeholder,
+            items.append({"key": f.key, "label": label, "kind": f.kind,
+                          "hint": hint, "placeholder": f.placeholder,
                           "options": options, "off": off,
                           "value": "" if value is None else str(value)})
         if items:
