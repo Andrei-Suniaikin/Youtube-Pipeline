@@ -11,10 +11,29 @@
   5. на диске меньше 100 ГБ
   6. самая старая задача ждёт дольше 6 часов
 
-Седьмой повод добавлен владельцем 07.09.2026, в ТЗ его нет:
+Седьмой и восьмой поводы добавлены владельцем 07.09.2026, в ТЗ их нет:
 
 7. задача упала с ошибкой — говорится один раз, без повтора и без «починилось»
 8. ключ провайдера исчерпан — отказ про деньги, а не про частоту; говорится сразу
+
+Девятый и десятый — тоже не из ТЗ, добавлены владельцем 16.09.2026, оба читают снимок
+`admin_state.fastgen_usage` (`server/main.py:save_fastgen_usage`, кладут его туда и
+`fastgen_status`, и `dev/alerts.py` перед каждым тиком — чтобы поводы видели свежие
+цифры, даже когда в кабинет никто не заходит):
+
+9. ключ FastGen истекает — состояние, а не событие; повтор и «починилось» по общим
+   правилам ниже
+10. расход картинок близок к часовому лимиту — 07.09.2026 конвейер уже упёрся именно в
+    него (`HTTP 429 … Limit: 6000 successful requests per hour`) и узнали об этом
+    постфактум по логу, а не заранее
+
+Оба читают один и тот же снимок, и у обоих одно правило свежести: если `checked` в
+снимке старше `VS_ALERT_USAGE_STALE_SEC` (по умолчанию 2 часа), оба молчат — судить о
+сроке ключа или о лимите по цифрам многочасовой давности значило бы врать так же, как
+выдуманный процент, который запрещает правило 1. Это же правило защищает и от обратной
+лжи: если тревога уже прозвучала, а снимок потом протух (сеть недоступна), «починилось»
+не отправляется, пока не придут свежие цифры — иначе именно сбой сети выключал бы
+тревогу о ключе (см. `FASTGEN_STATE_KEYS` в `tick`).
 
 Три правила подачи, тоже из ТЗ: одно сообщение на случай, повтор не чаще раза в час,
 обязательное сообщение «починилось».
@@ -46,6 +65,15 @@ def _sec(name: str, default: int) -> int:
         return default
 
 
+def _num(name: str, default: float) -> float:
+    """Как `_sec`, но без округления до целых секунд и без минимума в 1 — §9/§10
+    оперируют днями и процентами, а не секундами, и `_sec` для них не подходит."""
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 STALL_SEC = _sec("VS_ALERT_STALL_SEC", 30 * 60)          # §1
 RESTING_SEC = _sec("VS_ALERT_RESTING_SEC", 60 * 60)      # §2
 UPLOAD_SEC = _sec("VS_ALERT_UPLOAD_SEC", 3 * 3600)       # §3
@@ -59,6 +87,10 @@ FAILED_SEC = _sec("VS_ALERT_FAILED_SEC", 24 * 3600)      # §7
 FAILED_MAX = _sec("VS_ALERT_FAILED_MAX", 5)              # §7
 REPEAT_SEC = _sec("VS_ALERT_REPEAT_SEC", 60 * 60)        # повтор не чаще раза в час
 DISK_MIN_GB = float(os.environ.get("VS_ALERT_DISK_GB") or 100)
+# §9/§10 — не из ТЗ, добавлены владельцем 16.09.2026.
+KEY_EXPIRES_DAYS = _num("VS_ALERT_KEY_EXPIRES_DAYS", 7)          # §9: за сколько дней предупредить
+USAGE_PCT = _num("VS_ALERT_USAGE_PCT", 90)                       # §10: доля часового лимита, в %
+USAGE_STALE_SEC = _sec("VS_ALERT_USAGE_STALE_SEC", 2 * 3600)     # §9/§10: снимок старше — не повод
 
 GB = 1024 ** 3
 
@@ -92,7 +124,7 @@ class Alert:
         return f"<Alert {self.key}>"
 
 
-# ────────────────────────────── восемь поводов ───────────────────────────────
+# ────────────────────────────── десять поводов ────────────────────────────────
 
 # Слова, по которым отказ провайдера означает «ключ кончился», а не «слишком часто».
 # Список закрытый и совпадает с тем, по которому воркер останавливает прогон
@@ -405,9 +437,73 @@ def check_failed_tasks(c, now, tenant=None) -> list:
     return out
 
 
+def _fastgen_usage_snapshot(c, now):
+    """Снимок `admin_state.fastgen_usage`, если он есть и не протух.
+
+    Общий вход для §9 и §10: один источник данных — одно правило устаревания. Снимок
+    кладёт `main.save_fastgen_usage` (из `fastgen_status` и из `dev/alerts.py`); если
+    его ещё не было (свежий стенд, ни разу не спросили статус моделей) — снимка нет и
+    оба повода молчат, а не выдумывают цифры.
+    """
+    snap = _state_row(c, "fastgen_usage")
+    if not isinstance(snap, dict):
+        return None
+    checked = _f(snap.get("checked"))
+    if not checked or now - checked > USAGE_STALE_SEC:
+        return None
+    return snap
+
+
+def check_key_expiring(c, now, tenant=None) -> list:
+    """§9. Ключ FastGen истекает — не из ТЗ, добавлено владельцем 16.09.2026.
+
+    Состояние, а не событие: пока до истечения меньше `KEY_EXPIRES_DAYS`, повод держится
+    и повторяется по общему правилу раз в час (`REPEAT_SEC`); продление ключа снимает
+    его из `admin_state.fastgen_usage` на следующем снимке, и тогда звучит «починилось»,
+    как у любого другого состояния — своего исключения из `NO_FIXED` ему не нужно.
+    """
+    snap = _fastgen_usage_snapshot(c, now)
+    if not snap:
+        return []
+    expires = _f(snap.get("expires"))
+    if not expires or expires - now > KEY_EXPIRES_DAYS * 86400:
+        return []
+    when = time.strftime("%d.%m.%Y", time.localtime(expires))
+    left = expires - now
+    text = (f"Действует до {when}, осталось {_human(left)}." if left > 0
+            else f"Истёк {when}, {_human(-left)} назад.")
+    return [Alert(
+        "fastgen_key_expiring", "Ключ FastGen истекает", text,
+        money="Продлевает ключ владелец у провайдера — система это делать не может.")]
+
+
+def check_usage_near_limit(c, now, tenant=None) -> list:
+    """§10. Расход картинок близок к часовому лимиту — не из ТЗ, добавлено владельцем
+    16.09.2026.
+
+    07.09.2026 конвейер уже упёрся именно в этот лимит — `HTTP 429 … Limit: 6000
+    successful requests per hour` — и узнали об этом постфактум по логу. Порог задан
+    долей от `img_gen_per_hour_limit` (`USAGE_PCT`), а не абсолютным числом: лимит у
+    провайдера может измениться, и абсолютный порог тихо перестал бы срабатывать.
+    """
+    snap = _fastgen_usage_snapshot(c, now)
+    if not snap:
+        return []
+    limits = snap.get("limits") if isinstance(snap.get("limits"), dict) else {}
+    hourly = snap.get("hourly") if isinstance(snap.get("hourly"), dict) else {}
+    limit = _f(limits.get("img_gen_per_hour_limit"))
+    used = _f(hourly.get("image_generation"))
+    if limit <= 0 or used / limit * 100 < USAGE_PCT:
+        return []
+    return [Alert(
+        "fastgen_usage_near_limit", "Расход картинок близок к часовому лимиту",
+        f"Израсходовано {int(used)} из {int(limit)} за час.",
+        money="Лимит новый час не переносит остаток — упрёмся в 429, как 07.09.2026.")]
+
+
 CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
           check_missed_slots, check_disk, check_oldest_task, check_failed_tasks,
-          check_key_exhausted)
+          check_key_exhausted, check_key_expiring, check_usage_near_limit)
 
 # Сколько повод должен продержаться, прежде чем о нём говорят. Там, где длительность
 # и есть суть повода (§2), она проверяется здесь; остальные поводы уже содержат свой
@@ -418,6 +514,14 @@ MIN_HOLD = {"provider_resting": RESTING_SEC}
 # «починилось» осмысленны, только когда повод описывает то, что тянется.
 NO_REPEAT = {"failed"}
 NO_FIXED = {"failed"}
+
+# §9/§10 читают один и тот же снимок FastGen. Пока он протух (или его вовсе не было),
+# «пропал из active» значит «нет свежих цифр», а не «починилось» — иначе именно сбой
+# сети (единственная причина устаревания снимка) выключал бы уже прозвучавшую тревогу
+# о сроке ключа. Разбор инцидента 16.09.2026 (review issue 1): тревога прозвучала,
+# снимок перестал обновляться (сеть недоступна), два часа спустя `tick` без этого
+# исключения посылал бы «ПОЧИНИЛОСЬ», хотя ключ не продлён и расход не упал.
+FASTGEN_STATE_KEYS = {"fastgen_key_expiring", "fastgen_usage_near_limit"}
 
 
 def detect(c, now=None, tenant=None) -> dict:
@@ -454,6 +558,9 @@ def tick(c, send, now=None, tenant=None) -> list:
     """
     now = now or time.time()
     active = detect(c, now, tenant)
+    # Снимок FastGen протух (или его нет) — §9/§10 могли исчезнуть из `active` именно
+    # из-за этого, а не потому, что ключ продлили или расход упал. См. FASTGEN_STATE_KEYS.
+    fastgen_stale = _fastgen_usage_snapshot(c, now) is None
     state = load_state(c)
     sent = []
 
@@ -480,6 +587,8 @@ def tick(c, send, now=None, tenant=None) -> list:
         sent.append((key, kind, text))
 
     for key in [k for k in state if k not in active]:
+        if fastgen_stale and key in FASTGEN_STATE_KEYS:
+            continue        # снимок протух — ждём свежих цифр, а не чиним по тишине
         st = state.pop(key)
         if not isinstance(st, dict) or not _f(st.get("sent")):
             continue        # тревога не звучала — «починилось» было бы про что-то новое

@@ -225,6 +225,64 @@ def main() -> int:
     check("карта голосов по-прежнему разбирается parse_voice_map после сборки браузером",
           PF.parse_voice_map(assembled), {"ru": "id-1", "en": "id-2"})
 
+    print("\nСтатус моделей FastGen в подписи (пункт 2.1 ТЗ, батч 16.09.2026)")
+
+    def image_options(cab):
+        for g in PF.describe(cab, {}):
+            for f in g["fields"]:
+                if f["key"] == "model":
+                    return {o["value"]: o["title"] for o in f["options"]}
+        return {}
+
+    class CabinetWithStatus(Cabinet):
+        # Провайдеры — как в настоящем main.py: recrafter получает статус, openai — нет.
+        IMAGE_MODELS = {"OPENAI": ("OpenAI", "1 кр", "recrafter"),
+                        "NARWHAL": ("Nano Banana 2 · Flow", "4 кр", "recrafter"),
+                        "GPT_IMAGE2": ("GPT Image 2.5", "платно · $", "openai")}
+
+        @staticmethod
+        def keys():
+            return {"googler": "fg_live_test"}
+
+        @staticmethod
+        def _first_credential(cfg, family):
+            return cfg.get(family, "")
+
+        @staticmethod
+        def fastgen_status(key):
+            return {"models": [{"id": "NARWHAL", "txt": "работает"}]}
+
+    opts = image_options(CabinetWithStatus)
+    check("статус дописан у найденной модели FastGen",
+          opts["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · работает")
+    check("модель FastGen, которой нет в ответе, — «нет данных»",
+          opts["OPENAI"], "OpenAI · 1 кр · нет данных")
+    check("у GPT Image статуса нет вовсе — ничего не дописано",
+          opts["GPT_IMAGE2"], "GPT Image 2.5 · платно · $")
+
+    print("\n  форма открывается, даже когда fastgen_status недоступен")
+
+    class CabinetStatusDown(CabinetWithStatus):
+        @staticmethod
+        def fastgen_status(key):
+            raise RuntimeError("сеть недоступна")
+
+    opts_down = image_options(CabinetStatusDown)
+    check("сеть недоступна — статус «нет данных», форма не падает",
+          opts_down["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · нет данных")
+
+    class CabinetNoKey(CabinetWithStatus):
+        @staticmethod
+        def keys():
+            return {}
+
+    opts_nokey = image_options(CabinetNoKey)
+    check("ключа нет — статус «нет данных»",
+          opts_nokey["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · нет данных")
+
+    check("у кабинета без fastgen_status статуса просто нет, форма открывается",
+          bool(image_options(Cabinet)), True)
+
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

@@ -32,6 +32,8 @@ import sqlite3
 import sys
 import time
 
+import requests
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(BASE, "server"))
@@ -45,6 +47,47 @@ from pub_alerts_tg import Telegram                                # noqa: E402
 
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 TENANT = os.environ.get("VS_DEV_TENANT") or None
+
+_FG_USAGE_URL = "https://googler.fast-gen.ai/api/v6/usage"
+
+
+def refresh_fastgen_usage(c, now) -> None:
+    """Свежий снимок расхода ключа FastGen перед каждым тиком (пункт 8 ТЗ, батч
+    16.09.2026) — без него поводы §9/§10 (`pub_alerts.check_key_expiring`,
+    `check_usage_near_limit`) никогда бы не увидели актуальные цифры, если в кабинет
+    никто не заходит. Сбой сети не роняет проход: снимок просто не обновится, а
+    правило «устаревший снимок не повод» не даст соврать по старым цифрам.
+
+    Ключ читается через `main.keys()` + `main._first_credential(..., "googler")` —
+    ТОЧНО тот же разбор, что и в кабинете (скаляр, список, `googler_pool`; путь —
+    `main.KEYS_PATH`, тот же `VS_SERVER_KEYS_PATH`). До review issue 3 здесь был свой
+    разбор файла, который не понимал `googler_pool`: если в файле ключей записан
+    только пул, снимок молча не обновлялся, и поводы §9/§10 никогда не срабатывали.
+
+    `save_fastgen_usage` живёт в `server/main.py` — та же функция, что кладёт снимок
+    из кабинета, чтобы форма записи была одна на двоих, а не две похожие. Импорт
+    кабинета лениво: он тянет `googler_worker`, и тем, кто не смотрит на модели
+    картинок (--whoami, --test, --state), этот вес не нужен.
+    """
+    if os.path.join(BASE, "workers") not in sys.path:
+        sys.path.insert(0, os.path.join(BASE, "workers"))
+    import main as vsgen                                          # noqa: E402
+    try:
+        key = vsgen._first_credential(vsgen.keys(), "googler")
+    except Exception:
+        key = ""
+    if not key:
+        return
+    try:
+        r = requests.get(_FG_USAGE_URL, headers={"X-API-Key": key}, timeout=15)
+        r.raise_for_status()
+        usage = r.json()
+    except Exception:
+        return          # сеть недоступна — снимок просто не обновится
+    try:
+        vsgen.save_fastgen_usage(c, usage, now)
+    except Exception:
+        pass
 
 
 def db():
@@ -63,7 +106,7 @@ def show(c, now):
           f"ожидание {A.OLDEST_SEC // 3600} ч · диск {A.DISK_MIN_GB:.0f} ГБ · "
           f"повтор раз в {A.REPEAT_SEC // 60} мин")
     if not found:
-        print("\nвсё спокойно: ни один из восьми поводов не выполнен")
+        print("\nвсё спокойно: ни один из десяти поводов не выполнен")
     for key, a in sorted(found.items()):
         st = state.get(key) or {}
         said = ("сказано " + time.strftime("%H:%M", time.localtime(st["sent"]))
@@ -158,6 +201,9 @@ def main() -> int:
         if not tg.enabled:
             print("телеграм не настроен: тревоги будут определяться, но не отправляться")
         while True:
+            # Перед каждым тиком — свежий снимок FastGen, иначе поводы §9/§10 видят
+            # цифры только тогда, когда кто-то параллельно открывал кабинет.
+            refresh_fastgen_usage(c, time.time())
             sent = A.tick(c, tg.send, tenant=TENANT)
             stamp = time.strftime("%H:%M:%S")
             if sent:

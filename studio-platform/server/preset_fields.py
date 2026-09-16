@@ -79,6 +79,35 @@ def _engines(m):
 _HIDDEN_IMAGE_MODELS = {"GROK", "GROK_SPEED"}
 
 
+def _fg_status_map(m):
+    """id модели FastGen → текст живого статуса («работает»/«нестабильно»/«лежит»/
+    «нет данных»), батч 16.09.2026 (пункт 2.1 ТЗ).
+
+    Источник — только `m.fastgen_status`: свои пороги здесь не заводятся, `_fg_classify`
+    уже посчитал их в кабинете. Ключ берётся тем же способом, что кабинет берёт
+    серверный ключ `googler` (`keys()`) — без обращения к своим ключам пользователя,
+    их здесь неоткуда взять (`describe()` не получает `request`/юзера).
+
+    Всё под `getattr`+`try`: модуль-заглушка в тестах не обязан иметь ни `keys`, ни
+    `fastgen_status`, а сеть или ключ могут молчать в проде — ни один из этих случаев не
+    должен ронять форму (правило «форма обязана открываться»).
+    """
+    keys_fn = getattr(m, "keys", None)
+    first_cred = getattr(m, "_first_credential", None)
+    status_fn = getattr(m, "fastgen_status", None)
+    if not (keys_fn and first_cred and status_fn):
+        return {}
+    try:
+        key = first_cred(keys_fn(), "googler")
+        if not key:
+            return {}
+        st = status_fn(key)
+    except Exception:                                              # noqa: BLE001
+        return {}
+    return {row.get("id"): row.get("txt") for row in (st.get("models") or [])
+            if row.get("id")}
+
+
 def _image_models(m):
     """Модели картинок для выбора человеком.
 
@@ -86,9 +115,24 @@ def _image_models(m):
     движка: `main.py:3612` отвергает только по-настоящему незнакомые ключи, эти два в
     их числе не значатся, и старый пресет с GROK обязан продолжать работать. Ключ,
     которого нет в списке для человека, — не то же самое, что ключ, которого нет вовсе.
+
+    Статус (пункт 2.1 ТЗ, батч 16.09.2026): у моделей с провайдером `recrafter`
+    (третий элемент кортежа `IMAGE_MODELS` — тот же факт, что читает `_video_methods`
+    выше) подпись дополняется живым статусом FastGen. У `GPT_IMAGE2` (`openai`) и
+    `VEO_*` (`veo`) статуса у health-API нет вовсе — им ничего не дописываем, а не
+    подставляем «нет данных»: это разные вещи («источник молчит» vs «источника нет»).
     """
-    return [(k, f"{v[0]} · {v[1]}") for k, v in m.IMAGE_MODELS.items()
-            if k not in _HIDDEN_IMAGE_MODELS]
+    status = _fg_status_map(m)
+    out = []
+    for k, v in m.IMAGE_MODELS.items():
+        if k in _HIDDEN_IMAGE_MODELS:
+            continue
+        label = f"{v[0]} · {v[1]}"
+        provider = v[2] if len(v) > 2 else ""
+        if provider == "recrafter":
+            label += f" · {status.get(k, 'нет данных')}"
+        out.append((k, label))
+    return out
 
 
 # Тот же чёрный список по той же причине, что и у моделей картинок выше: методы

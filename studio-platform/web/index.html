@@ -586,6 +586,26 @@ async function viewKeys(){
       : '<div class="empty">Все ключи в строю.</div>'}
   </div>`));
 
+  const fg = d.fastgen;
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">FastGen</div>
+    ${fg ? `<div class="stage">
+        <div class="dot ${fg.expires_in_sec != null && fg.expires_in_sec <= 0 ? 's-error' : 's-done'}">${
+          fg.expires_in_sec != null && fg.expires_in_sec <= 0 ? '!' : '✓'}</div>
+        <div class="body">
+          <div class="name">${fg.expires
+            ? `Действует до ${when(fg.expires)} — ${fg.expires_in_sec > 0
+                ? `осталось ${dur(fg.expires_in_sec)}` : `истёк ${dur(-fg.expires_in_sec)} назад`}`
+            : 'Срок действия неизвестен'}</div>
+          <div class="facts">${fg.images_limit != null
+              ? `за час израсходовано ${fg.images_used != null ? fg.images_used : 'нет данных'} из ${fg.images_limit} картинок`
+              : 'расход картинок неизвестен'}${fg.threads_limit != null
+              ? ` · потоков занято ${fg.threads_used != null ? fg.threads_used : 'нет данных'} из ${fg.threads_limit}` : ''}</div>
+          <div class="note muted">снято ${when(fg.checked)}</div>
+        </div></div>`
+      : '<div class="empty">Данных пока нет.</div>'}
+  </div>`));
+
   const ownCard = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Свои ключи пользователей</div>
     ${d.own_keys.length ? `<table><thead><tr>
@@ -2687,7 +2707,7 @@ async function viewAdmin(){
             ? `сказано ${when(x.said_at)}${x.times > 1 ? `, раз: ${x.times}` : ''}`
             : 'ещё не сказано'}</div>
         </div></div>`).join('')
-      : '<div class="empty">Ни один из восьми поводов не выполнен.</div>'}
+      : '<div class="empty">Ни один из десяти поводов не выполнен.</div>'}
     ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
        ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
     <div class="sec" style="border-bottom:0">Пороги</div>

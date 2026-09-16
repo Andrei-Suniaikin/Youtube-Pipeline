@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Тревоги: восемь поводов и три правила подачи.
+"""Тревоги: десять поводов и три правила подачи.
 
 Сети здесь нет вообще: `pub_alerts` отправку не делает, а транспорт подменён списком.
 Поэтому тест гоняется где угодно, включая машину без телеграма и без интернета.
@@ -258,6 +258,79 @@ def main() -> int:
     c.execute("UPDATE admin_state SET v='{}' WHERE k='credential_cooldown'")
     A.tick(c, bag, now=NOW + 5 * 60)
     check("ключ заменили — сказали «починилось»",
+          any("ПОЧИНИЛОСЬ" in m for m in bag.sent), True)
+
+    print("\nПовод 9 — ключ FastGen истекает")
+    c = fresh()
+
+    def fg_snapshot(checked, expires, limit=6000, used=0):
+        # Та же форма JSON, что кладёт main.save_fastgen_usage — тесты не знают о
+        # кабинете, но обязаны читать ровно то, что он пишет.
+        snap = {"checked": checked, "expires": expires, "window": "per_hour",
+                "limits": {"img_gen_per_hour_limit": limit},
+                "hourly": {"image_generation": used}, "threads": {}}
+        c.execute("INSERT OR REPLACE INTO admin_state VALUES('fastgen_usage',?,0)",
+                  (json.dumps(snap, ensure_ascii=False),))
+
+    check("снимка ещё нет — повода нет", keys(c), [])
+    fg_snapshot(NOW, NOW + 30 * 24 * HOUR)
+    check("до истечения далеко — повода нет", keys(c), [])
+    fg_snapshot(NOW, NOW + 3 * 24 * HOUR)
+    check("осталось меньше порога (7 дней) — повод есть", keys(c), ["fastgen_key_expiring"])
+    check("в тексте — дата и остаток",
+          "осталось" in A.detect(c, NOW)["fastgen_key_expiring"].text, True)
+    fg_snapshot(NOW, NOW - HOUR)
+    check("ключ уже истёк — сказано «истёк», а не «осталось»",
+          "Истёк" in A.detect(c, NOW)["fastgen_key_expiring"].text, True)
+    fg_snapshot(NOW, NOW + 30 * 24 * HOUR)
+    check("ключ продлили — повод снят", keys(c), [])
+
+    print("\n  устаревший снимок — не повод (ни про срок, ни про расход)")
+    fg_snapshot(NOW - 3 * HOUR, NOW + 3 * 24 * HOUR, limit=6000, used=6000)
+    check("снимок старше двух часов — оба повода молчат", keys(c), [])
+
+    print("\n  review issue 1 — тревога прозвучала → снимок протух → «ПОЧИНИЛОСЬ»"
+          " ждёт свежих данных, а не сыплется по тишине сети")
+    c = fresh()
+    fg_snapshot(NOW, NOW + 3 * 24 * HOUR, limit=6000, used=5900)  # оба повода верны
+    check("сразу оба повода верны", sorted(keys(c)),
+          ["fastgen_key_expiring", "fastgen_usage_near_limit"])
+    bag = Bag()
+    A.tick(c, bag, now=NOW)
+    check("обе тревоги прозвучали", len(bag.sent), 2)
+    # снимок не обновлялся два часа с лишним — сеть недоступна, ключ НЕ продлён,
+    # расход НЕ упал, просто цифр больше нет.
+    A.tick(c, bag, now=NOW + 2 * HOUR + 60)
+    check("устаревший снимок — «ПОЧИНИЛОСЬ» НЕ отправлено (было отправлено до фикса)",
+          any("ПОЧИНИЛОСЬ" in m for m in bag.sent), False)
+    check("и вообще ничего нового не отправлено, пока данных нет", len(bag.sent), 2)
+    # свежий снимок: ключ продлили И расход упал — вот теперь «починилось» законно
+    fg_snapshot(NOW + 2 * HOUR + 60, NOW + 30 * 24 * HOUR, limit=6000, used=100)
+    A.tick(c, bag, now=NOW + 2 * HOUR + 120)
+    fixed = [m for m in bag.sent if "ПОЧИНИЛОСЬ" in m]
+    check("свежие данные подтвердили починку — два «ПОЧИНИЛОСЬ», по каждому поводу",
+          len(fixed), 2)
+
+    print("\nПовод 10 — расход картинок близок к часовому лимиту")
+    c = fresh()
+    fg_snapshot(NOW, NOW + 30 * 24 * HOUR, limit=6000, used=5000)
+    check("83% — ниже порога, повода нет", keys(c), [])
+    fg_snapshot(NOW, NOW + 30 * 24 * HOUR, limit=6000, used=5400)
+    check("90% — повод есть", keys(c), ["fastgen_usage_near_limit"])
+    check("в тексте — сколько из скольки за час",
+          "5400 из 6000" in A.detect(c, NOW)["fastgen_usage_near_limit"].text, True)
+
+    print("\n  повод 10 повторяется по общему правилу и снимается «починилось»")
+    bag = Bag()
+    A.tick(c, bag, now=NOW)
+    check("сказали", len(bag.sent), 1)
+    A.tick(c, bag, now=NOW + 30 * 60)
+    check("через полчаса молчим", len(bag.sent), 1)
+    A.tick(c, bag, now=NOW + HOUR + 60)
+    check("через час повторили", len(bag.sent), 2)
+    fg_snapshot(NOW + HOUR + 60, NOW + 30 * 24 * HOUR, limit=6000, used=1000)
+    A.tick(c, bag, now=NOW + HOUR + 120)
+    check("расход упал — сказали «починилось»",
           any("ПОЧИНИЛОСЬ" in m for m in bag.sent), True)
 
     print("\nПовод 7 — задача упала")

@@ -803,6 +803,8 @@ def ui_keys():
       отдыхающие ключи    — admin_state.credential_cooldown: до какого времени и почему
       свои ключи          — users.keys, только количество и маска, значения наружу не идут
       курсор раздачи      — provider_rr_cursor: кому выдали последним
+      FastGen             — admin_state.fastgen_usage: снимок расхода и срока ключа
+                            (пункт 8 ТЗ), нет снимка — «данных пока нет»
 
     Чего отсюда НЕ видно и почему: текущая занятость слотов живёт в памяти кабинета
     (SERVER_CREDENTIAL_POOL._loads), а не в базе. Показывать её выдуманной нельзя —
@@ -875,6 +877,33 @@ def ui_keys():
                    "updated": r["updated"]}
                   for r in c.execute("SELECT * FROM provider_rr_cursor ORDER BY provider")]
         busy = _pool_load()
+
+        # Ресурс ключа FastGen (пункт 8 ТЗ, батч 16.09.2026): снимок кладёт
+        # `main.save_fastgen_usage` — и из `fastgen_status`, и из `dev/alerts.py` перед
+        # каждым тиком тревоги. Нет снимка — «данных пока нет», а не выдуманный ноль.
+        fastgen = None
+        fg_row = c.execute("SELECT v FROM admin_state WHERE k='fastgen_usage'").fetchone()
+        if fg_row and fg_row["v"]:
+            try:
+                snap = json.loads(fg_row["v"])
+            except ValueError:
+                snap = None
+            if isinstance(snap, dict):
+                limits = snap.get("limits") if isinstance(snap.get("limits"), dict) else {}
+                hourly = snap.get("hourly") if isinstance(snap.get("hourly"), dict) else {}
+                threads = snap.get("threads") if isinstance(snap.get("threads"), dict) else {}
+                expires = snap.get("expires")
+                fastgen = {
+                    "checked": snap.get("checked"),
+                    "expires": expires,
+                    # Оставшееся считаем здесь, а не в браузере: серверные часы —
+                    # источник правды, как и у «отдыхающих ключей» выше (left_sec).
+                    "expires_in_sec": (int(float(expires) - now) if expires else None),
+                    "images_used": hourly.get("image_generation"),
+                    "images_limit": limits.get("img_gen_per_hour_limit"),
+                    "threads_used": threads.get("image_threads"),
+                    "threads_limit": limits.get("img_generation_threads_allowed"),
+                }
     finally:
         c.close()
     return {
@@ -883,6 +912,7 @@ def ui_keys():
         "own_keys": sorted(own, key=lambda o: (o["user"], o["family"])),
         "rr_cursor": cursor,
         "busy": busy,
+        "fastgen": fastgen,
         "unavailable": [],
     }
 

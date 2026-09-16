@@ -14643,6 +14643,39 @@ def _fg_classify(score):
     return ("down", "лежит")
 
 
+def save_fastgen_usage(c, usage: dict, now) -> None:
+    """Снимок расхода ключа FastGen в `admin_state.fastgen_usage` (пункт 8 ТЗ,
+    батч 16.09.2026).
+
+    Нужен не только экрану ключей: тревоги §9/§10 (`pub_alerts.check_key_expiring`,
+    `check_usage_near_limit`) читают этот же снимок, а `dev/alerts.py` кладёт его сюда
+    перед каждым проходом тика — иначе тревоги видели бы свежие цифры, только пока
+    кто-то держит открытым кабинет.
+
+    `usage` — сырой ответ `GET /api/v6/usage` (см. комментарий у `fastgen_status`).
+    Коннекшн `c` даётся вызывающим, а не открывается здесь: у `fastgen_status` (кабинет)
+    и у `dev/alerts.py` (dev-стенд) базы могут не совпадать, и решать, какую открыть,
+    должен вызывающий.
+    """
+    u = usage if isinstance(usage, dict) else {}
+    limits = u.get("account_limits") if isinstance(u.get("account_limits"), dict) else {}
+    cur = u.get("current_usage") if isinstance(u.get("current_usage"), dict) else {}
+    hourly = cur.get("hourly_usage") if isinstance(cur.get("hourly_usage"), dict) else {}
+    threads = cur.get("active_threads") if isinstance(cur.get("active_threads"), dict) else {}
+    snap = {
+        "checked": now,
+        "limits": limits,
+        "hourly": hourly,
+        "threads": threads,
+        "expires": u.get("expiration_date"),
+        "window": u.get("usage_window"),
+    }
+    c.execute("INSERT INTO admin_state(k,v,updated) VALUES(?,?,?) "
+              "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated=excluded.updated",
+              ("fastgen_usage", json.dumps(snap, ensure_ascii=False), now))
+    c.commit()
+
+
 def fastgen_status(key, force=False):
     """Статус FastGen-моделей из health-API. Кэш 30с (health глобальный, ключ — только auth)."""
     now = time.time()
@@ -14681,6 +14714,17 @@ def fastgen_status(key, force=False):
                 "pct": score, "code": code, "txt": txt, "col": _FG_STYLE.get(code, _FG_STYLE["na"]),
             })
         out["checked"] = time.strftime("%H:%M:%S")
+        if out.get("usage"):
+            # Снимок расхода — при каждом успешном обновлении кэша (пункт 8 ТЗ), не
+            # только когда человек смотрит на экран ключей. Сбой записи не должен
+            # портить сам статус моделей — он уже посчитан и уйдёт вызывающему.
+            uc = db()
+            try:
+                save_fastgen_usage(uc, out["usage"], now)
+            except Exception:
+                log_exc("fastgen_status/save_usage")
+            finally:
+                uc.close()
     except Exception as e:
         out["error"] = str(e)[:200]
     _fg_cache["data"] = out
