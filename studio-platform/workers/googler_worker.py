@@ -406,6 +406,12 @@ GPT_MODEL = "gpt-4.1-nano"
 # Сильнее nano для задач, где важна НАДЁЖНОСТЬ (извлечение персонажей + тег entities на сцену):
 # nano мусорит (пере/недо-тегает), mini == 4.1 по качеству тега, но дешевле (~$0.17/ролик). Output мал → дёшево.
 SCENE_GPT_MODEL = "gpt-4.1-mini"
+# 16.09.2026: живой GET https://api.openai.com/v1/models показал, что модели "gpt-image-2.5"
+# не существует — есть "gpt-image-2.5-flare" и "gpt-image-2.5-sunburst"; владелец выбрал
+# sunburst. Про доступность "gpt-image-2" данных нет (Cover Studio по-прежнему шлёт эту
+# модель, см. cover/cover_core.py). Вынесено в окружение по тому же принципу, что и адрес
+# FastGen в VS_GOOGLER_BASE (04.09): имя модели у провайдера меняется без правки кода.
+GPT_IMAGE_MODEL = os.environ.get("VS_GPT_IMAGE_MODEL") or "gpt-image-2.5-sunburst"
 
 # --- Модели для генерации изображений ---
 # Формат: "backend_model" → описание (API route)
@@ -428,7 +434,8 @@ GOOGLER_AVAILABLE_MODELS = [
     "VEO_BANANA",     # VeoNonStop Nano Banana Pro (image/banana/generate, model_key=GEM_PIX_2 — дефолт API, ключ veo). generate + до 5 refs
     "VEO_BANANA_2",   # VeoNonStop Nano Banana 2 (тот же эндпоинт, model_key=NARWHAL). generate + refs
     "VEO_BANANA_LITE",# VeoNonStop Nano Banana 2 Lite (тот же эндпоинт, model_key=HARBOR_SEAL) — быстрее/дешевле. generate + refs
-    "GPT_IMAGE2",     # OpenAI gpt-image-2 НАПРЯМУЮ (quality=low) — ПЛАТНО ~$0.006/шт с openai-ключа. generate-only
+    "GPT_IMAGE2",     # OpenAI gpt-image-2.5-sunburst НАПРЯМУЮ (quality=low) — ПЛАТНО, цена не
+                      # перепроверена под 2.5 (см. GPT_IMAGE_MODEL). generate-only
 ]
 GOOGLER_MODEL_LABELS = {
     "OPENAI":         "ChatGPT Image",
@@ -442,7 +449,7 @@ GOOGLER_MODEL_LABELS = {
     "VEO_BANANA":     "Nano Banana Pro (Veo)",
     "VEO_BANANA_2":   "Nano Banana 2 (Veo)",
     "VEO_BANANA_LITE":"Nano Banana 2 Lite (Veo)",
-    "GPT_IMAGE2":     "GPT-Image-2 low (💲платно)",
+    "GPT_IMAGE2":     "GPT Image 2.5 low (💲платно)",
 }
 # Кредиты FastGen/recrafter за ОДНУ генерацию — машиночитаемый дубль комментариев выше
 # (GOOGLER_AVAILABLE_MODELS). Это ИСТОЧНИК ИСТИНЫ для взвешенного бюджета серверного ключа
@@ -10300,6 +10307,9 @@ def _reconcile_authoritative_image_set(project_dir: str, receipt_path: str,
     }
 
 
+# 16.09.2026: размеры сняты под "gpt-image-2" и НЕ перепроверены под GPT_IMAGE_MODEL
+# ("gpt-image-2.5-sunburst") — поддержку размеров новой моделью нечем проверить без
+# платного вызова. Не трогать без реального теста.
 _GPT_IMAGE2_EXACT_SIZES = {
     "landscape": ("1536x864", (1536, 864)),
     "portrait": ("864x1536", (864, 1536)),
@@ -11113,15 +11123,17 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             api_label = "Nano Banana (Veo)"
 
         elif GOOGLER_MODEL == "GPT_IMAGE2":
-            # OpenAI gpt-image-2 НАПРЯМУЮ — 💲ПЛАТНО (~$0.006/шт с твоего openai-ключа).
-            # Отдельно от "OPENAI" (тот идёт через recrafter-кредиты). quality=low, output jpeg.
-            api_label = "GPT-Image-2 (💲платно)"
+            # OpenAI GPT_IMAGE_MODEL ("gpt-image-2.5-sunburst") НАПРЯМУЮ — 💲ПЛАТНО
+            # с твоего openai-ключа. Отдельно от "OPENAI" (тот идёт через recrafter-кредиты).
+            # quality=low, output jpeg. Цена ~$0.006/шт снята под старую "gpt-image-2" и
+            # НЕ перепроверена под 2.5 (платного вызова для проверки не делали).
+            api_label = "GPT Image 2.5 (💲платно)"
             gi_size, gi_expected_dimensions = _gpt_image2_size(ar)
-            v_res = {"success": False, "error": "GPT-Image-2: нет ответа"}
+            v_res = {"success": False, "error": "GPT Image 2.5: нет ответа"}
             if not OPENAI_API_KEY or not str(OPENAI_API_KEY).strip():
-                v_res = {"success": False, "error": "GPT-Image-2: нет openai-ключа (~/video_studio_api_keys.json['openai'])", "skip_retry": True}
+                v_res = {"success": False, "error": "GPT Image 2.5: нет openai-ключа (~/video_studio_api_keys.json['openai'])", "skip_retry": True}
             else:
-                gi_body = {"model": "gpt-image-2", "prompt": prompt, "size": gi_size, "quality": "low", "n": 1, "output_format": "jpeg"}
+                gi_body = {"model": GPT_IMAGE_MODEL, "prompt": prompt, "size": gi_size, "quality": "low", "n": 1, "output_format": "jpeg"}
                 try:
                     _gh = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
                     _gr = requests.post("https://api.openai.com/v1/images/generations", headers=_gh, json=gi_body, timeout=180)
@@ -11132,23 +11144,23 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                     else:
                         v_res = {"success": False, "error": f"OpenAI HTTP {_gr.status_code}: {_gr.text[:200]}"}
                 except requests.exceptions.Timeout:
-                    v_res = {"success": False, "error": "GPT-Image-2: таймаут 180с", "skip_retry": attempt >= 1}
+                    v_res = {"success": False, "error": "GPT Image 2.5: таймаут 180с", "skip_retry": attempt >= 1}
                 except Exception as _ge:
-                    v_res = {"success": False, "error": f"GPT-Image-2: {str(_ge)[:200]}"}
+                    v_res = {"success": False, "error": f"GPT Image 2.5: {str(_ge)[:200]}"}
             _gdata = v_res.get("data") if isinstance(v_res, dict) else None
             if _gdata and _gdata[0].get("b64_json"):
                 image_data = _gdata[0]["b64_json"]
                 try:
                     actual_dimensions = _base64_image_size(image_data)
                 except ValueError as exc:
-                    result = {"success": False, "error": f"GPT-Image-2: {exc}",
+                    result = {"success": False, "error": f"GPT Image 2.5: {exc}",
                               "skip_retry": True}
                 else:
                     if actual_dimensions != gi_expected_dimensions:
                         result = {
                             "success": False,
                             "error": (
-                                "GPT-Image-2: неверное разрешение ответа "
+                                "GPT Image 2.5: неверное разрешение ответа "
                                 f"{actual_dimensions[0]}x{actual_dimensions[1]} вместо "
                                 f"{gi_expected_dimensions[0]}x{gi_expected_dimensions[1]}"
                             ),
@@ -11156,19 +11168,19 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                         }
                     elif output_path and not save_base64_to_file(image_data, output_path):
                         result = {"success": False,
-                                  "error": "GPT-Image-2: изображение прошло проверку, но не сохранилось",
+                                  "error": "GPT Image 2.5: изображение прошло проверку, но не сохранилось",
                                   "skip_retry": True}
                     else:
                         print_user(
-                            f"✅ [{index+1}] Изображение через GPT-Image-2 "
+                            f"✅ [{index+1}] Изображение через GPT Image 2.5 "
                             f"{actual_dimensions[0]}x{actual_dimensions[1]} "
-                            "(💲ПЛАТНО ~$0.006)",
+                            "(💲ПЛАТНО, цена не перепроверена под 2.5)",
                             "SUCCESS",
                         )
                         return (index, image_data)
             else:
                 result = {"success": False,
-                          "error": (v_res.get("error") if isinstance(v_res, dict) else "GPT-Image-2: пустой data/b64_json"),
+                          "error": (v_res.get("error") if isinstance(v_res, dict) else "GPT Image 2.5: пустой data/b64_json"),
                           "skip_retry": (v_res.get("skip_retry") if isinstance(v_res, dict) else False)}
 
         elif GOOGLER_MODEL == "OPENAI":

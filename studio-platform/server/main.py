@@ -3512,7 +3512,7 @@ IMAGE_MODELS = {
     "VEO_BANANA":      ("Nano Banana Pro (Veo)",    "ключ veo",  "veo"),
     "VEO_BANANA_2":    ("Nano Banana 2 (Veo)",      "ключ veo",  "veo"),
     "VEO_BANANA_LITE": ("Nano Banana 2 Lite (Veo)", "ключ veo",  "veo"),
-    "GPT_IMAGE2": ("GPT Image",             "платно · $","openai"),
+    "GPT_IMAGE2": ("GPT Image 2.5",         "платно · $","openai"),
 }
 
 # Один контракт выбора источника картинок. ``image_mode`` и ``model`` — единственные
