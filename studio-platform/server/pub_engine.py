@@ -272,17 +272,33 @@ def reslot_pending_uploads(c, now: float) -> int:
 def due_items(c, now: float) -> list:
     """Строки плана, которым пора начинать: слот минус «готовить заранее» уже наступил."""
     return c.execute(
-        "SELECT p.*, ch.lead_days lead_days, ch.status ch_status "
+        "SELECT p.*, ch.lead_days lead_days, ch.status ch_status, ch.uc ch_uc "
         "FROM pub_plan_items p JOIN pub_channels ch ON ch.id=p.channel_id "
         "WHERE p.status='planned' AND p.slot_at IS NOT NULL AND ch.status='active' "
         "AND p.slot_at - COALESCE(ch.lead_days,2)*86400 <= ? "
         "ORDER BY p.slot_at", (now,)).fetchall()
 
 
+# Пункт 6.1 ТЗ: канал без ID YouTube заводить можно, а выпускать на нём — нет, иначе
+# готовому ролику некуда будет заливаться. Текст попадает в заметку строки плана —
+# колонку, которую сегодня больше никто не занимает (в отличие от полей канала, у строк
+# плана нет собственного постоянного места для причины остановки).
+NO_UC_REASON = "у канала не задан ID YouTube — выпуск не заводится"
+
+
 def materialize(c, now: float) -> list:
     """Завести выпуски для созревших строк. Повторный вызов новых не создаёт."""
     made = []
     for item in due_items(c, now):
+        if not item["ch_uc"]:
+            # Строка остаётся ждать (status не меняется) — как только владелец впишет
+            # ID во вкладке «Настройки» канала в пульте (`pub_ui.set_channel_uc`,
+            # дополнение 16.09, вопрос 1), следующий тик заведёт выпуск как обычно.
+            # Другие строки этот канал не блокирует: цикл идёт дальше.
+            if item["note"] != NO_UC_REASON:
+                c.execute("UPDATE pub_plan_items SET note=?, updated=? WHERE id=?",
+                          (NO_UC_REASON, now, item["id"]))
+            continue
         rid = new_release_id()
         try:
             c.execute(
@@ -296,9 +312,14 @@ def materialize(c, now: float) -> list:
             if "UNIQUE" in str(exc):
                 continue          # выпуск на эту версию строки уже есть — так и задумано
             raise
+        # Доработка ревьюера (code review, итерация 2, Issue 4): если строка раньше
+        # ждала из-за пустого ID, заметка с причиной NO_UC_REASON устаревает в момент
+        # заведения выпуска — стираем её, но только если там стоит РОВНО эта причина,
+        # чтобы не затереть чужую заметку (например, вписанную человеком вручную).
         cas = c.execute(
-            "UPDATE pub_plan_items SET status='frozen', frozen=1, updated=? "
-            "WHERE id=? AND status='planned'", (now, item["id"]))
+            "UPDATE pub_plan_items SET status='frozen', frozen=1, updated=?, "
+            "note=(CASE WHEN note=? THEN NULL ELSE note END) "
+            "WHERE id=? AND status='planned'", (now, NO_UC_REASON, item["id"]))
         if cas.rowcount != 1:
             # Строку отменили между выборкой и заморозкой — выпуск не нужен.
             c.execute("DELETE FROM pub_releases WHERE release_id=?", (rid,))

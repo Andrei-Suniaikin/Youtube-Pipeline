@@ -133,11 +133,16 @@ def many(form: dict, key: str) -> list:
 
 # ─────────────────────────── проверки ───────────────────────────
 
-def clean_uc(value: str) -> str:
+def clean_uc(value: str):
+    """Пустое значение — законный случай (пункт 6.1 ТЗ): канал иногда заводят раньше,
+    чем узнают его настоящий ID на YouTube. Пусто → None, а не "" — несколько пустых
+    строк в UNIQUE-колонке SQLite считает дублями, а несколько NULL — нет."""
     uc = (value or "").strip()
+    if not uc:
+        return None
     if not UC_RE.match(uc):
         raise ChannelError("ID канала должен быть вида UC и ещё 22 символа, например "
-                           "UCK8sQmJBp8GCxrOtXWBpyEA. Получено: " + (uc or "пусто"))
+                           "UCK8sQmJBp8GCxrOtXWBpyEA. Получено: " + uc)
     return uc
 
 
@@ -268,7 +273,12 @@ def create_channel(c, tenant_id: str, uc: str, name: str, lang: str = "",
 
 
 def update_channel(c, tenant_id: str, cid: int, data: dict, now: float = None) -> None:
-    """Сохранить настройки канала. `data` — то, что вернул `read_channel_form`."""
+    """Сохранить настройки канала. `data` — то, что вернул `read_channel_form`.
+
+    UC сюда намеренно не входит: он «не меняется после создания» (см. комментарий в
+    `pub_schema.py`). Дописать пустой ID можно — но отдельной функцией `set_channel_uc`
+    ниже, а не через эту: та ничего не проверяет, кроме «поле раньше было пусто», а
+    все остальные поля формы настроек проверяет `read_channel_form`."""
     import time as _t
     now = _t.time() if now is None else now
     c.execute(
@@ -283,6 +293,44 @@ def update_channel(c, tenant_id: str, cid: int, data: dict, now: float = None) -
          data["preset_cover"], data["collaborator"], data["note"], now, cid, tenant_id))
 
 
+def set_channel_uc(c, tenant_id: str, cid: int, uc: str, now: float = None) -> None:
+    """Вписать ID YouTube каналу, у которого его ещё нет (дополнение 16.09, вопрос 1,
+    вариант «а»). Зовёт только пульт (`web/app.py`) со страницы канала, вкладка
+    «Настройки» — кабинет (`server/pub_ui.py` формы настроек, `register_pub_routes`)
+    эту возможность не получает по прямому указанию владельца: он работает с ID
+    исключительно в пульте.
+
+    Уже заданный UC — read-only навсегда: он определяет, куда льётся видео, и смена
+    задним числом означает ролик на чужом канале (прецедент, из-за которого и введено
+    правило «UC не меняется после создания», см. `pub_schema.py`). Поэтому запрет — на
+    сервере, а не только в интерфейсе: попытка поменять или стереть уже заданный ID
+    отклоняется здесь, а не молчаливо принимается, если фронт вдруг пришлёт поле.
+
+    Доработка ревьюера (code review, итерация 2, Issue 2): раньше проверка «ID ещё
+    пуст» и сама запись были двумя отдельными запросами — SELECT, потом UPDATE без
+    условия на uc. Два одновременных запроса (двойной клик, две вкладки) оба видели
+    uc IS NULL и оба писали, второй поверх первого. Решает сам UPDATE: он затрагивает
+    строку, только если uc там всё ещё NULL, — это атомарно в пределах одной операции
+    SQLite. Предварительный SELECT оставлен ради понятного «канал не найден».
+    """
+    import time as _t
+    now = _t.time() if now is None else now
+    row = c.execute("SELECT id FROM pub_channels WHERE id=? AND tenant_id=?",
+                    (cid, tenant_id)).fetchone()
+    if row is None:
+        raise ChannelError("канал не найден")
+    new_uc = clean_uc(uc)
+    if not new_uc:
+        raise ChannelError("ID канала должен быть вида UC и ещё 22 символа, например "
+                           "UCK8sQmJBp8GCxrOtXWBpyEA")
+    cur = c.execute(
+        "UPDATE pub_channels SET uc=?, updated=? WHERE id=? AND tenant_id=? AND uc IS NULL",
+        (new_uc, now, cid, tenant_id))
+    if cur.rowcount == 0:
+        raise ChannelError("у канала уже задан ID — его нельзя изменить или стереть")
+    c.commit()
+
+
 def set_channel_status(c, tenant_id: str, cid: int, status: str, now: float = None) -> None:
     if status not in STATUS_TITLES:
         raise ChannelError("неизвестный статус канала")
@@ -295,8 +343,21 @@ IMPORT_FIELDS = ("name", "handle", "lang", "niche", "profile_id", "host_id", "tz
 
 
 def read_import_row(item: dict) -> tuple:
-    """Строка переноса → (uc, только реально присланные поля)."""
-    uc = clean_uc(str(item.get("uc") or ""))
+    """Строка переноса → (uc, только реально присланные поля).
+
+    Дополнение 16.09, вопрос 2: канал без ID заводится ТОЛЬКО формой пульта
+    (`create_channel`), перенос списком такие строки отклоняет — как было до пункта
+    6.1. Причина: у `import_channels` сопоставление старой и новой строки идёт по
+    `uc` (`WHERE uc=?`), а SQL `NULL` никогда не равен `NULL` — при пустом ID перенос
+    не смог бы отличить повторную загрузку той же строки от новой и плодил бы
+    дубликаты канала при каждом повторе импорта.
+    """
+    uc_raw = str(item.get("uc") or "").strip()
+    if not uc_raw:
+        raise ChannelError("в строке переноса не задан ID канала — заведите канал без "
+                           "ID через форму в пульте, перенос списком таких строк не "
+                           "принимает")
+    uc = clean_uc(uc_raw)
     got = {k: str(item[k]).strip() for k in IMPORT_FIELDS
            if item.get(k) is not None and str(item[k]).strip() != ""}
     out = {}
@@ -788,6 +849,12 @@ def register_pub_routes(app, ctx):
             if item:
                 rel_row = rels.get(item["id"])
                 text, color = release_look(rel_row, item["status"])
+                if rel_row is None and not row["uc"]:
+                    # Движок (pub_engine.materialize) намеренно не заводит выпуск на
+                    # канале без ID — «ждёт очереди» тут вводило бы в заблуждение,
+                    # выпуск и не начнёт заводиться, пока ID не появится. Цвет — из
+                    # уже существующего набора (см. `dot` ниже): это не сбой движка.
+                    text, color = "нет ID канала — выпуск не заводится", "muted"
                 dot = {"ok": "#5fa463", "err": "#c25a4e", "work": "var(--accent)",
                        "muted": "var(--muted)"}[color]
                 # Название донорского ролика, а не длинная ссылка. Клик ведёт в проект,
@@ -918,7 +985,8 @@ placeholder="по одной ссылке в строке — разложу п�
 <form method=post action="/api/channels/create">
 <div class=panel>
 <div class=fld><label class=cap>ID канала</label>
-  <input name=uc placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" required style="width:320px;flex:none"></div>
+  <input name=uc placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" style="width:320px;flex:none">
+  <span class=hint>необязательно — можно завести канал раньше, чем узнаете его ID</span></div>
 <div class=fld><label class=cap>Название</label><input name=name required style="width:320px;flex:none"></div>
 <div class=fld><label class=cap>Язык / ниша</label>
   <input name=lang placeholder="pl" style="width:60px;flex:none">

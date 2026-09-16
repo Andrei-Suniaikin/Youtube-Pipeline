@@ -442,7 +442,21 @@ def main() -> int:
           "fg.threads_used != null ? fg.threads_used : 'нет данных'" in index_html_src, True)
     check("пульт помечает, когда цифры сняты (§3.3 — «с пометкой, когда сняты»), "
           "а не просто держит поле в API без показа",
-          "снято ${when(fg.checked)}" in index_html_src, True)
+          # esc() вокруг when(...) — доработка ревьюера (дополнение 16.09, п.3): числа
+          # и дату на экране ключей выводить через esc(), не только сырым значением.
+          "снято ${esc(when(fg.checked))}" in index_html_src, True)
+    # Доработка 3 (дополнение 16.09) — не только дата: расход картинок и занятые
+    # потоки на этом же экране тоже должны идти через esc(), а не сырым значением.
+    check("израсходовано картинок — через esc()",
+          "${esc(fg.images_used != null ? fg.images_used : 'нет данных')}"
+          in index_html_src, True)
+    check("часовой лимит картинок — через esc()",
+          "из ${esc(fg.images_limit)} картинок" in index_html_src, True)
+    check("занято потоков — через esc()",
+          "${esc(fg.threads_used != null ? fg.threads_used : 'нет данных')}"
+          in index_html_src, True)
+    check("лимит потоков — через esc()",
+          "из ${esc(fg.threads_limit)}" in index_html_src, True)
     check("блок называется «FastGen» на экране ключей (§3.3)",
           '<div class="sec">FastGen</div>' in index_html_src, True)
 

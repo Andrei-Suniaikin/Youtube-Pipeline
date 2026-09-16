@@ -15,6 +15,105 @@ from __future__ import annotations
 import sqlite3
 
 
+def _migrate_channel_uc_optional(c: sqlite3.Connection) -> None:
+    """Снять NOT NULL с `pub_channels.uc` на базах, заведённых до пункта 6.1 ТЗ.
+
+    SQLite не умеет менять ограничение колонки через ALTER — единственный путь:
+    пересобрать таблицу целиком в одной транзакции. Идемпотентно: если notnull уже
+    снят (новая база или повторный запуск), ничего не делаем. Список колонок и
+    индексов берём из PRAGMA/sqlite_master, а не хардкодим — таблица уже не раз
+    расширялась через ALTER TABLE ADD COLUMN, и жёсткий список их бы потерял.
+
+    Доработка ревьюера (дополнение 16.09, п.1): в бою `ensure_pub_schema` зовут с
+    разными соединениями, не всегда с `row_factory=sqlite3.Row`. Поэтому здесь —
+    только позиционный доступ к PRAGMA table_info: cid, name, type, notnull,
+    dflt_value, pk — порядок столбцов PRAGMA фиксирован SQLite и не зависит от
+    row_factory вызывающего.
+    """
+    cols = c.execute("PRAGMA table_info(pub_channels)").fetchall()
+    uc_col = next((r for r in cols if r[1] == "uc"), None)
+    if uc_col is None or uc_col[3] == 0:
+        return   # колонки ещё нет либо ограничение уже снято — мигрировать нечего
+
+    def col_def(r) -> str:
+        cid, name, ctype, notnull, dflt_value, pk = r
+        if name == "uc":
+            # Ровно то ограничение, ради которого затевается пересборка: без NOT NULL,
+            # UNIQUE остаётся — несколько NULL в ней SQLite допускает, дублей не будет.
+            return "uc TEXT UNIQUE"
+        parts = [f'"{name}"']
+        # Доработка ревьюера (дополнение 16.09, п.2): тип переносится ровно как
+        # объявлен. SQLite допускает колонку без типа (динамическая типизация) —
+        # пустой тип остаётся пустым, а не подменяется на TEXT по умолчанию.
+        if ctype:
+            parts.append(ctype)
+        if pk:
+            parts.append("PRIMARY KEY AUTOINCREMENT")
+        if notnull:
+            parts.append("NOT NULL")
+        if dflt_value is not None:
+            parts.append(f"DEFAULT {dflt_value}")
+        return " ".join(parts)
+
+    col_names = [r[1] for r in cols]
+    cols_csv = ",".join(f'"{n}"' for n in col_names)
+    create_sql = "CREATE TABLE pub_channels_new(" + ", ".join(col_def(r) for r in cols) + ")"
+    # Индексы таблицы — их полный CREATE INDEX уже лежит в sqlite_master, автоиндекс
+    # UNIQUE-ограничения (sql IS NULL) сюда не попадает и пересоздастся сам новой
+    # колонкой `uc TEXT UNIQUE` выше.
+    idx_sql = [r[0] for r in c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='pub_channels' "
+        "AND sql IS NOT NULL").fetchall()]
+
+    # Доработка ревьюера (code review, итерация 2, Issue 1): INSERT...SELECT копирует
+    # значения id как обычные числа, а не через счётчик AUTOINCREMENT, поэтому
+    # sqlite_sequence после пересборки равен максимальному id СРЕДИ ОСТАВШИХСЯ строк,
+    # а не прежнему значению счётчика. Если максимальный id когда-то был удалён (канал
+    # убрали вручную), следующий новый канал получает переиспользованный id. Внешних
+    # ключей в базе нет, поэтому старые pub_plan_items/pub_releases/pub_upload_jobs с
+    # этим channel_id молча привяжутся к чужому новому каналу — ролик на чужом канале
+    # (см. CLAUDE.md, «Ловушки»). Поэтому счётчик запоминается до перестройки и
+    # восстанавливается после, если он оказался больше того, что получилось.
+    old_seq_row = c.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name='pub_channels'").fetchone()
+    old_seq = old_seq_row[0] if old_seq_row else None
+
+    in_tx = c.in_transaction
+    if not in_tx:
+        c.execute("BEGIN")
+    try:
+        c.execute(create_sql)
+        c.execute(f"INSERT INTO pub_channels_new({cols_csv}) "
+                  f"SELECT {cols_csv} FROM pub_channels")
+        c.execute("DROP TABLE pub_channels")
+        c.execute("ALTER TABLE pub_channels_new RENAME TO pub_channels")
+        for sql in idx_sql:
+            c.execute(sql)
+        # Счётчик приводится к ровно одной строке. Раньше здесь был UPDATE ... WHERE
+        # seq<?, а при rowcount == 0 — INSERT OR IGNORE. Но rowcount == 0 означает и
+        # «строки нет», и «строка есть, значение не меньше» — во втором случае вставлялась
+        # вторая строка (у sqlite_sequence нет UNIQUE, IGNORE ничего не отсекает). На
+        # копии dev-базы после миграции было две строки pub_channels. Сегодня SQLite
+        # читает первую, но какую он прочтёт завтра — не гарантировано, а устаревшая
+        # строка означает повтор номеров каналов и привязку старых выпусков к новому
+        # каналу. Поэтому: взять максимум из всего, что знаем, стереть все строки,
+        # записать одну.
+        seqs = [r[0] for r in c.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='pub_channels'").fetchall()]
+        max_id = c.execute("SELECT MAX(id) FROM pub_channels").fetchone()[0]
+        want = max([v for v in [old_seq, max_id, *seqs] if v is not None], default=None)
+        c.execute("DELETE FROM sqlite_sequence WHERE name IN ('pub_channels', 'pub_channels_new')")
+        if want is not None:
+            c.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('pub_channels', ?)",
+                      (want,))
+        if not in_tx:
+            c.commit()
+    except Exception:
+        if not in_tx:
+            c.rollback()
+        raise
+
+
 def ensure_pub_schema(c: sqlite3.Connection) -> None:
     """Создать таблицы контура. Идемпотентно: повторный вызов ничего не меняет."""
     # === Контур публикаций: каналы → план → выпуски ===
@@ -33,9 +132,14 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
     # Канал. UC уникален во всей системе и не меняется после создания: неверный UC
     # означает ролик на чужом канале (прецедент был). Формат UC проверяется в Python,
     # уникальность — здесь. Расписание и переопределения — JSON, как projects.settings.
+    # UC может быть пустым (пункт 6.1 ТЗ): канал иногда заводят раньше, чем узнают его
+    # реальный ID на YouTube. SQLite допускает несколько NULL в UNIQUE-колонке — этим и
+    # пользуемся; несколько пустых строк были бы дублем, поэтому пустое значение хранится
+    # как NULL (см. `pub_ui.clean_uc`), а не как "". У новых баз ограничение уже такое;
+    # у существующих его снимает `_migrate_channel_uc_optional` ниже.
     c.execute("CREATE TABLE IF NOT EXISTS pub_channels("
               "id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, "
-              "uc TEXT NOT NULL UNIQUE, name TEXT NOT NULL, handle TEXT, lang TEXT, niche TEXT, "
+              "uc TEXT UNIQUE, name TEXT NOT NULL, handle TEXT, lang TEXT, niche TEXT, "
               "profile_id INTEGER, host_id INTEGER, tz TEXT NOT NULL DEFAULT 'Europe/Warsaw', "
               "schedule TEXT NOT NULL DEFAULT '{}', horizon_days INTEGER NOT NULL DEFAULT 3, "
               "preset_rewrite TEXT, preset_vsgen_id INTEGER, preset_cover TEXT, "
@@ -67,6 +171,7 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
             c.execute(f"ALTER TABLE pub_channels ADD COLUMN {_col} {_sql}")
         except Exception:
             pass
+    _migrate_channel_uc_optional(c)
     # Теги: связь заводим сразу, интерфейс позже. Маршрут ролика они не определяют никогда.
     c.execute("CREATE TABLE IF NOT EXISTS pub_tags("
               "id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, "

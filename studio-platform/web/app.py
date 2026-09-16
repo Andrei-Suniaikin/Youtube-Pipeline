@@ -555,6 +555,9 @@ def ui_channels():
                 "lead_days": ch["lead_days"],
                 "per_day": sum(len(v or []) for v in schedule.values()),
                 "has_profile": bool(ch["profile_id"]),
+                # Пункт 6.1 ТЗ: канал можно завести без ID — списку нужно как-то
+                # отличить этот случай, чтобы показать плашку «ID пустой».
+                "has_uc": bool(ch["uc"]),
             })
         return {"channels": out}
     finally:
@@ -2402,6 +2405,34 @@ def ui_channel_status(cid: int, body: dict):
         except pub_ui.ChannelError as exc:
             raise HTTPException(400, str(exc))
         c.commit()
+    finally:
+        c.close()
+    return {"ok": True}
+
+
+class ChannelUCIn(BaseModel):
+    uc: str = ""
+
+
+@app.post("/ui/channels/{cid:int}/uc")
+def ui_channel_set_uc(cid: int, body: ChannelUCIn):
+    """Вписать ID YouTube каналу, у которого его пока нет (дополнение 16.09, вопрос 1).
+
+    Отдельный роут, а не поле в `/ui/channels/{cid}` (обычные настройки): у ID своё
+    правило («вписать можно только в пустое») и своя ошибка, которые не должны
+    путаться с проверками остальной формы. Эту возможность знает только пульт —
+    кабинет её не получает по прямому указанию владельца.
+    """
+    c = db()
+    try:
+        try:
+            pub_ui.set_channel_uc(c, TENANT, cid, body.uc)
+        except pub_ui.ChannelError as exc:
+            raise HTTPException(400, str(exc))
+        except Exception as exc:                                     # noqa: BLE001
+            if "UNIQUE" in str(exc):
+                raise HTTPException(409, "такой ID уже используется другим каналом")
+            raise
     finally:
         c.close()
     return {"ok": True}

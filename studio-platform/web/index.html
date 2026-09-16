@@ -594,14 +594,15 @@ async function viewKeys(){
           fg.expires_in_sec != null && fg.expires_in_sec <= 0 ? '!' : '✓'}</div>
         <div class="body">
           <div class="name">${fg.expires
-            ? `Действует до ${when(fg.expires)} — ${fg.expires_in_sec > 0
-                ? `осталось ${dur(fg.expires_in_sec)}` : `истёк ${dur(-fg.expires_in_sec)} назад`}`
+            ? `Действует до ${esc(when(fg.expires))} — ${fg.expires_in_sec > 0
+                ? `осталось ${esc(dur(fg.expires_in_sec))}`
+                : `истёк ${esc(dur(-fg.expires_in_sec))} назад`}`
             : 'Срок действия неизвестен'}</div>
           <div class="facts">${fg.images_limit != null
-              ? `за час израсходовано ${fg.images_used != null ? fg.images_used : 'нет данных'} из ${fg.images_limit} картинок`
+              ? `за час израсходовано ${esc(fg.images_used != null ? fg.images_used : 'нет данных')} из ${esc(fg.images_limit)} картинок`
               : 'расход картинок неизвестен'}${fg.threads_limit != null
-              ? ` · потоков занято ${fg.threads_used != null ? fg.threads_used : 'нет данных'} из ${fg.threads_limit}` : ''}</div>
-          <div class="note muted">снято ${when(fg.checked)}</div>
+              ? ` · потоков занято ${esc(fg.threads_used != null ? fg.threads_used : 'нет данных')} из ${esc(fg.threads_limit)}` : ''}</div>
+          <div class="note muted">снято ${esc(when(fg.checked))}</div>
         </div></div>`
       : '<div class="empty">Данных пока нет.</div>'}
   </div>`));
@@ -695,6 +696,8 @@ async function viewChannels(){
       }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
     };
   };
+  // Пункт 6.1 ТЗ: поле ID канала необязательное — канал иногда заводят раньше, чем
+  // узнают его настоящий ID на YouTube (см. также `pub_schema.py`, `pub_ui.clean_uc`).
   bar.querySelector('#newch').onclick = () => {
     if (document.getElementById('newch-form')) return;
     const form = $(`<div class="card" id="newch-form" style="padding:16px;margin-bottom:16px">
@@ -702,6 +705,9 @@ async function viewChannels(){
       <div id="err"></div>
       <div class="fldrow"><label>ID канала</label>
         <input id="uc" placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" style="width:340px"></div>
+      <div class="note muted">Необязательно — можно завести канал раньше, чем узнаете
+        его ID. Выпуски на таком канале не заводятся, пока ID не задан. Вписать ID
+        можно будет позже, на вкладке «Настройки» этого канала — и только один раз.</div>
       <div class="fldrow"><label>Название</label><input id="nm" style="width:340px"></div>
       <div class="fldrow"><label>Язык / ниша</label>
         <input id="lg" placeholder="pl" style="width:70px">
@@ -742,9 +748,12 @@ async function viewChannels(){
       </div>
       <div class="meta">готовим за ${c.lead_days} дн ·
         ${c.has_profile ? 'профиль есть' : '<span style="color:var(--bad)">профиля нет</span>'}</div>
-      <div style="margin-top:9px"><span class="pill ${
-        c.status === 'active' ? 's-done' : c.status === 'problem' ? 's-error' : 's-idle'
-      }">${esc(c.status)}</span></div>
+      <div style="margin-top:9px;display:flex;gap:7px;flex-wrap:wrap">
+        <span class="pill ${
+          c.status === 'active' ? 's-done' : c.status === 'problem' ? 's-error' : 's-idle'
+        }">${esc(c.status)}</span>
+        ${c.has_uc ? '' : '<span class="pill s-error">ID пустой</span>'}
+      </div>
     </div>`).join('')}</div>`);
   grid.querySelectorAll('.chcard').forEach(el =>
     el.onclick = () => location.hash = '#/channel/' + el.dataset.id);
@@ -887,7 +896,9 @@ async function viewChannel(id){
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/channels">← ко всем каналам</a>
     <h1>${esc(c.name)}</h1>
-    <p class="sub">${esc(c.handle || '')} · ${esc(c.lang)} · ${esc(c.niche || '')}</p>`));
+    <p class="sub">${esc(c.handle || '')} · ${esc(c.lang)} · ${esc(c.niche || '')}</p>
+    ${c.uc ? '' : `<span class="pill s-error">ID пустой — выпуски на этом канале
+      не заводятся. Вписать во вкладке «Настройки» ниже — один раз</span>`}`));
 
   // Две вкладки: «Ролики» — то, чем занимаются каждый день, «Настройки» — то, что
   // трогают раз в месяц. Ролики первыми: канал открывают, чтобы посмотреть выпуски,
@@ -1685,8 +1696,21 @@ async function wireChannelEdit(root, c){
       <select id="${id}"><option value="">— не выбран —</option>${items.map(i =>
         `<option value="${esc(String(i.value))}" ${String(i.value) === String(cur ?? '')
           ? 'selected' : ''}>${esc(i.title)}</option>`).join('')}</select></div>`;
+    // Дополнение 16.09, вопрос 1: ID можно вписать только в пустое поле — уже
+    // заданный UC «не меняется после создания» (см. `pub_ui.set_channel_uc`), поэтому
+    // показываем его как чтение с пояснением, а не как ещё одно редактируемое поле.
+    const ucField = c.uc
+      ? `<div class="fldrow"><label>ID канала</label>
+           <span class="mono">${esc(c.uc)}</span></div>
+         <div class="note muted">Не меняется после создания: неверный ID — ролик
+           на чужом канале.</div>`
+      : `<div class="fldrow"><label>ID канала</label>
+           <input id="f-uc" placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" style="width:300px"></div>
+         <div class="note muted">Задайте, когда узнаете, — сохранить можно один раз,
+           потом изменить будет нельзя.</div>`;
     box.innerHTML = `
       <div id="cherr"></div>
+      ${ucField}
       <div class="fldrow"><label>Название</label>
         <input id="f-name" value="${esc(c.name)}" style="width:300px"></div>
       <div class="fldrow"><label>Хэндл / язык / ниша</label>
@@ -1740,6 +1764,21 @@ async function wireChannelEdit(root, c){
         .filter(l => l.querySelector('input').checked).map(l => l.dataset.day);
       const v = id => box.querySelector('#' + id).value;
       try{
+        // ID — отдельным запросом и только если поле вообще есть (канал ещё без ID)
+        // и что-то в него вписали: пустое поле здесь значит «не сейчас», а не «стереть».
+        const ucInput = box.querySelector('#f-uc');
+        if (ucInput && ucInput.value.trim()){
+          await post(`/ui/channels/${c.id}/uc`, {uc: ucInput.value});
+          // Доработка ревьюера (code review, итерация 2, Issue 3): ID уже записан на
+          // сервере. Если вторым запросом ниже упадут остальные настройки, повторное
+          // нажатие «Сохранить» не должно снова слать тот же ID — сервер его больше не
+          // примет («уже задан»), а пользователь так и не сохранит исправленные поля.
+          // Переводим поле в чтение сразу, без ожидания перерисовки всей формы.
+          c.uc = ucInput.value.trim();
+          const ucRow = ucInput.closest('.fldrow');
+          if (ucRow) ucRow.innerHTML =
+            `<label>ID канала</label><span class="mono">${esc(c.uc)}</span>`;
+        }
         await post(`/ui/channels/${c.id}`, {
           name: v('f-name'), handle: v('f-handle'), lang: v('f-lang'),
           niche: v('f-niche'), tz: v('f-tz'), times: v('f-times'), days,
