@@ -1523,7 +1523,11 @@ def _cabinet_form(path: str, fields, request, timeout: float = 0.0,
         with urllib.request.urlopen(req, timeout=timeout or NEIGHBOUR_TIMEOUT * 3) as resp:
             body = resp.read().decode("utf-8", "replace")
             if not expect_json:
-                return {"ok": True}
+                # Батч C, Ф2, §5.3: `urlopen` сам идёт за 302 (POST→GET, как браузер),
+                # поэтому `resp.geturl()` — это конечный адрес с query-параметрами
+                # исхода (`?job=`, `?dup=`, `?imgbusy=1`…). Старт этапа разбирает эту
+                # строку — без неё пришлось бы гадать по одному только коду ответа.
+                return {"ok": True, "url": resp.geturl()}
             return json.loads(body or "{}")
     except urllib.error.HTTPError as exc:
         raw = exc.read().decode("utf-8", "replace")
@@ -2876,6 +2880,29 @@ def ui_projects(limit: int = 50):
             "note": "материалы роликов: кадры, озвучка, готовые файлы"}
 
 
+def _applied_preset_info(c, settings: dict) -> dict | None:
+    """`project.applied_preset` (§5.9): пресет, применённый последним снимком/кнопкой
+    «Применить», или честное «удалён», если строки уже нет.
+
+    `links` — только части, у которых ссылка на частичный пресет реально разрешилась
+    (та же логика `_locked_parts`, что и у редактора пресета выше): сломанную ссылку
+    (`_link_problems`) §7.2 требует не показывать как применённую — `resolve()` в этом
+    случае и не подставляет частичный, группа остаётся на своих полях целого.
+    """
+    prid = preset_links.parse_link_ref(settings.get("_applied_preset"))
+    if prid is None:
+        return None
+    row = c.execute("SELECT name FROM presets WHERE id=? AND tenant_id=?",
+                    (prid, TENANT)).fetchone()
+    if row is None:
+        return {"id": prid, "name": None, "missing": True, "links": []}
+    resolved = preset_links.resolve(c, prid)
+    links = [{"part": part, "title": _PART_TITLES.get(part, part)}
+             for part in sorted(_locked_parts(resolved))]
+    return {"id": prid, "name": row["name"] or f"пресет {prid}", "missing": False,
+            "links": links}
+
+
 @app.get("/ui/projects/{pid}")
 def ui_project(pid: str):
     """Один проект: что в нём есть, чем он занят и что можно забрать."""
@@ -2907,6 +2934,21 @@ def ui_project(pid: str):
                 for r in c.execute(
                     "SELECT kind, COUNT(*) n, SUM(COALESCE(cost,0)) s FROM provider_calls "
                     "WHERE project_id=? AND status='delivered' GROUP BY kind", (pid,))]
+        # §5.9: тот же проход, что кабинет делает для мини-степпера на /p/{pid}
+        # (main.py ≈4658–4663) — последний статус КАЖДОГО вида задачи, а не последние
+        # 30 строк истории выше (`jobs`): редкий вид (например, «render») мог не
+        # попасть в лимит 30, если проект успел наплодить много задач других видов.
+        km = {r["kind"]: r["status"] for r in c.execute(
+            "SELECT kind, status FROM queue_tasks WHERE project_id=? AND job_id IN "
+            "(SELECT MAX(job_id) FROM queue_tasks WHERE project_id=? GROUP BY kind)",
+            (pid, pid))}
+        try:
+            settings = json.loads(p["settings"] or "{}")
+        except ValueError:
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        applied_preset = _applied_preset_info(c, settings)
     finally:
         c.close()
 
@@ -2916,14 +2958,36 @@ def ui_project(pid: str):
             st = mod._project_status(TENANT, pid) or {}
         except Exception:                                          # noqa: BLE001
             st = {}
+    # `project.stage` — обёртка над кабинетной `project_stage_status` (Ф1, батч C,
+    # 17.09.2026). Ф1 и Ф2 шли параллельно: если бы функции ещё не было, ручка не
+    # должна была падать — честные пустые segments вместо выдуманных пяти шагов.
+    stage = {"segments": [], "caption": "", "tone": "dim"}
+    if mod is not None and hasattr(mod, "project_stage_status") and hasattr(mod, "_stage_sets"):
+        try:
+            merged = dict(st)
+            merged["running"], merged["queued"], merged["errored"] = mod._stage_sets(km)
+            stage = mod.project_stage_status(merged)
+        except Exception:                                          # noqa: BLE001
+            pass
+    source = ""
+    if mod is not None and hasattr(mod, "_project_dir"):
+        # Прямое чтение файла, тем же способом, что уже читает `_project_files`
+        # (§5.9) — не поход по HTTP до кабинета за собственным же диском.
+        try:
+            with open(os.path.join(mod._project_dir(TENANT, pid), "source.txt"),
+                      encoding="utf-8") as f:
+                source = f.read()
+        except FileNotFoundError:
+            source = ""
     groups = _project_files(mod, pid)
     return {
         "project": {"id": p["id"], "name": p["name"] or p["id"],
                     "status": p["status"] or "", "created": p["created"],
                     "updated": p["updated"],
                     "release_id": (rel["release_id"] if rel else ""),
-                    "phase": (rel["phase"] if rel else "")},
-        "ready": st, "jobs": jobs, "files": groups, "paid": paid,
+                    "phase": (rel["phase"] if rel else ""),
+                    "stage": stage, "applied_preset": applied_preset},
+        "ready": st, "jobs": jobs, "files": groups, "paid": paid, "source": source,
         # Ссылки на файлы и архивы — кабинета: он отдаёт их с проверкой, что путь
         # не выводит за пределы проекта, и с миниатюрами по ?w=.
         "file_base": f"/p/{urllib.parse.quote(pid)}/file/",
@@ -2963,7 +3027,12 @@ def _applied_params(raw) -> list:
 
 _FILE_GROUPS = (("images", "кадры"), ("clips", "клипы"), ("renders", "готовый ролик"),
                 ("audio", "озвучка"), ("subs", "субтитры"), ("chapters", "тайм-коды"),
-                ("scenes", "план сцен и промпты"))
+                ("scenes", "план сцен и промпты"),
+                # Батч C, Ф2, §5.10: категорию завёл Ф1 в `_DL_CATS`/`_DL_PATTERNS`
+                # (main.py, 17.09.2026) — кабинет кладёт готовую обложку в cover.jpg,
+                # конвейер её не перекодирует. Без этой строки вкладка «Обложка» не
+                # увидит уже стоящую обложку.
+                ("covers", "обложка"))
 
 
 def _project_files(mod, pid: str) -> list:
@@ -2985,7 +3054,9 @@ def _project_files(mod, pid: str) -> list:
         if not items:
             continue
         out.append({"code": code, "title": title, "count": len(items),
-                    "kind": ("image" if code == "images" else
+                    # covers → "image": одна миниатюра готовой обложки, не список
+                    # ссылок на скачивание, как у текстовых категорий (§5.10).
+                    "kind": ("image" if code in ("images", "covers") else
                              "video" if code in ("clips", "renders") else
                              "audio" if code == "audio" else "text"),
                     # Имена относительные — их же ждёт отдача файла кабинетом.
@@ -3131,6 +3202,264 @@ def ui_project_settings_save(pid: str, body: PresetSave, request: Request):
         raise HTTPException(400, "нечего сохранять")
     _cabinet_form(f"/api/projects/{pid}/settings", fields, request, expect_json=False)
     return {"ok": True}
+
+
+# ─────────────────────────── экран проекта: старт этапа (батч C, Ф2) ───────────────────────────
+
+# kind этапа → часть пресета (`preset_fields.PARTS`), которой он закрывается. Она же
+# отвечает на «какая группа — чьи поля»: та же карта, которой пользуется применение
+# ссылок частичного пресета (`preset_links.group_keys`), а не вторая копия соответствия.
+_STAGE_PART = {"tts": "voice", "images": "images", "video": "clips", "render": "render"}
+
+
+def _stage_form_fields(c, pid: str, kind: str, overrides: dict) -> list:
+    """Поля тела формы старта этапа = текущие эффективные настройки проекта по ключам
+    группы `preset_fields`, поверх которых накладываются явные поля из тела запроса
+    (поправка оркестратора к §5.4, 2026-09-17).
+
+    Зачем. Кабинетный `gen_submit` (main.py ≈12848–12890) при пустом теле формы всё
+    равно молча ЗАПИСЫВАЕТ настройки проекта (`_save_project_settings(tid, pid, dd)`)
+    — а для `tts` ещё и подставляет `engine="edge"` по умолчанию (main.py ≈12870),
+    если движок не пришёл в форме. Пустое тело с пульта означало бы «нажали „Начать“
+    ничего не меняя» — и молча перевело бы проект с Lumean/VoiceGenCore на Edge. Форма
+    кабинета на `/p/{pid}` эту дыру не открывает только потому, что рисует все поля
+    ТЕКУЩИМИ значениями — обычный ре-сабмит присылает то же самое обратно. Мы
+    отправляем то же самое, не рисуя HTML.
+
+    Набор ключей — `part_group_keys(part) | SHARED_KEYS` (видимые поля группы
+    `GROUPS` ∪ ключи, которые этап реально читает, но форма не показывает, ∪ общий
+    `use_cache`). Это НАДмножество полей, что рисует настоящая форма кабинета на
+    `/p/{pid}` (main.py: pane_tts ≈4860–4896, pane_img ≈4954–4984, pane_vid
+    ≈5187–5215, pane_rnd ≈5413–5470), сверено построчно — не побайтовое совпадение
+    имён `name=`. Известные расхождения, безопасные по коду кабинета:
+      - `render`: форма шлёт `auto_chapters`, мы шлём `chapters` — это РАЗНЫЕ ключи
+        (`preset_fields.py` называет поле группы «Сборка» `chapters`, а фактическая
+        настройка проекта, которую читает главный флаг «считать главы», —
+        `auto_chapters`). Расхождение безопасно, потому что глава считается не из
+        тела этого запроса: `gen_submit` лишь пересохраняет `dd["chapters"]` в
+        `projects.settings` как есть (не трогая `auto_chapters`), а сам расчёт глав
+        после рендера читает `auto_chapters` напрямую из настроек проекта отдельным
+        кодом (main.py ≈13316) — наш `chapters` этот путь не пересекает и не портит;
+      - мы шлём лишние ключи группы, которых нет ни в одной форме (`engine`,
+        `tts_engine`, `voice_uuid`, `voice_by_lang`, `auto_pause_duration`,
+        `auto_pause_frequency`, `img_source`, `image_source`, `googler_model`,
+        `smart_mode`, `t2v`, `t2v_first_n`, `render_media`, `stock_video_*`,
+        `vintage_effect`, `randomize_metadata`) — это текущие значения проекта по
+        полям, которые этап читает напрямую из настроек, а форма их просто не
+        рисует отдельными input'ами; кабинет их примет как есть, ре-сабмит не
+        меняет то, что форма не показывает;
+      - поля, которых в текущих настройках проекта нет вовсе, мы не отправляем
+        (не шлём пустую строку) — настоящая форма прислала бы `""`, но это
+        безопасно: `_save_project_settings` не отличает «не пришло» от «пришла
+        пустая строка» для этих ключей иначе, чем «не задано».
+    """
+    part = _STAGE_PART[kind]
+    keys = preset_fields.part_group_keys(part) | preset_fields.SHARED_KEYS
+    unknown = sorted(set(overrides) - keys)
+    if unknown:
+        raise HTTPException(400, "неизвестные поля этапа: " + ", ".join(unknown))
+    r = c.execute("SELECT settings FROM projects WHERE id=? AND tenant_id=?",
+                 (pid, TENANT)).fetchone()
+    try:
+        settings = json.loads((r["settings"] if r else "") or "{}")
+    except ValueError:
+        settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
+    fields = {}
+    for k in keys:
+        v = settings.get(k)
+        if v not in (None, ""):
+            fields[k] = str(v)
+    for k, v in (overrides or {}).items():
+        fields[k] = "" if v is None else str(v)
+    return list(fields.items())
+
+
+class StageStartIn(BaseModel):
+    settings: dict = {}
+
+
+@app.post("/ui/projects/{pid}/stage/{kind}")
+def ui_project_stage_start(pid: str, kind: str, body: StageStartIn, request: Request):
+    """Начать этап (`tts`/`images`/`video`/`render`) и честно сказать, что вышло.
+
+    Пять исходов (§5.4, поправка 1 триажа) — по query редиректа кабинета, который
+    теперь виден в ответе `_cabinet_form` (§5.3): `job=` — поставлено, `dup=` — уже
+    идёт, `imgbusy=1` — правка картинок занята, `dr=1`/`dv=1` — рендер/видео отложены
+    (не готовы входные материалы). «Поставлено» — только когда в query есть `job`.
+    Дубли/занятость проверяет сам кабинет (`gen_submit`) — здесь их не повторяем.
+    """
+    if kind not in _STAGE_PART:
+        raise HTTPException(404, f"нет этапа «{kind}»")
+    c = db()
+    try:
+        if not c.execute("SELECT 1 FROM projects WHERE id=? AND tenant_id=?",
+                         (pid, TENANT)).fetchone():
+            raise HTTPException(404, "проект не найден")
+        fields = _stage_form_fields(c, pid, kind, body.settings or {})
+    finally:
+        c.close()
+    resp = _cabinet_form(f"/api/projects/{pid}/{kind}", fields, request, expect_json=False)
+    q = urllib.parse.parse_qs(urllib.parse.urlparse(resp.get("url") or "").query)
+    if "job" in q:
+        return {"outcome": "started", "job_id": int(q["job"][0])}
+    if "dup" in q:
+        return {"outcome": "duplicate"}
+    if "imgbusy" in q:
+        return {"outcome": "images_busy"}
+    if "dr" in q:
+        return {"outcome": "render_deferred"}
+    if "dv" in q:
+        return {"outcome": "video_deferred"}
+    raise HTTPException(502, "кабинет ответил на старт этапа непонятным адресом")
+
+
+class SourceIn(BaseModel):
+    text: str = ""
+
+
+@app.post("/ui/projects/{pid}/source")
+def ui_project_source_save(pid: str, body: SourceIn, request: Request):
+    """Сохранить текст сценария (`source.txt`) — и «Сохранить текст», и «Взять в
+    проект» (текст рерайта, уже полученный клиентом отдельным запросом)."""
+    _cabinet_form(f"/api/projects/{pid}/source", [("source", body.text)], request,
+                 expect_json=False)
+    return {"ok": True}
+
+
+class PresetApplyIn(BaseModel):
+    preset_id: int
+
+
+@app.post("/ui/projects/{pid}/preset/apply")
+def ui_project_preset_apply(pid: str, body: PresetApplyIn, request: Request):
+    """Заменить настройки проекта целиком настройками пресета (§5.6). Подтверждение
+    («заменит настройки проекта целиком») — на клиенте (`confirmInline`, Ф4)."""
+    _cabinet_form(f"/api/presets/{body.preset_id}/apply", [("pid", pid)], request,
+                 expect_json=False)
+    return {"ok": True}
+
+
+class PresetSnapshotIn(BaseModel):
+    name: str = ""
+
+
+@app.post("/ui/projects/{pid}/preset/snapshot")
+def ui_project_preset_snapshot(pid: str, body: PresetSnapshotIn, request: Request):
+    """Завести новый пресет из ТЕКУЩИХ эффективных настроек проекта («сохранить как
+    новый… → Снимок»).
+
+    Имя проверяем здесь, ДО похода в кабинет (edge case §7.1): кабинетная
+    `/api/presets` (main.py ≈12176–12185) на пустом `pid`/`name` не отвечает
+    ошибкой, а молча редиректит без сохранения — повторять эту дыру в пульте нельзя.
+    Без `setting__*` полей в теле кабинет снимает пресет с текущих эффективных
+    настроек проекта как есть (main.py ≈12186–12219: пустой `active_updates` →
+    `effective` остаётся тем же, чем сейчас пользуется проект).
+    """
+    name = (body.name or "").strip()
+    if not name:
+        raise HTTPException(400, "у пресета должно быть имя")
+    _cabinet_form("/api/presets", [("pid", pid), ("preset_name", name)], request,
+                 expect_json=False)
+    return {"ok": True}
+
+
+class CoverPickIn(BaseModel):
+    service_job_id: str
+    name: str
+
+
+@app.post("/ui/projects/{pid}/cover")
+def ui_project_cover_pick(pid: str, body: CoverPickIn, request: Request):
+    """«Поставить обложкой проекта» — скопировать готовый вариант из задачи Cover в
+    `cover.jpg` проекта (§5.7, алгоритм §6).
+
+    Владение задачей за пульт не проверяет: Cover сам сверяет владельца файла с
+    тем же тенантом, что и у пульта. В объединённой платформе (`web/platform.py`)
+    Cover резолвит личность запроса через ту же куку кабинета, что шлёт сюда и
+    пульт (`server/platform_sso.py:cabinet_user` — `user_id` там это `tenant_id`),
+    и `_job_belongs_to_user` (cover/cover_server.py ≈234–237) сравнивает его с
+    `job.user_id` без исключения для админа — чужой тенант получает 403 раньше,
+    чем пульт успевает прочитать хоть один байт. Второй, дублирующей проверки
+    здесь поэтому нет (принцип «не повторять чужую проверку», §6, шаг 2).
+    """
+    mod = sys.modules.get("main")
+    c = db()
+    try:
+        if not c.execute("SELECT 1 FROM projects WHERE id=? AND tenant_id=?",
+                         (pid, TENANT)).fetchone():
+            raise HTTPException(404, "проект не найден")
+    finally:
+        c.close()
+    url = (f"{COVER_BASE}/jobs/{urllib.parse.quote(body.service_job_id)}/files/"
+           f"{urllib.parse.quote(body.name)}")
+    req = urllib.request.Request(url)
+    req.add_header("Cookie", f"{auth.COOKIE}={getattr(request.state, 'sid', '')}")
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 5) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as exc:
+        raise HTTPException(_pass_code(exc.code),
+                            exc.read().decode("utf-8", "replace")[:200])
+    except Exception as exc:                                       # noqa: BLE001
+        raise HTTPException(502, f"cover не отвечает: {type(exc).__name__}")
+    if mod is None or not hasattr(mod, "_project_dir"):
+        raise HTTPException(503, "кабинет не поднят — обложку положить некуда")
+    pdir = mod._project_dir(TENANT, pid)
+    target = os.path.join(pdir, "cover.jpg")
+    # Атомарная запись (§6, шаг 5): временный файл РЯДОМ (та же файловая система —
+    # иначе `os.replace` не атомарен), затем `os.replace`. Читатель `cover.jpg`
+    # никогда не увидит частично записанный файл. Место — то же самое, куда
+    # конвейер кладёт обложку (`server/pub_services.py` ≈609), без перекодирования.
+    tmp = os.path.join(pdir, f".cover.jpg.tmp-{secrets.token_hex(8)}")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, target)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    return {"ok": True, "bytes": len(data)}
+
+
+@app.get("/ui/jobs/{jid}/logs")
+def ui_job_logs(jid: int, after: int = 0):
+    """Лог одной задачи, дочитывается опросом (§5.8).
+
+    Права — `SELECT tenant_id FROM queue_tasks` (симметрично `job_logs_sse`,
+    main.py ≈13445–13453), но 404, а не 403: задачи чужого тенанта для пульта не
+    существуют, а не «доступ запрещён» (§7.5). Без редакции секретов сверх той, что
+    уже сделал кабинет на запись (main.py ≈9766–9772, «редактируем stdout
+    централизованно») — принцип 3 §5: ручка отдаёт `job_logs.line` как есть.
+    """
+    c = db()
+    try:
+        t = c.execute("SELECT tenant_id, status FROM queue_tasks WHERE job_id=?",
+                      (jid,)).fetchone()
+        if not t or t["tenant_id"] != TENANT:
+            raise HTTPException(404, "нет такой задачи")
+        total = c.execute("SELECT COUNT(*) FROM job_logs WHERE job_id=?",
+                          (jid,)).fetchone()[0]
+        truncated = False
+        if after <= 0 and total > 1000:
+            truncated = True
+            rows = list(c.execute(
+                "SELECT id, line FROM job_logs WHERE job_id=? ORDER BY id DESC LIMIT 1000",
+                (jid,)))
+            rows.reverse()
+        else:
+            rows = list(c.execute(
+                "SELECT id, line FROM job_logs WHERE job_id=? AND id>? ORDER BY id",
+                (jid, after)))
+    finally:
+        c.close()
+    lines = [{"id": r["id"], "line": r["line"]} for r in rows]
+    next_after = lines[-1]["id"] if lines else after
+    return {"job_id": jid, "status": t["status"] or "", "total": total,
+            "truncated": truncated, "lines": lines, "next_after": next_after}
 
 
 @app.post("/ui/releases/{release_id}/revive")
