@@ -44,24 +44,43 @@ def db():
 
 
 def make_running_job(kind="images") -> tuple:
-    """Живая задача в очереди с токеном — от её имени и пишет движок."""
+    """Живая задача в очереди с токеном — от её имени и пишет движок.
+
+    Номер берётся так же, как в `_enqueue` кабинета: максимум по `gen_jobs` и
+    `queue_tasks` плюс парная строка в `gen_jobs`. Раньше строка вставлялась в одну
+    `queue_tasks` без `claimed`: работающий планировщик сразу забирал её как «зависшую»
+    и писал в `job_logs`, а после чистки тот же номер получала настоящая задача и
+    дописывала свой лог к чужим строкам (render #15 на dev-стенде, 16.09.2026).
+    `claimed` = сейчас — чтобы планировщик не считал задачу зависшей, пока идёт тест.
+    """
     token = secrets.token_hex(16)
+    now = time.time()
     c = db()
     try:
-        cur = c.execute(
-            "INSERT INTO queue_tasks(tenant_id,project_id,kind,status,created,params,uid,"
-            "claim_token,provider) VALUES('dev',?,?,'running',?,'{}',1,?,'recrafter')",
-            (PROJECT, kind, time.time(), token))
+        c.execute("BEGIN IMMEDIATE")
+        nxt = c.execute("SELECT MAX(v) FROM (SELECT MAX(rowid) v FROM gen_jobs "
+                        "UNION ALL SELECT MAX(job_id) FROM queue_tasks)").fetchone()[0]
+        jid = int(nxt or 0) + 1
+        c.execute("INSERT INTO gen_jobs(rowid,user_id,type,status,ts,title) "
+                  "VALUES(?,1,?,'running',?,?)", (jid, kind, now, f"test:{kind}:{PROJECT}"))
+        c.execute(
+            "INSERT INTO queue_tasks(job_id,tenant_id,project_id,kind,status,created,params,uid,"
+            "claim_token,claimed,provider) VALUES(?,'dev',?,?,'running',?,'{}',1,?,?,'recrafter')",
+            (jid, PROJECT, kind, now, token, now))
         c.commit()
-        return cur.lastrowid, token
+        return jid, token
     finally:
         c.close()
 
 
 def cleanup(jid):
+    """Убрать задачу целиком: строку очереди, парную `gen_jobs` и её лог. Лог без задачи
+    — это ровно те осиротевшие строки, которые потом прилипают к задаче с тем же номером."""
     c = db()
     try:
         c.execute("DELETE FROM queue_tasks WHERE job_id=?", (jid,))
+        c.execute("DELETE FROM gen_jobs WHERE rowid=?", (jid,))
+        c.execute("DELETE FROM job_logs WHERE job_id=?", (jid,))
         c.execute("DELETE FROM provider_calls WHERE project_id=? AND unit LIKE 'test-%'",
                   (PROJECT,))
         c.commit()

@@ -113,6 +113,12 @@ def drop_project(pid: str) -> None:
     c = db()
     try:
         c.execute("DELETE FROM projects WHERE id=?", (pid,))
+        # Лог и парная gen_jobs — вместе с очередью: осиротевший лог прилипает к
+        # следующей задаче, получившей тот же номер.
+        c.execute("DELETE FROM job_logs WHERE job_id IN "
+                  "(SELECT job_id FROM queue_tasks WHERE project_id=?)", (pid,))
+        c.execute("DELETE FROM gen_jobs WHERE rowid IN "
+                  "(SELECT job_id FROM queue_tasks WHERE project_id=?)", (pid,))
         c.execute("DELETE FROM queue_tasks WHERE project_id=?", (pid,))
         c.commit()
     finally:
@@ -122,8 +128,11 @@ def drop_project(pid: str) -> None:
 def insert_queue_task(job_id: int, pid: str, kind: str, status: str, tenant=TENANT) -> None:
     c = db()
     try:
-        c.execute("INSERT INTO queue_tasks(job_id, tenant_id, project_id, kind, status, created) "
-                 "VALUES(?,?,?,?,?,?)", (job_id, tenant, pid, kind, status, time.time()))
+        # claimed = сейчас: иначе включённый планировщик сочтёт 'running' зависшей и
+        # запишет в job_logs под этим номером (так смешались логи #14/#15 на стенде).
+        now = time.time()
+        c.execute("INSERT INTO queue_tasks(job_id, tenant_id, project_id, kind, status, created, "
+                  "claimed) VALUES(?,?,?,?,?,?,?)", (job_id, tenant, pid, kind, status, now, now))
         c.commit()
     finally:
         c.close()
