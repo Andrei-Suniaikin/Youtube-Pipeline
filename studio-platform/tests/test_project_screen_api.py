@@ -505,6 +505,27 @@ def main() -> int:
             code, body = me.go(f"/ui/text?project_id={pid}")
             check("у проекта задач текста нет — пустой список, не ошибка",
                   (code, (body or {}).get("jobs")), (200, []))
+            # Старая задача проекта выпала из списка сервиса (Cover отдаёт пульту 50
+            # последних): пульт дочитывает её по одной, а не теряет.
+            filler = [f"psjfill{i}x{stamp}" for i in range(52)]
+            filler_dirs = [cover_insert_job(j, TENANT, "v.jpg", b"\xff\xd8x") for j in filler]
+            c = sqlite3.connect(COVER_DB, timeout=5)
+            try:
+                c.execute("UPDATE jobs SET created_at=? WHERE id=?", (1.0, older))
+                c.commit()
+            finally:
+                c.close()
+            try:
+                code, body = me.go("/ui/covers")
+                check("старая задача действительно не попадает в список аккаунта",
+                      older in [j["id"] for j in (body or {}).get("jobs") or []], False)
+                code, body = me.go(f"/ui/covers?project_id={pid}")
+                check("а в списке проекта она есть — дочитана по одной",
+                      [j["id"] for j in (body or {}).get("jobs") or []], [newer, older])
+            finally:
+                for j, d in zip(filler, filler_dirs):
+                    cover_drop_job(j, d)
+
             code, _b = me.go("/ui/covers?project_id=no-such-project")
             check("чужой или несуществующий проект — 404", code, 404)
 
