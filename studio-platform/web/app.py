@@ -32,7 +32,7 @@ sys.path.insert(0, SERVER)
 
 from fastapi import FastAPI, HTTPException, Request, Response    # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
-from pydantic import BaseModel                                   # noqa: E402
+from pydantic import BaseModel, StrictInt                         # noqa: E402
 
 sys.path.insert(0, HERE)
 import pult_auth as auth                                       # noqa: E402
@@ -1304,11 +1304,34 @@ def ui_presets():
                     continue
                 used[kind].setdefault(str(val), []).append(
                     {"id": ch["id"], "name": ch["name"]})
-        vsgen = [{"key": str(r["id"]), "name": r["name"] or f"пресет {r['id']}",
-                  "facts": _preset_facts(r["settings"])}
-                 for r in c.execute("SELECT id, name, settings FROM presets "
-                                    "WHERE tenant_id=? ORDER BY name COLLATE NOCASE",
-                                    (TENANT,))]
+        # Сводка — через preset_links.resolve (батч «Пресеты целые и частичные»):
+        # список обязан показывать то, что реально поедет в производство, а не
+        # пустые свои поля группы, у которой стоит ссылка на частичный пресет.
+        # Экраны кабинета (presets_page/_preset_summary) при этом НЕ трогаем — они
+        # уходят вместе с остальными экранами кабинета, а не остаются жить рядом с
+        # пультом с двумя разными правдами о том, что показывает пресет.
+        # N+1 сознательно (ревью цикла 1 фазы 2, Issue 5): `resolve()` (плюс запрос
+        # на каждую ссылку) и `users_of()` (свой проход по каналам/проектам/держателям)
+        # зовутся по разу на каждый пресет тенанта, а не одним общим проходом. На
+        # dev-базе (7 пресетов, 5 проектов) не заметно; тенант здесь — один пульт на
+        # команду, а не публичная витрина, и в продакшне ожидаются десятки пресетов,
+        # не тысячи. Если счёт пойдёт на сотни — считать сводки одним проходом, но
+        # через общий разбор ссылки из `preset_links` (тот же, что использует
+        # `resolve`/`users_of`), а не второй самостоятельный разбор здесь.
+        vsgen = []
+        for r in c.execute("SELECT id, name, settings FROM presets "
+                           "WHERE tenant_id=? ORDER BY name COLLATE NOCASE", (TENANT,)):
+            resolved = preset_links.resolve(c, r["id"])
+            users = preset_links.users_of(c, r["id"])
+            vsgen.append({
+                "key": str(r["id"]), "name": r["name"] or f"пресет {r['id']}",
+                "facts": _preset_facts(resolved),
+                "scope": preset_links.scope_of(resolved),
+                "links": resolved.get("_links") or {},
+                "users": {"channels": len(users["channels"]),
+                         "projects": len(users["projects"]),
+                         "presets": len(users["presets"])},
+            })
         keys = {n: get_key(c, n) for n in ("rewrite", "cover")}
     finally:
         c.close()
@@ -1387,6 +1410,12 @@ def _preset_facts(settings) -> list:
     facts = []
     for k, v in data.items():
         low = str(k).lower()
+        if low.startswith("_"):
+            # Служебные ключи пресета (`_scope`, `_links`, `_link_problems`) — не то,
+            # чем пресет узнают, а разметка «Пресетов целые и частичные». Та же
+            # причина, по которой `_preset_project_payload` их выбрасывает при
+            # переносе настроек в проект.
+            continue
         if any(m in low for m in ("key", "token", "secret", "password", "auth")):
             continue
         if isinstance(v, (dict, list)):
@@ -2078,14 +2107,33 @@ def _file_kind(name: str) -> str:
 
 class PresetNew(BaseModel):
     name: str = ""
+    scope: str = "full"
+
+
+# Часть → заголовок группы и обратно — раз навсегда, из того же источника, что и
+# разрешение ссылок (`preset_fields.PARTS`), а не второй список здесь. Заголовки
+# `GROUPS` совпадают с ними дословно (см. `preset_fields.py`).
+_PART_TITLES = dict(preset_fields.PARTS)
+_TITLE_TO_PART = {title: part for part, title in preset_fields.PARTS}
+# Ключ поля формы → часть, которой он принадлежит. Только поля самой формы
+# (`GROUPS`) — `PART_EXTRA_KEYS` в форму не попадают и отправить их с пульта
+# нельзя (см. `known = preset_fields.keys()` в `ui_preset_save` ниже), поэтому
+# для проверки «поле связанной группы отправлять нельзя» этой карты достаточно.
+_KEY_TO_PART = {f.key: _TITLE_TO_PART.get(title)
+                for title, fields in preset_fields.GROUPS for f in fields}
 
 
 @app.post("/ui/presets/vsgen")
 def ui_preset_create(body: PresetNew, request: Request):
-    """Завести пресет производства. Возвращает номер — чтобы сразу открыть редактор."""
+    """Завести пресет производства — целый или частичный (батч «Пресеты целые и
+    частичные»). Возвращает номер — чтобы сразу открыть редактор.
+    """
     name = (body.name or "").strip()[:80]
     if not name:
         raise HTTPException(400, "у пресета должно быть имя")
+    scope = (body.scope or preset_links.FULL).strip().lower() or preset_links.FULL
+    if scope != preset_links.FULL and scope not in preset_links.PARTS:
+        raise HTTPException(400, f"нет такой части: «{body.scope}»")
     c = db()
     try:
         exists = c.execute("SELECT 1 FROM presets WHERE tenant_id=? AND name=?",
@@ -2101,11 +2149,46 @@ def ui_preset_create(body: PresetNew, request: Request):
     try:
         r = c.execute("SELECT id FROM presets WHERE tenant_id=? AND name=? "
                       "ORDER BY id DESC LIMIT 1", (TENANT, name)).fetchone()
+        if not r:
+            raise HTTPException(502, "кабинет не завёл пресет")
+        prid = r["id"]
     finally:
         c.close()
-    if not r:
-        raise HTTPException(502, "кабинет не завёл пресет")
-    return {"id": r["id"], "name": name}
+    if scope != preset_links.FULL:
+        # Кабинет уже создал пресет отдельным HTTP-запросом выше — та транзакция
+        # своя и уже закоммичена, откатить её отсюда нельзя (ревью цикла 1 фазы 2,
+        # Issue 4: комментарий раньше обещал общий откат создания и разметки, но
+        # его не было — оставался целый пресет без `_scope`, занявший имя навсегда).
+        # Честная гарантия здесь другая: разметка `_scope` — либо она проходит целиком
+        # в своей транзакции, либо на сбое явным DELETE убирается только что заведённый
+        # пресет — так имя освобождается и попытку можно повторить, а не наткнуться
+        # молча на «уже есть» для пресета без разметки.
+        c = db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            row = c.execute("SELECT settings FROM presets WHERE id=? AND tenant_id=?",
+                            (prid, TENANT)).fetchone()
+            try:
+                settings = json.loads(row["settings"]) if row and row["settings"] else {}
+            except (ValueError, TypeError):
+                settings = {}
+            if not isinstance(settings, dict):
+                settings = {}
+            settings["_scope"] = scope
+            c.execute("UPDATE presets SET settings=? WHERE id=? AND tenant_id=?",
+                      (json.dumps(settings, ensure_ascii=False), prid, TENANT))
+            c.commit()
+        except Exception:
+            c.rollback()
+            try:
+                c.execute("DELETE FROM presets WHERE id=? AND tenant_id=?", (prid, TENANT))
+                c.commit()
+            except Exception:                                      # noqa: BLE001
+                pass          # лучшая попытка — не заслонять исходную ошибку своей
+            raise
+        finally:
+            c.close()
+    return {"id": prid, "name": name, "scope": scope}
 
 
 def _neighbour_preset_names() -> dict:
@@ -2127,6 +2210,55 @@ def _neighbour_preset_names() -> dict:
     return {"preset_rewrite": rew, "preset_cover": cov}
 
 
+def _locked_parts(resolved: dict) -> set:
+    """Части целого пресета, у которых ссылка реально сработала — `resolve()`
+    подставил в выдачу поля частичного пресета вместо своих. Только эти группы
+    заблокированы для правки.
+
+    Одно правило на форму (`source`/`readonly` в `ui_preset_get`) и на сохранение
+    (какие поля отвергать в `ui_preset_save`) — а не два разных разбора одного и
+    того же `_links` (ревью цикла 1 фазы 2, Issue 2). Сломанная ссылка
+    (`_link_problems`) часть НЕ блокирует: по разделу 1 спецификации и примечанию
+    оркестратора к Issue 2, `resolve()` в этом случае оставляет группу на своих
+    полях — значит и здесь она обязана остаться редактируемой, иначе форма
+    показывала бы «только чтение», а сохранение то же самое поле бы приняло
+    (или наоборот).
+    """
+    if not isinstance(resolved, dict):
+        return set()
+    links = resolved.get("_links")
+    if not isinstance(links, dict):
+        return set()
+    broken = {p.get("part") for p in (resolved.get("_link_problems") or [])}
+    return {part for part in links if part in preset_links.PARTS and part not in broken}
+
+
+def _partial_options_by_part(c) -> dict:
+    """Частичные пресеты тенанта, сгруппированные по части — варианты для выбора
+    ссылки в редакторе целого пресета.
+
+    Только те, которые `preset_links.resolve()` реально примет: нужная часть и без
+    собственных ссылок (правило 4 — ссылок на ссылки нет), проверено общей функцией
+    `preset_links.partial_fits_part` (Issue 1 ревью цикла 2 фазы 2) — той же, что
+    использует `resolve()`. Иначе список предлагал бы ссылку, которую разрешение
+    потом откажется признать.
+    """
+    out = {part: [] for part in preset_links.PARTS}
+    for row in c.execute("SELECT id, name, settings FROM presets WHERE tenant_id=? "
+                         "ORDER BY name COLLATE NOCASE", (TENANT,)):
+        try:
+            s = json.loads(row["settings"]) if row["settings"] else {}
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(s, dict):
+            continue
+        scope = preset_links.scope_of(s)
+        if scope not in out or not preset_links.partial_fits_part(s, scope):
+            continue
+        out[scope].append({"id": row["id"], "name": row["name"] or f"пресет {row['id']}"})
+    return out
+
+
 @app.get("/ui/presets/vsgen/{prid:int}")
 def ui_preset_get(prid: int):
     """Поля пресета и их текущие значения.
@@ -2137,9 +2269,22 @@ def ui_preset_get(prid: int):
 
     Значения — через `preset_links.resolve` (батч «Пресеты целые и частичные»): если у
     группы стоит ссылка на частичный пресет, форма обязана показать то, чем реально
-    будет делаться ролик, а не пустые свои поля целого. (Разбивку по группам на «свои
-    поля / из частичного, только чтение» и список ссылок делает следующая фаза этого
-    же батча — здесь только подключение самого разрешения.)
+    будет делаться ролик, а не пустые свои поля целого.
+
+    Каждая группа дополнительно несёт `part` (часть, которую она закрывает), `source`
+    (`own` или `link`) и явный признак `readonly` — оба вычислены одним правилом
+    (`_locked_parts`, ревью цикла 1 фазы 2, Issue 2): группа только для чтения
+    ровно тогда, когда `resolve()` реально подставил в неё частичный пресет.
+    Сломанная ссылка — это НЕ `readonly`: `resolve()` в этом случае оставляет
+    группу на своих полях, и сохранение (`ui_preset_save`) те же поля примет —
+    форма и запись не должны расходиться в том, что можно поправить.
+    `link_id`/`link_name` — на что стоит ссылка (по сырому `_links`, а не по тому,
+    сработала ли она — это нужно, чтобы показать «на что указывает» даже у
+    сломанной ссылки), `link_problem` — причина, если она сломана (`_link_problems`
+    от `resolve()`), а рядом — `link_options`: частичные пресеты этой части, из
+    которых можно выбрать. Свои поля целого при этом никуда не делись: они
+    остаются в самих настройках пресета, `resolve()` их не стирает, только
+    подменяет в выдаче — снятие ссылки их и вернёт.
     """
     c = db()
     try:
@@ -2148,13 +2293,45 @@ def ui_preset_get(prid: int):
         if not r:
             raise HTTPException(404, "нет такого пресета")
         resolved = preset_links.resolve(c, prid)
+        users = preset_links.users_of(c, prid)
+        links = resolved.get("_links") or {}
+        problems = {p.get("part"): p.get("why") for p in resolved.get("_link_problems") or []}
+        link_ids = sorted({lid for lid in (preset_links.parse_link_ref(links.get(p))
+                                           for p in preset_links.PARTS) if lid is not None})
+        names_by_id = {}
+        if link_ids:
+            placeholders = ",".join("?" for _ in link_ids)
+            for row in c.execute(
+                    f"SELECT id, name FROM presets WHERE tenant_id=? AND id IN ({placeholders})",
+                    (TENANT, *link_ids)):
+                names_by_id[row["id"]] = row["name"] or f"пресет {row['id']}"
+        options_by_part = _partial_options_by_part(c)
     finally:
         c.close()
     mod = sys.modules.get("main")
+    groups = preset_fields.describe(mod, resolved, _neighbour_preset_names())
+    locked_parts = _locked_parts(resolved)
+    for g in groups:
+        part = _TITLE_TO_PART.get(g["title"])
+        g["part"] = part
+        if part is None:
+            continue
+        lid = preset_links.parse_link_ref(links.get(part))
+        g["source"] = "link" if part in locked_parts else "own"
+        g["readonly"] = part in locked_parts
+        g["link_id"] = lid
+        g["link_name"] = names_by_id.get(lid) if lid is not None else None
+        g["link_problem"] = problems.get(part, "")
+        g["link_options"] = options_by_part.get(part, [])
     return {"id": r["id"], "name": r["name"] or f"пресет {r['id']}",
-            "groups": preset_fields.describe(mod, resolved, _neighbour_preset_names()),
+            "scope": preset_links.scope_of(resolved),
+            "links": links, "link_problems": resolved.get("_link_problems") or [],
+            "users": users,
+            "groups": groups,
             "note": ("Пустое поле означает «как по умолчанию». Проверку значений делает "
-                     "кабинет при сохранении — теми же контрактами, что и всегда.")}
+                     "кабинет при сохранении — теми же контрактами, что и всегда. "
+                     "Уже поставленные задачи правка не меняет — их настройки заморожены "
+                     "в момент запуска. Изменится со следующего запуска.")}
 
 
 class PresetSave(BaseModel):
@@ -2170,15 +2347,130 @@ def ui_preset_save(prid: int, body: PresetSave, request: Request):
     (`_canonical_image_params`, `_normalize_lumean_settings`) и там же делается merge —
     ключи, которых в этой форме нет, не затираются. Повторять проверки здесь значило бы
     завести вторую, отстающую версию правил.
+
+    Поля связанной группы (та, у которой ссылка реально сработала) отправлять нельзя:
+    они не этого пресета, а частичного, на который он ссылается — правка тут ничего бы
+    не изменила по-настоящему, только создала бы у человека иллюзию, что изменила.
+    Заблокированные части — те же самые, что `ui_preset_get` показывает `readonly`
+    (`_locked_parts` — общее правило, ревью цикла 1 фазы 2, Issue 2): если у ссылки
+    есть проблема (`_link_problems`), группа не блокируется — `resolve()` в этом
+    случае и так оставляет её на своих полях, значит их можно и сохранить.
     """
     known = preset_fields.keys()
     unknown = sorted(set(body.values) - known)
     if unknown:
         raise HTTPException(400, "неизвестные поля: " + ", ".join(unknown))
+    c = db()
+    try:
+        row = c.execute("SELECT id FROM presets WHERE id=? AND tenant_id=?",
+                        (prid, TENANT)).fetchone()
+        if not row:
+            raise HTTPException(404, "нет такого пресета")
+        resolved = preset_links.resolve(c, prid)
+    finally:
+        c.close()
+    locked_parts = _locked_parts(resolved)
+    locked = sorted({k for k in body.values if _KEY_TO_PART.get(k) in locked_parts})
+    if locked:
+        raise HTTPException(
+            400, "поля связанной группы не отправляются: " + ", ".join(locked))
     fields = [("name", (body.name or "").strip()[:80])]
     fields += [(k, "" if v is None else str(v)) for k, v in body.values.items()]
     _cabinet_form(f"/api/presets/{prid}/edit", fields, request,
                   expect_json=False)
+    return {"ok": True}
+
+
+class PresetLinkIn(BaseModel):
+    part: str = ""
+    # StrictInt, а не int (ревью цикла 1 фазы 2, Issue 1): у pydantic 2.13 обычный
+    # `int` в нестрогом режиме молча приводит к числу и строку из цифр ("12"), и
+    # дробное без остатка (12.0), и даже bool (True → 1). Решение владельца — «при
+    # записи приводить к int, строку отвергать» (ревью цикла 2 фазы 1, п.5) — именно
+    # запрет, а не тихое приведение. StrictInt отвергает всё перечисленное 422-м ещё
+    # до входа в обработчик, настоящее целое JSON-число проходит как есть.
+    #
+    # Без значения по умолчанию (Issue 2 ревью цикла 2 фазы 2): контракт ручки —
+    # `{part, preset_id | null}`, снятие ссылки задаётся ЯВНЫМ `null`, а не
+    # отсутствием поля. С умолчанием `= None` тело `{"part": "images"}` без
+    # `preset_id` молча читалось бы как «снять ссылку» и отвечало 200 — непроверенный
+    # ввод на границе. Без умолчания то же тело даёт 422 ещё до обработчика, а
+    # явный `{"part": "images", "preset_id": null}` по-прежнему снимает ссылку.
+    preset_id: StrictInt | None
+
+
+@app.post("/ui/presets/vsgen/{prid:int}/links")
+def ui_preset_link_set(prid: int, body: PresetLinkIn):
+    """Поставить или снять ссылку одной группы целого пресета на частичный.
+
+    `preset_id=null` — снять: своя группа уже лежит в настройках нетронутой
+    (`resolve()` её не стирает, только подменяет в выдаче), достаточно убрать запись
+    из `_links`. Ссылка хранится только числом (решения ревью цикла 2 фазы 1): тело —
+    pydantic-модель с `preset_id: StrictInt | None`, и строка (в том числе из цифр),
+    дробное и `bool` отвергаются ещё до входа в обработчик, а не приводятся к числу
+    молча (ревью цикла 1 фазы 2, Issue 1 — обычный `int` у pydantic это делал).
+
+    Проверки — те же, что и у `resolve()`, потому что ссылку, которую он не примет,
+    ставить незачем: пресет обязан быть целым, частичный — существовать, быть того же
+    тенанта, нужной части и без собственных ссылок (правило 4).
+    """
+    part = (body.part or "").strip().lower()
+    if part not in preset_links.PARTS:
+        raise HTTPException(400, f"нет такой части: «{body.part}»")
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT settings FROM presets WHERE id=? AND tenant_id=?",
+                        (prid, TENANT)).fetchone()
+        if not row:
+            raise HTTPException(404, "нет такого пресета")
+        try:
+            settings = json.loads(row["settings"]) if row["settings"] else {}
+        except (ValueError, TypeError):
+            settings = {}
+        if not isinstance(settings, dict):
+            settings = {}
+        if preset_links.scope_of(settings) != preset_links.FULL:
+            raise HTTPException(400, "ссылки ставятся только у целого пресета")
+        # `dict(...)` на списке или строке роняет `TypeError`/`ValueError` (ревью
+        # цикла 1 фазы 2, Issue 3): испорченный `_links` (объект/список/мусор,
+        # решения после ревью цикла 3 фазы 1 называют это сломанной ссылкой, а не
+        # поводом падать) начинаем как пустой набор — снять или переставить ссылку
+        # такого пресета через API можно, а не только правкой базы напрямую.
+        links_raw = settings.get("_links")
+        links = dict(links_raw) if isinstance(links_raw, dict) else {}
+        if body.preset_id is None:
+            links.pop(part, None)
+        else:
+            partial_row = c.execute(
+                "SELECT settings FROM presets WHERE id=? AND tenant_id=?",
+                (body.preset_id, TENANT)).fetchone()
+            if not partial_row:
+                raise HTTPException(404, "частичный пресет не найден")
+            try:
+                partial = json.loads(partial_row["settings"]) if partial_row["settings"] else {}
+            except (ValueError, TypeError):
+                partial = {}
+            if not isinstance(partial, dict):
+                partial = {}
+            if preset_links.scope_of(partial) != part:
+                raise HTTPException(400, "частичный пресет не той части")
+            # Общая функция вместо своей проверки own_links (Issue 1 ревью цикла 2
+            # фазы 2): часть уже совпала веткой выше, значит `partial_fits_part`
+            # здесь проверяет ровно «нет своих ссылок» — тем же кодом, что и `resolve()`.
+            if not preset_links.partial_fits_part(partial, part):
+                raise HTTPException(
+                    400, "у частичного пресета есть свои ссылки — так нельзя")
+            links[part] = int(body.preset_id)
+        settings["_links"] = links
+        c.execute("UPDATE presets SET settings=? WHERE id=? AND tenant_id=?",
+                  (json.dumps(settings, ensure_ascii=False), prid, TENANT))
+        c.commit()
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
     return {"ok": True}
 
 

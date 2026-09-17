@@ -15,6 +15,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -23,6 +24,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
 
 PULT = os.environ.get("VS_PULT_URL", "http://127.0.0.1:8080/studio")
+# Кабинет живёт в том же процессе под корнем платформы (web/platform.py) — сквозная
+# проверка через `POST /api/presets/{id}/apply` бьёт туда напрямую, а не через /studio.
+PLATFORM = os.environ.get("VS_PLATFORM_BASE",
+                          PULT[: -len("/studio")] if PULT.endswith("/studio") else PULT)
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 LOGIN = os.environ.get("VS_DEV_LOGIN", "dev")
 # Пароль стенда задаётся тем же способом, что и в dev/provision.py — одним значением
@@ -74,6 +79,14 @@ class Client:
     def has_session(self) -> bool:
         return any(ck.name == "vs_session" for ck in self.jar)
 
+    def session_cookie(self) -> str:
+        """Значение `vs_session` — единый вход у пульта и кабинета (то же имя, то
+        же значение), нужно для похода к кабинету напрямую в обход `Client.go()`."""
+        for ck in self.jar:
+            if ck.name == "vs_session":
+                return ck.value or ""
+        return ""
+
 
 def plan_rows(url_like: str) -> int:
     c = sqlite3.connect(DB, timeout=5)
@@ -121,6 +134,82 @@ def drop_preset(prid: int) -> None:
         c.commit()
     finally:
         c.close()
+
+
+def preset_settings(prid: int) -> dict:
+    """Сырые `settings` пресета из базы — для проверок, до которых API не пускает
+    (тип значения в `_links`, порча состояния частичного напрямую в обход API)."""
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        row = c.execute("SELECT settings FROM presets WHERE id=?", (prid,)).fetchone()
+        return json.loads(row[0]) if row and row[0] else {}
+    finally:
+        c.close()
+
+
+def write_preset_settings(prid: int, settings: dict) -> None:
+    """Записать `settings` пресета напрямую — имитирует легаси-данные / порчу в обход
+    API (частичный пресет со своими ссылками, который сама ручка API завести не даёт)."""
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        c.execute("UPDATE presets SET settings=? WHERE id=?",
+                  (json.dumps(settings, ensure_ascii=False), prid))
+        c.commit()
+    finally:
+        c.close()
+
+
+def project_settings(pid: str) -> dict:
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        row = c.execute("SELECT settings FROM projects WHERE id=?", (pid,)).fetchone()
+        return json.loads(row[0]) if row and row[0] else {}
+    finally:
+        c.close()
+
+
+def insert_channel(name: str, preset_vsgen_id) -> int:
+    """Канал, указывающий на пресет, — минимальная строка без похода через API
+    кабинета (у канала своя, более тяжёлая форма заведения, здесь важна только
+    связь `preset_vsgen_id` для проверки «кто бежит»)."""
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        cur = c.execute(
+            "INSERT INTO pub_channels(tenant_id, name, preset_vsgen_id, created, updated) "
+            "VALUES('dev', ?, ?, ?, ?)",
+            (name, preset_vsgen_id, time.time(), time.time()))
+        c.commit()
+        return cur.lastrowid
+    finally:
+        c.close()
+
+
+def drop_channel(chid: int) -> None:
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        c.execute("DELETE FROM pub_channels WHERE id=?", (chid,))
+        c.commit()
+    finally:
+        c.close()
+
+
+def cabinet_apply_preset(base_url: str, cookie_header: str, prid: int, pid: str):
+    """`POST /api/presets/{prid}/apply` кабинета напрямую — той же сессией, что и
+    пульт (единый вход, то же имя и значение куки `vs_session`). Кабинет разбирает
+    тело как `application/x-www-form-urlencoded`, а не JSON (`_form()` в main.py),
+    поэтому вызов нельзя сделать общим `Client.go()`, который всегда шлёт JSON.
+    Редиректы кабинет не запрещает — по умолчанию их отслеживает сам urllib.
+    """
+    data = urllib.parse.urlencode({"pid": pid}).encode("utf-8")
+    req = urllib.request.Request(base_url + f"/api/presets/{prid}/apply",
+                                 data=data, method="POST")
+    req.add_header("Content-Type", "application/x-www-form-urlencoded")
+    req.add_header("Cookie", cookie_header)
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return resp.status
+    except urllib.error.HTTPError as exc:
+        return exc.code
 
 
 def main() -> int:
@@ -243,6 +332,393 @@ def main() -> int:
         drop_preset(prid)
         check("пресет убран за собой", preset_row(prid) is None, True)
     check("чужого пресета нет", me.go("/ui/presets/vsgen/999999")[0], 404)
+
+    print("\nПресеты целые и частичные: ссылка на группу")
+    p_partial_name = "тест пульта: частичный images"
+    code, body = me.go("/ui/presets/vsgen", {"name": p_partial_name, "scope": "images"})
+    check("частичный пресет (images) заведён", code, 200)
+    check("scope вернулся", (body or {}).get("scope"), "images")
+    partial_id = (body or {}).get("id")
+
+    p_partial_voice_name = "тест пульта: частичный voice"
+    code, body = me.go("/ui/presets/vsgen", {"name": p_partial_voice_name, "scope": "voice"})
+    check("второй частичный (voice) заведён", code, 200)
+    partial_voice_id = (body or {}).get("id")
+
+    check("незнакомая часть в scope отвергнута",
+          me.go("/ui/presets/vsgen", {"name": "тест пульта: плохой scope",
+                                       "scope": "ерунда"})[0], 400)
+
+    if partial_id and partial_voice_id:
+        check("своё поле частичного сохраняется",
+              me.go(f"/ui/presets/vsgen/{partial_id}",
+                    {"name": p_partial_name, "values": {"style": "из частичного"}})[0], 200)
+
+        p_full_name = "тест пульта: целый со ссылкой"
+        code, body = me.go("/ui/presets/vsgen", {"name": p_full_name})
+        check("целый пресет заведён", code, 200)
+        check("scope целого — full", (body or {}).get("scope"), "full")
+        full_id = (body or {}).get("id")
+
+        if full_id:
+            check("своё поле целого сохранено",
+                  me.go(f"/ui/presets/vsgen/{full_id}",
+                        {"name": p_full_name, "values": {"style": "своё"}})[0], 200)
+
+            check("ссылку нельзя поставить у частичного пресета",
+                  me.go(f"/ui/presets/vsgen/{partial_id}/links",
+                        {"part": "images", "preset_id": full_id})[0], 400)
+            check("неизвестная часть в ссылке отвергнута",
+                  me.go(f"/ui/presets/vsgen/{full_id}/links",
+                        {"part": "ерунда", "preset_id": partial_id})[0], 400)
+            check("ссылка на частичный не той части отвергнута",
+                  me.go(f"/ui/presets/vsgen/{full_id}/links",
+                        {"part": "images", "preset_id": partial_voice_id})[0], 400)
+            check("ссылка на несуществующий частичный отвергнута",
+                  me.go(f"/ui/presets/vsgen/{full_id}/links",
+                        {"part": "images", "preset_id": 999999})[0], 404)
+
+            check("ссылка поставлена",
+                  me.go(f"/ui/presets/vsgen/{full_id}/links",
+                        {"part": "images", "preset_id": partial_id})[0], 200)
+
+            code, d = me.go(f"/ui/presets/vsgen/{full_id}")
+            check("поля пришли со ссылкой", code, 200)
+            check("scope верхнего уровня — full", d.get("scope"), "full")
+            check("ссылка видна в links", d.get("links", {}).get("images"), partial_id)
+            group = next(g for g in d["groups"] if g["title"] == "Картинки")
+            check("источник группы — ссылка", group.get("source"), "link")
+            check("явный признак «только чтение» тоже стоит (ревью цикла 1 фазы 2, Issue 2)",
+                  group.get("readonly"), True)
+            check("id ссылки — частичный пресет", group.get("link_id"), partial_id)
+            check("имя ссылки — имя частичного", group.get("link_name"), p_partial_name)
+            field = {f["key"]: f for f in group["fields"]}
+            check("значение поля группы — из частичного (только чтение по source)",
+                  field["style"]["value"], "из частичного")
+            other_group = next(g for g in d["groups"] if g["title"] == "Озвучка")
+            check("другая группа ссылкой не тронута", other_group.get("source"), "own")
+            check("у несвязанной группы признак read-only снят",
+                  other_group.get("readonly"), False)
+            check("частичный этой части виден в вариантах для выбора",
+                  partial_id in [o["id"] for o in group.get("link_options") or []], True)
+
+            check("сохранение поля связанной группы отвергнуто",
+                  me.go(f"/ui/presets/vsgen/{full_id}",
+                        {"name": p_full_name, "values": {"style": "подмена"}})[0], 400)
+            code, d = me.go(f"/ui/presets/vsgen/{full_id}")
+            field = {f["key"]: f for g in d["groups"] for f in g["fields"]}
+            check("отвергнутое сохранение не подменило значение из частичного",
+                  field["style"]["value"], "из частичного")
+
+            check("ссылка снята",
+                  me.go(f"/ui/presets/vsgen/{full_id}/links",
+                        {"part": "images", "preset_id": None})[0], 200)
+            code, d = me.go(f"/ui/presets/vsgen/{full_id}")
+            group = next(g for g in d["groups"] if g["title"] == "Картинки")
+            check("после снятия ссылки источник — свои поля", group.get("source"), "own")
+            check("после снятия ссылки признак read-only снят", group.get("readonly"), False)
+            field = {f["key"]: f for f in group["fields"]}
+            check("свои поля вернулись такими, какими были",
+                  field["style"]["value"], "своё")
+
+            print("\nСписок пресетов видит scope и users")
+            code, d = me.go("/ui/presets")
+            vsgen_group = next(g for g in d["groups"] if g["service"] == "vsgen")
+            items = {i["key"]: i for i in vsgen_group["items"]}
+            check("список пресетов показывает scope целого",
+                  items.get(str(full_id), {}).get("scope"), "full")
+            check("список пресетов показывает scope частичного",
+                  items.get(str(partial_id), {}).get("scope"), "images")
+            check("users присутствует у пресета в списке",
+                  "users" in items.get(str(full_id), {}), True)
+
+            drop_preset(full_id)
+            check("целый пресет убран за собой", preset_row(full_id) is None, True)
+        drop_preset(partial_id)
+        check("частичный (images) убран за собой", preset_row(partial_id) is None, True)
+        drop_preset(partial_voice_id)
+        check("частичный (voice) убран за собой", preset_row(partial_voice_id) is None, True)
+
+    print("\nПресеты целые и частичные — доп. проверки фазы 2 (QA)")
+
+    # --- 1. Ссылка ломается уже после того, как её поставили: частичный удалён ---
+    qa_partial_a = "QA: частичный images A"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_partial_a, "scope": "images"})
+    check("QA частичный A заведён", code, 200)
+    qa_a_id = (body or {}).get("id")
+
+    qa_full_1 = "QA: целый, ссылка ломается"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_full_1})
+    check("QA целый 1 заведён", code, 200)
+    qa_full1_id = (body or {}).get("id")
+
+    if qa_a_id and qa_full1_id:
+        me.go(f"/ui/presets/vsgen/{qa_a_id}",
+              {"name": qa_partial_a, "values": {"style": "A-стиль"}})
+        me.go(f"/ui/presets/vsgen/{qa_full1_id}",
+              {"name": qa_full_1, "values": {"style": "свой-стиль-1"}})
+        check("ссылка на A поставлена",
+              me.go(f"/ui/presets/vsgen/{qa_full1_id}/links",
+                    {"part": "images", "preset_id": qa_a_id})[0], 200)
+
+        drop_preset(qa_a_id)                    # частичный убран из-под ссылки
+        code, d = me.go(f"/ui/presets/vsgen/{qa_full1_id}")
+        check("форма всё равно открывается (пропавший частичный не роняет её)", code, 200)
+        check("проблема ссылки видна на верхнем уровне",
+              [p["part"] for p in d.get("link_problems") or []], ["images"])
+        check("причина — частичный удалён/повреждён",
+              (d.get("link_problems") or [{}])[0].get("why"),
+              "частичный пресет удалён или его настройки повреждены")
+        group = next(g for g in d["groups"] if g["title"] == "Картинки")
+        check("проблема видна и на самой группе", bool(group.get("link_problem")), True)
+        field = {f["key"]: f for f in group["fields"]}
+        check("сломанная ссылка — молча не подставляется: поле осталось своим",
+              field["style"]["value"], "свой-стиль-1")
+        # Ревью цикла 1 фазы 2, Issue 2 (примечание оркестратора): сломанная ссылка НЕ
+        # блокирует группу — `resolve()` оставляет её на своих полях, значит форма
+        # обязана показать «свои поля, можно править», а не «только чтение».
+        check("источник группы со сломанной ссылкой — свои поля, а не link",
+              group.get("source"), "own")
+        check("явный признак read-only снят у группы со сломанной ссылкой",
+              group.get("readonly"), False)
+        check("поле группы со сломанной ссылкой сохраняется (не отвергается сервером)",
+              me.go(f"/ui/presets/vsgen/{qa_full1_id}",
+                    {"name": qa_full_1, "values": {"style": "переправлено-после-обрыва"}})[0],
+              200)
+        code, d = me.go(f"/ui/presets/vsgen/{qa_full1_id}")
+        field = {f["key"]: f for g in d["groups"] for f in g["fields"] if g["title"] == "Картинки"}
+        check("сохранённое значение видно в форме — форма и сохранение согласны",
+              field["style"]["value"], "переправлено-после-обрыва")
+
+        drop_preset(qa_full1_id)
+        check("QA целый 1 убран за собой", preset_row(qa_full1_id) is None, True)
+
+    # --- 3-доп. Испорченный `_links` целиком (не словарь, а список/строка) — снятие
+    # или постановка ссылки через API не падает 500 (ревью цикла 1 фазы 2, Issue 3) ---
+    qa_full_g = "QA: целый, _links испорчен целиком"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_full_g})
+    qa_g_id = (body or {}).get("id")
+    if qa_g_id:
+        settings = preset_settings(qa_g_id)
+        settings["_links"] = ["images", 1]          # не словарь целиком — то самое Issue 3
+        write_preset_settings(qa_g_id, settings)
+
+        code, d = me.go(f"/ui/presets/vsgen/{qa_g_id}")
+        check("форма не падает, когда весь _links не словарь", code, 200)
+
+        code, _ = me.go(f"/ui/presets/vsgen/{qa_g_id}/links",
+                        {"part": "images", "preset_id": None})
+        check("снятие ссылки на испорченном целиком _links не даёт 500", code, 200)
+
+        qa_partial_g = "QA: частичный images G (испорченный _links)"
+        code, body = me.go("/ui/presets/vsgen", {"name": qa_partial_g, "scope": "images"})
+        qa_g_partial_id = (body or {}).get("id")
+        if qa_g_partial_id:
+            settings = preset_settings(qa_g_id)
+            settings["_links"] = "мусор"            # снова испорчен целиком — строка
+            write_preset_settings(qa_g_id, settings)
+            code, _ = me.go(f"/ui/presets/vsgen/{qa_g_id}/links",
+                            {"part": "images", "preset_id": qa_g_partial_id})
+            check("постановка ссылки поверх испорченного целиком _links не даёт 500",
+                  code, 200)
+            stored = preset_settings(qa_g_id).get("_links")
+            check("после постановки _links снова нормальный словарь",
+                  (isinstance(stored, dict), stored.get("images")),
+                  (True, qa_g_partial_id))
+            drop_preset(qa_g_partial_id)
+
+        drop_preset(qa_g_id)
+
+    # --- 2. Ссылка ведёт на частичный, у которого (в обход API) появились свои
+    # ссылки — состояние, которое сама ручка API завести не даёт, но старые данные
+    # или прямая правка базы могут. resolve() обязан отказать, а не рекурсировать. ---
+    qa_partial_b = "QA: частичный voice B"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_partial_b, "scope": "voice"})
+    check("QA частичный B (voice) заведён", code, 200)
+    qa_b_id = (body or {}).get("id")
+
+    qa_full_2 = "QA: целый, частичный со своими ссылками"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_full_2})
+    check("QA целый 2 заведён", code, 200)
+    qa_full2_id = (body or {}).get("id")
+
+    if qa_b_id and qa_full2_id:
+        me.go(f"/ui/presets/vsgen/{qa_full2_id}",
+              {"name": qa_full_2, "values": {"engine": "edge"}})
+        check("ссылка на B поставлена",
+              me.go(f"/ui/presets/vsgen/{qa_full2_id}/links",
+                    {"part": "voice", "preset_id": qa_b_id})[0], 200)
+
+        # Порча в обход API: у частичного B появляется собственный _links.
+        b_settings = preset_settings(qa_b_id)
+        b_settings["_links"] = {"images": 999999}
+        write_preset_settings(qa_b_id, b_settings)
+
+        code, d = me.go(f"/ui/presets/vsgen/{qa_full2_id}")
+        check("форма не падает на испорченном частичном", code, 200)
+        problems = {p["part"]: p["why"] for p in d.get("link_problems") or []}
+        check("причина — у частичного есть свои ссылки",
+              problems.get("voice"), "у частичного пресета есть свои ссылки — так нельзя")
+        group = next(g for g in d["groups"] if g["title"] == "Озвучка")
+        check("источник группы со ссылкой на испорченный частичный — свои поля",
+              group.get("source"), "own")
+        check("признак read-only снят и здесь", group.get("readonly"), False)
+        field = {f["key"]: f for f in group["fields"]}
+        check("своё поле группы уцелело (ссылка отвергнута целиком)",
+              field["engine"]["value"], "edge")
+
+        drop_preset(qa_full2_id)
+        drop_preset(qa_b_id)
+        check("QA целый 2 и частичный B убраны за собой",
+              (preset_row(qa_full2_id), preset_row(qa_b_id)), (None, None))
+
+    # --- 3. Ссылки пишутся только числом (решение владельца, ревью цикла 2 фазы 1,
+    # п.5): нечисловая строка, в том числе состоящая из цифр, дробное и bool
+    # отвергаются ещё до обработчика — StrictInt (ревью цикла 1 фазы 2, Issue 1
+    # закрепил это тестом вместо прежнего «числовая строка сейчас принимается»,
+    # что документировало отклонение от решения, а не выносило его на решение). ---
+    qa_partial_c = "QA: частичный images C (типы ссылок)"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_partial_c, "scope": "images"})
+    qa_c_id = (body or {}).get("id")
+    qa_full_3 = "QA: целый, типы ссылок"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_full_3})
+    qa_full3_id = (body or {}).get("id")
+    if qa_c_id and qa_full3_id:
+        check("нечисловая строка в preset_id отвергнута (422 — StrictInt)",
+              me.go(f"/ui/presets/vsgen/{qa_full3_id}/links",
+                    {"part": "images", "preset_id": "не-число"})[0], 422)
+        check("дробное число в preset_id отвергнуто (422 — StrictInt)",
+              me.go(f"/ui/presets/vsgen/{qa_full3_id}/links",
+                    {"part": "images", "preset_id": 1.5})[0], 422)
+        check("числовая строка в preset_id отвергнута (422 — StrictInt)",
+              me.go(f"/ui/presets/vsgen/{qa_full3_id}/links",
+                    {"part": "images", "preset_id": str(qa_c_id)})[0], 422)
+        check("bool в preset_id отвергнут (422 — StrictInt, bool это подкласс int)",
+              me.go(f"/ui/presets/vsgen/{qa_full3_id}/links",
+                    {"part": "images", "preset_id": True})[0], 422)
+        check("настоящее целое число в preset_id принято",
+              me.go(f"/ui/presets/vsgen/{qa_full3_id}/links",
+                    {"part": "images", "preset_id": qa_c_id})[0], 200)
+        stored = preset_settings(qa_full3_id).get("_links", {}).get("images")
+        check("в базе лежит int", (stored, type(stored).__name__), (qa_c_id, "int"))
+
+        # Отсутствующее поле preset_id — 422, а не молчаливое снятие ссылки
+        # (Issue 2 ревью цикла 2 фазы 2): контракт — `{part, preset_id | null}`,
+        # снятие задаётся ЯВНЫМ null, а не отсутствием поля в теле запроса.
+        code, _ = me.go(f"/ui/presets/vsgen/{qa_full3_id}/links", {"part": "images"})
+        check("отсутствующий preset_id отвергнут (422 — поле обязательно)", code, 422)
+        stored = preset_settings(qa_full3_id).get("_links", {}).get("images")
+        check("ссылка не снята отсутствующим полем", (stored, type(stored).__name__),
+              (qa_c_id, "int"))
+
+        drop_preset(qa_full3_id)
+        drop_preset(qa_c_id)
+
+    # --- 4. Список пресетов — links в каждом элементе, users — реальные держатели ---
+    qa_partial_d = "QA: частичный images D (users_of)"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_partial_d, "scope": "images"})
+    qa_d_id = (body or {}).get("id")
+    qa_full_4 = "QA: целый, users_of сквозняком"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_full_4})
+    qa_full4_id = (body or {}).get("id")
+    qa_channel_id = None
+    if qa_d_id and qa_full4_id:
+        me.go(f"/ui/presets/vsgen/{qa_full4_id}/links",
+              {"part": "images", "preset_id": qa_d_id})
+        qa_channel_id = insert_channel("QA канал на пресете", qa_full4_id)
+
+        code, d = me.go("/ui/presets")
+        vsgen_group = next(g for g in d["groups"] if g["service"] == "vsgen")
+        items = {i["key"]: i for i in vsgen_group["items"]}
+        check("links виден в списке у целого пресета",
+              items.get(str(qa_full4_id), {}).get("links"), {"images": qa_d_id})
+        check("список пресетов видит реальный канал (users.channels == 1)",
+              items.get(str(qa_full4_id), {}).get("users", {}).get("channels"), 1)
+
+        code, d = me.go(f"/ui/presets/vsgen/{qa_full4_id}")
+        check("users.channels в форме целого содержит наш канал",
+              [c["id"] for c in d.get("users", {}).get("channels") or []], [qa_channel_id])
+
+        code, d = me.go(f"/ui/presets/vsgen/{qa_d_id}")
+        check("у частичного users.presets содержит целый-держатель",
+              [p["id"] for p in d.get("users", {}).get("presets") or []], [qa_full4_id])
+        check("у частичного users.via содержит канал держателя транзитивно",
+              [c["id"] for c in d.get("users", {}).get("via") or []], [qa_channel_id])
+
+        drop_channel(qa_channel_id)
+        drop_preset(qa_full4_id)
+        drop_preset(qa_d_id)
+
+    # --- 5. Сохранение поля НЕсвязанной группы проходит, даже когда другая группа
+    # того же целого пресета заблокирована ссылкой ---
+    qa_partial_e = "QA: частичный images E (частичная блокировка)"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_partial_e, "scope": "images"})
+    qa_e_id = (body or {}).get("id")
+    qa_full_5 = "QA: целый, частичная блокировка полей"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_full_5})
+    qa_full5_id = (body or {}).get("id")
+    if qa_e_id and qa_full5_id:
+        me.go(f"/ui/presets/vsgen/{qa_full5_id}/links",
+              {"part": "images", "preset_id": qa_e_id})
+        check("поле связанной группы (images.style) отвергнуто",
+              me.go(f"/ui/presets/vsgen/{qa_full5_id}",
+                    {"name": qa_full_5, "values": {"style": "подмена"}})[0], 400)
+        check("поле НЕсвязанной группы (voice.engine) сохраняется как обычно",
+              me.go(f"/ui/presets/vsgen/{qa_full5_id}",
+                    {"name": qa_full_5, "values": {"engine": "edge"}})[0], 200)
+        code, d = me.go(f"/ui/presets/vsgen/{qa_full5_id}")
+        field = {f["key"]: f for g in d["groups"] for f in g["fields"]}
+        check("сохранённое поле несвязанной группы видно в форме",
+              field["engine"]["value"], "edge")
+
+        drop_preset(qa_full5_id)
+        drop_preset(qa_e_id)
+
+    # --- 6. Сквозная проверка через кабинет (пункт 6 проверки батча): применение
+    # пресета со ссылкой к проекту кладёт в projects.settings поля из частичного,
+    # а не свои поля целого, и без служебных `_`-ключей метаданных. ---
+    qa_partial_f = "QA: частичный images F (сквозная через кабинет)"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_partial_f, "scope": "images"})
+    qa_f_id = (body or {}).get("id")
+    qa_full_6 = "QA: целый, сквозная через кабинет"
+    code, body = me.go("/ui/presets/vsgen", {"name": qa_full_6})
+    qa_full6_id = (body or {}).get("id")
+    qa_pid = None
+    if qa_f_id and qa_full6_id:
+        me.go(f"/ui/presets/vsgen/{qa_f_id}",
+              {"name": qa_partial_f, "values": {"style": "из-частичного-F"}})
+        me.go(f"/ui/presets/vsgen/{qa_full6_id}",
+              {"name": qa_full_6, "values": {"style": "своё-у-целого-6"}})
+        check("ссылка на F поставлена",
+              me.go(f"/ui/presets/vsgen/{qa_full6_id}/links",
+                    {"part": "images", "preset_id": qa_f_id})[0], 200)
+
+        code, body = me.go("/ui/projects",
+                           {"name": "тест пульта: сквозная через кабинет",
+                            "text": "Раз. Два."})
+        check("проект для сквозной проверки заведён", code, 200)
+        qa_pid = str((body or {}).get("id") or "")
+
+        if qa_pid:
+            sid = me.session_cookie()
+            check("сессия для похода в кабинет есть", bool(sid), True)
+            status = cabinet_apply_preset(PLATFORM, f"vs_session={sid}",
+                                          qa_full6_id, qa_pid)
+            check("кабинет принял применение пресета (redirect → 200 по цепочке)",
+                  status, 200)
+            settings = project_settings(qa_pid)
+            check("в проект уехало значение из частичного, а не своё поле целого",
+                  settings.get("style"), "из-частичного-F")
+            check("_scope не утёк в проект", "_scope" in settings, False)
+            check("_links не утёк в проект", "_links" in settings, False)
+            check("_link_problems не утёк в проект", "_link_problems" in settings, False)
+            check("_applied_preset проставлен и указывает на применённый пресет",
+                  settings.get("_applied_preset"), qa_full6_id)
+
+            drop_project(qa_pid)
+
+        drop_preset(qa_full6_id)
+        drop_preset(qa_f_id)
 
     print("\nБатч 16.09.2026: списки короче, движок — нет")
     pname2 = "тест пульта: батч 16.09"

@@ -61,7 +61,7 @@ def group_keys(scope: str) -> set:
     return preset_fields.part_group_keys(scope) if scope in PARTS else set()
 
 
-def _parse_link_ref(raw):
+def parse_link_ref(raw):
     """Число id частичного пресета из значения `_links.<часть>`, или `None`, если
     ссылка сломана.
 
@@ -72,8 +72,9 @@ def _parse_link_ref(raw):
     не то, что можно молча передать в SQL: `sqlite3.ProgrammingError` на таком
     значении ронял `resolve()` и вместе с ним продвижение выпуска.
 
-    Разбор один на `resolve()` и `users_of()` (Issue 4) — иначе карточка «кто
-    бежит» показывала бы держателей, которых `resolve()` на самом деле отверг.
+    Публичная функция (Issue 1 ревью цикла 2 фазы 2): один разбор на `resolve()`,
+    `users_of()` и пульт (`web/app.py`, отображение `link_id`/`link_name`) — иначе
+    у формы и у разрешения были бы разные мнения о том, что считать числом ссылки.
     """
     if isinstance(raw, bool):
         return None                # bool — подкласс int в Python, но тут это не id
@@ -82,6 +83,29 @@ def _parse_link_ref(raw):
     if isinstance(raw, str) and raw.strip().isdigit():
         return int(raw.strip())
     return None
+
+
+# Обратная совместимость: `tests/test_preset_links.py` (фаза 1) зовёт разбор по
+# прежнему приватному имени — функция та же, имя публичное добавлено в фазе 2.
+_parse_link_ref = parse_link_ref
+
+
+def partial_fits_part(settings: dict, part: str) -> bool:
+    """True, если частичный пресет с настройками `settings` пригоден быть ссылкой
+    под часть `part`: его `_scope` — ровно `part`, и у него самого нет ссылок
+    (правило 4 — ссылок на ссылки нет).
+
+    Публичная функция (Issue 1 ревью цикла 2 фазы 2): та же проверка, что делает
+    `resolve()` при разрешении ссылки, нужна пульту дважды — при выборе варианта
+    (`_partial_options_by_part`) и при записи ссылки (`ui_preset_link_set`). Раньше
+    оба места в `web/app.py` повторяли условие самостоятельно; теперь оно одно.
+    """
+    if not isinstance(settings, dict):
+        return False
+    if scope_of(settings) != part:
+        return False
+    own_links = settings.get("_links")
+    return not (isinstance(own_links, dict) and own_links)
 
 
 def _load_row(c, preset_id):
@@ -138,7 +162,7 @@ def resolve(c, preset_id) -> dict:
         if part not in PARTS:
             continue
         keys = group_keys(part)
-        linked_id = _parse_link_ref(linked_raw)
+        linked_id = parse_link_ref(linked_raw)
         partial_row = None
         why = ""
         if linked_id is None:
@@ -158,7 +182,10 @@ def resolve(c, preset_id) -> dict:
                 why = "частичный пресет другого тенанта"
             elif scope_of(partial_row["settings"]) != part:
                 why = "частичный пресет не той части"
-            elif isinstance(partial_row["settings"].get("_links"), dict) and partial_row["settings"].get("_links"):
+            elif not partial_fits_part(partial_row["settings"], part):
+                # Тут `scope_of` уже совпал с `part` (ветка выше), значит единственная
+                # причина, по которой `partial_fits_part` может отказать — собственные
+                # ссылки частичного (правило 4). Общая функция вместо повтора условия.
                 why = "у частичного пресета есть свои ссылки — так нельзя"
         if why:
             # Ссылка сломана — молча подставлять нельзя: группа остаётся со своими
@@ -196,11 +223,11 @@ def users_of(c, preset_id) -> dict:
     загрузке заново парсил бы JSON всех проектов и всех пресетов тенанта.
     """
     out = {"channels": [], "projects": [], "presets": [], "via": []}
-    # Разбор тем же `_parse_link_ref`, что и `resolve()` (Issue 1 ревью цикла 4):
+    # Разбор тем же `parse_link_ref`, что и `resolve()` (Issue 1 ревью цикла 4):
     # id может прийти строкой (из URL пульта, фаза 2), а держателей в `_links`
     # `resolve()` находит по числу — если здесь сравнивать со строкой как есть,
     # `users_of("10")` и `users_of(10)` расходятся в поле `presets`.
-    preset_id = _parse_link_ref(preset_id)
+    preset_id = parse_link_ref(preset_id)
     if preset_id is None:
         return out
     row = _load_row(c, preset_id)
@@ -254,7 +281,7 @@ def users_of(c, preset_id) -> dict:
         # полный скан тенанта), а не окончательный ответ: объект/список в
         # `_links.<part>` тоже пройдёт CAST(...AS TEXT) не упав, но не совпадёт по
         # значению почти никогда, и на этот случай ниже стоит второй, уже питоновский
-        # разбор через `_parse_link_ref` — тем же кодом, что и `resolve()` (Issue 4).
+        # разбор через `parse_link_ref` — тем же кодом, что и `resolve()` (Issue 4).
         holder_rows = c.execute(
             "SELECT id, name, settings FROM presets WHERE tenant_id=? "
             "AND settings IS NOT NULL AND settings != '' AND json_valid(settings) "
@@ -276,7 +303,7 @@ def users_of(c, preset_id) -> dict:
                 # такой пресет не в счёт, даже если в его JSON завалялся мусорный
                 # `_links` (запрещённый, но не проверяемый на записи до фазы 2).
                 continue
-            if _parse_link_ref((hs.get("_links") or {}).get(scope)) != preset_id:
+            if parse_link_ref((hs.get("_links") or {}).get(scope)) != preset_id:
                 # Сама ссылка сломана (объект/список/не то значение) — resolve()
                 # её тоже не примет, значит и в «кто бежит» её не показываем.
                 continue
