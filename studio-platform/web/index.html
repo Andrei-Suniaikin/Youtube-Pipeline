@@ -2335,40 +2335,89 @@ function selectOptionsHtml(f){
     }>${esc(o.title)}</option>`).join('')}`;
 }
 
+// Строка «переключатель источника группы» (батч «Пресеты целые и частичные»): только
+// у групп, которые пришли из редактора ЦЕЛОГО пресета (`g.part` есть и вызывающая
+// сторона передала `onLinkChange` — у формы настроек проекта и у редактора частичного
+// пресета этого нет, и переключателя там не будет). «Свои поля / Из частичного
+// пресета» — ровно та формулировка, которую требует раздел 4 спецификации.
+function linkBarHtml(g){
+  const locked = !!g.readonly;
+  const options = g.link_options || [];
+  const attempted = g.link_id != null;
+  const linkOn = locked || attempted;
+  return `<div class="secbody" style="padding-top:14px;display:flex;flex-wrap:wrap;
+      gap:10px;align-items:center;border-bottom:1px solid var(--line);padding-bottom:14px">
+    <div class="modes" data-linkmodes="${esc(g.part)}" style="margin:0">
+      <button type="button" data-src="own" data-hadlink="${attempted ? '1' : ''}"
+        class="${linkOn ? '' : 'on'}">Свои поля</button>
+      <button type="button" data-src="link"
+        class="${linkOn ? 'on' : ''}">Из частичного пресета</button>
+    </div>
+    <select class="link-pick" data-part="${esc(g.part)}"${linkOn ? '' : ' hidden'}>
+      <option value="">— выбрать частичный —</option>
+      ${options.map(o => `<option value="${o.id}"${
+        g.link_id === o.id ? ' selected' : ''}>${esc(o.name)}</option>`).join('')}
+    </select>
+    ${!options.length
+      ? '<span class="note muted">Частичных пресетов этой части нет — сначала заведите один.</span>'
+      : ''}
+    ${locked
+      ? `<span class="note muted">Поля только для чтения — из пресета «${esc(g.link_name)}».
+           <a href="#/preset/${g.link_id}">Править его →</a></span>`
+      : ''}
+  </div>${g.link_problem
+    ? `<div class="err" style="margin:14px 18px 0">${esc(g.link_problem)}</div>` : ''}`;
+}
+
 // Форма настроек. Одна и та же для пресета и для проекта: это один набор полей —
 // пресет лишь заготовка, проект — его копия в момент заведения. Описание приходит с
 // сервера (server/preset_fields.py), здесь только отрисовка.
+// `groups.onLinkChange(part, presetIdOrNull)` — колбэк переключателя ссылки (только у
+// редактора целого пресета, вызывающая сторона вешает его на сам массив `groups`
+// перед вызовом). Не второй параметр функции: `tests/test_channel_settings_layout.py`
+// (батч A) ищет `fieldForm()` по буквальной сигнатуре `function fieldForm(groups){` —
+// менять её незачем, у вызова и так есть один объект, на который можно повесить
+// необязательное поле.
 function fieldForm(groups){
+  const onLinkChange = groups.onLinkChange;
   const form = $(`<form></form>`);
   for (const g of groups){
+    const locked = !!g.readonly;
+    const linkBar = (g.part && onLinkChange) ? linkBarHtml(g) : '';
     const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)}</div>
+      ${linkBar}
       <div class="fields">${g.fields.map(f => {
         const id = 'f-' + f.key;
         // Поле, отменённое другой настройкой, не прячем и не отключаем: readOnly
         // оставляет значение в форме (disabled-поля не отправляются, и сохранение
-        // стёрло бы их), а причина написана рядом — правило 2 ТЗ.
+        // стёрло бы их), а причина написана рядом — правило 2 ТЗ. Группа, у которой
+        // ссылка на частичный пресет реально сработала (`locked`), — другой случай:
+        // поле принадлежит не этому пресету, и его нельзя отправлять вовсе (сервер
+        // такую попытку отвергает), поэтому здесь именно `disabled`, а не `readonly`.
         const off = f.off ? ' readonly title="' + esc(f.off) + '"' : '';
         const body = f.kind === 'langmap'
           // Строки собираются в JS после вставки в DOM (wireLangMap): им нужен список
           // языков поля и значение соседнего поля «Движок» из этой же группы. Хранит
           // итог тот же скрытый input с data-key — form.read() не меняется вообще.
           ? `<div class="langmap" id="${id}-box">
-               <input type="hidden" id="${id}" data-key="${esc(f.key)}" value="${esc(f.value)}">
+               <input type="hidden" id="${id}" data-key="${esc(f.key)}" value="${esc(f.value)}"${
+                 locked ? ' disabled' : ''}>
                <div class="langmap-rows"></div>
-               <button type="button" class="ghost small langmap-add">+ строка</button>
+               <button type="button" class="ghost small langmap-add"${
+                 locked ? ' disabled' : ''}>+ строка</button>
              </div>`
           : f.kind === 'select'
-          ? `<select id="${id}" data-key="${esc(f.key)}"${f.off ? ' disabled' : ''}>
+          ? `<select id="${id}" data-key="${esc(f.key)}"${(f.off || locked) ? ' disabled' : ''}>
                ${selectOptionsHtml(f)}</select>`
           : f.kind === 'switch'
-          ? `<select id="${id}" data-key="${esc(f.key)}"${f.off ? ' disabled' : ''}>
+          ? `<select id="${id}" data-key="${esc(f.key)}"${(f.off || locked) ? ' disabled' : ''}>
                <option value=""${f.value === '' ? ' selected' : ''}>— как по умолчанию —</option>
                <option value="1"${['1','true','on','да'].includes(String(f.value).toLowerCase()) ? ' selected' : ''}>включено</option>
                <option value="0"${['0','false','off','нет'].includes(String(f.value).toLowerCase()) ? ' selected' : ''}>выключено</option>
              </select>`
           : `<input id="${id}" data-key="${esc(f.key)}" value="${esc(f.value)}"
-                 placeholder="${esc(f.placeholder)}"${off}>`;
+                 placeholder="${esc(f.placeholder)}"${off}${locked ? ' disabled' : ''}>`;
         // Подпись у langmap ведёт на видимый блок строк (`-box`), а не на скрытый
         // input с самим значением — клик по подписи на скрытом поле не делал ничего,
         // это была подпись в никуда.
@@ -2380,10 +2429,40 @@ function fieldForm(groups){
         </div>`;
       }).join('')}</div></div>`);
     form.append(card);
-    g.fields.filter(f => f.kind === 'langmap').forEach(f => wireLangMap(card, f, g));
+    g.fields.filter(f => f.kind === 'langmap').forEach(f => wireLangMap(card, f, g, locked));
+  }
+  // Переключатель источника группы — только когда его нарисовали (см. linkBarHtml).
+  // Клик по «Свои поля» шлёт запрос на снятие ссылки, только если она реально
+  // стояла (`data-hadlink`) — иначе это просто переключение вида без записи. Клик
+  // по «Из частичного пресета» без выбора конкретного варианта ничего не пишет,
+  // только открывает список — запись идёт из onchange самого списка.
+  if (onLinkChange){
+    form.querySelectorAll('[data-linkmodes]').forEach(bar => {
+      const part = bar.dataset.linkmodes;
+      const select = bar.parentElement.querySelector('.link-pick');
+      const ownBtn = bar.querySelector('[data-src="own"]');
+      const linkBtn = bar.querySelector('[data-src="link"]');
+      ownBtn.onclick = () => {
+        bar.querySelectorAll('button').forEach(x => x.classList.remove('on'));
+        ownBtn.classList.add('on');
+        if (select) select.hidden = true;
+        if (ownBtn.dataset.hadlink) onLinkChange(part, null);
+      };
+      linkBtn.onclick = () => {
+        bar.querySelectorAll('button').forEach(x => x.classList.remove('on'));
+        linkBtn.classList.add('on');
+        if (select) select.hidden = false;
+      };
+    });
+    form.querySelectorAll('.link-pick').forEach(sel => {
+      sel.onchange = () => onLinkChange(sel.dataset.part,
+                                        sel.value ? Number(sel.value) : null);
+    });
   }
   // Отключённые поля браузер не отправил бы сам; мы их и не читаем — значение
-  // останется таким, каким было, а не обнулится молча.
+  // останется таким, каким было, а не обнулится молча. Той же дорогой уходят и
+  // поля заблокированной ссылкой группы (`disabled` выше) — их и не должно быть
+  // среди того, что уезжает на сохранение.
   form.read = () => {
     const values = {};
     form.querySelectorAll('[data-key]').forEach(el => {
@@ -2412,7 +2491,7 @@ function parseVoiceMapRows(raw){
 // Собрать виджет «голоса по языкам»: строка = язык из выпадающего списка + текстовое
 // поле идентификатора + крестик. Движок и формат хранения не меняются — это только
 // удобная отрисовка одной и той же строки настроек.
-function wireLangMap(card, f, group){
+function wireLangMap(card, f, group, locked){
   const hidden = card.querySelector('#f-' + f.key);
   const box = card.querySelector('#f-' + f.key + '-box');
   const rows = box.querySelector('.langmap-rows');
@@ -2455,19 +2534,26 @@ function wireLangMap(card, f, group){
 
   const addRow = (lang, voice) => {
     const wrap = $(`<div class="langmap-row" style="display:flex;gap:8px;margin-bottom:6px">
-      <select class="lm-lang" style="width:180px;flex:0 0 auto">${langOptionsHtml(lang || '')}</select>
-      <input class="lm-voice" style="flex:1;width:auto;min-width:0"
+      <select class="lm-lang" style="width:180px;flex:0 0 auto"${locked ? ' disabled' : ''}
+        >${langOptionsHtml(lang || '')}</select>
+      <input class="lm-voice" style="flex:1;width:auto;min-width:0"${locked ? ' disabled' : ''}
              placeholder="${esc(idPlaceholder)}" value="${esc(voice || '')}">
-      <button type="button" class="ghost small lm-del" title="убрать строку">×</button>
+      <button type="button" class="ghost small lm-del" title="убрать строку"${
+        locked ? ' disabled' : ''}>×</button>
     </div>`);
-    wrap.querySelector('.lm-lang').onchange = sync;
-    wrap.querySelector('.lm-voice').oninput = sync;
-    wrap.querySelector('.lm-del').onclick = () => { wrap.remove(); sync(); };
+    // Группа закрыта ссылкой на частичный пресет (`locked`) — строки только для
+    // чтения: без обработчиков менять и удалять их нельзя, а сама карта в форму
+    // не уходит вовсе (скрытый input тоже `disabled`, см. вызывающий код).
+    if (!locked){
+      wrap.querySelector('.lm-lang').onchange = sync;
+      wrap.querySelector('.lm-voice').oninput = sync;
+      wrap.querySelector('.lm-del').onclick = () => { wrap.remove(); sync(); };
+    }
     rows.append(wrap);
   };
 
   parseVoiceMapRows(f.value).forEach(([lang, voice]) => addRow(lang, voice));
-  box.querySelector('.langmap-add').onclick = () => addRow('', '');
+  if (!locked) box.querySelector('.langmap-add').onclick = () => addRow('', '');
   sync();
 }
 
@@ -2492,12 +2578,41 @@ function saveBar(back, onSave){
 const PRESET_SLUG = {'Озвучка': 'ozvuchka', 'Картинки': 'kadry', 'Клипы': 'klipy',
                      'Сборка': 'sborka', 'Текст и обложка': 'tekst'};
 
+// Пять частей пресета (батч «Пресеты целые и частичные») — тот же порядок и те же
+// подписи, что и `server/preset_fields.py:PARTS`. Список один, чтобы выбор типа при
+// заведении пресета и разбивка списка на «Целые/Частичные» не разошлись в названиях.
+const PART_TITLES = [['voice', 'Озвучка'], ['images', 'Картинки'], ['clips', 'Клипы'],
+                     ['render', 'Сборка'], ['text_cover', 'Текст и обложка']];
+
 async function viewPresetNew(){
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
     <h1>Новый пресет</h1>
     <p class="sub">Настройки, которыми делаются ролики этого канала: озвучка, кадры,
       клипы, сборка, текст и обложка.</p>`));
+
+  // Целый или частичный (батч «Пресеты целые и частичные», решение владельца) —
+  // кнопки-группа, а не выпадающий список: вариантов шесть, и их надо видеть сразу,
+  // а не разворачивать список ради каждого выбора.
+  let scope = 'full';
+  const scopeCard = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Тип пресета</div>
+    <div class="secbody">
+    <div class="modes" id="scope-modes">
+      <button type="button" data-scope="full" class="on">Целый</button>
+      ${PART_TITLES.map(([code, title]) =>
+        `<button type="button" data-scope="${code}">Только ${esc(title.toLowerCase())}</button>`
+      ).join('')}
+    </div>
+    <div class="note muted">Частичный пресет закрывает одну часть ролика — его можно
+      подключить как ссылку в любом целом пресете этой же части.</div></div></div>`);
+  app.append(scopeCard);
+  scopeCard.querySelectorAll('#scope-modes button').forEach(b => b.onclick = () => {
+    scope = b.dataset.scope;
+    scopeCard.querySelectorAll('#scope-modes button').forEach(x =>
+      x.classList.toggle('on', x === b));
+  });
+
   const card = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Название</div>
     <div class="secbody">
@@ -2515,7 +2630,7 @@ async function viewPresetNew(){
     b.disabled = true;
     try{
       const out = await post('/ui/presets/vsgen',
-                             {name: card.querySelector('#p-name').value});
+                             {name: card.querySelector('#p-name').value, scope});
       location.hash = '#/preset/' + out.id;
     }catch(e){ toast(e.message); b.disabled = false; }
   };
@@ -2525,12 +2640,52 @@ async function viewPresetNew(){
   input.onkeydown = e => { if (e.key === 'Enter'){ e.preventDefault(); create(); } };
 }
 
+// «Кто бежит» (батч «Пресеты целые и частичные»): каналы и проекты — всегда,
+// у частичного ещё целые пресеты, которые на него ссылаются, и каналы через них
+// (`users.presets`/`users.via` — только у частичного, см. `preset_links.users_of`).
+// Проекты — не больше 20 ссылок и число остальных: список может быть длинным,
+// а карточка пресета не резиновая простыня.
+function presetUsersHtml(scope, users){
+  const linksOr = (arr, path) => arr.length
+    ? arr.map(x => `<a href="${path}${x.id}">${esc(x.name)}</a>`).join(', ')
+    : '<span class="muted">нет</span>';
+  const projects = users.projects || [];
+  const shown = projects.slice(0, 20);
+  const rest = projects.length - shown.length;
+  const projectsHtml = projects.length
+    ? shown.map(p => `<a href="#/project/${p.id}">${esc(p.name)}</a>`).join(', ') +
+      (rest > 0 ? `, и ещё ${rest}` : '')
+    : '<span class="muted">нет</span>';
+  const extra = scope === 'full' ? '' : `
+      <div class="fld"><label>Целые пресеты, ссылающиеся на этот</label>
+        <div class="note">${linksOr(users.presets || [], '#/preset/')}</div></div>
+      <div class="fld"><label>Каналы через них</label>
+        <div class="note">${linksOr(users.via || [], '#/channel/')}</div></div>`;
+  return `<div class="card" style="margin-bottom:16px">
+    <div class="sec">Кто бежит</div>
+    <div class="fields">
+      <div class="fld"><label>Каналы</label>
+        <div class="note">${linksOr(users.channels || [], '#/channel/')}</div></div>
+      <div class="fld"><label>Проекты</label><div class="note">${projectsHtml}</div></div>
+      ${extra}
+    </div>
+    <div class="secbody"><div class="note muted">Уже поставленные задачи правка не
+      меняет — их настройки заморожены в момент запуска. Изменится со следующего
+      запуска.</div></div>
+  </div>`;
+}
+
 async function viewPreset(id){
   const d = await api('/ui/presets/vsgen/' + encodeURIComponent(id));
   // Группы — вкладками, а не одной простынёй: полей три десятка, и «поменять голос»
-  // не должно означать прокрутку мимо сборки и обложки.
+  // не должно означать прокрутку мимо сборки и обложки. У частичного пресета вкладка
+  // ровно одна — своя часть (раздел 4 спецификации: «Редактор частичного. Только
+  // вкладка своей части»): у него нет и не может быть ссылок на другие части
+  // (правило 4 — ссылок на ссылки нет), показывать остальные группы нечем.
   const slug = t => PRESET_SLUG[t] || 'ostalnoe';
-  const tabs = d.groups.map(g => [slug(g.title), g.title]);
+  const groups = d.scope === 'full' ? d.groups
+                                     : d.groups.filter(g => g.part === d.scope);
+  const tabs = groups.map(g => [slug(g.title), g.title]);
   const cur = location.hash.split('/')[3] || (tabs[0] || ['', ''])[0];
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
@@ -2541,11 +2696,42 @@ async function viewPreset(id){
     <div class="secbody">
     <input id="p-name" value="${esc(d.name)}" style="width:100%;max-width:420px"></div></div>`);
   app.append(name);
-  app.append($(`<div class="subtabs">${tabs.map(([k, title]) =>
-    `<a href="#/preset/${encodeURIComponent(id)}/${k}"
-        class="${cur === k ? 'on' : ''}">${esc(title)}</a>`).join('')}</div>`));
-  const shown = d.groups.filter(g => slug(g.title) === cur);
-  const form = fieldForm(shown.length ? shown : d.groups.slice(0, 1));
+  app.append($(presetUsersHtml(d.scope, d.users || {})));
+  // Плашка проблем ссылок на вкладке (раздел 4: «link_problems — красной плашкой на
+  // вкладке группы с причиной») — предупреждающий значок на самой вкладке, чтобы
+  // проблему было видно, не открывая её, и красный блок внутри вкладки (см. ниже,
+  // `linkBarHtml` в `fieldForm`).
+  app.append($(`<div class="subtabs">${tabs.map(([k, title]) => {
+    const g = groups.find(x => slug(x.title) === k);
+    const warn = g && g.link_problem ? ' ⚠' : '';
+    return `<a href="#/preset/${encodeURIComponent(id)}/${k}"
+        class="${cur === k ? 'on' : ''}">${esc(title)}${warn}</a>`;
+  }).join('')}</div>`));
+  const shown = groups.filter(g => slug(g.title) === cur);
+  const formGroups = shown.length ? shown : groups.slice(0, 1);
+  // Переключатель «свои поля / из частичного пресета» — только у целого пресета:
+  // у частичного своих ссылок не бывает (правило 4), поэтому колбэк вешаем на массив
+  // групп только когда `d.scope === 'full'` — без него `fieldForm()` переключатель
+  // не рисует (см. комментарий у самой функции про буквальную сигнатуру).
+  if (d.scope === 'full'){
+    formGroups.onLinkChange = async (part, presetId) => {
+      // `ownBtn`/`linkBtn` в fieldForm переключают вид сразу по клику, до ответа
+      // сервера (иначе список частичных не успевал бы открыться до записи). Если
+      // запись упала, экран должен вернуться к тому, что реально хранится, а не
+      // остаться в оптимистичном виде — иначе переключатель показывает «Свои поля»
+      // при фактически стоящей ссылке (ревью цикла 1 фазы 3, Issue 2). `render()`
+      // перечитывает пресет и перерисовывает форму в любом случае — и при успехе,
+      // и при ошибке, — поэтому визуальное состояние всегда совпадает с сервером.
+      try{
+        await post(`/ui/presets/vsgen/${encodeURIComponent(id)}/links`,
+                   {part, preset_id: presetId});
+      }catch(e){
+        toast(e.message);
+      }
+      await render();
+    };
+  }
+  const form = fieldForm(formGroups);
   app.append(form);
   app.append(saveBar('#/presets', () => post(
     '/ui/presets/vsgen/' + encodeURIComponent(id),
@@ -2591,6 +2777,72 @@ async function viewPresets(){
     </div>`));
   }
 
+  // Один пресет-«стейдж» — общий для всех трёх сервисов; у производства (vsgen)
+  // вдобавок строка «кто бежит» счётом (раздел 4 спецификации: «каналы: 3,
+  // проекты: 12», у частичного ещё «в пресетах: 2») — счёт берётся из
+  // `preset_links.users_of` (фаза 1/2), а не из числа каналов-ссылок ниже:
+  // «кто бежит» отвечает и за проекты, которых в первой строке нет вовсе.
+  const presetItemHtml = (g, i) => {
+    const who = i.users ? [`каналы: ${i.users.channels}`, `проекты: ${i.users.projects}`,
+      ...(i.scope !== 'full' ? [`в пресетах: ${i.users.presets}`] : [])].join(', ') : '';
+    // Частичный пресет никогда не привязан к каналу напрямую — канал ссылается
+    // на целый, а не на частичный. Раньше «в работе» считалось только по прямым
+    // каналам (`i.channels`), и частичный, который реально бежит через целый
+    // (`_links`), показывался серой точкой и «ни один канал им не пользуется» —
+    // ровно то ложное прочтение, от которого предостерегает раздел 4 (ревью
+    // цикла 1 фазы 3, Issue 1). Минимальный правдивый признак — `users.presets`:
+    // он уже посчитан `preset_links.users_of` и учитывает только ссылки, которые
+    // реально разрешились бы (см. фазу 1).
+    const viaPresets = i.scope !== 'full' && i.users ? i.users.presets : 0;
+    const inUse = i.channels.length > 0 || viaPresets > 0;
+    return `<div class="stage">
+      <div class="dot ${inUse ? 's-done' : 's-idle'}">${inUse ? '✓' : '·'}</div>
+      <div class="body">
+        <div class="name">${esc(i.name)}</div>
+        <div class="facts">${i.facts.map(f => esc(f)).join(' · ') || '—'}</div>
+        ${who ? `<div class="note muted">${esc(who)}</div>` : ''}
+        <div class="note ${inUse ? 'muted' : ''}">${
+          i.channels.length
+            ? 'каналы: ' + i.channels.map(ch =>
+                `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')
+            : viaPresets > 0
+              ? `напрямую каналы не ссылаются — используется через целые пресеты (${viaPresets})`
+              : 'ни один канал им не пользуется'}</div>
+      </div>
+      <div style="white-space:nowrap;align-self:center">
+        ${g.service === 'vsgen' ? `<button class="ghost pedit"
+          data-key="${esc(i.key)}">Править</button>` : ''}
+        <button class="ghost pcopy" data-svc="${esc(g.service)}"
+          data-name="${esc(i.name)}">Копия</button>
+        <button class="ghost pdel" data-svc="${esc(g.service)}"
+          data-name="${esc(i.name)}">Удалить</button>
+      </div></div>`;
+  };
+
+  // Пресеты производства — «Целые» и «Частичные» отдельно, частичные вдобавок по
+  // частям (раздел 4 спецификации): иначе список из трёх десятков строк не отличить,
+  // какая настройка целиком отвечает за ролик, а какая — только заготовка озвучки.
+  const vsgenBodyHtml = items => {
+    const whole = items.filter(i => i.scope === 'full');
+    const partial = items.filter(i => i.scope !== 'full');
+    let html = '<div class="sec">Целые</div>';
+    html += whole.length ? whole.map(i => presetItemHtml({service: 'vsgen'}, i)).join('')
+                         : '<div class="empty">Целых пресетов нет.</div>';
+    html += '<div class="sec">Частичные</div>';
+    if (!partial.length){
+      html += '<div class="empty">Частичных пресетов нет.</div>';
+    } else {
+      for (const [code, title] of PART_TITLES){
+        const arr = partial.filter(i => i.scope === code);
+        if (!arr.length) continue;
+        html += `<div class="sec" style="border-top:1px solid var(--line);
+          font-size:12px;color:var(--muted)">${esc(title)}</div>`;
+        html += arr.map(i => presetItemHtml({service: 'vsgen'}, i)).join('');
+      }
+    }
+    return html;
+  };
+
   for (const g of d.groups){
     const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)}${g.home
@@ -2601,27 +2853,9 @@ async function viewPresets(){
              <div class="name">Список не получен — ${esc(g.error)}</div>
              <div class="note muted">Пусто здесь означает «не спросили», а не
                «пресетов нет».</div></div></div>`
-        : (g.items.length ? g.items.map(i => `<div class="stage">
-             <div class="dot ${i.channels.length ? 's-done' : 's-idle'}">${
-               i.channels.length ? '✓' : '·'}</div>
-             <div class="body">
-               <div class="name">${esc(i.name)}</div>
-               <div class="facts">${i.facts.map(f => esc(f)).join(' · ') || '—'}</div>
-               <div class="note ${i.channels.length ? 'muted' : ''}">${
-                 i.channels.length
-                   ? 'каналы: ' + i.channels.map(ch =>
-                       `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')
-                   : 'ни один канал им не пользуется'}</div>
-             </div>
-             <div style="white-space:nowrap;align-self:center">
-               ${g.service === 'vsgen' ? `<button class="ghost pedit"
-                 data-key="${esc(i.key)}">Править</button>` : ''}
-               <button class="ghost pcopy" data-svc="${esc(g.service)}"
-                 data-name="${esc(i.name)}">Копия</button>
-               <button class="ghost pdel" data-svc="${esc(g.service)}"
-                 data-name="${esc(i.name)}">Удалить</button>
-             </div></div>`).join('')
-           : '<div class="empty">Пресетов нет.</div>')}
+        : (g.service === 'vsgen' ? vsgenBodyHtml(g.items)
+           : (g.items.length ? g.items.map(i => presetItemHtml(g, i)).join('')
+              : '<div class="empty">Пресетов нет.</div>'))}
       ${g.note ? `<div class="note muted">${esc(g.note)}</div>` : ''}
     </div>`);
     app.append(card);
