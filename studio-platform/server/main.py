@@ -3718,9 +3718,13 @@ def _stage_sets(km):
     return running, queued, errored
 
 
-def mc_stepper(st: dict) -> str:
-    """5-сегментный степпер: текст → озвучка → картинки → видео → РЕНДЕР.
-    Идущие этапы — синие (МОЖНО НЕСКОЛЬКО сразу), в очереди — серые, «Готово» только после рендера."""
+def project_stage_status(st: dict) -> dict:
+    """Классификация статуса проекта по пяти этапам — чистая функция без HTML и побочных
+    эффектов. Вынесена 2026-09-17 из mc_stepper (батч C, Ф1): пульту (studio-platform/web/)
+    нужна СТРУКТУРА статуса, а не готовая разметка кабинета — раньше это было неразделимо.
+    Правила классификации не менялись, только форма результата.
+    st — как раньше у mc_stepper: text/audio/images/images_expected/video/render
+    + running/queued/errored (множества имён этапов, из _stage_sets)."""
     running = st.get("running") or set()
     queued = st.get("queued") or set()
     errored = st.get("errored") or set()
@@ -3749,29 +3753,42 @@ def mc_stepper(st: dict) -> str:
         for k in ("tts", "prompts", "images", "video", "render"):
             if k in running:
                 parts.append((f"картинки {n}/{m}" if m else f"картинки {n}") if k == "images" else _LBL[k])
-        cap, col = ("Идёт: " + ", ".join(parts) if parts else "Идёт обработка"), "var(--running)"
+        caption, tone = ("Идёт: " + ", ".join(parts) if parts else "Идёт обработка"), "running"
     elif errored:
         _ek = next((k for k in ("render", "video", "images", "tts") if k in errored), None)
-        cap = {"tts": "Ошибка озвучки", "images": "Ошибка картинок",
-               "video": "Ошибка видео", "render": "Ошибка рендера"}.get(_ek, "Ошибка")
-        col = "var(--error)"
+        caption = {"tts": "Ошибка озвучки", "images": "Ошибка картинок",
+                   "video": "Ошибка видео", "render": "Ошибка рендера"}.get(_ek, "Ошибка")
+        tone = "error"
     elif queued:
         parts = [_LBL[k] for k in ("tts", "images", "video", "render") if k in queued]
-        cap, col = ("В очереди: " + ", ".join(parts) if parts else "В очереди"), "var(--queued)"
+        caption, tone = ("В очереди: " + ", ".join(parts) if parts else "В очереди"), "queued"
     elif has_render:
-        cap, col = "Готово", "var(--done)"
+        caption, tone = "Готово", "done"
     elif has_clips or img_done:
-        cap, col = "Ждёт рендер", "var(--muted)"
+        caption, tone = "Ждёт рендер", "muted"
     elif n > 0:
-        cap, col = "Ждёт видео", "var(--muted)"
+        caption, tone = "Ждёт видео", "muted"
     elif st.get("audio"):
-        cap, col = "Ждёт картинки", "var(--muted)"
+        caption, tone = "Ждёт картинки", "muted"
     elif st.get("text"):
-        cap, col = "Только текст", "var(--dim)"
+        caption, tone = "Только текст", "dim"
     else:
-        cap, col = "Пусто", "var(--dim)"
-    segs = "".join(f'<span class="seg {c}"></span>' for c in (s_text, s_audio, s_img, s_vid, s_render))
-    return f'<div class="stepper">{segs}</div><div class="stepper-cap" style="color:{col}">{cap}</div>'
+        caption, tone = "Пусто", "dim"
+
+    segments = [{"stage": name, "state": state} for name, state in (
+        ("text", s_text), ("tts", s_audio), ("images", s_img), ("video", s_vid), ("render", s_render))]
+    return {"segments": segments, "caption": caption, "tone": tone}
+
+
+def mc_stepper(st: dict) -> str:
+    """5-сегментный степпер: текст → озвучка → картинки → видео → РЕНДЕР.
+    Идущие этапы — синие (МОЖНО НЕСКОЛЬКО сразу), в очереди — серые, «Готово» только после рендера.
+    Тонкая HTML-обёртка над project_stage_status (2026-09-17) — байт-в-байт та же разметка,
+    что была здесь до выноса логики."""
+    d = project_stage_status(st)
+    segs = "".join(f'<span class="seg {x["state"]}"></span>' for x in d["segments"])
+    return (f'<div class="stepper">{segs}</div>'
+            f'<div class="stepper-cap" style="color:var(--{d["tone"]})">{d["caption"]}</div>')
 
 
 def mc_badge(state: str) -> str:
@@ -5516,7 +5533,7 @@ def project_file(pid: str, fpath: str, request: Request):
 # падал с SQLITE_FULL). Компрессия ZIP_STORED: jpg/mp3/mp4 уже сжаты, deflate только жёг бы CPU.
 _DL_CATS = {"audio": "озвучки", "images": "картинок", "clips": "клипов",
             "renders": "готовых mp4", "subs": "субтитров", "chapters": "тайм-кодов",
-            "scenes": "плана сцен", "all": "материалов"}
+            "scenes": "плана сцен", "covers": "обложки", "all": "материалов"}
 # категория → glob-шаблоны (относительно каталога проекта, recursive?). Страница проекта
 # считает кнопки этим же списком (_dl_n), поэтому число на кнопке = число файлов в архиве
 _DL_PATTERNS = {
@@ -5542,6 +5559,10 @@ _DL_PATTERNS = {
     "scenes":  ((("googler", "scenes.json"), False),
                 (("googler", "scenes.meta.json"), False),
                 (("googler", "prompts.json"), False)),
+    # ДОБАВЛЕНО 17.09.2026 (батч C, Ф1): обложку проекта раньше нельзя было скачать —
+    # экран проекта в пульте кладёт её сюда же (server/pub_services.py ~609), конвейер кладёт
+    # cover.jpg без перекодирования, поэтому шаблон отдаёт файл как есть, без подкаталогов.
+    "covers":  ((("cover.jpg",), False),),
 }
 
 
