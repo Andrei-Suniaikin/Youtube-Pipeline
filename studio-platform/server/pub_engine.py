@@ -32,6 +32,7 @@ import re
 import secrets
 import time
 
+import preset_links
 from pub_log import add as log_line
 from pub_publish import schedule_iso
 
@@ -334,20 +335,6 @@ def materialize(c, now: float) -> list:
 
 # ─────────────────────────── продвижение ───────────────────────────
 
-def preset_settings(c, preset_id) -> dict:
-    """Настройки пресета производства. Пусто — если пресета нет или он повреждён."""
-    if not preset_id:
-        return {}
-    row = c.execute("SELECT settings FROM presets WHERE id=?", (preset_id,)).fetchone()
-    if not row or not row["settings"]:
-        return {}
-    try:
-        data = json.loads(row["settings"])
-    except ValueError:
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def channel_presets(c, preset_vsgen_id, preset_rewrite="", preset_cover="") -> tuple:
     """Какими пресетами делаются текст и обложка. Решает ПРЕСЕТ ПРОИЗВОДСТВА.
 
@@ -359,8 +346,13 @@ def channel_presets(c, preset_vsgen_id, preset_rewrite="", preset_cover="") -> t
     производства про соседей ещё ничего не знает, и молча обнулить им текст и обложку
     значило бы остановить их выпуски. Пустое поле в пресете — это «не задано», а не
     «убрать»: у нас нет способа отличить одно от другого, а цена ошибки разная.
+
+    Читает `preset_links.resolve`, а не `preset_settings` напрямую (батч «Пресеты целые
+    и частичные»): «Текст и обложка» — тоже одна из пяти групп пресета, и если у неё
+    стоит ссылка на частичный пресет, `preset_rewrite`/`preset_cover` обязаны прийти
+    оттуда, а не из своих (пустых) полей целого.
     """
-    s = preset_settings(c, preset_vsgen_id)
+    s = preset_links.resolve(c, preset_vsgen_id)
     rew = str(s.get("preset_rewrite") or "").strip() or (preset_rewrite or "")
     cov = str(s.get("preset_cover") or "").strip() or (preset_cover or "")
     return rew, cov

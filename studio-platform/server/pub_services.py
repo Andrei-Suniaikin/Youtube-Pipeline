@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import preset_fields
+import preset_links
 import hashlib
 import json
 import os
@@ -335,12 +336,34 @@ class PubServices:
         # у него пустые — озвучка и картинки уедут на умолчаниях кабинета.
         settings = None
         if rel["preset_vsgen_id"]:
+            # `_preset_settings` уже разрешает ссылки частичных пресетов
+            # (`preset_links.resolve`) — здесь остаётся только убрать служебные
+            # ключи `_scope`/`_links`/`_link_problems`, чтобы они не уехали в
+            # `projects.settings` вместе с настоящими полями.
             ps = self._preset_settings(c, rel["preset_vsgen_id"])
-            if isinstance(ps, dict) and ps:
-                settings = dict(ps)
+            # `resolve()` всегда добавляет служебные `_scope`/`_links`/`_link_problems` —
+            # словарь после него не пустой, даже если у пресета нет ни одного настоящего
+            # поля. Проверять «прочитался ли пресет» нужно уже ПОСЛЕ снятия этих ключей,
+            # иначе старый warn «настройки не прочитались» перестаёт срабатывать (Issue 2
+            # ревью цикла 1) и проект молча уходит на умолчаниях кабинета без единой строки
+            # в журнале.
+            real = {k: v for k, v in ps.items() if not str(k).startswith("_")} if isinstance(ps, dict) else {}
+            # Причину сломанной ссылки пишем в журнал ВСЕГДА, а не только когда у
+            # пресета остались свои поля (Minor 2 ревью цикла 2): и при пустом
+            # результате `resolve()` человек обязан узнать, что именно не сработало,
+            # а не только то, что пресет «не прочитался».
+            for prob in (ps.get("_link_problems") or []) if isinstance(ps, dict) else []:
+                log_line(c, rel["release_id"], "ролик",
+                         f"пресет {rel['preset_vsgen_id']}: ссылка «{prob.get('part')}» "
+                         f"на частичный пресет {prob.get('preset_id')} не сработала — "
+                         f"{prob.get('why')}; группа осталась на своих полях",
+                         level="warn")
+            if real:
+                settings = real
             else:
-                # Пресет удалён или нечитаем: проект всё равно заводим, но говорим
-                # об этом в журнале выпуска — молчаливые умолчания хуже жалобы.
+                # Пресет удалён, нечитаем или в нём нет ни одного настоящего поля: проект
+                # всё равно заводим, но говорим об этом в журнале выпуска — молчаливые
+                # умолчания хуже жалобы.
                 log_line(c, rel["release_id"], "ролик",
                          f"настройки пресета {rel['preset_vsgen_id']} не прочитались — "
                          "проект уйдёт на умолчаниях кабинета", level="warn")
@@ -811,7 +834,12 @@ class PubServices:
             return ""
 
     def _preset_settings(self, c, preset_id) -> dict:
-        """Настройки пресета VideoStudio словарём.
+        """Настройки пресета VideoStudio словарём, с разрешёнными ссылками частичных
+        пресетов (`preset_links.resolve`) — включая служебные `_scope`/`_links`/
+        `_link_problems`, которые вызывающая сторона обязана снять перед тем, как
+        класть результат в проект или в задачу (правило 2 архитектуры: одна функция
+        разрешает пресет, но убрать метаданные — дело каждого потребителя отдельно,
+        как это уже делает `_preset_project_payload` в кабинете).
 
         Пресет удалён, нечитаем или хранит мусор — пустой словарь: ролик уходит без
         таймкодов и на умолчаниях, а не умирает на заливке из-за чужой уборки.
@@ -824,14 +852,20 @@ class PubServices:
             row = c.execute("SELECT settings FROM presets WHERE id=?", (preset_id,)).fetchone()
         except Exception:
             return {}
-        raw = (row["settings"] if row else "") or ""
-        if isinstance(raw, dict):
-            return raw
+        if not row:
+            return {}
+        raw = row["settings"] or ""
+        if not isinstance(raw, dict):
+            try:
+                value = json.loads(raw) if str(raw).strip() else {}
+            except Exception:
+                return {}
+            if not isinstance(value, dict):
+                return {}
         try:
-            value = json.loads(raw) if str(raw).strip() else {}
+            return preset_links.resolve(c, preset_id)
         except Exception:
             return {}
-        return value if isinstance(value, dict) else {}
 
     # ── источник текста ──
 

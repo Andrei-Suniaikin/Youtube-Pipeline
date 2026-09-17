@@ -28,6 +28,7 @@ BACKGROUND_ENABLED = os.environ.get("VS_SERVER_DISABLE_BACKGROUND", "").strip().
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 import card_jobs as card_contract
+import preset_links
 from pub_calls import ensure_calls_schema, node_disk, note_node_disk
 from pub_calls_api import register_calls_routes
 from pub_schema import ensure_pub_schema
@@ -4196,7 +4197,13 @@ async def project_create(request: Request):
 
 
 def _preset_settings(tid, preset_id):
-    """settings dict выбранного пресета (для создания проекта сразу с пресетом) или None."""
+    """settings dict выбранного пресета (для создания проекта сразу с пресетом) или None.
+
+    Разрешение ссылок частичных пресетов — через `preset_links.resolve`, той же
+    функцией, что и остальные потребители (правило 2 архитектуры батча «Пресеты целые
+    и частичные»): группа со ссылкой уезжает в проект полями частичного пресета, а не
+    своими.
+    """
     if not preset_id:
         return None
     try:
@@ -4204,12 +4211,27 @@ def _preset_settings(tid, preset_id):
     except (ValueError, TypeError):
         return None
     c = db()
-    r = c.execute("SELECT settings FROM presets WHERE id=? AND tenant_id=?", (pid, tid)).fetchone()
-    c.close()
-    if not r or not r["settings"]:
-        return None
     try:
-        return _preset_project_payload(json.loads(r["settings"]), pid)
+        r = c.execute("SELECT settings FROM presets WHERE id=? AND tenant_id=?", (pid, tid)).fetchone()
+        if not r or not r["settings"]:
+            return None
+        # Битый/не-объектный JSON — как и раньше, до подключения `resolve`: `None`, а
+        # не пустой словарь умолчаний. `resolve()` сам по себе такое различие не делает
+        # (пресет без ссылок читается «как если бы был пустым целым» — так задумано для
+        # производства), но здесь, до батча, битый пресет валил вызывающую сторону на
+        # путь наследования от последнего проекта тенанта (Issue 1 ревью цикла 1), и это
+        # поведение обязано сохраниться один в один.
+        try:
+            parsed = json.loads(r["settings"])
+        except (ValueError, TypeError):
+            return None
+        if not isinstance(parsed, dict):
+            return None
+        resolved = preset_links.resolve(c, pid)
+    finally:
+        c.close()
+    try:
+        return _preset_project_payload(resolved, pid)
     except (ImageModeContractError, LumeanTemplateError, PresetSettingsError):
         raise
     except Exception:
@@ -12216,11 +12238,19 @@ async def preset_apply(prid: int, request: Request):
         ).fetchone()
         if not row:
             raise HTTPException(404, "нет пресета")
+        # Проверка на битый JSON: сам разбор здесь не используется (настройки дальше
+        # читает `preset_links.resolve` своим путём), но применить ссылку на пресет, чьи
+        # `settings` не парсятся, нельзя — лучше явная ошибка сейчас, чем молчание.
         try:
-            raw = json.loads(row["settings"]) if row["settings"] else {}
+            corruption_check = json.loads(row["settings"]) if row["settings"] else {}
         except json.JSONDecodeError as exc:
             raise HTTPException(400, "настройки пресета повреждены") from exc
-        payload = _preset_project_payload(raw, prid)
+        del corruption_check
+        # Разрешение ссылок частичных пресетов — той же функцией, что и создание
+        # проекта с пресетом (`_preset_settings` выше): применение пресета обязано
+        # положить в проект то же самое, чем реально будет делаться ролик.
+        resolved = preset_links.resolve(c, prid)
+        payload = _preset_project_payload(resolved, prid)
         updated = c.execute(
             "UPDATE projects SET settings=?, updated=? WHERE id=? AND tenant_id=?",
             (json.dumps(payload, ensure_ascii=False), _now(), pid, tid),

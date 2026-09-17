@@ -22,7 +22,8 @@ BASE = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(BASE, "server"))
 
 import preset_fields as PF                                        # noqa: E402
-from pub_engine import channel_presets, preset_settings           # noqa: E402
+import preset_links as PL                                         # noqa: E402
+from pub_engine import channel_presets                            # noqa: E402
 
 FAILS = []
 
@@ -36,9 +37,12 @@ def check(label, got, want):
 
 
 def fresh(settings=None) -> sqlite3.Connection:
+    # tenant_id — колонка настоящей таблицы `presets` (batch «Пресеты целые и
+    # частичные», фаза 1): `channel_presets` теперь идёт через `preset_links.resolve`,
+    # а её `_load_row` читает `tenant_id` вместе с настройками.
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
-    c.execute("CREATE TABLE presets(id INTEGER PRIMARY KEY, settings TEXT)")
+    c.execute("CREATE TABLE presets(id INTEGER PRIMARY KEY, tenant_id TEXT, settings TEXT)")
     if settings is not None:
         c.execute("INSERT INTO presets(id, settings) VALUES(1, ?)",
                   (json.dumps(settings, ensure_ascii=False),))
@@ -71,7 +75,12 @@ def main() -> int:
 
     c = fresh()
     c.execute("INSERT INTO presets(id, settings) VALUES(2, 'не json')")
-    check("битые настройки не роняют разбор", preset_settings(c, 2), {})
+    # `pub_engine.preset_settings` удалён (Minor 3 ревью цикла 2, обход `resolve`) —
+    # разбор пресета теперь только через `preset_links.resolve`; служебные `_`-ключи
+    # снимаем так же, как это уже делает `pub_services.PubServices.do_project_ready`.
+    resolved = PL.resolve(c, 2)
+    real = {k: v for k, v in resolved.items() if not str(k).startswith("_")}
+    check("битые настройки не роняют разбор", real, {})
 
     print("\nГолос по языку — правило «язык → провайдер → идентификатор»")
     check("запятыми", PF.parse_voice_map("ru: aaa, en: bbb"), {"ru": "aaa", "en": "bbb"})

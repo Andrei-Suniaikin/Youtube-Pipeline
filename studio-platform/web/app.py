@@ -42,6 +42,7 @@ from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
 from pub_engine import PHASES, PHASE_DEADLINES                   # noqa: E402
 from pub_engine import revive as pub_engine_revive                # noqa: E402
 import preset_fields                                             # noqa: E402
+import preset_links                                              # noqa: E402
 from pub_engine import channel_presets                            # noqa: E402
 from pub_remote import (COVER_BASE, REWRITE_BASE, donor_text,     # noqa: E402
                         get_key, video_id)
@@ -2133,22 +2134,25 @@ def ui_preset_get(prid: int):
     Список полей приходит из `server/preset_fields.py` — одного описания на кабинет и
     пульт. Своей копии формы здесь нет намеренно: разойдясь, две формы начнут показывать
     разные настройки одного и того же пресета.
+
+    Значения — через `preset_links.resolve` (батч «Пресеты целые и частичные»): если у
+    группы стоит ссылка на частичный пресет, форма обязана показать то, чем реально
+    будет делаться ролик, а не пустые свои поля целого. (Разбивку по группам на «свои
+    поля / из частичного, только чтение» и список ссылок делает следующая фаза этого
+    же батча — здесь только подключение самого разрешения.)
     """
     c = db()
     try:
-        r = c.execute("SELECT id, name, settings FROM presets WHERE id=? AND tenant_id=?",
+        r = c.execute("SELECT id, name FROM presets WHERE id=? AND tenant_id=?",
                       (prid, TENANT)).fetchone()
+        if not r:
+            raise HTTPException(404, "нет такого пресета")
+        resolved = preset_links.resolve(c, prid)
     finally:
         c.close()
-    if not r:
-        raise HTTPException(404, "нет такого пресета")
-    try:
-        settings = json.loads(r["settings"] or "{}")
-    except ValueError:
-        settings = {}
     mod = sys.modules.get("main")
     return {"id": r["id"], "name": r["name"] or f"пресет {r['id']}",
-            "groups": preset_fields.describe(mod, settings, _neighbour_preset_names()),
+            "groups": preset_fields.describe(mod, resolved, _neighbour_preset_names()),
             "note": ("Пустое поле означает «как по умолчанию». Проверку значений делает "
                      "кабинет при сохранении — теми же контрактами, что и всегда.")}
 
