@@ -191,6 +191,21 @@ def main() -> int:
     check("voice_by_lang — карта по языкам", voice_field["kind"], "langmap")
     check("языки берутся из _LANG_NAMES кабинета",
           {o["value"] for o in voice_field["options"]}, {"ru", "en", "pl"})
+    # Решение владельца 17.09.2026: названия языков — полный список Rewrite Studio.
+    import types
+    fake_core = types.ModuleType("rewrite_core")
+    fake_core.LANGUAGES = {"Русский": "Russian", "Армянский": "Armenian",
+                           "Португальский": "Portuguese", "Клингонский": "Klingon"}
+    sys.modules["rewrite_core"] = fake_core
+    try:
+        rw_opts = build_field("voice_by_lang", {"engine": "edge"})["options"]
+    finally:
+        del sys.modules["rewrite_core"]
+    check("при загруженном Rewrite языки — его списком, в его порядке, с ISO-кодом",
+          [(o["value"], o["title"]) for o in rw_opts],
+          [("ru", "Русский (ru)"), ("hy", "Армянский (hy)"), ("pt", "Португальский (pt)")])
+    check("все языки настоящего Rewrite имеют ISO-код без коллизий",
+          len(set(PF.REWRITE_LANG_ISO.values())) == len(PF.REWRITE_LANG_ISO) == 46, True)
     check("подсказка для обычного движка — про язык→провайдер→идентификатор",
           "идентификатор" in voice_field["hint"], True)
     lumean_hint = build_field("voice_by_lang", {"engine": "lumean"})["hint"]

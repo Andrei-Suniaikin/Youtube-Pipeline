@@ -21,6 +21,7 @@ f-строк: список полей, их подписи, варианты в�
 """
 from __future__ import annotations
 
+import sys
 import threading
 
 
@@ -258,15 +259,44 @@ def _aspect_ratio(m):
             ("square", "Квадрат")]
 
 
-def _lang_options(m):
-    """Языки для строк карты «голоса по языкам» (батч 16.09.2026).
+# Код ISO 639-1 для каждого языка Rewrite Studio. Имена берутся у самого Rewrite
+# (`rewrite_core.LANGUAGES`, «Русский» → "Russian"), а коды — отсюда: у Rewrite короткие
+# коды получаются первыми двумя буквами названия («Armenian» → "ar", как у арабского;
+# «Portuguese» → "po»), а карта голосов и язык канала хранят именно ISO ("pl", "pt").
+REWRITE_LANG_ISO = {
+    "Russian": "ru", "Ukrainian": "uk", "Belarusian": "be", "Polish": "pl", "Czech": "cs",
+    "Slovak": "sk", "Bulgarian": "bg", "Serbian": "sr", "Croatian": "hr", "Slovenian": "sl",
+    "Macedonian": "mk", "Bosnian": "bs", "English": "en", "German": "de", "French": "fr",
+    "Spanish": "es", "Italian": "it", "Catalan": "ca", "Portuguese": "pt", "Dutch": "nl",
+    "Swedish": "sv", "Norwegian": "no", "Danish": "da", "Finnish": "fi", "Lithuanian": "lt",
+    "Latvian": "lv", "Estonian": "et", "Greek": "el", "Romanian": "ro", "Hungarian": "hu",
+    "Turkish": "tr", "Kazakh": "kk", "Uzbek": "uz", "Azerbaijani": "az", "Armenian": "hy",
+    "Georgian": "ka", "Arabic": "ar", "Hebrew": "he", "Persian": "fa", "Hindi": "hi",
+    "Simplified Chinese": "zh", "Japanese": "ja", "Korean": "ko", "Vietnamese": "vi",
+    "Thai": "th", "Indonesian": "id",
+}
 
-    Задача называла `_SUB_LANGS_ALL` и `LANGUAGE_CODES` — ни один не подошёл:
-    `_SUB_LANGS_ALL` в studio-platform хранит не двухбуквенные коды, а полные
-    английские названия языков субтитров, а `LANGUAGE_CODES` здесь не существует
-    вовсе. `_LANG_NAMES` (`main.py:7275`) — тот же формат «код → имя», в котором и
-    хранится сам `voice_by_lang` («ru: id, en: id2»), поэтому источник — он.
+
+def _lang_options(m):
+    """Языки для строк карты «голоса по языкам».
+
+    Источник — полный список Rewrite Studio (решение владельца 17.09.2026): те же
+    русские названия, что человек видит при выборе языков текста, в том же порядке.
+    Rewrite в платформе поднят в том же процессе, поэтому модуль уже загружен. Если его
+    нет (кабинет отдельно, тесты) — прежний источник `_LANG_NAMES` кабинета, чтобы поле
+    не пропало и не вычистило сохранённую карту. Язык в карте, которого нет в списке,
+    не теряется: его показывает отдельным пунктом сама форма.
     """
+    core = sys.modules.get("rewrite_core")
+    langs = getattr(core, "LANGUAGES", None) if core is not None else None
+    if isinstance(langs, dict) and langs:
+        out = []
+        for ru, canon in langs.items():
+            code = REWRITE_LANG_ISO.get(canon)
+            if code:
+                out.append((code, f"{ru} ({code})"))
+        if out:
+            return out
     names = getattr(m, "_LANG_NAMES", None) or {}
     return [(code, f"{code} — {name}") for code, name in sorted(names.items())]
 
