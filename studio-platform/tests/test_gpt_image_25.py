@@ -76,6 +76,37 @@ def cabinet_image_models_entry(key):
     return (out.stdout.strip().splitlines() or [""])[-1]
 
 
+def cover_call_model(env_extra=None) -> dict:
+    """Какую модель Cover кладёт в тело запроса к OpenAI — отдельным процессом без сети:
+    константа читается на импорте, а requests.post подменяется до вызова."""
+    env = dict(os.environ)
+    env.pop("VS_GPT_IMAGE_MODEL", None)
+    env.pop("COVER_GPT_IMAGE_MODEL", None)
+    env.update(env_extra or {})
+    code = (
+        "import sys, json, threading; sys.path.insert(0, %r)\n"
+        "import cover_core as C\n"
+        "seen = {}\n"
+        "class R:\n"
+        "    status_code = 500; text = 'stub'\n"
+        "def fake(url, headers=None, json=None, timeout=None):\n"
+        "    seen['model'] = json['model']; return R()\n"
+        "C.requests.post = fake\n"
+        "C._provider_semaphore_for_key = lambda *a, **k: threading.BoundedSemaphore(1)\n"
+        "C._generate_via_gpt_image2('маяк', 'sk-test', max_retries=1)\n"
+        "seen['label'] = next(l for l, p, m in C.GENERATION_OPTIONS if p == 'gpt_image2')\n"
+        "print(json.dumps(seen, ensure_ascii=False))\n"
+    ) % os.path.join(BASE, "cover")
+    with tempfile.TemporaryDirectory() as tmp:
+        out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True,
+                             env=env, cwd=tmp, timeout=120)
+    try:
+        import json as _json
+        return _json.loads((out.stdout.strip().splitlines() or ["{}"])[-1])
+    except ValueError:
+        return {"model": f"вызов не удался: {out.stderr.strip()[-300:]}"}
+
+
 def png_b64(width, height):
     from PIL import Image
     buf = io.BytesIO()
@@ -189,6 +220,16 @@ def main() -> int:
         G._gen_attempts = saved_attempts
         G.requests.post = saved_post
         G.print_user = saved_print_user
+
+    print("\nCover Studio шлёт ту же модель (17.09.2026)")
+    got = cover_call_model()
+    check("Cover: в теле запроса gpt-image-2.5-sunburst", got.get("model"),
+          "gpt-image-2.5-sunburst")
+    check("Cover: COVER_GPT_IMAGE_MODEL переопределяет",
+          cover_call_model({"COVER_GPT_IMAGE_MODEL": "gpt-image-2.5-flare"}).get("model"),
+          "gpt-image-2.5-flare")
+    check("Cover: подпись в списке — GPT Image 2.5", got.get("label"),
+          "GPT Image 2.5 low (OpenAI)")
 
     print("\nВыхлоп рерайта — в .gitignore, а не в репозитории (§7)")
     gitignore = open(os.path.join(ROOT, ".gitignore"), encoding="utf-8").read()

@@ -142,7 +142,7 @@ GENERATION_OPTIONS = [
     ("Nano Banana Pro (VeoNonStop)", "veo", "GEM_PIX_2"),
     ("Nano Banana 2 (VeoNonStop)", "veo", "NARWHAL"),
     ("Nano Banana 2 Lite (VeoNonStop)", "veo", "HARBOR_SEAL"),
-    ("GPT-Image-2 low (OpenAI)", "gpt_image2", ""),
+    ("GPT Image 2.5 low (OpenAI)", "gpt_image2", ""),
 ]
 THUMBNAIL_URLS = [
     "https://img.youtube.com/vi/{vid}/maxresdefault.jpg",
@@ -1133,6 +1133,12 @@ VEO_BASE_URL = os.environ.get("VEO_BASE_URL", "https://veononstop.org/api/v1")  
 VEO_BANANA_TIMEOUT = int(os.environ.get("VEO_BANANA_TIMEOUT", "600"))  # СИНХРОННЫЙ endpoint: POST держит соединение до готовности
 VEO_RETRY_DELAY = 3            # плоская пауза между попытками (капча у провайдера не лечится backoff'ом)
 GPT_IMAGE2_TIMEOUT = 180
+# 17.09.2026: модель та же, что у кадров VideoStudio (`workers/googler_worker.py`,
+# GPT_IMAGE_MODEL): "gpt-image-2.5" без суффикса у OpenAI нет, владелец выбрал sunburst.
+# Внутренний id провайдера `gpt_image2` не меняется — он лежит в пресетах и задачах.
+# Размеры 1536x1024 / 1024x1536 сняты под gpt-image-2 и под 2.5 не перепроверены.
+GPT_IMAGE_MODEL = (os.environ.get("COVER_GPT_IMAGE_MODEL")
+                   or os.environ.get("VS_GPT_IMAGE_MODEL") or "gpt-image-2.5-sunburst")
 
 # xAI напрямую (официальный API Grok). Ключ xai-..., отдельный от Fast Gen.
 XAI_BASE_URL = "https://api.x.ai/v1"
@@ -1208,14 +1214,14 @@ def _generate_via_gpt_image2(
     max_retries: int = None, log_fn=None,
     reference_images: Optional[List[str]] = None, cancel_check=None,
 ) -> Optional[Image.Image]:
-    """OpenAI gpt-image-2 НАПРЯМУЮ (платно ~$0.006/шт, quality=low фиксирован).
+    """OpenAI GPT_IMAGE_MODEL НАПРЯМУЮ (платно, quality=low фиксирован; цена не перепроверена под 2.5).
     generate-only: референсы не поддерживаются — предупреждаем и генерим без них."""
     log = log_fn or (lambda m: None)
     if reference_images:
-        log("[gpt-image-2] референсы не поддерживаются (generate-only) — генерирую без референса")
+        log(f"[{GPT_IMAGE_MODEL}] референсы не поддерживаются (generate-only) — генерирую без референса")
     ar = _v6_aspect(aspect_ratio)
     size = {"16:9": "1536x1024", "9:16": "1024x1536"}.get(ar, "1024x1024")
-    body = {"model": "gpt-image-2", "prompt": prompt, "size": size,
+    body = {"model": GPT_IMAGE_MODEL, "prompt": prompt, "size": size,
             "quality": "low", "n": 1, "output_format": "jpeg"}
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     attempts = max(1, max_retries or 3)
@@ -1232,27 +1238,27 @@ def _generate_via_gpt_image2(
             finally:
                 openai_semaphore.release()
             if r.status_code in (401, 403):
-                log(f"[gpt-image-2] auth {r.status_code}: OpenAI ключ неверный/без доступа — ретраи бессмысленны")
+                log(f"[{GPT_IMAGE_MODEL}] auth {r.status_code}: OpenAI ключ неверный/без доступа — ретраи бессмысленны")
                 return None
             if r.status_code == 200:
                 data = (r.json() or {}).get("data") or []
                 b64 = data[0].get("b64_json") if data else None
                 if b64:
                     return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
-                log(f"[gpt-image-2] попытка {attempt}/{attempts}: пустой ответ")
+                log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: пустой ответ")
                 return None
             if r.status_code != 429:
                 # 4xx/5xx мог прийти после принятия платной операции; без
                 # idempotency key не создаём возможный дубль.
-                log(f"[gpt-image-2] попытка {attempt}/{attempts}: HTTP {r.status_code}: {r.text[:200]}")
+                log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: HTTP {r.status_code}: {r.text[:200]}")
                 return None
             else:
-                log(f"[gpt-image-2] попытка {attempt}/{attempts}: HTTP {r.status_code}: {r.text[:200]}")
+                log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: HTTP {r.status_code}: {r.text[:200]}")
         except requests.exceptions.Timeout:
-            log(f"[gpt-image-2] попытка {attempt}/{attempts}: таймаут {GPT_IMAGE2_TIMEOUT}с")
+            log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: таймаут {GPT_IMAGE2_TIMEOUT}с")
             return None
         except Exception as e:
-            log(f"[gpt-image-2] попытка {attempt}/{attempts}: {e}")
+            log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: {e}")
             return None
         if attempt < attempts and _interruptible_sleep(3, cancel_check):
             return None
@@ -1595,7 +1601,7 @@ def _generate_via_fast_gen_inner(
 # оплачивал обложку второй раз. Порядок обязателен: reserve() до провайдера →
 # ordered() как только известен id заказа → delivered() когда файл записан.
 #
-# Синхронные провайдеры (veononstop, gpt-image-2, xai) id заказа не выдают: у них
+# Синхронные провайдеры (veononstop, gpt_image2, xai) id заказа не выдают: у них
 # шаг ordered() пропускается, а «заказ создан» выводится из самого факта запроса.
 
 # Единственный dispatch с id заказа и опросом статуса — Fast Gen v6. Всё остальное
@@ -1684,7 +1690,7 @@ def _journaled_generate(
     except Exception:                                                 # noqa: BLE001
         dispatch = ""
     # Соотношение сторон обязано быть в отпечатке: 16:9 и 9:16 — разные картинки и разная
-    # цена. Известный дефект gpt-image-2 (16:9 → 1536x1024, то есть 3:2) здесь НЕ чиним —
+    # цена. Известный дефект gpt_image2 (16:9 → 1536x1024, то есть 3:2) здесь НЕ чиним —
     # пишем то соотношение, которое реально ушло в вызов.
     fingerprint = journal.fingerprint(
         provider=provider, model=model, prompt=prompt, lang=lang,

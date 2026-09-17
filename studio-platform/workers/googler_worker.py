@@ -408,8 +408,7 @@ GPT_MODEL = "gpt-4.1-nano"
 SCENE_GPT_MODEL = "gpt-4.1-mini"
 # 16.09.2026: живой GET https://api.openai.com/v1/models показал, что модели "gpt-image-2.5"
 # не существует — есть "gpt-image-2.5-flare" и "gpt-image-2.5-sunburst"; владелец выбрал
-# sunburst. Про доступность "gpt-image-2" данных нет (Cover Studio по-прежнему шлёт эту
-# модель, см. cover/cover_core.py). Вынесено в окружение по тому же принципу, что и адрес
+# sunburst. Cover Studio с 17.09 шлёт ту же модель (cover/cover_core.py, GPT_IMAGE_MODEL). Вынесено в окружение по тому же принципу, что и адрес
 # FastGen в VS_GOOGLER_BASE (04.09): имя модели у провайдера меняется без правки кода.
 GPT_IMAGE_MODEL = os.environ.get("VS_GPT_IMAGE_MODEL") or "gpt-image-2.5-sunburst"
 

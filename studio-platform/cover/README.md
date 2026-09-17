@@ -4,7 +4,8 @@
 оригинала, анализирует его vision-моделью, адаптирует текст на целевые языки и
 генерирует новые обложки через Fast Gen (Nano Banana Pro / Flower / Grok / OpenAI),
 VeoNonStop (Nano Banana Pro/2/2 Lite, ключ `veo_…` / env `COVER_VEO_KEY`) или
-напрямую OpenAI gpt-image-2 low (~$0.006/шт, ключ OpenAI, без референсов).
+напрямую OpenAI GPT Image 2.5 (`gpt-image-2.5-sunburst`, env `COVER_GPT_IMAGE_MODEL`) low
+(ключ OpenAI, без референсов).
 
 ## Установка
 
