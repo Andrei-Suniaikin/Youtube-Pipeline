@@ -219,6 +219,17 @@ def main() -> int:
           build_field("voice_by_lang", {"engine": "lumean"})["label"],
           "Пресеты Lumean по языкам")
 
+    # Решение владельца 17.09.2026: подпись переключается сразу при смене движка —
+    # сервер отдаёт оба варианта, форма берёт нужный без сохранения.
+    both = build_field("voice_by_lang", {"engine": "edge"}).get("by_engine") or {}
+    check("оба варианта подписи отданы форме",
+          (both.get("lumean", {}).get("label"), both.get("other", {}).get("label")),
+          ("Пресеты Lumean по языкам", "Голоса по языкам"))
+    check("варианты не зависят от текущего движка",
+          build_field("voice_by_lang", {"engine": "lumean"}).get("by_engine"), both)
+    check("подсказка Lumean в варианте — про template_id",
+          "template_id" in both.get("lumean", {}).get("hint", ""), True)
+
     # Язык, введённый в строку карты до появления этого выпадающего списка (или код,
     # которого больше нет в _LANG_NAMES), не должен теряться на sync()/сохранении
     # формы. Проверка со стороны описания — value поля

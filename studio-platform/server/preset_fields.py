@@ -647,10 +647,25 @@ def describe(mod, settings: dict, extra: dict = None) -> list:
             except Exception:                                      # noqa: BLE001
                 label = f.key          # правило подписи сломалось — ключ лучше пустоты
             value = s.get(f.key)
-            items.append({"key": f.key, "label": label, "kind": f.kind,
-                          "hint": hint, "placeholder": f.placeholder,
-                          "options": options, "off": off,
-                          "value": "" if value is None else str(value)})
+            item = {"key": f.key, "label": label, "kind": f.kind,
+                    "hint": hint, "placeholder": f.placeholder,
+                    "options": options, "off": off,
+                    "value": "" if value is None else str(value)}
+            if f.kind == "langmap":
+                # Подпись и подсказка карты зависят от движка озвучки. Отдаём оба
+                # варианта сразу: форма переключает их при смене «Движка», не дожидаясь
+                # сохранения (решение владельца 17.09.2026). Тексты — те же функции,
+                # что и выше, второго источника правды в браузере нет.
+                item["by_engine"] = {}
+                for eng in ("lumean", "other"):
+                    s2 = dict(s, engine="lumean" if eng == "lumean" else "edge")
+                    try:
+                        item["by_engine"][eng] = {
+                            "label": f.label(mod, s2) if callable(f.label) else f.label,
+                            "hint": f.hint(mod, s2) if callable(f.hint) else f.hint}
+                    except Exception:                              # noqa: BLE001
+                        item["by_engine"][eng] = {"label": label, "hint": hint}
+            items.append(item)
         if items:
             out.append({"title": title, "fields": items})
     return out

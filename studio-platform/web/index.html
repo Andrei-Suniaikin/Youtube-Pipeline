@@ -3384,14 +3384,27 @@ function wireLangMap(card, f, group, locked){
   const rows = box.querySelector('.langmap-rows');
   const langs = f.options || [];
   // Случай Lumean (ТЗ, батч 16.09.2026): у него идентификатор строки — id пресета
-  // Lumean (template_id), а не голос. Значение движка читается здесь один раз, при
-  // отрисовке формы, и не пересчитывается при смене «Движка» до сохранения — это
-  // принятое ограничение формы, а не побочный эффект приёма: все правила off/hide в
-  // этой форме так же статичны до сохранения и перезагрузки, карта голосов не
-  // исключение.
+  // Lumean (template_id), а не голос. Подпись поля, подсказка и подсказка в строках
+  // переключаются СРАЗУ при смене «Движка» в этой же группе (решение владельца
+  // 17.09.2026), без сохранения: оба варианта текста прислал сервер в `f.by_engine`.
   const engineField = (group.fields || []).find(x => x.key === 'engine');
-  const isLumean = !!engineField && String(engineField.value || '').toLowerCase() === 'lumean';
-  const idPlaceholder = isLumean ? 'id пресета Lumean (template_id)' : 'id голоса';
+  const engineSelect = card.querySelector('#f-engine');
+  const lumeanNow = () => String(engineSelect ? engineSelect.value
+    : (engineField ? engineField.value : '') || '').toLowerCase() === 'lumean';
+  let idPlaceholder = lumeanNow() ? 'id пресета Lumean (template_id)' : 'id голоса';
+  const fld = box.closest('.fld');
+  const applyEngine = () => {
+    const lum = lumeanNow();
+    idPlaceholder = lum ? 'id пресета Lumean (template_id)' : 'id голоса';
+    rows.querySelectorAll('.lm-voice').forEach(i => { i.placeholder = idPlaceholder; });
+    const texts = (f.by_engine || {})[lum ? 'lumean' : 'other'];
+    if (!texts || !fld) return;
+    const label = fld.querySelector('label');
+    if (label) label.textContent = texts.label;
+    const hint = fld.querySelector('.note.muted');
+    if (hint) hint.textContent = texts.hint;
+  };
+  if (engineSelect) engineSelect.addEventListener('change', applyEngine);
 
   // Тот же приём, что и у selectOptionsHtml() выше, доведённый до строк карты: язык,
   // введённый до появления этого выпадающего списка (диалектный код вида `pt-br`,
