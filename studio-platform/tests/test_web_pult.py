@@ -164,6 +164,10 @@ def main() -> int:
     check("предпросмотр отвечает", code, 200)
     check("сказано, чем будет сделано", len(body.get("presets") or []), 3)
     check("в базе ничего не прибавилось", plan_rows(mark), before)
+    # Форма ответа, на которую опирается страница канала. 17.09 страница читала
+    # несуществующее `items`, и кнопка «Поставить» не включалась никогда.
+    check("в ответе есть placed / queued / skipped",
+          all(k in body for k in ("placed", "queued", "skipped")), True)
 
     print("\nДействия пересылаются, а не выполняются здесь")
     code, body = me.go("/ui/actions/vsgen/99999999/cancel", {})
@@ -317,6 +321,8 @@ def main() -> int:
     check("страница отдаётся", code, 200)
     check("база API берётся из адреса", "const API = (location.pathname.match" in page,
           True)
+    check("предпросмотр ссылок не читает несуществующее items",
+          "out.items" in page, False)
     bare = [line.strip()[:70] for line in page.splitlines()
             if ("fetch(" in line and "API + " not in line and "fetch(API" not in line)
             or ("'/ui/files/" in line and "${API}" not in line)]

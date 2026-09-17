@@ -15,6 +15,7 @@ import json
 import os
 import sqlite3
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
@@ -282,6 +283,22 @@ def main() -> int:
 
     check("у кабинета без fastgen_status статуса просто нет, форма открывается",
           bool(image_options(Cabinet)), True)
+
+    print("\n  форма не висит, если fastgen_status завис (доработка 4, Дополнение 16.09)")
+
+    class CabinetStatusHang(CabinetWithStatus):
+        @staticmethod
+        def fastgen_status(key):
+            time.sleep(30)                     # имитация зависшего провайдера
+            return {"models": [{"id": "NARWHAL", "txt": "работает"}]}
+
+    t0 = time.monotonic()
+    opts_hang = image_options(CabinetStatusHang)
+    elapsed = time.monotonic() - t0
+    check("завис — статус «нет данных», а не то, что вернулось бы через 30с",
+          opts_hang["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · нет данных")
+    check("форма уложилась в бюджет, не дождавшись зависшего вызова",
+          elapsed < PF._FG_FORM_BUDGET_SEC + 2, True)
 
     print()
     if FAILS:

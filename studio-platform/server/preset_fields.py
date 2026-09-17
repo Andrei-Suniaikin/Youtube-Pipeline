@@ -21,6 +21,8 @@ f-строк: список полей, их подписи, варианты в�
 """
 from __future__ import annotations
 
+import threading
+
 
 class Field:
     __slots__ = ("key", "label", "kind", "hint", "options", "off", "hide", "placeholder")
@@ -79,6 +81,18 @@ def _engines(m):
 _HIDDEN_IMAGE_MODELS = {"GROK", "GROK_SPEED"}
 
 
+# Доработка 4 (Дополнение 16.09 к батчу 16.09.2026, фаза 4): у `fastgen_status` на
+# холодном кэше — до трёх последовательных сетевых вызовов по 20с каждый (см.
+# `main.py:_fg_get`), то есть до минуты, если провайдер завис. Открытие формы пресета
+# не вправе ждать столько: бюджет ниже жёстко ограничивает, сколько форма готова
+# подождать живой статус, прежде чем показать «нет данных» и открыться.
+_FG_FORM_BUDGET_SEC = 3.0
+
+
+_FG_INFLIGHT_LOCK = threading.Lock()
+_FG_INFLIGHT = {"busy": False}
+
+
 def _fg_status_map(m):
     """id модели FastGen → текст живого статуса («работает»/«нестабильно»/«лежит»/
     «нет данных»), батч 16.09.2026 (пункт 2.1 ТЗ).
@@ -91,6 +105,17 @@ def _fg_status_map(m):
     Всё под `getattr`+`try`: модуль-заглушка в тестах не обязан иметь ни `keys`, ни
     `fastgen_status`, а сеть или ключ могут молчать в проде — ни один из этих случаев не
     должен ронять форму (правило «форма обязана открываться»).
+
+    Бюджет `_FG_FORM_BUDGET_SEC` (доработка 4, Дополнение 16.09): вызов идёт в отдельном
+    потоке-демоне, и если он не уложился в бюджет — путь формы получает «нет данных» и
+    открывается сразу, не дожидаясь ответа. Поток «убить» на зависшем сетевом вызове
+    нельзя (Python этого не умеет), поэтому он продолжает висеть в фоне и — если всё же
+    досчитает — просто обновит кэш `fastgen_status`/`admin_state.fastgen_usage` впрок,
+    для следующего открытия формы. Демон, а не `ThreadPoolExecutor`, — намеренно: у
+    executor'а есть atexit-обработчик, который на выходе процесса ждёт завершения ВСЕХ
+    его потоков, включая зависшие, а демон interpreter убивает сразу, без ожидания.
+    Экран ключей и цикл тревог (`dev/alerts.py`) зовут `fastgen_status` напрямую, без
+    этого бюджета: им ждать можно, форме — нельзя.
     """
     keys_fn = getattr(m, "keys", None)
     first_cred = getattr(m, "_first_credential", None)
@@ -101,7 +126,33 @@ def _fg_status_map(m):
         key = first_cred(keys_fn(), "googler")
         if not key:
             return {}
-        st = status_fn(key)
+        # Один фоновый вызов за раз. Если FastGen завис, каждое открытие формы иначе
+        # запускало бы ещё один поток и ещё одну серию запросов к провайдеру, который и
+        # так не отвечает, — нагрузка росла бы ровно тогда, когда ему хуже всего. Пока
+        # предыдущий вызов не вернулся, форма сразу получает «нет данных».
+        with _FG_INFLIGHT_LOCK:
+            if _FG_INFLIGHT["busy"]:
+                return {}
+            _FG_INFLIGHT["busy"] = True
+        box = {}
+        done = threading.Event()
+
+        def _call():
+            try:
+                box["st"] = status_fn(key)
+            except Exception:                                      # noqa: BLE001
+                pass
+            finally:
+                with _FG_INFLIGHT_LOCK:
+                    _FG_INFLIGHT["busy"] = False
+                done.set()
+
+        threading.Thread(target=_call, daemon=True).start()
+        if not done.wait(timeout=_FG_FORM_BUDGET_SEC):
+            return {}          # не уложились в бюджет — «нет данных», форма открывается
+        st = box.get("st")
+        if st is None:
+            return {}
     except Exception:                                              # noqa: BLE001
         return {}
     return {row.get("id"): row.get("txt") for row in (st.get("models") or [])

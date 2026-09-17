@@ -207,8 +207,18 @@
             color:var(--ok)}
   .day .cnt.work{color:var(--acc-hi)}
   .day .cnt.bad{color:var(--bad)}
+  /* .fields — сетка полей формы (пресет, настройки проекта/канала). Боковой отступ
+     18px и нижний 16px — в тон заголовку .sec (пункт 7 ТЗ, отступы): без него поля
+     упирались прямо в рамку карточки, потому что у .card своего отступа нет, а .sec
+     заголовку он даёт. */
   .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
-          gap:22px 20px;padding:6px 0 4px}
+          gap:22px 20px;padding:6px 18px 16px}
+  /* Общий отступ для содержимого карточки сразу после заголовка .sec — тем же
+     числом 18/16, что и у .fields выше (пункт 7 ТЗ). Не общее правило по всей
+     карточке: строчные компоненты со своим отступом на каждую строку (таблицы,
+     .stage, .ev, .cal, .grid, .chgrid — уже «от края до края» по замыслу) этот
+     класс не получают и не должны — им и так хорошо. */
+  .secbody{padding:0 18px 16px}
   .fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px;
              line-height:1.3}
   .fld input,.fld select{width:100%;padding:8px 10px}
@@ -663,8 +673,9 @@ async function viewChannels(){
 
   bar.querySelector('#impch').onclick = () => {
     if (document.getElementById('imp-form')) return;
-    const form = $(`<div class="card" id="imp-form" style="padding:16px;margin-bottom:16px">
+    const form = $(`<div class="card" id="imp-form" style="margin-bottom:16px">
       <div class="sec">Перенести каналы списком</div>
+      <div class="secbody">
       <div id="err"></div>
       <div class="note muted">JSON-массив или CSV с заголовком. Обязательны
         <b>uc</b> и <b>name</b>. Пустая колонка ничего не затирает — так можно
@@ -674,6 +685,7 @@ async function viewChannels(){
       <div style="margin-top:12px"><button id="go">Перенести</button>
         <button class="ghost" id="no">Отмена</button></div>
       <div id="res"></div>
+      </div>
     </div>`);
     bar.after(form);
     const err = form.querySelector('#err');
@@ -700,8 +712,9 @@ async function viewChannels(){
   // узнают его настоящий ID на YouTube (см. также `pub_schema.py`, `pub_ui.clean_uc`).
   bar.querySelector('#newch').onclick = () => {
     if (document.getElementById('newch-form')) return;
-    const form = $(`<div class="card" id="newch-form" style="padding:16px;margin-bottom:16px">
+    const form = $(`<div class="card" id="newch-form" style="margin-bottom:16px">
       <div class="sec">Новый канал</div>
+      <div class="secbody">
       <div id="err"></div>
       <div class="fldrow"><label>ID канала</label>
         <input id="uc" placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" style="width:340px"></div>
@@ -716,6 +729,7 @@ async function viewChannels(){
         она откроется сразу.</div>
       <div style="margin-top:12px"><button id="go">Создать</button>
         <button class="ghost" id="no">Отмена</button></div>
+      </div>
     </div>`);
     bar.after(form);
     const err = form.querySelector('#err');
@@ -813,32 +827,68 @@ async function channelReleases(id, d){
 
   // Флоу создания: ссылки встают в ближайшие свободные слоты. Это и есть «залить
   // видосы» — дальше конвейер делает их сам по расписанию канала.
+  //
+  // Чего не хватает каналу — показываем ДО нажатия. Поставить ссылку заранее можно и
+  // без этого (кнопку не блокируем), но молча принять ссылку, которая не выйдет из
+  // очереди, — это то, на чём 17.09 споткнулся владелец: канал без расписания,
+  // пресета и профиля принимал ссылку и ничего не объяснял.
+  const ch = d.channel || {};
+  const lacks = [
+    !ch.uc && 'нет ID YouTube — выпуски не заводятся',
+    !Object.keys(ch.schedule || {}).length && 'нет расписания — ссылки встанут без даты',
+    !ch.preset_vsgen_id && 'не выбран пресет — выпуску нечем делать озвучку и кадры',
+    !ch.profile_id && 'не выбран профиль AdsPower — заливать нечем',
+    !ch.host_id && 'не выбрана машина заливки',
+  ].filter(Boolean);
   const add = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Поставить ролики</div>
+    <div class="secbody">
+    ${lacks.length ? `<div class="note bad" style="margin-bottom:10px">Ролик с этого
+      канала сейчас не выйдет: ${lacks.map(esc).join('; ')}.
+      <a href="#/channel/${encodeURIComponent(id)}/nastroyki">Настроить канал →</a></div>` : ''}
     <textarea id="lk" rows="4" style="width:100%"
       placeholder="ссылки на доноров, по одной в строке — разложатся по свободным датам"></textarea>
     <div style="margin-top:10px"><button id="prev" class="small">Показать, что будет</button>
       <button id="go" class="small" style="margin-left:8px" disabled>Поставить</button></div>
-    <div id="pv"></div></div>`);
+    <div id="pv"></div></div></div>`);
   app.append(add);
   const pv = add.querySelector('#pv');
+  const fmt = v => {
+    const t = new Date(v);
+    return isNaN(t) ? String(v)
+      : t.toLocaleString('ru-RU', {weekday: 'short', day: '2-digit', month: '2-digit',
+                                   hour: '2-digit', minute: '2-digit'});
+  };
   add.querySelector('#prev').onclick = async () => {
     pv.innerHTML = '';
     try{
       const out = await post('/ui/links/preview',
                              {channel_id: Number(id), links: add.querySelector('#lk').value});
-      pv.innerHTML = `<div class="note muted">${(out.items || []).map(i =>
-        `${esc(i.when || '—')} · ${esc(i.title || i.url || '')}`).join('<br>')
-        || 'ничего не разобрано'}</div>`;
-      add.querySelector('#go').disabled = !(out.items || []).length;
+      // Ответ — `placed` (даты слотов), `queued` (сколько без даты), `skipped` (дубли).
+      // Раньше здесь читалось несуществующее `items`: предпросмотр всегда писал «ничего
+      // не разобрано», и «Поставить» не включалась никогда.
+      const placed = out.placed || [], skipped = out.skipped || [], queued = out.queued || 0;
+      const parts = [];
+      if (placed.length) parts.push(`<b>Встанет на даты:</b> ${placed.map(v => esc(fmt(v))).join(', ')}`);
+      if (queued) parts.push(`<b>Без даты:</b> ${queued} — в расписании нет свободных выходов
+        на ${esc(String((out.channel || {}).horizon_days ?? ''))} дн вперёд; встанут, когда
+        выходы освободятся`);
+      if (skipped.length) parts.push(`<b>Пропустятся как дубли:</b> ${skipped.map(esc).join(', ')}`);
+      pv.innerHTML = `<div class="note muted" style="margin-top:10px">${
+        parts.join('<br>') || 'ничего не разобрано — вставьте ссылки на YouTube'}</div>`;
+      add.querySelector('#go').disabled = !(placed.length || queued);
     }catch(e){ toast(e.message); }
   };
   add.querySelector('#go').onclick = async () => {
+    const b = add.querySelector('#go');
+    b.disabled = true;
     try{
-      await post('/ui/links', {channel_id: Number(id), links: add.querySelector('#lk').value});
-      toast('Поставлено', 'ok');
+      const out = await post('/ui/links', {channel_id: Number(id),
+                                           links: add.querySelector('#lk').value});
+      const n = (out.placed || []).length, q = out.queued || 0;
+      toast(`Поставлено: на даты ${n}, без даты ${q}`, 'ok');
       await render();
-    }catch(e){ toast(e.message); }
+    }catch(e){ toast(e.message); b.disabled = false; }
   };
 
   if (!d.calendar.length){
@@ -890,8 +940,6 @@ function uploadsCard(rows){
 async function viewChannel(id){
   const d = await api('/ui/channels/' + encodeURIComponent(id) + '?history=14');
   const c = d.channel;
-  const times = Object.entries(c.schedule)
-    .map(([day, tt]) => `${day}: ${(tt || []).join(', ')}`).join(' · ') || 'не задано';
 
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/channels">← ко всем каналам</a>
@@ -913,21 +961,15 @@ async function viewChannel(id){
 
   if (tab === 'roliki'){ await channelReleases(id, d); return; }
 
-  const head = $(`<div class="card" style="margin-bottom:16px"><div class="grid">
-    <div><div class="k">Расписание</div>${esc(times)}</div>
-    <div><div class="k">Часовой пояс</div>${esc(c.tz)}</div>
-    <div><div class="k">Горизонт</div>${c.horizon_days} дн</div>
-    <div><div class="k">Готовим заранее</div>${c.lead_days} дн</div>
-    <div><div class="k">Машина</div>${esc(c.host || '—')}</div>
-    <div><div class="k">Профиль</div>${esc(c.profile || '—')}</div>
-  </div>
-  <div class="sec" style="border-bottom:0;padding-bottom:0">
-    <button class="ghost" id="edit">Настроить</button>
-    <span id="statusbtns"></span></div>
-  <div id="editbox"></div></div>`);
+  // Сводка убрана (доработка §5, Дополнение 16.09): расписание, часовой пояс,
+  // горизонт, «заранее», машина и профиль — те же поля, что и в форме ниже, а
+  // машина с профилем в форме редактируемые, а не для чтения, так что дублировать
+  // их отдельной плашкой незачем. Форма видна сразу, без кнопки «Настроить».
+  const head = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec"><span id="statusbtns"></span></div>
+    <div id="editbox" class="secbody"></div></div>`);
   app.append(head);
   wireChannelEdit(head, c);
-
 }
 
 function calendarFeed(d){
@@ -1284,6 +1326,7 @@ async function viewProjects(){
     if (document.getElementById('npform')) return;
     const form = $(`<div class="card" id="npform" style="margin-bottom:16px">
       <div class="sec">Новый проект</div>
+      <div class="secbody">
       <div id="err"></div>
       <div class="row"><label>Название</label>
         <input id="nm" placeholder="как называть ролик" style="width:100%"></div>
@@ -1297,7 +1340,7 @@ async function viewProjects(){
         Ручку на сервере файл не заводит новую: браузер сам читает его в поле текста.</div>
       <div style="margin-top:12px"><button id="go">Завести</button>
         <button class="ghost" id="no">Отмена</button></div>
-    </div>`);
+    </div></div>`);
     bar.after(form);
     const err = form.querySelector('#err');
     form.querySelector('#no').onclick = () => form.remove();
@@ -1468,6 +1511,7 @@ async function viewProject(id){
 
   const run = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Сделать всё</div>
+    <div class="secbody">
     <div id="rerr"></div>
     <div class="row" style="gap:12px;flex-wrap:wrap">
       <div><label>Предложений на кадр</label>
@@ -1485,7 +1529,7 @@ async function viewProject(id){
       запущена, проект дойдёт до сборки и остановится.</div>
     <div style="margin-top:12px"><button id="rgo">Запустить</button>
       <a class="ghost" href="#/project/${encodeURIComponent(p.id)}/settings"
-         style="color:var(--muted);margin-left:10px">Все настройки проекта →</a></div></div>`);
+         style="color:var(--muted);margin-left:10px">Все настройки проекта →</a></div></div></div>`);
   app.append(run);
   const rerr = run.querySelector('#rerr');
   run.querySelector('#rgo').onclick = async () => {
@@ -1688,8 +1732,9 @@ async function wireChannelEdit(root, c){
     catch(e){ b.disabled = false; toast(e.message); }
   });
 
-  root.querySelector('#edit').onclick = () => {
-    if (box.innerHTML){ box.innerHTML = ''; return; }
+  // Форма строится сразу при открытии вкладки (доработка §5, Дополнение 16.09):
+  // кнопки «Настроить» и промежуточного состояния «свёрнуто» больше нет.
+  {
     const picked = new Set(Object.keys(c.schedule || {}));
     const times = [...new Set(Object.values(c.schedule || {}).flat())].join(', ');
     const sel = (id, items, cur, label) => `<div class="fldrow"><label>${label}</label>
@@ -1795,7 +1840,7 @@ async function wireChannelEdit(root, c){
         await render();
       }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
     };
-  };
+  }
 }
 
 /* ────────────────────────── результаты задачи ────────────────────────── */
@@ -2232,12 +2277,12 @@ async function viewProfile(){
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Ключи провайдеров
       <a class="mklink" href="#/keys">открыть →</a></div>
-    <div class="note muted">Ключи принадлежат человеку, а не системе: свой ключ тратит
-      свои деньги, серверный — деньги владельца.</div></div>`));
+    <div class="note muted secbody">Ключи принадлежат человеку, а не системе: свой ключ
+      тратит свои деньги, серверный — деньги владельца.</div></div>`));
 
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Система</div>
-    <div class="note muted">
+    <div class="note muted secbody">
       <a href="#/admin">Состояние: тревоги, диск, публикации</a> ·
       <a href="#/limits">Серверные лимиты</a></div></div>`));
 
@@ -2455,10 +2500,11 @@ async function viewPresetNew(){
       клипы, сборка, текст и обложка.</p>`));
   const card = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Название</div>
+    <div class="secbody">
     <input id="p-name" placeholder="например: длинные ролики, польский"
       style="width:100%;max-width:420px">
     <div class="note muted">Дальше откроется редактор полей. Пустое поле означает
-      «как по умолчанию» — заполнять всё сразу не нужно.</div></div>`);
+      «как по умолчанию» — заполнять всё сразу не нужно.</div></div></div>`);
   app.append(card);
   const bar = $(`<div style="display:flex;gap:10px;align-items:center">
     <button id="go">Завести</button>
@@ -2492,7 +2538,8 @@ async function viewPreset(id){
     <p class="sub">${esc(d.note)}</p>`));
   const name = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Название</div>
-    <input id="p-name" value="${esc(d.name)}" style="width:100%;max-width:420px"></div>`);
+    <div class="secbody">
+    <input id="p-name" value="${esc(d.name)}" style="width:100%;max-width:420px"></div></div>`);
   app.append(name);
   app.append($(`<div class="subtabs">${tabs.map(([k, title]) =>
     `<a href="#/preset/${encodeURIComponent(id)}/${k}"
@@ -2649,6 +2696,7 @@ async function accountsCard(){
     </tr>`).join('')}</tbody></table>
 
     <div class="sec" style="border-bottom:0">Завести человека</div>
+    <div class="secbody">
     <div id="uerr"></div>
     <div class="fldrow"><label>Логин</label>
       <input id="n-login" style="width:200px" autocomplete="off">
@@ -2663,6 +2711,7 @@ async function accountsCard(){
     </div>
     <div class="note muted">${esc(d.note)}. Заводить его в Rewrite и Cover не нужно —
       они узнают человека по этому же входу.</div>
+    </div>
   </div>`);
 
   const err = card.querySelector('#uerr');
