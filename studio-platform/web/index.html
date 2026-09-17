@@ -1476,73 +1476,993 @@ async function viewProjects(){
 // Проект по составляющим. Раньше всё лежало одной лентой: запуск, задачи, кадры,
 // озвучка, ролик, субтитры — и чтобы посмотреть обложку, надо было проскроллить сто
 // картинок. Вкладка на каждую составляющую: у них разные вопросы и разные кнопки.
-const PROJ_TABS = [
-  ['obzor',   'Обзор',    []],
-  ['tekst',   'Текст',    ['scenes']],
-  ['ozvuchka','Озвучка',  ['audio']],
-  ['kadry',   'Кадры',    ['images']],
-  ['klipy',   'Клипы',    ['clips']],
-  ['sborka',  'Сборка',   ['renders', 'subs', 'chapters']],
-  ['oblozhka','Обложка',  []],
+// Батч C (экран проекта): шесть вкладок вместо старых «Обзор/Текст/Кадры/Клипы/
+// Сборка/Обложка» + отдельной «Настройки». Настройки этапа теперь живут ВНУТРИ
+// каждой вкладки производства (см. TAB_SETTINGS_GROUP) — второй страницы для них
+// больше нет (ФР §4, п.9).
+const PROJECT_TABS = [
+  ['scenario', 'Сценарий'],
+  ['tts',      'Озвучка'],
+  ['images',   'Изображения'],
+  ['video',    'Видео'],
+  ['render',   'Рендер'],
+  ['cover',    'Обложка'],
 ];
-const PROJ_KINDS = {tekst: ['prompts'], ozvuchka: ['tts'], kadry: ['images', 'regen'],
-                    klipy: ['video', 'regen_video'], sborka: ['render', 'chapters'],
-                    oblozhka: ['cover']};
+// Коды групп файлов (`_FILE_GROUPS` пульта) и виды задач (`queue_tasks.kind`),
+// которые относятся к каждой вкладке — те же коды, что были в PROJ_TABS/PROJ_KINDS
+// до этого батча, просто под новыми ключами вкладок.
+const TAB_FILES = {scenario: ['scenes'], tts: ['audio'], images: ['images'],
+                   video: ['clips'], render: ['renders', 'subs', 'chapters'],
+                   cover: ['covers']};
+const TAB_KINDS = {scenario: ['prompts'], tts: ['tts'], images: ['images', 'regen'],
+                   video: ['video', 'regen_video'], render: ['render', 'chapters'],
+                   cover: ['cover']};
+// Группа `preset_fields.GROUPS`, которая закрывает этап — только у четырёх вкладок
+// производства; у «Сценария» и «Обложки» блока «Настройки этапа» нет (§3: пятая
+// группа «Текст и обложка» в проект не идёт).
+const TAB_SETTINGS_GROUP = {tts: 'Озвучка', images: 'Картинки', video: 'Клипы',
+                            render: 'Сборка'};
 
-async function viewProject(id){
-  const d = await api('/ui/projects/' + encodeURIComponent(id));
+/* ─────────────────── статус проекта пятью сегментами ─────────────────── */
+// `project_stage_status` (Ф1, server/main.py) отдаёт tone/state кабинетными именами
+// (`running`/`error`/`queued`/`done`/`muted`/`dim`) — это переменные ЕГО палитры
+// (`var(--running)` и т.п.). У пульта своя палитра (см. :root вверху файла), поэтому
+// имена переводятся в свои переменные и свои классы, а не используются как есть.
+// Класс .segs/.segs i уже существует (полоска этапов выпуска) — тот же визуальный
+// язык, а не вторая полоска с нуля.
+const STAGE_TONE_VAR = {running: '--run', error: '--bad', queued: '--wait',
+                        done: '--ok', muted: '--muted', dim: '--off'};
+const STAGE_SEG_CLS = {done: 'done', running: 'running', queued: 'queued',
+                       error: 'error', pending: 'off'};
+function stageStripHtml(stage){
+  if (!stage || !(stage.segments || []).length) return '';
+  const bar = stage.segments.map(s =>
+    `<i class="${STAGE_SEG_CLS[s.state] || 'off'}" title="${esc(s.stage)}"></i>`).join('');
+  return `<div class="segs" style="max-width:320px;margin-top:9px">${bar}</div>
+    <div class="note" style="color:var(${STAGE_TONE_VAR[stage.tone] || '--muted'})"
+      >${esc(stage.caption)}</div>`;
+}
+
+/* ───────────────────────── панель пресета ───────────────────────── */
+// Только ЦЕЛЫЕ пресеты (частичные — заготовка одной части, к проекту целиком не
+// применяются, §3/раздел 2 спецификации). Список берётся из уже существующей
+// GET /ui/presets (группа service==='vsgen'), второй ручки листинга заводить не
+// нужно — так велит спецификация напрямую.
+function presetPanelHtml(applied, wholePresets){
+  const curId = (applied && !applied.missing) ? String(applied.id) : '';
+  return `<div class="card" style="margin-bottom:16px">
+    <div class="sec">Пресет</div>
+    <div class="secbody">
+    <div style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+      <select id="pp-pick" style="min-width:220px">
+        <option value="">— не выбран —</option>
+        ${wholePresets.map(p => `<option value="${esc(p.key)}"
+          ${p.key === curId ? 'selected' : ''}>${esc(p.name)}</option>`).join('')}
+      </select>
+      <button id="pp-apply" class="ghost small">Применить</button>
+      <button id="pp-clear" class="ghost small" title="снять выбор в списке">×</button>
+      <span style="flex:1 1 auto"></span>
+      <input id="pp-name" placeholder="сохранить как новый…" style="width:200px">
+      <button id="pp-snap" class="ghost small">Снимок</button>
+    </div>
+    ${applied && applied.missing
+      ? '<div class="note bad">пресет удалён</div>'
+      : (applied ? `<div class="note muted">применён: ${esc(applied.name)}</div>` : '')}
+    ${applied && !applied.missing && (applied.links || []).length
+      ? `<div class="note muted">часть настроек — из частичных пресетов: ${
+          applied.links.map(l => esc(l.title)).join(', ')}</div>` : ''}
+    </div></div>`;
+}
+
+function wirePresetPanel(card, pid){
+  const sel = card.querySelector('#pp-pick');
+  // «×» — снимает выбор ТОЛЬКО в списке, ничего не отправляет и не меняет в проекте
+  // (раздел 2 спецификации: без запроса).
+  card.querySelector('#pp-clear').onclick = () => { sel.value = ''; };
+  card.querySelector('#pp-apply').onclick = ev => {
+    const presetId = sel.value;
+    if (!presetId) return;
+    // Применение заменяет настройки проекта ЦЕЛИКОМ — обязательное предупреждение
+    // перед необратимым действием (раздел 2 спецификации), инлайн, не confirm().
+    confirmInline(ev.currentTarget,
+      'Заменит настройки проекта целиком — применить пресет?', async () => {
+      try{
+        await post(`/ui/projects/${encodeURIComponent(pid)}/preset/apply`,
+                   {preset_id: Number(presetId)});
+        toast('Пресет применён', 'ok');
+        await viewProject(pid);           // перерисовать экран целиком (п.3 спецификации)
+      }catch(e){ toast(e.message); }
+    });
+  };
+  card.querySelector('#pp-snap').onclick = async () => {
+    const btn = card.querySelector('#pp-snap');
+    const name = card.querySelector('#pp-name').value.trim();
+    if (!name){ toast('у пресета должно быть имя'); return; }
+    btn.disabled = true;
+    try{
+      await post(`/ui/projects/${encodeURIComponent(pid)}/preset/snapshot`, {name});
+      toast('Пресет сохранён снимком', 'ok');
+      await viewProject(pid);
+    }catch(e){ toast(e.message); }
+    finally{ btn.disabled = false; }
+  };
+}
+
+/* ───────────────────────── лог задачи, опросом ───────────────────────── */
+// Раскрывающийся лог на задачу (ФР §4 п.7): дочитывается раз в 3с, пока задача не
+// в терминальном статусе; сворачивание блока или уход со страницы (смена hash) —
+// таймер снимается. Реестр таймеров — общий на все вкладки проекта: при перерисовке
+// экрана (смена hash, повторный viewProject) снимаются все разом, а не по одному —
+// иначе вкладка, которую уже покинули, продолжала бы дёргать API вникуда.
+const LOG_TIMERS = {};
+// `deleted` — тоже терминальный статус `queue_tasks` (review-feedback-F4 цикл 1,
+// Issue 7): без него опрос лога уже удалённой задачи продолжался бы впустую.
+const LOG_TERMINAL = new Set(['done', 'error', 'cancelled', 'failed', 'deleted']);
+function clearAllLogTimers(){
+  for (const jid of Object.keys(LOG_TIMERS)){ clearInterval(LOG_TIMERS[jid]); delete LOG_TIMERS[jid]; }
+}
+function stopJobLogPoll(jid){
+  if (LOG_TIMERS[jid]){ clearInterval(LOG_TIMERS[jid]); delete LOG_TIMERS[jid]; }
+}
+function startJobLogPoll(jid, pre){
+  let after = 0;
+  // Тик не запускается повторно, пока предыдущий ещё не ответил (review-feedback-F4
+  // цикл 1, Issue 7): без этого ответ дольше 3с давал два тика с одним `after`, и
+  // строки лога дописывались дважды.
+  let busy = false;
+  const tick = async () => {
+    if (busy) return;
+    busy = true;
+    try{
+      const d = await api(`/ui/jobs/${encodeURIComponent(jid)}/logs?after=${after}`);
+      const text = d.lines.map(l => l.line).join('\n');
+      if (after === 0){
+        pre.textContent = (d.truncated ? '… показаны последние 1000 строк …\n' : '')
+          + (text || '(пусто)');
+      } else if (text){
+        pre.textContent += '\n' + text;
+      }
+      pre.scrollTop = pre.scrollHeight;
+      after = d.next_after;
+      if (LOG_TERMINAL.has(d.status)) stopJobLogPoll(jid);   // задача завершилась — дальше нечего опрашивать
+    }catch(e){
+      // Сеть иногда сбоит (условие задачи) — один неудачный тик не должен стирать уже
+      // показанный лог и останавливать опрос идущей задачи; следующий тик попробует
+      // снова с тем же `after`.
+    }finally{ busy = false; }
+  };
+  tick();
+  LOG_TIMERS[jid] = setInterval(tick, 3000);
+}
+function toggleJobLog(tr, btn){
+  const jid = btn.dataset.job;
+  const next = tr.nextElementSibling;
+  if (next && next.classList.contains('jlog-row')){
+    stopJobLogPoll(jid);
+    next.remove();
+    return;
+  }
+  tr.insertAdjacentHTML('afterend', `<tr class="jlog-row"><td colspan="4">
+    <pre class="mono" style="white-space:pre-wrap;max-height:260px;overflow:auto;
+      background:var(--card-2);border-radius:8px;padding:10px;margin:0"
+      >загрузка…</pre></td></tr>`);
+  startJobLogPoll(jid, tr.nextElementSibling.querySelector('pre'));
+}
+
+// Строка задачи: состояние, прогресс, ошибка, «с какими настройками пошла» (снимок
+// момента постановки — правило 6 ТЗ, `j.applied`), отменить/повторить и раскрывающийся
+// лог. review-feedback-F4 цикл 1, Issue 5: старый «Обзор» умел всё это через
+// `actions()`/`wireActions()` (те же, что у очереди и #/text/#/covers — не новая
+// кнопка), но при переезде на вкладки список задач превратился в одну колонку «лог» и
+// молча потерял остальное. `jobRowHtml`/`jobsTableCard` — общий рендер строки/карточки
+// для «Лога задач» каждой вкладки и для «Прочих задач проекта» на «Сценарии».
+function jobRowHtml(j){
+  return `<tr>
+    <td>${esc(j.kind)}<div class="muted mono" style="font-size:11px">#${j.id}</div></td>
+    <td><span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
+      ${j.stage ? `<div class="muted">${esc(j.stage)}</div>` : ''}
+      ${j.progress != null ? `<div class="bar"><i style="width:${
+        Math.round(j.progress * 100)}%"></i></div>` : ''}
+      ${j.error ? `<div class="note bad">${esc(j.error)}</div>` : ''}
+      ${(j.applied || []).length ? `<details style="margin-top:6px">
+        <summary class="muted" style="cursor:pointer;font-size:12px"
+          >с какими настройками пошла</summary>
+        <div class="note muted">${j.applied.map(a =>
+          `${esc(a.name)}: <b>${esc(a.value)}</b>`).join(' · ')}</div>
+        <div class="note muted">Это снимок момента запуска — правка пресета
+          его не меняет.</div></details>` : ''}</td>
+    <td class="muted">${when(j.created)}</td>
+    <td style="white-space:nowrap">${actions({service: 'vsgen', id: j.id,
+                                              state: j.state, status: j.status})}
+      <button class="ghost small jlog-toggle" data-job="${j.id}">лог</button></td>
+  </tr>`;
+}
+function jobsTableCard(title, jobs, emptyText){
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">${esc(title)}</div>
+    ${jobs.length ? `<table><thead><tr>
+      <th>Задача</th><th>Состояние</th><th>Создана</th><th></th></tr></thead>
+      <tbody>${jobs.map(jobRowHtml).join('')}</tbody></table>`
+      : `<div class="empty">${esc(emptyText)}</div>`}
+  </div>`);
+  wireActions(card);
+  card.querySelectorAll('.jlog-toggle').forEach(btn => {
+    btn.onclick = () => toggleJobLog(btn.closest('tr'), btn);
+  });
+  return card;
+}
+
+// Список задач вкладки (вид задачи — по TAB_KINDS) с раскрывающимся логом на каждую
+// (ФР §4 п.7). Источник — то же `d.jobs`, что уже приходит с `GET /ui/projects/{pid}`
+// (project-scoped `queue_tasks`, не общий список сервиса).
+function jobsLogCard(d, tab){
+  const kinds = TAB_KINDS[tab] || [];
+  const jobs = (d.jobs || []).filter(j => kinds.includes(j.kind));
+  return jobsTableCard('Лог задач', jobs, 'Задач пока нет.');
+}
+
+function emptyResultCard(){
+  // Заголовок обязателен и у пустого блока (Issue 8): без него порядок «Действие →
+  // Настройки → Результат → Лог» на глаз терялся — было непонятно, что вообще
+  // означает пустой безымянный блок между настройками и логом.
+  return $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Результат</div>
+    <div class="secbody">
+    <div class="empty">Здесь пока пусто — этот этап ещё не отработал.</div>
+    </div></div>`);
+}
+
+/* ───────────────────────── старт этапа (tts/images/video/render) ───────────────────────── */
+const STAGE_OUTCOME_TEXT = {
+  duplicate: 'Уже идёт — вторая такая же задача не ставится',
+  images_busy: 'Картинки заняты правкой — дождитесь освобождения',
+  render_deferred: 'Рендер отложен: материалы для сборки ещё не готовы',
+  video_deferred: 'Видео отложено: материалы ещё не готовы',
+};
+// Строка исхода последнего нажатия «Начать» переживает автообновление экрана после
+// успешного старта (review-feedback-F4 цикл 1, Issue 3): раньше отложенный
+// `viewProject()` рисовал блок «Действие» заново уже пустым, и «Поставлено: задача
+// #N» пропадало через 1,2 с, так и не будучи прочитанным. Ключ — pid:tab, живёт на
+// сессию вкладки браузера, как и остальные *_STATE этого экрана.
+const STAGE_OUTCOME_STATE = {};
+
+async function renderStageTab(d, tab){
   const p = d.project;
-  const tab = location.hash.split('/')[3] || 'obzor';
+  const skey = p.id + ':' + tab;
+  const groupTitle = TAB_SETTINGS_GROUP[tab];
+  const settingsData = await api(`/ui/projects/${encodeURIComponent(p.id)}/settings`);
+  const group = settingsData.groups.find(g => g.title === groupTitle);
+  let settingsForm = group ? fieldForm([group]) : null;
+
+  // 1. Действие — «Начать» шлёт ТЕКУЩИЕ значения формы настроек этой вкладки
+  // (fieldForm(...).read()), чтобы старт не сбросил их на «как по умолчанию»
+  // (поправка оркестратора к §5.4).
+  const actCard = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Действие</div>
+    <div class="secbody">
+    <button id="stage-go">Начать</button>
+    <div id="stage-outcome" class="note"></div>
+    </div></div>`);
+  app.append(actCard);
+  const outcomeBox = actCard.querySelector('#stage-outcome');
+  // Показать исход предыдущего нажатия сразу же — переживает перерисовку экрана.
+  const savedOutcome = STAGE_OUTCOME_STATE[skey];
+  if (savedOutcome){
+    outcomeBox.textContent = savedOutcome.text;
+    outcomeBox.classList.add(savedOutcome.cls);
+  }
+  actCard.querySelector('#stage-go').onclick = async () => {
+    const btn = actCard.querySelector('#stage-go');
+    btn.disabled = true;
+    outcomeBox.className = 'note';
+    outcomeBox.textContent = 'запускаю…';
+    // Адрес на момент нажатия — чтобы отложенное обновление ниже не сработало,
+    // если человек за эти 1,2 с уже ушёл с этой вкладки (Issue 3).
+    const hashAtClick = location.hash;
+    try{
+      const settings = settingsForm ? settingsForm.read() : {};
+      const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/stage/${tab}`,
+                             {settings});
+      // Пять честных исходов (поправка 1 триажа) — «поставлено» только когда
+      // outcome === 'started'; остальное — своя правдивая подпись (принцип 3).
+      const text = out.outcome === 'started'
+        ? `Поставлено: задача #${out.job_id}`
+        : (STAGE_OUTCOME_TEXT[out.outcome] || out.outcome);
+      const cls = out.outcome === 'started' ? 'muted' : 'bad';
+      STAGE_OUTCOME_STATE[skey] = {text, cls};
+      outcomeBox.textContent = text;
+      outcomeBox.classList.add(cls);
+      if (out.outcome === 'started'){
+        setTimeout(() => { if (location.hash === hashAtClick) viewProject(p.id); }, 1200);
+      }
+    }catch(e){
+      STAGE_OUTCOME_STATE[skey] = {text: e.message, cls: 'bad'};
+      outcomeBox.textContent = e.message;         // текст кабинета как есть (принцип 3)
+      outcomeBox.classList.add('bad');
+    }finally{ btn.disabled = false; }
+  };
+
+  // 2. Настройки этапа — та же fieldForm/группа, что и в общих настройках проекта,
+  // сохранение — той же ручкой (§3: путь переиспользуется без изменений).
+  if (settingsForm){
+    app.append(settingsForm);
+    // «Отмена» тут не адрес — вкладка сама и есть текущий экран, у неё нет отдельной
+    // страницы «назад» (Issue 8: ссылка на тот же hash не делала ничего). Вместо
+    // перехода — построить форму заново из тех же данных, что пришли с сервера,
+    // отбросив несохранённые правки на месте.
+    app.append(saveBar(location.hash,
+      () => post(`/ui/projects/${encodeURIComponent(p.id)}/settings`,
+                 {values: settingsForm.read()}),
+      () => {
+        const fresh = fieldForm([group]);
+        settingsForm.replaceWith(fresh);
+        settingsForm = fresh;
+      }));
+  }
+
+  // 3. Результат
+  const mine = d.files.filter(g => (TAB_FILES[tab] || []).includes(g.code));
+  if (mine.length) for (const g of mine) app.append(fileCard(d, g));
+  else app.append(emptyResultCard());
+
+  // 4. Лог задач
+  app.append(jobsLogCard(d, tab));
+}
+
+/* ───────────────────────── вкладка «Сценарий» ───────────────────────── */
+// У Rewrite нет понятия «проект VSGen» — GET /ui/text не фильтруется по проекту, и
+// связать задачу рерайта с этим проектом в данных нечем. Решение оркестратора
+// (review-feedback-F4 цикл 2, Issue 4): needs-clarification.md не писать и новую
+// связь в данных не придумывать — вкладка показывает те же «последние задачи текста»,
+// что и #/text (тот же источник, без новой ручки сервера), честно подписано, что
+// список — по аккаунту, а не по проекту; задача, созданная тут же, — первой в списке.
+// Опрос переиспользует LOG_TIMERS/clearAllLogTimers (тот же реестр, что у раскрытого
+// лога задачи выше) — останавливается сам при уходе со страницы (смене hash).
+const SCEN_STATE = {};
+function scenState(pid){
+  if (!SCEN_STATE[pid]) SCEN_STATE[pid] = {mode: 'link', langs: new Set(),
+                                           model: '', preset: '', lastJob: null};
+  return SCEN_STATE[pid];
+}
+// Терминальные состояния СПИСКА задач Rewrite/Cover (не `queue_tasks` кабинета —
+// у тех `LOG_TERMINAL` выше): пока среди показанных есть бегущая/ждущая, есть смысл
+// продолжать опрашивать.
+const JOB_LIST_TERMINAL = new Set(['done', 'partial', 'cancelled', 'error', 'blocked']);
+function jobListPollKey(kind, pid){ return `${kind}-jobs:${pid}`; }
+
+async function fetchText(path){
+  const r = await fetch(API + path);
+  if (!r.ok) throw new Error('файл не прочитался: HTTP ' + r.status);
+  return r.text();
+}
+
+// Раскрывающаяся строка результата задачи — та же механика RESULT_OPEN, что у
+// #/text/#/covers (`wireResults`), но `paint` умеет класть готовый файл в проект,
+// чего нет у общего `paintResults`. Клик вынесен в отдельную `wireOneJobRow` (review-
+// feedback-F4 цикл 3, Issue 1): `syncJobsTable` навешивает её на КОНКРЕТНУЮ новую
+// строку без повторного прохода по всей таблице — общий `wireProjectJobRows` ниже
+// на уже открытых строках сам эмулирует клик (`tr.click()`), и повторный вызов на
+// всей таблице закрыл бы то, что уже открыто.
+function wireOneJobRow(tr, service, colspan, paint){
+  tr.style.cursor = 'pointer';
+  tr.onclick = ev => {
+    if (ev.target.closest('button, a')) return;
+    const id = tr.dataset.job;
+    const key = service + ':' + id;
+    const next = tr.nextElementSibling;
+    if (next && next.classList.contains('res-row')){
+      next.remove(); RESULT_OPEN.delete(key); return;
+    }
+    RESULT_OPEN.add(key);
+    tr.insertAdjacentHTML('afterend',
+      `<tr class="res-row"><td colspan="${colspan}" style="padding-top:0">` +
+      '<div class="muted">загрузка…</div></td></tr>');
+    paint(id, tr.nextElementSibling.querySelector('div'));
+  };
+}
+function wireProjectJobRows(root, service, colspan, paint){
+  root.querySelectorAll('tr[data-job]').forEach(tr => {
+    wireOneJobRow(tr, service, colspan, paint);
+    if (RESULT_OPEN.has(service + ':' + tr.dataset.job)) tr.click();
+  });
+}
+
+// Ячейка «Состояние» строки списка задач Rewrite/Cover — общая для первой отрисовки
+// таблицы и для точечного обновления тиком опроса (`syncJobsTable`), чтобы обе
+// рисовали её одинаково.
+function jobListStateCellHtml(j){
+  return `<span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
+    ${j.detail ? `<div class="muted" style="margin-top:4px">${esc(j.detail)}</div>` : ''}
+    ${j.progress != null ? `<div class="bar"><i style="width:${
+      Math.round(j.progress * 100)}%"></i></div>` : ''}`;
+}
+// Тик опроса списка задач Rewrite/Cover (review-feedback-F4 цикл 3, Issue 1): не
+// перестраивает таблицу через `box.innerHTML` — это стирало бы раскрытые result-row и
+// всё внутри них (в т.ч. `confirmInline` у «Взять в проект» — Issue 1 цикла 3). Вместо
+// этого обновляется только ячейка `.jl-state` строк, у которых изменилось состояние
+// (по `data-state` на `<tr>`), новые задачи дописываются новыми строками, а уже
+// раскрытый результат перечитывается РОВНО ОДИН раз — в момент, когда задача только
+// что перешла в терминальное состояние (а не на каждом тике). Строки, которых больше
+// нет в ответе сервера, не удаляются — список Rewrite/Cover — это последние задачи
+// аккаунта, а не полный журнал, пропажа строки — редкий и неопасный случай (просто
+// устареет до следующего полного захода на вкладку).
+// Отпечаток строки: состояние + прогресс + подпись. Внутри `running` меняются только
+// прогресс и подпись, поэтому сравнивать по одному состоянию нельзя — полоска застынет.
+function jobRowPrint(j){
+  return [j.state, j.progress == null ? '' : j.progress, j.detail || ''].join('|');
+}
+// Снять СВОЙ таймер опроса: реестр чистится, только если под ключом всё ещё он.
+// Иначе запоздавший тик старого экрана погасил бы опрос нового под тем же ключом.
+function stopOwnPoll(key, handle){
+  clearInterval(handle);
+  if (LOG_TIMERS[key] === handle) delete LOG_TIMERS[key];
+}
+function syncJobsTable(box, jobs, service, rowHtml, colspan, paint){
+  const table = box.querySelector('table');
+  if (!table) return;                          // таблицы ещё нет — рано, ждём полной отрисовки
+  const tbody = table.querySelector('tbody');
+  const rows = {};
+  tbody.querySelectorAll('tr[data-job]').forEach(tr => { rows[tr.dataset.job] = tr; });
+  jobs.forEach(j => {
+    const id = String(j.id);
+    const tr = rows[id];
+    if (!tr){
+      tbody.insertAdjacentHTML('beforeend', rowHtml(j));   // новая задача — новая строка в конец
+      wireOneJobRow(tbody.lastElementChild, service, colspan, paint);
+      return;
+    }
+    if (tr.dataset.print === jobRowPrint(j)) return;   // ни состояние, ни прогресс, ни подпись не изменились
+    const wasTerminal = JOB_LIST_TERMINAL.has(tr.dataset.state);
+    const cell = tr.querySelector('.jl-state');
+    if (cell) cell.innerHTML = jobListStateCellHtml(j);
+    tr.dataset.state = j.state;
+    tr.dataset.print = jobRowPrint(j);
+    const key = service + ':' + id;
+    if (!wasTerminal && JOB_LIST_TERMINAL.has(j.state) && RESULT_OPEN.has(key)){
+      const next = tr.nextElementSibling;
+      if (next && next.classList.contains('res-row')) paint(id, next.querySelector('div'));
+    }
+  });
+}
+
+async function paintTextTake(jobId, host, pid, srcTextEl){
+  try{
+    const fd = await api(`/ui/files/rewrite/${encodeURIComponent(jobId)}`);
+    if (!fd.files.length){
+      host.innerHTML = '<span class="muted">Файлов пока нет — рерайт ещё не готов.</span>';
+      return;
+    }
+    host.innerHTML = `<div style="display:flex;flex-direction:column;gap:6px">${fd.files.map(f => `
+      <div style="display:flex;gap:10px;align-items:center">
+        <span class="mono">${esc(f.name)}</span>
+        <button class="ghost small tx-take" data-name="${esc(f.name)}"
+          >Взять в проект</button>
+      </div>`).join('')}</div>`;
+    host.querySelectorAll('.tx-take').forEach(btn => btn.onclick = async () => {
+      const name = btn.dataset.name;
+      const apply = async () => {
+        btn.disabled = true;
+        try{
+          const text = await fetchText(
+            `/ui/files/rewrite/${encodeURIComponent(jobId)}/${encodeURIComponent(name)}`);
+          await post(`/ui/projects/${encodeURIComponent(pid)}/source`, {text});
+          if (srcTextEl) srcTextEl.value = text;
+          toast('Текст взят в проект', 'ok');
+        }catch(e){ toast(e.message); }
+        finally{ btn.disabled = false; }
+      };
+      const cur = srcTextEl ? srcTextEl.value.trim() : '';
+      if (cur) confirmInline(btn, 'Заменить текущий текст проекта?', apply);
+      else await apply();
+    });
+  }catch(e){
+    host.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+  }
+}
+
+// Строка списка «последние задачи текста аккаунта» — общая для первой отрисовки
+// таблицы (`refreshScenarioJobs`) и для точечного дополнения тиком (`syncJobsTable`).
+function scenJobRowHtml(j){
+  return `<tr data-job="${esc(j.id)}" data-state="${esc(j.state)}" data-print="${esc(jobRowPrint(j))}">
+    <td><div style="font-weight:600">${esc(j.title)}</div>
+        <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
+    <td>${j.kind === 'generation' ? 'с нуля' : 'рерайт'}</td>
+    <td>${(Array.isArray(j.langs) ? j.langs : [j.langs]).map(esc).join(', ') || '—'}</td>
+    <td class="jl-state">${jobListStateCellHtml(j)}</td>
+    <td class="muted">${when(j.created)}</td>
+  </tr>`;
+}
+// Список «последние задачи текста аккаунта»: источник — `GET /ui/text` (как у
+// #/text, не отфильтрован по проекту — подпись прямо в разметке), задача, созданная
+// тут же (`st.lastJob`), — первой. Опрашивается раз в 3с, пока среди показанных есть
+// незавершённая (review-feedback-F4 цикл 2, Issue 4а — готовый результат должен
+// дочитываться сам, не только после ухода с вкладки и возврата).
+// review-feedback-F4 цикл 3: полная перестройка (`box.innerHTML`) — только здесь, при
+// первом заходе на вкладку/сразу после постановки новой задачи; тик опроса ниже правит
+// таблицу на месте через `syncJobsTable` (Issue 1 — не стирать раскрытые result-row) и
+// проверяет `location.hash`/`box.isConnected` ПОСЛЕ каждого своего ответа, а не только
+// при первом входе (Issue 2 — не оживать на чужом экране, если ответ задержался и hash
+// уже сменился); busy-флаг и перехват ошибки — тот же приём, что у `startJobLogPoll`.
+async function refreshScenarioJobs(box, pid, srcTextEl){
+  const key = jobListPollKey('scenario', pid);
+  stopJobLogPoll(key);
+  const hashAtStart = location.hash;
+  const st = scenState(pid);
+  const td = await api('/ui/text');
+  if (location.hash !== hashAtStart || !box.isConnected) return;   // ушли со страницы, пока список грузился
+  const jobs = td.jobs.slice();
+  if (st.lastJob != null){
+    const i = jobs.findIndex(j => String(j.id) === String(st.lastJob));
+    if (i > 0){ const [j] = jobs.splice(i, 1); jobs.unshift(j); }
+  }
+  box.innerHTML = `<div class="note muted" style="margin:14px 0 8px">Последние задачи
+    текста вашего аккаунта — у Rewrite нет понятия «проект», список не отфильтрован по
+    этому проекту.</div>
+    ${jobs.length ? `<table><thead><tr>
+      <th>Задача</th><th>Вид</th><th>Языки</th><th>Состояние</th><th>Создана</th></tr></thead>
+      <tbody>${jobs.map(scenJobRowHtml).join('')}</tbody></table>
+      <div class="note muted">Нажмите на строку — покажется результат.</div>`
+      : '<div class="empty">Задач текста пока нет.</div>'}`;
+  wireProjectJobRows(box, 'rewrite', 5, (jid, host) => paintTextTake(jid, host, pid, srcTextEl));
+
+  if (!jobs.some(j => !JOB_LIST_TERMINAL.has(j.state))) return;   // все терминальны — опрашивать нечего
+  let busy = false;
+  const tick = async () => {
+    if (busy) return;
+    busy = true;
+    try{
+      const d2 = await api('/ui/text');
+      if (location.hash !== hashAtStart || !box.isConnected){ stopOwnPoll(key, handle); return; }
+      const jobs2 = d2.jobs.slice();
+      if (st.lastJob != null){
+        const i = jobs2.findIndex(j => String(j.id) === String(st.lastJob));
+        if (i > 0){ const [j] = jobs2.splice(i, 1); jobs2.unshift(j); }
+      }
+      syncJobsTable(box, jobs2, 'rewrite', scenJobRowHtml, 5,
+        (jid, host) => paintTextTake(jid, host, pid, srcTextEl));
+      if (!jobs2.some(j => !JOB_LIST_TERMINAL.has(j.state))) stopOwnPoll(key, handle);
+    }catch(e){
+      // сеть иногда сбоит — список не стираем, следующий тик попробует снова
+    }finally{ busy = false; }
+  };
+  // Два наложившихся вызова оба дошли сюда: снять уже записанный таймер, чтобы он не
+  // выпал из реестра и не опрашивал сервис до перезагрузки страницы.
+  stopJobLogPoll(key);
+  const handle = setInterval(tick, 3000);
+  LOG_TIMERS[key] = handle;
+}
+
+async function renderScenarioTab(d){
+  const p = d.project;
+  const st = scenState(p.id);
+  const td = await api('/ui/text');
+  if (!st.model && td.models.length) st.model = td.models[0].value;
+
+  // 1. Действие: «Получить текст» (три режима TEXT_MODES — та же форма, что у
+  // #/text) + список последних задач текста аккаунта + textarea с source.txt.
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Действие</div>
+    <div class="secbody">
+    <div class="note muted" style="margin-bottom:6px">Получить текст</div>
+    <div class="modes">${td.modes.map(m => `<button type="button" data-mode="${
+      esc(m.key)}" class="${m.key === st.mode ? 'on' : ''}">${esc(m.title)}</button>`
+      ).join('')}</div>
+    <div class="note muted" id="tx-note"></div>
+    <label class="k" style="display:block;margin-bottom:6px" id="tx-label"></label>
+    <input id="tx-one" style="width:100%;box-sizing:border-box">
+    <textarea id="tx-many"></textarea>
+    <div id="tx-preset-box" style="margin-top:10px">
+      <label class="k" style="display:block;margin-bottom:6px">Бриф</label>
+      <select id="tx-preset"><option value="">— выберите бриф —</option>
+        ${td.presets.generation.map(x => `<option ${x === st.preset ? 'selected' : ''}
+          >${esc(x)}</option>`).join('')}</select>
+    </div>
+    <div style="margin-top:10px">
+      <label class="k" style="display:block;margin-bottom:6px">Модель</label>
+      <select id="tx-model">${td.models.map(m => `<option value="${esc(m.value)}"
+        ${m.value === st.model ? 'selected' : ''}>${esc(m.label)}</option>`).join('')}</select>
+    </div>
+    <div style="margin-top:10px">
+      <label class="k" style="display:block">Языки</label>
+      <div class="langs" id="tx-langs">${td.languages.map(l => `<label
+        data-code="${esc(l.code)}"><input type="checkbox"
+        ${st.langs.has(l.code) ? 'checked' : ''}>${esc(l.title)}</label>`).join('')}</div>
+    </div>
+    <div style="margin-top:12px"><button id="tx-go">Получить текст</button></div>
+    <div id="tx-jobs"></div>
+
+    <div class="note muted" style="margin-top:18px;border-top:1px solid var(--line);
+      padding-top:12px">Исходный текст</div>
+    <textarea id="src-text" style="margin-top:6px">${esc(d.source)}</textarea>
+    <div style="margin-top:8px"><button id="src-save">Сохранить текст</button></div>
+    <div class="note muted">Edge режет текст по строкам/абзацам — короткие абзацы
+      могут потеряться при озвучке этим движком.</div>
+    </div></div>`);
+  app.append(card);
+
+  const one = card.querySelector('#tx-one');
+  const many = card.querySelector('#tx-many');
+  const presetBox = card.querySelector('#tx-preset-box');
+  const label = card.querySelector('#tx-label');
+  const srcText = card.querySelector('#src-text');
+  function paintMode(){
+    const m = st.mode;
+    label.textContent = m === 'link' ? 'Ссылка на ролик-донор'
+                      : m === 'text' ? 'Текст' : 'Тема';
+    one.hidden = (m === 'text');
+    many.hidden = (m !== 'text');
+    presetBox.hidden = (m !== 'topic');
+    one.placeholder = m === 'link' ? 'https://www.youtube.com/watch?v=…'
+                                   : 'О чём должен быть ролик';
+    const note = td.modes.find(x => x.key === m);
+    card.querySelector('#tx-note').textContent = note ? note.note : '';
+  }
+  paintMode();
+  card.querySelectorAll('.modes button').forEach(b => b.onclick = () => {
+    st.mode = b.dataset.mode;
+    card.querySelectorAll('.modes button').forEach(x => x.classList.toggle('on', x === b));
+    paintMode();
+  });
+  card.querySelectorAll('#tx-langs label').forEach(l => {
+    const box = l.querySelector('input');
+    const sync = () => { l.classList.toggle('on', box.checked);
+      box.checked ? st.langs.add(l.dataset.code) : st.langs.delete(l.dataset.code); };
+    sync();
+    box.onchange = sync;
+  });
+  card.querySelector('#tx-model').onchange = e => st.model = e.target.value;
+  card.querySelector('#tx-preset').onchange = e => st.preset = e.target.value;
+
+  card.querySelector('#tx-go').onclick = async () => {
+    const btn = card.querySelector('#tx-go');
+    btn.disabled = true;
+    try{
+      const out = await post('/ui/text', {
+        mode: st.mode,
+        source: (st.mode === 'text' ? many.value : one.value),
+        languages: [...st.langs], model: st.model, preset: st.preset,
+      });
+      st.lastJob = out.job && out.job.job_id;
+      toast('Задача текста создана', 'ok');
+      await refreshScenarioJobs(card.querySelector('#tx-jobs'), p.id, srcText);
+    }catch(e){ toast(e.message); }
+    finally{ btn.disabled = false; }
+  };
+  await refreshScenarioJobs(card.querySelector('#tx-jobs'), p.id, srcText);
+
+  card.querySelector('#src-save').onclick = async () => {
+    const btn = card.querySelector('#src-save');
+    btn.disabled = true;
+    try{
+      await post(`/ui/projects/${encodeURIComponent(p.id)}/source`, {text: srcText.value});
+      toast('Текст сохранён', 'ok');
+    }catch(e){ toast(e.message); }
+    finally{ btn.disabled = false; }
+  };
+
+  // 3. Результат — план сцен/промпты.
+  const mine = d.files.filter(g => (TAB_FILES.scenario || []).includes(g.code));
+  if (mine.length) for (const g of mine) app.append(fileCard(d, g));
+  else app.append(emptyResultCard());
+
+  // 4. Лог задач вида prompts.
+  app.append(jobsLogCard(d, 'scenario'));
+
+  // 5. Прочие задачи проекта — виды, не относящиеся ни к одной из шести вкладок
+  // (например `cards`/`pipeline`), были видны на старом «Обзоре» целиком; молча
+  // прятать платную работу с экрана нельзя (review-feedback-F4 цикл 1, Issue 5).
+  const knownKinds = new Set(Object.values(TAB_KINDS).flat());
+  const other = (d.jobs || []).filter(j => !knownKinds.has(j.kind));
+  if (other.length) app.append(jobsTableCard('Прочие задачи проекта', other, ''));
+}
+
+/* ───────────────────────── вкладка «Обложка» ───────────────────────── */
+const COVER_STATE = {};
+function coverState(pid){
+  if (!COVER_STATE[pid]) COVER_STATE[pid] = {mode: 'url', langs: new Set(), preset: '',
+                                             option: 0, edit: false, n: 3, lastJob: null};
+  return COVER_STATE[pid];
+}
+
+async function paintCoverTake(jobId, host, pid){
+  try{
+    const fd = await api(`/ui/files/cover/${encodeURIComponent(jobId)}`);
+    if (!fd.files.length){
+      host.innerHTML = '<span class="muted">Вариантов пока нет — обложка ещё не готова.</span>';
+      return;
+    }
+    const url = f => `${API}/ui/files/cover/${encodeURIComponent(jobId)}/${
+      encodeURIComponent(f.name)}`;
+    host.innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:12px">${fd.files.map(f => `
+      <div style="text-align:center">
+        <a href="${url(f)}" target="_blank"><img src="${url(f)}" style="height:96px;
+          border-radius:6px;border:1px solid var(--line);display:block"></a>
+        <button class="ghost small cv-take" data-name="${esc(f.name)}"
+          style="margin-top:6px">Поставить обложкой проекта</button>
+      </div>`).join('')}</div>`;
+    host.querySelectorAll('.cv-take').forEach(btn => btn.onclick = async () => {
+      btn.disabled = true;
+      try{
+        await post(`/ui/projects/${encodeURIComponent(pid)}/cover`,
+                   {service_job_id: jobId, name: btn.dataset.name});
+        toast('Обложка поставлена', 'ok');
+        await viewProject(pid);         // перерисовать — новая обложка видна в «Результат»
+      }catch(e){ toast(e.message); btn.disabled = false; }
+    });
+  }catch(e){
+    host.innerHTML = `<span class="note bad">${esc(e.message)}</span>`;
+  }
+}
+
+// Строка списка «последние задачи обложек аккаунта» — общая для первой отрисовки и
+// для точечного дополнения тиком (`syncJobsTable`), см. `scenJobRowHtml` выше.
+function coverJobRowHtml(j){
+  return `<tr data-job="${esc(j.id)}" data-state="${esc(j.state)}" data-print="${esc(jobRowPrint(j))}">
+    <td><div style="font-weight:600">${esc(j.title)}</div>
+        <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
+    <td class="jl-state">${jobListStateCellHtml(j)}</td>
+    <td class="muted">${when(j.created)}</td>
+  </tr>`;
+}
+// Тот же приём, что у «Сценария» (см. комментарии там, включая review-feedback-F4
+// цикл 3, Issue 1/2 — тик правит таблицу на месте и проверяет актуальность экрана
+// после каждого своего ответа), только источник — `GET /ui/covers` (как у #/covers).
+async function refreshCoverJobs(box, pid){
+  const key = jobListPollKey('cover', pid);
+  stopJobLogPoll(key);
+  const hashAtStart = location.hash;
+  const st = coverState(pid);
+  const cd = await api('/ui/covers');
+  if (location.hash !== hashAtStart || !box.isConnected) return;   // ушли со страницы, пока список грузился
+  const jobs = cd.jobs.slice();
+  if (st.lastJob != null){
+    const i = jobs.findIndex(j => String(j.id) === String(st.lastJob));
+    if (i > 0){ const [j] = jobs.splice(i, 1); jobs.unshift(j); }
+  }
+  box.innerHTML = `<div class="note muted" style="margin:14px 0 8px">Последние задачи
+    обложек вашего аккаунта — у Cover нет понятия «проект», список не отфильтрован по
+    этому проекту.</div>
+    ${jobs.length ? `<table><thead><tr>
+      <th>Задача</th><th>Состояние</th><th>Создана</th></tr></thead>
+      <tbody>${jobs.map(coverJobRowHtml).join('')}</tbody></table>
+      <div class="note muted">Нажмите на строку — покажутся готовые обложки.</div>`
+      : '<div class="empty">Задач обложек пока нет.</div>'}`;
+  wireProjectJobRows(box, 'cover', 3, (jid, host) => paintCoverTake(jid, host, pid));
+
+  if (!jobs.some(j => !JOB_LIST_TERMINAL.has(j.state))) return;   // все терминальны — опрашивать нечего
+  let busy = false;
+  const tick = async () => {
+    if (busy) return;
+    busy = true;
+    try{
+      const d2 = await api('/ui/covers');
+      if (location.hash !== hashAtStart || !box.isConnected){ stopOwnPoll(key, handle); return; }
+      const jobs2 = d2.jobs.slice();
+      if (st.lastJob != null){
+        const i = jobs2.findIndex(j => String(j.id) === String(st.lastJob));
+        if (i > 0){ const [j] = jobs2.splice(i, 1); jobs2.unshift(j); }
+      }
+      syncJobsTable(box, jobs2, 'cover', coverJobRowHtml, 3,
+        (jid, host) => paintCoverTake(jid, host, pid));
+      if (!jobs2.some(j => !JOB_LIST_TERMINAL.has(j.state))) stopOwnPoll(key, handle);
+    }catch(e){
+      // сеть иногда сбоит — список не стираем, следующий тик попробует снова
+    }finally{ busy = false; }
+  };
+  // Два наложившихся вызова оба дошли сюда: снять уже записанный таймер, чтобы он не
+  // выпал из реестра и не опрашивал сервис до перезагрузки страницы.
+  stopJobLogPoll(key);
+  const handle = setInterval(tick, 3000);
+  LOG_TIMERS[key] = handle;
+}
+
+async function renderCoverTab(d){
+  const p = d.project;
+  const st = coverState(p.id);
+  const cd = await api('/ui/covers');
+
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Действие</div>
+    <div class="secbody">
+    <div class="note muted" style="margin-bottom:6px">Сделать обложку</div>
+    <div class="modes">${cd.modes.map(m => `<button type="button" data-mode="${
+      esc(m.key)}" class="${m.key === st.mode ? 'on' : ''}">${esc(m.title)}</button>`
+      ).join('')}</div>
+    <div class="note muted" id="cv-note"></div>
+    <div id="cv-fields"></div>
+    <div style="margin-top:12px">
+      <label class="k" style="display:block;margin-bottom:6px">Пресет</label>
+      <select id="cv-preset"><option value="">— без пресета —</option>
+        ${cd.presets.map(x => `<option ${x === st.preset ? 'selected' : ''}
+          >${esc(x)}</option>`).join('')}</select>
+    </div>
+    <div style="margin-top:10px">
+      <label class="k" style="display:block;margin-bottom:6px">Чем генерировать</label>
+      <select id="cv-option">${cd.options.map((o, i) => `<option value="${i}"
+        ${i === st.option ? 'selected' : ''}>${esc(o.label)}${
+          o.admin_only ? ' — платит владелец' : ''}</option>`).join('')}</select>
+    </div>
+    <div style="margin-top:10px">
+      <label class="k" style="display:block">Языки</label>
+      <div class="langs" id="cv-langs">${cd.languages.map(l => `<label
+        data-code="${esc(l)}"><input type="checkbox"
+        ${st.langs.has(l) ? 'checked' : ''}>${esc(l)}</label>`).join('')}</div>
+    </div>
+    <div id="cv-edit-box" style="margin-top:10px"></div>
+    <div class="note muted" style="margin-top:12px">Соотношение сторон —
+      <b>${esc(cd.aspect)}</b>, всегда. У обложки YouTube оно одно, поэтому его здесь
+      не спрашивают и не дают выбрать; в задачу оно уходит явно, а не «по умолчанию».</div>
+    <div style="margin-top:12px"><button id="cv-go">Запустить</button></div>
+    <div id="cv-jobs"></div>
+    </div></div>`);
+  app.append(card);
+
+  const fields = card.querySelector('#cv-fields');
+  const editBox = card.querySelector('#cv-edit-box');
+  const noteBox = card.querySelector('#cv-note');
+  function paintFields(){
+    const m = st.mode;
+    // Текущий выбор языков — считан здесь же, при каждой отрисовке полей, а не из
+    // снимка, сделанного один раз при открытии вкладки (Issue 2, review-feedback-F4
+    // цикл 1): иначе отметка языка в режиме «По заголовку» не показывала поле
+    // заголовка без полной перерисовки вкладки.
+    const langs = [...st.langs];
+    if (m === 'url'){
+      fields.innerHTML = `<label class="k" style="display:block;margin-bottom:6px"
+        >Ссылки на доноров, по одной в строке</label>
+        <textarea id="cv-urls" placeholder="https://www.youtube.com/watch?v=…"></textarea>`;
+    } else if (m === 'title'){
+      fields.innerHTML = langs.length
+        ? `<label class="k" style="display:block;margin-bottom:6px">Заголовок на
+             каждый язык</label>${langs.map(l => `<div style="display:flex;gap:8px;
+             align-items:center;margin-bottom:6px"><span class="muted"
+             style="min-width:110px">${esc(l)}</span><input data-lang="${esc(l)}"
+             class="cv-title-in" style="flex:1"></div>`).join('')}
+           <label class="k" style="display:block;margin:10px 0 6px">Дополнение к промпту</label>
+           <input id="cv-extra" style="width:100%;box-sizing:border-box">`
+        : '<div class="note">Сначала выберите языки — заголовок задаётся на каждый отдельно.</div>';
+    } else {
+      fields.innerHTML = `<label class="k" style="display:block;margin-bottom:6px">Семя</label>
+        <textarea id="cv-seed"></textarea>
+        <label class="k" style="display:block;margin:10px 0 6px">Вариантов на язык</label>
+        <input id="cv-n" type="number" min="1" max="8" value="${st.n}" style="width:90px">`;
+    }
+    const killed = cd.rules.find(r => r.when === 'edit');
+    editBox.innerHTML = st.mode === 'url'
+      ? `<label style="display:flex;gap:8px;align-items:flex-start;cursor:pointer">
+           <input type="checkbox" id="cv-edit" ${st.edit ? 'checked' : ''}>
+           <span><b>Редактировать превью моделью</b>${st.edit
+             ? `<div class="note muted">Тогда не действуют: ${killed.kills.join(', ')} —
+                 ${esc(killed.why)}.</div>` : ''}</span></label>`
+      : `<div class="note muted">${esc((cd.rules.find(r => r.when === 'not_url') || {}).why
+          || '')}.</div>`;
+    const box = editBox.querySelector('#cv-edit');
+    if (box) box.onchange = e => { st.edit = e.target.checked; paintFields(); };
+  }
+  // Подпись режима заполняется сразу при первой отрисовке (Issue 8, review-feedback-F4
+  // цикл 1) — раньше #cv-note оставалась пустой, пока не нажать кнопку режима вручную.
+  const initNote = cd.modes.find(x => x.key === st.mode);
+  noteBox.textContent = initNote ? initNote.note : '';
+  paintFields();
+  card.querySelectorAll('.modes button').forEach(b => b.onclick = () => {
+    st.mode = b.dataset.mode;
+    card.querySelectorAll('.modes button').forEach(x => x.classList.toggle('on', x === b));
+    const note = cd.modes.find(x => x.key === st.mode);
+    noteBox.textContent = note ? note.note : '';
+    paintFields();
+  });
+  card.querySelectorAll('#cv-langs label').forEach(l => {
+    const box = l.querySelector('input');
+    const sync = () => { l.classList.toggle('on', box.checked);
+      box.checked ? st.langs.add(l.dataset.code) : st.langs.delete(l.dataset.code); };
+    sync();
+    box.onchange = () => { sync(); if (st.mode === 'title') paintFields(); };
+  });
+  card.querySelector('#cv-preset').onchange = e => st.preset = e.target.value;
+  card.querySelector('#cv-option').onchange = e => st.option = Number(e.target.value);
+
+  card.querySelector('#cv-go').onclick = async () => {
+    const btn = card.querySelector('#cv-go');
+    btn.disabled = true;
+    try{
+      // Провайдер и модель — из ТЕКУЩЕГО выбора на момент нажатия «Запустить», а не
+      // из значения, посчитанного при отрисовке вкладки (Issue 1, review-feedback-F4
+      // цикл 1): иначе смена пункта в списке «Чем генерировать» без полной
+      // перерисовки уводила платный вызов не тому провайдеру, которого выбрал
+      // человек — тот же дефект, что и в #/covers (см. viewCovers ниже).
+      const curOpt = cd.options[st.option] || cd.options[0] || {};
+      const body = {mode: st.mode, preset: st.preset, languages: [...st.langs],
+                    provider: curOpt.provider || '', model: curOpt.model || '',
+                    edit_preview: st.edit};
+      if (st.mode === 'url'){
+        body.urls = (card.querySelector('#cv-urls').value || '')
+          .split(/\s+/).map(x => x.trim()).filter(Boolean);
+      } else if (st.mode === 'title'){
+        body.titles = {};
+        card.querySelectorAll('.cv-title-in').forEach(i => {
+          if (i.value.trim()) body.titles[i.dataset.lang] = i.value.trim();
+        });
+        body.extra_prompt = (card.querySelector('#cv-extra') || {}).value || '';
+      } else {
+        body.seed = card.querySelector('#cv-seed').value;
+        body.n_variants = Number(card.querySelector('#cv-n').value) || 3;
+      }
+      const out = await post('/ui/covers', body);
+      st.lastJob = out.job && out.job.job_id;
+      toast('Задача обложки создана', 'ok');
+      await refreshCoverJobs(card.querySelector('#cv-jobs'), p.id);
+    }catch(e){ toast(e.message); }
+    finally{ btn.disabled = false; }
+  };
+  await refreshCoverJobs(card.querySelector('#cv-jobs'), p.id);
+
+  // 3. Результат — уже стоящая обложка проекта (категория covers, §5.10).
+  const mine = d.files.filter(g => (TAB_FILES.cover || []).includes(g.code));
+  if (mine.length) for (const g of mine) app.append(fileCard(d, g));
+  else app.append(emptyResultCard());
+
+  // 4. Лог задач вида cover.
+  app.append(jobsLogCard(d, 'cover'));
+}
+
+/* ───────────────────────── экран проекта целиком ───────────────────────── */
+async function viewProject(id){
+  clearAllLogTimers();
+  const [d, presetsData] = await Promise.all([
+    api('/ui/projects/' + encodeURIComponent(id)),
+    api('/ui/presets'),
+  ]);
+  const p = d.project;
+  const wantTab = location.hash.split('/')[3] || '';
+  const tab = PROJECT_TABS.some(([k]) => k === wantTab) ? wantTab : 'scenario';
   app.innerHTML = '';
-  app.append($(`<h1>${esc(p.name)}</h1>
-    <p class="sub"><span class="mono">${esc(p.id)}</span>
-      ${p.release_id ? ` · выпуск <a href="#/release/${
-        encodeURIComponent(p.release_id)}">${esc(p.release_id)}</a> · фаза ${
-        esc(p.phase)}` : ''}</p>`));
-  app.append($(`<div class="subtabs">${PROJ_TABS.map(([k, title, groups]) => {
-      const n = d.files.filter(g => groups.includes(g.code))
-                       .reduce((a, g) => a + g.count, 0);
-      return `<a href="#/project/${encodeURIComponent(id)}/${k}"
-        class="${tab === k ? 'on' : ''}">${esc(title)}${n ? ` <span class="muted">${n}</span>` : ''}</a>`;
-    }).join('')}<a href="#/project/${encodeURIComponent(id)}/settings"
-      class="${tab === 'settings' ? 'on' : ''}" style="margin-left:auto">Настройки</a></div>`));
+  app.append($(`<a class="back" href="#/projects">‹ Все проекты</a>
+    <div class="head">
+      <div><h1>${esc(p.name)}</h1>
+        <p class="sub"><span class="mono">${esc(p.id)}</span>
+          ${p.release_id ? ` · выпуск <a href="#/release/${
+            encodeURIComponent(p.release_id)}">${esc(p.release_id)}</a> · фаза ${
+            esc(p.phase)}` : ''}</p>
+        ${stageStripHtml(p.stage)}
+      </div>
+      <button id="runall" class="small ghost">Сделать всё</button>
+    </div>`));
 
-  if (tab !== 'obzor'){ projectTab(d, tab); return; }
-
-  const run = $(`<div class="card" style="margin-bottom:16px">
+  // «Сделать всё» — ровно одна кнопка на экране (ФР §4 п.8), видна на любой вкладке,
+  // сама форма сворачиваема, чтобы не занимать место на каждый день.
+  const runBox = $(`<div class="card" style="margin-bottom:16px;display:none">
     <div class="sec">Сделать всё</div>
     <div class="secbody">
     <div id="rerr"></div>
-    <div class="row" style="gap:12px;flex-wrap:wrap">
-      <div><label>Предложений на кадр</label>
-        <input id="r-spp" value="" placeholder="как в проекте" style="width:110px"></div>
-      <div><label>Модель кадров</label>
-        <input id="r-model" value="" placeholder="как в проекте" style="width:150px"></div>
-      <div><label>Озвучка</label>
-        <input id="r-engine" value="" placeholder="как в проекте" style="width:120px"></div>
-      <div><label>Качество</label>
-        <input id="r-quality" value="" placeholder="как в проекте" style="width:110px"></div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <div><label class="k" style="display:block;margin-bottom:4px">Предложений на кадр</label>
+        <input id="r-spp" placeholder="как в проекте" style="width:110px"></div>
+      <div><label class="k" style="display:block;margin-bottom:4px">Модель кадров</label>
+        <input id="r-model" placeholder="как в проекте" style="width:150px"></div>
+      <div><label class="k" style="display:block;margin-bottom:4px">Озвучка</label>
+        <input id="r-engine" placeholder="как в проекте" style="width:120px"></div>
+      <div><label class="k" style="display:block;margin-bottom:4px">Качество</label>
+        <input id="r-quality" placeholder="как в проекте" style="width:110px"></div>
     </div>
     <div class="note muted">Пустое поле = как в настройках проекта. Озвучка и кадры
       пойдут параллельно, сборка дождётся материалов сама.</div>
     <div class="note muted">Сборку делает отдельная машина. Если рендер-нода не
       запущена, проект дойдёт до сборки и остановится.</div>
-    <div style="margin-top:12px"><button id="rgo">Запустить</button>
-      <a class="ghost" href="#/project/${encodeURIComponent(p.id)}/settings"
-         style="color:var(--muted);margin-left:10px">Все настройки проекта →</a></div></div></div>`);
-  app.append(run);
-  const rerr = run.querySelector('#rerr');
-  run.querySelector('#rgo').onclick = async () => {
-    const btn = run.querySelector('#rgo');
+    <div style="margin-top:12px"><button id="rgo">Запустить</button></div></div></div>`);
+  app.append(runBox);
+  app.querySelector('#runall').onclick = () => {
+    runBox.style.display = (runBox.style.display === 'none') ? '' : 'none';
+  };
+  const rerr = runBox.querySelector('#rerr');
+  runBox.querySelector('#rgo').onclick = async () => {
+    const btn = runBox.querySelector('#rgo');
     rerr.innerHTML = ''; btn.disabled = true;
     try{
       const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/run`, {
-        sentences_per_prompt: run.querySelector('#r-spp').value,
-        model: run.querySelector('#r-model').value,
-        engine: run.querySelector('#r-engine').value,
-        quality: run.querySelector('#r-quality').value});
-      // Кабинет отвечает счётчиками, а не «ок»: поставленное, отложенное и пропущенное —
-      // разные вещи, и «поставлено 0» без объяснения выглядит как несработавшая кнопка.
+        sentences_per_prompt: runBox.querySelector('#r-spp').value,
+        model: runBox.querySelector('#r-model').value,
+        engine: runBox.querySelector('#r-engine').value,
+        quality: runBox.querySelector('#r-quality').value});
       rerr.innerHTML = `<div class="note ${out.enqueued ? 'muted' : 'bad'}">поставлено: ${
         out.enqueued}${out.deferred ? `, отложено: ${out.deferred}` : ''}${
         out.skipped ? `, пропущено (уже идёт): ${out.skipped}` : ''}${
@@ -1552,95 +2472,58 @@ async function viewProject(id){
     finally{ btn.disabled = false; }
   };
 
+  // Панель пресета — только целые (раздел 2 спецификации).
+  const vsgenGroup = (presetsData.groups || []).find(g => g.service === 'vsgen');
+  const wholePresets = ((vsgenGroup && vsgenGroup.items) || [])
+    .filter(i => i.scope === 'full').map(i => ({key: i.key, name: i.name}));
+  const ppCard = $(presetPanelHtml(p.applied_preset, wholePresets));
+  app.append(ppCard);
+  wirePresetPanel(ppCard, p.id);
+
+  // «Во что обошёлся» (`d.paid`) — один раз на экране, здесь в шапке, видна на любой
+  // вкладке (review-feedback-F4 цикл 1, Issue 5: карточка была на старом «Обзоре» и
+  // молча пропала при переезде на вкладки). `.stage`/`.dot`/`.body`/`.name` — те же
+  // классы, что и раньше здесь же, строки от края до края по замыслу (правило батча A
+  // — строчные компоненты сами себе отступ); хвостовая подпись — в `.secbody`, чтобы
+  // не касаться рамки (Issue 6).
   if (d.paid.length){
     app.append($(`<div class="card" style="margin-bottom:16px">
       <div class="sec">Во что обошёлся</div>
       ${d.paid.map(x => `<div class="stage"><div class="dot s-done">✓</div>
         <div class="body"><div class="name">${esc(x.kind)}: ${x.delivered} оплаченных
           вызовов${x.cost ? ` · ${x.cost.toFixed(0)} кр.` : ''}</div></div></div>`).join('')}
+      <div class="secbody" style="padding-top:8px">
       <div class="note muted">Это то, что будет выброшено, если проект убрать с диска.</div>
-    </div>`));
+      </div></div>`));
   }
 
-  if (d.jobs.length){
-    const jc = $(`<div class="card" style="margin-bottom:16px">
-      <div class="sec">Задачи проекта</div>
-      <table><thead><tr><th>Этап</th><th>Состояние</th><th>Создана</th><th></th></tr>
-      </thead><tbody>${d.jobs.map(j => `<tr>
-        <td>${esc(j.kind)}<div class="muted mono" style="font-size:11px">#${j.id}</div></td>
-        <td><span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
-          ${j.stage ? `<div class="muted">${esc(j.stage)}</div>` : ''}
-          ${j.progress != null ? `<div class="bar"><i style="width:${
-            Math.round(j.progress * 100)}%"></i></div>` : ''}
-          ${j.error ? `<div class="note bad">${esc(j.error)}</div>` : ''}
-          ${(j.applied || []).length ? `<details style="margin-top:6px">
-            <summary class="muted" style="cursor:pointer;font-size:12px"
-              >с какими настройками пошла</summary>
-            <div class="note muted">${j.applied.map(a =>
-              `${esc(a.name)}: <b>${esc(a.value)}</b>`).join(' · ')}</div>
-            <div class="note muted">Это снимок момента запуска — правка пресета
-              его не меняет.</div></details>` : ''}</td>
-        <td class="muted">${when(j.created)}</td>
-        <td style="white-space:nowrap">${actions({service:'vsgen', id:j.id,
-                                                  state:j.state, status:j.status})}</td>
-      </tr>`).join('')}</tbody></table></div>`);
-    app.append(jc);
-    wireActions(jc);
-  }
+  // Вкладки — адрес вида #/project/{pid}/{tab}, никакой отдельной «Настройки».
+  app.append($(`<div class="subtabs">${PROJECT_TABS.map(([k, title]) => {
+    const codes = TAB_FILES[k] || [];
+    const n = d.files.filter(g => codes.includes(g.code)).reduce((a, g) => a + g.count, 0);
+    return `<a href="#/project/${encodeURIComponent(id)}/${k}"
+      class="${tab === k ? 'on' : ''}">${esc(title)}${
+        n ? ` <span class="muted">${n}</span>` : ''}</a>`;
+  }).join('')}</div>`));
 
-  if (!d.files.length){
-    app.append($(`<div class="card"><div class="empty">Файлов пока нет —
-      проект ещё ничего не сделал.</div></div>`));
-  }
-}
-
-// Одна вкладка проекта: файлы своей составляющей и задачи, которые её делали.
-function projectTab(d, tab){
-  const p = d.project;
-  const groups = (PROJ_TABS.find(t => t[0] === tab) || [null, '', []])[2];
-  const kinds = PROJ_KINDS[tab] || [];
-  const jobs = (d.jobs || []).filter(j => kinds.includes(j.kind));
-  if (jobs.length){
-    const jc = $(`<div class="card" style="margin-bottom:16px">
-      <div class="sec">Задачи этого этапа</div>
-      <table><thead><tr><th>Этап</th><th>Состояние</th><th>Создана</th><th></th></tr></thead>
-      <tbody>${jobs.map(j => `<tr>
-        <td>${esc(j.kind)}<div class="muted mono" style="font-size:11px">#${j.id}</div></td>
-        <td><span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
-          ${j.stage ? `<div class="muted">${esc(j.stage)}</div>` : ''}
-          ${j.error ? `<div class="note bad">${esc(j.error)}</div>` : ''}</td>
-        <td class="muted">${when(j.created)}</td>
-        <td style="white-space:nowrap">${actions({service: 'vsgen', id: j.id,
-                                                  state: j.state, status: j.status})}</td>
-      </tr>`).join('')}</tbody></table></div>`);
-    app.append(jc);
-    wireActions(jc);
-  }
-  const mine = d.files.filter(g => groups.includes(g.code));
-  for (const g of mine) app.append(fileCard(d, g));
-  if (!mine.length && !jobs.length){
-    app.append($(`<div class="card"><div class="empty">
-      Здесь пока пусто — этот этап ещё не отработал.</div></div>`));
-  }
-  // Куда пойти, чтобы этот этап сделать. Без этих ссылок вкладка — тупик: «Текста нет»
-  // и ни слова о том, где он берётся.
-  const MAKE = {tekst: ['#/text', 'Сделать текст: рерайт по ссылке или с нуля'],
-                oblozhka: ['#/covers', 'Сделать обложку']};
-  if (MAKE[tab]){
-    app.append($(`<div class="note muted" style="margin-top:4px">
-      <a href="${MAKE[tab][0]}">${esc(MAKE[tab][1])} →</a></div>`));
-  }
+  if (tab === 'scenario') await renderScenarioTab(d);
+  else if (tab === 'cover') await renderCoverTab(d);
+  else await renderStageTab(d, tab);
 }
 
 function fileCard(d, g){
   const p = d.project;
   const url = n => d.file_base + n.split('/').map(encodeURIComponent).join('/');
+    // Содержимое — в .secbody (правило батча A, отступ 18px): без него миниатюры,
+    // плеер и ссылки шли вплотную к рамке карточки (Issue 6, review-feedback-F4
+    // цикл 1). Заголовок и кнопка «Скачать архивом» остаются в .sec как есть.
     const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)} · ${g.count}
         <a class="ghost" href="${d.zip_base}${esc(g.code)}"
            style="float:right;padding:3px 10px;border:1px solid var(--line);
                   border-radius:6px;text-decoration:none;font-size:12px"
            >Скачать архивом</a></div>
+      <div class="secbody">
       ${g.kind === 'image'
         ? `<div style="display:flex;flex-wrap:wrap;gap:6px">${g.names.map(n =>
             thumb(url(n) + '?w=160', url(n), n, 78, p.id)).join('')}</div>`
@@ -1661,6 +2544,7 @@ function fileCard(d, g){
                      text-decoration:none;font-size:12px">${esc(n)}</a>`).join('')}</div>`}
       ${g.more ? `<div class="note muted">показаны первые ${g.names.length},
         всего ${g.count} — остальные в архиве</div>` : ''}
+      </div>
     </div>`);
   wireRegen(card);
   return card;
@@ -2051,7 +2935,6 @@ async function viewCovers(){
     <p class="sub">Сначала выберите, как делаем обложку.</p>`));
 
   const mode = () => d.modes.find(m => m.key === COVER_FORM.mode) || d.modes[0];
-  const opt = d.options[COVER_FORM.option] || d.options[0] || {};
   const langs = [...COVER_FORM.langs];
 
   const form = $(`<div class="card" style="padding:16px;margin-bottom:16px">
@@ -2165,9 +3048,15 @@ async function viewCovers(){
     errBox.innerHTML = ''; resBox.innerHTML = ''; btn.disabled = true;
     btn.textContent = 'Отправляю…';
     try{
+      // Провайдер и модель — из ТЕКУЩЕГО выбора на момент нажатия «Запустить», не из
+      // значения, посчитанного при отрисовке экрана (review-feedback-F4 цикл 2,
+      // Issue 1 — «тот же файл и тот же дефект с деньгами», что и в проектной
+      // вкладке «Обложка»): `#option.onchange` меняет только `COVER_FORM.option`, без
+      // перерисовки, и платный вызов уходил бы провайдеру не того пункта списка.
+      const curOpt = d.options[COVER_FORM.option] || d.options[0] || {};
       const body = {mode: COVER_FORM.mode, preset: COVER_FORM.preset,
                     languages: [...COVER_FORM.langs],
-                    provider: opt.provider || '', model: opt.model || '',
+                    provider: curOpt.provider || '', model: curOpt.model || '',
                     edit_preview: COVER_FORM.edit};
       if (COVER_FORM.mode === 'url'){
         body.urls = (form.querySelector('#urls').value || '')
@@ -2557,19 +3446,27 @@ function wireLangMap(card, f, group, locked){
   sync();
 }
 
-function saveBar(back, onSave){
+// `onCancel` — необязательный (review-feedback-F4 цикл 1, Issue 8): форма настроек
+// этапа внутри вкладки проекта не отдельная страница, идти «Отмене» некуда — ссылка
+// на текущий же hash ничего не делала. Если onCancel передан, «Отмена» — кнопка,
+// которая откатывает форму на месте, а сохранение не уходит с экрана. Без onCancel
+// поведение прежнее: ссылка на `back` (страница пресета и т.п.).
+function saveBar(back, onSave, onCancel){
+  const cancelHtml = onCancel
+    ? `<button type="button" id="cancel" class="ghost">Отмена</button>`
+    : `<a class="ghost" href="${back}" style="color:var(--muted)">Отмена</a>`;
   const bar = $(`<div style="display:flex;gap:10px;align-items:center">
-    <button id="save">Сохранить</button>
-    <a class="ghost" href="${back}" style="color:var(--muted)">Отмена</a></div>`);
+    <button id="save">Сохранить</button>${cancelHtml}</div>`);
   const b = bar.querySelector('#save');
   b.onclick = async () => {
     b.disabled = true;
     try{
       await onSave();
       toast('Сохранено', 'ok');
-      location.hash = back;
+      if (!onCancel) location.hash = back;
     }catch(e){ toast(e.message); b.disabled = false; }
   };
+  if (onCancel) bar.querySelector('#cancel').onclick = onCancel;
   return bar;
 }
 
@@ -2738,18 +3635,9 @@ async function viewPreset(id){
     {name: name.querySelector('#p-name').value, values: form.read()})));
 }
 
-async function viewProjectSettings(id){
-  const d = await api('/ui/projects/' + encodeURIComponent(id) + '/settings');
-  app.innerHTML = '';
-  app.append($(`<a class="back" href="#/project/${encodeURIComponent(id)}"
-      >← к проекту</a>
-    <h1>${esc(d.name)}</h1>
-    <p class="sub">${esc(d.note)}</p>`));
-  const form = fieldForm(d.groups);
-  app.append(form);
-  app.append(saveBar('#/project/' + encodeURIComponent(id), () => post(
-    '/ui/projects/' + encodeURIComponent(id) + '/settings', {values: form.read()})));
-}
+// Батч C: отдельный экран «Настройки проекта» убран — настройки этапа теперь внутри
+// каждой вкладки производства (renderStageTab), той же ручкой `GET/POST
+// /ui/projects/{pid}/settings`. Вторая копии формы не заводим.
 
 async function viewPresets(){
   const d = await api('/ui/presets');
@@ -3179,9 +4067,8 @@ const ROUTES = [
   ['projects', h => h === '#/text',               () => viewText()],
   ['projects', h => h === '#/covers',             () => viewCovers()],
   ['projects', h => h === '#/projects',           () => viewProjects()],
-  ['projects', h => h.startsWith('#/project/') && h.endsWith('/settings'),
-                                                  h  => viewProjectSettings(
-                                                          decodeURIComponent(h.split('/')[2]))],
+  // Отдельного адреса `.../settings` для проекта больше нет (батч C, ФР §4 п.9) —
+  // настройки этапа переехали внутрь каждой производственной вкладки.
   ['projects', h => h.startsWith('#/project/'),   h  => viewProject(
                                                           decodeURIComponent(h.split('/')[2]))],
   ['profile',  h => h === '#/limits',             () => viewLimits()],
@@ -3198,6 +4085,11 @@ const ROUTES = [
 ];
 
 async function render(){
+  // Смена адреса — уход со страницы для опроса логов задач проекта (§6): останавливаем
+  // все таймеры здесь одним местом, а не по одному в каждом view — иначе переключение
+  // на #/text/#/covers/куда угодно из открытого лога проекта оставляло бы его дёргать
+  // API вникуда.
+  clearAllLogTimers();
   if (!ME){
     try{ ME = await api('/ui/me'); }
     catch(e){ return viewLogin(e instanceof NeedLogin ? '' : e.message); }
