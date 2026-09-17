@@ -2050,6 +2050,24 @@ def init_db():
             c.execute(f"ALTER TABLE projects ADD COLUMN {_col} {_typ}")
         except Exception:
             pass
+    # Задачи Rewrite и Cover, поставленные из проекта (17.09.2026). У этих сервисов нет
+    # понятия «проект», а их базы отдельные — поэтому связь живёт здесь, рядом с
+    # `projects`, как `queue_tasks.project_id` у остальных задач. REFERENCES — для
+    # читателя и будущей общей базы: PRAGMA foreign_keys тут не включается, поэтому
+    # удаление проекта подчищает связи триггером (он срабатывает при любом из путей
+    # удаления: кнопка, пакетное, уборка по сроку хранения, dev/cleanup.py).
+    c.execute("CREATE TABLE IF NOT EXISTS project_service_jobs("
+              "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+              "tenant_id TEXT NOT NULL, "
+              "project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE, "
+              "service TEXT NOT NULL CHECK(service IN ('rewrite','cover')), "
+              "job_id TEXT NOT NULL, created REAL NOT NULL, "
+              "UNIQUE(service, job_id))")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_project_service_jobs "
+              "ON project_service_jobs(tenant_id, project_id, service, created)")
+    c.execute("CREATE TRIGGER IF NOT EXISTS trg_projects_drop_service_jobs "
+              "AFTER DELETE ON projects BEGIN "
+              "DELETE FROM project_service_jobs WHERE project_id = OLD.id; END")
     for _col, _typ in [("email", "TEXT"), ("password_hash", "TEXT"), ("tenant_id", "TEXT"),
                        # блокировка аккаунта из админ-панели: вход запрещён и новые
                        # задачи не ставятся, уже запущенные не трогаем (см. _adm_action)

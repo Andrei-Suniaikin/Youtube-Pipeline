@@ -1713,8 +1713,71 @@ def _rw(path: str, sid: str, payload=None, method=None, raw=None, ctype=None):
         return 502, f"рерайт не отвечает: {type(exc).__name__}"
 
 
+# ─────────────── задачи Rewrite/Cover, поставленные из проекта ───────────────
+# Связь хранится в `project_service_jobs` (схема — в кабинете рядом с `projects`).
+# Сам сервис про проект не знает; пульт записывает связь сразу после того, как
+# сервис принял задачу, и по ней же показывает список во вкладке проекта.
+PROJECT_JOBS_SHOWN = 30
+
+
+def _project_or_404(c, pid: str) -> None:
+    if not c.execute("SELECT 1 FROM projects WHERE id=? AND tenant_id=?",
+                     (pid, TENANT)).fetchone():
+        raise HTTPException(404, "нет такого проекта")
+
+
+def _link_project_jobs(pid: str, service: str, out) -> None:
+    """Записать связь «проект → задача сервиса». Задача уже принята и, возможно,
+    оплачивается — поэтому сбой записи не превращаем в ошибку создания (человек нажал бы
+    ещё раз и получил дубль), а только теряем строку в списке проекта."""
+    ids = []
+    if isinstance(out, dict):
+        ids = [str(x) for x in (out.get("job_ids") or []) if str(x)]
+        if not ids and out.get("job_id"):
+            ids = [str(out["job_id"])]
+    if not pid or not ids:
+        return
+    c = db()
+    try:
+        now = time.time()
+        c.executemany("INSERT OR IGNORE INTO project_service_jobs"
+                      "(tenant_id, project_id, service, job_id, created) VALUES (?,?,?,?,?)",
+                      [(TENANT, pid, service, jid, now) for jid in ids])
+        c.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        c.close()
+
+
+def _project_job_rows(pid: str, service: str, listed: list, fetch_one) -> list:
+    """Задачи проекта в порядке постановки, новые первыми.
+
+    Список сервиса (`/jobs`) — последние N задач аккаунта; старая задача проекта могла
+    из него выпасть. Её дочитываем по одной (`/jobs/{id}`), не больше PROJECT_JOBS_SHOWN.
+    """
+    c = db()
+    try:
+        _project_or_404(c, pid)
+        linked = [r["job_id"] for r in c.execute(
+            "SELECT job_id FROM project_service_jobs WHERE tenant_id=? AND project_id=? "
+            "AND service=? ORDER BY created DESC, id DESC LIMIT ?",
+            (TENANT, pid, service, PROJECT_JOBS_SHOWN))]
+    finally:
+        c.close()
+    by_id = {str(j.get("id") or ""): j for j in listed if isinstance(j, dict)}
+    out = []
+    for jid in linked:
+        j = by_id.get(jid)
+        if j is None:
+            j = fetch_one(jid)
+        if isinstance(j, dict):
+            out.append(j)
+    return out
+
+
 @app.get("/ui/text")
-def ui_text(request: Request):
+def ui_text(request: Request, project_id: str = ""):
     """Экран текста: что уже сделано и чем можно сделать ещё.
 
     Модели спрашиваем у Rewrite, а не перечисляем сами: он показывает только те, под
@@ -1745,9 +1808,23 @@ def ui_text(request: Request):
                   "title": x.get("display_ru") or x.get("canonical")}
                  for x in ((langs_body or {}).get("languages") or [])
                  if x.get("canonical")]
+    listed = jobs if isinstance(jobs, list) else []
+    if project_id:
+        def _one(jid):
+            code1, j1 = _rw(f"/jobs/{urllib.parse.quote(jid)}", sid)
+            if code1 != 200 or not isinstance(j1, dict):
+                return None
+            # Одиночная задача у Rewrite — полный dataclass, а не строка списка: поля
+            # называются иначе, а лог бывает в мегабайты. Приводим к виду строки списка.
+            return {"id": j1.get("id"), "type": j1.get("job_type"),
+                    "status": j1.get("status"), "progress": j1.get("progress_percent"),
+                    "detail": j1.get("progress_detail"), "created_at": j1.get("created_at")}
+        listed = _project_job_rows(project_id, "rewrite", listed, _one)
     rows = []
-    for j in (jobs if isinstance(jobs, list) else []):
+    for j in listed:
         pct = j.get("progress")
+        if pct is None and isinstance(j.get("progress_percent"), (int, float)):
+            pct = j.get("progress_percent")
         rows.append({
             "id": str(j.get("id") or ""),
             "kind": str(j.get("type") or ""),
@@ -1759,7 +1836,8 @@ def ui_text(request: Request):
             "langs": j.get("langs") or [],
             "created": j.get("created_at"),
         })
-    rows.sort(key=lambda r: -(r["created"] or 0))
+    if not project_id:
+        rows.sort(key=lambda r: -(r["created"] or 0))   # у проекта — порядок постановки
     c = db()
     try:
         channels = [{"id": r["id"], "name": r["name"], "lang": r["lang"] or "",
@@ -1791,6 +1869,7 @@ class TextIn(BaseModel):
     model: str = ""
     preset: str = ""
     channel_id: int | None = None
+    project_id: str = ""             # поставлено из проекта — запомнить связь
 
 
 @app.post("/ui/text")
@@ -1808,6 +1887,13 @@ def ui_text_create(body: TextIn, request: Request):
     langs = [str(x).strip() for x in (body.languages or []) if str(x).strip()]
     if not langs:
         raise HTTPException(400, "не выбран ни один язык")
+    pid = (body.project_id or "").strip()
+    if pid:
+        c0 = db()
+        try:
+            _project_or_404(c0, pid)     # до постановки: платная задача без проекта не нужна
+        finally:
+            c0.close()
 
     if mode == "topic":
         if not body.preset:
@@ -1818,6 +1904,7 @@ def ui_text_create(body: TextIn, request: Request):
             "model": body.model or "gpt-4.1-nano"})
         if code >= 400:
             raise HTTPException(_pass_code(code), out)
+        _link_project_jobs(pid, "rewrite", out)
         return {"ok": True, "job": out}
 
     if mode == "link":
@@ -1849,6 +1936,7 @@ def ui_text_create(body: TextIn, request: Request):
         "model": body.model or "gpt-4.1-nano"})
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
+    _link_project_jobs(pid, "rewrite", out)
     return {"ok": True, "job": out, "chars": len(text)}
 
 
@@ -1922,7 +2010,7 @@ def _cover_options(is_admin: bool) -> list:
 
 
 @app.get("/ui/covers")
-def ui_covers(request: Request):
+def ui_covers(request: Request, project_id: str = ""):
     """Экран обложек: стратегия, поля этой стратегии и что в ней не действует."""
     sid = getattr(request.state, "sid", "")
     user = getattr(request.state, "user", None)
@@ -1930,8 +2018,17 @@ def ui_covers(request: Request):
                     == "admin")
     code, jobs = _cover("/jobs?page=1&page_size=50", sid)
     items = (jobs.get("items") if isinstance(jobs, dict) else jobs) or []
+    items = items if isinstance(items, list) else []
+    if project_id:
+        def _one(jid):
+            code1, j1 = _cover(f"/jobs/{urllib.parse.quote(jid)}", sid)
+            if code1 != 200 or not isinstance(j1, dict):
+                return None
+            j1.pop("log", None)          # в строке списка лога нет, и тащить его незачем
+            return j1
+        items = _project_job_rows(project_id, "cover", items, _one)
     rows = []
-    for j in (items if isinstance(items, list) else []):
+    for j in items:
         pct = j.get("progress") or j.get("progress_percent")
         rows.append({
             "id": str(j.get("id") or ""),
@@ -1973,6 +2070,7 @@ class CoverIn(BaseModel):
     n_variants: int = 3
     extra_prompt: str = ""
     edit_preview: bool = False       # явный выбор, а не побочный эффект приложенного файла
+    project_id: str = ""             # поставлено из проекта — запомнить связь
 
 
 @app.post("/ui/covers")
@@ -1989,6 +2087,13 @@ def ui_covers_create(body: CoverIn, request: Request):
     langs = [str(x).strip() for x in (body.languages or []) if str(x).strip()]
     if not langs:
         raise HTTPException(400, "не выбран ни один язык")
+    pid = (body.project_id or "").strip()
+    if pid:
+        c0 = db()
+        try:
+            _project_or_404(c0, pid)     # до постановки: платная задача без проекта не нужна
+        finally:
+            c0.close()
 
     preset_data = {"aspect_ratio": "16:9"}
     if body.provider:
@@ -2022,6 +2127,7 @@ def ui_covers_create(body: CoverIn, request: Request):
     code, out = _cover("/jobs/cover", sid, payload)
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
+    _link_project_jobs(pid, "cover", out)
     return {"ok": True, "job": out}
 
 

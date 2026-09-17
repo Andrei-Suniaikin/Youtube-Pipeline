@@ -250,7 +250,7 @@ def main() -> int:
         check("source — то, что дали при заведении", body.get("source"), "Раз. Два. Три.")
 
         print("\nСтарт этапа: пять исходов (§5.4)")
-        code, body = me.go(f"/ui/projects/{pid}/stage/нет-такого", {})
+        code, body = me.go(f"/ui/projects/{pid}/stage/no-such-project", {})
         check("неизвестный kind — 404", code, 404)
 
         code, body = me.go(f"/ui/projects/{pid}/stage/tts", {"settings": {"engine": "edge"}})
@@ -310,7 +310,7 @@ def main() -> int:
         # обращения к провайдеру (main.py ≈12871) — 400 с текстом кабинета, ничего
         # не встаёт в очередь и подменять сообщение своим нельзя (принцип 3 §5).
         code, body = me.go(f"/ui/projects/{pid}/stage/tts",
-                           {"settings": {"engine": "нет-такого-движка"}})
+                           {"settings": {"engine": "no-such-project-движка"}})
         check("неизвестный движок озвучки — 400", code, 400)
         check("текст ошибки — от кабинета (не выдуман пультом)",
               "неизвестный TTS-движок" in str((body or {}).get("detail", "")), True)
@@ -377,7 +377,7 @@ def main() -> int:
 
         code, body = me.go(f"/ui/projects/{pid}/preset/apply", {"preset_id": 999999999})
         check("применение несуществующего пресета — 404", code, 404)
-        code, body = me.go(f"/ui/projects/нет-такого-проекта/preset/apply", {"preset_id": 1})
+        code, body = me.go(f"/ui/projects/no-such-project-проекта/preset/apply", {"preset_id": 1})
         check("применение на несуществующий проект — 404", code, 404)
 
         print("\nПрименённый пресет: ссылки и «удалён» (§5.9, functional req. 2, §7.2, §7.7)")
@@ -479,9 +479,57 @@ def main() -> int:
         finally:
             cover_drop_job(own_jid, own_dir)
             cover_drop_job(foreign_jid, foreign_dir)
+
+        print("\nЗадачи текста и обложек проекта — по связи project_service_jobs (17.09.2026)")
+        stamp = str(int(time.time()))
+        older, newer, stray = "psjold" + stamp, "psjnew" + stamp, "psjstray" + stamp
+        dirs = [cover_insert_job(j, TENANT, "v.jpg", b"\xff\xd8x") for j in (older, newer, stray)]
+        c = db()
+        try:
+            now = time.time()
+            c.executemany("INSERT INTO project_service_jobs(tenant_id, project_id, service, "
+                          "job_id, created) VALUES (?,?,?,?,?)",
+                          [(TENANT, pid, "cover", older, now - 10),
+                           (TENANT, pid, "cover", newer, now)])
+            c.commit()
+        finally:
+            c.close()
+        try:
+            code, body = me.go(f"/ui/covers?project_id={pid}")
+            check("список обложек проекта отдаётся", code, 200)
+            check("только связанные задачи, новые первыми",
+                  [j["id"] for j in (body or {}).get("jobs") or []], [newer, older])
+            code, body = me.go("/ui/covers")
+            check("без project_id — все задачи аккаунта, как раньше",
+                  stray in [j["id"] for j in (body or {}).get("jobs") or []], True)
+            code, body = me.go(f"/ui/text?project_id={pid}")
+            check("у проекта задач текста нет — пустой список, не ошибка",
+                  (code, (body or {}).get("jobs")), (200, []))
+            code, _b = me.go("/ui/covers?project_id=no-such-project")
+            check("чужой или несуществующий проект — 404", code, 404)
+
+            before = sqlite3.connect(COVER_DB).execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            code, _b = me.go("/ui/covers", {"mode": "seed", "languages": ["Русский"],
+                                            "seed": "x", "project_id": "no-such-project"})
+            check("постановка обложки в несуществующий проект — 404 до создания", code, 404)
+            after = sqlite3.connect(COVER_DB).execute("SELECT COUNT(*) FROM jobs").fetchone()[0]
+            check("задача Cover не создана", after, before)
+            code, _b = me.go("/ui/text", {"mode": "text", "source": "раз", "languages": ["ru"],
+                                          "project_id": "no-such-project"})
+            check("постановка текста в несуществующий проект — 404 до создания", code, 404)
+        finally:
+            for j, d in zip((older, newer, stray), dirs):
+                cover_drop_job(j, d)
     finally:
         drop_project(pid)
         check("проект убран за собой", project_row(pid) is None, True)
+        c = db()
+        try:
+            left = c.execute("SELECT COUNT(*) FROM project_service_jobs WHERE project_id=?",
+                             (pid,)).fetchone()[0]
+        finally:
+            c.close()
+        check("связи задач ушли вместе с проектом (триггер)", left, 0)
 
     print()
     if FAILS:

@@ -352,24 +352,25 @@ def main() -> int:
           "hashAtClick перед срабатыванием",
           "if (location.hash === hashAtClick) viewProject(p.id);" in stage_tab, True)
 
-    print("\nРегрессия Issue 4: списки задач вкладок «Сценарий»/«Обложка» — честно "
-          "подписаны как «по аккаунту, не по проекту» (у Rewrite/Cover нет понятия "
-          "«проект» — решение оркестратора, needs-clarification.md не писать, связь не "
-          "выдумывать); задача, созданная тут же, — первой; опрос идёт, пока есть "
-          "незавершённая; готовая раскрывается кликом")
+    print("\nСписки задач вкладок «Сценарий»/«Обложка» — только задачи этого проекта "
+          "(связь project_service_jobs, решение владельца 17.09.2026); задача, созданная "
+          "тут же, — первой; опрос идёт, пока есть незавершённая; готовая раскрывается кликом")
     scen_refresh = function_body(index_html,
                                  "async function refreshScenarioJobs(box, pid, srcTextEl){")
     cover_refresh = function_body(index_html, "async function refreshCoverJobs(box, pid){")
     check("refreshScenarioJobs() найдена", bool(scen_refresh), True)
     check("refreshCoverJobs() найдена", bool(cover_refresh), True)
-    check("источник — GET /ui/text (тот же, что у #/text, без новой ручки сервера)",
-          "await api('/ui/text');" in scen_refresh, True)
-    check("список честно подписан: не отфильтрован по проекту",
-          "не отфильтрован по" in scen_refresh and "проект" in scen_refresh, True)
-    check("источник обложек — GET /ui/covers (тот же, что у #/covers)",
-          "await api('/ui/covers');" in cover_refresh, True)
-    check("список обложек тоже честно подписан: не отфильтрован по проекту",
-          "не отфильтрован по" in cover_refresh and "проект" in cover_refresh, True)
+    check("источник — GET /ui/text с project_id (и на первом заходе, и на тике)",
+          scen_refresh.count("api(`/ui/text?project_id=${encodeURIComponent(pid)}`)"), 2)
+    check("подпись списка — задачи этого проекта",
+          "Задачи текста этого" in scen_refresh, True)
+    check("источник обложек — GET /ui/covers с project_id",
+          cover_refresh.count("api(`/ui/covers?project_id=${encodeURIComponent(pid)}`)"), 2)
+    check("подпись списка обложек — задачи этого проекта",
+          "Задачи обложек этого" in cover_refresh, True)
+    check("задача из вкладки уходит с project_id (текст и обложка)",
+          "project_id: p.id," in index_html and "edit_preview: st.edit, project_id: p.id}" in index_html,
+          True)
     check("задача, созданная тут же (st.lastJob), переставляется первой в списке текста",
           "if (i > 0){ const [j] = jobs.splice(i, 1); jobs.unshift(j); }" in scen_refresh,
           True)

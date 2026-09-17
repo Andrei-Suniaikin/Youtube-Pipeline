@@ -1883,9 +1883,8 @@ function jobListStateCellHtml(j){
 // (по `data-state` на `<tr>`), новые задачи дописываются новыми строками, а уже
 // раскрытый результат перечитывается РОВНО ОДИН раз — в момент, когда задача только
 // что перешла в терминальное состояние (а не на каждом тике). Строки, которых больше
-// нет в ответе сервера, не удаляются — список Rewrite/Cover — это последние задачи
-// аккаунта, а не полный журнал, пропажа строки — редкий и неопасный случай (просто
-// устареет до следующего полного захода на вкладку).
+// нет в ответе сервера, не удаляются: связь с проектом только добавляется, пропасть
+// строка может лишь при удалении задачи в самом сервисе — до следующего захода на вкладку.
 // Отпечаток строки: состояние + прогресс + подпись. Внутри `running` меняются только
 // прогресс и подпись, поэтому сравнивать по одному состоянию нельзя — полоска застынет.
 function jobRowPrint(j){
@@ -1960,7 +1959,7 @@ async function paintTextTake(jobId, host, pid, srcTextEl){
   }
 }
 
-// Строка списка «последние задачи текста аккаунта» — общая для первой отрисовки
+// Строка списка «задачи текста проекта» — общая для первой отрисовки
 // таблицы (`refreshScenarioJobs`) и для точечного дополнения тиком (`syncJobsTable`).
 function scenJobRowHtml(j){
   return `<tr data-job="${esc(j.id)}" data-state="${esc(j.state)}" data-print="${esc(jobRowPrint(j))}">
@@ -1972,9 +1971,9 @@ function scenJobRowHtml(j){
     <td class="muted">${when(j.created)}</td>
   </tr>`;
 }
-// Список «последние задачи текста аккаунта»: источник — `GET /ui/text` (как у
-// #/text, не отфильтрован по проекту — подпись прямо в разметке), задача, созданная
-// тут же (`st.lastJob`), — первой. Опрашивается раз в 3с, пока среди показанных есть
+// Список «задачи текста проекта»: источник — `GET /ui/text?project_id=` (связь
+// `project_service_jobs` пишется при постановке из вкладки, 17.09.2026), порядок —
+// постановки, задача, созданная тут же (`st.lastJob`), — первой. Опрашивается раз в 3с, пока среди показанных есть
 // незавершённая (review-feedback-F4 цикл 2, Issue 4а — готовый результат должен
 // дочитываться сам, не только после ухода с вкладки и возврата).
 // review-feedback-F4 цикл 3: полная перестройка (`box.innerHTML`) — только здесь, при
@@ -1988,21 +1987,20 @@ async function refreshScenarioJobs(box, pid, srcTextEl){
   stopJobLogPoll(key);
   const hashAtStart = location.hash;
   const st = scenState(pid);
-  const td = await api('/ui/text');
+  const td = await api(`/ui/text?project_id=${encodeURIComponent(pid)}`);
   if (location.hash !== hashAtStart || !box.isConnected) return;   // ушли со страницы, пока список грузился
   const jobs = td.jobs.slice();
   if (st.lastJob != null){
     const i = jobs.findIndex(j => String(j.id) === String(st.lastJob));
     if (i > 0){ const [j] = jobs.splice(i, 1); jobs.unshift(j); }
   }
-  box.innerHTML = `<div class="note muted" style="margin:14px 0 8px">Последние задачи
-    текста вашего аккаунта — у Rewrite нет понятия «проект», список не отфильтрован по
-    этому проекту.</div>
+  box.innerHTML = `<div class="note muted" style="margin:14px 0 8px">Задачи текста этого
+    проекта — поставленные из этой вкладки, новые сверху.</div>
     ${jobs.length ? `<table><thead><tr>
       <th>Задача</th><th>Вид</th><th>Языки</th><th>Состояние</th><th>Создана</th></tr></thead>
       <tbody>${jobs.map(scenJobRowHtml).join('')}</tbody></table>
       <div class="note muted">Нажмите на строку — покажется результат.</div>`
-      : '<div class="empty">Задач текста пока нет.</div>'}`;
+      : '<div class="empty">У проекта задач текста пока нет.</div>'}`;
   wireProjectJobRows(box, 'rewrite', 5, (jid, host) => paintTextTake(jid, host, pid, srcTextEl));
 
   if (!jobs.some(j => !JOB_LIST_TERMINAL.has(j.state))) return;   // все терминальны — опрашивать нечего
@@ -2011,7 +2009,7 @@ async function refreshScenarioJobs(box, pid, srcTextEl){
     if (busy) return;
     busy = true;
     try{
-      const d2 = await api('/ui/text');
+      const d2 = await api(`/ui/text?project_id=${encodeURIComponent(pid)}`);
       if (location.hash !== hashAtStart || !box.isConnected){ stopOwnPoll(key, handle); return; }
       const jobs2 = d2.jobs.slice();
       if (st.lastJob != null){
@@ -2039,7 +2037,7 @@ async function renderScenarioTab(d){
   if (!st.model && td.models.length) st.model = td.models[0].value;
 
   // 1. Действие: «Получить текст» (три режима TEXT_MODES — та же форма, что у
-  // #/text) + список последних задач текста аккаунта + textarea с source.txt.
+  // #/text) + список задач текста этого проекта + textarea с source.txt.
   const card = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Действие</div>
     <div class="secbody">
@@ -2121,6 +2119,7 @@ async function renderScenarioTab(d){
         mode: st.mode,
         source: (st.mode === 'text' ? many.value : one.value),
         languages: [...st.langs], model: st.model, preset: st.preset,
+        project_id: p.id,
       });
       st.lastJob = out.job && out.job.job_id;
       toast('Задача текста создана', 'ok');
@@ -2194,7 +2193,7 @@ async function paintCoverTake(jobId, host, pid){
   }
 }
 
-// Строка списка «последние задачи обложек аккаунта» — общая для первой отрисовки и
+// Строка списка «задачи обложек проекта» — общая для первой отрисовки и
 // для точечного дополнения тиком (`syncJobsTable`), см. `scenJobRowHtml` выше.
 function coverJobRowHtml(j){
   return `<tr data-job="${esc(j.id)}" data-state="${esc(j.state)}" data-print="${esc(jobRowPrint(j))}">
@@ -2212,21 +2211,20 @@ async function refreshCoverJobs(box, pid){
   stopJobLogPoll(key);
   const hashAtStart = location.hash;
   const st = coverState(pid);
-  const cd = await api('/ui/covers');
+  const cd = await api(`/ui/covers?project_id=${encodeURIComponent(pid)}`);
   if (location.hash !== hashAtStart || !box.isConnected) return;   // ушли со страницы, пока список грузился
   const jobs = cd.jobs.slice();
   if (st.lastJob != null){
     const i = jobs.findIndex(j => String(j.id) === String(st.lastJob));
     if (i > 0){ const [j] = jobs.splice(i, 1); jobs.unshift(j); }
   }
-  box.innerHTML = `<div class="note muted" style="margin:14px 0 8px">Последние задачи
-    обложек вашего аккаунта — у Cover нет понятия «проект», список не отфильтрован по
-    этому проекту.</div>
+  box.innerHTML = `<div class="note muted" style="margin:14px 0 8px">Задачи обложек этого
+    проекта — поставленные из этой вкладки, новые сверху.</div>
     ${jobs.length ? `<table><thead><tr>
       <th>Задача</th><th>Состояние</th><th>Создана</th></tr></thead>
       <tbody>${jobs.map(coverJobRowHtml).join('')}</tbody></table>
       <div class="note muted">Нажмите на строку — покажутся готовые обложки.</div>`
-      : '<div class="empty">Задач обложек пока нет.</div>'}`;
+      : '<div class="empty">У проекта задач обложек пока нет.</div>'}`;
   wireProjectJobRows(box, 'cover', 3, (jid, host) => paintCoverTake(jid, host, pid));
 
   if (!jobs.some(j => !JOB_LIST_TERMINAL.has(j.state))) return;   // все терминальны — опрашивать нечего
@@ -2235,7 +2233,7 @@ async function refreshCoverJobs(box, pid){
     if (busy) return;
     busy = true;
     try{
-      const d2 = await api('/ui/covers');
+      const d2 = await api(`/ui/covers?project_id=${encodeURIComponent(pid)}`);
       if (location.hash !== hashAtStart || !box.isConnected){ stopOwnPoll(key, handle); return; }
       const jobs2 = d2.jobs.slice();
       if (st.lastJob != null){
@@ -2373,7 +2371,7 @@ async function renderCoverTab(d){
       const curOpt = cd.options[st.option] || cd.options[0] || {};
       const body = {mode: st.mode, preset: st.preset, languages: [...st.langs],
                     provider: curOpt.provider || '', model: curOpt.model || '',
-                    edit_preview: st.edit};
+                    edit_preview: st.edit, project_id: p.id};
       if (st.mode === 'url'){
         body.urls = (card.querySelector('#cv-urls').value || '')
           .split(/\s+/).map(x => x.trim()).filter(Boolean);
