@@ -30,7 +30,7 @@ BASE = os.path.abspath(os.path.join(HERE, ".."))
 SERVER = os.path.join(BASE, "server")
 sys.path.insert(0, SERVER)
 
-from fastapi import FastAPI, HTTPException, Request, Response    # noqa: E402
+from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
 from pydantic import BaseModel, StrictInt                         # noqa: E402
 
@@ -2693,6 +2693,247 @@ def _renamed(preset, name: str):
         out.pop("id", None)          # id пересоздаст сам сервис: копия — не тот же пресет
         return out
     return preset
+
+
+# Поля пресетов соседей, которые пульт даёт править (18.09.2026). Раньше их можно было
+# только скопировать или удалить, а настроить — уйти в чужой интерфейс, которого по ТЗ
+# быть не должно. Список намеренно короткий: ровно то, что есть в формах самих соседей.
+# Всё остальное, что лежит в пресете (в т.ч. поля, похожие на секреты), пульт не
+# показывает и не трогает — оно остаётся в пресете как было, правка его не стирает.
+NEIGHBOUR_PRESET_FIELDS = {
+    "cover": (
+        {"key": "prompt_template", "kind": "text", "label": "Шаблон промпта",
+         "hint": "постоянные правила стиля. {ЯЗЫК} — название языка, {СЕМЯ} — описание "
+                 "конкретной обложки. Пусто — семя станет полным промптом"},
+        {"key": "seed_n_variants", "kind": "number", "label": "Обложек на каждый язык",
+         "min": 1, "max": 8},
+        {"key": "generation", "kind": "select", "label": "Модель генерации",
+         "hint": "кем рисуется обложка"},
+        {"key": "seed_reference_image", "kind": "file", "label": "Образец стиля",
+         "hint": "картинка-референс для всех языков: модель получает её напрямую и "
+                 "повторяет стиль. JPG/PNG до 20 МБ"},
+    ),
+    "rewrite": (
+        {"key": "model", "kind": "select", "label": "Модель"},
+        {"key": "chunk", "kind": "number", "label": "Размер куска, знаков",
+         "min": 500, "max": 20000,
+         "hint": "текст режется на куски такой длины — по абзацам"},
+        {"key": "threads", "kind": "number", "label": "Потоков", "min": 1, "max": 8},
+        {"key": "address", "kind": "text", "label": "Обращение",
+         "hint": "«вы», «ты» — как рерайт обращается к зрителю"},
+        {"key": "preserve_paragraphs", "kind": "switch", "label": "Сохранять абзацы"},
+        {"key": "safe_text", "kind": "switch", "label": "Безопасный текст"},
+        {"key": "languages", "kind": "langrows", "label": "Языки и ведущие",
+         "hint": "для каждого языка — имя ведущего и название канала: их рерайт "
+                 "подставляет в приветствие"},
+    ),
+    "rewrite_gen": (
+        {"key": "content", "kind": "text", "label": "Бриф",
+         "hint": "о чём и как писать текст с нуля"},
+        {"key": "target_length_words", "kind": "number", "label": "Длина, слов",
+         "min": 0, "max": 20000},
+    ),
+}
+
+
+def _neighbour_preset_options(service: str, sid: str, request) -> dict:
+    """Варианты для выпадающих списков — у самого соседа, не переписанные здесь."""
+    if service == "cover":
+        user = getattr(request.state, "user", None)
+        is_admin = bool(user is not None
+                        and (user["role"] if "role" in user.keys() else "") == "admin")
+        opts = [{"value": f'{o["provider"]}|{o["model"]}', "title": o["label"]}
+                for o in _cover_options(is_admin)]
+        return {"generation": opts}
+    if service == "rewrite":
+        code, models = _rw("/models", sid)
+        items = models if code == 200 else []
+        out = []
+        for m in (items if isinstance(items, list) else []):
+            val = m.get("id") or m.get("name") or m.get("value") if isinstance(m, dict) else m
+            if not val:
+                continue
+            title = (m.get("title") or m.get("label") or val) if isinstance(m, dict) else val
+            out.append({"value": str(val), "title": str(title)})
+        return {"model": out}
+    return {}
+
+
+def _neighbour_preset_read(service: str, name: str, sid: str, request) -> dict:
+    store, _put = _preset_store(service, sid, request)
+    if name not in store:
+        raise HTTPException(404, f"нет пресета «{name}»")
+    cfg = store[name] if isinstance(store[name], dict) else {}
+    options = _neighbour_preset_options(service, sid, request)
+    fields = []
+    for f in NEIGHBOUR_PRESET_FIELDS.get(service, ()):
+        item = dict(f)
+        if f["key"] == "generation":
+            item["value"] = f'{cfg.get("generation_provider") or "flow"}|' \
+                            f'{cfg.get("generation_model") or ""}'
+        elif f["kind"] == "langrows":
+            item["value"] = [{"code": str(x.get("code") or ""),
+                              "host": str(x.get("host") or ""),
+                              "channel": str(x.get("channel") or "")}
+                             for x in (cfg.get("languages") or [])
+                             if isinstance(x, dict)]
+        elif f["kind"] == "file":
+            item["value"] = str(cfg.get(f["key"]) or "")
+            item["filename"] = str(cfg.get("seed_reference_filename") or "")
+        else:
+            val = cfg.get(f["key"])
+            item["value"] = "" if val is None else val
+        item["options"] = options.get(f["key"], [])
+        if f["kind"] == "select" and not item["options"]:
+            # Список неоткуда взять — поле не рисуем: пустой выпадающий список при
+            # сохранении стёр бы модель, которую человек не менял.
+            continue
+        fields.append(item)
+    return {"service": service, "name": name, "fields": fields}
+
+
+def _neighbour_preset_write(service: str, name: str, values: dict, sid: str, request) -> None:
+    store, put = _preset_store(service, sid, request)
+    if name not in store:
+        # Правка — только существующего: иначе опечатка в имени молча заводила бы
+        # третий пресет, на который никто не ссылается. Новый заводится «Копией».
+        raise HTTPException(404, f"нет пресета «{name}»")
+    cfg = dict(store.get(name) or {}) if isinstance(store.get(name), dict) else {}
+    known = {f["key"]: f for f in NEIGHBOUR_PRESET_FIELDS.get(service, ())}
+    unknown = [k for k in values if k not in known]
+    if unknown:
+        raise HTTPException(400, "не поля этого пресета: " + ", ".join(sorted(unknown)))
+    for key, raw in values.items():
+        f = known[key]
+        if key == "generation":
+            provider, _sep, model = str(raw or "").partition("|")
+            if not provider:
+                raise HTTPException(400, "не выбрана модель генерации")
+            cfg["generation_provider"], cfg["generation_model"] = provider, model
+        elif f["kind"] == "number":
+            try:
+                num = int(str(raw).strip() or 0)
+            except ValueError:
+                raise HTTPException(400, f"{f['label']}: нужно целое число")
+            lo, hi = f.get("min", 0), f.get("max", 10 ** 9)
+            if not (lo <= num <= hi):
+                raise HTTPException(400, f"{f['label']}: допустимо от {lo} до {hi}")
+            cfg[key] = num
+        elif f["kind"] == "switch":
+            cfg[key] = str(raw).strip().lower() in ("1", "true", "on", "да")
+        elif f["kind"] == "langrows":
+            # Правим только свои поля строки. У языка бывают и чужие (`voice` — чем
+            # озвучивать), и стереть их формой, которая их не показывает, нельзя.
+            was = {str((x or {}).get("code") or "").strip().lower(): dict(x)
+                   for x in (cfg.get(key) or []) if isinstance(x, dict)}
+            rows = []
+            for x in (raw if isinstance(raw, list) else []):
+                code = str((x or {}).get("code") or "").strip().lower()
+                if not code:
+                    continue
+                row = dict(was.get(code) or {})
+                row["code"] = code
+                for fld in ("host", "channel"):
+                    val = str((x or {}).get(fld) or "").strip()[:80]
+                    # Пустое поле — это «не задано», а не пустая строка: пустой ключ в
+                    # строке языка потом не отличить от заданного пустым.
+                    if val:
+                        row[fld] = val
+                    else:
+                        row.pop(fld, None)
+                rows.append(row)
+            cfg[key] = rows
+        else:
+            cfg[key] = str(raw)
+    if service == "rewrite_gen":
+        cfg["name"] = name
+    store[name] = cfg
+    put(store)
+
+
+@app.post("/ui/presets/cover/{name}/reference")
+async def ui_cover_preset_reference(name: str, request: Request,
+                                    file: UploadFile = File(...)):
+    """Положить картинку-образец стиля в пресет обложки.
+
+    Файл хранит Cover Studio (`POST /api/v1/files`) и отвечает `file_id` — его и пишем
+    в пресет. Своей копии файла пульт не заводит: второе хранилище разошлось бы с тем,
+    что реально читает генерация.
+    """
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "файл пустой")
+    if len(data) > 20 * 1024 * 1024:
+        raise HTTPException(413, "файл больше 20 МБ")
+    c = db()
+    try:
+        key = get_key(c, "cover")
+    finally:
+        c.close()
+    if not key:
+        raise HTTPException(503, "ключ доступа к Cover Studio не сохранён")
+    boundary = "----studio" + secrets.token_hex(8)
+    head = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; '
+            f'filename="{os.path.basename(file.filename or "reference")}"\r\n'
+            f"Content-Type: {file.content_type or 'application/octet-stream'}\r\n\r\n"
+            ).encode("utf-8")
+    raw = head + data + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    req = urllib.request.Request(f"{COVER_BASE}/api/v1/files", data=raw, method="POST")
+    req.add_header("Authorization", f"Bearer {key}")
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 5) as resp:
+            out = json.loads(resp.read().decode("utf-8") or "{}")
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        try:
+            detail = (json.loads(body or "{}") or {}).get("detail") or body[:200]
+        except ValueError:
+            detail = body[:200]
+        raise HTTPException(_pass_code(exc.code), detail)
+    except Exception as exc:                                       # noqa: BLE001
+        raise HTTPException(502, f"обложки не отвечают: {type(exc).__name__}")
+    file_id = str(out.get("file_id") or "")
+    if not file_id:
+        raise HTTPException(502, "Cover Studio не вернула идентификатор файла")
+    sid = getattr(request.state, "sid", "")
+    store, put = _preset_store("cover", sid, request)
+    cfg = dict(store.get(name) or {})
+    if not cfg and name not in store:
+        raise HTTPException(404, f"нет пресета «{name}»")
+    cfg["seed_reference_image"] = file_id
+    cfg["seed_reference_filename"] = str(out.get("filename") or file.filename or "")
+    store[name] = cfg
+    put(store)
+    return {"ok": True, "file_id": file_id, "filename": cfg["seed_reference_filename"]}
+
+
+@app.get("/ui/presets/{service}/{name}/form")
+def ui_neighbour_preset_form(service: str, name: str, request: Request):
+    """Поля пресета соседа для формы. Секреты сюда не попадают: отдаём только те поля,
+    которые сами же и перечислили."""
+    if service not in NEIGHBOUR_PRESET_FIELDS:
+        raise HTTPException(404, f"у сервиса «{service}» правки полей нет")
+    return _neighbour_preset_read(service, name, getattr(request.state, "sid", ""), request)
+
+
+class NeighbourPresetIn(BaseModel):
+    values: dict = {}
+
+
+@app.post("/ui/presets/{service}/{name}/form")
+def ui_neighbour_preset_save(service: str, name: str, body: NeighbourPresetIn,
+                             request: Request):
+    """Сохранить поля пресета соседа. Читаем весь набор, меняем известные поля и пишем
+    обратно целиком — остальные поля пресета остаются как были."""
+    if service not in NEIGHBOUR_PRESET_FIELDS:
+        raise HTTPException(404, f"у сервиса «{service}» правки полей нет")
+    if not body.values:
+        raise HTTPException(400, "пустое сохранение")
+    _neighbour_preset_write(service, name, body.values,
+                            getattr(request.state, "sid", ""), request)
+    return {"ok": True}
 
 
 def _preset_store(service: str, sid: str, request):

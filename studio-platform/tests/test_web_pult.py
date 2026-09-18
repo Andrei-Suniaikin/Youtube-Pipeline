@@ -155,6 +155,17 @@ def drop_release(rel: str, plan_id: int) -> None:
         c.close()
 
 
+def rew_preset(name: str) -> dict:
+    """Пресет рерайта прямо из его базы: через API видно не всё (и не должно)."""
+    c = sqlite3.connect(os.path.join(BASE, "rewrite", "sessions.db"), timeout=5)
+    try:
+        row = c.execute("SELECT rew_presets FROM user_keys WHERE user_id=?",
+                        (TENANT,)).fetchone()
+    finally:
+        c.close()
+    return (json.loads(row[0] or "{}") if row else {}).get(name, {})
+
+
 def project_row(pid: str):
     c = sqlite3.connect(DB, timeout=5)
     c.row_factory = sqlite3.Row
@@ -882,6 +893,61 @@ def main() -> int:
             me.go("/ui/channels/1", dict(base, days=days, times=", ".join(times)))
             check("прежнее расписание канала возвращено",
                   me.go("/ui/channels/1")[1]["channel"]["schedule"], c0["schedule"])
+
+    print("\nПресеты соседей правятся из пульта, а не в чужом интерфейсе (18.09.2026)")
+    code, form = me.go("/ui/presets/rewrite/Базовый рерайт/form")
+    check("форма пресета рерайта отдана", code, 200)
+    if code == 200:
+        keys_ = [f["key"] for f in form["fields"]]
+        check("поля — те, что правит сосед", set(keys_) >= {"model", "chunk", "threads",
+                                                            "address", "languages"}, True)
+        check("секретов среди полей нет",
+              [k for k in keys_ if "key" in k or "token" in k], [])
+        body_txt = json.dumps(form, ensure_ascii=False)
+        check("значение чужого ключа в форму не попало", "НЕ ДОЛЖЕН УТЕЧЬ" in body_txt, False)
+        before = rew_preset("Базовый рерайт")
+        vals = {f["key"]: f["value"] for f in form["fields"]}
+        vals["address"] = "ты"
+        vals["languages"] = [dict(x, host="Проверка") for x in (vals.get("languages") or [])]
+        check("сохранение принято",
+              me.go("/ui/presets/rewrite/Базовый рерайт/form",
+                    {"values": vals})[0], 200)
+        after = rew_preset("Базовый рерайт")
+        check("поле изменилось", after.get("address"), "ты")
+        check("скрытое поле пресета цело", after.get("openai_api_key"),
+              before.get("openai_api_key"))
+        check("чужие поля языка целы",
+              [x.get("voice") for x in after.get("languages") or []],
+              [x.get("voice") for x in before.get("languages") or []])
+        check("имя ведущего записано",
+              [x.get("host") for x in after.get("languages") or []],
+              ["Проверка"] * len(before.get("languages") or []))
+        check("поле не из формы отвергнуто",
+              me.go("/ui/presets/rewrite/Базовый рерайт/form",
+                    {"values": {"openai_api_key": "x"}})[0], 400)
+        check("правка несуществующего — 404",
+              me.go("/ui/presets/rewrite/нет-такого/form",
+                    {"values": {"address": "вы"}})[0], 404)
+        # Вернуть как было: тест не оставляет за собой изменённых настроек.
+        vals["address"] = before.get("address") or ""
+        vals["languages"] = [{"code": x.get("code"), "host": x.get("host") or "",
+                              "channel": x.get("channel") or ""}
+                             for x in (before.get("languages") or [])]
+        me.go("/ui/presets/rewrite/Базовый рерайт/form", {"values": vals})
+        check("настройки возвращены", rew_preset("Базовый рерайт"), before)
+
+    code, form = me.go("/ui/presets/cover/Default RU/form")
+    check("форма пресета обложки отдана", code, 200)
+    if code == 200:
+        keys_ = [f["key"] for f in form["fields"]]
+        check("есть шаблон промпта, число вариантов, модель и образец стиля",
+              set(keys_) >= {"prompt_template", "seed_n_variants", "generation",
+                             "seed_reference_image"}, True)
+        gen = [f for f in form["fields"] if f["key"] == "generation"][0]
+        check("модель — из списка самого Cover", bool(gen["options"]), True)
+        check("выбрана та, что стоит в пресете",
+              gen["value"].split("|")[0] in [o["value"].split("|")[0] for o in gen["options"]],
+              True)
 
     print("\nКлюч Rewrite виден и правится из пульта (18.09.2026)")
     code, keys = me.go("/ui/keys")

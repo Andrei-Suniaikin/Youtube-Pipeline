@@ -57,14 +57,16 @@ SCENARIO = r"""
     await viewKeys();
     out.noKey = cardText();
 
-    // Вписываем ключ той же кнопкой «Добавить ключ».
+    // Вписываем ключ той же кнопкой «Добавить ключ» — форма открывается окном
+    // (18.09.2026), поэтому ждём его и жмём «Сохранить» в нём.
     document.querySelector('#addkey').click();
-    await sleep(50);
+    await sleep(300);
     out.opts = [...document.querySelectorAll('#kfam option')].map(o => o.value);
+    out.inModal = !!document.querySelector('dialog.modal #kfam');
     document.querySelector('#kfam').value = '__rewrite';
     document.querySelector('#kval').value = 'sk-проверочный';
-    document.querySelector('#ksave').click();
-    await sleep(200);
+    document.querySelector('dialog.modal .m-ok').click();
+    await sleep(300);
 
     // Ключ задан: строка это показывает, рядом «снять свой».
     KEYS.rewrite = {ok: true, own_openai: true, own_claude: false,
@@ -100,6 +102,8 @@ def main() -> int:
           and "Rewrite Studio" in (res.get("noKey") or ""), True)
     check("в списке провайдеров есть пункт рерайта",
           "__rewrite" in (res.get("opts") or []), True)
+    check("форма ключа открывается окном, а не строкой в карточке",
+          res.get("inModal"), True)
     check("ключ уходит в рерайт, а не в кабинет",
           [p for p, _b in sent], ["/ui/keys/rewrite", "/ui/keys/rewrite"])
     check("значение передано как есть", sent[0][1] if sent else None,

@@ -242,6 +242,18 @@
 
   /* Тосты: ошибка действия видна там, где смотрит глаз, и не перекрывает работу.
      Раньше это был alert() — он останавливает страницу и требует нажать «ОК». */
+  /* Модальное окно (18.09.2026). Это НЕ браузерный попап: `alert`/`confirm`/`prompt`
+     останавливают страницу и не дают сравнить два поля. Здесь обычный <dialog> —
+     закрывается Esc и кликом по фону, внутри живёт нормальная форма. */
+  dialog.modal{border:1px solid var(--line-2);border-radius:var(--r);background:var(--card);
+               color:var(--fg);padding:0;max-width:720px;width:calc(100% - 32px)}
+  dialog.modal::backdrop{background:rgba(0,0,0,.55)}
+  dialog.modal .sec{display:flex;align-items:center;justify-content:space-between}
+  dialog.modal .mbody{padding:16px 18px 18px;max-height:70vh;overflow:auto}
+  dialog.modal .mfoot{display:flex;gap:10px;align-items:center;
+                      padding:0 18px 18px}
+  dialog.modal .x{background:transparent;border:0;color:var(--muted);font-size:18px;
+                  cursor:pointer;padding:0 4px}
   #toasts{position:fixed;top:16px;right:16px;z-index:99;display:flex;flex-direction:column;
           gap:9px;max-width:min(420px,calc(100vw - 32px));pointer-events:none}
   #toasts .toast{pointer-events:auto;background:var(--card);border:1px solid var(--line-2);
@@ -661,8 +673,7 @@ async function viewKeys(){
       : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
     ${rewriteRowHtml(d.rewrite || {})}
     <div class="secbody" style="padding-top:0">
-      <div id="keyedit"></div>
-      <div style="margin-top:10px"><button class="ghost" id="addkey">Добавить ключ</button></div>
+      <button class="ghost" id="addkey">Добавить ключ</button>
     </div>
   </div>`);
   app.append(ownCard);
@@ -2748,7 +2759,6 @@ function wireThumbScroll(card, d, g){
    своим же обработчиком: там ключи правятся по одному, каждый несёт свой лимит,
    и ёмкость дорожки пересчитывается сразу. */
 async function wireKeys(root, d){
-  const box = root.querySelector('#keyedit');
 
   const rwDrop = root.querySelector('#rw-drop');
   if (rwDrop) rwDrop.onclick = ev => {
@@ -2772,31 +2782,29 @@ async function wireKeys(root, d){
   });
 
   root.querySelector('#addkey').onclick = async () => {
-    if (box.innerHTML){ box.innerHTML = ''; return; }
+    // Форма ключа — в окне (18.09.2026): в строке карточки она жила криво и мешала
+    // читать сам список. Провайдеры спрашиваем у кабинета, как и раньше.
     const ref = await api('/ui/keys/families');
-    box.innerHTML = `
-      <div id="kerr"></div>
+    modal('Добавить ключ', `
       <div class="fldrow"><label>Провайдер</label>
         <select id="kfam">${ref.families.map(f =>
           `<option value="${esc(f.key)}">${esc(f.title)}</option>`).join('')}
           <option value="__rewrite">OpenAI · текст (Rewrite Studio)</option></select></div>
       <div class="fldrow"><label>Ключ</label>
-        <input id="kval" style="width:340px" autocomplete="off"></div>
+        <input id="kval" type="password" autocomplete="off" style="flex:1;min-width:0"></div>
       <div class="note muted">${esc(ref.note)}</div>
-      <div style="margin-top:10px"><button id="ksave">Сохранить</button></div>`;
-    box.querySelector('#ksave').onclick = async () => {
-      const err = box.querySelector('#kerr');
-      err.innerHTML = '';
-      const val = box.querySelector('#kval').value.trim();
-      if (!val){ err.innerHTML = '<div class="err">Ключ пустой.</div>'; return; }
-      const fam = box.querySelector('#kfam').value;
-      try{
+      <div class="note muted">Ключ для текста хранит Rewrite Studio, остальные — кабинет.
+        Значение нигде не показывается: в списке видно только хвост.</div>`,
+      {ok: 'Сохранить', onOk: async (box, close) => {
+        const val = box.querySelector('#kval').value.trim();
+        if (!val) throw new Error('Ключ пустой.');
+        const fam = box.querySelector('#kfam').value;
         // Ключ рерайта хранит сам Rewrite: второго места хранения секрета не заводим.
         if (fam === '__rewrite') await post('/ui/keys/rewrite', {openai_api_key: val});
         else await post('/ui/keys', {add: {[fam]: [val]}});
+        close();
         await render();
-      }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
-    };
+      }});
   };
 }
 
@@ -3352,6 +3360,42 @@ function askInline(btn, opts, onOk){
 }
 
 // Вместо confirm(): вопрос рядом с кнопкой. Нужен только там, где действие необратимо.
+// Окно для формы, которой тесно в строке: ключ, пресет обложки, бриф сценария.
+// Возвращает {el, body, close}: содержимое рисует вызывающий, кнопка «Сохранить» и
+// показ ошибки — здесь, потому что они одинаковы у всех таких форм.
+function modal(title, bodyHtml, opts){
+  const o = opts || {};
+  // $() возвращает обёртку-div, а нам нужен сам <dialog>: showModal() есть только у него.
+  const dlg = $(`<dialog class="modal">
+    <div class="sec">${esc(title)}<button class="x" title="Закрыть">×</button></div>
+    <div class="mbody">${bodyHtml}</div>
+    <div class="mfoot"><button class="m-ok">${esc(o.ok || 'Сохранить')}</button>
+      <button class="ghost m-no">Отмена</button>
+      <span class="note bad m-err" style="margin:0"></span></div>
+  </dialog>`).firstElementChild;
+  document.body.append(dlg);
+  const close = () => { dlg.close(); dlg.remove(); };
+  dlg.querySelector('.x').onclick = close;
+  dlg.querySelector('.m-no').onclick = close;
+  // Клик по фону — это клик по самому <dialog> вне его содержимого.
+  dlg.onclick = ev => { if (ev.target === dlg) close(); };
+  dlg.addEventListener('cancel', ev => { ev.preventDefault(); close(); });
+  const err = dlg.querySelector('.m-err');
+  const ok = dlg.querySelector('.m-ok');
+  ok.onclick = async () => {
+    err.textContent = '';
+    ok.disabled = true;
+    try{
+      await o.onOk(dlg.querySelector('.mbody'), close);
+    }catch(e){ err.textContent = e.message; }
+    finally{ ok.disabled = false; }
+  };
+  dlg.showModal();
+  const first = dlg.querySelector('.mbody input,.mbody textarea,.mbody select');
+  if (first) first.focus();
+  return {el: dlg, body: dlg.querySelector('.mbody'), close};
+}
+
 function confirmInline(btn, text, onOk){
   const box = inlineBox(btn);
   box.innerHTML = `<span class="muted">${esc(text)}</span>
@@ -3933,8 +3977,10 @@ async function viewPresets(){
               : 'ни один канал им не пользуется'}</div>
       </div>
       <div style="white-space:nowrap;align-self:center">
-        ${g.service === 'vsgen' ? `<button class="ghost pedit"
-          data-key="${esc(i.key)}">Править</button>` : ''}
+        ${g.service === 'vsgen'
+          ? `<button class="ghost pedit" data-key="${esc(i.key)}">Править</button>`
+          : `<button class="ghost pform" data-svc="${esc(g.service)}"
+               data-name="${esc(i.name)}">Править</button>`}
         <button class="ghost pcopy" data-svc="${esc(g.service)}"
           data-name="${esc(i.name)}">Копия</button>
         <button class="ghost pdel" data-svc="${esc(g.service)}"
@@ -4050,6 +4096,10 @@ function wirePresets(root){
   };
   root.querySelectorAll('button.pedit').forEach(b => b.onclick =
     () => { location.hash = '#/preset/' + encodeURIComponent(b.dataset.key); });
+  // Пресеты соседей (обложки, рерайт, брифы) правятся окном, а не уходом в чужой
+  // интерфейс: до 18.09.2026 их можно было только скопировать или удалить.
+  root.querySelectorAll('button.pform').forEach(b => b.onclick =
+    () => neighbourPresetModal(b.dataset.svc, b.dataset.name));
   root.querySelectorAll('button.pcopy').forEach(b => b.onclick = () => {
     askInline(b, {value: b.dataset.name + ' — копия', ok: 'Скопировать'}, to =>
       ask(b, () => post(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/copy`,
@@ -4060,6 +4110,123 @@ function wirePresets(root){
       ask(b, () => api(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/${
         encodeURIComponent(b.dataset.name)}`, {method: 'DELETE'})));
   });
+}
+
+// Окно правки пресета соседа. Поля описывает сервер (NEIGHBOUR_PRESET_FIELDS) — здесь
+// только отрисовка: второй список полей в браузере разошёлся бы с первым.
+async function neighbourPresetModal(service, name){
+  let d;
+  try{ d = await api(`/ui/presets/${encodeURIComponent(service)}/${
+    encodeURIComponent(name)}/form`); }
+  catch(e){ toast(e.message); return; }
+
+  const fieldHtml = f => {
+    const id = 'np-' + f.key;
+    if (f.kind === 'text')
+      return `<div class="fld" style="grid-column:1/-1"><label for="${id}">${esc(f.label)}</label>
+        <textarea id="${id}" data-key="${esc(f.key)}" rows="8"
+          style="width:100%">${esc(f.value || '')}</textarea>
+        ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    if (f.kind === 'number')
+      return `<div class="fld"><label for="${id}">${esc(f.label)}</label>
+        <input id="${id}" data-key="${esc(f.key)}" type="number" min="${f.min}"
+          max="${f.max}" value="${esc(String(f.value ?? ''))}">
+        ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    if (f.kind === 'switch')
+      return `<div class="fld"><label for="${id}">${esc(f.label)}</label>
+        <select id="${id}" data-key="${esc(f.key)}">
+          <option value="1"${f.value ? ' selected' : ''}>включено</option>
+          <option value="0"${f.value ? '' : ' selected'}>выключено</option></select>
+        ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    if (f.kind === 'select'){
+      const known = (f.options || []).some(o => String(o.value) === String(f.value));
+      return `<div class="fld"><label for="${id}">${esc(f.label)}</label>
+        <select id="${id}" data-key="${esc(f.key)}">
+          ${known ? '' : `<option value="${esc(String(f.value || ''))}" selected
+            >${esc(String(f.value || '—'))} — нет в списке, но сохранено</option>`}
+          ${(f.options || []).map(o => `<option value="${esc(String(o.value))}"${
+            String(o.value) === String(f.value) ? ' selected' : ''}>${esc(o.title)}</option>`
+          ).join('')}</select>
+        ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    }
+    if (f.kind === 'file')
+      return `<div class="fld" style="grid-column:1/-1"><label>${esc(f.label)}</label>
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <span class="muted np-refname">${f.value
+            ? esc(f.filename || f.value) : 'не прикреплена'}</span>
+          <input type="file" id="np-ref" accept="image/*">
+        </div>
+        ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    return '';
+  };
+
+  const m = modal(`Пресет «${name}»`,
+    `<div class="fields" style="padding:0">${d.fields.map(fieldHtml).join('')}</div>`,
+    {ok: 'Сохранить', onOk: async (box, close) => {
+      const values = {};
+      box.querySelectorAll('[data-key]').forEach(el => {
+        const f = d.fields.find(x => x.key === el.dataset.key) || {};
+        values[el.dataset.key] = f.kind === 'number' ? el.value.trim() : el.value;
+      });
+      const rows = box.querySelector('.np-langrows');
+      if (rows){
+        values.languages = [...rows.querySelectorAll('.np-lang')].map(r => ({
+          code: r.querySelector('.np-code').value.trim(),
+          host: r.querySelector('.np-host').value.trim(),
+          channel: r.querySelector('.np-ch').value.trim(),
+        })).filter(x => x.code);
+      }
+      await post(`/ui/presets/${encodeURIComponent(service)}/${
+        encodeURIComponent(name)}/form`, {values});
+      close();
+      await render();
+    }});
+
+  // Языковые строки (у рерайта): язык + ведущий + канал.
+  const lf = d.fields.find(f => f.kind === 'langrows');
+  if (lf){
+    const host = $(`<div class="fld" style="grid-column:1/-1">
+      <label>${esc(lf.label)}</label><div class="np-langrows"></div>
+      <button type="button" class="ghost small np-add">+ строка</button>
+      ${lf.hint ? `<div class="note muted">${esc(lf.hint)}</div>` : ''}</div>`)
+      .firstElementChild;
+    m.body.querySelector('.fields').append(host);
+    const rows = host.querySelector('.np-langrows');
+    const addRow = v => {
+      const r = $(`<div class="np-lang" style="display:flex;gap:8px;margin-bottom:6px">
+        <input class="np-code" placeholder="язык, напр. pl" style="width:130px"
+          value="${esc((v || {}).code || '')}">
+        <input class="np-host" placeholder="имя ведущего" style="flex:1;min-width:0"
+          value="${esc((v || {}).host || '')}">
+        <input class="np-ch" placeholder="название канала" style="flex:1;min-width:0"
+          value="${esc((v || {}).channel || '')}">
+        <button type="button" class="ghost small np-del" title="убрать строку">×</button>
+      </div>`).firstElementChild;
+      r.querySelector('.np-del').onclick = () => r.remove();
+      rows.append(r);
+    };
+    (lf.value || []).forEach(addRow);
+    host.querySelector('.np-add').onclick = () => addRow(null);
+  }
+
+  // Картинка-образец уходит сразу: файл хранит Cover Studio, а не форма.
+  const ref = m.body.querySelector('#np-ref');
+  if (ref) ref.onchange = async () => {
+    const file = ref.files && ref.files[0];
+    if (!file) return;
+    const fd = new FormData();
+    fd.append('file', file);
+    ref.disabled = true;
+    try{
+      const r = await fetch(API + `/ui/presets/${encodeURIComponent(service)}/${
+        encodeURIComponent(name)}/reference`, {method: 'POST', body: fd});
+      const out = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(out.detail || ('HTTP ' + r.status));
+      m.body.querySelector('.np-refname').textContent = out.filename || out.file_id;
+      toast('Образец стиля прикреплён', 'ok');
+    }catch(e){ toast(e.message); }
+    finally{ ref.disabled = false; ref.value = ''; }
+  };
 }
 
 /* ─────────────────────────── учётные записи ─────────────────────────── */
