@@ -1,0 +1,53 @@
+{
+  "at": "2026-09-14T00:23:34+00:00",
+  "profile_id": "54",
+  "target_id": "914DDB883E29AF1AF9A4A6F0B117DA4A",
+  "state": {
+    "url": "https://studio.youtube.com/channel/UCN9rwIpHw-UxhRBYBFdOfOw/videos/upload",
+    "hosts": [
+      {
+        "host": {
+          "tag": "YT-TRUST-TIERS-WIZARD-DIALOG",
+          "hidden": false,
+          "width": 1556,
+          "height": 0,
+          "display": "flex",
+          "visibility": "visible",
+          "text": "Unlock more on YouTube\nTo upload videos longer than 15 minutes, verify your phone number. Refresh the page after verifying. Learn more\nVerify\nCancel"
+        },
+        "descendants": [
+          {
+            "tag": "YTCP-DIALOG",
+            "hidden": false,
+            "opened": true,
+            "width": 1556,
+            "height": 0,
+            "display": "block",
+            "visibility": "visible",
+            "text": "Unlock more on YouTube\nTo upload videos longer than 15 minutes, verify your phone number. Refresh the page after verifying. Learn more\nVerify\nCancel"
+          },
+          {
+            "tag": "TP-YT-PAPER-DIALOG",
+            "hidden": false,
+            "opened": true,
+            "width": 512,
+            "height": 313,
+            "display": "flex",
+            "visibility": "visible",
+            "text": "Unlock more on YouTube\nTo upload videos longer than 15 minutes, verify your phone number. Refresh the page after verifying. Learn more\nVerify\nCancel"
+          },
+          {
+            "tag": "YT-TRUST-TIERS-WIZARD",
+            "hidden": false,
+            "width": 512,
+            "height": 40,
+            "display": "flex",
+            "visibility": "visible",
+            "text": "To upload videos longer than 15 minutes, verify your phone number. Refresh the page after verifying. Learn more"
+          }
+        ]
+      }
+    ]
+  },
+  "script": "(function(){function deep(root,out){for(const el of root.querySelectorAll('*')){out.push(el);if(el.shadowRoot)deep(el.shadowRoot,out);}return out;}function snap(e){const r=e.getBoundingClientRect(),s=getComputedStyle(e);return {tag:e.tagName,hidden:e.hidden,opened:e.opened,width:r.width,height:r.height,display:s.display,visibility:s.visibility,text:e.innerText};}return {url:location.origin+location.pathname,hosts:deep(document,[]).filter(e=>e.tagName==='YT-TRUST-TIERS-WIZARD-DIALOG').map(e=>({host:snap(e),descendants:[...new Set(deep(e,[]).concat(e.shadowRoot?deep(e.shadowRoot,[]):[]))].filter(e=>['YTCP-DIALOG','TP-YT-PAPER-DIALOG','YT-TRUST-TIERS-WIZARD'].includes(e.tagName)).map(snap)}))};})()"
+}

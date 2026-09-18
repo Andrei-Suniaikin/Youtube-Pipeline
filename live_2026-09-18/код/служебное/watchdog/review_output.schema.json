@@ -1,0 +1,35 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Video Ops Codex review",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "send",
+    "severity",
+    "dedup_key",
+    "message"
+  ],
+  "properties": {
+    "send": {
+      "type": "boolean"
+    },
+    "severity": {
+      "type": "string",
+      "enum": [
+        "ok",
+        "warning",
+        "critical"
+      ]
+    },
+    "dedup_key": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z0-9][a-z0-9._:-]*$"
+    },
+    "message": {
+      "type": "string",
+      "maxLength": 1000
+    }
+  }
+}

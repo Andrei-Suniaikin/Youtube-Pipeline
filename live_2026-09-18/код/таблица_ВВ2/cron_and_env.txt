@@ -1,0 +1,39 @@
+# Снято 18.09.2026 только чтением с VPS (crontab -l, systemctl show, ls). Значения секретов вырезаны.
+
+## cron root на VPS (строки, относящиеся к таблице ВВ2)
+*/10 * * * * /root/ops/ww2_sheet/run.sh --light
+0 1 * * * /root/ops/ww2_sheet/run.sh --sync
+# ручные режимы: run.sh --pool (только пул оригиналов), run.sh --rebuild (с Mac, пересобирает вкладки)
+# время сервера CEST; в логе ww2_sheet.log время Вьетнама (+7), т.к. скрипт пишет в своём TZ
+
+## /root/ops/ww2_sheet/ (рабочая папка на VPS)
+# run.sh                       обёртка: читает .env, flock -w 900, пишет в ww2_sheet.log
+# ww2_sheet.py, ww2_pool.py    код (md5 = Mac ~/ops/*.py на 18.09)
+# .env                         WW2_YT_KEY=<ключ YouTube Data API>            — СЕКРЕТ, в пакет не идёт
+# google_service_account.json  ключ сервисного аккаунта Google Sheets        — СЕКРЕТ, в пакет не идёт
+# pool_state.json (~4.5 МБ)    состояние пула: donors{<канал>: {full, seen}} — рабочие данные, не код
+# ww2_names.json               переименования каналов для переноса в «Очередь»
+# venv/                        gspread 6.2.1, google-auth 2.58.0
+
+## Переменные окружения, которые читает код таблицы
+# WW2_SHEET_ID   id Google-таблицы (в коде есть дефолт — в пакете заменён маркером)
+# WW2_SA         путь к ключу сервисного аккаунта
+# WW2_YT_KEY     ключ YouTube Data API (или WW2_YT_KEY_FILE — файл, из которого ключ достаётся регуляркой "key AIza...")
+# WW2_REG        путь к ~/ops/registry.db (нужен только для --rebuild)
+# WW2_NICHES     путь к ~/niches (нужен только для --rebuild)
+# WW2_KEYS_FILE  файл ключей, из него берётся "openai" для разбора роликов (по умолчанию /root/video_studio_api_keys.json)
+# WW2_OPENAI_KEY альтернатива WW2_KEYS_FILE
+# WW2_POOL_MODEL модель разбора, по умолчанию gpt-4.1
+# WW2_POOL_STATE путь к pool_state.json
+
+## Субтитры доноров в кабинете (vsgen) — /etc/systemd/system/vsgen.service.d/subs.conf
+# VS_SUBS_PROXIES = 21 выход через запятую: socks5h://127.0.0.1:1080 (свой туннель) + 20 прокси профилей AdsPower
+#                   с логином/паролем внутри адреса — СЕКРЕТ, в пакет не идёт
+# VS_SUBS_COOKIES = /root/.vs_yt_cookies.txt (файл cookies YouTube владельца, 12 КБ, от 19.08) — СЕКРЕТ
+# VS_SUBS_REST    = 1800 (сколько секунд «отдыхает» выход после отказа YouTube)
+# Rewrite Studio (/etc/rewrite.env): REWRITE_SUBS_PROXY = socks5h://127.0.0.1:1080 (значение не секрет, но файл целиком — секретный)
+
+## Туннель
+# на VPS порт 127.0.0.1:1080 держит sshd (обратный проброс ssh -R), сессия с 08.09.2026 17:25 CEST,
+# входящий адрес — домашний, не VPS и не Mac. Ключ в /root/.ssh/authorized_keys с опциями restrict,port-forwarding.
+# Живая проверка: curl -s -m 15 --socks5-hostname 127.0.0.1:1080 https://api.ipify.org  (должен вернуть НЕ 13.140.129.66)

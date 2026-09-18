@@ -1,0 +1,31 @@
+{
+  "host": "minsk",
+  "time": 1789395216.51384,
+  "ok": true,
+  "checks": [
+    {
+      "path": "/opt/video_agent/render_worker.py",
+      "expected": "aac593ab9271273991ffd9f8e675f6f432476fa57b5c4f195406ab2db97534be",
+      "actual": "aac593ab9271273991ffd9f8e675f6f432476fa57b5c4f195406ab2db97534be",
+      "ok": true
+    },
+    {
+      "path": "/opt/video_agent/render_puller.py",
+      "expected": "c120b3857a9f6e42c0b091a28d72c18f11807c73f8784ec30a23a01559de509f",
+      "actual": "c120b3857a9f6e42c0b091a28d72c18f11807c73f8784ec30a23a01559de509f",
+      "ok": true
+    },
+    {
+      "path": "/opt/video_agent/render_delivery.py",
+      "expected": "2ff34f096dfa7936e3b32d72427f9829c5a7e2b4b1a0a1e298f57448a25aa8ce",
+      "actual": "2ff34f096dfa7936e3b32d72427f9829c5a7e2b4b1a0a1e298f57448a25aa8ce",
+      "ok": true
+    },
+    {
+      "path": "/opt/video_agent/render_narration.py",
+      "expected": "dfcbe0a056eeb1b87b14e4276bbedd82ee54a9d2f526bd4ef1a7a52d840a1bf9",
+      "actual": "dfcbe0a056eeb1b87b14e4276bbedd82ee54a9d2f526bd4ef1a7a52d840a1bf9",
+      "ok": true
+    }
+  ]
+}

@@ -1,0 +1,133 @@
+{
+  "_note": "Структура боевых настроек служебного контура VPS на 18.09.2026. Снято только чтением ключей верхних уровней; все значения-секреты, чаты, UC каналов и адреса заменены маркерами. Числа — живые значения, пути — живые.",
+
+  "/etc/video-ops-watchdog/config.json (сторож)": {
+    "_note": "строка-пояснение",
+    "timezone": "Asia/Ho_Chi_Minh",
+    "publication_day_start": "23:00",
+    "telegram_config": "/opt/ytcortiez-autobuyer/config.json  <-- бот и чат берутся из конфига СОСЕДА (автопокупатель), поля telegram.enabled/botToken/chatId",
+    "rss": {"timeout_seconds": 20, "workers": 12, "retries": 2},
+    "notifications": {
+      "morning": "10:00", "reminder": "18:00", "final": "22:30", "slot_window_minutes": 45,
+      "failure_threshold": 3,
+      "failure_cooldown_seconds": 86400,
+      "failure_overrides": {
+        "infra:minsk": {"min_failure_minutes": 60, "min_recovery_minutes": 60},
+        "infra:youtube_rss": {"min_failure_minutes": 360, "min_recovery_minutes": 60}
+      },
+      "mode": "evening_only",
+      "list_cap": 8,
+      "check_interval_minutes": 15
+    },
+    "infrastructure": {
+      "health_url": "<http://127.0.0.1:8800/...>",
+      "vsgen_db": "/root/VideoStudio/server/vsgen.db",
+      "disk_path": "<path>",
+      "min_free_gb": 80,
+      "queue_stale_hours": 4,
+      "queue_queued_stale_hours": 6,
+      "queue_pause_max_hours": 6,
+      "ytcortiez_service": "",
+      "acknowledged_pause_providers": ["<provider, сейчас 1 шт.>"],
+      "acknowledged_pause_uids": ["<uid, сейчас 1 шт.>"],
+      "credentials_report": "/root/ops/credentials_report.json",
+      "credentials_max_age_hours": 36,
+      "task_failure_window_hours": 6,
+      "task_failure_min_errors": 3,
+      "task_failure_max_share": "0.5  <-- читается и проверяется, но в подсчёте НЕ используется",
+      "service_probes": {
+        "services": [
+          {"name": "rewrite", "unit": "rewrite-server", "health_url": "<url>", "db": "<job_queue.db>"},
+          {"name": "cover", "unit": "cover-server", "health_url": "<url>", "db": "<cover_job_queue.db>"}
+        ],
+        "reports": [
+          {"name": "backup", "path": "/var/lib/video-studio-ops/backup.json", "max_age_seconds": 108000},
+          {"name": "storage", "path": "/var/lib/video-studio-ops/storage.json", "max_age_seconds": 3600, "ignore_components": ["delivery_evidence"]}
+        ],
+        "render_heartbeat_db": "/root/VideoStudio/server/vsgen.db  (admin_state.render_node_health)"
+      }
+    },
+    "receipts": {
+      "enabled": true, "inbox_dir": "/var/lib/video-ops-watchdog/receipts/inbox",
+      "max_age_hours": 72, "future_skew_minutes": 5, "archive_retention_days": 30,
+      "audit_retention_days": 180, "diagnostic_cap": 25,
+      "allowed_source_hosts": ["<2 имени источников>"], "rejected_alert_hours": 24
+    },
+    "agent": {"enabled": false, "report_max_age_minutes": 30, "dedup_cooldown_hours": 12, "failure_threshold": 1, "codex_timeout_seconds": 240},
+    "channels": ["<44 строки: uc, name, lang, niche, enabled, days, deadline, expected_publications, schedule_source>"]
+  },
+
+  "/opt/video-studio-ops/storage.production.json (уборка диска)": {
+    "database": "/root/VideoStudio/server/vsgen.db",
+    "projects_root": "/data/tenants",
+    "archives": "/var/lib/video-studio-ops/media-archive",
+    "deliveries": "/var/lib/video-studio-ops/deliveries",
+    "upload_receipts": "/var/lib/video-ops-watchdog/receipts",
+    "receipt_io": "/opt/video-ops-watchdog/receipt_io.py",
+    "report": "/var/lib/video-studio-ops/storage.json",
+    "worker_module_directory": "/root/VideoStudio/src",
+    "delivery_evidence": "/var/lib/video-studio-ops/delivery-evidence",
+    "delivery_evidence_producers": ["minsk"],
+    "delivery_evidence_max_bytes": 4294967296,
+    "retention_days": 14,
+    "archive_days": 1,
+    "max_archive_bytes": 68719476736,
+    "min_free_bytes": 68719476736,
+    "warning_free_bytes": 85899345920,
+    "cache_retirement_enabled": true,
+    "cache_loader_sha256": "<sha256 развёрнутого src/remote_generation_journal.py; при несовпадении scan --apply падает>"
+  },
+
+  "/opt/video-studio-ops/backup.production.json (внешние копии)": {
+    "local_directory": "/var/lib/video-studio-ops/backups",
+    "report": "/var/lib/video-studio-ops/backup.json",
+    "keep": 2,
+    "offsite": {"target": "root@<бокс B, отдельный VPS>", "directory": "/root/video-studio-backups"},
+    "components": {
+      "vsgen": {"databases": ["/root/VideoStudio/server/vsgen.db"],
+                "recovery_globs": ["/data/tenants/*/projects/*/.remote_jobs/**/*.json", "…/cancel.requested", "…/*.ref"],
+                "optional_globs": ["delivery-evidence/*.json", "delivery-evidence/health/*.json", "deliveries/*.json", "deliveries/proofs/*", "media-archive/*.json"]},
+      "rewrite": {"databases": ["/root/rewrite-server/job_queue.db", "/root/rewrite-server/sessions.db"], "directories": ["/root/rewrite-server/presets"]},
+      "cover": {"databases": ["cover_job_queue.db", "cover_sessions.db", ".cover-user-keys.db"], "directories": ["/root/cover_tool/presets"], "optional_files": ["default_prompts.json", "cover_gen_settings.json"]},
+      "credentials": {"files": ["<файл ключей кабинета>", "<env рерайта>", "<3 unit-файла>", "<.env обложек>"],
+                      "optional_globs": ["<drop-in *.conf трёх служб>"],
+                      "auth_roots": ["<5 каталогов Codex: серверный, рерайта, пользовательские>"]}
+    }
+  },
+
+  "/etc/vsfix/config.json (кнопка «Пожаловаться»)": {
+    "db": "/root/VideoStudio/server/vsgen.db",
+    "code_root": "/root/VideoStudio",
+    "state_dir": "/var/lib/vsfix",
+    "codex_home": "/root/.codex-server",
+    "telegram_config": "/opt/ytcortiez-autobuyer/config.json",
+    "codex_timeout_seconds": 2700,
+    "safe_restart_wait_minutes": 20
+  },
+
+  "Минск ~/.local/lib/video-delivery-evidence/delivery_evidence.minsk.json (поставщик доказательств публикации; по research, вживую не сверено)": {
+    "producer": "minsk",
+    "server": "https://gen.<домен>",
+    "puller_unit": "vsrender-puller.service  (токен берётся из /proc/<pid>/environ этой службы)",
+    "state": "/home/vova/.local/state/video-delivery-evidence",
+    "bases": ["/home/vova/ww2_night_20260914"],
+    "base_globs": ["/home/vova/ww2_night_*"]
+  },
+
+  "crontab root на VPS (18.09)": [
+    "0 4 * * *    /root/VideoStudio/server/backup_db.sh        (старое, локально, 14 копий)",
+    "10 4 * * *   /root/rewrite-server/backup_db.sh            (старое, локально)",
+    "20 4 * * *   /root/cover_tool/backup_db.sh                (старое, локально)",
+    "40 4 * * *   /root/offsite_backup.sh -> exec backup_service.py (НОВОЕ с 14.09)",
+    "15 6 * * *   /root/ops/check_credentials.py               (НОВОЕ с 04.09)",
+    "*/30 * * * * storage_service.py scan --apply              (НОВОЕ с 14.09, маркер video-storage-retention-cycle5)",
+    "*/10 * * * * /root/ops/ww2_sheet/run.sh --light            (сосед: таблица ниши WW2)",
+    "0 1 * * *    /root/ops/ww2_sheet/run.sh --sync             (сосед: таблица ниши WW2)"
+  ],
+
+  "systemd-таймеры служебного контура (18.09)": {
+    "video-ops-watchdog.timer": "enabled, OnCalendar *:00/15",
+    "video-ops-review.timer": "DISABLED с 17.09 (обзор Codex сломан); сам service в состоянии failed",
+    "vsfix.timer": "enabled, раз в минуту после завершения прошлого запуска"
+  }
+}

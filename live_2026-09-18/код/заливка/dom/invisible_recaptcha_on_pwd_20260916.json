@@ -1,0 +1,17 @@
+{
+ "path": "/v3/signin/challenge/pwd",
+ "lang": "en",
+ "recaptcha_nodes": 1,
+ "geometry": [
+  {
+   "w": 0,
+   "h": 0,
+   "display": "block",
+   "visibility": "visible",
+   "offsetParent": false
+  }
+ ],
+ "visible_body_has_too_many": false,
+ "note": "обычная страница пароля: невидимая reCAPTCHA присутствует в разметке",
+ "captured_utc": "2026-09-16T10:09:56Z"
+}

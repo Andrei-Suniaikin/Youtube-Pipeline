@@ -1,0 +1,26 @@
+# Минск, vsrender-puller.service — снимок 14.09.2026 08:17 UTC (research/launch_readiness_20260914/render_node_baseline.json)
+# Секретов в этом тексте нет: PULLER_TOKEN задаётся вне основного файла юнита и сюда не копировался.
+# Пороги нового пуллера (PULLER_HEARTBEAT_SEC, PULLER_*_TIMEOUT, PULLER_MIN_FREE_BYTES, PULLER_MAX_OUTBOX_BYTES,
+# PULLER_MAX_DELIVERY_ATTEMPTS) в юните не заданы на момент снимка -> работают значения по умолчанию из render_puller.py.
+# Изменялся ли юнит после 14.09 — не сверено (Минск недоступен по SSH 18.09).
+# /etc/systemd/system/vsrender-puller.service
+[Unit]
+Description=VideoStudio render puller (Minsk GPU node)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vova
+WorkingDirectory=/opt/video_agent
+Environment=VSGEN_SERVER=https://gen.13.140.129.66.sslip.io
+Environment=RENDER_WORKER=/opt/video_agent/render_worker.py
+Environment=PULLER_WORK=/opt/video_agent/render_jobs
+Environment=PULLER_CONCURRENCY=3
+ExecStart=/usr/bin/python3 -u /opt/video_agent/render_puller.py
+Restart=always
+RestartSec=15
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

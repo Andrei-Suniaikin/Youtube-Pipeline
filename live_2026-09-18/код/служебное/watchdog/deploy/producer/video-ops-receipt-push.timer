@@ -1,0 +1,13 @@
+[Unit]
+Description=Retry pending VideoStudio exact upload receipts every five minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=5min
+Persistent=true
+AccuracySec=30s
+Unit=video-ops-receipt-push.service
+
+[Install]
+WantedBy=timers.target
+

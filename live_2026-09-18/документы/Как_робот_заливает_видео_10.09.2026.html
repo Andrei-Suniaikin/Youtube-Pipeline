@@ -1,0 +1,307 @@
+<title>Как робот заливает видео</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Chivo+Mono:wght@400;500;600&family=Chivo:ital,wght@0,400;0,500;0,600;0,700;1,400&display=swap">
+
+<style>
+  :root{
+    --bg:#EFF1F3; --card:#FCFCFD; --sunk:#E2E6EA;
+    --ink:#101418; --dim:#59636D; --line:#D5DAE0;
+    --accent:#1F4E5F; --accent-bg:#DDEAEE;
+    --stop:#B23A30; --stop-bg:#F3DEDB;
+    --ok:#2C6647; --ok-bg:#DBEAE1;
+    --s:"Chivo",-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+    --m:"Chivo Mono",ui-monospace,Menlo,monospace;
+    --wide:min(100% - 2.5rem, 70rem);
+    --col:min(100% - 2.5rem, 41rem);
+  }
+  @media (prefers-color-scheme: dark){
+    :root:not([data-theme="light"]){
+      --bg:#0F1214; --card:#171B1F; --sunk:#1F252A;
+      --ink:#E3E7EA; --dim:#98A2AB; --line:#2A3238;
+      --accent:#6FB2C4; --accent-bg:#16292F;
+      --stop:#E08A82; --stop-bg:#2E1A18;
+      --ok:#6BB088; --ok-bg:#17281E;
+    }
+  }
+  :root[data-theme="dark"]{
+    --bg:#0F1214; --card:#171B1F; --sunk:#1F252A;
+    --ink:#E3E7EA; --dim:#98A2AB; --line:#2A3238;
+    --accent:#6FB2C4; --accent-bg:#16292F;
+    --stop:#E08A82; --stop-bg:#2E1A18;
+    --ok:#6BB088; --ok-bg:#17281E;
+  }
+
+  *{box-sizing:border-box}
+  body{background:var(--bg); color:var(--ink); font-family:var(--s);
+       font-size:17px; line-height:1.62; -webkit-font-smoothing:antialiased; padding-bottom:6rem}
+  .wrap{display:flex; flex-direction:column; align-items:center}
+  .col{width:var(--col)} .wide{width:var(--wide)}
+
+  h1,h2,h3{margin:0; text-wrap:balance; letter-spacing:-.015em}
+  h1{font-size:clamp(2.1rem,5.2vw,3.3rem); font-weight:700; line-height:1.05}
+  h2{font-size:clamp(1.3rem,3vw,1.7rem); font-weight:700; line-height:1.18}
+  h3{font-size:1.03rem; font-weight:600; letter-spacing:0}
+  p{margin:0} a{color:var(--accent)}
+  code,.m{font-family:var(--m); font-size:.83em}
+  code{background:var(--sunk); padding:.08em .35em; border-radius:3px; word-break:break-word}
+  .eyebrow{font-family:var(--m); font-size:.71rem; font-weight:500; letter-spacing:.15em;
+           text-transform:uppercase; color:var(--dim)}
+
+  header{width:100%; background:var(--card); border-bottom:1px solid var(--line);
+         padding:4rem 0 2.5rem; margin-bottom:3rem}
+  header .col{display:flex; flex-direction:column; gap:1.05rem; margin:0 auto}
+  .lede{color:var(--dim); font-size:1.1rem}
+
+  section{width:100%; display:flex; flex-direction:column; align-items:center; gap:1.15rem}
+  section+section{margin-top:3.4rem}
+  .col>*+*{margin-top:.9rem}
+  .sh{display:flex; gap:.95rem; align-items:baseline; width:100%}
+  .sn{font-family:var(--m); font-size:.82rem; font-weight:600; color:var(--accent); flex:0 0 auto}
+
+  .box{background:var(--card); border-left:3px solid var(--accent); padding:.9rem 1.05rem; font-size:.96rem}
+  .box.stop{border-left-color:var(--stop); background:var(--stop-bg)}
+  .box.ok{border-left-color:var(--ok); background:var(--ok-bg)}
+  .box b{font-weight:600}
+
+  .steps{width:100%; border-top:1px solid var(--line)}
+  .st{display:grid; grid-template-columns:2.7rem 1fr; gap:0 1rem; padding:.85rem 0; border-bottom:1px solid var(--line)}
+  .st .n{font-family:var(--m); font-size:.8rem; font-weight:600; color:var(--dim); padding-top:.22rem; font-variant-numeric:tabular-nums}
+  .st.k{background:var(--stop-bg); margin:0 -1rem; padding-left:1rem; padding-right:1rem; border-bottom-color:var(--stop)}
+  .st.k .n{color:var(--stop)}
+  .st b{font-weight:600}
+  .st .d{display:block; color:var(--dim); font-size:.92rem; margin-top:.2rem}
+  .st .src{display:block; font-family:var(--m); font-size:.72rem; color:var(--dim); margin-top:.25rem; opacity:.85}
+  @media (max-width:620px){ .st{grid-template-columns:1fr; gap:.3rem} }
+
+  .tw{overflow-x:auto; border:1px solid var(--line); background:var(--card); width:100%}
+  table{border-collapse:collapse; width:100%; font-size:.92rem}
+  th,td{text-align:left; padding:.65rem .85rem; border-bottom:1px solid var(--line); vertical-align:top}
+  thead th{font-family:var(--m); font-size:.68rem; font-weight:600; letter-spacing:.08em;
+           text-transform:uppercase; color:var(--dim); background:var(--sunk); white-space:nowrap}
+  tbody tr:last-child td{border-bottom:none}
+
+  figure{margin:0; display:flex; flex-direction:column; gap:.7rem}
+  figure svg{width:100%; height:auto; display:block; background:var(--card); border:1px solid var(--line)}
+  figcaption{font-size:.87rem; color:var(--dim); max-width:44rem}
+  ul,ol{margin:0; padding-left:1.25rem} li+li{margin-top:.32rem}
+  hr{border:none; border-top:1px solid var(--line); width:100%; margin:0}
+</style>
+
+<div class="wrap">
+
+<header>
+  <div class="col">
+    <div class="eyebrow">VideoStudio · заливка на YouTube · 10.09.2026</div>
+    <h1>Как робот заливает видео</h1>
+    <p class="lede">Разбор по коду: что происходит между «ролик готов» и «запланировано на канале». Со ссылками на файлы и строки — всё можно проверить.</p>
+  </div>
+</header>
+
+<!-- 01 -->
+<section>
+  <div class="col">
+    <div class="sh"><span class="sn">01</span><h2>Главный принцип</h2></div>
+    <p>Робот не смотрит на страницу глазами. Он <b>читает внутреннее состояние YouTube Studio</b> — те самые объекты, которыми страница живёт внутри себя, — и судит по машинным полям, а не по видимому тексту.</p>
+    <p>Это не стилистика, а единственный способ, чтобы оно работало. Пример: когда ролик запланирован, Studio в финальном окне пишет «Video published». Текст врёт. Правда лежит в поле <code>userSetVisibility</code>, и там будет <code>VIDEO_USER_SET_VISIBILITY_SCHEDULED</code>.</p>
+    <div class="box stop">
+      <b>Цена ошибки здесь измерена.</b> Седьмого августа проверка по тексту объявила провальными <b>тринадцать заливок</b>, которые на самом деле прошли. Записано прямо в коде рядом с исправлением.
+      <span class="m" style="display:block; margin-top:.4rem; font-size:.78rem">yt_studio.py:1594</span>
+    </div>
+    <p>Практически это выглядит так: в страницу выполняется скрипт, который обходит все теневые деревья, находит строки роликов и вынимает из каждой её собственный объект — идентификатор, заголовок, статус черновика, приватность, установленную пользователем видимость, время запланированной публикации, длительность, коллабораторов.</p>
+    <div class="box">
+      <b>Отдельная тонкость про запланированные.</b> У них приватность остаётся <code>PRIVATE</code>, а время публикации равно нулю. Реальное время лежит в другом месте — <code>scheduledPublishingDetails</code>. Это снято живым дампом страницы 3 августа, а не выведено логически.
+    </div>
+  </div>
+</section>
+
+<!-- 02 -->
+<section>
+  <div class="col">
+    <div class="sh"><span class="sn">02</span><h2>Путь задания</h2></div>
+    <p>Заливка живёт отдельно от кабинета. Кабинет только ставит задание в очередь; всё остальное делает машина в Минске, потому что там AdsPower с профилями каналов.</p>
+  </div>
+  <div class="wide">
+    <figure>
+      <svg viewBox="0 0 1180 330" role="img" aria-label="Путь задания: кабинет ставит задачу, минский пуллер её забирает, запускает заливщик, тот открывает профиль и работает в YouTube Studio; перед передачей файла проходит точка невозврата, после которой повторная заливка запрещена навсегда">
+        <defs>
+          <marker id="a1" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="currentColor"/>
+          </marker>
+          <marker id="a2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+            <path d="M0 0 L10 5 L0 10 z" fill="#C2453B"/>
+          </marker>
+        </defs>
+        <g fill="none" stroke="currentColor" stroke-width="1.25">
+          <rect x="26" y="96" width="168" height="70" rx="2"/>
+          <rect x="250" y="96" width="168" height="70" rx="2"/>
+          <rect x="474" y="96" width="168" height="70" rx="2"/>
+          <rect x="922" y="96" width="232" height="70" rx="2"/>
+          <path d="M194 131 L244 131" marker-end="url(#a1)"/>
+          <path d="M418 131 L468 131" marker-end="url(#a1)"/>
+          <path d="M642 131 L694 131" marker-end="url(#a1)"/>
+          <path d="M866 131 L916 131" marker-end="url(#a1)"/>
+          <path d="M334 96 L334 60 L110 60 L110 92" marker-end="url(#a1)" stroke-dasharray="4 3" opacity=".65"/>
+        </g>
+        <g fill="none" stroke="#C2453B" stroke-width="2">
+          <rect x="700" y="88" width="160" height="86" rx="2"/>
+          <line x1="780" y1="200" x2="780" y2="248" marker-end="url(#a2)"/>
+        </g>
+        <g font-family="Chivo, sans-serif" fill="currentColor">
+          <text x="110" y="126" font-size="13" font-weight="600" text-anchor="middle">Кабинет</text>
+          <text x="110" y="145" font-size="10.5" text-anchor="middle" opacity=".72">ставит задание,</text>
+          <text x="110" y="159" font-size="10.5" text-anchor="middle" opacity=".72">хранит вердикт</text>
+
+          <text x="334" y="126" font-size="13" font-weight="600" text-anchor="middle">Пуллер</text>
+          <text x="334" y="145" font-size="10.5" text-anchor="middle" opacity=".72">Минск, спрашивает</text>
+          <text x="334" y="159" font-size="10.5" text-anchor="middle" opacity=".72">раз в 20 секунд</text>
+
+          <text x="558" y="126" font-size="13" font-weight="600" text-anchor="middle">Заливщик</text>
+          <text x="558" y="145" font-size="10.5" text-anchor="middle" opacity=".72">отдельный процесс,</text>
+          <text x="558" y="159" font-size="10.5" text-anchor="middle" opacity=".72">пишет ход построчно</text>
+
+          <text x="780" y="120" font-size="12.5" font-weight="700" text-anchor="middle" fill="#C2453B">Точка</text>
+          <text x="780" y="138" font-size="12.5" font-weight="700" text-anchor="middle" fill="#C2453B">невозврата</text>
+          <text x="780" y="158" font-size="10" text-anchor="middle" fill="#C2453B" opacity=".9">файл уходит в форму</text>
+
+          <text x="1038" y="126" font-size="13" font-weight="600" text-anchor="middle">YouTube Studio</text>
+          <text x="1038" y="145" font-size="10.5" text-anchor="middle" opacity=".72">в браузере профиля</text>
+          <text x="1038" y="159" font-size="10.5" text-anchor="middle" opacity=".72">AdsPower</text>
+
+          <text x="222" y="54" font-size="10.5" opacity=".7">ход и вердикт возвращаются в кабинет</text>
+
+          <text x="780" y="268" font-size="12" font-weight="600" text-anchor="middle" fill="#C2453B">после неё повторная заливка запрещена навсегда</text>
+          <text x="780" y="288" font-size="11" text-anchor="middle" opacity=".75">упали — ищем начатый ролик и продолжаем его, а не льём заново</text>
+        </g>
+      </svg>
+      <figcaption>Пуллер только исходящие запросы — на минской машине нет ни одного открытого порта. Одно задание на рабочее место: два браузера в одном профиле рвут куки и ломают идущую заливку.</figcaption>
+    </figure>
+  </div>
+  <div class="col">
+    <p>Между пуллером и кабинетом три обращения: взять задание, сообщить ход, отдать вердикт. Вывод заливщика уезжает построчно, поэтому после сбоя видно, что именно случилось, а не «нода молчит».</p>
+  </div>
+</section>
+
+<!-- 03 -->
+<section>
+  <div class="col">
+    <div class="sh"><span class="sn">03</span><h2>Что делает заливщик, по шагам</h2></div>
+    <p>Это реальная последовательность из кода, а не пересказ. Красным отмечен единственный необратимый шаг.</p>
+  </div>
+  <div class="wide">
+    <div class="steps">
+      <div class="st"><div class="n">01</div><div><b>Открывает профиль AdsPower.</b> Если браузер профиля уже запущен — присоединяется к нему, а не перезапускает. До восьми попыток старта с паузами.<span class="d">Повторный запуск активного профиля роняет AdsPower с ошибкой, поэтому сначала смотрим список запущенных.</span></div></div>
+
+      <div class="st"><div class="n">02</div><div><b>Находит канал по точному идентификатору.</b> Заходит прямым адресом Studio нужного канала и сверяет адрес после загрузки. Чужой канал или переброс на страницу входа Google — остановка.<span class="src">upload_worker.py:748, 777, 849</span></div></div>
+
+      <div class="st"><div class="n">03</div><div><b>Проверяет, не залит ли ролик уже.</b> Читает список роликов канала и ищет свой по заголовку. Нашёл запланированный или опубликованный — выходит, не заливая.<span class="d">Пустой список не считается ответом «ролика нет»: сначала перезаход и повторное чтение.</span></div></div>
+
+      <div class="st"><div class="n">04</div><div><b>Проверяет, нет ли оборванной загрузки.</b> Если на канале висит недозалитый черновик и это наш ролик — досылает файл в него. Если чужой — откладывает задание, чтобы не сломать чужую заливку.<span class="d">Принадлежность определяется по состоянию строки, а не по совпадению названия на глаз.</span></div></div>
+
+      <div class="st"><div class="n">05</div><div><b>Открывает форму загрузки.</b> Сначала пробует прямой адрес диалога, потом кнопку «Создать». До трёх попыток.</div></div>
+
+      <div class="st k"><div class="n">06</div><div><b>Проходит точку невозврата и отдаёт файл.</b> Перед тем как передать видео в форму, заливщик обязан получить от управляющего подтверждение, что факт «загрузка началась» уже записан на диск. Нет подтверждения или оно не совпало — падает <b>до</b> передачи файла.<span class="d">Ситуация «файл ушёл, а система об этом не знает» физически невозможна.</span><span class="src">upload_worker.py:97–122</span></div></div>
+
+      <div class="st"><div class="n">07</div><div><b>Забирает идентификатор ролика.</b> Studio выдаёт его ещё на первом шаге мастера, задолго до конца загрузки — робот берёт его сразу, потому что дальше он нужен для всех проверок.</div></div>
+
+      <div class="st"><div class="n">08</div><div><b>Заполняет название.</b> Сначала через скрипт, с проверкой обратным чтением; не применилось — печатает вручную, как человек. Заголовок длиннее ста символов обрезает, иначе шаг остаётся невалидным и «Далее» не нажимается.</div></div>
+
+      <div class="st"><div class="n">09</div><div><b>Заполняет описание, ставит обложку.</b> Описание — с тайм-кодами глав, если они посчитаны. Тут же, если включено, добавляет второй вариант обложки для A/B-теста.</div></div>
+
+      <div class="st"><div class="n">10</div><div><b>Отмечает «не для детей».</b> Проверяет результат по состоянию переключателя. Не подтвердилось — это ошибка, а не «наверное сработало»: без ответа шаг невалиден.<span class="d">Групп «для детей» на странице две, и робот знает, какая из них настоящая.</span></div></div>
+
+      <div class="st"><div class="n">11</div><div><b>Отмечает «изменённый контент» — что использован ИИ.</b> Тоже с проверкой по состоянию.</div></div>
+
+      <div class="st"><div class="n">12</div><div><b>Проходит мастер по порядку.</b> Детали → монетизация → возрастные ограничения → проверка. Прыгать по шагам нельзя.<span class="d">В коде записана причина: обход монетизации и возрастных ограничений оставлял ролик черновиком.</span><span class="src">upload_worker.py:2681–2723</span></div></div>
+
+      <div class="st"><div class="n">13</div><div><b>Ставит рекламные слоты.</b> Прямо в мастере, план считается от длительности ролика.</div></div>
+
+      <div class="st"><div class="n">14</div><div><b>Ждёт, пока файл реально догрузится.</b> До нескольких минут, с проверкой процента и признака загруженности. Не дождался — идёт дальше, но помечает риск остаться черновиком.</div></div>
+
+      <div class="st"><div class="n">15</div><div><b>Ставит расписание.</b> Сначала дата, потом время. Часовой пояс берётся у самого браузера профиля, а не у машины — иначе ролик выйдет не в то время для своей страны.<span class="src">upload_worker.py:306–351</span></div></div>
+
+      <div class="st"><div class="n">16</div><div><b>Ставит видимость и жмёт финальную кнопку.</b> Перед нажатием кнопка распознаётся по смыслу — «опубликовать», «запланировать» или «сохранить» — чтобы не нажать не то в чужом языке интерфейса.<span class="d">Если намерение не подтвердилось, робот переустанавливает видимость и жмёт ещё раз, а не считает, что получилось.</span></div></div>
+
+      <div class="st"><div class="n">17</div><div><b>Выносит вердикт по состоянию канала.</b> Ждёт, пока строка ролика в списке придёт в ожидаемое состояние, и сверяет: идентификатор, точное совпадение заголовка, установленная видимость, время публикации тем же самым числом секунд.<span class="src">upload_worker.py:145–293, 354–363</span></div></div>
+    </div>
+  </div>
+</section>
+
+<!-- 04 -->
+<section>
+  <div class="col">
+    <div class="sh"><span class="sn">04</span><h2>Как устроена защита от дублей</h2></div>
+    <p>Заливка необратима, поэтому у неё четыре именованные стадии, и они идут только вперёд:</p>
+  </div>
+  <div class="wide">
+    <div class="tw"><table>
+      <thead><tr><th>Стадия</th><th>Что уже произошло</th><th>Можно ли лить заново</th></tr></thead>
+      <tbody>
+        <tr><td><code>preflight</code></td><td>Ничего. Проверяем профиль и канал</td><td style="color:var(--ok)">да, безопасно</td></tr>
+        <tr><td><code>profile_opened</code></td><td>Браузер профиля запущен</td><td style="color:var(--ok)">да, безопасно</td></tr>
+        <tr><td><code>upload_started</code></td><td><b>Файл ушёл в форму</b></td><td style="color:var(--stop)"><b>нет, никогда</b></td></tr>
+        <tr><td><code>video_id_known</code></td><td>Известен идентификатор ролика</td><td style="color:var(--stop)"><b>нет, никогда</b></td></tr>
+      </tbody>
+    </table></div>
+  </div>
+  <div class="col">
+    <p>Начиная с третьей стадии повторная заливка запрещена навсегда. Единственное, что разрешено, — найти уже начатый ролик и довести его до конца.</p>
+    <div class="box ok">
+      <b>Вердикт — не строка «успех», а набор доказательств.</b> Он обязан содержать: стадию, идентификатор ролика, ссылку, итоговую видимость, признак «не заливать повторно», подтверждение из строки канала и точное подтверждение совпадения. Заголовок сверяется приведением к единому виду и отпечатком — чтобы «похоже» не засчиталось за «то самое».
+    </div>
+  </div>
+</section>
+
+<!-- 05 -->
+<section>
+  <div class="col">
+    <div class="sh"><span class="sn">05</span><h2>Грабли, которые нельзя вывести из головы</h2></div>
+    <p>Каждая стоила отдельного разбирательства. Ни одну нельзя угадать, читая документацию.</p>
+  </div>
+  <div class="wide">
+    <div class="tw"><table>
+      <thead><tr><th>Грабля</th><th>Что происходит</th><th>Как обходится</th></tr></thead>
+      <tbody>
+        <tr><td>Текст врёт</td><td>Studio пишет «Video published» и для запланированного</td><td>Судим только по машинному полю видимости</td></tr>
+        <tr><td>Диакритика</td><td>Studio отдаёт буквы в одном виде, наши строки в другом — «одинаковые» названия не совпадают</td><td>Сначала строгое сравнение, потом упрощённое без диакритики</td></tr>
+        <tr><td>Клик из скрипта</td><td>Интерфейс Studio его проглатывает, ничего не происходит</td><td>Клики настоящей мышью через отладочный протокол браузера</td></tr>
+        <tr><td>Ввод времени рекламы</td><td>Четыре обычных способа ввода молча не срабатывают</td><td>Клик мышью → выделить всё → вставить текст</td></tr>
+        <tr><td>Прыжок по шагам</td><td>Ролик остаётся черновиком, хотя мастер выглядел пройденным</td><td>Только строгий порядок шагов</td></tr>
+        <tr><td>Пустой список</td><td>Studio иногда отдаёт ноль роликов на непустом канале</td><td>Перезаход и повторное чтение, ноль не считается ответом</td></tr>
+        <tr><td>Один профиль на двух машинах</td><td>Вторая сессия рвёт куки, появляется «подтвердите личность», идущая заливка ломается</td><td>Перед открытием опрашиваются обе машины; недоступная = стоп</td></tr>
+        <tr><td>Мёртвый прокси профиля</td><td>Studio белая, ввод молчит, около девяти минут на ролик впустую</td><td>Распознаётся отдельно, чтобы не искать ошибку в коде</td></tr>
+        <tr><td>Часовой пояс</td><td>Время берут у машины, а канал живёт в своей стране</td><td>Пояс читается у самого браузера профиля</td></tr>
+      </tbody>
+    </table></div>
+  </div>
+  <div class="col">
+    <div class="box">
+      <b>Селекторы хранятся с датами.</b> Семь реестров, пятьдесят отметок «когда этот элемент последний раз видели живьём». Ни один селектор не попадает в код без строки из настоящего дампа страницы — есть отдельный инструмент, который их снимает и проверяет.
+    </div>
+  </div>
+</section>
+
+<!-- 06 -->
+<section>
+  <div class="col">
+    <div class="sh"><span class="sn">06</span><h2>Если будешь переписывать</h2></div>
+    <p>Здесь около семи тысяч строк, но собственно знания про YouTube — сто восемь строк селекторов и порядок шагов. Остальное — ожидания, повторы и проверки, то есть та же механика, что и в других частях системы.</p>
+    <p>Что нельзя потерять ни при каком переписывании:</p>
+    <ol>
+      <li><b>Подтверждение перед передачей файла.</b> Без него однажды случится двойная заливка, и это будет видно только по жалобе на канал.</li>
+      <li><b>Суждение по состоянию, а не по тексту.</b> Иначе вернутся тринадцать «провальных» заливок, которые прошли.</li>
+      <li><b>Строгий порядок шагов мастера.</b></li>
+      <li><b>Проверку итога по точному времени в секундах</b>, а не по строке на экране.</li>
+      <li><b>Реестры селекторов вместе с датами</b> — переносить дословно, это данные, а не код.</li>
+      <li><b>Правило одного профиля.</b> Оно живёт не в этом файле, но ломает именно эту часть.</li>
+    </ol>
+    <hr style="margin:1.8rem 0 1.2rem">
+    <p class="eyebrow">Где смотреть</p>
+    <p><span class="m">src/upload_worker.py</span> — весь путь заливки, основная функция начинается на строке 1383.<br>
+       <span class="m">src/yt_studio.py</span> — чтение состояния Studio и реестры селекторов.<br>
+       <span class="m">src/upload_contract.py</span> — стадии и обязательные поля вердикта.<br>
+       <span class="m">upload_puller.py</span> на минской машине — как задание приходит и как возвращается вердикт.</p>
+  </div>
+</section>
+
+</div>

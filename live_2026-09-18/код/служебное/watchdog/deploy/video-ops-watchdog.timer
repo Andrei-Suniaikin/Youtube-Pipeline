@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Video Ops watchdog check every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+Persistent=true
+AccuracySec=30s
+Unit=video-ops-watchdog.service
+
+[Install]
+WantedBy=timers.target
+
