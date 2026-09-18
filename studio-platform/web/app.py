@@ -799,7 +799,7 @@ def ui_queue(service: str | None = None, channel: int | None = None,
 
 
 @app.get("/ui/keys")
-def ui_keys():
+def ui_keys(request: Request):
     """Честная картина по ключам вместо «свободных слотов» (ТЗ §12).
 
     Что видно отсюда и откуда берётся:
@@ -917,8 +917,44 @@ def ui_keys():
         "rr_cursor": cursor,
         "busy": busy,
         "fastgen": fastgen,
+        "rewrite": _rewrite_keys(getattr(request.state, "sid", "")),
         "unavailable": [],
     }
+
+
+def _rewrite_keys(sid: str) -> dict:
+    """Чем Rewrite Studio делает текст у этого человека (18.09.2026).
+
+    Свои ключи рерайта живут у него, а не в кабинете: они нужны его моделям, а не нашей
+    очереди. Пока их не было видно в пульте, выпуск просто вставал с «нет доступных
+    ключей провайдера», и где это чинить — не говорил никто. Значения ключей сюда не
+    приходят (Rewrite их наружу не отдаёт) — только признаки «задан» и что сработает.
+    """
+    code, body = _rw("/settings/keys", sid)
+    if code != 200 or not isinstance(body, dict):
+        return {"ok": False, "why": body if isinstance(body, str) else "рерайт не ответил"}
+    return {"ok": True,
+            "own_openai": bool(body.get("own_openai_key_set")),
+            "own_claude": bool(body.get("own_claude_token_set")),
+            "server_openai": bool(body.get("openai_configured")),
+            "server_claude": bool(body.get("claude_configured")),
+            "source": body.get("openai_key_source") or "",
+            "claude_source": body.get("claude_key_source") or ""}
+
+
+class RewriteKeyIn(BaseModel):
+    openai_api_key: str = ""      # пусто = снять свой ключ, снова заработает серверный
+
+
+@app.post("/ui/keys/rewrite")
+def ui_keys_rewrite(body: RewriteKeyIn, request: Request):
+    """Записать свой ключ OpenAI для текста. Хранит его Rewrite, пульт только передаёт:
+    второго места хранения секрета заводить нельзя."""
+    sid = getattr(request.state, "sid", "")
+    code, out = _rw("/settings/keys", sid, {"openai_api_key": body.openai_api_key})
+    if code >= 400:
+        raise HTTPException(_pass_code(code), out)
+    return {"ok": True, "set": bool(body.openai_api_key.strip())}
 
 
 def _pool_load() -> list:
@@ -3171,6 +3207,12 @@ _FILE_GROUPS = (("images", "кадры"), ("clips", "клипы"), ("renders", "
                 ("covers", "обложка"))
 
 
+# Сколько имён файлов отдаём на первом экране. В проекте бывает 300+ кадров: грузить
+# их все сразу незачем — остальное браузер дочитывает по мере прокрутки
+# (`GET /ui/projects/{pid}/files/{code}`, 18.09.2026). 40 — экран с запасом.
+FILES_PAGE = 40
+
+
 def _project_files(mod, pid: str) -> list:
     """Файлы проекта по группам — теми же шаблонами, что и скачивание в кабинете.
 
@@ -3196,9 +3238,40 @@ def _project_files(mod, pid: str) -> list:
                              "video" if code in ("clips", "renders") else
                              "audio" if code == "audio" else "text"),
                     # Имена относительные — их же ждёт отдача файла кабинетом.
-                    "names": [rel for _full, rel in items[:60]],
-                    "more": max(0, len(items) - 60)})
+                    "names": [rel for _full, rel in items[:FILES_PAGE]],
+                    "more": max(0, len(items) - FILES_PAGE)})
     return out
+
+
+@app.get("/ui/projects/{pid}/files/{code}")
+def ui_project_files_page(pid: str, code: str, request: Request,
+                          offset: int = 0, limit: int = FILES_PAGE):
+    """Следующая порция имён файлов этой группы — для дочитывания при прокрутке.
+
+    Порядок тот же, что и на первом экране: имена берутся у `_dl_items` кабинета, а не
+    перечитываются своим обходом каталога, иначе список на экране разъехался бы с
+    архивом. Отдаём только имена: сами файлы по-прежнему отдаёт кабинет.
+    """
+    if code not in {c for c, _t in _FILE_GROUPS}:
+        raise HTTPException(404, "нет такой группы файлов")
+    offset = max(0, int(offset))
+    limit = max(1, min(200, int(limit)))
+    c = db()
+    try:
+        _project_or_404(c, pid)
+    finally:
+        c.close()
+    mod = sys.modules.get("main")
+    if mod is None or not hasattr(mod, "_dl_items"):
+        raise HTTPException(503, "кабинет не поднят")
+    try:
+        items = mod._dl_items(mod._project_dir(TENANT, pid), code)
+    except Exception:                                              # noqa: BLE001
+        items = []
+    return {"code": code, "count": len(items),
+            "names": [rel for _full, rel in items[offset:offset + limit]],
+            "offset": offset,
+            "more": max(0, len(items) - (offset + limit))}
 
 
 class ProjectNew(BaseModel):

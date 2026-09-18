@@ -561,6 +561,51 @@ async function viewKeys(){
   app.append($(`<h1>Ключи</h1>
     <p class="sub">Кто ждёт, сколько ждёт и когда снова заработает.</p>`));
 
+  // Ключ, которым Rewrite делает текст. Без него выпуск встаёт на первом же шаге с
+  // «нет доступных ключей провайдера», и до 18.09.2026 из пульта это было не починить.
+  const rw = d.rewrite || {};
+  const rwState = !rw.ok
+    ? `<span class="note bad">${esc(rw.why || 'рерайт не ответил')}</span>`
+    : rw.own_openai ? 'работает ваш ключ OpenAI'
+    : rw.own_claude ? 'работает ваша подписка Claude'
+    : rw.server_openai || rw.server_claude ? 'работает серверный ключ владельца'
+    : '<span class="note bad">ключа нет — текст делать нечем</span>';
+  const rwCard = $(`<div class="card">
+    <div class="sec">Ключ для текста (Rewrite)</div>
+    <div class="secbody">
+      <div class="note muted">Сейчас: ${rwState}.</div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
+        <input id="rw-key" type="password" autocomplete="off" placeholder="ключ OpenAI"
+               style="flex:1 1 280px;min-width:0;max-width:420px">
+        <button id="rw-save" class="small">Сохранить</button>
+        ${rw.own_openai ? '<button id="rw-drop" class="ghost small">Снять свой ключ</button>' : ''}
+      </div>
+      <div class="note muted">Ключ хранит сам Rewrite и наружу не отдаёт — здесь видно
+        только, задан он или нет. Свой ключ тратит ваши деньги, серверный — деньги
+        владельца.</div>
+    </div></div>`);
+  app.append(rwCard);
+  rwCard.querySelector('#rw-save').onclick = async () => {
+    const inp = rwCard.querySelector('#rw-key');
+    const val = inp.value.trim();
+    if (!val){ toast('Пустое поле: вписать нечего'); return; }
+    const btn = rwCard.querySelector('#rw-save');
+    btn.disabled = true;
+    try{
+      await post('/ui/keys/rewrite', {openai_api_key: val});
+      inp.value = '';
+      toast('Ключ сохранён', 'ok');
+      await render();
+    }catch(e){ toast(e.message); }
+    finally{ btn.disabled = false; }
+  };
+  const drop = rwCard.querySelector('#rw-drop');
+  if (drop) drop.onclick = () => confirmInline(drop,
+    'Снять свой ключ? Останется серверный, если он задан.', async () => {
+      try{ await post('/ui/keys/rewrite', {openai_api_key: ''}); await render(); }
+      catch(e){ toast(e.message); }
+    });
+
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Занято прямо сейчас</div>
     ${(d.busy || []).length ? d.busy.map(b => `<div class="stage">
@@ -2560,8 +2605,9 @@ function fileCard(d, g){
            >Скачать архивом</a></div>
       <div class="secbody">
       ${g.kind === 'image'
-        ? `<div style="display:flex;flex-wrap:wrap;gap:6px">${g.names.map(n =>
-            thumb(url(n) + '?w=160', url(n), n, 78, p.id)).join('')}</div>`
+        ? `<div class="thumbs" style="display:flex;flex-wrap:wrap;gap:6px">${g.names.map(n =>
+            thumb(url(n) + '?w=160', url(n), n, 78, p.id)).join('')}</div>
+           <div class="more-mark"></div>`
         : g.kind === 'audio'
         ? g.names.map(n => `<audio controls preload="none" src="${url(n)}"
             style="width:100%;margin-top:6px"></audio>`).join('')
@@ -2577,12 +2623,98 @@ function fileCard(d, g){
             `<a href="${url(n)}" target="_blank"
               style="padding:4px 10px;border:1px solid var(--line);border-radius:6px;
                      text-decoration:none;font-size:12px">${esc(n)}</a>`).join('')}</div>`}
-      ${g.more ? `<div class="note muted">показаны первые ${g.names.length},
-        всего ${g.count} — остальные в архиве</div>` : ''}
+      ${g.more && g.kind !== 'image'
+        ? `<div class="note muted">показаны первые ${g.names.length},
+             всего ${g.count} — остальные в архиве</div>` : ''}
       </div>
     </div>`);
   wireRegen(card);
+  if (g.kind === 'image') wireThumbScroll(card, d, g);
   return card;
+}
+
+// Дочитывание кадров при прокрутке (18.09.2026). В проекте бывает 300+ кадров: сервер
+// отдаёт первую порцию, остальные подтягиваются по мере того, как человек досматривает
+// до конца списка. Загруженные миниатюры не перерисовываются — дописываются новые,
+// поэтому «переделать» у уже открытой картинки не слетает.
+const THUMBS_PAGE = 40;
+
+function wireThumbScroll(card, d, g){
+  const box = card.querySelector('.thumbs');
+  const mark = card.querySelector('.more-mark');
+  if (!box || !mark) return;
+  const p = d.project;
+  const url = n => d.file_base + n.split('/').map(encodeURIComponent).join('/');
+  let loaded = g.names.length;
+  let total = g.count;
+  let busy = false;
+  let stopped = false;
+  let everConnected = false;
+  const note = html => {
+    mark.innerHTML = html != null ? html
+      : (loaded < total ? `<div class="note muted">показано ${loaded} из ${total}</div>` : '');
+  };
+  note();
+  if (loaded >= total) return;
+
+  // Конец списка виден (с запасом в экран вперёд) — пора дочитывать. Считаем сами, а не
+  // через IntersectionObserver: тот сообщает только о СМЕНЕ видимости, и когда конец
+  // списка так и остаётся на экране, второй порции уже не дождаться.
+  const nearEnd = () => mark.getBoundingClientRect().top
+    < (window.innerHeight || 800) + 400;
+
+  const stop = () => {
+    stopped = true;
+    window.removeEventListener('scroll', onView);
+    window.removeEventListener('resize', onView);
+  };
+
+  async function fetchPage(){
+    const out = await api(`/ui/projects/${encodeURIComponent(p.id)}/files/${
+      encodeURIComponent(g.code)}?offset=${loaded}&limit=${THUMBS_PAGE}`);
+    // Экран мог смениться, пока шёл ответ: дописывать в оторванный узел незачем.
+    if (!mark.isConnected){ stop(); return; }
+    const names = out.names || [];
+    total = out.count != null ? out.count : total;
+    if (!names.length){ stop(); note(''); return; }
+    box.insertAdjacentHTML('beforeend', names.map(n =>
+      thumb(url(n) + '?w=160', url(n), n, 78, p.id)).join(''));
+    wireRegen(card);
+    loaded += names.length;
+    note();
+    if (loaded >= total) stop();
+  }
+
+  async function onView(){
+    if (busy || stopped) return;
+    if (!mark.isConnected){
+      // Первый вызов случается до того, как карточку вставили в страницу: это не повод
+      // выключать дочитывание навсегда — выключаем только когда карточку убрали.
+      if (everConnected) stop();
+      return;
+    }
+    everConnected = true;
+    busy = true;
+    try{
+      // Пока конец списка на виду — дочитываем дальше: одна порция могла его не сдвинуть.
+      while (!stopped && loaded < total && nearEnd()) await fetchPage();
+    }catch(e){
+      // Сеть сбоит — уже показанное не трогаем, причину говорим и даём дочитать снова
+      // кнопкой: молча повторять в цикле значит долбить сервер, который и так отвечает
+      // ошибкой.
+      note(`<div class="note bad">кадры не дочитались: ${esc(e.message)}
+        <button type="button" class="ghost small thumb-retry"
+          style="margin-left:8px">Ещё раз</button></div>`);
+      const btn = mark.querySelector('.thumb-retry');
+      if (btn) btn.onclick = () => { note(); onView(); };
+    }finally{ busy = false; }
+  }
+
+  window.addEventListener('scroll', onView, {passive: true});
+  window.addEventListener('resize', onView);
+  // Конец списка может быть виден сразу, без единой прокрутки. Через setTimeout —
+  // карточку в страницу вставляет вызывающий код, уже после возврата отсюда.
+  setTimeout(onView, 0);
 }
 
 /* ───────────────────────── свои ключи ───────────────────────── */
@@ -2654,7 +2786,11 @@ async function wireChannelEdit(root, c){
   // Форма строится сразу при открытии вкладки (доработка §5, Дополнение 16.09):
   // кнопки «Настроить» и промежуточного состояния «свёрнуто» больше нет.
   {
-    const picked = new Set(Object.keys(c.schedule || {}));
+    // «*» в расписании означает «каждый день»: без этого галочки дней оставались
+    // пустыми у канала, который выходит ежедневно (жалоба владельца 18.09.2026).
+    const schedKeys = Object.keys(c.schedule || {});
+    const picked = new Set(schedKeys.includes('*')
+      ? ref.days.filter(x => x !== ref.any_day) : schedKeys);
     const times = [...new Set(Object.values(c.schedule || {}).flat())].join(', ');
     const sel = (id, items, cur, label) => `<div class="fldrow"><label>${label}</label>
       <select id="${id}"><option value="">— не выбран —</option>${items.map(i =>

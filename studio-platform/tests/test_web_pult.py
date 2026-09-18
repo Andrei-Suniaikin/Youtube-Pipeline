@@ -825,6 +825,27 @@ def main() -> int:
             check("прежнее расписание канала возвращено",
                   me.go("/ui/channels/1")[1]["channel"]["schedule"], c0["schedule"])
 
+    print("\nКлюч Rewrite виден и правится из пульта (18.09.2026)")
+    code, keys = me.go("/ui/keys")
+    rw = (keys or {}).get("rewrite") or {}
+    check("экран ключей отвечает", code, 200)
+    check("состояние рерайта отдано", set(rw) >= {"ok"}, True)
+    if rw.get("ok"):
+        check("видно, чей ключ сработает",
+              all(k in rw for k in ("own_openai", "server_openai", "source")), True)
+        check("значение ключа наружу не уходит",
+              any("sk-" in str(v) for v in rw.values()), False)
+        if not rw.get("own_openai"):
+            # Своего ключа нет — можно безопасно проверить приём пустого значения:
+            # «снять свой ключ» на пустом месте ничего не портит. Настоящий ключ тест
+            # не пишет и чужой не снимает.
+            check("пустое значение принимается (снять свой ключ)",
+                  me.go("/ui/keys/rewrite", {"openai_api_key": ""})[0], 200)
+            check("состояние не изменилось",
+                  (me.go("/ui/keys")[1]["rewrite"] or {}).get("own_openai"), False)
+        else:
+            print("  — пропущено: у пользователя стенда задан свой ключ, не трогаем")
+
     print("\nСсылки без даты видно списком, а не только числом (18.09.2026)")
     mark = "test-waiting-list"
     code, body = me.go("/ui/links", {"channel_id": 1, "links": f"https://youtu.be/{mark}"})

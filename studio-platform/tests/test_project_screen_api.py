@@ -480,7 +480,38 @@ def main() -> int:
             cover_drop_job(own_jid, own_dir)
             cover_drop_job(foreign_jid, foreign_dir)
 
-        print("\nЗадачи текста и обложек проекта — по связи project_service_jobs (17.09.2026)")
+        print("\nКадры дочитываются порциями, а не все сразу (18.09.2026)")
+        # Проект стенда со 155 кадрами: только читаем, ничего не меняем.
+        many_pid = "proj-dev-0001"
+        code, body = me.go(f"/ui/projects/{many_pid}")
+        images = [g for g in (body.get("files") or []) if g["code"] == "images"]
+        check("группа кадров есть", len(images), 1)
+        if images:
+            g = images[0]
+            first = g["names"]
+            check("на первом экране ровно порция, а не всё", len(first), 40)
+            check("всего кадров больше порции", g["count"] > len(first), True)
+            code, page2 = me.go(f"/ui/projects/{many_pid}/files/images?offset=40&limit=40")
+            check("вторая порция отдана", code, 200)
+            check("в ней тоже порция", len(page2["names"]), 40)
+            check("порции не пересекаются", set(first) & set(page2["names"]), set())
+            check("порядок сквозной — вторая порция идёт после первой",
+                  page2["offset"], 40)
+            check("сказано, сколько ещё осталось",
+                  page2["more"], max(0, g["count"] - 80))
+            code, tail = me.go(
+                f"/ui/projects/{many_pid}/files/images?offset={g['count']}&limit=40")
+            check("за концом списка — пусто, а не ошибка", (code, tail["names"]), (200, []))
+            check("предел порции не обойти",
+                  len(me.go(f"/ui/projects/{many_pid}/files/images?offset=0&limit=9999")[1]
+                      ["names"]) <= 200, True)
+        check("неизвестная группа файлов — 404",
+              me.go(f"/ui/projects/{many_pid}/files/netgruppy")[0], 404)
+        check("чужой проект — 404",
+              me.go("/ui/projects/no-such-project/files/images")[0], 404)
+
+        print("\nЗадачи текста и обложек проекта — по связи project_service_jobs "
+              "(17.09.2026)")
         stamp = str(int(time.time()))
         older, newer, stray = "psjold" + stamp, "psjnew" + stamp, "psjstray" + stamp
         dirs = [cover_insert_job(j, TENANT, "v.jpg", b"\xff\xd8x") for j in (older, newer, stray)]
