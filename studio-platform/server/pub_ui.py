@@ -148,11 +148,19 @@ def clean_uc(value: str):
 
 def clean_schedule(times_raw: str, days: list) -> str:
     times = [t for t in re.split(r"[,\s]+", times_raw or "") if t]
+    picked_raw = [d for d in days if d in DAY_KEYS]
     if not times:
+        # Дни без времени — расписания не выходит: слот задаётся временем, и до
+        # 18.09.2026 такая форма молча сохранялась как «расписания нет» (владелец
+        # отметил дни, нажал «Сохранить» и увидел, что они не сохранились). Пустая
+        # форма целиком по-прежнему законна: так расписание и снимают.
+        if picked_raw:
+            raise ScheduleError("выбраны дни, но не задано время выходов — "
+                                "укажите время или снимите дни")
         return "{}"
     for t in times:
         parse_time(t)
-    picked = [d for d in days if d in DAY_KEYS]
+    picked = picked_raw
     schedule = {"*": times} if (not picked or len(picked) == 7) else {d: times for d in picked}
     normalize_schedule(schedule)
     return json.dumps(schedule, ensure_ascii=False)

@@ -831,6 +831,37 @@ async function channelReleases(id, d){
     ${d.waiting_without_slot ? `<span class="pill s-queued">без даты ждут:
       ${d.waiting_without_slot}</span>` : ''}</div>`));
 
+  // Ссылки, которые уже поставлены, но даты не получили: раньше о них говорило только
+  // число в плашке, и посмотреть, что за ролик поставлен, было негде (жалоба владельца
+  // 18.09.2026). Дата появится сама, как только у канала будет расписание, — выпуск
+  // заводит движок, поэтому здесь только показать и убрать лишнее.
+  const waiting = d.waiting_items || [];
+  if (waiting.length){
+    const card = $(`<div class="card">
+      <div class="sec">Ждут даты</div>
+      <table><thead><tr><th>Ролик</th><th>Поставлен</th><th style="width:90px"></th>
+        </tr></thead><tbody>${waiting.map(w => `<tr data-id="${w.id}">
+        <td><div style="font-weight:600">${esc(w.title || 'название неизвестно')}</div>
+            <div class="muted"><a href="${esc(w.url)}" target="_blank" rel="noopener"
+              >${esc(w.url)}</a></div>
+            ${w.note ? `<div class="note muted">${esc(w.note)}</div>` : ''}</td>
+        <td class="muted">${when(w.created)}</td>
+        <td><button class="ghost small pl-del">Убрать</button></td></tr>`).join('')}
+      </tbody></table>
+      <div class="secbody"><div class="note muted">Дата назначится сама, как только у
+        канала появится расписание: очередь раскладывает ссылки по свободным
+        выходам.</div></div></div>`);
+    app.append(card);
+    card.querySelectorAll('button.pl-del').forEach(b => b.onclick = () => {
+      const id = b.closest('tr').dataset.id;
+      confirmInline(b, 'Убрать ссылку из плана?', async () => {
+        b.disabled = true;
+        try{ await post(`/ui/plan/${id}/cancel`); await render(); }
+        catch(e){ b.disabled = false; toast(e.message); }
+      });
+    });
+  }
+
   // Флоу создания: ссылки встают в ближайшие свободные слоты. Это и есть «залить
   // видосы» — дальше конвейер делает их сам по расписанию канала.
   //
@@ -1505,7 +1536,7 @@ const TAB_KINDS = {scenario: ['prompts'], tts: ['tts'], images: ['images', 'rege
                    cover: ['cover']};
 // Группа `preset_fields.GROUPS`, которая закрывает этап — только у четырёх вкладок
 // производства; у «Сценария» и «Обложки» блока «Настройки этапа» нет (§3: пятая
-// группа «Текст и обложка» в проект не идёт).
+// группы «Сценарий» и «Обложка» в проект не идут).
 const TAB_SETTINGS_GROUP = {tts: 'Озвучка', images: 'Картинки', video: 'Клипы',
                             render: 'Сборка'};
 
@@ -2677,8 +2708,8 @@ async function wireChannelEdit(root, c){
             c.host_id, 'Машина заливки')}
       ${sel('f-pv', ref.presets.vsgen.map(p => ({value: p.id, title: p.name})),
             c.preset_vsgen_id, 'Пресет')}
-      <div class="note muted">Текст и обложка берутся из него же — группа
-        «Текст и обложка» внутри пресета. Сейчас: рерайт
+      <div class="note muted">Текст и обложка берутся из него же — группы
+        «Сценарий» и «Обложка» внутри пресета. Сейчас: рерайт
         «${esc(c.presets.rewrite || 'не задан')}», обложка
         «${esc(c.presets.cover || 'не задана')}».${c.preset_vsgen_id
           ? ` <a href="#/preset/${c.preset_vsgen_id}">Открыть пресет →</a>` : ''}</div>
@@ -3490,13 +3521,14 @@ function saveBar(back, onSave, onCancel){
 // Заведение пресета — своя страница, а не браузерный попап: имя видно рядом с тем,
 // куда попадёшь, и опечатку можно исправить, не начиная заново.
 const PRESET_SLUG = {'Озвучка': 'ozvuchka', 'Картинки': 'kadry', 'Клипы': 'klipy',
-                     'Сборка': 'sborka', 'Текст и обложка': 'tekst'};
+                     'Сборка': 'sborka', 'Сценарий': 'stsenariy', 'Обложка': 'oblozhka'};
 
-// Пять частей пресета (батч «Пресеты целые и частичные») — тот же порядок и те же
-// подписи, что и `server/preset_fields.py:PARTS`. Список один, чтобы выбор типа при
-// заведении пресета и разбивка списка на «Целые/Частичные» не разошлись в названиях.
+// Части пресета (батч «Пресеты целые и частичные») — тот же порядок и те же подписи,
+// что и `server/preset_fields.py:PARTS`. Список один, чтобы выбор типа при заведении
+// пресета и разбивка списка на «Целые/Частичные» не разошлись в названиях.
+// С 18.09.2026 «Сценарий» и «Обложка» — разные части.
 const PART_TITLES = [['voice', 'Озвучка'], ['images', 'Картинки'], ['clips', 'Клипы'],
-                     ['render', 'Сборка'], ['text_cover', 'Текст и обложка']];
+                     ['render', 'Сборка'], ['text', 'Сценарий'], ['cover', 'Обложка']];
 
 // Фильтр списка пресетов: живёт между заходами на экран, у каждого зрителя свой.
 const PRESET_FILTER_TYPES = [['all', 'Все'], ['full', 'Целые'], ['partial', 'Частичные'],

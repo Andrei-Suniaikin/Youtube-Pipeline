@@ -49,6 +49,9 @@ def run_scenario(scenario_js: str, budget_ms: int = 5000) -> dict:
         proc = subprocess.Popen(
             [chrome, "--headless", "--disable-gpu", "--no-first-run", "--disable-extensions",
              "--disable-sync", "--disable-background-networking",
+             # Без этого Chrome на macOS лезет в связку ключей и падает с ошибкой
+             # «связка ключей не найдена» (жалоба владельца 18.09.2026).
+             "--password-store=basic", "--use-mock-keychain",
              f"--user-data-dir={os.path.join(tmp, 'profile')}",
              f"--virtual-time-budget={budget_ms}", "--dump-dom", "file://" + page],
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)

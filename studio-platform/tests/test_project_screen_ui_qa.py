@@ -221,8 +221,8 @@ def main() -> int:
           tsg.get("video") in pf_titles, True)
     check("группа вкладки «Сборка» существует в preset_fields.GROUPS",
           tsg.get("render") in pf_titles, True)
-    check("у «Сценария» и «Обложки» своей группы настроек нет — §3: пятая группа "
-          "«Текст и обложка» в проект не идёт",
+    check("у «Сценария» и «Обложки» своей группы настроек нет — §3: группы «Сценарий» "
+          "и «Обложка» пресета в проект не идут",
           ("scenario" in tsg, "cover" in tsg), (False, False))
     check("«Сценарий» не строит fieldForm/settingsForm (нет блока «Настройки этапа»)",
           ("fieldForm(" in scenario_tab, "settingsForm" in scenario_tab), (False, False))

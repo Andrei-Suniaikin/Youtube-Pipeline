@@ -348,9 +348,9 @@ def channel_presets(c, preset_vsgen_id, preset_rewrite="", preset_cover="") -> t
     «убрать»: у нас нет способа отличить одно от другого, а цена ошибки разная.
 
     Читает `preset_links.resolve`, а не `preset_settings` напрямую (батч «Пресеты целые
-    и частичные»): «Текст и обложка» — тоже одна из пяти групп пресета, и если у неё
-    стоит ссылка на частичный пресет, `preset_rewrite`/`preset_cover` обязаны прийти
-    оттуда, а не из своих (пустых) полей целого.
+    и частичные»): «Сценарий» и «Обложка» — тоже группы пресета (с 18.09.2026 разные),
+    и если у любой из них стоит ссылка на частичный пресет, `preset_rewrite` или
+    `preset_cover` обязан прийти оттуда, а не из своего (пустого) поля целого.
     """
     s = preset_links.resolve(c, preset_vsgen_id)
     rew = str(s.get("preset_rewrite") or "").strip() or (preset_rewrite or "")

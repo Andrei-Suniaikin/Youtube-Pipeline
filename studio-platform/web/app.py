@@ -1035,9 +1035,17 @@ def ui_channel(channel_id: int, history: int = 14):
         if ch is None:
             raise HTTPException(404, "канал не найден")
         cal = _calendar(c, ch, history)
-        waiting = c.execute(
-            "SELECT COUNT(*) n FROM pub_plan_items WHERE channel_id=? AND slot_at IS NULL "
-            "AND status NOT IN ('cancelled','done')", (channel_id,)).fetchone()["n"]
+        # Ссылки, стоящие без даты: раньше их было видно только числом в плашке — что
+        # именно поставлено, посмотреть было негде (жалоба владельца 18.09.2026).
+        waiting_rows = [
+            {"id": r["id"], "url": r["donor_url"], "title": r["donor_title"] or "",
+             "note": r["note"] or "", "status": r["status"], "created": r["created"]}
+            for r in c.execute(
+                "SELECT id, donor_url, donor_title, note, status, created "
+                "FROM pub_plan_items WHERE channel_id=? AND tenant_id=? AND slot_at IS NULL "
+                "AND status NOT IN ('cancelled','done') ORDER BY position, id LIMIT 200",
+                (channel_id, TENANT))]
+        waiting = len(waiting_rows)
         host = c.execute("SELECT code, title FROM pub_hosts WHERE id=?",
                          (ch["host_id"],)).fetchone() if ch["host_id"] else None
         prof = c.execute("SELECT serial, title FROM pub_profiles WHERE id=?",
@@ -1098,6 +1106,7 @@ def ui_channel(channel_id: int, history: int = 14):
             "by_day": by_day,
             "tz": tzname,
             "waiting_without_slot": waiting,
+            "waiting_items": waiting_rows,
             "history_days": history,
         }
     finally:
@@ -2775,6 +2784,22 @@ def ui_channel_create(body: ChannelIn):
     return {"ok": True, "id": cid}
 
 
+@app.post("/ui/plan/{pid:int}/cancel")
+def ui_plan_cancel(pid: int, request: Request):
+    """Убрать ссылку из плана. Снимает её кабинет (`cancel_item`): он же проверяет,
+    что выпуск по ней ещё не пошёл, и он же владеет статусами."""
+    c = db()
+    try:
+        row = c.execute("SELECT id FROM pub_plan_items WHERE id=? AND tenant_id=?",
+                        (pid, TENANT)).fetchone()
+    finally:
+        c.close()
+    if not row:
+        raise HTTPException(404, "ссылка не найдена")
+    _cabinet_form(f"/api/plan/{pid}/cancel", [], request, expect_json=False)
+    return {"ok": True}
+
+
 # {cid:int} — иначе этот путь перехватывает «/ui/channels/import».
 @app.post("/ui/channels/{cid:int}")
 def ui_channel_edit(cid: int, body: dict):
@@ -2783,7 +2808,12 @@ def ui_channel_edit(cid: int, body: dict):
     Тело — те же имена полей, что у формы кабинета: их разбирает его же
     `read_channel_form`, вместе со всеми проверками и нормализацией расписания.
     """
-    form = {k: (v if isinstance(v, list) else [v]) for k, v in (body or {}).items()}
+    # Значения приводим к строкам: форма кабинета разбирает текст (`one`/`many` зовут
+    # `.strip()`), а JSON приносит и числа, и null — раньше число давало 500 вместо
+    # внятного отказа.
+    form = {k: ["" if x is None else str(x)
+                for x in (v if isinstance(v, list) else [v])]
+            for k, v in (body or {}).items()}
     c = db()
     try:
         row = c.execute("SELECT id FROM pub_channels WHERE id=? AND tenant_id=?",
@@ -3279,11 +3309,11 @@ def ui_project_settings(pid: str):
     except ValueError:
         settings = {}
     mod = sys.modules.get("main")
-    # Пятая группа («Текст и обложка») в проект не идёт: какими пресетами Rewrite и
+    # Группы «Сценарий» и «Обложка» в проект не идут: какими пресетами Rewrite и
     # Cover делают текст и обложку, решает КАНАЛ, а не отдельный проект. Показать здесь
     # эти поля значило бы предложить настройку, которую никто не прочитает.
     groups = [g for g in preset_fields.describe(mod, settings)
-              if g["title"] != "Текст и обложка"]
+              if g["title"] not in ("Сценарий", "Обложка")]
     return {"id": r["id"], "name": r["name"] or r["id"],
             "groups": groups,
             "note": ("Пустое поле означает «как по умолчанию». Настройки уже стоящих "

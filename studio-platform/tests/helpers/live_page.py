@@ -95,7 +95,10 @@ def chrome_dump(url: str, budget_ms: int = 15000, width: int = 1400,
         return {"error": "Chrome не найден (CHROME_BIN)"}
     with tempfile.TemporaryDirectory() as tmp:
         args = [chrome, "--headless", "--disable-gpu", "--no-first-run", "--disable-extensions",
-                "--disable-sync", "--disable-background-networking", "--hide-scrollbars",
+                "--disable-sync", "--disable-background-networking",
+             # Без этого Chrome на macOS лезет в связку ключей и падает с ошибкой
+             # «связка ключей не найдена» (жалоба владельца 18.09.2026).
+             "--password-store=basic", "--use-mock-keychain", "--hide-scrollbars",
                 f"--user-data-dir={os.path.join(tmp, 'profile')}", f"--window-size={width},2400",
                 f"--virtual-time-budget={budget_ms}"]
         if screenshot:

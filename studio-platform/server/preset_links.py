@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """Пресеты целые и частичные — одно разрешение на всех (батч «Пресеты целые и частичные»).
 
-Решение владельца: пресет производства можно завести **целым** (все пять групп) или
+Решение владельца: пресет производства можно завести **целым** (все группы) или
 **частичным** — только под одну часть: озвучку, картинки, клипы, сборку, текст и
 обложку. Это одна и та же строка таблицы `presets` — у частичного просто заполнена
 одна группа, а служебные ключи `_scope`/`_links` в `presets.settings` (см.
@@ -39,6 +39,12 @@ import preset_fields
 
 FULL = "full"
 PARTS = tuple(part for part, _title in preset_fields.PARTS)
+
+# Части, которых больше нет. 18.09.2026 «Текст и обложка» разделена на «Сценарий» и
+# «Обложка» (решение владельца: это разные компоненты). Ни одного такого пресета в
+# базах нет — часть прожила один день и до выкатки не дошла, — но молчать о ней нельзя:
+# запись с исчезнувшей частью должна быть видна в `_link_problems`, а не тихо потеряться.
+RETIRED_PARTS = {"text_cover": "часть «Текст и обложка» разделена на «Сценарий» и «Обложка»"}
 
 
 def scope_of(settings: dict) -> str:
@@ -160,6 +166,9 @@ def resolve(c, preset_id) -> dict:
         links = {}
     for part, linked_raw in links.items():
         if part not in PARTS:
+            if part in RETIRED_PARTS:
+                problems.append({"part": part, "preset_id": linked_raw,
+                                 "why": RETIRED_PARTS[part]})
             continue
         keys = group_keys(part)
         linked_id = parse_link_ref(linked_raw)

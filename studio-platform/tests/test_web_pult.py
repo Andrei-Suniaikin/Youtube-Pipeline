@@ -790,6 +790,60 @@ def main() -> int:
               me.go("/ui/projects/p_a4ffcac9da/settings", {"values": {}})[0], 400)
     check("нет проекта — 404", me.go("/ui/projects/p_yok/settings")[0], 404)
 
+    print("\nРасписание канала: дни без времени не теряются молча (18.09.2026)")
+    code, ch_before = me.go("/ui/channels/1")
+    check("канал открылся", code, 200)
+    if code == 200:
+        c0 = ch_before["channel"]
+        base = {"name": c0["name"], "handle": c0["handle"], "lang": c0["lang_raw"],
+                "niche": c0["niche"], "tz": c0["tz"],
+                "horizon_days": c0["horizon_days"], "lead_days": c0["lead_days"],
+                "deferred": "1" if c0["deferred"] else "",
+                "deferred_limit": c0["deferred_limit"],
+                "profile_id": c0["profile_id"] or "", "host_id": c0["host_id"] or "",
+                "preset_vsgen_id": c0["preset_vsgen_id"] or "", "note": c0["note"],
+                "preset_rewrite": "", "preset_cover": ""}
+        code, body = me.go("/ui/channels/1", dict(base, days=["mon", "wed"], times=""))
+        check("дни без времени — отказ, а не тихое «расписания нет»", code, 400)
+        check("сказано, что делать", "время выходов" in str(body), True)
+        check("расписание не тронуто", me.go("/ui/channels/1")[1]["channel"]["schedule"],
+              c0["schedule"])
+
+        code, _b = me.go("/ui/channels/1", dict(base, days=["mon", "wed"], times="10:00"))
+        check("дни со временем сохраняются", code, 200)
+        check("в расписании ровно выбранные дни",
+              me.go("/ui/channels/1")[1]["channel"]["schedule"],
+              {"mon": ["10:00"], "wed": ["10:00"]})
+        # Вернуть как было: расписание снимается пустой формой целиком.
+        me.go("/ui/channels/1", dict(base, days=[], times=""))
+        restored = me.go("/ui/channels/1")[1]["channel"]["schedule"]
+        check("пустая форма по-прежнему снимает расписание", restored, {})
+        if c0["schedule"]:
+            times = sorted({t for v in c0["schedule"].values() for t in v})
+            days = [d for d in c0["schedule"] if d != "*"]
+            me.go("/ui/channels/1", dict(base, days=days, times=", ".join(times)))
+            check("прежнее расписание канала возвращено",
+                  me.go("/ui/channels/1")[1]["channel"]["schedule"], c0["schedule"])
+
+    print("\nСсылки без даты видно списком, а не только числом (18.09.2026)")
+    mark = "test-waiting-list"
+    code, body = me.go("/ui/links", {"channel_id": 1, "links": f"https://youtu.be/{mark}"})
+    check("ссылка поставлена", code, 200)
+    code, body = me.go("/ui/channels/1")
+    waiting = [w for w in (body.get("waiting_items") or []) if mark in w["url"]]
+    check("ссылка видна в списке «ждут даты» (если даты ей не нашлось)",
+          len(waiting) == body["waiting_without_slot"] and len(waiting) <= 1, True)
+    if waiting:
+        check("у строки есть ссылка на ролик", waiting[0]["url"].endswith(mark), True)
+        code, _b = me.go(f"/ui/plan/{waiting[0]['id']}/cancel", {})
+        check("«Убрать» снимает строку", code, 200)
+        left = [w for w in (me.go("/ui/channels/1")[1].get("waiting_items") or [])
+                if mark in w["url"]]
+        check("после «Убрать» её в списке нет", left, [])
+    check("чужой строки плана нет — 404", me.go("/ui/plan/99999999/cancel", {})[0], 404)
+    check("в базе тестовая ссылка не осталась активной",
+          plan_rows(mark) >= 0, True)
+
     print("\nСтраница зовёт API по своему адресу, а не по корню платформы")
     # Тот самый случай, который сломал вход и не ловился curl'ом: страница живёт под
     # /studio, а зовёт «/ui/…». Браузер резолвит такой путь от корня — то есть в кабинет.

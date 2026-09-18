@@ -458,10 +458,11 @@ def main() -> int:
     check("не превращается в _link_problems (это не ссылка на существующую часть)",
           r["_link_problems"], [])
 
-    print("\npreset_fields.PARTS и part_group_keys — пять частей из спецификации")
+    print("\npreset_fields.PARTS и part_group_keys — части из спецификации "
+          "(с 18.09.2026 «Сценарий» и «Обложка» разделены)")
     check("части соответствуют группам GROUPS", dict(PF.PARTS),
           {"voice": "Озвучка", "images": "Картинки", "clips": "Клипы",
-           "render": "Сборка", "text_cover": "Текст и обложка"})
+           "render": "Сборка", "text": "Сценарий", "cover": "Обложка"})
     # Ответ на вопрос 1 (ревью цикла 2, вариант б): группа части — поля формы
     # GROUPS ∪ PART_EXTRA_KEYS (ключи, которые читает сборщик параметров этапа, но
     # форма их не показывает). Ниже — форма ∪ карта, а не только форма, как было
@@ -482,8 +483,10 @@ def main() -> int:
           {"quality", "transitions", "sync_audio", "kenburns", "subtitles",
            "subtitle_lang", "chapters", "material_order",
            "min_image_duration", "max_image_duration"} | PF.PART_EXTRA_KEYS["render"])
-    check("text_cover — поля группы «Текст и обложка», лишних ключей нет",
-          PF.part_group_keys("text_cover"), {"preset_rewrite", "preset_cover"})
+    check("text — только пресет рерайта", PF.part_group_keys("text"), {"preset_rewrite"})
+    check("cover — только пресет обложки", PF.part_group_keys("cover"), {"preset_cover"})
+    check("сценарий и обложка не пересекаются ключами",
+          PF.part_group_keys("text") & PF.part_group_keys("cover"), set())
     check("неизвестная часть — пусто, а не исключение", PF.part_group_keys("не часть"), set())
 
     print("\nВспомогательные проверки самой карты PART_EXTRA_KEYS (не зависят от "
@@ -563,14 +566,33 @@ def main() -> int:
     check("проблем нет — резолвится сам частичный, а не то, на что он (незаконно) сослался",
           r["_link_problems"], [])
 
-    print("\npub_engine.channel_presets: «Текст и обложка» — тоже одна из пяти групп")
+    print("\npub_engine.channel_presets: «Сценарий» и «Обложка» — отдельные части")
     c = fresh()
-    put(c, 20, {"_scope": "text_cover", "preset_rewrite": "Из частичного",
-                "preset_cover": "Обложка Х"})
-    put(c, 1, {"preset_rewrite": "своё, но перекрыто ссылкой", "_links": {"text_cover": 20}})
-    check("оба поля группы — из частичного пресета",
+    put(c, 20, {"_scope": "text", "preset_rewrite": "Из частичного"})
+    put(c, 21, {"_scope": "cover", "preset_cover": "Обложка Х"})
+    put(c, 1, {"preset_rewrite": "своё, но перекрыто ссылкой", "preset_cover": "своя обложка",
+               "_links": {"text": 20, "cover": 21}})
+    check("каждое поле — из своего частичного пресета",
           pub_engine.channel_presets(c, 1, "старый рерайт", "старая обложка"),
           ("Из частичного", "Обложка Х"))
+
+    # Главное ради чего делили: обложку можно подменить, не трогая текст.
+    c = fresh()
+    put(c, 21, {"_scope": "cover", "preset_cover": "Обложка Х"})
+    put(c, 1, {"preset_rewrite": "свой рерайт", "_links": {"cover": 21}})
+    check("ссылка только на обложку не трогает пресет рерайта целого",
+          pub_engine.channel_presets(c, 1, "старый рерайт", "старая обложка"),
+          ("свой рерайт", "Обложка Х"))
+
+    # Исчезнувшая часть: пресетов с ней нет, но если такая запись появится, она обязана
+    # быть видна как проблема ссылки, а не потеряться молча.
+    c = fresh()
+    put(c, 1, {"preset_rewrite": "своё", "_links": {"text_cover": 20}})
+    r = preset_links.resolve(c, 1)
+    check("ссылка на разделённую часть — в _link_problems",
+          [(x["part"], "разделена" in x["why"]) for x in r["_link_problems"]],
+          [("text_cover", True)])
+    check("свои поля целого при этом на месте", r["preset_rewrite"], "своё")
 
     c = fresh()
     put(c, 1, {"preset_rewrite": "своё"})
