@@ -231,7 +231,18 @@ def register_upload_routes(app, ctx):
             # Фазу дублируем в журнал выпуска: именно по нему движок понимает, что заливка
             # уже началась, и запрещает повтор навсегда.
             if phase:
-                log_line(c, release_id, "заливка", f"машина сообщает: {phase}", now=now)
+                # Машина шлёт фазу целым JSON по контракту (`upload_contract`), а сравнение
+                # ниже ждало голого имени: `phase == "upload_started"` не совпадало НИКОГДА,
+                # и фаза «идёт заливка» в журнал выпуска не попадала ни разу. Разбираем имя;
+                # старый формат (голая строка) продолжает работать.
+                said = phase
+                try:
+                    parsed = json.loads(phase)
+                    if isinstance(parsed, dict) and parsed.get("phase"):
+                        said = str(parsed["phase"])
+                except (ValueError, TypeError):
+                    pass
+                log_line(c, release_id, "заливка", f"машина сообщает: {said}", now=now)
                 stdout = str(body.get("stdout") or "")
                 if stdout:
                     add_lines(c, release_id, "заливщик", stdout)
@@ -239,7 +250,7 @@ def register_upload_routes(app, ctx):
                 known = {r[0] for r in c.execute(
                     "SELECT phase FROM pub_release_events WHERE release_id=?",
                     (release_id,)).fetchall()}
-                if phase == "upload_started" and "upload_running" not in known:
+                if said == "upload_started" and "upload_running" not in known:
                     log_phase(c, release_id, "upload_running", now)
             c.commit()
             return JSONResponse({"ok": True})

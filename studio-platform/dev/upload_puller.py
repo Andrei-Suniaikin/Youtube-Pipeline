@@ -186,7 +186,13 @@ def run_upload(task: dict, projdir: str, video: str, cover: str) -> dict:
                 result = {"success": False, "error": "не разобрал результат заливщика"}
         if line.startswith(PHASE_MARK):
             # Фазу отправляем немедленно: сервер по ней запрещает повтор.
-            say(rid, claim, phase=line[len(PHASE_MARK):].strip()[:40])
+            # БЕЗ обрезки: заливщик шлёт фазу целым JSON по контракту
+            # (`upload_contract.encode_phase_event`), а `[:40]` резал его посреди строки —
+            # на сервер приезжал огрызок вида {"phase":"profile_opened","upload_phase_.
+            # Разобрать такое нельзя, и движок не мог отличить «файл ещё не отправляли»
+            # от «отправка началась»: любая неудача считалась необратимой. Сервер
+            # принимает 400 символов — этого хватает с запасом.
+            say(rid, claim, phase=line[len(PHASE_MARK):].strip())
         if time.time() - last_beat > 60:
             say(rid, claim, stdout="\n".join(buffer[-30:]))
             buffer, last_beat = [], time.time()
