@@ -71,7 +71,8 @@ def fresh():
         release_id TEXT, service TEXT, kind TEXT, remote_job_id TEXT, status TEXT,
         error TEXT, created REAL, updated REAL, UNIQUE(release_id,service,kind));
       CREATE TABLE pub_release_log(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
-        ts REAL, level TEXT, step TEXT, message TEXT);
+        ts REAL, level TEXT, step TEXT, message TEXT,
+        repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
       CREATE TABLE pub_releases(id INTEGER PRIMARY KEY, release_id TEXT, tenant_id TEXT,
         project_id TEXT, lang TEXT, preset_rewrite TEXT, updated REAL);
       CREATE TABLE users(id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT,

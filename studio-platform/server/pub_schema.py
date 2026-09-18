@@ -287,19 +287,41 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
               "ON pub_releases(channel_id,slot_at)")
     # Журнал фаз выпуска: он же защита от повторной заливки. Пишется до необратимого
     # действия и подтверждается после; seq растёт монотонно.
+    # `repeats`/`last_seen` (19.09.2026): одна и та же фаза, повторённая подряд, не
+    # заводит новую строку — растёт счётчик и обновляется время последнего раза.
+    # Повод из боя: движок пишет `resource_wait` на КАЖДОМ тике (30 с) по каждому
+    # стоящему выпуску — 10,5 млн строк и 1,64 ГБ базы, при 187 ждущих выпусках это
+    # ~530 тыс. строк в сутки. Журнал при этом не сообщает ничего нового: важны «с
+    # какого времени ждём» (created) и «когда проверяли в последний раз» (last_seen).
     c.execute("CREATE TABLE IF NOT EXISTS pub_release_events("
               "id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT NOT NULL, "
               "seq INTEGER NOT NULL, phase TEXT NOT NULL, video_id TEXT, "
-              "payload TEXT, created REAL NOT NULL, UNIQUE(release_id,seq))")
+              "payload TEXT, created REAL NOT NULL, "
+              "repeats INTEGER NOT NULL DEFAULT 1, last_seen REAL, "
+              "UNIQUE(release_id,seq))")
+    for _col, _sql in (("repeats", "INTEGER NOT NULL DEFAULT 1"), ("last_seen", "REAL")):
+        try:
+            c.execute(f"ALTER TABLE pub_release_events ADD COLUMN {_col} {_sql}")
+        except Exception:
+            pass   # колонка уже есть — живой SELECT в тестах это проверяет
     c.execute("CREATE INDEX IF NOT EXISTS idx_pub_release_events_rid "
               "ON pub_release_events(release_id,seq)")
     # Журнал выпуска: единственное место, где после сбоя видно, ЧТО именно произошло.
     # Фазы отвечают на вопрос «где остановилось», а этот лог — «почему»: что спросили
     # у соседа, что он ответил, какое решение принял движок, что печатал заливщик.
+    # `repeats`/`last_ts` — по той же причине, что и у фаз: строка «ждём: нет ключей»
+    # писалась каждый тик и за час выедала весь лимит KEEP_PER_RELEASE, вытесняя из
+    # журнала то единственное, ради чего его открывают — что было ДО ожидания.
     c.execute("CREATE TABLE IF NOT EXISTS pub_release_log("
               "id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT NOT NULL, "
               "ts REAL NOT NULL, level TEXT NOT NULL DEFAULT 'info', "
-              "step TEXT NOT NULL, message TEXT NOT NULL)")
+              "step TEXT NOT NULL, message TEXT NOT NULL, "
+              "repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL)")
+    for _col, _sql in (("repeats", "INTEGER NOT NULL DEFAULT 1"), ("last_ts", "REAL")):
+        try:
+            c.execute(f"ALTER TABLE pub_release_log ADD COLUMN {_col} {_sql}")
+        except Exception:
+            pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_pub_release_log_rid "
               "ON pub_release_log(release_id, id)")
     # Задание на заливку: то, что забирает машина с профилем AdsPower.

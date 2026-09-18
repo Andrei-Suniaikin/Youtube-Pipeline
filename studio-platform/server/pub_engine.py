@@ -93,15 +93,38 @@ def new_release_id() -> str:
 
 def log_phase(c, release_id: str, phase: str, now: float, video_id: str = "",
               payload=None) -> int:
-    """Записать фазу. Номер растёт монотонно, повтор той же фазы не создаёт дубля."""
-    last = c.execute("SELECT MAX(seq) FROM pub_release_events WHERE release_id=?",
-                     (release_id,)).fetchone()[0] or 0
+    """Записать фазу. Номер растёт монотонно, повтор той же фазы не создаёт дубля.
+
+    До 19.09.2026 докстринг это обещал, а код делал ровно обратное: INSERT шёл
+    безусловно. Цена видна в бою — движок пишет `resource_wait` каждые 30 секунд по
+    каждому стоящему выпуску, и при 187 ждущих это 530 тысяч строк в сутки; база
+    кабинета доросла до 1,64 ГБ, ночной архив и уборка тянут её целиком.
+
+    Теперь подряд идущий повтор ТОЙ ЖЕ фазы (та же фаза, тот же ролик, тот же payload)
+    не создаёт строку: растёт `repeats` и обновляется `last_seen`. Смысл журнала от
+    этого только полнее — `created` отвечает «с какого времени ждём», `last_seen` —
+    «когда проверяли в последний раз», а раньше на этот вопрос отвечала стена
+    одинаковых строк. Номер `seq` сохраняется прежний: на него ссылаются читатели
+    (`phase_history`, экран выпуска, поздняя проверка публикации).
+
+    Повтор именно ПОДРЯД ИДУЩИЙ: `created → resource_wait → created` — три события,
+    потому что между ними фаза менялась. Схлопывается только «то же самое опять».
+    """
+    body = json.dumps(payload, ensure_ascii=False) if payload else None
+    last = c.execute(
+        "SELECT seq, phase, video_id, payload FROM pub_release_events "
+        "WHERE release_id=? ORDER BY seq DESC LIMIT 1", (release_id,)).fetchone()
+    if last and last[1] == phase and (last[2] or "") == (video_id or "") \
+            and (last[3] or None) == body:
+        c.execute("UPDATE pub_release_events SET repeats=repeats+1, last_seen=? "
+                  "WHERE release_id=? AND seq=?", (now, release_id, last[0]))
+        return last[0]
+    seq = (last[0] if last else 0) + 1
     c.execute(
-        "INSERT INTO pub_release_events(release_id,seq,phase,video_id,payload,created)"
-        " VALUES(?,?,?,?,?,?)",
-        (release_id, last + 1, phase, video_id or None,
-         json.dumps(payload, ensure_ascii=False) if payload else None, now))
-    return last + 1
+        "INSERT INTO pub_release_events(release_id,seq,phase,video_id,payload,created,"
+        "repeats,last_seen) VALUES(?,?,?,?,?,?,1,?)",
+        (release_id, seq, phase, video_id or None, body, now, now))
+    return seq
 
 
 def phase_history(c, release_id: str) -> list:

@@ -644,7 +644,8 @@ def main() -> int:
       CREATE TABLE pub_release_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
         service TEXT, kind TEXT, payload TEXT);
       CREATE TABLE pub_release_log(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
-        ts REAL, level TEXT, step TEXT, message TEXT);
+        ts REAL, level TEXT, step TEXT, message TEXT,
+        repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
     """)
     put(c, 1, {"engine": "edge", "speed": "1.0", "_links": {"voice": 404}})
     c.execute("INSERT INTO pub_releases(release_id, project_id, tenant_id) "
@@ -690,7 +691,8 @@ def main() -> int:
       CREATE TABLE pub_release_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
         service TEXT, kind TEXT, payload TEXT);
       CREATE TABLE pub_release_log(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
-        ts REAL, level TEXT, step TEXT, message TEXT);
+        ts REAL, level TEXT, step TEXT, message TEXT,
+        repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
     """)
     put(c, 1, {})   # целый пресет без единого настоящего поля
     c.execute("INSERT INTO pub_releases(release_id, project_id, tenant_id) "

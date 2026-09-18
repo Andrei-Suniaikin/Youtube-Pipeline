@@ -525,15 +525,26 @@ def ui_release(release_id: str):
         if not found:
             raise HTTPException(404, "выпуск не найден")
         rel = found[0]
+        # `repeats`/`last_seen`: подряд идущий повтор одной фазы или одной строки
+        # журнала не заводит новую запись (pub_engine.log_phase, pub_log.add), поэтому
+        # экран показывает «с какого времени» и «сколько раз», а не стену одинаковых
+        # строк. Старые записи повторов не знают — отсюда COALESCE.
         events = [{"seq": e["seq"], "phase": e["phase"],
                    "phase_title": PHASE_TITLE.get(e["phase"], e["phase"]),
-                   "video_id": e["video_id"] or "", "created": e["created"]}
-                  for e in c.execute("SELECT * FROM pub_release_events WHERE release_id=? "
-                                     "ORDER BY seq", (release_id,))]
+                   "video_id": e["video_id"] or "", "created": e["created"],
+                   "repeats": e["repeats"] or 1,
+                   "last_seen": e["last_seen"] or e["created"]}
+                  for e in c.execute(
+                      "SELECT *, COALESCE(repeats,1) repeats, "
+                      "COALESCE(last_seen, created) last_seen "
+                      "FROM pub_release_events WHERE release_id=? ORDER BY seq",
+                      (release_id,))]
         log = [{"ts": l["ts"], "level": l["level"], "step": l["step"],
-                "message": l["message"]}
-               for l in c.execute("SELECT * FROM pub_release_log WHERE release_id=? "
-                                  "ORDER BY id", (release_id,))]
+                "message": l["message"], "repeats": l["repeats"] or 1,
+                "last_ts": l["last_ts"] or l["ts"]}
+               for l in c.execute(
+                   "SELECT *, COALESCE(repeats,1) repeats, COALESCE(last_ts, ts) last_ts "
+                   "FROM pub_release_log WHERE release_id=? ORDER BY id", (release_id,))]
         return {"release": rel, "stages": _stages(c, rel), "events": events, "log": log}
     finally:
         c.close()
@@ -1523,11 +1534,12 @@ def ui_public():
                for r in pub_verify.due(c, TENANT, now)]
         checked = []
         for e in c.execute(
-                "SELECT e.release_id, e.payload, e.created, r.phase, r.blocked_reason "
+                "SELECT e.release_id, e.payload, "
+                "COALESCE(e.last_seen, e.created) created, r.phase, r.blocked_reason "
                 "FROM pub_release_events e JOIN pub_releases r "
                 "  ON r.release_id = e.release_id "
                 "WHERE e.phase='public_check' AND r.tenant_id=? "
-                "ORDER BY e.created DESC LIMIT 40", (TENANT,)):
+                "ORDER BY created DESC LIMIT 40", (TENANT,)):
             try:
                 payload = json.loads(e["payload"] or "{}")
             except ValueError:

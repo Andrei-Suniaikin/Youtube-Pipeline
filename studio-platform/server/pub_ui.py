@@ -1062,11 +1062,22 @@ placeholder='[{"uc":"UC...","name":"Канал","lang":"pl","times":"10:00, 18:0
         c.close()
 
         colors = {"error": "#c25a4e", "warn": "#e0a33e", "info": "var(--muted)"}
+        # Повтор одной и той же строки не заводит новую запись (pub_log.add): движок
+        # проверяет «ждём: …» каждые полминуты, и раньше эти повторы вытесняли из
+        # журнала всё остальное. Вместо стены — счётчик и время последнего раза.
+        def _repeat(r):
+            n = (r["repeats"] if "repeats" in r.keys() else 1) or 1
+            if n <= 1:
+                return ""
+            last = dt.datetime.fromtimestamp(r["last_ts"]).strftime("%d.%m %H:%M:%S")
+            return (f' <span class=muted style="font-size:12px">· повторилось {n} раз(а), '
+                    f'последний раз {last}</span>')
+
         rows = "".join(
             f'<tr><td style="width:120px;white-space:nowrap;color:var(--muted)">'
             f'{dt.datetime.fromtimestamp(r["ts"]).strftime("%d.%m %H:%M:%S")}</td>'
             f'<td style="width:110px;color:{colors.get(r["level"], "var(--muted)")}">'
-            f'{e(r["step"])}</td><td>{e(r["message"])}</td></tr>'
+            f'{e(r["step"])}</td><td>{e(r["message"])}{_repeat(r)}</td></tr>'
             for r in lines) or ('<tr><td colspan=3><span class=muted>записей пока нет</span>'
                                 '</td></tr>')
 

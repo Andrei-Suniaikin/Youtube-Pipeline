@@ -32,11 +32,25 @@ def add(c, release_id: str, step: str, message: str, level: str = "info",
     text = " ".join(str(message or "").split())[:MAX_MESSAGE]
     if not text:
         return
+    ts = time.time() if now is None else now
+    lvl = level if level in LEVELS else "info"
+    step = str(step)[:40]
     try:
+        # Подряд идущий повтор той же строки не занимает новое место: у движка есть
+        # состояния, которые он проверяет каждые 30 секунд («ждём: нет ключей»,
+        # «ждём: очередь провайдера»), и за час они выедали весь лимит KEEP_PER_RELEASE
+        # — журнал переставал отвечать на главный вопрос «что было до того».
+        last = c.execute(
+            "SELECT id, level, step, message FROM pub_release_log WHERE release_id=? "
+            "ORDER BY id DESC LIMIT 1", (release_id,)).fetchone()
+        if last and last[1] == lvl and last[2] == step and last[3] == text:
+            c.execute("UPDATE pub_release_log SET repeats=repeats+1, last_ts=? WHERE id=?",
+                      (ts, last[0]))
+            return
         c.execute(
-            "INSERT INTO pub_release_log(release_id,ts,level,step,message) VALUES(?,?,?,?,?)",
-            (release_id, time.time() if now is None else now,
-             level if level in LEVELS else "info", str(step)[:40], text))
+            "INSERT INTO pub_release_log(release_id,ts,level,step,message,repeats,last_ts)"
+            " VALUES(?,?,?,?,?,1,?)",
+            (release_id, ts, lvl, step, text, ts))
         _trim(c, release_id)
     except Exception:
         pass          # журнал — вспомогательный: его сбой не должен рушить выпуск
@@ -52,8 +66,9 @@ def _trim(c, release_id: str) -> None:
 
 def read(c, release_id: str, limit: int = 400) -> list:
     return c.execute(
-        "SELECT ts, level, step, message FROM pub_release_log WHERE release_id=? "
-        "ORDER BY id DESC LIMIT ?", (release_id, limit)).fetchall()
+        "SELECT ts, level, step, message, repeats, COALESCE(last_ts, ts) last_ts "
+        "FROM pub_release_log WHERE release_id=? ORDER BY id DESC LIMIT ?",
+        (release_id, limit)).fetchall()
 
 
 def last_error(c, release_id: str) -> str:

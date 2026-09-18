@@ -122,9 +122,14 @@ def due(c, tenant=None, now=None, grace=None) -> list:
 
 def _seen(c, release_id: str) -> dict:
     """Когда этот ролик спрашивали в прошлый раз и что ответили."""
+    # `last_seen` — время ПОСЛЕДНЕЙ проверки: одинаковые подряд ответы с 19.09.2026
+    # схлопываются в одну строку (pub_engine.log_phase), и `created` у неё означает
+    # «когда этот ответ получили впервые». Спрашивать надо по последнему разу, иначе
+    # ролик со стабильным ответом опрашивался бы на каждом проходе и жёг квоту API.
     row = c.execute(
-        "SELECT payload, created FROM pub_release_events WHERE release_id=? "
-        "AND phase='public_check' ORDER BY seq DESC LIMIT 1", (release_id,)).fetchone()
+        "SELECT payload, COALESCE(last_seen, created) FROM pub_release_events "
+        "WHERE release_id=? AND phase='public_check' ORDER BY seq DESC LIMIT 1",
+        (release_id,)).fetchone()
     if not row:
         return {}
     try:
@@ -136,12 +141,14 @@ def _seen(c, release_id: str) -> dict:
 
 
 def _note(c, release_id: str, payload: dict, now: float) -> None:
-    last = c.execute("SELECT MAX(seq) FROM pub_release_events WHERE release_id=?",
-                     (release_id,)).fetchone()[0] or 0
-    c.execute("INSERT INTO pub_release_events(release_id,seq,phase,video_id,payload,created)"
-              " VALUES(?,?,?,?,?,?)",
-              (release_id, last + 1, "public_check", payload.get("video_id"),
-               json.dumps(payload, ensure_ascii=False), now))
+    """Запись через общий log_phase — чтобы и здесь работало схлопывание повторов.
+
+    Своя вставка стояла тут исторически; при ней ролик, который висит приватным
+    неделю, копил по строке на каждый проход, и все строки были одинаковые.
+    """
+    import pub_engine        # локально: модуль тянет requests, а поздней проверке он не нужен
+    pub_engine.log_phase(c, release_id, "public_check", now,
+                         video_id=payload.get("video_id") or "", payload=payload)
 
 
 def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:

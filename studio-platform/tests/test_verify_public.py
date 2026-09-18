@@ -42,9 +42,12 @@ def fresh(phase="scheduled", video_id="vid1", slot=NOW - 3 * HOUR, tenant="dev")
                                 video_id TEXT, blocked_reason TEXT, updated REAL);
       CREATE TABLE pub_release_events(id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 release_id TEXT, seq INTEGER, phase TEXT, video_id TEXT,
-                                payload TEXT, created REAL, UNIQUE(release_id,seq));
+                                payload TEXT, created REAL,
+                                repeats INTEGER NOT NULL DEFAULT 1, last_seen REAL,
+                                UNIQUE(release_id,seq));
       CREATE TABLE pub_release_log(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
-                                ts REAL, level TEXT, step TEXT, message TEXT);
+                                ts REAL, level TEXT, step TEXT, message TEXT,
+                                repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
     """)
     c.execute("INSERT INTO pub_releases VALUES(1,'r1',?,1,?,?,'done',?,NULL,?)",
               (tenant, slot, phase, video_id, NOW))
