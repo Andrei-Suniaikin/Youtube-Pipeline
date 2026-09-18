@@ -630,6 +630,16 @@ def process_paragraph(paragraph_data):
             model_id=str(model_uuid or ""),
             speed=speed_for_fingerprint,
             text_sha=hashlib.sha256(paragraph_text.encode("utf-8")).hexdigest(),
+            # Настройки заказа (стабильность, схожесть, стиль, паузы, нормализация…)
+            # меняют сам звук — значит, это ДРУГОЙ платный вызов. Без них журнал считал
+            # бы новую озвучку уже оплаченной и молча отдавал бы файл со старыми
+            # настройками. В квитанции они уже учтены (identity_scope), а в журнале —
+            # не были: расхождение появилось вместе с настройками Lumean 18.09.2026.
+            # Пусто — отпечаток прежний: `fingerprint` выбрасывает пустые значения,
+            # поэтому у заказов без настроек ничего не меняется и повторно платить
+            # за уже сделанное не придётся.
+            config=(json.dumps(TTS_CONFIG_OVERRIDE, ensure_ascii=False, sort_keys=True)
+                    if TTS_CONFIG_OVERRIDE else ""),
         ),
         kind="tts",
         provider="lumean",

@@ -134,6 +134,33 @@ def main() -> int:
                                    {"config": '{"tts_settings": {"voice_settings": {"stability": 0.4}}}'})
         check("другая стабильность — другой отпечаток", one == two, False)
         check("те же настройки — тот же отпечаток", one == same, True)
+
+        print("\nЖурнал платных вызовов считает так же, иначе он отдаст старый файл")
+        # Квитанция знала про настройки с самого начала, а журнал — нет: он решал
+        # «этот вызов уже оплачен и доставлен» по шаблону, модели, скорости и тексту.
+        # То есть сменил стабильность — и journal.reserve отвечал skip, подставляя
+        # озвучку со СТАРЫМИ настройками. Отпечаток журнала обязан меняться вместе с
+        # настройками — и оставаться прежним, когда настроек нет вовсе.
+        from call_journal import CallJournal
+        def fp():
+            return CallJournal.fingerprint(
+                template_id="tpl-1", model_id="eleven_v3", speed="1.0",
+                text_sha="abc",
+                config=(json.dumps(W.TTS_CONFIG_OVERRIDE, ensure_ascii=False, sort_keys=True)
+                        if W.TTS_CONFIG_OVERRIDE else ""))
+        W.TTS_CONFIG_OVERRIDE.clear()
+        bare = fp()
+        W.TTS_CONFIG_OVERRIDE.update({"tts_settings": {"voice_settings": {"stability": 0.4}}})
+        soft = fp()
+        W.TTS_CONFIG_OVERRIDE.clear()
+        W.TTS_CONFIG_OVERRIDE.update({"tts_settings": {"voice_settings": {"stability": 0.9}}})
+        hard = fp()
+        W.TTS_CONFIG_OVERRIDE.clear()
+        check("без настроек отпечаток прежний — старые оплаченные вызовы не пересчитаются",
+              bare, CallJournal.fingerprint(template_id="tpl-1", model_id="eleven_v3",
+                                            speed="1.0", text_sha="abc"))
+        check("настройки появились — отпечаток другой", bare == soft, False)
+        check("другая стабильность — снова другой", soft == hard, False)
     finally:
         W.requests.request = saved_post
         if saved_key is None:
