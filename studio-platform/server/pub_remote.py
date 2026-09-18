@@ -50,6 +50,12 @@ SUBS_PROXIES = ["" if p.strip().lower() in DIRECT else p.strip()
 SUBS_COOKIES = os.environ.get("VS_SUBS_COOKIES", "/root/.vs_yt_cookies.txt")
 # Выход, ответивший отказом, отдыхает — но очередь идёт дальше через остальные.
 SUBS_REST = float(os.environ.get("VS_SUBS_REST", "1800"))
+# Таймаут на запрос к YouTube (18.09.2026). `youtube-transcript-api` зовёт сессию БЕЗ
+# таймаута, а выход бывает полумёртвым: порт слушает, туннель не отвечает — так на бою
+# 18.09 и было (срез live_2026-09-18, глава «субтитры», раздел 5). Без таймаута первый
+# же выход вешает поток, а движок выпусков крутится одним циклом: встаёт всё, включая
+# снятие зависших заливок. Ставим умолчание на уровне сессии — библиотеку не трогаем.
+SUBS_TIMEOUT = float(os.environ.get("VS_SUBS_TIMEOUT", "25"))
 _subs_rest_until = {}          # выход → до какого времени отдыхает
 _subs_gate = threading.Lock()
 
@@ -158,13 +164,26 @@ def _subs_wait_left() -> int:
         return max(0, int((min(_subs_rest_until.values()) - time.time()) / 60) + 1)
 
 
+class _SubsSession(requests.Session):
+    """Сессия со своим таймаутом по умолчанию.
+
+    `youtube-transcript-api` вызывает `session.get(...)` без `timeout`, и переопределить
+    это снаружи нечем: единственное место, где можно подставить умолчание, — сама
+    сессия. Явно переданный вызывающим таймаут остаётся сильнее.
+    """
+
+    def request(self, method, url, **kw):                          # noqa: D102
+        kw.setdefault("timeout", SUBS_TIMEOUT)
+        return super().request(method, url, **kw)
+
+
 def _subs_session(proxy: str):
     """Сессия к YouTube: заданный выход наружу и cookies владельца внутри.
 
     Файл cookies читаем на каждый запрос — обновили его, и новые подхватятся сами,
     перезапуск сервиса для этого не нужен.
     """
-    session = requests.Session()
+    session = _SubsSession()
     if proxy:
         session.proxies = {"http": proxy, "https": proxy}
     if SUBS_COOKIES and os.path.exists(SUBS_COOKIES):
