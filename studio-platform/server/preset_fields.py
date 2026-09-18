@@ -21,8 +21,11 @@ f-строк: список полей, их подписи, варианты в�
 """
 from __future__ import annotations
 
+import os
+import re
 import sys
 import threading
+import time
 
 
 class Field:
@@ -80,6 +83,12 @@ def _engines(m):
 # список из трёх пунктов ТЗ §09, которому автопоявление новых значений не нужно и не
 # обещано.
 _HIDDEN_IMAGE_MODELS = {"GROK", "GROK_SPEED"}
+# Кто исполняет модель картинок. Третий элемент кортежа `IMAGE_MODELS` — это ключ
+# провайдера кабинета; здесь только человеческая подпись к нему, как у методов клипов.
+_IMAGE_PROVIDER_TITLE = {"recrafter": "FastGen", "veo": "VeoNonStop", "openai": "OpenAI"}
+# Насколько снимок статусов считается свежим. Больше — форма покажет старое; меньше —
+# лишние обращения к health-API, который и так общий на платформу.
+_FG_SNAPSHOT_TTL = float(os.environ.get("VS_FG_SNAPSHOT_TTL", "600"))
 
 
 # Доработка 4 (Дополнение 16.09 к батчу 16.09.2026, фаза 4): у `fastgen_status` на
@@ -95,69 +104,58 @@ _FG_INFLIGHT = {"busy": False}
 
 
 def _fg_status_map(m):
-    """id модели FastGen → текст живого статуса («работает»/«нестабильно»/«лежит»/
-    «нет данных»), батч 16.09.2026 (пункт 2.1 ТЗ).
+    """id модели FastGen → текст живого статуса («работает»/«нестабильно»/«лежит»).
 
-    Источник — только `m.fastgen_status`: свои пороги здесь не заводятся, `_fg_classify`
-    уже посчитал их в кабинете. Ключ берётся тем же способом, что кабинет берёт
-    серверный ключ `googler` (`keys()`) — без обращения к своим ключам пользователя,
-    их здесь неоткуда взять (`describe()` не получает `request`/юзера).
+    Источник — снимок `main.fastgen_models_snapshot()`: живой опрос health-API занимает
+    около трёх секунд, а форме на всё про всё дано `_FG_FORM_BUDGET_SEC` (доработка 4,
+    Дополнение 16.09), и до 18.09.2026 она поэтому ВСЕГДА показывала «нет данных».
+    Снимок кладёт тот, кому ждать можно: экран ключей, `dev/alerts.py` и фоновое
+    обновление ниже. Пороги по-прежнему считает кабинет (`_fg_classify`), своих здесь нет.
 
-    Всё под `getattr`+`try`: модуль-заглушка в тестах не обязан иметь ни `keys`, ни
-    `fastgen_status`, а сеть или ключ могут молчать в проде — ни один из этих случаев не
-    должен ронять форму (правило «форма обязана открываться»).
-
-    Бюджет `_FG_FORM_BUDGET_SEC` (доработка 4, Дополнение 16.09): вызов идёт в отдельном
-    потоке-демоне, и если он не уложился в бюджет — путь формы получает «нет данных» и
-    открывается сразу, не дожидаясь ответа. Поток «убить» на зависшем сетевом вызове
-    нельзя (Python этого не умеет), поэтому он продолжает висеть в фоне и — если всё же
-    досчитает — просто обновит кэш `fastgen_status`/`admin_state.fastgen_usage` впрок,
-    для следующего открытия формы. Демон, а не `ThreadPoolExecutor`, — намеренно: у
-    executor'а есть atexit-обработчик, который на выходе процесса ждёт завершения ВСЕХ
-    его потоков, включая зависшие, а демон interpreter убивает сразу, без ожидания.
-    Экран ключей и цикл тревог (`dev/alerts.py`) зовут `fastgen_status` напрямую, без
-    этого бюджета: им ждать можно, форме — нельзя.
+    Если снимок устарел (или его нет), форма всё равно открывается сразу: она отдаёт то,
+    что есть, и просит обновить снимок в фоне — к следующему открытию он будет свежим.
+    Поток демон и один на процесс: у зависшего FastGen иначе копились бы потоки ровно
+    тогда, когда ему хуже всего.
     """
+    snap = {}
+    getter = getattr(m, "fastgen_models_snapshot", None)
+    if getter:
+        try:
+            snap = getter() or {}
+        except Exception:                                          # noqa: BLE001
+            snap = {}
+    models = snap.get("models") if isinstance(snap.get("models"), dict) else {}
+    checked = snap.get("checked")
+    fresh = isinstance(checked, (int, float)) and (time.time() - checked) < _FG_SNAPSHOT_TTL
+    if not fresh:
+        _fg_refresh_async(m)
+    return dict(models)
+
+
+def _fg_refresh_async(m) -> None:
+    """Обновить снимок статусов в фоне, не задерживая форму."""
     keys_fn = getattr(m, "keys", None)
     first_cred = getattr(m, "_first_credential", None)
     status_fn = getattr(m, "fastgen_status", None)
     if not (keys_fn and first_cred and status_fn):
-        return {}
-    try:
-        key = first_cred(keys_fn(), "googler")
-        if not key:
-            return {}
-        # Один фоновый вызов за раз. Если FastGen завис, каждое открытие формы иначе
-        # запускало бы ещё один поток и ещё одну серию запросов к провайдеру, который и
-        # так не отвечает, — нагрузка росла бы ровно тогда, когда ему хуже всего. Пока
-        # предыдущий вызов не вернулся, форма сразу получает «нет данных».
-        with _FG_INFLIGHT_LOCK:
-            if _FG_INFLIGHT["busy"]:
-                return {}
-            _FG_INFLIGHT["busy"] = True
-        box = {}
-        done = threading.Event()
+        return
+    with _FG_INFLIGHT_LOCK:
+        if _FG_INFLIGHT["busy"]:
+            return
+        _FG_INFLIGHT["busy"] = True
 
-        def _call():
-            try:
-                box["st"] = status_fn(key)
-            except Exception:                                      # noqa: BLE001
-                pass
-            finally:
-                with _FG_INFLIGHT_LOCK:
-                    _FG_INFLIGHT["busy"] = False
-                done.set()
+    def _call():
+        try:
+            key = first_cred(keys_fn(), "googler")
+            if key:
+                status_fn(key)          # сам положит снимок в admin_state
+        except Exception:                                          # noqa: BLE001
+            pass
+        finally:
+            with _FG_INFLIGHT_LOCK:
+                _FG_INFLIGHT["busy"] = False
 
-        threading.Thread(target=_call, daemon=True).start()
-        if not done.wait(timeout=_FG_FORM_BUDGET_SEC):
-            return {}          # не уложились в бюджет — «нет данных», форма открывается
-        st = box.get("st")
-        if st is None:
-            return {}
-    except Exception:                                              # noqa: BLE001
-        return {}
-    return {row.get("id"): row.get("txt") for row in (st.get("models") or [])
-            if row.get("id")}
+    threading.Thread(target=_call, daemon=True).start()
 
 
 def _image_models(m):
@@ -179,11 +177,17 @@ def _image_models(m):
     for k, v in m.IMAGE_MODELS.items():
         if k in _HIDDEN_IMAGE_MODELS:
             continue
-        label = f"{v[0]} · {v[1]}"
         provider = v[2] if len(v) > 2 else ""
+        # Провайдер в подписи у ВСЕХ моделей (18.09.2026): раньше его было видно только
+        # у Veo — и то потому, что он попал в само имя модели у кабинета. Имя чистим от
+        # такой скобки, иначе выйдет «… (Veo) · VeoNonStop».
+        name = re.sub(r"\s*\((Veo|VeoNonStop|OpenAI)\)\s*$", "", str(v[0])).strip()
+        parts = [name, str(v[1]), _IMAGE_PROVIDER_TITLE.get(provider, provider)]
         if provider == "recrafter":
-            label += f" · {status.get(k, 'нет данных')}"
-        out.append((k, label))
+            # Статус есть только у FastGen: у Veo и OpenAI health-API нет вовсе, и
+            # «нет данных» у них означало бы «источник молчит», а источника нет.
+            parts.append(status.get(k) or "статуса нет")
+        out.append((k, " · ".join(p for p in parts if p)))
     return out
 
 
@@ -275,6 +279,13 @@ REWRITE_LANG_ISO = {
     "Simplified Chinese": "zh", "Japanese": "ja", "Korean": "ko", "Vietnamese": "vi",
     "Thai": "th", "Indonesian": "id",
 }
+
+
+def lang_options_for_form(mod=None) -> list:
+    """Список языков «код → подпись» для любой формы пульта: карта голосов в пресете и
+    язык канала. Один источник на оба места (18.09.2026): канал с кодом, которого нет в
+    списке пресета, остался бы без голоса и без рерайта."""
+    return _lang_options(mod if mod is not None else sys.modules.get("main"))
 
 
 def _lang_options(m):

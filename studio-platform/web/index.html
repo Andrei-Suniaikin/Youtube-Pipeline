@@ -569,6 +569,21 @@ function dur(sec){
 // самого рерайта, поэтому в таблицу «свои ключи» не попадает — но искать его человек
 // будет именно здесь: без него выпуск встаёт на первом шаге с «нет доступных ключей
 // провайдера». Значение ключа наружу не отдаётся, видно только «задан или нет».
+// Язык канала — списком (18.09.2026). Уже сохранённый код, которого нет в списке, не
+// теряется: он остаётся отдельным выбранным пунктом, как у моделей и языков карты голосов.
+function langOptionsHtml(langs, cur){
+  if (!langs.length)
+    return `<input id="f-lang" value="${esc(cur || '')}" style="width:60px">`;
+  const known = langs.some(l => String(l.value) === String(cur || ''));
+  return `<select id="f-lang" style="width:230px">
+    <option value=""${cur ? '' : ' selected'}>— не выбран —</option>
+    ${known || !cur ? '' : `<option value="${esc(cur)}" selected>${esc(cur)
+      } — нет в списке, но сохранён</option>`}
+    ${langs.map(l => `<option value="${esc(l.value)}"${
+      String(l.value) === String(cur || '') ? ' selected' : ''}>${esc(l.title)}</option>`).join('')}
+  </select>`;
+}
+
 function rewriteRowHtml(rw){
   const state = !rw.ok
     ? `<span class="note bad">${esc(rw.why || 'рерайт не ответил')}</span>`
@@ -748,8 +763,13 @@ async function viewChannels(){
   };
   // Пункт 6.1 ТЗ: поле ID канала необязательное — канал иногда заводят раньше, чем
   // узнают его настоящий ID на YouTube (см. также `pub_schema.py`, `pub_ui.clean_uc`).
-  bar.querySelector('#newch').onclick = () => {
+  bar.querySelector('#newch').onclick = async () => {
     if (document.getElementById('newch-form')) return;
+    // Язык выбирается списком, а не вписывается руками (18.09.2026): свой код языка
+    // канала потом не совпадёт с картой голосов пресета, и ролик выйдет без голоса.
+    let langs = [];
+    try{ langs = (await api('/ui/channels/new')).languages || []; }
+    catch(e){ toast(e.message); }
     const form = $(`<div class="card" id="newch-form" style="margin-bottom:16px">
       <div class="sec">Новый канал</div>
       <div class="secbody">
@@ -761,8 +781,12 @@ async function viewChannels(){
         можно будет позже, на вкладке «Настройки» этого канала — и только один раз.</div>
       <div class="fldrow"><label>Название</label><input id="nm" style="width:340px"></div>
       <div class="fldrow"><label>Язык / ниша</label>
-        <input id="lg" placeholder="pl" style="width:70px">
-        <input id="nc" style="width:240px"></div>
+        ${langs.length
+          ? `<select id="lg" style="width:230px"><option value="">— не выбран —</option>${
+              langs.map(l => `<option value="${esc(l.value)}">${esc(l.title)}</option>`).join('')
+            }</select>`
+          : `<input id="lg" placeholder="pl" style="width:70px">`}
+        <input id="nc" style="width:240px" placeholder="ниша"></div>
       <div class="note muted">Расписание, пресеты и профиль — в карточке,
         она откроется сразу.</div>
       <div style="margin-top:12px"><button id="go">Создать</button>
@@ -1044,10 +1068,18 @@ async function viewChannel(id){
 function calendarFeed(d){
   // Черта «сейчас» между прошлым и будущим: без неё пропуск и свободный слот
   // выглядят одинаково, а это разные вещи.
+  //
+  // Порядок (18.09.2026, жалоба владельца): сверху — ближайший будущий выход, ниже
+  // черта «сейчас», под ней прошлое свежим вперёд. Сервер отдаёт ленту по возрастанию
+  // (web/app.py `_calendar`) — и человек первым делом видел прошлогоднее, а не то,
+  // что происходит сейчас. Сортируем в представлении: порядок сервера нужен его же
+  // расчётам (счётчики, сетка по дням, «за горизонтом»).
+  const future = d.calendar.filter(r => !r.past).slice().reverse();
+  const past = d.calendar.filter(r => r.past).slice().reverse();
   const rows = [];
   let drawn = false;
-  for (const r of d.calendar){
-    if (!r.past && !drawn){ rows.push('<div class="today"><span>сейчас</span></div>'); drawn = true; }
+  for (const r of [...future, ...past]){
+    if (r.past && !drawn){ rows.push('<div class="today"><span>сейчас</span></div>'); drawn = true; }
     const when_ = new Date(r.at * 1000).toLocaleString('ru-RU',
       {weekday:'short', day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
     const link = r.project_id ? `#/release/${esc(r.release_id)}` : (r.donor_url || '');
@@ -1408,6 +1440,20 @@ function wireReleaseDrop(root){
   });
 }
 
+// Поле карточки пакетного запуска: select — если у поля есть варианты (их даёт
+// `preset_fields`), иначе обычный ввод. Пустое значение всегда первое: «как в проекте».
+function fieldSelectHtml(kind, f){
+  const id = `b-${kind}-${f.key}`;
+  if ((f.options || []).length)
+    return `<select id="${id}" data-bk="${kind}" data-key="${esc(f.key)}"
+              style="width:100%;margin-top:6px" title="${esc(f.hint || f.label)}">
+      <option value="">${esc(f.label)}: как в проекте</option>
+      ${f.options.map(o => `<option value="${esc(String(o.value))}">${esc(o.title)}</option>`)
+        .join('')}</select>`;
+  return `<input id="${id}" data-bk="${kind}" data-key="${esc(f.key)}"
+            placeholder="${esc(f.label)}: как в проекте" style="width:100%;margin-top:6px">`;
+}
+
 async function viewProjects(){
   const d = await api('/ui/projects');
   app.innerHTML = '';
@@ -1418,58 +1464,17 @@ async function viewProjects(){
     </div>`);
   app.append(bar);
 
-  document.getElementById('newp').onclick = () => {
-    if (document.getElementById('npform')) return;
-    const form = $(`<div class="card" id="npform" style="margin-bottom:16px">
-      <div class="sec">Новый проект</div>
-      <div class="secbody">
-      <div id="err"></div>
-      <div class="row"><label>Название</label>
-        <input id="nm" placeholder="как называть ролик" style="width:100%"></div>
-      <div class="row" style="margin-top:8px"><label>Текст</label>
-        <textarea id="tx" rows="10" style="width:100%"
-          placeholder="Текст, который будет озвучен. По нему же строятся кадры."></textarea></div>
-      <div class="row" style="margin-top:8px"><label>Или файл .txt</label>
-        <input id="txfile" type="file" accept=".txt,text/plain"></div>
-      <div class="note muted">Название и текст — разные поля: название не читается вслух.
-        Пустое название возьмётся из первой строки, а при загрузке файла — из его имени.
-        Ручку на сервере файл не заводит новую: браузер сам читает его в поле текста.</div>
-      <div style="margin-top:12px"><button id="go">Завести</button>
-        <button class="ghost" id="no">Отмена</button></div>
-    </div></div>`);
-    bar.after(form);
-    const err = form.querySelector('#err');
-    form.querySelector('#no').onclick = () => form.remove();
-    // Файл читается в браузере, а не отправляется отдельной ручкой: серверу всё равно
-    // не нужен файл сам по себе, ему нужен текст, а он и так едет полем формы.
-    // TextDecoder с fatal:true — единственный способ узнать, что байты не UTF-8, а не
-    // молча подставить кракозябры вместо текста, который потом озвучат.
-    form.querySelector('#txfile').onchange = async (e) => {
-      const file = e.target.files && e.target.files[0];
-      if (!file) return;
-      try{
-        const buf = await file.arrayBuffer();
-        const text = new TextDecoder('utf-8', {fatal: true}).decode(buf);
-        form.querySelector('#tx').value = text;
-        const nm = form.querySelector('#nm');
-        if (!nm.value.trim()) nm.value = file.name.replace(/\.[^./\\]+$/, '');
-      }catch(readErr){
-        // Имя не err: снаружи уже есть переменная err — контейнер сообщений об ошибке
-        // формы; одноимённый catch её тут не трогает, но следующая правка внутри catch
-        // легко написала бы не туда по невнимательности.
-        toast(`файл «${file.name}» не в UTF-8 — пересохраните его в этой кодировке`);
-      }finally{
-        e.target.value = '';
-      }
-    };
-    form.querySelector('#go').onclick = async () => {
-      err.innerHTML = '';
-      try{
-        const out = await post('/ui/projects', {name: form.querySelector('#nm').value,
-                                                text: form.querySelector('#tx').value});
-        location.hash = '#/project/' + encodeURIComponent(out.id);
-      }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
-    };
+  document.getElementById('newp').onclick = async () => {
+    // Один клик — и сразу на «Сценарий» (18.09.2026). Раньше форма спрашивала название
+    // и текст, а вкладка «Сценарий» тут же спрашивала то же самое второй раз: донора,
+    // текст или файл. Имя даётся временное и правится на самом экране проекта.
+    const btn = document.getElementById('newp');
+    btn.disabled = true;
+    try{
+      const out = await post('/ui/projects', {});
+      location.hash = `#/project/${encodeURIComponent(out.id)}/scenario`;
+    }catch(e){ toast(e.message); }
+    finally{ btn.disabled = false; }
   };
 
   if (!d.projects.length){
@@ -1478,13 +1483,46 @@ async function viewProjects(){
     return;
   }
   const mark = (ok, txt) => `<span class="pill ${ok ? 's-done' : 's-idle'}">${txt}</span>`;
-  const batch = $(`<div class="card" style="margin-bottom:16px;padding:16px 18px">
-    <button id="batchgo" class="small" disabled>Сделать всё для отмеченных</button>
-    <span class="muted" id="batchn" style="margin-left:10px">отмечено: 0</span>
-    <div class="note muted" style="margin-top:10px">Кнопка ставит существующую задачу «сделать всё» по каждому
-      отмеченному проекту — с его собственными настройками, без общих переопределений.
-      Кнопка «Запустить» внутри проекта остаётся: там можно подставить свои поля
-      для одного прогона.</div></div>`);
+  // Частичный прогон пачкой (18.09.2026): по кнопке на каждый этап, как было в
+  // кабинете. «Сделать всё» осталось — теперь одним запросом на весь пакет, а не
+  // отдельным на каждый проект.
+  let batchFields = {};
+  try{ batchFields = (await api('/ui/projects/batch/fields')).kinds || {}; }
+  catch(e){ toast(e.message); }
+  const BATCH_ORDER = ['tts', 'images', 'video', 'render'];
+  const batch = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Запуск для отмеченных
+      <span class="muted" id="batchn" style="float:right;font-weight:400;
+        text-transform:none;letter-spacing:0">отмечено: 0</span></div>
+    <div class="secbody">
+      <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:stretch">
+        ${BATCH_ORDER.map(kind => {
+          const k = batchFields[kind] || {title: kind, fields: []};
+          const main = (k.fields || [])[0];
+          const extra = (k.fields || []).slice(1);
+          return `<div style="flex:1 1 220px;min-width:220px;border:1px solid var(--line);
+                    border-radius:10px;padding:12px">
+            <div style="font-weight:600;margin-bottom:8px">${esc(k.title)}</div>
+            ${main ? fieldSelectHtml(kind, main) : ''}
+            <button class="small bgo" data-kind="${kind}" disabled
+              style="width:100%;margin-top:10px">Сделать</button>
+            <button class="ghost small bcancel" data-kind="${kind}" disabled
+              style="width:100%;margin-top:6px">Отменить</button>
+            ${extra.length ? `<details style="margin-top:9px">
+              <summary class="muted" style="cursor:pointer;font-size:12px">Доп. настройки</summary>
+              ${extra.map(f => fieldSelectHtml(kind, f)).join('')}</details>` : ''}
+          </div>`;
+        }).join('')}
+      </div>
+      <button id="batchgo" class="small" disabled
+        style="width:100%;margin-top:14px">Сделать всё для отмеченных</button>
+      <button class="ghost small bcancel" data-kind="all" disabled
+        style="width:100%;margin-top:6px">Отменить всё у отмеченных</button>
+      <div class="note muted" style="margin-top:10px">Пустое поле — «как в проекте»:
+        настройки проекта не перетираются. Видео и рендер у неготовых проектов ставятся
+        отложенно — стартуют сами, когда материалы дозреют. «Отменить» снимает и уже
+        идущие задачи, и отложенный авто-запуск; готовые файлы не удаляются.</div>
+    </div></div>`);
   app.append(batch);
   const card = $(`<div class="card"><table>
     <thead><tr><th style="width:26px"><input type="checkbox" id="pickall"></th>
@@ -1536,54 +1574,71 @@ async function viewProjects(){
   const refreshCount = () => {
     const n = picks().length;
     countEl.textContent = `отмечено: ${n}`;
-    goBtn.disabled = n === 0;
+    batch.querySelectorAll('button.bgo, button.bcancel, #batchgo')
+      .forEach(b => b.disabled = n === 0);
   };
   card.querySelectorAll('input.pick').forEach(cb => cb.onchange = refreshCount);
   card.querySelector('#pickall').onchange = (e) => {
     card.querySelectorAll('input.pick').forEach(cb => cb.checked = e.target.checked);
     refreshCount();
   };
+
+  // Кнопки этапов. Значения полей карточки уходят как есть: пустые кабинет
+  // отбрасывает сам и берёт настройку проекта.
+  const batchValues = kind => {
+    const out = {};
+    batch.querySelectorAll(`[data-bk="${kind}"]`).forEach(el => {
+      if (el.value.trim()) out[el.dataset.key] = el.value.trim();
+    });
+    return out;
+  };
+  const batchToast = (out, n) => {
+    const enq = out.enqueued || 0, def = out.deferred || 0, skip = out.skipped || 0;
+    toast(`проектов: ${n} — поставлено задач: ${enq}${def ? `, отложено: ${def}` : ''}${
+      skip ? `, пропущено: ${skip}` : ''}${
+      out.block_reason && !enq && !def ? ' — ' + out.block_reason : ''}`,
+      (enq || def) ? 'ok' : 'bad');
+  };
+  batch.querySelectorAll('button.bgo').forEach(b => b.onclick = async () => {
+    const ids = picks();
+    if (!ids.length) return;
+    b.disabled = true;
+    try{
+      const out = await post(`/ui/projects/batch/${b.dataset.kind}`,
+                             {pids: ids, values: batchValues(b.dataset.kind)});
+      batchToast(out, ids.length);
+    }catch(e){ toast(e.message); }
+    finally{ b.disabled = false; setTimeout(() => viewProjects(), 1200); }
+  });
+  batch.querySelectorAll('button.bcancel').forEach(b => b.onclick = () => {
+    const ids = picks();
+    if (!ids.length) return;
+    confirmInline(b, 'Отменить у отмеченных? Снимутся и отложенные авто-запуски.',
+      async () => {
+        b.disabled = true;
+        try{
+          const out = await post(`/ui/projects/batch/cancel/${b.dataset.kind}`, {pids: ids});
+          toast(`остановлено: ${out.cancelled || 0}, снято отложенных: ${
+            out.cleared || 0}`, 'ok');
+        }catch(e){ toast(e.message); }
+        finally{ b.disabled = false; setTimeout(() => viewProjects(), 1200); }
+      });
+  });
   goBtn.onclick = async () => {
     const ids = picks();
+    if (!ids.length) return;
     goBtn.disabled = true;
-    // Одним тостом на весь пакет: «поставлено 0» без объяснения выглядело бы как
-    // несработавшая кнопка (тот же принцип, что и у одиночного «Запустить» выше).
-    let enq = 0, def = 0, skip = 0;
-    // Причина — на счётчик, а не на список строк: отметив двадцать проектов одного
-    // канала без ключа, человек получал бы одну и ту же фразу
-    // двадцать раз в тосте, который живёт пять секунд и не читается построчно. Здесь
-    // одинаковые причины схлопываются, и рядом остаётся число проектов.
-    const reasons = new Map();
-    for (const pid of ids){
-      try{
-        const out = await post(`/ui/projects/${encodeURIComponent(pid)}/run`, {});
-        enq += out.enqueued || 0;
-        def += out.deferred || 0;
-        skip += out.skipped || 0;
-        // out.block_reason у этой ручки в успешный ответ не попадает: при одиночном
-        // pid (а батч зовёт /run по одному) полная блокировка всегда отвечает кодом
-        // 400 (server/main.py:4529-4530), а не 200 с заполненным block_reason — этот
-        // случай приходит ниже, через catch.
-      }catch(e){
-        // Сессия истекла посреди пакета — это не «причина отказа» проекта, а «войдите
-        // снова»: тот же случай и тот же уход на экран входа, что и в render() при
-        // обычной навигации. Остаток пакета не имеет смысла продолжать без сессии.
-        if (e instanceof NeedLogin){ ME = null; return viewLogin(''); }
-        skip += 1;
-        reasons.set(e.message, (reasons.get(e.message) || 0) + 1);
-      }
-    }
-    const reasonText = [...reasons].map(([text, n]) =>
-      n > 1 ? `${text} (×${n})` : text).join('; ');
-    // «Проектов» и «задач» — разные единицы (один проект даёт до двух поставленных и
-    // ровно две отложенные задачи, server/main.py:4512-4525): назвать их отдельно,
-    // иначе «из 3: поставлено 6» читается как ошибка арифметики.
-    toast(`проектов: ${ids.length} — поставлено задач: ${enq}${def ? `, отложено: ${def}` : ''}${
-      skip ? `, пропущено: ${skip}` : ''}${
-      reasonText ? ' — ' + reasonText : ''}`, enq ? 'ok' : 'bad');
-    // Та же пауза, что у одиночного «Запустить» (rgo, выше по файлу): кабинету нужно
-    // время записать статусы после постановки задач, и немедленное перечитывание после
-    // пакета с большей вероятностью показало бы ещё старый список.
+    // Один запрос на весь пакет (18.09.2026): раньше пульт слал по одному на проект —
+    // двадцать отмеченных означали двадцать последовательных походов в кабинет.
+    try{
+      const out = await post('/ui/projects/batch/pipeline', {pids: ids});
+      batchToast(out, ids.length);
+    }catch(e){
+      // Сессия истекла посреди пакета — это не «причина отказа» проекта, а «войдите
+      // снова»: тот же уход на экран входа, что и в render() при обычной навигации.
+      if (e instanceof NeedLogin){ ME = null; return viewLogin(''); }
+      toast(e.message);
+    }finally{ goBtn.disabled = false; }
     setTimeout(() => viewProjects(), 1200);
   };
 
@@ -1620,7 +1675,7 @@ const TAB_KINDS = {scenario: ['prompts'], tts: ['tts'], images: ['images', 'rege
 const TAB_SETTINGS_GROUP = {tts: 'Озвучка', images: 'Картинки', video: 'Клипы',
                             render: 'Сборка'};
 
-/* ─────────────────── статус проекта пятью сегментами ─────────────────── */
+/* ─────────────────── статус проекта по этапам ─────────────────── */
 // `project_stage_status` (Ф1, server/main.py) отдаёт tone/state кабинетными именами
 // (`running`/`error`/`queued`/`done`/`muted`/`dim`) — это переменные ЕГО палитры
 // (`var(--running)` и т.п.). У пульта своя палитра (см. :root вверху файла), поэтому
@@ -1631,10 +1686,16 @@ const STAGE_TONE_VAR = {running: '--run', error: '--bad', queued: '--wait',
                         done: '--ok', muted: '--muted', dim: '--off'};
 const STAGE_SEG_CLS = {done: 'done', running: 'running', queued: 'queued',
                        error: 'error', pending: 'off'};
+// Подписи этапов: до 18.09.2026 в подсказке стоял внутренний код («tts», «cover»),
+// а плиток было пять при шести вкладках — шестую (обложку) добавили в
+// `project_stage_status`, здесь её надо ещё и назвать по-человечески.
+const STAGE_SEG_TITLE = {text: 'сценарий', tts: 'озвучка', images: 'картинки',
+                         video: 'видео', render: 'рендер', cover: 'обложка'};
 function stageStripHtml(stage){
   if (!stage || !(stage.segments || []).length) return '';
   const bar = stage.segments.map(s =>
-    `<i class="${STAGE_SEG_CLS[s.state] || 'off'}" title="${esc(s.stage)}"></i>`).join('');
+    `<i class="${STAGE_SEG_CLS[s.state] || 'off'}" title="${
+      esc(STAGE_SEG_TITLE[s.stage] || s.stage)}"></i>`).join('');
   return `<div class="segs" style="max-width:320px;margin-top:9px">${bar}</div>
     <div class="note" style="color:var(${STAGE_TONE_VAR[stage.tone] || '--muted'})"
       >${esc(stage.caption)}</div>`;
@@ -2189,7 +2250,11 @@ async function renderScenarioTab(d){
     <div class="note muted" style="margin-top:18px;border-top:1px solid var(--line);
       padding-top:12px">Исходный текст</div>
     <textarea id="src-text" style="margin-top:6px">${esc(d.source)}</textarea>
-    <div style="margin-top:8px"><button id="src-save">Сохранить текст</button></div>
+    <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="src-save">Сохранить текст</button>
+      <label class="muted" style="font-size:12.5px">или файлом:
+        <input id="src-file" type="file" accept=".txt,text/plain"></label>
+    </div>
     <div class="note muted">Edge режет текст по строкам/абзацам — короткие абзацы
       могут потеряться при озвучке этим движком.</div>
     </div></div>`);
@@ -2245,6 +2310,23 @@ async function renderScenarioTab(d){
     finally{ btn.disabled = false; }
   };
   await refreshScenarioJobs(card.querySelector('#tx-jobs'), p.id, srcText);
+
+  // Файл .txt читается в браузере (18.09.2026 переехал сюда из формы заведения
+  // проекта): серверу нужен текст, а не файл, и он уже едет тем же полем.
+  // TextDecoder с fatal — единственный способ отличить не-UTF-8 от кракозябр, которые
+  // потом озвучат.
+  const srcFile = card.querySelector('#src-file');
+  if (srcFile) srcFile.onchange = async e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try{
+      const text = new TextDecoder('utf-8', {fatal: true}).decode(await file.arrayBuffer());
+      card.querySelector('#src-text').value = text;
+      toast('Файл прочитан — нажмите «Сохранить текст»', 'ok');
+    }catch(readErr){
+      toast(`файл «${file.name}» не в UTF-8 — пересохраните его в этой кодировке`);
+    }finally{ e.target.value = ''; }
+  };
 
   card.querySelector('#src-save').onclick = async () => {
     const btn = card.querySelector('#src-save');
@@ -2533,7 +2615,8 @@ async function viewProject(id){
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/projects">‹ Все проекты</a>
     <div class="head">
-      <div><h1>${esc(p.name)}</h1>
+      <div><h1 id="pname" title="Нажмите, чтобы переименовать"
+             style="cursor:text">${esc(p.name)}</h1>
         <p class="sub"><span class="mono">${esc(p.id)}</span>
           ${p.release_id ? ` · выпуск <a href="#/release/${
             encodeURIComponent(p.release_id)}">${esc(p.release_id)}</a> · фаза ${
@@ -2542,6 +2625,32 @@ async function viewProject(id){
       </div>
       <button id="runall" class="small ghost">Сделать всё</button>
     </div>`));
+
+  // Имя правится прямо в заголовке: при заведении его больше не спрашивают
+  // (18.09.2026), и «Проект от 18.09 14:20» в списке из сорока проектов ничего не
+  // говорит. Сохраняется по Enter или уходу фокуса, пустое имя не принимается.
+  const h1 = app.querySelector('#pname');
+  if (h1) h1.onclick = () => {
+    if (h1.querySelector('input')) return;
+    const was = h1.textContent.trim();
+    h1.innerHTML = `<input id="pname-in" value="${esc(was)}"
+      style="font-size:inherit;font-weight:inherit;width:min(520px,100%)">`;
+    const inp = h1.querySelector('#pname-in');
+    inp.focus();
+    inp.select();
+    const save = async () => {
+      const name = inp.value.trim();
+      if (!name || name === was){ h1.textContent = was; return; }
+      try{
+        await post(`/ui/projects/${encodeURIComponent(p.id)}/name`, {name});
+        h1.textContent = name;
+        toast('Название изменено', 'ok');
+      }catch(e){ h1.textContent = was; toast(e.message); }
+    };
+    inp.onkeydown = ev => { if (ev.key === 'Enter') inp.blur();
+                            if (ev.key === 'Escape'){ inp.onblur = null; h1.textContent = was; } };
+    inp.onblur = save;
+  };
 
   // «Сделать всё» — ровно одна кнопка на экране (ФР §4 п.8), видна на любой вкладке,
   // сама форма сворачиваема, чтобы не занимать место на каждый день.
@@ -2861,7 +2970,7 @@ async function wireChannelEdit(root, c){
         <input id="f-name" value="${esc(c.name)}" style="width:300px"></div>
       <div class="fldrow"><label>Хэндл / язык / ниша</label>
         <input id="f-handle" value="${esc(c.handle || '')}" style="width:150px">
-        <input id="f-lang" value="${esc(c.lang_raw ?? c.lang ?? '')}" style="width:60px">
+        ${langOptionsHtml(ref.languages || [], c.lang_raw ?? c.lang ?? '')}
         <input id="f-niche" value="${esc(c.niche || '')}" style="width:180px"></div>
       <div class="fldrow"><label>Дни</label>
         <span class="langs" style="max-height:none;border:0;padding:0">${
@@ -4048,9 +4157,10 @@ async function viewPresets(){
       if (g.service !== 'vsgen' && F.q && !items.length && !g.error) continue;
       shown++;
       const card = $(`<div class="card" style="margin-bottom:16px">
-      <div class="sec">${esc(g.title)}${g.home
-        ? ` <a class="mklink" href="${esc(g.home)}" target="_blank" rel="noopener"
-             >завести в ${esc(g.home_title)} ↗</a>` : ''}</div>
+      <div class="sec">${esc(g.title)}${g.service !== 'vsgen'
+        ? ` <button class="ghost small pnew" data-svc="${esc(g.service)}"
+              style="float:right;font-weight:400;text-transform:none;letter-spacing:0"
+              >Завести</button>` : ''}</div>
       ${g.error
         ? `<div class="stage"><div class="dot s-error">!</div><div class="body">
              <div class="name">Список не получен — ${esc(g.error)}</div>
@@ -4100,6 +4210,10 @@ function wirePresets(root){
   // интерфейс: до 18.09.2026 их можно было только скопировать или удалить.
   root.querySelectorAll('button.pform').forEach(b => b.onclick =
     () => neighbourPresetModal(b.dataset.svc, b.dataset.name));
+  // Завести пресет обложек, рерайта или бриф — тем же окном, что и правка (18.09.2026).
+  // Раньше из пульта их можно было только скопировать: заведение жило в чужом сервисе.
+  root.querySelectorAll('button.pnew').forEach(b => b.onclick =
+    () => neighbourPresetModal(b.dataset.svc, null));
   root.querySelectorAll('button.pcopy').forEach(b => b.onclick = () => {
     askInline(b, {value: b.dataset.name + ' — копия', ok: 'Скопировать'}, to =>
       ask(b, () => post(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/copy`,
@@ -4115,10 +4229,13 @@ function wirePresets(root){
 // Окно правки пресета соседа. Поля описывает сервер (NEIGHBOUR_PRESET_FIELDS) — здесь
 // только отрисовка: второй список полей в браузере разошёлся бы с первым.
 async function neighbourPresetModal(service, name){
+  const creating = !name;
   let d;
-  try{ d = await api(`/ui/presets/${encodeURIComponent(service)}/${
-    encodeURIComponent(name)}/form`); }
-  catch(e){ toast(e.message); return; }
+  try{
+    d = await api(creating
+      ? `/ui/presets/${encodeURIComponent(service)}/new/form`
+      : `/ui/presets/${encodeURIComponent(service)}/${encodeURIComponent(name)}/form`);
+  }catch(e){ toast(e.message); return; }
 
   const fieldHtml = f => {
     const id = 'np-' + f.key;
@@ -4160,9 +4277,13 @@ async function neighbourPresetModal(service, name){
     return '';
   };
 
-  const m = modal(`Пресет «${name}»`,
-    `<div class="fields" style="padding:0">${d.fields.map(fieldHtml).join('')}</div>`,
-    {ok: 'Сохранить', onOk: async (box, close) => {
+  const nameHtml = creating
+    ? `<div class="fld" style="grid-column:1/-1"><label for="np-name">Название</label>
+         <input id="np-name" placeholder="как называть пресет"></div>`
+    : '';
+  const m = modal(creating ? 'Новый пресет' : `Пресет «${name}»`,
+    `<div class="fields" style="padding:0">${nameHtml}${d.fields.map(fieldHtml).join('')}</div>`,
+    {ok: creating ? 'Завести' : 'Сохранить', onOk: async (box, close) => {
       const values = {};
       box.querySelectorAll('[data-key]').forEach(el => {
         const f = d.fields.find(x => x.key === el.dataset.key) || {};
@@ -4176,8 +4297,14 @@ async function neighbourPresetModal(service, name){
           channel: r.querySelector('.np-ch').value.trim(),
         })).filter(x => x.code);
       }
-      await post(`/ui/presets/${encodeURIComponent(service)}/${
-        encodeURIComponent(name)}/form`, {values});
+      if (creating){
+        const nm = box.querySelector('#np-name').value.trim();
+        if (!nm) throw new Error('Название пустое.');
+        await post(`/ui/presets/${encodeURIComponent(service)}/new`, {name: nm, values});
+      }else{
+        await post(`/ui/presets/${encodeURIComponent(service)}/${
+          encodeURIComponent(name)}/form`, {values});
+      }
       close();
       await render();
     }});
@@ -4211,7 +4338,11 @@ async function neighbourPresetModal(service, name){
 
   // Картинка-образец уходит сразу: файл хранит Cover Studio, а не форма.
   const ref = m.body.querySelector('#np-ref');
-  if (ref) ref.onchange = async () => {
+  if (ref && creating){
+    ref.disabled = true;
+    ref.title = 'Образец стиля прикрепляется после заведения пресета';
+  }
+  if (ref && !creating) ref.onchange = async () => {
     const file = ref.files && ref.files[0];
     if (!file) return;
     const fd = new FormData();

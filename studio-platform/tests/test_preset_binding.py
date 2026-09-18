@@ -261,7 +261,8 @@ def main() -> int:
     check("карта голосов по-прежнему разбирается parse_voice_map после сборки браузером",
           PF.parse_voice_map(assembled), {"ru": "id-1", "en": "id-2"})
 
-    print("\nСтатус моделей FastGen в подписи (пункт 2.1 ТЗ, батч 16.09.2026)")
+    print("\nСтатус моделей FastGen и провайдер в подписи (пункт 2.1 ТЗ; 18.09.2026 —"
+          " статус из снимка, провайдер у всех моделей)")
 
     def image_options(cab):
         for g in PF.describe(cab, {}):
@@ -285,43 +286,48 @@ def main() -> int:
             return cfg.get(family, "")
 
         @staticmethod
-        def fastgen_status(key):
-            return {"models": [{"id": "NARWHAL", "txt": "работает"}]}
+        def fastgen_models_snapshot():
+            return {"checked": time.time(), "models": {"NARWHAL": "работает"}}
 
     opts = image_options(CabinetWithStatus)
-    check("статус дописан у найденной модели FastGen",
-          opts["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · работает")
-    check("модель FastGen, которой нет в ответе, — «нет данных»",
-          opts["OPENAI"], "OpenAI · 1 кр · нет данных")
-    check("у GPT Image статуса нет вовсе — ничего не дописано",
-          opts["GPT_IMAGE2"], "GPT Image 2.5 · платно · $")
+    check("статус из снимка дописан у модели FastGen",
+          opts["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · FastGen · работает")
+    check("модель FastGen, которой нет в снимке, — «статуса нет», а не выдуманное «работает»",
+          opts["OPENAI"], "OpenAI · 1 кр · FastGen · статуса нет")
+    check("у GPT Image health-API нет — статус не дописан, но виден провайдер",
+          opts["GPT_IMAGE2"], "GPT Image 2.5 · платно · $ · OpenAI")
 
-    print("\n  форма открывается, даже когда fastgen_status недоступен")
+    print("\n  форма открывается и когда снимка нет, и когда провайдер молчит")
 
-    class CabinetStatusDown(CabinetWithStatus):
+    class CabinetNoSnap(CabinetWithStatus):
+        @staticmethod
+        def fastgen_models_snapshot():
+            return {}
+
         @staticmethod
         def fastgen_status(key):
             raise RuntimeError("сеть недоступна")
 
-    opts_down = image_options(CabinetStatusDown)
-    check("сеть недоступна — статус «нет данных», форма не падает",
-          opts_down["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · нет данных")
+    check("снимка нет и сеть молчит — форма открывается и не врёт",
+          image_options(CabinetNoSnap)["NARWHAL"],
+          "Nano Banana 2 · Flow · 4 кр · FastGen · статуса нет")
 
-    class CabinetNoKey(CabinetWithStatus):
+    class CabinetNoKey(CabinetNoSnap):
         @staticmethod
         def keys():
             return {}
 
-    opts_nokey = image_options(CabinetNoKey)
-    check("ключа нет — статус «нет данных»",
-          opts_nokey["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · нет данных")
+    check("ключа нет — то же самое, без исключений",
+          image_options(CabinetNoKey)["NARWHAL"],
+          "Nano Banana 2 · Flow · 4 кр · FastGen · статуса нет")
 
-    check("у кабинета без fastgen_status статуса просто нет, форма открывается",
+    check("у кабинета без снимка и без fastgen_status форма всё равно собирается",
           bool(image_options(Cabinet)), True)
 
-    print("\n  форма не висит, если fastgen_status завис (доработка 4, Дополнение 16.09)")
+    print("\n  зависший провайдер не задерживает форму (жалоба владельца 18.09: раньше"
+          " живой опрос не укладывался в бюджет и статус не показывался никогда)")
 
-    class CabinetStatusHang(CabinetWithStatus):
+    class CabinetStatusHang(CabinetNoSnap):
         @staticmethod
         def fastgen_status(key):
             time.sleep(30)                     # имитация зависшего провайдера
@@ -330,10 +336,16 @@ def main() -> int:
     t0 = time.monotonic()
     opts_hang = image_options(CabinetStatusHang)
     elapsed = time.monotonic() - t0
-    check("завис — статус «нет данных», а не то, что вернулось бы через 30с",
-          opts_hang["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · нет данных")
-    check("форма уложилась в бюджет, не дождавшись зависшего вызова",
-          elapsed < PF._FG_FORM_BUDGET_SEC + 2, True)
+    check("статус честный, пока снимок не обновился",
+          opts_hang["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · FastGen · статуса нет")
+    check("форма собралась мгновенно, а не ждала провайдера", elapsed < 1.0, True)
+
+    # Старое поведение (ждать ответ прямо в форме) не должно вернуться: живой опрос
+    # занимает ~3.4с, и любое ожидание внутри describe() снова спрячет статус.
+    src = open(os.path.join(BASE, "server", "preset_fields.py"), encoding="utf-8").read()
+    body = src[src.index("def _fg_status_map(m):"):src.index("def _fg_refresh_async(m)")]
+    check("в пути формы нет ожидания ответа провайдера",
+          "wait(" in body or "join(" in body, False)
 
     print()
     if FAILS:

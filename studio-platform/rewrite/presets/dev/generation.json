@@ -1,0 +1,14 @@
+{
+  "updated_at": 1789716184.4304729,
+  "presets": {
+    "бриф-1789716035": {
+      "id": "brif-1789716035",
+      "name": "бриф-1789716035",
+      "target_length_words": 900,
+      "language": null,
+      "content": "Пиши коротко",
+      "created_at": 1789716035.830527,
+      "last_used_at": null
+    }
+  }
+}

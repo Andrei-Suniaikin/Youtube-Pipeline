@@ -105,7 +105,6 @@ def main() -> int:
         # может стоять предупреждение о том, чего не хватает каналу.
         ('«Поставить ролики»',
          '<div class="sec">Поставить ролики</div>\n    <div class="secbody">'),
-        ('новый проект', '<div class="sec">Новый проект</div>\n      <div class="secbody">'),
         ('перенос каналов списком',
          '<div class="sec">Перенести каналы списком</div>\n      <div class="secbody">'),
         ('новый канал', '<div class="sec">Новый канал</div>\n      <div class="secbody">'),
@@ -139,13 +138,15 @@ def main() -> int:
     check("ни одна строка с <table не получила класс .secbody",
           table_lines_with_secbody, [])
 
-    print("\nДоработка 4 (Дополнение 16.09): статус FastGen в форме — с бюджетом времени")
+    print("\nСтатус FastGen в форме — из снимка, а не живым опросом (18.09.2026)")
 
-    check("бюджет — положительное число не больше 3 секунд, как велит доработка 4",
-          0 < PF._FG_FORM_BUDGET_SEC <= 3.0, True)
-
+    # До 18.09 форма ходила в health-API с бюджетом 3с. Живой опрос занимает ~3.4с, и
+    # форма ВСЕГДА показывала «нет данных» (жалоба владельца, пункт 3 баглиста).
+    # Теперь статус берётся из снимка `main.fastgen_models_snapshot`, а обновляет его
+    # фоновый поток — форма не ждёт ни секунды.
     class Cabinet:
         IMAGE_MODELS = {"NARWHAL": ("Nano Banana 2 · Flow", "4 кр", "recrafter")}
+        asked = []
 
         @staticmethod
         def keys():
@@ -155,32 +156,47 @@ def main() -> int:
         def _first_credential(cfg, family):
             return cfg.get(family, "")
 
-    class CabinetFast(Cabinet):
+    class CabinetFresh(Cabinet):
+        @staticmethod
+        def fastgen_models_snapshot():
+            return {"checked": time.time(), "models": {"NARWHAL": "работает"}}
+
         @staticmethod
         def fastgen_status(key):
-            return {"models": [{"id": "NARWHAL", "txt": "работает"}]}
+            Cabinet.asked.append("не должен вызываться при свежем снимке")
+            return {}
 
     t0 = time.monotonic()
-    fast = dict(PF._image_models(CabinetFast))
-    elapsed_fast = time.monotonic() - t0
-    check("быстрый ответ — статус реальный, а не «нет данных»",
-          fast["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · работает")
-    check("быстрый ответ не ждёт бюджет целиком",
-          elapsed_fast < PF._FG_FORM_BUDGET_SEC, True)
+    fresh = dict(PF._image_models(CabinetFresh))
+    elapsed_fresh = time.monotonic() - t0
+    check("свежий снимок — статус реальный",
+          fresh["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · FastGen · работает")
+    check("форма не ходит в сеть при свежем снимке", Cabinet.asked, [])
+    check("и собирается мгновенно", elapsed_fresh < 0.5, True)
 
     class CabinetHang(Cabinet):
         @staticmethod
+        def fastgen_models_snapshot():
+            return {}                      # снимка ещё нет
+
+        @staticmethod
         def fastgen_status(key):
-            time.sleep(20)                      # заметно дольше бюджета в 3с
+            time.sleep(20)                 # провайдер завис
             return {"models": [{"id": "NARWHAL", "txt": "работает"}]}
 
     t0 = time.monotonic()
     hung = dict(PF._image_models(CabinetHang))
     elapsed_hang = time.monotonic() - t0
-    check("зависший провайдер — «нет данных», форма не ждёт ответа",
-          hung["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · нет данных")
-    check("время ожидания уложилось в бюджет (не 20с)",
-          elapsed_hang < PF._FG_FORM_BUDGET_SEC + 1, True)
+    check("снимка нет — так и сказано, форма не выдумывает статус",
+          hung["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · FastGen · статуса нет")
+    check("зависший провайдер форму не задерживает вовсе", elapsed_hang < 1.0, True)
+
+    class CabinetVeo:
+        IMAGE_MODELS = {"VEO_BANANA": ("Nano Banana Pro (Veo)", "ключ veo", "veo")}
+
+    check("у моделей без health-API статус не дописывается, а провайдер виден",
+          dict(PF._image_models(CabinetVeo))["VEO_BANANA"],
+          "Nano Banana Pro · ключ veo · VeoNonStop")
 
     print("\nДоработка 5 (Дополнение 16.09): job_logs рерайта — в .gitignore, не в git")
 

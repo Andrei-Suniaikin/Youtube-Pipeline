@@ -17,6 +17,7 @@ import datetime as dt
 import zoneinfo
 import json
 import os
+import re
 import secrets
 import sqlite3
 import sys
@@ -1555,6 +1556,19 @@ ACTIONS = {
 BASES = {"vsgen": None, "rewrite": REWRITE_BASE, "cover": COVER_BASE}
 
 
+# Не ходить за редиректом кабинета (18.09.2026). Раньше `urlopen` сам шёл по 302, а
+# кабинет на POST формы отвечает редиректом на свою страницу проекта — и каждый старт
+# этапа дополнительно рендерил её целиком (server/main.py `project_page`, сотни строк и
+# обходы каталога проекта). Человек ждал этот рендер на каждое нажатие «Начать».
+# Нам нужен только адрес из заголовка Location — в нём и лежит исход (`?job=`, `?dup=`…).
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_CABINET_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def _cabinet_form(path: str, fields, request, timeout: float = 0.0,
                   expect_json: bool = True) -> dict:
     """POST формой в кабинет от имени вошедшего человека.
@@ -1564,25 +1578,32 @@ def _cabinet_form(path: str, fields, request, timeout: float = 0.0,
     как есть: «повтор доступен только для ошибочной задачи» — это ответ, а не сбой.
 
     `expect_json=False` — для ручек, которые про «это fetch» не знают и отвечают
-    редиректом всегда (формы пресетов). Тогда нам важен только код ответа: прошло или
-    нет. Разбирать их HTML мы не станем — это не контракт, а страница.
+    редиректом всегда (старт этапа, формы пресетов). Нам важен адрес редиректа: в его
+    query лежит исход. Саму страницу мы не запрашиваем — это не контракт, а страница,
+    и её сборка занимала секунды на каждое нажатие.
     """
     data = urllib.parse.urlencode(fields).encode("utf-8")
     req = urllib.request.Request(CABINET_BASE + path, data=data, method="POST")
     req.add_header("Content-Type", "application/x-www-form-urlencoded")
     req.add_header("Cookie", f"{auth.COOKIE}={getattr(request.state, 'sid', '')}")
     req.add_header("X-Requested-With", "fetch")
+    # За редиректом не ходим только там, где нам нужен сам адрес: у JSON-ручек кабинета
+    # редиректа нет, и обычный `urlopen` для них короче и привычнее.
+    open_ = urllib.request.urlopen if expect_json else _CABINET_OPENER.open
     try:
-        with urllib.request.urlopen(req, timeout=timeout or NEIGHBOUR_TIMEOUT * 3) as resp:
+        with open_(req, timeout=timeout or NEIGHBOUR_TIMEOUT * 3) as resp:
             body = resp.read().decode("utf-8", "replace")
             if not expect_json:
-                # Батч C, Ф2, §5.3: `urlopen` сам идёт за 302 (POST→GET, как браузер),
-                # поэтому `resp.geturl()` — это конечный адрес с query-параметрами
-                # исхода (`?job=`, `?dup=`, `?imgbusy=1`…). Старт этапа разбирает эту
-                # строку — без неё пришлось бы гадать по одному только коду ответа.
                 return {"ok": True, "url": resp.geturl()}
             return json.loads(body or "{}")
     except urllib.error.HTTPError as exc:
+        if not expect_json and exc.code in (301, 302, 303, 307, 308):
+            # Это и есть успех формы: кабинет говорит, куда пошёл бы браузер. Сам
+            # адрес абсолютный или относительный — приводим к абсолютному, чтобы
+            # разбор query у вызывающего не зависел от формы ответа.
+            location = exc.headers.get("Location") or ""
+            exc.close()
+            return {"ok": True, "url": urllib.parse.urljoin(CABINET_BASE + path, location)}
         raw = exc.read().decode("utf-8", "replace")
         try:
             detail = (json.loads(raw or "{}") or {}).get("detail") or raw[:200]
@@ -2041,12 +2062,34 @@ def _cover(path: str, sid: str, payload=None, method=None):
         return 502, f"обложки не отвечают: {type(exc).__name__}"
 
 
+# Кто на самом деле рисует обложку (18.09.2026). В подписях Cover Studio провайдер
+# назван только у VeoNonStop, и в списке было не понять, чем отличается «Flow — Nano Pro»
+# от «Nano Banana Pro (VeoNonStop)». Карта короткая и своя, потому что у соседа таких
+# подписей нет вовсе — это подпись интерфейса, а не контракт.
+COVER_PROVIDER_TITLE = {
+    "flow": "FastGen", "flower": "FastGen", "openai_img": "FastGen",
+    "grok": "FastGen", "grok_speed": "FastGen",
+    "grok_api": "xAI напрямую", "gpt_image2": "OpenAI напрямую",
+    "veo": "VeoNonStop",
+}
+
+# Платит личный счёт владельца ключа, а не кредиты FastGen (решение владельца 18.09.2026:
+# пометить официальный Grok и GPT Image как платные).
+COVER_PAID_PROVIDERS = {"grok_api", "gpt_image2"}
+
+# Скрытые модели — чёрным списком (решение владельца 17.09.2026: «держим список
+# запрещённых»): новая модель у провайдера появится в списке сама. Гроки через FastGen
+# убраны 18.09 — остаётся только официальный API.
+COVER_HIDDEN = {("grok", "quality"), ("grok", "speed")}
+
+
 def _cover_options(is_admin: bool) -> list:
     """Варианты генерации — из самого Cover, а не переписанные у нас.
 
     `GENERATION_OPTIONS` там и есть источник правды: по нему же Cover проверяет пару
     provider+model на входе. Список, разъехавшийся с проверкой, обещал бы то, что
-    сервер отвергнет.
+    сервер отвергнет. Мы только прячем лишнее и дописываем в подпись провайдера и
+    признак «платно» — сам список у соседа не трогаем.
     """
     mod = sys.modules.get("cover_server")
     core = sys.modules.get("cover_core")
@@ -2057,8 +2100,18 @@ def _cover_options(is_admin: bool) -> list:
     for label, provider, model in core.GENERATION_OPTIONS:
         if provider in admin_only and not is_admin:
             continue          # платит с личного счёта владельца — не показываем чужим
-        out.append({"label": label, "provider": provider, "model": model,
-                    "admin_only": provider in admin_only})
+        if (provider, model) in COVER_HIDDEN:
+            continue
+        paid = provider in COVER_PAID_PROVIDERS
+        who = COVER_PROVIDER_TITLE.get(provider, provider)
+        # Подпись собираем сами: «модель · провайдер», платное — с пометкой. Имя модели
+        # берём как есть у соседа, но убираем из него скобку с провайдером, если она уже
+        # там есть, — иначе выйдет «… (VeoNonStop) · VeoNonStop».
+        name = re.sub(r"\s*\((VeoNonStop|OpenAI)\)\s*$", "", label).strip()
+        shown = f"{name} · {who}" + (" · 💲 платно" if paid else "")
+        out.append({"label": shown, "provider": provider, "model": model,
+                    "admin_only": provider in admin_only, "paid": paid,
+                    "provider_title": who})
     return out
 
 
@@ -2702,6 +2755,21 @@ def _renamed(preset, name: str):
 # показывает и не трогает — оно остаётся в пресете как было, правка его не стирает.
 NEIGHBOUR_PRESET_FIELDS = {
     "cover": (
+        # Режим «по превью донора» — им работает автоконвейер канала
+        # (server/pub_remote.py `CoverClient.create_job`, mode=url), и до 18.09.2026 в
+        # пульте не было ни одного его поля: правились только поля режима «по семени».
+        {"key": "simple_mode", "kind": "switch", "label": "Редактировать превью донора",
+         "hint": "включено — модель правит само превью (перевод текста, позы); "
+                 "выключено — анализ превью и сборка промпта"},
+        {"key": "style_prompt", "kind": "text", "label": "Промпт стиля",
+         "hint": "действует, когда «стиль автоматически» выключен"},
+        {"key": "use_auto_style", "kind": "switch", "label": "Стиль автоматически",
+         "hint": "включено — стиль берётся из превью донора, промпт стиля не читается"},
+        {"key": "analysis", "kind": "select", "label": "Чем анализировать превью"},
+        {"key": "fallback_mode", "kind": "select", "label": "Если текст не лёг"},
+        {"key": "max_generation_retries", "kind": "number", "label": "Попыток генерации",
+         "min": 1, "max": 20},
+        # Режим «по семени» — им человек делает обложки руками на экране обложек.
         {"key": "prompt_template", "kind": "text", "label": "Шаблон промпта",
          "hint": "постоянные правила стиля. {ЯЗЫК} — название языка, {СЕМЯ} — описание "
                  "конкретной обложки. Пусто — семя станет полным промптом"},
@@ -2744,7 +2812,15 @@ def _neighbour_preset_options(service: str, sid: str, request) -> dict:
                         and (user["role"] if "role" in user.keys() else "") == "admin")
         opts = [{"value": f'{o["provider"]}|{o["model"]}', "title": o["label"]}
                 for o in _cover_options(is_admin)]
-        return {"generation": opts}
+        # Анализ превью и поведение при неудачной подстановке текста: значения те же,
+        # что принимает сам Cover (`cover/api_cover.py`), подписи — человеческие.
+        analysis = [{"value": "openai|gpt-4.1-mini", "title": "OpenAI · gpt-4.1-mini"},
+                    {"value": "openai|gpt-4o", "title": "OpenAI · gpt-4o"},
+                    {"value": "google|gemini-2.0-flash", "title": "Google · gemini-2.0-flash"}]
+        fallback = [{"value": "auto", "title": "как решит сервис"},
+                    {"value": "always_overlay", "title": "всегда накладывать текст"},
+                    {"value": "never_overlay", "title": "никогда не накладывать"}]
+        return {"generation": opts, "analysis": analysis, "fallback_mode": fallback}
     if service == "rewrite":
         code, models = _rw("/models", sid)
         items = models if code == 200 else []
@@ -2759,18 +2835,32 @@ def _neighbour_preset_options(service: str, sid: str, request) -> dict:
     return {}
 
 
-def _neighbour_preset_read(service: str, name: str, sid: str, request) -> dict:
-    store, _put = _preset_store(service, sid, request)
-    if name not in store:
-        raise HTTPException(404, f"нет пресета «{name}»")
-    cfg = store[name] if isinstance(store[name], dict) else {}
-    options = _neighbour_preset_options(service, sid, request)
+# Умолчания нового пресета соседа: ровно то, что он подставил бы сам, если поле не
+# прислать. Держим их здесь, чтобы форма заведения не показывала пустоту там, где у
+# сервиса есть осмысленное значение.
+NEIGHBOUR_PRESET_DEFAULTS = {
+    "cover": {"seed_n_variants": 3, "prompt_template": "", "use_auto_style": True,
+              "simple_mode": False, "fallback_mode": "auto", "aspect_ratio": "16:9",
+              "max_generation_retries": 5, "analysis_provider": "openai",
+              "analysis_model": "gpt-4.1-mini"},
+    "rewrite": {"model": "gpt-4.1-nano", "chunk": 3500, "threads": 1, "address": "",
+                "preserve_paragraphs": True, "safe_text": False, "languages": []},
+    "rewrite_gen": {"content": "", "target_length_words": ""},
+}
+
+
+def _neighbour_preset_fields(service: str, cfg: dict, options: dict) -> list:
+    """Поля формы пресета соседа по его настройкам. Одна сборка на правку и на
+    заведение (18.09.2026): две разошлись бы на первом же новом поле."""
     fields = []
     for f in NEIGHBOUR_PRESET_FIELDS.get(service, ()):
         item = dict(f)
         if f["key"] == "generation":
             item["value"] = f'{cfg.get("generation_provider") or "flow"}|' \
                             f'{cfg.get("generation_model") or ""}'
+        elif f["key"] == "analysis":
+            item["value"] = f'{cfg.get("analysis_provider") or "openai"}|' \
+                            f'{cfg.get("analysis_model") or "gpt-4.1-mini"}'
         elif f["kind"] == "langrows":
             item["value"] = [{"code": str(x.get("code") or ""),
                               "host": str(x.get("host") or ""),
@@ -2789,10 +2879,29 @@ def _neighbour_preset_read(service: str, name: str, sid: str, request) -> dict:
             # сохранении стёр бы модель, которую человек не менял.
             continue
         fields.append(item)
-    return {"service": service, "name": name, "fields": fields}
+    return fields
+
+
+def _neighbour_preset_read(service: str, name: str, sid: str, request) -> dict:
+    if service == "rewrite_gen":
+        # У брифов есть своя ручка одного пресета: список отдаёт только сводку (id, имя,
+        # длина), без самого текста, и править бриф по сводке было бы правкой вслепую.
+        code, cfg = _rw(f"/presets/{urllib.parse.quote(name)}", sid)
+        if code != 200 or not isinstance(cfg, dict):
+            raise HTTPException(404, f"нет брифа «{name}»")
+    else:
+        store, _put = _preset_store(service, sid, request)
+        if name not in store:
+            raise HTTPException(404, f"нет пресета «{name}»")
+        cfg = store[name] if isinstance(store[name], dict) else {}
+    return {"service": service, "name": name,
+            "fields": _neighbour_preset_fields(
+                service, cfg, _neighbour_preset_options(service, sid, request))}
 
 
 def _neighbour_preset_write(service: str, name: str, values: dict, sid: str, request) -> None:
+    if service == "rewrite_gen":
+        return _rewrite_gen_write(name, values, sid)
     store, put = _preset_store(service, sid, request)
     if name not in store:
         # Правка — только существующего: иначе опечатка в имени молча заводила бы
@@ -2810,6 +2919,11 @@ def _neighbour_preset_write(service: str, name: str, values: dict, sid: str, req
             if not provider:
                 raise HTTPException(400, "не выбрана модель генерации")
             cfg["generation_provider"], cfg["generation_model"] = provider, model
+        elif key == "analysis":
+            provider, _sep, model = str(raw or "").partition("|")
+            if not provider:
+                raise HTTPException(400, "не выбрано, чем анализировать превью")
+            cfg["analysis_provider"], cfg["analysis_model"] = provider, model
         elif f["kind"] == "number":
             try:
                 num = int(str(raw).strip() or 0)
@@ -2909,6 +3023,92 @@ async def ui_cover_preset_reference(name: str, request: Request,
     return {"ok": True, "file_id": file_id, "filename": cfg["seed_reference_filename"]}
 
 
+def _rewrite_gen_write(name: str, values: dict, sid: str, create: bool = False) -> None:
+    """Бриф генерации пишет сама Rewrite Studio своей ручкой `POST /presets/{name}`.
+
+    Через общий `/presets/sync` писать нельзя: список брифов отдаёт сводку без текста,
+    и полная замена набора стёрла бы содержимое всех остальных брифов.
+    """
+    known = {f["key"] for f in NEIGHBOUR_PRESET_FIELDS["rewrite_gen"]}
+    unknown = [k for k in values if k not in known]
+    if unknown:
+        raise HTTPException(400, "не поля этого пресета: " + ", ".join(sorted(unknown)))
+    code, cfg = _rw(f"/presets/{urllib.parse.quote(name)}", sid)
+    was = cfg if code == 200 and isinstance(cfg, dict) else {}
+    if not was and not create:
+        raise HTTPException(404, f"нет брифа «{name}»")
+    body = {"name": name,
+            "content": str(values.get("content", was.get("content") or "")),
+            "target_length_words": values.get("target_length_words",
+                                              was.get("target_length_words") or "")}
+    if not str(body["content"]).strip():
+        raise HTTPException(400, "бриф пустой: рерайту нечем работать")
+    try:
+        body["target_length_words"] = (int(str(body["target_length_words"]).strip())
+                                       if str(body["target_length_words"]).strip() else None)
+    except ValueError:
+        raise HTTPException(400, "длина: нужно целое число")
+    code, out = _rw(f"/presets/{urllib.parse.quote(name)}", sid, body)
+    if code >= 400:
+        raise HTTPException(_pass_code(code), out)
+
+
+@app.get("/ui/presets/{service}/new/form")
+def ui_neighbour_preset_new_form(service: str, request: Request):
+    """Поля для НОВОГО пресета соседа (18.09.2026). До этого завести пресет обложек или
+    рерайта из пульта было нечем — только скопировать существующий."""
+    if service not in NEIGHBOUR_PRESET_FIELDS:
+        raise HTTPException(404, f"у сервиса «{service}» своих пресетов нет")
+    sid = getattr(request.state, "sid", "")
+    cfg = dict(NEIGHBOUR_PRESET_DEFAULTS.get(service) or {})
+    return {"service": service, "name": "",
+            "fields": _neighbour_preset_fields(
+                service, cfg, _neighbour_preset_options(service, sid, request))}
+
+
+class NeighbourPresetNew(BaseModel):
+    name: str = ""
+    values: dict = {}
+
+
+@app.post("/ui/presets/{service}/new")
+def ui_neighbour_preset_create(service: str, body: NeighbourPresetNew, request: Request):
+    """Завести пресет у соседа. Пишет его сам сосед — своим же способом полной замены
+    набора (`/presets/sync`, `/settings/presets`): второго хранилища пресетов у пульта
+    нет и быть не должно."""
+    if service not in NEIGHBOUR_PRESET_FIELDS:
+        raise HTTPException(404, f"у сервиса «{service}» своих пресетов нет")
+    name = (body.name or "").strip()[:80]
+    if not name:
+        raise HTTPException(400, "пустое название")
+    sid = getattr(request.state, "sid", "")
+    store, put = _preset_store(service, sid, request)
+    if name in store:
+        raise HTTPException(409, f"пресет «{name}» уже есть")
+    if service == "rewrite_gen":
+        # Бриф заводится своей ручкой сразу с текстом: пустой бриф Rewrite не примет.
+        _rewrite_gen_write(name, body.values or {}, sid, create=True)
+        return {"ok": True, "name": name}
+    cfg = dict(NEIGHBOUR_PRESET_DEFAULTS.get(service) or {})
+    if service == "cover":
+        cfg["name"] = name          # у Cover имя лежит и внутри самого пресета
+    store[name] = cfg
+    put(store)
+    # Поля формы дописываем той же дорогой, что и обычную правку: одни проверки на
+    # заведение и на правку, а не вторая копия разбора значений.
+    if body.values:
+        try:
+            _neighbour_preset_write(service, name, body.values, sid, request)
+        except HTTPException:
+            # Пресет уже заведён, а поля не приняты — откатываем, чтобы не оставлять
+            # наполовину заполненный пресет, о котором человек не знает.
+            store2, put2 = _preset_store(service, sid, request)
+            store2.pop(name, None)
+            put2(store2)
+            raise
+    return {"ok": True, "name": name}
+
+
 @app.get("/ui/presets/{service}/{name}/form")
 def ui_neighbour_preset_form(service: str, name: str, request: Request):
     """Поля пресета соседа для формы. Секреты сюда не попадают: отдаём только те поля,
@@ -2997,15 +3197,39 @@ def _preset_store(service: str, sid: str, request):
         return store, put
 
     if service == "rewrite_gen":
+        # Список брифов отдаёт СВОДКУ (id, имя, длина) — без самого текста. Полная
+        # замена набора такой сводкой стёрла бы текст всех брифов разом, поэтому
+        # каждый бриф читается своей ручкой, а пишется и удаляется — по одному
+        # (18.09.2026; до этого копия и удаление бриф обесточивали).
         code, body = _rw("/presets", sid)
         if code >= 400 or not isinstance(body, dict):
             raise HTTPException(_pass_code(code), body or "брифы не получены")
+        store = {}
+        for name in body:
+            code2, full = _rw(f"/presets/{urllib.parse.quote(name)}", sid)
+            store[name] = full if code2 == 200 and isinstance(full, dict) else dict(body[name])
+        # Снимок «что было»: вызывающий меняет тот же словарь, что мы вернули
+        # (`store.pop(name)` в удалении), и сравнивать с ним самим — значит не увидеть
+        # ни одной правки.
+        was = {k: dict(v) if isinstance(v, dict) else v for k, v in store.items()}
 
         def put(s):
-            code2, out = _rw("/presets/sync", sid, {"presets": s})
-            if code2 >= 400:
-                raise HTTPException(_pass_code(code2), out)
-        return dict(body), put
+            for name, cfg in s.items():
+                if was.get(name) == cfg:
+                    continue          # не трогаем то, что не менялось
+                payload = {"name": name,
+                           "content": str((cfg or {}).get("content") or ""),
+                           "target_length_words": (cfg or {}).get("target_length_words")}
+                code3, out = _rw(f"/presets/{urllib.parse.quote(name)}", sid, payload)
+                if code3 >= 400:
+                    raise HTTPException(_pass_code(code3), out)
+            for name in was:
+                if name not in s:
+                    code3, out = _rw(f"/presets/{urllib.parse.quote(name)}", sid,
+                                     method="DELETE")
+                    if code3 >= 400:
+                        raise HTTPException(_pass_code(code3), out)
+        return store, put
 
     raise HTTPException(404, f"нет сервиса «{service}»")
 
@@ -3016,6 +3240,14 @@ def _preset_store(service: str, sid: str, request):
 # `create_channel`, `update_channel`): расписание, часовой пояс, горизонт и лимиты
 # разбираются там по одним правилам для обоих интерфейсов. Вторая копия этих правил
 # разошлась бы с первой на первом же новом поле.
+
+def _language_options() -> list:
+    """Языки канала списком, а не полем для ввода (18.09.2026). Источник тот же, что у карты
+    голосов в пресете: полный список Rewrite Studio с кодами ISO (`preset_fields`). Один
+    справочник на оба места — иначе в канале окажется код, которого пресет не знает."""
+    return [{"value": code, "title": title}
+            for code, title in preset_fields.lang_options_for_form()]
+
 
 @app.get("/ui/channels/new")
 def ui_channel_new():
@@ -3039,6 +3271,7 @@ def ui_channel_new():
     return {
         "profiles": profiles, "hosts": hosts,
         "presets": {"vsgen": vsgen, "rewrite": rew, "cover": cov},
+        "languages": _language_options(),
         "days": list(DAY_KEYS), "any_day": ANY_DAY,
         "statuses": [{"key": k, "title": v} for k, v in pub_ui.STATUS_TITLES.items()],
         "note": "остальное настраивается в карточке канала — она откроется сразу",
@@ -3458,6 +3691,11 @@ def ui_project(pid: str):
         try:
             merged = dict(st)
             merged["running"], merged["queued"], merged["errored"] = mod._stage_sets(km)
+            # Шестая плитка — обложка: вкладок на экране шесть, и пять плиток читались
+            # как «одну стадию забыли» (18.09.2026). Готовность берём тем же способом,
+            # что и файлы проекта, — по самому файлу, а не по статусу задачи: задача
+            # могла отработать, а обложки не появиться (правило 1 ТЗ).
+            merged["cover"] = bool(_project_cover_ready(mod, pid))
             stage = mod.project_stage_status(merged)
         except Exception:                                          # noqa: BLE001
             pass
@@ -3531,6 +3769,18 @@ _FILE_GROUPS = (("images", "кадры"), ("clips", "клипы"), ("renders", "
 # их все сразу незачем — остальное браузер дочитывает по мере прокрутки
 # (`GET /ui/projects/{pid}/files/{code}`, 18.09.2026). 40 — экран с запасом.
 FILES_PAGE = 40
+
+
+def _project_cover_ready(mod, pid: str) -> bool:
+    """Есть ли у проекта готовая обложка. Тем же списком шаблонов, что и скачивание
+    (`_dl_items(..., "covers")`), — второй способ узнать «есть ли файл» разошёлся бы с
+    первым на первой же смене имени файла."""
+    if mod is None or not hasattr(mod, "_dl_items"):
+        return False
+    try:
+        return bool(mod._dl_items(mod._project_dir(TENANT, pid), "covers"))
+    except Exception:                                              # noqa: BLE001
+        return False
 
 
 def _project_files(mod, pid: str) -> list:
@@ -3615,11 +3865,38 @@ def ui_project_new(body: ProjectNew, request: Request):
     if mod is None or not hasattr(mod, "_create_project"):
         raise HTTPException(503, "кабинет не поднят — заводить проект нечем")
     text = (body.text or "").strip()
-    if not text:
-        raise HTTPException(400, "пустой текст: нечего озвучивать и не из чего делать кадры")
-    name = (body.name or "").strip() or text.splitlines()[0].strip()[:80] or "Без названия"
+    # Текст больше не обязателен (18.09.2026): раньше его спрашивала форма заведения, а
+    # потом ровно то же самое спрашивала вкладка «Сценарий» — два ввода одного и того же.
+    # Теперь проект заводится пустым и сразу открывается на «Сценарии», где текст можно
+    # получить по ссылке, вставить или загрузить файлом.
+    name = ((body.name or "").strip()
+            or (text.splitlines()[0].strip()[:80] if text else "")
+            or "Проект от " + dt.datetime.now().strftime("%d.%m %H:%M"))
     pid = mod._create_project(TENANT, name, text)
     return {"id": pid, "name": name}
+
+
+class ProjectName(BaseModel):
+    name: str = ""
+
+
+@app.post("/ui/projects/{pid}/name")
+def ui_project_rename(pid: str, body: ProjectName, request: Request):
+    """Переименовать проект. Нужно с 18.09.2026: имя больше не спрашивают при заведении,
+    а «Проект от 18.09 14:20» в списке из сорока проектов ничего не говорит."""
+    name = (body.name or "").strip()[:120]
+    if not name:
+        raise HTTPException(400, "пустое название")
+    c = db()
+    try:
+        cur = c.execute("UPDATE projects SET name=?, updated=? WHERE id=? AND tenant_id=?",
+                        (name, time.time(), pid, TENANT))
+        c.commit()
+    finally:
+        c.close()
+    if not cur.rowcount:
+        raise HTTPException(404, "нет такого проекта")
+    return {"ok": True, "name": name}
 
 
 # Поля запуска. Пустое значение = «как в проекте»: кабинет кладёт настройки проекта
@@ -3633,6 +3910,74 @@ class RunIn(BaseModel):
     transitions: str = ""            # переходы между кадрами
     sync_audio: str = ""             # подгонять кадры под озвучку
     subtitles: str = ""              # вшивать субтитры
+
+
+# Частичный прогон пачкой (18.09.2026). В кабинете это были четыре карточки —
+# «Озвучка / Картинки / Видео / Рендер» с необязательными полями и своей отменой
+# (server/main.py:4141); в пульт переехала только кнопка «Сделать всё», и сделать одну
+# озвучку по десяти проектам стало нечем. Ставит по-прежнему кабинет (`batch_run`):
+# он проверяет ключи, дубли и готовность материалов, и повторять это здесь нельзя.
+BATCH_KINDS = {
+    "tts": ("Озвучка", "engine", ("voice", "speed")),
+    "images": ("Картинки", "model", ("image_mode", "aspect_ratio", "style",
+                                     "sentences_per_prompt")),
+    "video": ("Видео", "video_method", ("first_n", "prompt")),
+    "render": ("Рендер", "quality", ()),
+    "chapters": ("Главы", "", ()),
+    "pipeline": ("Сделать всё", "", ()),
+}
+
+
+class BatchIn(BaseModel):
+    pids: list = []
+    values: dict = {}
+
+
+@app.post("/ui/projects/batch/{kind}")
+def ui_projects_batch(kind: str, body: BatchIn, request: Request):
+    """Поставить один этап пачке проектов. Пустое поле — «как в проекте»: кабинет
+    кладёт настройки проекта базой и накрывает только непустыми полями формы."""
+    if kind not in BATCH_KINDS:
+        raise HTTPException(404, f"нет вида «{kind}»")
+    pids = [str(p).strip() for p in (body.pids or []) if str(p).strip()]
+    if not pids:
+        raise HTTPException(400, "не отмечен ни один проект")
+    fields = [("pid", p) for p in pids]
+    fields += [(k, str(v).strip()) for k, v in (body.values or {}).items() if str(v).strip()]
+    return _cabinet_form(f"/api/batch/{kind}", fields, request)
+
+
+@app.post("/ui/projects/batch/cancel/{kind}")
+def ui_projects_batch_cancel(kind: str, body: BatchIn, request: Request):
+    """Отменить этап у пачки проектов — вместе с отложенным авто-запуском. Снимает
+    кабинет (`batch_cancel`): он один знает, что считать «активной задачей»."""
+    pids = [str(p).strip() for p in (body.pids or []) if str(p).strip()]
+    if not pids:
+        raise HTTPException(400, "не отмечен ни один проект")
+    return _cabinet_form(f"/api/batch/cancel/{kind}", [("pid", p) for p in pids], request)
+
+
+@app.get("/ui/projects/batch/fields")
+def ui_projects_batch_fields():
+    """Из чего выбирать в карточках частичного прогона: те же варианты, что у пресета
+    (`preset_fields`), а не второй список здесь."""
+    mod = sys.modules.get("main")
+    out = {}
+    for kind, (title, main_key, extra) in BATCH_KINDS.items():
+        if not main_key:
+            out[kind] = {"title": title, "fields": []}
+            continue
+        fields = []
+        for g in preset_fields.describe(mod, {}):
+            for f in g["fields"]:
+                if f["key"] == main_key or f["key"] in extra:
+                    fields.append({"key": f["key"], "label": f["label"], "kind": f["kind"],
+                                   "options": f["options"], "hint": f.get("hint", "")})
+        # Порядок как в карточке кабинета: главное поле сверху, остальное — «доп.».
+        fields.sort(key=lambda f: 0 if f["key"] == main_key else 1)
+        out[kind] = {"title": title, "fields": fields}
+    return {"kinds": out,
+            "note": "пустое поле — «как в проекте»: настройки проекта не перетираются"}
 
 
 @app.post("/ui/projects/{pid}/run")

@@ -339,7 +339,24 @@ def main() -> int:
     check("и его словами", body.get("detail"), "job not found")
 
     print("\nПроект заводится в пульте, а работу ставит кабинет")
-    check("пустой текст не принимается", me.go("/ui/projects", {"text": "   "})[0], 400)
+    # 18.09.2026: текст при заведении больше не обязателен — проект открывается пустым
+    # на вкладке «Сценарий», где текст получают по ссылке, вставляют или грузят файлом.
+    # Раньше его спрашивали дважды: в форме заведения и тут же на вкладке.
+    code, body = me.go("/ui/projects", {})
+    check("проект заводится без текста", code, 200)
+    blank = str((body or {}).get("id") or "")
+    if blank:
+        check("имя дано временное, с датой", (body.get("name") or "").startswith("Проект от"),
+              True)
+        check("переименование принято",
+              me.go(f"/ui/projects/{blank}/name", {"name": "Названный проект"})[0], 200)
+        check("имя изменилось в базе кабинета",
+              (project_row(blank) or {})["name"], "Названный проект")
+        check("пустое имя отвергнуто",
+              me.go(f"/ui/projects/{blank}/name", {"name": "  "})[0], 400)
+        drop_project(blank)
+    check("переименование несуществующего — 404",
+          me.go("/ui/projects/p_yok/name", {"name": "Имя"})[0], 404)
     check("завести проект без входа нельзя",
           anon.go("/ui/projects", {"text": "раз два три"})[0], 401)
     name = "тест пульта: не удалять руками"
@@ -948,6 +965,67 @@ def main() -> int:
         check("выбрана та, что стоит в пресете",
               gen["value"].split("|")[0] in [o["value"].split("|")[0] for o in gen["options"]],
               True)
+
+    print("\nПресеты соседей заводятся из пульта, а не только копируются (18.09.2026)")
+    stamp = str(int(time.time()))
+    cov_name, rew_name, gen_name = f"проба-обл-{stamp}", f"проба-рер-{stamp}", f"бриф-{stamp}"
+    code, form = me.go("/ui/presets/cover/new/form")
+    check("форма нового пресета обложки отдана", code, 200)
+    if code == 200:
+        keys_ = [f["key"] for f in form["fields"]]
+        check("в ней и режим превью донора, и режим семени",
+              set(keys_) >= {"simple_mode", "style_prompt", "use_auto_style", "analysis",
+                             "prompt_template", "seed_n_variants", "generation"}, True)
+        check("умолчания подставлены, а не пустота",
+              {f["key"]: f["value"] for f in form["fields"]}["seed_n_variants"], 3)
+    try:
+        check("пресет обложки заводится",
+              me.go("/ui/presets/cover/new", {"name": cov_name,
+                                              "values": {"seed_n_variants": "5"}})[0], 200)
+        check("он появился в списке",
+              cov_name in [i["name"] for g in me.go("/ui/presets")[1]["groups"]
+                           if g["service"] == "cover" for i in g["items"]], True)
+        check("значение сохранилось",
+              {f["key"]: f["value"] for f in
+               me.go(f"/ui/presets/cover/{cov_name}/form")[1]["fields"]}["seed_n_variants"], 5)
+        check("имя занято — 409",
+              me.go("/ui/presets/cover/new", {"name": cov_name, "values": {}})[0], 409)
+        check("пустое имя — 400",
+              me.go("/ui/presets/cover/new", {"name": "  ", "values": {}})[0], 400)
+
+        check("пресет рерайта заводится",
+              me.go("/ui/presets/rewrite/new", {"name": rew_name,
+                                                "values": {"chunk": "3000"}})[0], 200)
+        check("чужой ключ соседнего пресета цел",
+              bool(rew_preset("Базовый рерайт").get("openai_api_key")), True)
+
+        check("бриф без текста не заводится",
+              me.go("/ui/presets/rewrite_gen/new", {"name": gen_name,
+                                                    "values": {"content": " "}})[0], 400)
+        check("бриф с текстом заводится",
+              me.go("/ui/presets/rewrite_gen/new",
+                    {"name": gen_name, "values": {"content": "Пиши коротко",
+                                                  "target_length_words": "900"}})[0], 200)
+        got = {f["key"]: f["value"] for f in
+               me.go(f"/ui/presets/rewrite_gen/{gen_name}/form")[1]["fields"]}
+        check("текст брифа читается обратно", got.get("content"), "Пиши коротко")
+        # Копия брифа шла через полную замену набора, а список отдаёт сводку без текста:
+        # до 18.09.2026 копия обесточивала ВСЕ брифы. Проверяем, что текст цел.
+        check("копия брифа принята",
+              me.go("/ui/presets/rewrite_gen/copy", {"from": gen_name,
+                                                     "to": gen_name + "-копия"})[0], 200)
+        after = {f["key"]: f["value"] for f in
+                 me.go(f"/ui/presets/rewrite_gen/{gen_name}/form")[1]["fields"]}
+        check("после копии текст исходного брифа на месте", after.get("content"),
+              "Пиши коротко")
+    finally:
+        for svc, nm in (("cover", cov_name), ("rewrite", rew_name),
+                        ("rewrite_gen", gen_name), ("rewrite_gen", gen_name + "-копия")):
+            me.go(f"/ui/presets/{svc}/{nm}", method="DELETE")
+    check("за собой прибрано",
+          [n for n in (cov_name, rew_name, gen_name)
+           if n in [i["name"] for g in me.go("/ui/presets")[1]["groups"]
+                    for i in g["items"]]], [])
 
     print("\nКлюч Rewrite виден и правится из пульта (18.09.2026)")
     code, keys = me.go("/ui/keys")

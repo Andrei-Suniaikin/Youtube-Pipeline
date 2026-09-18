@@ -3795,6 +3795,12 @@ def project_stage_status(st: dict) -> dict:
 
     segments = [{"stage": name, "state": state} for name, state in (
         ("text", s_text), ("tts", s_audio), ("images", s_img), ("video", s_vid), ("render", s_render))]
+    # Шестой сегмент — обложка (18.09.2026, жалоба владельца: вкладок шесть, плиток
+    # пять). Только если вызывающий знает про обложку: `mc_stepper` кормит функцию тем
+    # же `st`, что и раньше, ключа `cover` там нет — и его разметка не меняется
+    # (tests/test_project_stage_status.py сверяет её байт-в-байт).
+    if "cover" in st:
+        segments.append({"stage": "cover", "state": seg("cover", st.get("cover"))})
     return {"segments": segments, "caption": caption, "tone": tone}
 
 
@@ -14745,6 +14751,40 @@ def save_fastgen_usage(c, usage: dict, now) -> None:
     c.commit()
 
 
+def save_fastgen_models(c, models: list, now) -> None:
+    """Снимок «какая модель сейчас работает» в `admin_state.fastgen_models`.
+
+    Хранятся только id и текст статуса: это всё, что нужно подписи в форме. Время
+    снятия — рядом, чтобы форма могла честно сказать, насколько он свежий.
+    """
+    snap = {"checked": now,
+            "models": {m.get("id"): m.get("txt") for m in (models or []) if m.get("id")}}
+    c.execute("INSERT INTO admin_state(k,v,updated) VALUES('fastgen_models',?,?) "
+              "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated=excluded.updated",
+              (json.dumps(snap, ensure_ascii=False), now))
+    c.commit()
+
+
+def fastgen_models_snapshot() -> dict:
+    """Последний снимок статусов моделей: {"checked": ts, "models": {id: текст}}.
+
+    Нет снимка или база недоступна — пустой словарь: «данных пока нет» честнее, чем
+    выдуманное «работает».
+    """
+    try:
+        c = db()
+        try:
+            row = c.execute("SELECT v FROM admin_state WHERE k='fastgen_models'").fetchone()
+        finally:
+            c.close()
+        if not row or not row["v"]:
+            return {}
+        snap = json.loads(row["v"])
+        return snap if isinstance(snap, dict) else {}
+    except Exception:                                              # noqa: BLE001
+        return {}
+
+
 def fastgen_status(key, force=False):
     """Статус FastGen-моделей из health-API. Кэш 30с (health глобальный, ключ — только auth)."""
     now = time.time()
@@ -14783,6 +14823,18 @@ def fastgen_status(key, force=False):
                 "pct": score, "code": code, "txt": txt, "col": _FG_STYLE.get(code, _FG_STYLE["na"]),
             })
         out["checked"] = time.strftime("%H:%M:%S")
+        # Снимок статусов моделей в базу (18.09.2026). Живой опрос health-API занимает
+        # около трёх секунд — форме пресета столько ждать нельзя, и она всегда видела
+        # «нет данных». Теперь форма берёт последний снимок мгновенно, а обновляет его
+        # тот, кому ждать можно: экран ключей, тик тревог, фоновая догрузка формы.
+        if out["models"]:
+            sc = db()
+            try:
+                save_fastgen_models(sc, out["models"], now)
+            except Exception:
+                log_exc("fastgen_status/save_models")
+            finally:
+                sc.close()
         if out.get("usage"):
             # Снимок расхода — при каждом успешном обновлении кэша (пункт 8 ТЗ), не
             # только когда человек смотрит на экран ключей. Сбой записи не должен
