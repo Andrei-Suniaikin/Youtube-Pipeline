@@ -27,8 +27,11 @@ export VS_REWRITE_BASE="http://127.0.0.1:$PORT/rewrite"
 export VS_COVER_BASE="http://127.0.0.1:$PORT/cover"
 export VS_CABINET_BASE="http://127.0.0.1:$PORT"
 export HOME="$ROOT/dev/home"
-export VS_SERVER_DB="$ROOT/dev/vsgen.dev.db"
-export VS_DEV_DB="$ROOT/dev/vsgen.dev.db"
+# Базу можно подменить снаружи: стенды поднимаются на КОПИИ базы (правило проекта),
+# и раньше жёсткое присваивание перебивало переданный путь — стенд молча работал на
+# общей dev-базе, а тесты смотрели в копию.
+export VS_SERVER_DB="${VS_SERVER_DB:-$ROOT/dev/vsgen.dev.db}"
+export VS_DEV_DB="${VS_DEV_DB:-$VS_SERVER_DB}"
 export VS_TENANTS_DIR="$ROOT/dev/data/tenants"
 # Планировщик по умолчанию ВЫКЛЮЧЕН: здесь разбирают интерфейс, а не тратят деньги.
 # Задачи стоят в очереди и никто их не берёт. Боевой прогон — dev/run-live.sh,
