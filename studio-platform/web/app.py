@@ -39,7 +39,7 @@ import pult_auth as auth                                       # noqa: E402
 
 from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
                            normalize_schedule, upcoming_slots)
-from pub_engine import PHASES, PHASE_DEADLINES                   # noqa: E402
+from pub_engine import PHASES, PHASE_DEADLINES, IRREVERSIBLE_FROM                   # noqa: E402
 from pub_engine import revive as pub_engine_revive                # noqa: E402
 import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
@@ -759,6 +759,14 @@ def ui_queue(service: str | None = None, channel: int | None = None,
             })
         services = [{"key": "vsgen", "title": "Видео", "ok": True, "error": "",
                      "count": len(rows)}]
+        # Выпуск канала, который ещё не дошёл до задач (или ждёт между этапами), в
+        # очереди не появлялся вовсе: задач у него пока нет, и человек видел пустую
+        # очередь при работающем конвейере (жалоба владельца 18.09.2026). Показываем
+        # его отдельной строкой — с фазой и причиной ожидания, а не выдуманным этапом.
+        releases = _live_release_rows(c)
+        rows.extend(releases)
+        services.append({"key": "release", "title": "Выпуски", "ok": True, "error": "",
+                         "count": len(releases)})
         for name, title, base in NEIGHBOURS:
             got, err = _neighbour_jobs(name, base, get_key(c, name))
             rows.extend(got)
@@ -3014,6 +3022,44 @@ def ui_channels_import(body: ImportIn):
 # Счётчики и список файлов считает кабинет своими же функциями (`_project_status`,
 # `_dl_items`): они знают, где что лежит, включая исторические раскладки папок.
 
+def _can_drop(phase: str) -> bool:
+    """Выпуск ещё можно убрать из очереди? С `upload_running` — нет (правило 5 ТЗ)."""
+    try:
+        return PHASES.index(phase or "created") < IRREVERSIBLE_FROM
+    except ValueError:
+        return True
+
+
+def _live_release_rows(c) -> list:
+    """Выпуски в работе — строками для очереди. Не подменяют задачи: у задачи свой этап
+    и свой сервис, а здесь состояние самого выпуска, включая «ждём: …»."""
+    out = []
+    for r in c.execute(
+            "SELECT r.release_id, r.phase, r.status, r.blocked_reason, r.updated, "
+            "       r.plan_item_id, r.project_id, ch.id ch_id, ch.name ch_name, ch.lang lang, "
+            "       p.donor_title, p.donor_url "
+            "FROM pub_releases r "
+            "LEFT JOIN pub_channels ch ON ch.id = r.channel_id "
+            "LEFT JOIN pub_plan_items p ON p.id = r.plan_item_id "
+            "WHERE r.tenant_id=? AND r.status NOT IN ('done','cancelled') "
+            "ORDER BY r.updated DESC LIMIT 100", (TENANT,)):
+        ph = r["phase"] or "created"
+        out.append({
+            "service": "release", "id": r["release_id"],
+            "title": r["donor_title"] or r["donor_url"] or r["release_id"],
+            "channel": r["ch_name"] or "", "channel_id": r["ch_id"],
+            "lang": (r["lang"] or "").upper(),
+            "release_id": r["release_id"], "project_id": r["project_id"] or "",
+            "plan_item_id": (r["plan_item_id"] if _can_drop(ph) else None),
+            "user": "", "kind": "release",
+            "kind_title": f"выпуск · {PHASE_TITLE.get(ph, ph)}",
+            "status": r["status"] or "", "state": _state(r["status"]),
+            "progress": None, "stage": PHASE_TITLE.get(ph, ph), "provider": "",
+            "created": r["updated"], "error": r["blocked_reason"] or "",
+        })
+    return out
+
+
 @app.get("/ui/projects")
 def ui_projects(limit: int = 50):
     """Проекты и то, насколько каждый готов."""
@@ -3024,7 +3070,7 @@ def ui_projects(limit: int = 50):
         for p in c.execute("SELECT id, name, status, created, updated FROM projects "
                            "WHERE tenant_id=? ORDER BY updated DESC LIMIT ?",
                            (TENANT, max(1, min(200, limit)))):
-            rel = c.execute("SELECT release_id, phase FROM pub_releases "
+            rel = c.execute("SELECT release_id, phase, plan_item_id FROM pub_releases "
                             "WHERE project_id=? ORDER BY updated DESC LIMIT 1",
                             (p["id"],)).fetchone()
             busy = c.execute("SELECT COUNT(*) FROM queue_tasks WHERE project_id=? "
@@ -3038,14 +3084,47 @@ def ui_projects(limit: int = 50):
             rows.append({
                 "id": p["id"], "name": p["name"] or p["id"], "status": p["status"] or "",
                 "updated": p["updated"], "busy": busy,
+                "kind": "project",
                 "release_id": (rel["release_id"] if rel else ""),
+                # Убрать можно только то, что ещё не ушло на канал: с фазы
+                # `upload_running` заливка необратима, и кабинет такую отмену отвергает.
+                # Кнопка, которая через раз отвечает «поздно», учит её не нажимать.
+                "plan_item_id": (rel["plan_item_id"] if rel and _can_drop(rel["phase"])
+                                 else None),
                 "phase": (rel["phase"] if rel else ""),
+                "phase_title": (PHASE_TITLE.get(rel["phase"], rel["phase"]) if rel else ""),
                 "ready": {"text": bool(st.get("text")), "audio": bool(st.get("audio")),
                           "images": st.get("images") or 0,
                           "images_expected": st.get("images_expected"),
                           "clips": st.get("clips") or 0,
                           "render": bool(st.get("render"))},
             })
+        # Выпуск, у которого проекта ещё нет: проект заводится только после готового
+        # текста, и до тех пор ролик канала не было видно нигде, кроме самого канала
+        # (жалоба владельца 18.09.2026). Показываем его здесь же, отдельным видом строки.
+        for r in c.execute(
+                "SELECT r.release_id, r.phase, r.status, r.blocked_reason, r.updated, "
+                "       r.plan_item_id, ch.name ch_name, p.donor_title, p.donor_url "
+                "FROM pub_releases r "
+                "LEFT JOIN pub_channels ch ON ch.id = r.channel_id "
+                "LEFT JOIN pub_plan_items p ON p.id = r.plan_item_id "
+                "WHERE r.tenant_id=? AND (r.project_id IS NULL OR r.project_id='') "
+                "AND r.status NOT IN ('done','cancelled') "
+                "ORDER BY r.updated DESC LIMIT 50", (TENANT,)):
+            ph = r["phase"] or "created"
+            rows.append({
+                "id": r["release_id"], "kind": "release",
+                "name": r["donor_title"] or r["donor_url"] or r["release_id"],
+                "status": r["status"] or "", "updated": r["updated"], "busy": 0,
+                "release_id": r["release_id"],
+                "plan_item_id": (r["plan_item_id"] if _can_drop(ph) else None),
+                "phase": ph, "phase_title": PHASE_TITLE.get(ph, ph),
+                "channel": r["ch_name"] or "",
+                "waiting": r["blocked_reason"] or "",
+                "ready": {"text": False, "audio": False, "images": 0,
+                          "images_expected": None, "clips": 0, "render": False},
+            })
+        rows.sort(key=lambda x: -(x["updated"] or 0))
     finally:
         c.close()
     return {"projects": rows,

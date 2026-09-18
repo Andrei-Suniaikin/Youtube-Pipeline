@@ -13,6 +13,7 @@ import http.cookiejar
 import json
 import os
 import shutil
+import secrets
 import sqlite3
 import sys
 import time
@@ -29,6 +30,7 @@ PULT = os.environ.get("VS_PULT_URL", "http://127.0.0.1:8080/studio")
 PLATFORM = os.environ.get("VS_PLATFORM_BASE",
                           PULT[: -len("/studio")] if PULT.endswith("/studio") else PULT)
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
+TENANT = os.environ.get("VS_DEV_TENANT", "dev")
 LOGIN = os.environ.get("VS_DEV_LOGIN", "dev")
 # Пароль стенда задаётся тем же способом, что и в dev/provision.py — одним значением
 # на оба. Разойтись им нельзя: тест логинится ровно той учёткой, которую provision завёл.
@@ -93,6 +95,62 @@ def plan_rows(url_like: str) -> int:
     try:
         return c.execute("SELECT COUNT(*) FROM pub_plan_items WHERE donor_url LIKE ?",
                          (f"%{url_like}%",)).fetchone()[0]
+    finally:
+        c.close()
+
+
+def make_release(mark: str) -> tuple:
+    """Выпуск на первом канале, ещё без проекта: ровно тот случай, когда ролик канала
+    раньше не было видно нигде, кроме самого канала. Заводим строками — движок на
+    стенде выключен (VS_SERVER_DISABLE_BACKGROUND=1)."""
+    now = time.time()
+    rel = "r-test-" + secrets.token_hex(4)
+    c = sqlite3.connect(DB, timeout=5)
+    c.row_factory = sqlite3.Row
+    try:
+        ch = c.execute("SELECT id, uc FROM pub_channels WHERE tenant_id=? ORDER BY id LIMIT 1",
+                       (TENANT,)).fetchone()
+        cur = c.execute(
+            "INSERT INTO pub_plan_items(tenant_id, channel_id, donor_url, donor_title, "
+            "position, slot_at, status, created, updated) VALUES(?,?,?,?,?,?,'frozen',?,?)",
+            (TENANT, ch["id"], f"https://youtu.be/{mark}", "Проверочный ролик",
+             1, now + 3600, now, now))
+        plan_id = cur.lastrowid
+        c.execute(
+            "INSERT INTO pub_releases(release_id, tenant_id, plan_item_id, plan_item_version, "
+            "channel_id, uc, slot_at, status, phase, blocked_reason, created, updated) "
+            "VALUES(?,?,?,1,?,?,?, 'pending','created','нет ключа (проверка)',?,?)",
+            (rel, TENANT, plan_id, ch["id"], ch["uc"] or "", now + 3600, now, now))
+        c.commit()
+        return rel, plan_id
+    finally:
+        c.close()
+
+
+def set_release_phase(rel: str, phase: str) -> None:
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        c.execute("UPDATE pub_releases SET phase=? WHERE release_id=?", (phase, rel))
+        c.commit()
+    finally:
+        c.close()
+
+
+def release_status(rel: str) -> str:
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        row = c.execute("SELECT status FROM pub_releases WHERE release_id=?", (rel,)).fetchone()
+        return row[0] if row else ""
+    finally:
+        c.close()
+
+
+def drop_release(rel: str, plan_id: int) -> None:
+    c = sqlite3.connect(DB, timeout=5)
+    try:
+        c.execute("DELETE FROM pub_releases WHERE release_id=?", (rel,))
+        c.execute("DELETE FROM pub_plan_items WHERE id=?", (plan_id,))
+        c.commit()
     finally:
         c.close()
 
@@ -845,6 +903,52 @@ def main() -> int:
                   (me.go("/ui/keys")[1]["rewrite"] or {}).get("own_openai"), False)
         else:
             print("  — пропущено: у пользователя стенда задан свой ключ, не трогаем")
+
+    print("\nВыпуски каналов видно в «Проектах» и «Очереди», и их можно убрать (18.09.2026)")
+    rel_id, plan_id = make_release("test-release-visible")
+    try:
+        code, body = me.go("/ui/projects")
+        mine = [p for p in (body.get("projects") or []) if p.get("release_id") == rel_id]
+        check("выпуск без проекта виден в «Проектах»", len(mine), 1)
+        if mine:
+            check("это отдельный вид строки, а не проект", mine[0]["kind"], "release")
+            check("видна фаза", mine[0]["phase_title"], "заведён")
+            check("видно, чего ждёт", mine[0]["waiting"], "нет ключа (проверка)")
+            check("строку можно убрать — есть чем", mine[0]["plan_item_id"], plan_id)
+
+        code, body = me.go("/ui/queue")
+        rows = [r for r in (body.get("rows") or []) if r.get("release_id") == rel_id]
+        check("выпуск виден и в очереди", len(rows), 1)
+        check("отдельным сервисом", [s["key"] for s in body["services"]][-3:],
+              ["release", "rewrite", "cover"])
+        if rows:
+            check("этап назван по-человечески", rows[0]["kind_title"], "выпуск · заведён")
+            check("причина ожидания показана", rows[0]["error"], "нет ключа (проверка)")
+
+        check("фильтр по сервису «выпуски» работает",
+              [r["release_id"] for r in me.go("/ui/queue?service=release")[1]["rows"]
+               if r["release_id"] == rel_id], [rel_id])
+
+        # Ролик, который уже уходит на канал, убирать поздно (правило 5 ТЗ): кнопки у
+        # такой строки быть не должно, и это решает сервер, а не разметка.
+        set_release_phase(rel_id, "upload_running")
+        gone = [p for p in me.go("/ui/projects")[1]["projects"]
+                if p.get("release_id") == rel_id]
+        check("у заливающегося выпуска убрать нечем", [p["plan_item_id"] for p in gone],
+              [None])
+        qrow = [r for r in me.go("/ui/queue")[1]["rows"] if r.get("release_id") == rel_id]
+        check("в очереди — тоже", [r["plan_item_id"] for r in qrow], [None])
+        set_release_phase(rel_id, "created")
+
+        check("«Убрать» принято", me.go(f"/ui/plan/{plan_id}/cancel", {})[0], 200)
+        check("после этого выпуска в «Проектах» нет",
+              [p for p in me.go("/ui/projects")[1]["projects"]
+               if p.get("release_id") == rel_id], [])
+        check("и в очереди его нет",
+              [r for r in me.go("/ui/queue")[1]["rows"] if r.get("release_id") == rel_id], [])
+        check("выпуск отменён, а не удалён из журнала", release_status(rel_id), "cancelled")
+    finally:
+        drop_release(rel_id, plan_id)
 
     print("\nСсылки без даты видно списком, а не только числом (18.09.2026)")
     mark = "test-waiting-list"

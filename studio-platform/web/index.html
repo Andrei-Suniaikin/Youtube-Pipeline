@@ -1063,7 +1063,7 @@ function calendarFeed(d){
 
 /* ────────────────────── сквозная очередь трёх сервисов ────────────────────── */
 
-const SVC_TITLE = {vsgen:'Видео', rewrite:'Текст', cover:'Обложки'};
+const SVC_TITLE = {vsgen:'Видео', rewrite:'Текст', cover:'Обложки', release:'Выпуск'};
 
 let QFILTER = {service:'', channel:'', state:'', since:''};
 
@@ -1136,6 +1136,7 @@ async function viewQueue(){
       </tr>`).join('')}</tbody></table></div>`);
   app.append(card);
   wireActions(card);
+  wireReleaseDrop(card);
 }
 
 /* Кнопка показывается только там, где действие имеет смысл: отменить можно то, что
@@ -1145,6 +1146,15 @@ function actions(r){
   const btn = (act, title) =>
     `<button class="ghost act" data-service="${esc(r.service)}" data-id="${esc(r.id)}"
              data-act="${act}">${title}</button>`;
+  // Выпуск — не задача сервиса: отменять и повторять у него нечего, его ведёт движок.
+  // Что с ним можно сделать руками — убрать из очереди целиком (18.09.2026).
+  if (r.service === 'release'){
+    return `<a class="ghost" href="#/release/${encodeURIComponent(r.release_id)}"
+              style="padding:3px 10px;border:1px solid var(--line);border-radius:6px;
+                     text-decoration:none;font-size:12px">Открыть</a>
+            ${r.plan_item_id ? `<button class="ghost small rel-del"
+              data-plan="${r.plan_item_id}" style="margin-left:6px">Убрать</button>` : ''}`;
+  }
   if (r.state === 'running' || r.state === 'queued') return btn('cancel', 'Отменить');
   if (r.state === 'error' || r.status === 'cancelled') return btn('retry', 'Повторить');
   return '';
@@ -1370,6 +1380,23 @@ function stageFiles(s, pid){
    в кабинет. Ссылки на файлы ведут в кабинет: он отдаёт их с проверкой пути и с
    миниатюрами, и второй такой отдачи заводить незачем. */
 
+// «Убрать» у выпуска — и в «Проектах», и в «Очереди» (18.09.2026). Снимает его кабинет
+// своей ручкой `cancel_item`: она же гасит ждущую заливку и отказывает, когда ролик уже
+// уходит на канал. Материалы проекта при этом остаются — их удаляет уборка по сроку
+// хранения, а не эта кнопка.
+function wireReleaseDrop(root){
+  root.querySelectorAll('button.rel-del').forEach(b => b.onclick = ev => {
+    ev.stopPropagation();
+    const plan = b.dataset.plan || (b.closest('[data-plan]') || {dataset: {}}).dataset.plan;
+    if (!plan){ toast('У этого выпуска не нашлось строки плана'); return; }
+    confirmInline(b, 'Убрать выпуск из очереди? Материалы проекта останутся.', async () => {
+      b.disabled = true;
+      try{ await post(`/ui/plan/${plan}/cancel`); await render(); }
+      catch(e){ b.disabled = false; toast(e.message); }
+    });
+  });
+}
+
 async function viewProjects(){
   const d = await api('/ui/projects');
   app.innerHTML = '';
@@ -1451,7 +1478,23 @@ async function viewProjects(){
   const card = $(`<div class="card"><table>
     <thead><tr><th style="width:26px"><input type="checkbox" id="pickall"></th>
       <th>Проект</th><th>Готово</th><th>Выпуск</th><th>Изменён</th></tr></thead>
-    <tbody>${d.projects.map(p => `<tr class="row" data-id="${esc(p.id)}">
+    <tbody>${d.projects.map(p => p.kind === 'release'
+      // Выпуск канала, у которого проекта ещё нет: проект появится после готового
+      // текста. Показываем строку здесь же, чтобы ролик не пропадал из виду,
+      // но отмечать её галочкой нечего — «сделать всё» делают по проекту.
+      ? `<tr class="row" data-release="${esc(p.release_id)}" data-plan="${p.plan_item_id}">
+      <td onclick="event.stopPropagation()"><span class="muted">·</span></td>
+      <td><div style="font-weight:600">${esc(p.name)}</div>
+          <div class="muted" style="font-size:11px">выпуск канала
+            ${esc(p.channel || '')} · проекта ещё нет</div></td>
+      <td><span class="pill s-queued">${esc(p.phase_title || p.phase)}</span>
+          ${p.waiting ? `<div class="note bad">${esc(p.waiting)}</div>` : ''}</td>
+      <td><a href="#/release/${encodeURIComponent(p.release_id)}">открыть выпуск</a></td>
+      <td class="muted">${when(p.updated)}${p.plan_item_id
+        ? `<button class="ghost small rel-del" onclick="event.stopPropagation()"
+             data-plan="${p.plan_item_id}" style="margin-left:8px">Убрать</button>` : ''}</td>
+    </tr>`
+      : `<tr class="row" data-id="${esc(p.id)}">
       <td onclick="event.stopPropagation()"><input type="checkbox" class="pick"
           data-id="${esc(p.id)}"></td>
       <td><div style="font-weight:600">${esc(p.name)}</div>
@@ -1464,12 +1507,17 @@ async function viewProjects(){
           ${mark(p.ready.render, 'ролик')}
           ${p.busy ? `<span class="pill s-running">в работе: ${p.busy}</span>` : ''}</td>
       <td>${p.release_id
-        ? `<a href="#/release/${encodeURIComponent(p.release_id)}">${esc(p.phase)}</a>`
-        : '<span class="muted">—</span>'}</td>
-      <td class="muted">${when(p.updated)}</td>
+        ? `<a href="#/release/${encodeURIComponent(p.release_id)}">${esc(
+            p.phase_title || p.phase)}</a>` : '<span class="muted">—</span>'}</td>
+      <td class="muted">${when(p.updated)}${p.plan_item_id
+        ? `<button class="ghost small rel-del" onclick="event.stopPropagation()"
+             data-plan="${p.plan_item_id}" style="margin-left:8px">Убрать выпуск</button>` : ''}</td>
     </tr>`).join('')}</tbody></table></div>`);
-  card.querySelectorAll('tr.row').forEach(tr =>
-    tr.onclick = () => location.hash = '#/project/' + encodeURIComponent(tr.dataset.id));
+  card.querySelectorAll('tr.row').forEach(tr => tr.onclick = () => {
+    if (tr.dataset.id) location.hash = '#/project/' + encodeURIComponent(tr.dataset.id);
+    else if (tr.dataset.release) location.hash = '#/release/' + encodeURIComponent(tr.dataset.release);
+  });
+  wireReleaseDrop(card);
 
   const goBtn = batch.querySelector('#batchgo');
   const countEl = batch.querySelector('#batchn');
