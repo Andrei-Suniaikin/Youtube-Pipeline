@@ -553,6 +553,24 @@ function dur(sec){
   return Math.round(sec/86400) + ' дн';
 }
 
+// Ключ, которым Rewrite Studio делает текст (18.09.2026). Он живёт не в кабинете, а у
+// самого рерайта, поэтому в таблицу «свои ключи» не попадает — но искать его человек
+// будет именно здесь: без него выпуск встаёт на первом шаге с «нет доступных ключей
+// провайдера». Значение ключа наружу не отдаётся, видно только «задан или нет».
+function rewriteRowHtml(rw){
+  const state = !rw.ok
+    ? `<span class="note bad">${esc(rw.why || 'рерайт не ответил')}</span>`
+    : rw.own_openai ? '<span class="pill s-done">ваш ключ OpenAI</span>'
+    : rw.own_claude ? '<span class="pill s-done">ваша подписка Claude</span>'
+    : (rw.server_openai || rw.server_claude)
+      ? '<span class="pill s-idle">серверный ключ владельца</span>'
+      : '<span class="pill s-error">ключа нет — текст делать нечем</span>';
+  return `<div class="secbody"><div class="note muted">Текст (Rewrite Studio): ${state}${
+    rw.own_openai ? ' <a href="#" id="rw-drop">снять свой</a>' : ''}
+    <br>Ключ для текста добавляется той же кнопкой ниже — провайдер
+    «OpenAI · текст (Rewrite Studio)».</div></div>`;
+}
+
 async function viewKeys(){
   // Ключи живут в профиле: это про человека, а не про производство. Вкладки в топбаре
   // у них больше нет — обратный путь должен быть виден со страницы.
@@ -560,51 +578,6 @@ async function viewKeys(){
   app.innerHTML = '';
   app.append($(`<h1>Ключи</h1>
     <p class="sub">Кто ждёт, сколько ждёт и когда снова заработает.</p>`));
-
-  // Ключ, которым Rewrite делает текст. Без него выпуск встаёт на первом же шаге с
-  // «нет доступных ключей провайдера», и до 18.09.2026 из пульта это было не починить.
-  const rw = d.rewrite || {};
-  const rwState = !rw.ok
-    ? `<span class="note bad">${esc(rw.why || 'рерайт не ответил')}</span>`
-    : rw.own_openai ? 'работает ваш ключ OpenAI'
-    : rw.own_claude ? 'работает ваша подписка Claude'
-    : rw.server_openai || rw.server_claude ? 'работает серверный ключ владельца'
-    : '<span class="note bad">ключа нет — текст делать нечем</span>';
-  const rwCard = $(`<div class="card">
-    <div class="sec">Ключ для текста (Rewrite)</div>
-    <div class="secbody">
-      <div class="note muted">Сейчас: ${rwState}.</div>
-      <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
-        <input id="rw-key" type="password" autocomplete="off" placeholder="ключ OpenAI"
-               style="flex:1 1 280px;min-width:0;max-width:420px">
-        <button id="rw-save" class="small">Сохранить</button>
-        ${rw.own_openai ? '<button id="rw-drop" class="ghost small">Снять свой ключ</button>' : ''}
-      </div>
-      <div class="note muted">Ключ хранит сам Rewrite и наружу не отдаёт — здесь видно
-        только, задан он или нет. Свой ключ тратит ваши деньги, серверный — деньги
-        владельца.</div>
-    </div></div>`);
-  app.append(rwCard);
-  rwCard.querySelector('#rw-save').onclick = async () => {
-    const inp = rwCard.querySelector('#rw-key');
-    const val = inp.value.trim();
-    if (!val){ toast('Пустое поле: вписать нечего'); return; }
-    const btn = rwCard.querySelector('#rw-save');
-    btn.disabled = true;
-    try{
-      await post('/ui/keys/rewrite', {openai_api_key: val});
-      inp.value = '';
-      toast('Ключ сохранён', 'ok');
-      await render();
-    }catch(e){ toast(e.message); }
-    finally{ btn.disabled = false; }
-  };
-  const drop = rwCard.querySelector('#rw-drop');
-  if (drop) drop.onclick = () => confirmInline(drop,
-    'Снять свой ключ? Останется серверный, если он задан.', async () => {
-      try{ await post('/ui/keys/rewrite', {openai_api_key: ''}); await render(); }
-      catch(e){ toast(e.message); }
-    });
 
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Занято прямо сейчас</div>
@@ -686,6 +659,7 @@ async function viewKeys(){
         Значение ключа нигде не показывается — только его хвост.
       </div>`
       : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
+    ${rewriteRowHtml(d.rewrite || {})}
     <div id="keyedit"></div>
     <div style="margin-top:10px"><button class="ghost" id="addkey">Добавить ключ</button></div>
   </div>`);
@@ -2726,6 +2700,16 @@ function wireThumbScroll(card, d, g){
 async function wireKeys(root, d){
   const box = root.querySelector('#keyedit');
 
+  const rwDrop = root.querySelector('#rw-drop');
+  if (rwDrop) rwDrop.onclick = ev => {
+    ev.preventDefault();
+    confirmInline(rwDrop, 'Снять свой ключ рерайта? Останется серверный, если он задан.',
+      async () => {
+        try{ await post('/ui/keys/rewrite', {openai_api_key: ''}); await render(); }
+        catch(e){ toast(e.message); }
+      });
+  };
+
   root.querySelectorAll('a.dropkey').forEach(a => a.onclick = ev => {
     ev.preventDefault();
     // Ключ снимается сразу и без отмены — спросить обязаны, но не попапом.
@@ -2744,7 +2728,8 @@ async function wireKeys(root, d){
       <div id="kerr"></div>
       <div class="fldrow"><label>Провайдер</label>
         <select id="kfam">${ref.families.map(f =>
-          `<option value="${esc(f.key)}">${esc(f.title)}</option>`).join('')}</select></div>
+          `<option value="${esc(f.key)}">${esc(f.title)}</option>`).join('')}
+          <option value="__rewrite">OpenAI · текст (Rewrite Studio)</option></select></div>
       <div class="fldrow"><label>Ключ</label>
         <input id="kval" style="width:340px" autocomplete="off"></div>
       <div class="note muted">${esc(ref.note)}</div>
@@ -2754,8 +2739,11 @@ async function wireKeys(root, d){
       err.innerHTML = '';
       const val = box.querySelector('#kval').value.trim();
       if (!val){ err.innerHTML = '<div class="err">Ключ пустой.</div>'; return; }
+      const fam = box.querySelector('#kfam').value;
       try{
-        await post('/ui/keys', {add: {[box.querySelector('#kfam').value]: [val]}});
+        // Ключ рерайта хранит сам Rewrite: второго места хранения секрета не заводим.
+        if (fam === '__rewrite') await post('/ui/keys/rewrite', {openai_api_key: val});
+        else await post('/ui/keys', {add: {[fam]: [val]}});
         await render();
       }catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
     };
