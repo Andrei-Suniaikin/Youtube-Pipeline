@@ -2935,6 +2935,42 @@ def _materials_ready(proj):
     return (bool(imgs) and bool(auds)), len(imgs), bool(auds)
 
 
+def _narration_dirs(proj):
+    """Папки озвучки, в которых реально что-то лежит. Пустые не считаются."""
+    return sorted(os.path.basename(d) for d in glob.glob(os.path.join(proj, "_FINAL_AUDIO_*"))
+                  if os.path.isdir(d) and glob.glob(os.path.join(d, "*.mp3")))
+
+
+def _narration_conflict(tid, pid, settings=None):
+    """Почему рендер запускать нельзя, пока озвучек несколько. Пусто — всё однозначно.
+
+    Рендер-нода собирает ВСЕ `_FINAL_AUDIO_*` рекурсивно и склеивает их в одну дорожку
+    (об этом же предупреждает комментарий у `_ENGINE_AUDIO_DIR`). Поэтому две сохранившиеся
+    озвучки — это не выбор из двух, а гарантированно задвоенный звук в готовом ролике.
+    Штатно лишние папки сносит `_clear_other_audio_dirs` перед НОВОЙ озвучкой, но проект
+    доезжает до рендера и в обход: движок сменили после озвучки, задача упала на полпути,
+    материалы пришли из старого проекта.
+
+    Мы только останавливаем и объясняем. Удалять готовую озвучку за человека нельзя: она
+    оплачена, и какую из двух оставить — решение владельца, а не догадка кабинета.
+    """
+    dirs = _narration_dirs(_project_dir(tid, pid))
+    if len(dirs) < 2:
+        return ""
+    if settings is None:
+        _p = _get_project(tid, pid)
+        settings = _psettings(_p) if _p else {}
+    eng = str((settings or {}).get("engine") or (settings or {}).get("tts_engine")
+              or "").strip().lower()
+    want = _ENGINE_AUDIO_DIR.get(eng)
+    tail = (f"Сейчас в проекте выбран движок «{eng}» — его папка {want}. "
+            if want else "Движок озвучки в проекте не выбран. ")
+    return ("В проекте несколько озвучек: " + ", ".join(dirs) + ". Рендер склеил бы их в "
+            "одну дорожку, поэтому он остановлен. " + tail +
+            "Оставьте одну папку (лишнюю удалите) или переозвучьте нужным движком — "
+            "тогда лишние папки уберутся сами.")
+
+
 IMG_RENDER_MIN_RATIO = 0.70   # авто/отложенный рендер не стартует, пока картинок < 70% от ожидаемого
 
 
@@ -3399,7 +3435,11 @@ def _render_inputs_ready(tid, pid):
     if not (ready and _images_ratio_ok(tid, pid)):
         return False
     _p = _get_project(tid, pid)
-    return _images_gap_ok(tid, pid, _psettings(_p) if _p else None)
+    _st = _psettings(_p) if _p else None
+    # Две озвучки в проекте — это задвоенный звук в ролике, а не выбор из двух.
+    if _narration_conflict(tid, pid, _st):
+        return False
+    return _images_gap_ok(tid, pid, _st)
 
 
 def _video_ready(tid, pid):
@@ -5262,6 +5302,16 @@ document.addEventListener('keydown',function(e){{var o=document.getElementById('
             f'<b>не завершена</b> (прервана или упала на первых фразах). Видео собирается по длине озвучки: '
             f'получится ролик на ~{max(1, int(_aud_est))} сек, и почти все картинки в него не попадут. '
             f'Сначала запустите «Озвучить проект» на вкладке Озвучка и дождитесь конца — потом рендерите.</div>')
+    # Две озвучки разом: рендер склеил бы обе дорожки, поэтому он остановлен. Объясняем
+    # прямо здесь, иначе проект молча висит «материалы не готовы» при готовых материалах.
+    _two_audio = _narration_conflict(tid, pid, s)
+    if _two_audio:
+        short_audio_note += (
+            f'<div style="background:var(--surface2);border:1px solid var(--border);'
+            f'border-left:3px solid var(--warn);border-radius:8px;padding:10px 13px;'
+            f'margin-bottom:12px;font-size:13.5px">'
+            f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> '
+            f'{html.escape(_two_audio)}</div>')
     # Дыры в наборе картинок: объясняем ПОЧЕМУ рендер не стартует. Без этого проект молча
     # висит «отложено», и причина видна только в логах генерации картинок.
     _gap_ok, _gap_run, _gap_missing, _gap_total = _images_gap_report(tid, pid)
