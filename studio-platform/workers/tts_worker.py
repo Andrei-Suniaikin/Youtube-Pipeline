@@ -98,6 +98,16 @@ AUDIO_DIR_NAME = "_FINAL_AUDIO_ELEVENLABS"
 FULL_TEXT_MARKER_NAME = ".lumean-full-text.v1.json"
 PARALLEL_REQUESTS = max(1, int(os.environ.get("LUMEAN_PARALLEL", "5") or "5"))
 HEARTBEAT_SECONDS = max(30, int(os.environ.get("LUMEAN_HEARTBEAT_SECONDS", "120") or "120"))
+# Настройки заказа, заданные у нас (18.09.2026). Шаблон Lumean остаётся выбором голоса,
+# а всё остальное — модель, стабильность, схожесть, стиль, буст, скорость, нормализацию,
+# размер куска, паузы и ударения — задаёт пресет в нашей студии и присылает их сюда
+# одним JSON. Формат тот же, что у самого шаблона (`config`), поэтому ничего
+# переводить не надо: то, что пришло, ложится в `config_override` заказа.
+# «Настройки вывода» (audio_format) сюда не входят намеренно: кабинет всегда ждёт mp3.
+TTS_CONFIG_OVERRIDE = {}
+CONFIG_OVERRIDE_SECTIONS = ("tts_settings", "worker_settings", "pause_settings",
+                            "stress_settings")
+
 LUMEAN_MODEL_IDS = {
     "eleven_v3", "eleven_v3_beta", "eleven_multilingual_v2",
     "eleven_flash_v2_5", "eleven_turbo_v2_5", "eleven_turbo_v2", "eleven_flash_v2",
@@ -190,6 +200,20 @@ def create_task(text_content, voice_uuid=None, model_uuid=None):
     # Кабинет всегда ожидает mp3. Template может быть настроен на wav/ogg, поэтому
     # фиксируем формат на уровне конкретного заказа, не изменяя сам шаблон.
     config_override = {"output_settings": {"audio_format": "mp3"}}
+    # Наши настройки поверх шаблона. Раздел за разделом, а не одной заменой: заказ
+    # должен получить именно то, что задал человек, а незаданное — из шаблона.
+    for section in CONFIG_OVERRIDE_SECTIONS:
+        block = TTS_CONFIG_OVERRIDE.get(section)
+        if isinstance(block, dict) and block:
+            merged = dict(config_override.get(section) or {})
+            for key, value in block.items():
+                if key == "voice_settings" and isinstance(value, dict):
+                    vs = dict(merged.get("voice_settings") or {})
+                    vs.update(value)
+                    merged["voice_settings"] = vs
+                else:
+                    merged[key] = value
+            config_override[section] = merged
     data = {
         "template_id": effective_template_uuid,
         "input_text": text_content,
@@ -199,7 +223,9 @@ def create_task(text_content, voice_uuid=None, model_uuid=None):
     # an old UUID must not be sent because it would deterministically fail validation.
     model_id = str(model_uuid or "").strip()
     if model_id in LUMEAN_MODEL_IDS:
-        config_override["tts_settings"] = {"model_id": model_id}
+        tts = dict(config_override.get("tts_settings") or {})
+        tts["model_id"] = model_id
+        config_override["tts_settings"] = tts
     elif model_id:
         print_user(f"Lumean: legacy model_uuid '{model_id[:24]}' пропущен; модель берётся из шаблона", "WARNING")
     for attempt in range(MAX_RETRIES):
@@ -746,7 +772,28 @@ def main():
         help="Изолированная папка результата для выбранного серверного движка.",
     )
     parser.add_argument("--speed", default=os.environ.get("TTS_SPEED", "1.0"), help="Темп речи (atempo): 1.0=норма, <1 медленнее, >1 быстрее")
+    parser.add_argument(
+        "--tts_config", default="",
+        help="JSON с настройками заказа (tts_settings/worker_settings/pause_settings/"
+             "stress_settings) — кладутся в config_override поверх шаблона Lumean.",
+    )
     args = parser.parse_args()
+    if args.tts_config:
+        try:
+            parsed = json.loads(args.tts_config)
+        except ValueError:
+            print_error_user_friendly("Настройки озвучки пришли не JSON — заказ не отправляю")
+            sys.exit(1)
+        if not isinstance(parsed, dict):
+            print_error_user_friendly("Настройки озвучки должны быть объектом")
+            sys.exit(1)
+        # Разделы, которых мы не знаем, не пропускаем: заказ платный, и отправлять в
+        # него то, чего мы не понимаем, нельзя.
+        unknown = [k for k in parsed if k not in CONFIG_OVERRIDE_SECTIONS]
+        if unknown:
+            print_error_user_friendly("Неизвестные разделы настроек: " + ", ".join(unknown))
+            sys.exit(1)
+        TTS_CONFIG_OVERRIDE.update(parsed)
     AUDIO_DIR_NAME = args.audio_dir_name
     try:
         TTS_SPEED = float(args.speed)
@@ -793,6 +840,13 @@ def main():
         {"mode": "full_text_v1", "speed": _canonical_speed(args.speed)}
         if full_text else None
     )
+    # Настройки — часть отпечатка: сменили стабильность или модель — это ДРУГАЯ озвучка,
+    # и старый оплаченный файл переиспользовать нельзя (правило 4 ТЗ наоборот: повтор
+    # платного вызова только когда вход тот же).
+    if TTS_CONFIG_OVERRIDE:
+        scope = dict(identity_scope or {})
+        scope["config"] = json.dumps(TTS_CONFIG_OVERRIDE, ensure_ascii=False, sort_keys=True)
+        identity_scope = scope
 
     if full_text:
         paragraphs = [normalized_text]

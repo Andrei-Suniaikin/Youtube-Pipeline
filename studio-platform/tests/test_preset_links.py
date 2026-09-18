@@ -479,7 +479,13 @@ def main() -> int:
     check("voice — «Озвучка» ∪ ключи, которые читает tts-сборщик",
           PF.part_group_keys("voice"),
           {"engine", "speed", "voice_by_lang", "voice", "model_id",
-           "split_type", "stability", "voice_uuid"} | PF.PART_EXTRA_KEYS["voice"])
+           "split_type", "stability", "voice_uuid",
+           # Настройки заказа Lumean (18.09.2026): задаются у нас и уезжают в
+           # `config_override` каждого заказа — часть «Озвучка», как и всё остальное,
+           # чем делается голос.
+           "lum_model", "lum_stability", "lum_similarity", "lum_style", "lum_speed",
+           "lum_speaker_boost", "lum_normalization", "lum_chunk", "lum_pauses",
+           "lum_stress"} | PF.PART_EXTRA_KEYS["voice"])
     check("images — «Картинки» ∪ ключи images-контракта/сборщика",
           PF.part_group_keys("images"),
           {"model", "aspect_ratio", "style", "sentences_per_prompt", "seed",

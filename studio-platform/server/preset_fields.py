@@ -312,6 +312,21 @@ def _lang_options(m):
     return [(code, f"{code} — {name}") for code, name in sorted(names.items())]
 
 
+def _lumean_models(m):
+    """Модели озвучки Lumean — список движка (`tts_worker.LUMEAN_MODEL_IDS`), а не свой.
+    Пустой пункт — «как в шаблоне»: провайдер возьмёт то, что записано у шаблона."""
+    ids = getattr(sys.modules.get("tts_worker"), "LUMEAN_MODEL_IDS", None)
+    if not ids:
+        ids = {"eleven_v3", "eleven_multilingual_v2", "eleven_flash_v2_5",
+               "eleven_turbo_v2_5", "eleven_turbo_v2", "eleven_flash_v2"}
+    return [("", "как в шаблоне")] + [(x, x) for x in sorted(ids)]
+
+
+def _lumean_normalization(m):
+    return [("", "как в шаблоне"), ("auto", "как решит сервис"),
+            ("on", "всегда разворачивать"), ("off", "не трогать")]
+
+
 def _voice_by_lang_label(m, s):
     """Подпись поля — тем же контрактом, что и подсказка ниже.
 
@@ -416,6 +431,28 @@ GROUPS = (
         Field("split_type", "Разбивка", "text", placeholder="по абзацам"),
         Field("stability", "Стабильность", "text", hide=_tts_only("voicegencore")),
         Field("voice_uuid", "Lumean template_id", "text", hide=_tts_only("lumean")),
+        # Настройки заказа Lumean (18.09.2026). Шаблон у провайдера остаётся выбором
+        # голоса, а всё остальное задаётся здесь и уезжает на каждый заказ
+        # (`main._lumean_config_override` → `config_override`). Имена и диапазоны — те
+        # же, что у самого шаблона Lumean (сверено по `GET /templates`).
+        # Пустое поле — «как в шаблоне»: в заказ оно не уходит вовсе.
+        Field("lum_model", "Модель озвучки", "select", options=_lumean_models,
+              hide=_tts_only("lumean"), hint="пусто — как в шаблоне Lumean"),
+        Field("lum_stability", "Стабильность", "number", hide=_tts_only("lumean"),
+              placeholder="0–1", hint="ниже — живее и рискованнее, выше — ровнее"),
+        Field("lum_similarity", "Схожесть с голосом", "number", hide=_tts_only("lumean"),
+              placeholder="0–1"),
+        Field("lum_style", "Стиль", "number", hide=_tts_only("lumean"), placeholder="0–1"),
+        Field("lum_speed", "Скорость", "number", hide=_tts_only("lumean"),
+              placeholder="0.5–2.0", hint="1.0 — как есть"),
+        Field("lum_speaker_boost", "Усиление голоса", "switch", hide=_tts_only("lumean")),
+        Field("lum_normalization", "Нормализация текста", "select",
+              options=_lumean_normalization, hide=_tts_only("lumean"),
+              hint="как читать числа, даты и сокращения"),
+        Field("lum_chunk", "Размер куска, знаков", "number", hide=_tts_only("lumean"),
+              placeholder="2000"),
+        Field("lum_pauses", "Паузы", "switch", hide=_tts_only("lumean")),
+        Field("lum_stress", "Ударения", "switch", hide=_tts_only("lumean")),
     )),
     ("Картинки", (
         Field("model", "Модель", "select", options=_image_models),

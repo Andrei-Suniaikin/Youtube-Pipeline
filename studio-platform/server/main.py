@@ -5867,6 +5867,65 @@ def _is_lumean_template_id(value):
     return bool(_LUMEAN_TEMPLATE_ID_RE.fullmatch(str(value or "").strip()))
 
 
+# Настройки Lumean, которые человек задаёт у нас, → разделы `config` заказа. Имена
+# полей — те же, что у самого шаблона (проверено 18.09.2026 на `GET /templates`):
+# менять их по дороге незачем, а совпадение имён делает поведение предсказуемым.
+LUMEAN_VOICE_RANGES = {
+    "lum_stability": ("stability", 0.0, 1.0),
+    "lum_similarity": ("similarity_boost", 0.0, 1.0),
+    "lum_style": ("style", 0.0, 1.0),
+    "lum_speed": ("speed", 0.5, 2.0),
+}
+LUMEAN_NORMALIZATION = ("auto", "on", "off")
+
+
+def _lumean_config_override(params) -> dict:
+    """`config_override` заказа Lumean из настроек проекта. Пустая настройка — «как в
+    шаблоне»: незаданное поле в заказ не уходит вовсе."""
+    p = params or {}
+    voice, tts, worker = {}, {}, {}
+    for key, (name, lo, hi) in LUMEAN_VOICE_RANGES.items():
+        raw = str(p.get(key) or "").strip().replace(",", ".")
+        if not raw:
+            continue
+        try:
+            val = float(raw)
+        except ValueError:
+            raise RuntimeError(f"Lumean: «{name}» — нужно число от {lo} до {hi}")
+        if not (lo <= val <= hi):
+            raise RuntimeError(f"Lumean: «{name}» — допустимо от {lo} до {hi}, а не {val}")
+        voice[name] = val
+    boost = str(p.get("lum_speaker_boost") or "").strip().lower()
+    if boost:
+        voice["use_speaker_boost"] = boost in ("1", "true", "on", "да")
+    norm = str(p.get("lum_normalization") or "").strip().lower()
+    if norm:
+        if norm not in LUMEAN_NORMALIZATION:
+            raise RuntimeError("Lumean: нормализация текста — auto, on или off")
+        tts["apply_text_normalization"] = norm
+    chunk = str(p.get("lum_chunk") or "").strip()
+    if chunk:
+        try:
+            num = int(chunk)
+        except ValueError:
+            raise RuntimeError("Lumean: размер куска — целое число знаков")
+        if not (100 <= num <= 20000):
+            raise RuntimeError("Lumean: размер куска — от 100 до 20000 знаков")
+        worker["chunk_size"] = num
+    if voice:
+        tts["voice_settings"] = voice
+    out = {}
+    if tts:
+        out["tts_settings"] = tts
+    if worker:
+        out["worker_settings"] = worker
+    for key, section in (("lum_pauses", "pause_settings"), ("lum_stress", "stress_settings")):
+        raw = str(p.get(key) or "").strip().lower()
+        if raw:
+            out[section] = {"enabled": raw in ("1", "true", "on", "да")}
+    return out
+
+
 def _normalize_lumean_settings(settings):
     """Keep one canonical HeyGen template ID in both legacy-compatible fields."""
     out = dict(settings or {})
@@ -7548,8 +7607,21 @@ def _build_cmd(kind, projdir, params, own_threads=None, *, job_id=None, project_
             argv += ["--template_id", vu]
         if not on_own_key:
             argv += ["--full_text", "--required_service", "heygen"]
-        if str(params.get("model_uuid") or "").strip():
-            argv += ["--model_id", str(params["model_uuid"]).strip()]
+        # Модель озвучки: «как в шаблоне» по умолчанию, иначе — выбранная у нас.
+        # `lum_model` отдельно от legacy `model_uuid`: тот хранит старый UUID и его
+        # `_normalize_lumean_settings` намеренно гасит.
+        model_pick = (str(params.get("lum_model") or "").strip()
+                      or str(params.get("model_uuid") or "").strip())
+        if model_pick:
+            argv += ["--model_id", model_pick]
+        # Настройки заказа, заданные у нас (18.09.2026): модель, стабильность, схожесть,
+        # стиль, буст, скорость, нормализация, размер куска, паузы и ударения. Уезжают
+        # одним JSON и ложатся в `config_override` заказа поверх шаблона Lumean —
+        # создавать шаблоны у провайдера для этого не нужно. Формат вывода не трогаем:
+        # кабинет всегда ждёт mp3.
+        cfg = _lumean_config_override(params)
+        if cfg:
+            argv += ["--tts_config", json.dumps(cfg, ensure_ascii=False)]
         if uc:
             argv.append("--use_cache")
         return "tts_worker.py", argv
