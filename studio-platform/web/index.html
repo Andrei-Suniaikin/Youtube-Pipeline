@@ -212,13 +212,19 @@
      упирались прямо в рамку карточки, потому что у .card своего отступа нет, а .sec
      заголовку он даёт. */
   .fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));
-          gap:22px 20px;padding:6px 18px 16px}
+          gap:22px 20px;padding:16px 18px 18px}
   /* Общий отступ для содержимого карточки сразу после заголовка .sec — тем же
      числом 18/16, что и у .fields выше (пункт 7 ТЗ). Не общее правило по всей
      карточке: строчные компоненты со своим отступом на каждую строку (таблицы,
      .stage, .ev, .cal, .grid, .chgrid — уже «от края до края» по замыслу) этот
      класс не получают и не должны — им и так хорошо. */
-  .secbody{padding:0 18px 16px}
+  .secbody{padding:16px 18px 18px}
+  /* Ритм страницы (17.09.2026): соседние блоки экрана — карточки, панель «Сохранить»,
+     формы — всегда на 16px друг от друга. Раньше отступ ставил каждый экран сам
+     (inline margin-bottom), и там, где его забыли, блоки слипались. Вертикальные
+     margin соседей схлопываются, поэтому старые inline-отступы 16px не удваиваются. */
+  #app > * + *{margin-top:16px}
+  form > .card + .card{margin-top:16px}
   .fld label{display:block;font-size:12px;color:var(--muted);margin-bottom:7px;
              line-height:1.3}
   .fld input,.fld select{width:100%;padding:8px 10px}
@@ -1382,10 +1388,10 @@ async function viewProjects(){
     return;
   }
   const mark = (ok, txt) => `<span class="pill ${ok ? 's-done' : 's-idle'}">${txt}</span>`;
-  const batch = $(`<div class="card" style="margin-bottom:16px">
+  const batch = $(`<div class="card" style="margin-bottom:16px;padding:16px 18px">
     <button id="batchgo" class="small" disabled>Сделать всё для отмеченных</button>
     <span class="muted" id="batchn" style="margin-left:10px">отмечено: 0</span>
-    <div class="note muted">Кнопка ставит существующую задачу «сделать всё» по каждому
+    <div class="note muted" style="margin-top:10px">Кнопка ставит существующую задачу «сделать всё» по каждому
       отмеченному проекту — с его собственными настройками, без общих переопределений.
       Кнопка «Запустить» внутри проекта остаётся: там можно подставить свои поля
       для одного прогона.</div></div>`);
@@ -2490,7 +2496,7 @@ async function viewProject(id){
       ${d.paid.map(x => `<div class="stage"><div class="dot s-done">✓</div>
         <div class="body"><div class="name">${esc(x.kind)}: ${x.delivered} оплаченных
           вызовов${x.cost ? ` · ${x.cost.toFixed(0)} кр.` : ''}</div></div></div>`).join('')}
-      <div class="secbody" style="padding-top:8px">
+      <div class="secbody">
       <div class="note muted">Это то, что будет выброшено, если проект убрать с диска.</div>
       </div></div>`));
   }
@@ -3232,7 +3238,7 @@ function linkBarHtml(g){
   const options = g.link_options || [];
   const attempted = g.link_id != null;
   const linkOn = locked || attempted;
-  return `<div class="secbody" style="padding-top:14px;display:flex;flex-wrap:wrap;
+  return `<div class="secbody" style="display:flex;flex-wrap:wrap;
       gap:10px;align-items:center;border-bottom:1px solid var(--line);padding-bottom:14px">
     <div class="modes" data-linkmodes="${esc(g.part)}" style="margin:0">
       <button type="button" data-src="own" data-hadlink="${attempted ? '1' : ''}"
@@ -3492,6 +3498,18 @@ const PRESET_SLUG = {'Озвучка': 'ozvuchka', 'Картинки': 'kadry', 
 const PART_TITLES = [['voice', 'Озвучка'], ['images', 'Картинки'], ['clips', 'Клипы'],
                      ['render', 'Сборка'], ['text_cover', 'Текст и обложка']];
 
+// Фильтр списка пресетов: живёт между заходами на экран, у каждого зрителя свой.
+const PRESET_FILTER_TYPES = [['all', 'Все'], ['full', 'Целые'], ['partial', 'Частичные'],
+                             ...PART_TITLES];
+const presetFilter = (() => {
+  const dflt = {q: '', type: 'all'};
+  try{
+    const v = JSON.parse(localStorage.getItem('presetFilter') || 'null');
+    if (v && typeof v.q === 'string' && PRESET_FILTER_TYPES.some(([c]) => c === v.type)) return v;
+  }catch(e){}
+  return dflt;
+})();
+
 async function viewPresetNew(){
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
@@ -3721,29 +3739,63 @@ async function viewPresets(){
   // Пресеты производства — «Целые» и «Частичные» отдельно, частичные вдобавок по
   // частям (раздел 4 спецификации): иначе список из трёх десятков строк не отличить,
   // какая настройка целиком отвечает за ролик, а какая — только заготовка озвучки.
+  // Фильтр списка (17.09.2026): по названию и по типу. Тип — у пресетов производства
+  // (целый / частичный / какая часть); у Rewrite и Cover типа нет, поэтому при
+  // выборе типа их карточки скрываются, а не показываются «не подходящими».
+  const F = presetFilter;
+  const nameOk = i => !F.q || String(i.name || '').toLowerCase().includes(F.q.toLowerCase());
+  const typeOk = i => F.type === 'all' || (F.type === 'full' ? i.scope === 'full'
+    : F.type === 'partial' ? i.scope !== 'full' : i.scope === F.type);
+
   const vsgenBodyHtml = items => {
+    items = items.filter(i => nameOk(i) && typeOk(i));
     const whole = items.filter(i => i.scope === 'full');
     const partial = items.filter(i => i.scope !== 'full');
-    let html = '<div class="sec">Целые</div>';
-    html += whole.length ? whole.map(i => presetItemHtml({service: 'vsgen'}, i)).join('')
-                         : '<div class="empty">Целых пресетов нет.</div>';
-    html += '<div class="sec">Частичные</div>';
-    if (!partial.length){
-      html += '<div class="empty">Частичных пресетов нет.</div>';
-    } else {
-      for (const [code, title] of PART_TITLES){
-        const arr = partial.filter(i => i.scope === code);
-        if (!arr.length) continue;
-        html += `<div class="sec" style="border-top:1px solid var(--line);
-          font-size:12px;color:var(--muted)">${esc(title)}</div>`;
-        html += arr.map(i => presetItemHtml({service: 'vsgen'}, i)).join('');
+    const filtered = F.q || F.type !== 'all';
+    let html = '';
+    if (!filtered || whole.length){
+      html += '<div class="sec">Целые</div>';
+      html += whole.length ? whole.map(i => presetItemHtml({service: 'vsgen'}, i)).join('')
+                           : '<div class="empty">Целых пресетов нет.</div>';
+    }
+    if (!filtered || partial.length){
+      html += '<div class="sec">Частичные</div>';
+      if (!partial.length){
+        html += '<div class="empty">Частичных пресетов нет.</div>';
+      } else {
+        for (const [code, title] of PART_TITLES){
+          const arr = partial.filter(i => i.scope === code);
+          if (!arr.length) continue;
+          html += `<div class="sec" style="border-top:1px solid var(--line);
+            font-size:12px;color:var(--muted)">${esc(title)}</div>`;
+          html += arr.map(i => presetItemHtml({service: 'vsgen'}, i)).join('');
+        }
       }
     }
-    return html;
+    return html || '<div class="empty">Под фильтр ничего не подошло.</div>';
   };
 
-  for (const g of d.groups){
-    const card = $(`<div class="card" style="margin-bottom:16px">
+  const bar = $(`<div class="card" style="padding:16px 18px">
+    <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
+      <input id="pf-q" type="search" placeholder="Поиск по названию"
+             style="flex:1 1 240px;min-width:0;max-width:360px" value="${esc(F.q)}">
+      <div class="modes" style="margin:0">${PRESET_FILTER_TYPES.map(([code, title]) =>
+        `<button type="button" data-type="${code}" class="small${F.type === code ? ' on' : ''}"
+         >${esc(title)}</button>`).join('')}</div>
+    </div></div>`);
+  app.append(bar);
+  const list = document.createElement('div');
+  app.append(list);
+
+  const paint = () => {
+    list.innerHTML = '';
+    let shown = 0;
+    for (const g of d.groups){
+      if (g.service !== 'vsgen' && F.type !== 'all') continue;
+      const items = g.service === 'vsgen' ? g.items : g.items.filter(nameOk);
+      if (g.service !== 'vsgen' && F.q && !items.length && !g.error) continue;
+      shown++;
+      const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)}${g.home
         ? ` <a class="mklink" href="${esc(g.home)}" target="_blank" rel="noopener"
              >завести в ${esc(g.home_title)} ↗</a>` : ''}</div>
@@ -3753,13 +3805,24 @@ async function viewPresets(){
              <div class="note muted">Пусто здесь означает «не спросили», а не
                «пресетов нет».</div></div></div>`
         : (g.service === 'vsgen' ? vsgenBodyHtml(g.items)
-           : (g.items.length ? g.items.map(i => presetItemHtml(g, i)).join('')
+           : (items.length ? items.map(i => presetItemHtml(g, i)).join('')
               : '<div class="empty">Пресетов нет.</div>'))}
-      ${g.note ? `<div class="note muted">${esc(g.note)}</div>` : ''}
+      ${g.note ? `<div class="secbody"><div class="note muted">${esc(g.note)}</div></div>` : ''}
     </div>`);
-    app.append(card);
-    wirePresets(card);
-  }
+      list.append(card);
+      wirePresets(card);
+    }
+    if (!shown) list.append($(`<div class="card"><div class="empty">Под фильтр ничего не
+      подошло.</div></div>`));
+  };
+  const save = () => { try{ localStorage.setItem('presetFilter', JSON.stringify(F)); }catch(e){} };
+  bar.querySelector('#pf-q').oninput = e => { F.q = e.target.value; save(); paint(); };
+  bar.querySelectorAll('[data-type]').forEach(b => b.onclick = () => {
+    F.type = b.dataset.type;
+    bar.querySelectorAll('[data-type]').forEach(x => x.classList.toggle('on', x === b));
+    save(); paint();
+  });
+  paint();
   app.append($(`<div class="note muted">Быстрее всего новый пресет получается копией
     похожего: «Копия» рядом с ним, потом правка полей. Завести с нуля и править
     настройки — в том сервисе, которому пресет принадлежит: ссылки в заголовках выше.

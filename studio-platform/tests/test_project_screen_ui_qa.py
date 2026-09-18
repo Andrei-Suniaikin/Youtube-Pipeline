@@ -499,7 +499,7 @@ def main() -> int:
           re.search(r'<div class="sec">.*?</div>\s*<div class="secbody">', file_card, re.S)
           is not None, True)
     check("хвостовая подпись карточки «Во что обошёлся» — тоже в .secbody",
-          '<div class="secbody" style="padding-top:8px">' in view_project, True)
+          '<div class="secbody">' in view_project, True)
 
     print("\nРегрессия Issue 7: опрос лога не запускает тик поверх ещё не ответившего "
           "(busy-флаг), сетевая ошибка тика не стирает уже показанный лог и не глушит "

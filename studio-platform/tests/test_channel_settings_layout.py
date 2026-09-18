@@ -92,10 +92,12 @@ def main() -> int:
 
     check("у .fields снят нулевой боковой отступ (было padding:6px 0 4px)",
           re.search(r"\.fields\{[^}]*padding:6px 0 4px", index_html) is None, True)
-    check(".fields получил боковой 18px и нижний 16px",
-          bool(re.search(r"\.fields\{[^}]*padding:6px 18px 16px", index_html)), True)
-    check("класс .secbody объявлен с отступом 18px/16px",
-          bool(re.search(r"\.secbody\{padding:0 18px 16px\}", index_html)), True)
+    check(".fields получил отступ 16px сверху, 18px по бокам",
+          bool(re.search(r"\.fields\{[^}]*padding:16px 18px 18px", index_html)), True)
+    # 17.09.2026: сверху тоже 16px — без него поля прилипали к линии заголовка .sec.
+    # Сами зазоры на экранах меряет tests/test_spacing_browser.py в браузере.
+    check("класс .secbody объявлен с отступом 16px сверху, 18px по бокам",
+          bool(re.search(r"\.secbody\{padding:16px 18px 18px\}", index_html)), True)
 
     spots = [
         ('шапка канала (editbox)', '<div id="editbox" class="secbody">'),
