@@ -37,6 +37,7 @@ from pub_publish import (
 )
 from pub_remote import (
     CoverClient,
+    RemoteJobMissing,
     RewriteClient,
     cover_degraded,
     donor_text,
@@ -183,6 +184,12 @@ class PubServices:
         рерайт заново, а только смотрит, готов ли он.
         """
         known = self._remote(c, rel["release_id"], "rewrite")
+        if known is not None and known["status"] == "missing":
+            # Задача, за которую уже заплачено, у соседа не нашлась. Молча заказать
+            # заново — заплатить второй раз за тот же текст, поэтому строка стоит до
+            # решения человека и причина видна прямо в ней.
+            raise ItemFailed(known["error"] or "сохранённая задача рерайта отсутствует, "
+                                               "нужен разбор: повтор оплачивается заново")
         try:
             project_id = rel["project_id"]
         except (KeyError, IndexError):
@@ -251,8 +258,9 @@ class PubServices:
                 return {"wait": True}
             file_id = client.upload_text(text, filename=f'{rel["release_id"]}.txt')
             try:
-                job_id = client.create_job(file_id, lang, preset,
-                                           channel_name=rel["ch_name"] or "")
+                job_id = client.create_job(
+                    file_id, lang, preset, channel_name=rel["ch_name"] or "",
+                    idempotency_key=f'release:{rel["release_id"]}')
             except Exception as exc:
                 # Заказа нет — денег нет: строку открываем заново, повтор безопасен.
                 pub_calls.mark_failed(c, decision["call_id"], str(exc)[:400],
@@ -271,7 +279,15 @@ class PubServices:
                      f"пресет «{rel['preset_rewrite'] or 'не выбран'}»")
             return {"wait": True}
 
-        info = client.job(known["remote_job_id"])
+        try:
+            info = client.job(known["remote_job_id"])
+        except RemoteJobMissing as exc:
+            # Помечаем задачу пропавшей: иначе следующий тик увидел бы её «running» и
+            # спросил бы снова, а ручной сброс строки привёл бы к заказу дубля.
+            self._close_text_call(c, rel, error=str(exc))
+            self._finish_remote(c, rel["release_id"], "rewrite", "missing", str(exc))
+            log_line(c, rel["release_id"], "рерайт", str(exc), level="error")
+            raise
         state = str(info.get("status") or "").lower()
         if state in ("error", "failed", "cancelled"):
             reason = "рерайт не справился: " + str(info.get("error") or state)

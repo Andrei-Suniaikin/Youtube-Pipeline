@@ -96,6 +96,10 @@ def set_key(c, name: str, value: str, now: float) -> None:
 
 def _call(method: str, url: str, key: str, service: str, **kw):
     """Запрос к соседу с переводом его ответа в наши два класса отказа."""
+    # `missing_job=True` ставят только опросы уже созданной задачи: там 404/410 значит
+    # «задача у соседа исчезла», а не «мы ошиблись адресом». Отличать это важно — см.
+    # RemoteJobMissing ниже.
+    missing_job = kw.pop("missing_job", False)
     headers = kw.pop("headers", {}) or {}
     headers["Authorization"] = f"Bearer {key}"
     try:
@@ -113,6 +117,11 @@ def _call(method: str, url: str, key: str, service: str, **kw):
         raise ResourceDown(service, f"{service}: нет доступных ключей провайдера")
     if resp.status_code >= 500:
         raise ResourceDown(service, f"{service}: внутренняя ошибка {resp.status_code}")
+    if resp.status_code in (404, 410) and missing_job:
+        raise RemoteJobMissing(
+            f"{service}: сохранённая задача отсутствует — она удалена у соседа или "
+            f"заказана с другого стенда. Автоматическое создание дубля остановлено: "
+            f"новый заказ это новые деньги, решение за человеком")
     if resp.status_code == 422:
         raise ItemFailed(f"{service} не принял запрос: {_detail(resp)}")
     if resp.status_code >= 400:
@@ -371,6 +380,15 @@ def donor_text(url: str) -> str:
 
 # ─────────────────────────── рерайт ───────────────────────────
 
+class RemoteJobMissing(ItemFailed):
+    """Задача, номер которой мы храним, у соседа не существует (404/410).
+
+    Отдельный класс, а не общий отказ: на это нельзя отвечать повтором. Повтор здесь
+    означал бы «закажу заново», то есть вторую оплату того же текста. Строка встаёт и
+    ждёт человека — он либо найдёт задачу, либо разрешит платить снова.
+    """
+
+
 class RewriteClient:
     def __init__(self, key: str, base: str = REWRITE_BASE):
         self.key = key
@@ -398,7 +416,8 @@ class RewriteClient:
                     return entry
         return {}
 
-    def create_job(self, file_id: str, lang_code: str, preset: dict, channel_name: str = "") -> str:
+    def create_job(self, file_id: str, lang_code: str, preset: dict,
+                   channel_name: str = "", idempotency_key: str = "") -> str:
         preset = preset or {}
         lang_entry = self.preset_language(preset, lang_code)
         body = {
@@ -417,11 +436,20 @@ class RewriteClient:
             "safe_text": bool(preset.get("safe_text", False)),
             "max_threads": int(preset.get("threads") or 1),
         }
-        resp = _call("POST", self._url("/jobs"), self.key, "рерайт", json=body)
+        # Ключ повтора (перенесено из production 14.09): если ответ на POST потерялся
+        # по дороге, второй такой же запрос вернёт ТУ ЖЕ задачу, а не создаст вторую.
+        # Сосед узнаёт заказ по отпечатку тела, где вместо file_id стоит хэш содержимого
+        # текста; тот же ключ с другим текстом/моделью/языком он обязан отвергнуть.
+        # Наш форк рерайта этого ещё не умеет (ребейз 31.08 → 18.09 впереди) — заголовок
+        # он просто не заметит, а после ребейза защита включится сама.
+        resp = _call("POST", self._url("/jobs"), self.key, "рерайт", json=body,
+                     headers={"Idempotency-Key": idempotency_key}
+                     if idempotency_key else {})
         return resp.json()["job_id"]
 
     def job(self, job_id: str) -> dict:
-        return _call("GET", self._url(f"/jobs/{job_id}"), self.key, "рерайт").json()
+        return _call("GET", self._url(f"/jobs/{job_id}"), self.key, "рерайт",
+                     missing_job=True).json()
 
     def result_code(self, info: dict, lang_code: str) -> str:
         """Под каким кодом сервис положил результат.

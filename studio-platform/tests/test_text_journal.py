@@ -39,6 +39,8 @@ class FakeClient:
 
     made = 0
     fail_create = False
+    keys = []
+    missing = False
 
     def __init__(self, *_a, **_k):
         pass
@@ -46,13 +48,17 @@ class FakeClient:
     def upload_text(self, text, filename=""):
         return "file-1"
 
-    def create_job(self, file_id, lang, preset, channel_name=""):
+    def create_job(self, file_id, lang, preset, channel_name="", idempotency_key=""):
         if FakeClient.fail_create:
             raise RuntimeError("рерайт отказал до создания задачи")
         FakeClient.made += 1
+        FakeClient.keys.append(idempotency_key)
         return f"job-{FakeClient.made}"
 
     def job(self, job_id):
+        if FakeClient.missing:
+            from pub_remote import RemoteJobMissing
+            raise RemoteJobMissing("рерайт: сохранённая задача отсутствует")
         return {"status": "done"}
 
     def result_code(self, info, lang):
@@ -193,6 +199,45 @@ def main() -> int:
         c5.execute("DELETE FROM pub_release_jobs"); c5.commit()
         out = svc5.do_source_ready(c5, REL)
         check("новый заказ НЕ создан", FakeClient.made, 1)
+
+        print("\nКлюч повтора уходит вместе с заказом (перенос правки production 14.09)")
+        # Если ответ на POST потерялся по дороге, тот же ключ вернёт ТУ ЖЕ задачу.
+        # Ключ — «release:<выпуск>», то есть один заказ на один выпуск.
+        check("ключ повтора привязан к выпуску",
+              [k for k in FakeClient.keys if k], ["release:rel-1"] * len(
+                  [k for k in FakeClient.keys if k]))
+        check("ключ вообще передавался", bool([k for k in FakeClient.keys if k]), True)
+
+        print("\nЗадача пропала у соседа — дубль не заказывается, строка ждёт человека")
+        c6 = fresh()
+        FakeClient.made = 0
+        svc6 = services([])
+        svc6.do_source_ready(c6, REL)
+        FakeClient.missing = True
+        try:
+            svc6.do_source_ready(c6, REL)
+            check("выпуск остановлен", "не остановлен", "RemoteJobMissing")
+        except ItemFailed as exc:
+            check("выпуск остановлен", type(exc).__name__, "RemoteJobMissing")
+        finally:
+            FakeClient.missing = False
+        row = c6.execute("SELECT status, error FROM pub_release_jobs "
+                         "WHERE service='rewrite' AND kind='job'").fetchone()
+        check("задача помечена пропавшей", row["status"], "missing")
+        check("причина сохранена", "отсутствует" in (row["error"] or ""), True)
+        # Самое важное: следующий тик не заказывает заново — это были бы вторые деньги.
+        try:
+            svc6.do_source_ready(c6, REL)
+            check("повтор остановлен тоже", "не остановлен", "ItemFailed")
+        except ItemFailed:
+            check("повтор остановлен тоже", "ItemFailed", "ItemFailed")
+        check("нового заказа не создано", FakeClient.made, 1)
+        # Строка журнала остаётся «заказано»: заказ БЫЛ и деньги за него ушли. Именно
+        # поэтому повтор пойдёт по ветке «подхватить существующий», а не «заказать».
+        call = c6.execute("SELECT status, error FROM provider_calls").fetchone()
+        check("деньги за пропавшую задачу считаются потраченными", call["status"], "ordered")
+        check("и причина записана в журнал вызовов",
+              "отсутствует" in (call["error"] or ""), True)
     finally:
         pub_services.RewriteClient = saved_client
         pub_services.donor_text = saved_text
