@@ -3073,6 +3073,240 @@ def _rewrite_gen_write(name: str, values: dict, sid: str, create: bool = False) 
         raise HTTPException(_pass_code(code), out)
 
 
+# ─────────────────── шаблоны озвучки Lumean (18.09.2026) ───────────────────
+# Решение владельца: шаблоны собираются прямо у нас. Провайдер это позволяет —
+# `POST /templates` (обязательны service_key, name, config) возвращает шаблон вместе с
+# id, у шаблона есть PATCH и DELETE (проверено живыми запросами 18.09). Поля те же, что
+# у настроек озвучки в пресете: второго словаря имён не заводим.
+LUMEAN_SERVICES = (("elevenlabs", "ElevenLabs TTS"), ("heygen", "HeyGen"), ("sfx", "Звуки"))
+LUMEAN_TEMPLATE_FIELDS = (
+    {"key": "name", "kind": "text", "label": "Название"},
+    {"key": "service_key", "kind": "select", "label": "Сервис",
+     "hint": "чем озвучивать; маршрут кабинета «Lumean · только HeyGen» ждёт heygen"},
+    {"key": "voice_id", "kind": "text", "label": "ID голоса",
+     "hint": "голос из библиотеки Lumean — обязателен"},
+    {"key": "model_id", "kind": "select", "label": "Модель"},
+    {"key": "stability", "kind": "number", "label": "Стабильность", "min": 0, "max": 1},
+    {"key": "similarity_boost", "kind": "number", "label": "Схожесть", "min": 0, "max": 1},
+    {"key": "style", "kind": "number", "label": "Стиль", "min": 0, "max": 1},
+    {"key": "speed", "kind": "number", "label": "Скорость", "min": 0.5, "max": 2},
+    {"key": "use_speaker_boost", "kind": "switch", "label": "Усиление голоса"},
+    {"key": "apply_text_normalization", "kind": "select", "label": "Нормализация текста"},
+    {"key": "chunk_size", "kind": "number", "label": "Размер куска, знаков",
+     "min": 100, "max": 20000},
+    {"key": "pauses", "kind": "switch", "label": "Паузы"},
+    {"key": "stress", "kind": "switch", "label": "Ударения"},
+)
+LUMEAN_TEMPLATE_DEFAULTS = {"service_key": "elevenlabs", "model_id": "eleven_v3",
+                            "stability": 0.5, "similarity_boost": 0.75, "style": 0,
+                            "speed": 1, "use_speaker_boost": "1",
+                            "apply_text_normalization": "auto", "chunk_size": 2000,
+                            "pauses": "", "stress": ""}
+
+
+def _lumean_field_options(mod) -> dict:
+    models = [{"value": v, "title": t} for v, t in
+              (getattr(preset_fields, "_lumean_models")(mod) or []) if v]
+    norm = [{"value": v, "title": t} for v, t in
+            (getattr(preset_fields, "_lumean_normalization")(mod) or []) if v]
+    return {"model_id": models, "apply_text_normalization": norm,
+            "service_key": [{"value": k, "title": t} for k, t in LUMEAN_SERVICES]}
+
+
+def _lumean_template_form(mod, values: dict) -> list:
+    options = _lumean_field_options(mod)
+    out = []
+    for f in LUMEAN_TEMPLATE_FIELDS:
+        item = dict(f)
+        val = values.get(f["key"], "")
+        item["value"] = "" if val is None else val
+        item["options"] = options.get(f["key"], [])
+        out.append(item)
+    return out
+
+
+def _lumean_template_values(info: dict) -> dict:
+    """Шаблон провайдера → значения полей формы. Имена у него и у нас совпадают, но
+    лежат на разной глубине: `config.tts_settings.voice_settings.*`."""
+    cfg = info.get("config") if isinstance(info.get("config"), dict) else {}
+    tts = cfg.get("tts_settings") if isinstance(cfg.get("tts_settings"), dict) else {}
+    vs = tts.get("voice_settings") if isinstance(tts.get("voice_settings"), dict) else {}
+    worker = cfg.get("worker_settings") if isinstance(cfg.get("worker_settings"), dict) else {}
+    pause = cfg.get("pause_settings") if isinstance(cfg.get("pause_settings"), dict) else {}
+    stress = cfg.get("stress_settings") if isinstance(cfg.get("stress_settings"), dict) else {}
+    return {"name": info.get("name") or "", "service_key": info.get("service_key") or "",
+            "voice_id": tts.get("voice_id") or "", "model_id": tts.get("model_id") or "",
+            "stability": vs.get("stability", ""), "similarity_boost": vs.get("similarity_boost", ""),
+            "style": vs.get("style", ""), "speed": vs.get("speed", ""),
+            "use_speaker_boost": "1" if vs.get("use_speaker_boost") else "0",
+            "apply_text_normalization": tts.get("apply_text_normalization") or "",
+            "chunk_size": worker.get("chunk_size", ""),
+            "pauses": "1" if pause.get("enabled") else "0",
+            "stress": "1" if stress.get("enabled") else "0"}
+
+
+def _lumean_template_payload(values: dict) -> dict:
+    """Значения формы → тело запроса к Lumean. Проверяем здесь, а не у провайдера:
+    отказ после отправки читается хуже, чем понятная фраза до неё."""
+    name = str(values.get("name") or "").strip()[:120]
+    if not name:
+        raise HTTPException(400, "пустое название шаблона")
+    service = str(values.get("service_key") or "elevenlabs").strip()
+    if service not in {k for k, _t in LUMEAN_SERVICES}:
+        raise HTTPException(400, f"неизвестный сервис «{service}»")
+    voice = str(values.get("voice_id") or "").strip()
+    if not voice:
+        raise HTTPException(400, "не задан ID голоса — шаблон без голоса не работает")
+    voice_settings, tts = {}, {"voice_id": voice}
+    for key, lo, hi in (("stability", 0.0, 1.0), ("similarity_boost", 0.0, 1.0),
+                        ("style", 0.0, 1.0), ("speed", 0.5, 2.0)):
+        raw = str(values.get(key, "")).strip().replace(",", ".")
+        if raw == "":
+            continue
+        try:
+            val = float(raw)
+        except ValueError:
+            raise HTTPException(400, f"{key}: нужно число от {lo} до {hi}")
+        if not (lo <= val <= hi):
+            raise HTTPException(400, f"{key}: допустимо от {lo} до {hi}")
+        voice_settings[key] = val
+    boost = str(values.get("use_speaker_boost", "")).strip().lower()
+    if boost:
+        voice_settings["use_speaker_boost"] = boost in ("1", "true", "on", "да")
+    model = str(values.get("model_id") or "").strip()
+    if model:
+        tts["model_id"] = model
+    norm = str(values.get("apply_text_normalization") or "").strip().lower()
+    if norm:
+        if norm not in ("auto", "on", "off"):
+            raise HTTPException(400, "нормализация текста — auto, on или off")
+        tts["apply_text_normalization"] = norm
+    if voice_settings:
+        tts["voice_settings"] = voice_settings
+    config = {"tts_settings": tts,
+              # Формат вывода задаём сами: кабинет собирает ролик из mp3, и шаблон,
+              # отдающий wav, ломает сборку молча.
+              "output_settings": {"audio_format": "mp3"}}
+    chunk = str(values.get("chunk_size", "")).strip()
+    if chunk:
+        try:
+            num = int(chunk)
+        except ValueError:
+            raise HTTPException(400, "размер куска — целое число знаков")
+        if not (100 <= num <= 20000):
+            raise HTTPException(400, "размер куска — от 100 до 20000 знаков")
+        config["worker_settings"] = {"chunk_size": num}
+    for key, section in (("pauses", "pause_settings"), ("stress", "stress_settings")):
+        raw = str(values.get(key, "")).strip().lower()
+        if raw:
+            config[section] = {"enabled": raw in ("1", "true", "on", "да")}
+    return {"service_key": service, "name": name, "config": config}
+
+
+def _lumean_users(template_id: str) -> list:
+    """Кто ссылается на этот шаблон: пресеты и проекты. Нужно перед удалением —
+    у них озвучка встанет в момент запуска, а не сейчас."""
+    tid = (template_id or "").strip().lower()
+    if not tid:
+        return []
+    out = []
+    c = db()
+    try:
+        rows = list(c.execute("SELECT id, name, settings FROM presets WHERE tenant_id=?",
+                              (TENANT,)))
+        rows += list(c.execute("SELECT id, name, settings FROM projects WHERE tenant_id=? "
+                               "AND settings IS NOT NULL AND settings!=''", (TENANT,)))
+    finally:
+        c.close()
+    for r in rows:
+        try:
+            st = json.loads(r["settings"] or "{}")
+        except ValueError:
+            continue
+        used = {str(st.get("voice") or "").strip().lower(),
+                str(st.get("voice_uuid") or "").strip().lower()}
+        used |= {str(v).strip().lower()
+                 for v in preset_fields.parse_voice_map(st.get("voice_by_lang")).values()}
+        if tid in used:
+            out.append(r["name"] or str(r["id"]))
+    return out
+
+
+def _lumean_mod():
+    mod = sys.modules.get("main")
+    if mod is None or not hasattr(mod, "lumean_templates"):
+        raise HTTPException(503, "кабинет не поднят")
+    return mod
+
+
+@app.get("/ui/lumean/templates")
+def ui_lumean_templates():
+    """Шаблоны озвучки Lumean и поля формы для нового."""
+    mod = _lumean_mod()
+    got = mod.lumean_templates()
+    return {"ok": got.get("ok", False), "why": got.get("why", ""),
+            "templates": got.get("templates", []),
+            "services": [{"value": k, "title": t} for k, t in LUMEAN_SERVICES],
+            "fields": _lumean_template_form(mod, dict(LUMEAN_TEMPLATE_DEFAULTS)),
+            "note": "шаблон живёт в аккаунте Lumean: правка меняет его и там"}
+
+
+@app.get("/ui/lumean/templates/{tid}/form")
+def ui_lumean_template_form(tid: str):
+    mod = _lumean_mod()
+    info = mod.lumean_template_info(tid)
+    if not info.get("ok"):
+        raise HTTPException(404, info.get("why") or "шаблон не прочитался")
+    raw = mod._lumean_call("GET", f"/templates/{tid}")[1]
+    full = raw.get("data") if isinstance(raw.get("data"), dict) else {}
+    return {"id": tid, "fields": _lumean_template_form(mod, _lumean_template_values(full)),
+            "used_by": _lumean_users(tid)}
+
+
+class LumeanTemplateIn(BaseModel):
+    values: dict = {}
+
+
+@app.post("/ui/lumean/templates")
+def ui_lumean_template_create(body: LumeanTemplateIn):
+    """Завести шаблон в Lumean. Ответ провайдера содержит id — возвращаем его, чтобы
+    человеку не приходилось копировать идентификатор руками."""
+    mod = _lumean_mod()
+    out = mod.lumean_template_save(_lumean_template_payload(body.values or {}))
+    if not out.get("ok"):
+        raise HTTPException(502, out.get("why") or "Lumean не принял шаблон")
+    return {"ok": True, "id": out.get("id"), "name": out.get("name")}
+
+
+@app.post("/ui/lumean/templates/{tid}")
+def ui_lumean_template_update(tid: str, body: LumeanTemplateIn):
+    mod = _lumean_mod()
+    out = mod.lumean_template_save(_lumean_template_payload(body.values or {}), tid)
+    if not out.get("ok"):
+        raise HTTPException(502, out.get("why") or "Lumean не принял правку")
+    return {"ok": True, "id": tid}
+
+
+@app.delete("/ui/lumean/templates/{tid}")
+def ui_lumean_template_remove(tid: str):
+    """Удалить шаблон у провайдера. Если на него ссылается пресет или проект — сначала
+    сказать, какой: озвучка у них встанет в момент запуска, а не сейчас."""
+    used = _lumean_users(tid)
+    if used:
+        raise HTTPException(409, "на него ссылаются: " + ", ".join(used[:10])
+                            + ". Сначала переключите их на другой шаблон.")
+    out = _lumean_mod().lumean_template_delete(tid)
+    if not out.get("ok"):
+        raise HTTPException(502, out.get("why") or "Lumean не удалил шаблон")
+    return {"ok": True}
+
+
+@app.get("/ui/lumean/voices")
+def ui_lumean_voices(service: str = "", search: str = ""):
+    """Голоса Lumean для подстановки в поле шаблона."""
+    return _lumean_mod().lumean_voices(service=service, search=search)
+
+
 @app.get("/ui/lumean/template")
 def ui_lumean_template(id: str = ""):
     """Проверить шаблон Lumean до оплаты (18.09.2026).

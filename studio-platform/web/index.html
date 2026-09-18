@@ -4281,6 +4281,53 @@ async function viewPresets(){
     save(); paint();
   });
   paint();
+  // Шаблоны озвучки Lumean (18.09.2026): собираются прямо здесь. Провайдер отдаёт id
+  // в ответе на создание — его сразу видно и можно вставить в карту голосов пресета.
+  let lum = {ok: false, templates: [], fields: []};
+  try{ lum = await api('/ui/lumean/templates'); }catch(e){ lum = {ok: false, why: e.message}; }
+  const lumCard = $(`<div class="card">
+    <div class="sec">Шаблоны озвучки Lumean
+      ${lum.ok ? `<button class="ghost small" id="lum-new"
+        style="float:right;font-weight:400;text-transform:none;letter-spacing:0"
+        >Завести</button>` : ''}</div>
+    ${lum.ok
+      ? (lum.templates.length ? lum.templates.map(t => `<div class="stage">
+          <div class="dot s-done">♪</div>
+          <div class="body">
+            <div class="name">${esc(t.name || t.id)}</div>
+            <div class="facts">${esc(t.service || '')}${t.model ? ' · ' + esc(t.model) : ''}${
+              t.voice_id ? ' · голос ' + esc(t.voice_id) : ''}</div>
+            <div class="note muted mono" style="font-size:11px">${esc(t.id)}</div>
+          </div>
+          <div style="white-space:nowrap;align-self:center">
+            <button class="ghost lum-copy" data-id="${esc(t.id)}">Копировать id</button>
+            <button class="ghost lum-edit" data-id="${esc(t.id)}">Править</button>
+            <button class="ghost lum-del" data-id="${esc(t.id)}"
+              data-name="${esc(t.name || t.id)}">Удалить</button>
+          </div></div>`).join('')
+        : '<div class="empty">Шаблонов нет — заведите первый.</div>')
+      : `<div class="secbody"><div class="note bad">${esc(lum.why || 'Lumean не ответил')}</div>
+         <div class="note muted">Шаблоны читаются ключом Lumean из профиля: без него
+           список пуст, а озвучка идёт по id, вписанному в пресет руками.</div></div>`}
+    ${lum.ok ? `<div class="secbody"><div class="note muted">${esc(lum.note || '')}</div></div>` : ''}
+  </div>`);
+  app.append(lumCard);
+  const lumNew = lumCard.querySelector('#lum-new');
+  if (lumNew) lumNew.onclick = () => lumeanTemplateModal(null, lum.fields);
+  lumCard.querySelectorAll('.lum-edit').forEach(b => b.onclick =
+    () => lumeanTemplateModal(b.dataset.id, null));
+  lumCard.querySelectorAll('.lum-copy').forEach(b => b.onclick = async () => {
+    try{ await navigator.clipboard.writeText(b.dataset.id); toast('id скопирован', 'ok'); }
+    catch(e){ toast('Скопировать не вышло — id виден в строке шаблона'); }
+  });
+  lumCard.querySelectorAll('.lum-del').forEach(b => b.onclick = () =>
+    confirmInline(b, `Удалить «${b.dataset.name}» в Lumean? Это правда удалит его у провайдера.`,
+      async () => {
+        try{ await api(`/ui/lumean/templates/${encodeURIComponent(b.dataset.id)}`,
+                       {method: 'DELETE'}); await render(); }
+        catch(e){ toast(e.message); }
+      }));
+
   // Каналы на пресете видно сразу: правка меняет их поведение со следующего прохода.
   const chpCard = $(`<div class="card">
     <div class="sec">Пресеты каналов
@@ -4356,6 +4403,69 @@ function wirePresets(root){
       ask(b, () => api(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/${
         encodeURIComponent(b.dataset.name)}`, {method: 'DELETE'})));
   });
+}
+
+// Окно шаблона озвучки Lumean. Поля описывает сервер (те же имена, что у провайдера),
+// здесь только отрисовка. Создание возвращает id — показываем его и предлагаем
+// скопировать: именно он вписывается в карту «язык → шаблон» пресета.
+async function lumeanTemplateModal(id, fields){
+  const creating = !id;
+  let d = {fields: fields || [], used_by: []};
+  if (!creating){
+    try{ d = await api(`/ui/lumean/templates/${encodeURIComponent(id)}/form`); }
+    catch(e){ toast(e.message); return; }
+  }
+  const fieldHtml = f => {
+    const fid = 'lt-' + f.key;
+    if (f.kind === 'switch')
+      return `<div class="fld"><label for="${fid}">${esc(f.label)}</label>
+        <select id="${fid}" data-lt="${esc(f.key)}">
+          <option value=""${String(f.value) === '' ? ' selected' : ''}>как у провайдера</option>
+          <option value="1"${String(f.value) === '1' ? ' selected' : ''}>включено</option>
+          <option value="0"${String(f.value) === '0' ? ' selected' : ''}>выключено</option>
+        </select>${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    if (f.kind === 'select')
+      return `<div class="fld"><label for="${fid}">${esc(f.label)}</label>
+        <select id="${fid}" data-lt="${esc(f.key)}">
+          ${(f.options || []).map(o => `<option value="${esc(String(o.value))}"${
+            String(o.value) === String(f.value) ? ' selected' : ''}>${esc(o.title)}</option>`)
+            .join('')}</select>
+        ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    if (f.kind === 'number')
+      return `<div class="fld"><label for="${fid}">${esc(f.label)}</label>
+        <input id="${fid}" data-lt="${esc(f.key)}" type="number" step="0.05"
+          min="${f.min}" max="${f.max}" value="${esc(String(f.value ?? ''))}">
+        ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    return `<div class="fld"${f.key === 'name' ? ' style="grid-column:1/-1"' : ''}>
+      <label for="${fid}">${esc(f.label)}</label>
+      <input id="${fid}" data-lt="${esc(f.key)}" value="${esc(String(f.value ?? ''))}">
+      ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+  };
+  const used = (d.used_by || []).length
+    ? `<div class="note muted">На него ссылаются: ${d.used_by.map(esc).join(', ')}.
+       Правка изменит их озвучку со следующего запуска.</div>`
+    : '';
+  modal(creating ? 'Новый шаблон озвучки' : 'Шаблон озвучки Lumean',
+    `<div class="fields" style="padding:0">${(d.fields || []).map(fieldHtml).join('')}</div>
+     <div class="note muted">Шаблон живёт в аккаунте Lumean: заведённый здесь виден и
+       в их кабинете, удаление удаляет его там же. Формат вывода задаём мы — кабинет
+       собирает ролик из mp3.</div>${used}`,
+    {ok: creating ? 'Завести' : 'Сохранить', onOk: async (box, close) => {
+      const values = {};
+      box.querySelectorAll('[data-lt]').forEach(el => { values[el.dataset.lt] = el.value; });
+      if (creating){
+        const out = await post('/ui/lumean/templates', {values});
+        close();
+        // id нужен человеку сразу: именно он идёт в карту голосов пресета.
+        toast(`Шаблон заведён, id: ${out.id}`, 'ok');
+        try{ await navigator.clipboard.writeText(out.id); }catch(e){}
+      }else{
+        await post(`/ui/lumean/templates/${encodeURIComponent(id)}`, {values});
+        close();
+        toast('Шаблон обновлён у провайдера', 'ok');
+      }
+      await render();
+    }});
 }
 
 // Окно пресета канала: те же настройки, что у канала, кроме языка. Пустое поле — «в

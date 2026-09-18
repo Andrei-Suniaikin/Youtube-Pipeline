@@ -14823,6 +14823,108 @@ def save_fastgen_usage(c, usage: dict, now) -> None:
     c.commit()
 
 
+def _lumean_key(key: str = "") -> str:
+    """Ключ Lumean: свой у семейства `elevenlabs`, иначе `lumean` — как их видит пул."""
+    return key or _first_credential(keys(), "elevenlabs") or _first_credential(keys(), "lumean")
+
+
+def _lumean_call(method: str, path: str, body=None, key: str = "") -> tuple:
+    """Запрос к Lumean от имени владельца ключа. Возвращает (код, разобранное тело).
+
+    Один вход на все обращения к провайдеру: список шаблонов, чтение, создание, правка и
+    удаление. Ключ сюда не передаётся наружу и в журнал не пишется.
+    """
+    cred = _lumean_key(key)
+    if not cred:
+        return 0, {"message": "ключ Lumean не задан"}
+    base = PROVIDERS["elevenlabs"]["base"].rstrip("/")
+    try:
+        r = requests.request(method, f"{base}{path}", headers={"X-API-Key": cred},
+                             json=body, timeout=45)
+    except Exception as exc:                                       # noqa: BLE001
+        return 0, {"message": f"Lumean не отвечает: {type(exc).__name__}"}
+    try:
+        data = r.json() or {}
+    except Exception:                                              # noqa: BLE001
+        data = {"message": f"Lumean ответил {r.status_code}"}
+    return r.status_code, data
+
+
+def lumean_templates(key: str = "") -> dict:
+    """Список шаблонов Lumean владельца ключа — по одному короткому описанию на шаблон."""
+    code, data = _lumean_call("GET", "/templates", key=key)
+    if code != 200:
+        return {"ok": False, "why": _lumean_why(code, data)}
+    out = []
+    for t in (data.get("data") or []):
+        cfg = t.get("config") if isinstance(t.get("config"), dict) else {}
+        tts = cfg.get("tts_settings") if isinstance(cfg.get("tts_settings"), dict) else {}
+        out.append({"id": t.get("id"), "name": t.get("name") or "",
+                    "service": t.get("service_key") or "",
+                    "voice_id": tts.get("voice_id") or "",
+                    "model": tts.get("model_id") or ""})
+    return {"ok": True, "templates": out}
+
+
+def _lumean_why(code: int, data: dict) -> str:
+    """Отказ провайдера человеческими словами, вместе с полями, которые он забраковал."""
+    msg = str((data or {}).get("message") or f"Lumean ответил {code}")
+    errors = (data or {}).get("errors")
+    if isinstance(errors, dict) and errors:
+        parts = [f"{k}: {'; '.join(str(x) for x in v)}" if isinstance(v, list) else f"{k}: {v}"
+                 for k, v in errors.items()]
+        return msg + " — " + "; ".join(parts)
+    return msg
+
+
+def lumean_template_save(payload: dict, template_id: str = "", key: str = "") -> dict:
+    """Завести шаблон Lumean или поправить существующий.
+
+    `template_id` пуст — создаём (`POST /templates`, в ответе приходит id, его и
+    возвращаем). Задан — правим (`PATCH /templates/{id}`). Тело собирает вызывающий:
+    здесь только передача и перевод отказа провайдера на русский.
+    """
+    if template_id:
+        code, data = _lumean_call("PATCH", f"/templates/{template_id}", payload, key)
+    else:
+        code, data = _lumean_call("POST", "/templates", payload, key)
+    if code not in (200, 201):
+        return {"ok": False, "why": _lumean_why(code, data)}
+    made = data.get("data") if isinstance(data.get("data"), dict) else {}
+    return {"ok": True, "id": made.get("id") or template_id, "name": made.get("name") or ""}
+
+
+def lumean_template_delete(template_id: str, key: str = "") -> dict:
+    code, data = _lumean_call("DELETE", f"/templates/{template_id}", key=key)
+    if code not in (200, 204):
+        return {"ok": False, "why": _lumean_why(code, data)}
+    return {"ok": True}
+
+
+def lumean_voices(key: str = "", service: str = "", search: str = "") -> dict:
+    """Голоса Lumean для выбора в форме шаблона. Пусто — не беда: id голоса можно
+    вписать руками, и форма так и говорит."""
+    path = "/voices?per_page=100"
+    if service:
+        path += f"&service_key={urllib.parse.quote(service)}"
+    if search:
+        path += f"&search={urllib.parse.quote(search)}"
+    code, data = _lumean_call("GET", path, key=key)
+    if code != 200:
+        return {"ok": False, "why": _lumean_why(code, data), "voices": []}
+    block = data.get("data")
+    items = block.get("items") if isinstance(block, dict) else block
+    out = []
+    for v in (items or []):
+        if not isinstance(v, dict):
+            continue
+        out.append({"id": v.get("voice_id") or v.get("id") or "",
+                    "name": v.get("name") or v.get("display_name") or "",
+                    "language": v.get("language") or v.get("lang") or "",
+                    "gender": v.get("gender") or ""})
+    return {"ok": True, "voices": [v for v in out if v["id"]]}
+
+
 def lumean_template_info(template_id: str, key: str = "") -> dict:
     """Что за шаблон Lumean скрывается за этим id. Только чтение (`GET /templates/{id}`),
     оплаты не происходит.
