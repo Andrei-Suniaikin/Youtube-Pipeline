@@ -28,6 +28,7 @@ from pub_neighbors import rewrite_preset_config
 from pub_publish import (
     TitleError,
     TitleUnavailable,
+    VideoAmbiguous,
     chapters_enabled,
     find_video,
     make_description,
@@ -754,7 +755,18 @@ class PubServices:
 
         proj = self.project_dir(rel["tenant_id"], rel["project_id"])
         render_job = (self._jobs(c, rel["release_id"]).get("render") or {})
-        video = find_video(proj, render_job["remote_job_id"] if render_job else None)
+        job_id = render_job["remote_job_id"] if render_job else None
+        # Путь, записанный самим рендером при приёме результата: единственный источник,
+        # который знает файл ТОЧНО. Всё остальное в find_video — запасные варианты.
+        out_rel = ""
+        if job_id:
+            row = c.execute("SELECT output_rel FROM queue_tasks WHERE job_id=? "
+                            "AND kind='render'", (job_id,)).fetchone()
+            out_rel = (row["output_rel"] if row and row["output_rel"] else "")
+        try:
+            video = find_video(proj, job_id, out_rel)
+        except VideoAmbiguous as exc:
+            raise ItemFailed(str(exc))
         if not video:
             raise ItemFailed("готового mp4 в проекте нет")
         cover = os.path.join(proj, "cover.jpg")

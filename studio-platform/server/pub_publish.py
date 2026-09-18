@@ -137,26 +137,46 @@ def make_description(title: str, chapters_text: str = "") -> str:
 
 # ─────────────────────────── файл ролика ───────────────────────────
 
-def find_video(project_dir: str, render_job_id=None) -> str:
-    """Путь к готовому mp4 внутри папки проекта.
+class VideoAmbiguous(Exception):
+    """В папке рендера несколько mp4, и какой из них наш — неизвестно."""
 
-    Сначала ищем ровно тот файл, который сделал наш этап рендера (`render/<job>.mp4`),
-    и только если его нет — самый свежий mp4 в папке render. Брать «любой mp4» без
-    попытки точного совпадения нельзя: в папке могут лежать прошлые версии.
+
+def find_video(project_dir: str, render_job_id=None, output_rel: str = "") -> str:
+    """Путь к готовому mp4 внутри папки проекта — точный, а не угаданный.
+
+    Порядок: путь, записанный САМИМ завершившимся рендером (`queue_tasks.output_rel`) →
+    штатное имя `render/<job>.mp4` → единственный mp4 в папке.
+
+    Чего здесь больше нет: выбора «самый свежий mp4». В папке проекта лежат прошлые
+    версии ролика и результаты перерендеров, и «самый свежий по времени файла» — это
+    догадка, ценой которой чужой ролик уходит на канал под нашим названием и в наш
+    слот. Когда точного ответа нет, а кандидатов несколько, честный исход — отказ с
+    перечислением файлов: пусть решит человек.
     """
     render_dir = os.path.join(project_dir or "", "render")
+    if output_rel:
+        # Путь относительный папке проекта — так его записывает приём результата.
+        exact = os.path.join(project_dir or "", output_rel)
+        if os.path.exists(exact):
+            return exact
     if render_job_id:
         exact = os.path.join(render_dir, f"{render_job_id}.mp4")
         if os.path.exists(exact):
             return exact
     try:
-        found = [os.path.join(render_dir, n) for n in os.listdir(render_dir)
-                 if n.lower().endswith(".mp4")]
+        found = sorted(os.path.join(render_dir, n) for n in os.listdir(render_dir)
+                       if n.lower().endswith(".mp4"))
     except Exception:
         return ""
     if not found:
         return ""
-    return max(found, key=lambda p: os.path.getmtime(p))
+    if len(found) == 1:
+        return found[0]
+    raise VideoAmbiguous(
+        "в папке рендера несколько готовых mp4 и не записано, какой из них наш: "
+        + ", ".join(os.path.basename(p) for p in found)
+        + ". Оставьте нужный файл или перезапустите рендер — угадывать «самый свежий» "
+          "нельзя, на канал уйдёт чужой ролик")
 
 
 # ─────────────────────────── время выхода ───────────────────────────
