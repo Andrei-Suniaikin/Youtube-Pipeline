@@ -544,7 +544,7 @@ def ui_channels():
     c = db()
     try:
         out = []
-        for ch in c.execute("SELECT * FROM pub_channels WHERE tenant_id=? ORDER BY name",
+        for ch in c.execute("SELECT * FROM pub_channels_live WHERE tenant_id=? ORDER BY name",
                             (TENANT,)):
             try:
                 schedule = json.loads(ch["schedule"] or "{}")
@@ -1075,7 +1075,7 @@ def ui_channel(channel_id: int, history: int = 14):
     history = max(0, min(90, int(history)))
     c = db()
     try:
-        ch = c.execute("SELECT * FROM pub_channels WHERE id=? AND tenant_id=?",
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
                        (channel_id, TENANT)).fetchone()
         if ch is None:
             raise HTTPException(404, "канал не найден")
@@ -1099,6 +1099,14 @@ def ui_channel(channel_id: int, history: int = 14):
             schedule = json.loads(ch["schedule"] or "{}")
         except ValueError:
             schedule = {}
+        # Сырая строка канала (18.09.2026): в форме настроек надо показать СВОИ значения
+        # канала и отдельно сказать, какие из них сейчас перекрыты пресетом канала.
+        # Иначе форма покажет унаследованное и сохранит его как своё.
+        own = c.execute("SELECT * FROM pub_channels WHERE id=? AND tenant_id=?",
+                        (channel_id, TENANT)).fetchone()
+        ch_presets = [{"id": r["id"], "name": r["name"]} for r in c.execute(
+            "SELECT id, name FROM pub_channel_presets WHERE tenant_id=? ORDER BY name",
+            (TENANT,))]
         _res_rew, _res_cov = channel_presets(c, ch["preset_vsgen_id"],
                                              ch["preset_rewrite"] or "",
                                              ch["preset_cover"] or "")
@@ -1150,6 +1158,18 @@ def ui_channel(channel_id: int, history: int = 14):
             "uploads": _uploads(c, channel_id),
             "by_day": by_day,
             "tz": tzname,
+            "channel_preset": {
+                "id": own["preset_channel_id"] if own else None,
+                "name": ch["preset_channel_name"] if "preset_channel_name" in ch.keys() else "",
+                # Какие поля сейчас приходят из пресета, а не из канала: форма гасит их
+                # и подписывает, а не делает вид, что это собственные настройки канала.
+                "inherited": [k for k in CHANNEL_PRESET_COLUMNS
+                              if own is not None and own["preset_channel_id"]
+                              and ch[k] != own[k]],
+                "own": {k: (own[k] if own is not None else None)
+                        for k in CHANNEL_PRESET_COLUMNS},
+                "all": ch_presets,
+            },
             "waiting_without_slot": waiting,
             "waiting_items": waiting_rows,
             "history_days": history,
@@ -1180,7 +1200,7 @@ def ui_links(body: LinksIn):
         raise HTTPException(400, "в поле нет ни одной ссылки")
     c = db()
     try:
-        ch = c.execute("SELECT * FROM pub_channels WHERE id=? AND tenant_id=?",
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
                        (body.channel_id, TENANT)).fetchone()
         if not ch:
             raise HTTPException(404, "канал не найден")
@@ -1344,7 +1364,7 @@ def ui_presets():
     try:
         used = {"rewrite": {}, "vsgen": {}, "cover": {}}
         for ch in c.execute("SELECT id, name, preset_rewrite, preset_vsgen_id, "
-                            "preset_cover FROM pub_channels WHERE tenant_id=? "
+                            "preset_cover FROM pub_channels_live WHERE tenant_id=? "
                             "ORDER BY name", (TENANT,)):
             # Кто чем пользуется — считаем ПОСЛЕ разрешения через пресет производства.
             # Иначе пресет обложки, заданный в пресете, выглядел бы никому не нужным,
@@ -1682,7 +1702,7 @@ def ui_links_preview(body: LinksIn):
         raise HTTPException(400, "в поле нет ни одной ссылки")
     c = db()
     try:
-        ch = c.execute("SELECT * FROM pub_channels WHERE id=? AND tenant_id=?",
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
                        (body.channel_id, TENANT)).fetchone()
         if not ch:
             raise HTTPException(404, "канал не найден")
@@ -2721,7 +2741,7 @@ def ui_preset_delete(service: str, name: str, request: Request):
         used = []
         if column:
             used = [r["name"] for r in c.execute(
-                f"SELECT name FROM pub_channels WHERE tenant_id=? AND {column}=?",
+                f"SELECT name FROM pub_channels_live WHERE tenant_id=? AND {column}=?",
                 (TENANT, name))]
     finally:
         c.close()
@@ -3053,6 +3073,20 @@ def _rewrite_gen_write(name: str, values: dict, sid: str, create: bool = False) 
         raise HTTPException(_pass_code(code), out)
 
 
+@app.get("/ui/lumean/template")
+def ui_lumean_template(id: str = ""):
+    """Проверить шаблон Lumean до оплаты (18.09.2026).
+
+    Сегодня id шаблона вписывают вслепую, и ошибка вскрывается платным заказом. Читает
+    кабинет своим ключом (`lumean_template_info`) — своего похода к провайдеру у пульта
+    нет, как и своего ключа.
+    """
+    mod = sys.modules.get("main")
+    if mod is None or not hasattr(mod, "lumean_template_info"):
+        raise HTTPException(503, "кабинет не поднят")
+    return mod.lumean_template_info(id)
+
+
 @app.get("/ui/presets/{service}/new/form")
 def ui_neighbour_preset_new_form(service: str, request: Request):
     """Поля для НОВОГО пресета соседа (18.09.2026). До этого завести пресет обложек или
@@ -3247,6 +3281,258 @@ def _language_options() -> list:
     справочник на оба места — иначе в канале окажется код, которого пресет не знает."""
     return [{"value": code, "title": title}
             for code, title in preset_fields.lang_options_for_form()]
+
+
+# ─────────────────────── пресеты каналов (18.09.2026) ───────────────────────
+# Решение владельца: те же настройки, что у канала, кроме языка — чтобы завести два
+# канала на разных языках по одному набору правил. Привязка ЖИВАЯ: канал ссылается на
+# пресет, правка пресета сразу меняет поведение всех каналов на нём. Значения не
+# копируются в канал: их разрешает вид `pub_channels_live` (server/pub_schema.py).
+CHANNEL_PRESET_FIELDS = (
+    {"key": "schedule_days", "kind": "days", "label": "Дни выходов"},
+    {"key": "schedule_times", "kind": "text", "label": "Время выходов",
+     "hint": "через запятую: 10:00, 18:00. Пусто вместе с днями — расписание не задано"},
+    {"key": "tz", "kind": "text", "label": "Часовой пояс", "hint": "например Europe/Warsaw"},
+    {"key": "horizon_days", "kind": "number", "label": "Горизонт, дней", "min": 1, "max": 90},
+    {"key": "lead_days", "kind": "number", "label": "Готовить заранее, дней",
+     "min": 0, "max": 30},
+    {"key": "deferred", "kind": "switch", "label": "Отложенная публикация"},
+    {"key": "deferred_limit", "kind": "number", "label": "Отложенных максимум",
+     "min": 1, "max": 200},
+    {"key": "preset_vsgen_id", "kind": "select", "label": "Пресет производства"},
+    {"key": "host_id", "kind": "select", "label": "Машина заливки"},
+    {"key": "niche", "kind": "text", "label": "Ниша"},
+    {"key": "collaborator", "kind": "text", "label": "Соавтор", "hint": "@имя на YouTube"},
+)
+# Колонки таблицы, которые правит форма. `schedule` собирается из двух полей (дни и
+# время) той же функцией кабинета, что и расписание канала, — вторых правил нет.
+CHANNEL_PRESET_COLUMNS = ("tz", "schedule", "horizon_days", "lead_days", "deferred",
+                          "deferred_limit", "preset_vsgen_id", "host_id", "niche",
+                          "collaborator")
+
+
+def _channel_preset_options(c) -> dict:
+    hosts = [{"value": str(r["id"]), "title": r["title"] or r["code"]}
+             for r in c.execute("SELECT id, code, title FROM pub_hosts "
+                                "WHERE tenant_id=? AND status='active' ORDER BY code",
+                                (TENANT,))]
+    vsgen = [{"value": str(pid), "title": name} for pid, name in vsgen_presets(c, TENANT)]
+    return {"host_id": hosts, "preset_vsgen_id": vsgen}
+
+
+def _channel_preset_row(c, pid: int):
+    row = c.execute("SELECT * FROM pub_channel_presets WHERE id=? AND tenant_id=?",
+                    (pid, TENANT)).fetchone()
+    if row is None:
+        raise HTTPException(404, "нет такого пресета канала")
+    return row
+
+
+def _channel_preset_payload(c, row) -> dict:
+    """Пресет канала полями формы. NULL — «в пресете не задано»: канал возьмёт своё."""
+    try:
+        sched = json.loads(row["schedule"] or "{}") if row["schedule"] else {}
+    except ValueError:
+        sched = {}
+    days = [d for d in sched if d != ANY_DAY]
+    times = sorted({t for v in sched.values() for t in (v or [])})
+    options = _channel_preset_options(c)
+    values = {"schedule_days": ([] if not sched else (list(DAY_KEYS) if ANY_DAY in sched
+                                                      else days)),
+              "schedule_times": ", ".join(times)}
+    for key in CHANNEL_PRESET_COLUMNS:
+        if key == "schedule":
+            continue
+        val = row[key]
+        values[key] = "" if val is None else val
+    fields = [dict(f, value=values.get(f["key"], ""), options=options.get(f["key"], []))
+              for f in CHANNEL_PRESET_FIELDS]
+    used = [{"id": r["id"], "name": r["name"]} for r in c.execute(
+        "SELECT id, name FROM pub_channels WHERE tenant_id=? AND preset_channel_id=? "
+        "ORDER BY name", (TENANT, row["id"]))]
+    return {"id": row["id"], "name": row["name"], "note": row["note"] or "",
+            "fields": fields, "channels": used,
+            "days": list(DAY_KEYS), "any_day": ANY_DAY}
+
+
+@app.get("/ui/channel-presets")
+def ui_channel_presets():
+    """Список пресетов канала и кто на них бежит."""
+    c = db()
+    try:
+        rows = []
+        for r in c.execute("SELECT * FROM pub_channel_presets WHERE tenant_id=? ORDER BY name",
+                           (TENANT,)):
+            used = [{"id": x["id"], "name": x["name"]} for x in c.execute(
+                "SELECT id, name FROM pub_channels WHERE tenant_id=? AND preset_channel_id=? "
+                "ORDER BY name", (TENANT, r["id"]))]
+            given = [f for f in CHANNEL_PRESET_COLUMNS if r[f] not in (None, "")]
+            rows.append({"id": r["id"], "name": r["name"], "note": r["note"] or "",
+                         "channels": used, "given": given})
+    finally:
+        c.close()
+    return {"presets": rows,
+            "note": "правка пресета меняет поведение всех каналов на нём со следующего "
+                    "прохода очереди; уже поставленные задачи не пересчитываются"}
+
+
+class ChannelPresetIn(BaseModel):
+    name: str = ""
+    note: str = ""
+    values: dict = {}
+
+
+def _channel_preset_write(c, pid: int, body: ChannelPresetIn) -> None:
+    """Разбор полей пресета канала. Проверки — кабинетные (`pub_ui`): расписание, часовой
+    пояс и числа обязаны жить по одним правилам с настройками самого канала."""
+    vals = body.values or {}
+    sets, args = [], []
+    if body.name.strip():
+        sets.append("name=?")
+        args.append(body.name.strip()[:80])
+    sets.append("note=?")
+    args.append((body.note or "").strip()[:200])
+    # Расписание: та же функция, что у канала. Пустое и дни, и время — «не задано»,
+    # NULL, канал берёт своё.
+    days = [str(x) for x in (vals.get("schedule_days") or [])]
+    times = str(vals.get("schedule_times") or "").strip()
+    try:
+        schedule = pub_ui.clean_schedule(times, days) if (times or days) else None
+    except (pub_ui.ChannelError, pub_ui.ScheduleError) as exc:
+        raise HTTPException(400, str(exc))
+    if schedule == "{}":
+        schedule = None
+    sets.append("schedule=?")
+    args.append(schedule)
+    tz = str(vals.get("tz") or "").strip()
+    if tz:
+        try:
+            zoneinfo.ZoneInfo(tz)
+        except Exception:                                          # noqa: BLE001
+            raise HTTPException(400, f"часовой пояс «{tz}» не найден")
+    sets.append("tz=?")
+    args.append(tz or None)
+    numeric = {"horizon_days": (1, 90), "lead_days": (0, 30), "deferred_limit": (1, 200),
+               "preset_vsgen_id": (1, 10 ** 9), "host_id": (1, 10 ** 9)}
+    for key, (lo, hi) in numeric.items():
+        raw = str(vals.get(key) or "").strip()
+        if not raw:
+            sets.append(f"{key}=?")
+            args.append(None)
+            continue
+        try:
+            num = int(raw)
+        except ValueError:
+            raise HTTPException(400, f"{key}: нужно целое число")
+        if not (lo <= num <= hi):
+            raise HTTPException(400, f"{key}: допустимо от {lo} до {hi}")
+        sets.append(f"{key}=?")
+        args.append(num)
+    deferred = str(vals.get("deferred") or "").strip().lower()
+    sets.append("deferred=?")
+    args.append(None if deferred == "" else (1 if deferred in ("1", "true", "on", "да") else 0))
+    for key in ("niche", "collaborator"):
+        val = str(vals.get(key) or "").strip()[:80]
+        if key == "collaborator" and val and not val.startswith("@"):
+            val = "@" + val
+        sets.append(f"{key}=?")
+        args.append(val or None)
+    sets.append("updated=?")
+    args.append(time.time())
+    args += [pid, TENANT]
+    c.execute(f"UPDATE pub_channel_presets SET {', '.join(sets)} "
+              "WHERE id=? AND tenant_id=?", args)
+
+
+@app.post("/ui/channel-presets")
+def ui_channel_preset_create(body: ChannelPresetIn):
+    name = (body.name or "").strip()[:80]
+    if not name:
+        raise HTTPException(400, "пустое название")
+    c = db()
+    try:
+        now = time.time()
+        try:
+            cur = c.execute("INSERT INTO pub_channel_presets(tenant_id,name,created,updated) "
+                            "VALUES(?,?,?,?)", (TENANT, name, now, now))
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, f"пресет канала «{name}» уже есть")
+        pid = cur.lastrowid
+        if body.values:
+            _channel_preset_write(c, pid, ChannelPresetIn(values=body.values, note=body.note))
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True, "id": pid, "name": name}
+
+
+@app.get("/ui/channel-presets/{pid:int}")
+def ui_channel_preset_get(pid: int):
+    c = db()
+    try:
+        return _channel_preset_payload(c, _channel_preset_row(c, pid))
+    finally:
+        c.close()
+
+
+@app.post("/ui/channel-presets/{pid:int}")
+def ui_channel_preset_save(pid: int, body: ChannelPresetIn):
+    c = db()
+    try:
+        _channel_preset_row(c, pid)
+        try:
+            _channel_preset_write(c, pid, body)
+        except sqlite3.IntegrityError:
+            raise HTTPException(409, "пресет канала с таким названием уже есть")
+        c.commit()
+        return _channel_preset_payload(c, _channel_preset_row(c, pid))
+    finally:
+        c.close()
+
+
+@app.delete("/ui/channel-presets/{pid:int}")
+def ui_channel_preset_delete(pid: int):
+    """Удалить пресет канала. Если на нём кто-то бежит — сначала сказать, кто именно:
+    молча вернуть эти каналы к их собственным настройкам значило бы поменять им
+    расписание и машину заливки без предупреждения."""
+    c = db()
+    try:
+        row = _channel_preset_row(c, pid)
+        used = [r["name"] for r in c.execute(
+            "SELECT name FROM pub_channels WHERE tenant_id=? AND preset_channel_id=?",
+            (TENANT, pid))]
+        if used:
+            raise HTTPException(409, "на нём бегут каналы: " + ", ".join(used)
+                                + ". Сначала отвяжите их — иначе они молча вернутся к "
+                                  "своим старым настройкам.")
+        c.execute("DELETE FROM pub_channel_presets WHERE id=? AND tenant_id=?", (pid, TENANT))
+        c.commit()
+        return {"ok": True, "name": row["name"]}
+    finally:
+        c.close()
+
+
+class ChannelPresetPick(BaseModel):
+    preset_id: int | None = None
+
+
+@app.post("/ui/channels/{cid:int}/channel-preset")
+def ui_channel_preset_attach(cid: int, body: ChannelPresetPick):
+    """Посадить канал на пресет канала или снять его с пресета."""
+    c = db()
+    try:
+        if not c.execute("SELECT 1 FROM pub_channels WHERE id=? AND tenant_id=?",
+                         (cid, TENANT)).fetchone():
+            raise HTTPException(404, "канал не найден")
+        pid = body.preset_id
+        if pid is not None:
+            _channel_preset_row(c, pid)
+        c.execute("UPDATE pub_channels SET preset_channel_id=?, updated=? WHERE id=? "
+                  "AND tenant_id=?", (pid, time.time(), cid, TENANT))
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True, "preset_id": body.preset_id}
 
 
 @app.get("/ui/channels/new")

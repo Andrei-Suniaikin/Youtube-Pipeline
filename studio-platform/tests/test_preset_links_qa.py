@@ -136,7 +136,15 @@ def main() -> int:
           "оба целых попадают в presets/via, без дублей и без пропусков")
     c = fresh()
     c.execute("CREATE TABLE pub_channels(id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, "
-              "preset_vsgen_id INTEGER)")
+              "preset_vsgen_id INTEGER, preset_channel_id INTEGER)")
+    # Читатели каналов ходят в вид `pub_channels_live` (пресет канала, 18.09.2026).
+    c.execute("CREATE TABLE pub_channel_presets(id INTEGER PRIMARY KEY, tenant_id TEXT, "
+              "name TEXT, preset_vsgen_id INTEGER)")
+    c.execute("CREATE VIEW pub_channels_live AS SELECT ch.id, ch.tenant_id, ch.name, "
+              "COALESCE(p.preset_vsgen_id, ch.preset_vsgen_id) preset_vsgen_id, "
+              "ch.preset_channel_id, p.name preset_channel_name FROM pub_channels ch "
+              "LEFT JOIN pub_channel_presets p ON p.id = ch.preset_channel_id "
+              "AND p.tenant_id = ch.tenant_id")
     c.execute("CREATE TABLE projects(id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT, "
               "settings TEXT)")
     put(c, 10, {"_scope": "voice", "engine": "lumean"})

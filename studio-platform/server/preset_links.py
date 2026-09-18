@@ -248,7 +248,7 @@ def users_of(c, preset_id) -> dict:
     out["channels"] = [
         {"id": r["id"], "name": r["name"]}
         for r in c.execute(
-            "SELECT id, name FROM pub_channels WHERE tenant_id=? AND preset_vsgen_id=?",
+            "SELECT id, name FROM pub_channels_live WHERE tenant_id=? AND preset_vsgen_id=?",
             (tenant_id, preset_id),
         ).fetchall()
     ]
@@ -324,7 +324,7 @@ def users_of(c, preset_id) -> dict:
             out["via"] = [
                 {"id": r["id"], "name": r["name"]}
                 for r in c.execute(
-                    "SELECT id, name FROM pub_channels "
+                    "SELECT id, name FROM pub_channels_live "
                     f"WHERE tenant_id=? AND preset_vsgen_id IN ({placeholders})",
                     (tenant_id, *holder_ids),
                 ).fetchall()

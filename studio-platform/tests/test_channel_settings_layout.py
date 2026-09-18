@@ -68,7 +68,7 @@ def main() -> int:
     check("форма встроена сразу в шапку (editbox есть без промежуточного тумблера)",
           'id="editbox"' in view_channel, True)
 
-    wire_edit = function_body(index_html, "async function wireChannelEdit(root, c){")
+    wire_edit = function_body(index_html, "async function wireChannelEdit(root, c, chp){")
     check("wireChannelEdit() найдена", bool(wire_edit), True)
     check("тумблера «свернуть/показать форму» по клику на #edit больше нет",
           "root.querySelector('#edit')" in wire_edit, False)
@@ -77,7 +77,14 @@ def main() -> int:
     check("поле «Профиль AdsPower» осталось в форме редактируемым",
           "'Профиль AdsPower'" in wire_edit or '"Профиль AdsPower"' in wire_edit, True)
     check("поле «Машина заливки» осталось в форме редактируемым",
-          "'Машина заливки'" in wire_edit or '"Машина заливки"' in wire_edit, True)
+          "Машина заливки" in wire_edit, True)
+    # 18.09.2026: поля, которые приходят из пресета канала, в форме гасятся и
+    # подписываются — править их надо в пресете, иначе форма сохранит унаследованное
+    # значение как собственное значение канала.
+    check("поля пресета канала гасятся, а не правятся в канале",
+          "приходит из пресета канала" in wire_edit, True)
+    check("за погашенные поля уходят собственные значения канала",
+          "inherited.has(key) ? (ownValue ?? '')" in index_html, True)
 
     # Вкладка «Ролики» не должна потеряться вместе с кнопкой «Настроить»: до правки
     # viewChannel() выходила из функции раньше показа настроек, если открыта вкладка

@@ -58,7 +58,16 @@ def fresh() -> sqlite3.Connection:
     c.execute("CREATE TABLE presets(id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, "
               "settings TEXT)")
     c.execute("CREATE TABLE pub_channels(id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, "
-              "preset_vsgen_id INTEGER)")
+              "preset_vsgen_id INTEGER, preset_channel_id INTEGER)")
+    # Пресет канала (18.09.2026): читатели каналов ходят в вид `pub_channels_live`, а не
+    # в таблицу — здесь он нужен в минимальном виде, иначе `users_of` некуда смотреть.
+    c.execute("CREATE TABLE pub_channel_presets(id INTEGER PRIMARY KEY, tenant_id TEXT, "
+              "name TEXT, preset_vsgen_id INTEGER)")
+    c.execute("CREATE VIEW pub_channels_live AS SELECT ch.id, ch.tenant_id, ch.name, "
+              "COALESCE(p.preset_vsgen_id, ch.preset_vsgen_id) preset_vsgen_id, "
+              "ch.preset_channel_id, p.name preset_channel_name FROM pub_channels ch "
+              "LEFT JOIN pub_channel_presets p ON p.id = ch.preset_channel_id "
+              "AND p.tenant_id = ch.tenant_id")
     c.execute("CREATE TABLE projects(id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT, "
               "settings TEXT)")
     return c

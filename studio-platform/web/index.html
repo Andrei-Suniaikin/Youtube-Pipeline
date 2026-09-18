@@ -1062,7 +1062,7 @@ async function viewChannel(id){
     <div class="sec"><span id="statusbtns"></span></div>
     <div id="editbox" class="secbody"></div></div>`);
   app.append(head);
-  wireChannelEdit(head, c);
+  wireChannelEdit(head, c, d.channel_preset || {});
 }
 
 function calendarFeed(d){
@@ -2923,10 +2923,23 @@ async function wireKeys(root, d){
    read_channel_form. Расписание, часовой пояс, горизонт и лимиты живут по одним
    правилам в обоих интерфейсах; вторая копия правил разошлась бы на первом же поле. */
 const DAY_TITLE = {mon:'пн', tue:'вт', wed:'ср', thu:'чт', fri:'пт', sat:'сб', sun:'вс'};
+// Порядок дней — как в неделе, а не как в объекте: тот же порядок у формы канала.
+const DAY_ORDER = ['mon', 'tue', 'wed', 'thu', 'fri', 'sat', 'sun'];
+// Названия полей канала для фразы «из пресета приходят: …» — теми же словами, что
+// подписаны поля формы.
+const CHANNEL_FIELD_TITLE = {tz: 'часовой пояс', schedule: 'расписание',
+  horizon_days: 'горизонт', lead_days: 'готовить заранее', deferred: 'отложенные',
+  deferred_limit: 'лимит отложенных', preset_vsgen_id: 'пресет производства',
+  host_id: 'машина заливки', niche: 'ниша', collaborator: 'соавтор'};
 
-async function wireChannelEdit(root, c){
+async function wireChannelEdit(root, c, chp){
   const box = root.querySelector('#editbox');
   const ref = await api('/ui/channels/new');
+  // Пресет канала (18.09.2026): привязка живая — пока канал на пресете, перекрытые
+  // поля приходят из него, и править их в канале нельзя. Иначе форма показала бы
+  // унаследованное значение и сохранила его как собственное значение канала.
+  const inherited = new Set((chp && chp.inherited) || []);
+  const own = (chp && chp.own) || {};
 
   root.querySelector('#statusbtns').innerHTML = ref.statuses
     .filter(s => s.key !== c.status)
@@ -2943,12 +2956,22 @@ async function wireChannelEdit(root, c){
   {
     // «*» в расписании означает «каждый день»: без этого галочки дней оставались
     // пустыми у канала, который выходит ежедневно (жалоба владельца 18.09.2026).
-    const schedKeys = Object.keys(c.schedule || {});
-    const picked = new Set(schedKeys.includes('*')
-      ? ref.days.filter(x => x !== ref.any_day) : schedKeys);
+    // В форме — СВОИ значения канала: пресет их только перекрывает на чтение.
+    const ownSched = (() => {
+      try{ return JSON.parse(own.schedule || '{}'); }catch(e){ return {}; }
+    })();
+    // Показываем ДЕЙСТВУЮЩЕЕ значение (из пресета, если оно оттуда), но поле гасим:
+    // человек видит, как канал живёт на самом деле, и не может случайно записать это
+    // значение как собственное. При сохранении вместо погашенных полей уходят
+    // собственные значения канала — они не должны потеряться при отвязке от пресета.
+    const off = k => inherited.has(k) ? ' disabled title="приходит из пресета канала"' : '';
+    const schedSrc = c.schedule || {};
+    const schedKeys2 = Object.keys(schedSrc);
+    const picked = new Set(schedKeys2.includes('*')
+      ? ref.days.filter(x => x !== ref.any_day) : schedKeys2);
     const times = [...new Set(Object.values(c.schedule || {}).flat())].join(', ');
-    const sel = (id, items, cur, label) => `<div class="fldrow"><label>${label}</label>
-      <select id="${id}"><option value="">— не выбран —</option>${items.map(i =>
+    const sel = (id, items, cur, label, key) => `<div class="fldrow"><label>${label}</label>
+      <select id="${id}"${key ? off(key) : ''}><option value="">— не выбран —</option>${items.map(i =>
         `<option value="${esc(String(i.value))}" ${String(i.value) === String(cur ?? '')
           ? 'selected' : ''}>${esc(i.title)}</option>`).join('')}</select></div>`;
     // Дополнение 16.09, вопрос 1: ID можно вписать только в пустое поле — уже
@@ -2963,42 +2986,56 @@ async function wireChannelEdit(root, c){
            <input id="f-uc" placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" style="width:300px"></div>
          <div class="note muted">Задайте, когда узнаете, — сохранить можно один раз,
            потом изменить будет нельзя.</div>`;
+    const chpOptions = ((chp && chp.all) || []).map(p =>
+      `<option value="${p.id}"${String(p.id) === String(chp.id || '') ? ' selected' : ''}
+        >${esc(p.name)}</option>`).join('');
+    const inheritNote = inherited.size
+      ? `<div class="note muted">Из пресета канала приходят: ${
+          [...inherited].map(k => esc(CHANNEL_FIELD_TITLE[k] || k)).join(', ')}.
+         Эти поля здесь не правятся — правьте их в пресете, и изменится у всех каналов
+         на нём.</div>`
+      : '';
     box.innerHTML = `
       <div id="cherr"></div>
+      <div class="fldrow"><label>Пресет канала</label>
+        <select id="f-chp" style="width:230px">
+          <option value="">— свои настройки —</option>${chpOptions}</select>
+        <a href="#/presets" class="muted" style="font-size:12px">завести и править →</a></div>
+      ${inheritNote}
       ${ucField}
       <div class="fldrow"><label>Название</label>
         <input id="f-name" value="${esc(c.name)}" style="width:300px"></div>
       <div class="fldrow"><label>Хэндл / язык / ниша</label>
         <input id="f-handle" value="${esc(c.handle || '')}" style="width:150px">
         ${langOptionsHtml(ref.languages || [], c.lang_raw ?? c.lang ?? '')}
-        <input id="f-niche" value="${esc(c.niche || '')}" style="width:180px"></div>
+        <input id="f-niche" value="${esc(c.niche || '')}" style="width:180px"${off('niche')}></div>
       <div class="fldrow"><label>Дни</label>
         <span class="langs" style="max-height:none;border:0;padding:0">${
           ref.days.filter(x => x !== ref.any_day).map(dk =>
             `<label data-day="${dk}" class="${picked.has(dk) ? 'on' : ''}"><input
-              type="checkbox" ${picked.has(dk) ? 'checked' : ''}>${DAY_TITLE[dk] || dk}
-            </label>`).join('')}</span></div>
+              type="checkbox" ${picked.has(dk) ? 'checked' : ''}${off('schedule')}>${
+              DAY_TITLE[dk] || dk}</label>`).join('')}</span></div>
       <div class="fldrow"><label>Время выходов</label>
         <input id="f-times" value="${esc(times)}" placeholder="10:00, 18:00"
-          style="width:220px"></div>
+          style="width:220px"${off('schedule')}></div>
       <div class="fldrow"><label>Часовой пояс</label>
-        <input id="f-tz" value="${esc(c.tz)}" style="width:200px"></div>
+        <input id="f-tz" value="${esc(c.tz)}" style="width:200px"${off('tz')}></div>
       <div class="fldrow"><label>Горизонт / заранее</label>
         <input id="f-hor" type="number" min="1" max="90" value="${c.horizon_days}"
-          style="width:80px"> дн
+          style="width:80px"${off('horizon_days')}> дн
         <input id="f-lead" type="number" min="0" max="30" value="${c.lead_days}"
-          style="width:80px"> дн</div>
+          style="width:80px"${off('lead_days')}> дн</div>
       <div class="fldrow"><label>Отложенные</label>
         <label style="font-weight:400"><input type="checkbox" id="f-def"
-          ${c.deferred ? 'checked' : ''}> копить</label>
+          ${c.deferred ? 'checked' : ''}${off('deferred')}> копить</label>
         <input id="f-deflim" type="number" min="1" max="200"
-          value="${c.deferred_limit ?? 5}" style="width:80px"> шт</div>
+          value="${c.deferred_limit ?? 5}" style="width:80px"${off('deferred_limit')}> шт</div>
       ${sel('f-prof', ref.profiles.map(p => ({value: p.id, title: p.title})),
             c.profile_id, 'Профиль AdsPower')}
       ${sel('f-host', ref.hosts.map(h => ({value: h.id, title: h.title})),
-            c.host_id, 'Машина заливки')}
+            c.host_id, 'Машина заливки', 'host_id')}
       ${sel('f-pv', ref.presets.vsgen.map(p => ({value: p.id, title: p.name})),
-            c.preset_vsgen_id, 'Пресет')}
+            c.preset_vsgen_id, 'Пресет', 'preset_vsgen_id')}
       <div class="note muted">Текст и обложка берутся из него же — группы
         «Сценарий» и «Обложка» внутри пресета. Сейчас: рерайт
         «${esc(c.presets.rewrite || 'не задан')}», обложка
@@ -3012,12 +3049,36 @@ async function wireChannelEdit(root, c){
       const cb = l.querySelector('input');
       cb.onchange = () => l.classList.toggle('on', cb.checked);
     });
+    // Привязка сохраняется сразу: это не «одно из полей формы», а решение, откуда
+    // канал берёт настройки, и от него зависит, что вообще показывать в форме.
+    box.querySelector('#f-chp').onchange = async e => {
+      const val = e.target.value;
+      try{
+        await post(`/ui/channels/${c.id}/channel-preset`,
+                   {preset_id: val ? Number(val) : null});
+        toast(val ? 'Канал посажен на пресет' : 'Канал снят с пресета', 'ok');
+        await render();
+      }catch(err){ toast(err.message); e.target.value = chp.id || ''; }
+    };
+
     box.querySelector('#save').onclick = async () => {
       const err = box.querySelector('#cherr');
       err.innerHTML = '';
       const days = [...box.querySelectorAll('span.langs label')]
         .filter(l => l.querySelector('input').checked).map(l => l.dataset.day);
       const v = id => box.querySelector('#' + id).value;
+      // Поля, которые сейчас приходят из пресета, в форме погашены — и отправляем за
+      // них СОБСТВЕННЫЕ значения канала: иначе кабинет записал бы вместо них
+      // умолчания, и при снятии с пресета канал получил бы не свои настройки.
+      const ownSchedObj = (() => {
+        try{ return JSON.parse(own.schedule || '{}'); }catch(e){ return {}; }
+      })();
+      const ownDays = Object.keys(ownSchedObj).includes('*')
+        ? ref.days.filter(x => x !== ref.any_day)
+        : Object.keys(ownSchedObj);
+      const ownTimes = [...new Set(Object.values(ownSchedObj).flat())].join(', ');
+      const pick = (key, formValue, ownValue) =>
+        inherited.has(key) ? (ownValue ?? '') : formValue;
       try{
         // ID — отдельным запросом и только если поле вообще есть (канал ещё без ID)
         // и что-то в него вписали: пустое поле здесь значит «не сейчас», а не «стереть».
@@ -3036,15 +3097,23 @@ async function wireChannelEdit(root, c){
         }
         await post(`/ui/channels/${c.id}`, {
           name: v('f-name'), handle: v('f-handle'), lang: v('f-lang'),
-          niche: v('f-niche'), tz: v('f-tz'), times: v('f-times'), days,
-          horizon_days: v('f-hor'), lead_days: v('f-lead'),
-          deferred: box.querySelector('#f-def').checked ? '1' : '',
-          deferred_limit: v('f-deflim'),
-          profile_id: v('f-prof'), host_id: v('f-host'),
+          niche: pick('niche', v('f-niche'), own.niche),
+          tz: pick('tz', v('f-tz'), own.tz),
+          times: pick('schedule', v('f-times'), ownTimes),
+          days: inherited.has('schedule') ? ownDays : days,
+          horizon_days: pick('horizon_days', v('f-hor'), own.horizon_days),
+          lead_days: pick('lead_days', v('f-lead'), own.lead_days),
+          deferred: inherited.has('deferred')
+            ? (own.deferred ? '1' : '')
+            : (box.querySelector('#f-def').checked ? '1' : ''),
+          deferred_limit: pick('deferred_limit', v('f-deflim'), own.deferred_limit),
+          profile_id: v('f-prof'),
+          host_id: pick('host_id', v('f-host'), own.host_id),
           // Текст и обложку канал больше не хранит: их держит пресет. Старые значения
           // отправляем как есть — обнулить их значило бы остановить выпуски каналов,
           // у которых пресет про соседей ещё не знает.
-          preset_vsgen_id: v('f-pv'), preset_rewrite: c.preset_rewrite || '',
+          preset_vsgen_id: pick('preset_vsgen_id', v('f-pv'), own.preset_vsgen_id),
+          preset_rewrite: c.preset_rewrite || '',
           preset_cover: c.preset_cover || '', note: v('f-note'),
         });
         await render();
@@ -3761,6 +3830,9 @@ function wireLangMap(card, f, group, locked){
     const lum = lumeanNow();
     idPlaceholder = lum ? 'id пресета Lumean (template_id)' : 'id голоса';
     rows.querySelectorAll('.lm-voice').forEach(i => { i.placeholder = idPlaceholder; });
+    // Кнопка проверки шаблона нужна только у Lumean: у остальных движков проверять
+    // нечего — там обычный id голоса, а не ссылка на чужой шаблон.
+    rows.querySelectorAll('.lm-check').forEach(b => { b.hidden = !lum; });
     const texts = (f.by_engine || {})[lum ? 'lumean' : 'other'];
     if (!texts || !fld) return;
     const label = fld.querySelector('label');
@@ -3802,6 +3874,9 @@ function wireLangMap(card, f, group, locked){
         >${langOptionsHtml(lang || '')}</select>
       <input class="lm-voice" style="flex:1;width:auto;min-width:0"${locked ? ' disabled' : ''}
              placeholder="${esc(idPlaceholder)}" value="${esc(voice || '')}">
+      ${locked ? '' : `<button type="button" class="ghost small lm-check"
+        title="проверить шаблон у Lumean, не платя"${lumeanNow() ? '' : ' hidden'}
+        >проверить</button>`}
       <button type="button" class="ghost small lm-del" title="убрать строку"${
         locked ? ' disabled' : ''}>×</button>
     </div>`);
@@ -3812,6 +3887,22 @@ function wireLangMap(card, f, group, locked){
       wrap.querySelector('.lm-lang').onchange = sync;
       wrap.querySelector('.lm-voice').oninput = sync;
       wrap.querySelector('.lm-del').onclick = () => { wrap.remove(); sync(); };
+      // Проверка шаблона Lumean до оплаты (18.09.2026): id вписывают вслепую, и ошибка
+      // вскрывалась платным заказом — теперь видно, что за шаблоном стоит.
+      const chk = wrap.querySelector('.lm-check');
+      if (chk) chk.onclick = async () => {
+        const id = wrap.querySelector('.lm-voice').value.trim();
+        if (!id){ toast('Сначала впишите id шаблона'); return; }
+        chk.disabled = true;
+        try{
+          const out = await api(`/ui/lumean/template?id=${encodeURIComponent(id)}`);
+          if (!out.ok) toast(out.why || 'шаблон не прочитался');
+          else toast(`${out.name || id}: сервис ${out.service || '—'}${
+            out.language ? ', язык ' + out.language : ''}${
+            out.model ? ', модель ' + out.model : ''}`, 'ok');
+        }catch(e){ toast(e.message); }
+        finally{ chk.disabled = false; }
+      };
     }
     rows.append(wrap);
   };
@@ -4136,6 +4227,11 @@ async function viewPresets(){
     return html || '<div class="empty">Под фильтр ничего не подошло.</div>';
   };
 
+  // Пресеты канала (18.09.2026) — отдельная сущность: это не «чем делается ролик», а
+  // «как живёт канал»: расписание, машина заливки, ниша. Привязка живая.
+  let chp = {presets: [], note: ''};
+  try{ chp = await api('/ui/channel-presets'); }catch(e){ toast(e.message); }
+
   const bar = $(`<div class="card" style="padding:16px 18px">
     <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
       <input id="pf-q" type="search" placeholder="Поиск по названию"
@@ -4185,6 +4281,42 @@ async function viewPresets(){
     save(); paint();
   });
   paint();
+  // Каналы на пресете видно сразу: правка меняет их поведение со следующего прохода.
+  const chpCard = $(`<div class="card">
+    <div class="sec">Пресеты каналов
+      <button class="ghost small" id="chp-new"
+        style="float:right;font-weight:400;text-transform:none;letter-spacing:0"
+        >Завести</button></div>
+    ${chp.presets.length ? chp.presets.map(p => `<div class="stage" data-chp="${p.id}">
+      <div class="dot ${p.channels.length ? 's-done' : 's-idle'}"
+        >${p.channels.length ? '✓' : '·'}</div>
+      <div class="body">
+        <div class="name">${esc(p.name)}</div>
+        <div class="facts">${p.given.length ? 'задано: ' + p.given.map(esc).join(', ')
+          : 'ничего не задано — каналы работают по своим настройкам'}</div>
+        <div class="note ${p.channels.length ? 'muted' : ''}">${p.channels.length
+          ? 'каналы: ' + p.channels.map(ch =>
+              `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')
+          : 'ни один канал на нём не бежит'}</div>
+      </div>
+      <div style="white-space:nowrap;align-self:center">
+        <button class="ghost chp-edit" data-id="${p.id}">Править</button>
+        <button class="ghost chp-del" data-id="${p.id}"
+          data-name="${esc(p.name)}">Удалить</button>
+      </div></div>`).join('')
+      : '<div class="empty">Пресетов каналов нет.</div>'}
+    <div class="secbody"><div class="note muted">${esc(chp.note || '')}</div></div>
+  </div>`);
+  app.append(chpCard);
+  chpCard.querySelector('#chp-new').onclick = () => channelPresetModal(null);
+  chpCard.querySelectorAll('.chp-edit').forEach(b => b.onclick =
+    () => channelPresetModal(Number(b.dataset.id)));
+  chpCard.querySelectorAll('.chp-del').forEach(b => b.onclick = () =>
+    confirmInline(b, `Удалить «${b.dataset.name}»?`, async () => {
+      try{ await api(`/ui/channel-presets/${b.dataset.id}`, {method: 'DELETE'}); await render(); }
+      catch(e){ toast(e.message); }
+    }));
+
   app.append($(`<div class="note muted">Быстрее всего новый пресет получается копией
     похожего: «Копия» рядом с ним, потом правка полей. Завести с нуля и править
     настройки — в том сервисе, которому пресет принадлежит: ссылки в заголовках выше.
@@ -4224,6 +4356,85 @@ function wirePresets(root){
       ask(b, () => api(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/${
         encodeURIComponent(b.dataset.name)}`, {method: 'DELETE'})));
   });
+}
+
+// Окно пресета канала: те же настройки, что у канала, кроме языка. Пустое поле — «в
+// пресете не задано», канал берёт своё значение. Привязка живая: правка меняет все
+// каналы на этом пресете со следующего прохода очереди.
+async function channelPresetModal(id){
+  const creating = !id;
+  let d = {name: '', note: '', fields: [], channels: [], days: [], any_day: '*'};
+  if (!creating){
+    try{ d = await api(`/ui/channel-presets/${id}`); }
+    catch(e){ toast(e.message); return; }
+  }else{
+    // Поля для нового берём у пустого набора: тот же список, что и при правке.
+    try{
+      const probe = await api('/ui/channel-presets');
+      d.fields = (probe.presets[0] ? (await api(`/ui/channel-presets/${probe.presets[0].id}`)).fields
+                                   : []).map(f => ({...f, value: f.kind === 'days' ? [] : ''}));
+    }catch(e){ /* полей нет — заведём по названию, поля добавятся при правке */ }
+  }
+
+  const fieldHtml = f => {
+    const id_ = 'cp-' + f.key;
+    if (f.kind === 'days')
+      return `<div class="fld" style="grid-column:1/-1"><label>${esc(f.label)}</label>
+        <span class="langs" id="${id_}" style="max-height:none;border:0;padding:0">${
+          DAY_ORDER.map(dk => `<label data-day="${dk}" class="${
+            (f.value || []).includes(dk) ? 'on' : ''}"><input type="checkbox" ${
+            (f.value || []).includes(dk) ? 'checked' : ''}>${DAY_TITLE[dk] || dk}</label>`).join('')
+        }</span></div>`;
+    if (f.kind === 'number')
+      return `<div class="fld"><label for="${id_}">${esc(f.label)}</label>
+        <input id="${id_}" data-cp="${esc(f.key)}" type="number" min="${f.min}" max="${f.max}"
+          value="${esc(String(f.value ?? ''))}" placeholder="как у канала">
+        ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+    if (f.kind === 'switch')
+      return `<div class="fld"><label for="${id_}">${esc(f.label)}</label>
+        <select id="${id_}" data-cp="${esc(f.key)}">
+          <option value=""${f.value === '' ? ' selected' : ''}>как у канала</option>
+          <option value="1"${String(f.value) === '1' ? ' selected' : ''}>включено</option>
+          <option value="0"${String(f.value) === '0' ? ' selected' : ''}>выключено</option>
+        </select></div>`;
+    if (f.kind === 'select')
+      return `<div class="fld"><label for="${id_}">${esc(f.label)}</label>
+        <select id="${id_}" data-cp="${esc(f.key)}">
+          <option value="">как у канала</option>
+          ${(f.options || []).map(o => `<option value="${esc(String(o.value))}"${
+            String(o.value) === String(f.value) ? ' selected' : ''}>${esc(o.title)}</option>`)
+            .join('')}</select></div>`;
+    return `<div class="fld"><label for="${id_}">${esc(f.label)}</label>
+      <input id="${id_}" data-cp="${esc(f.key)}" value="${esc(String(f.value ?? ''))}"
+        placeholder="как у канала">
+      ${f.hint ? `<div class="note muted">${esc(f.hint)}</div>` : ''}</div>`;
+  };
+
+  const used = (d.channels || []).length
+    ? `<div class="note muted">Сейчас на нём: ${d.channels.map(ch =>
+        esc(ch.name)).join(', ')}. Правка изменит их поведение со следующего прохода
+        очереди; уже поставленные задачи не пересчитываются.</div>`
+    : '<div class="note muted">Пока на нём не бежит ни один канал.</div>';
+
+  modal(creating ? 'Новый пресет канала' : `Пресет канала «${d.name}»`, `
+    <div class="fields" style="padding:0">
+      <div class="fld" style="grid-column:1/-1"><label for="cp-name">Название</label>
+        <input id="cp-name" value="${esc(d.name || '')}" placeholder="например: немецкие каналы"></div>
+      ${(d.fields || []).map(fieldHtml).join('')}
+    </div>${used}`,
+    {ok: creating ? 'Завести' : 'Сохранить', onOk: async (box, close) => {
+      const name = box.querySelector('#cp-name').value.trim();
+      if (!name) throw new Error('Название пустое.');
+      const values = {};
+      box.querySelectorAll('[data-cp]').forEach(el => { values[el.dataset.cp] = el.value; });
+      const daysBox = box.querySelector('#cp-schedule_days');
+      if (daysBox) values.schedule_days = [...daysBox.querySelectorAll('label')]
+        .filter(l => l.querySelector('input').checked).map(l => l.dataset.day);
+      if (creating) await post('/ui/channel-presets', {name, values});
+      else await post(`/ui/channel-presets/${id}`, {name, values});
+      close();
+      await render();
+    }});
 }
 
 // Окно правки пресета соседа. Поля описывает сервер (NEIGHBOUR_PRESET_FIELDS) — здесь

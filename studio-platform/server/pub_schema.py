@@ -15,6 +15,39 @@ from __future__ import annotations
 import sqlite3
 
 
+# Колонки, которые пресет канала перекрывает. Язык, ID, название, хэндл, профиль
+# AdsPower, статус и заметка сюда не входят: они у каждого канала свои (решение
+# владельца 18.09.2026).
+CHANNEL_PRESET_COLUMNS = ("tz", "schedule", "horizon_days", "lead_days", "deferred",
+                          "deferred_limit", "preset_vsgen_id", "host_id", "niche",
+                          "collaborator")
+
+
+def _channel_live_view(c) -> None:
+    """Вид «канал с учётом его пресета»: значение пресета сильнее, NULL — берём своё.
+
+    Читатели меняют только имя таблицы: имена и порядок колонок те же, `dict(row)`
+    работает как раньше. Это единственный способ разрешить ссылку и там, где колонка
+    участвует в отборе прямо в SQL (`pub_engine.due_items` фильтрует по `lead_days`,
+    список каналов — по `niche`): питоновская подмена туда не достаёт — строка, не
+    прошедшая WHERE, до Python не доедет.
+
+    Запись через вид SQLite запрещает — и это хорошо: настройки по-прежнему пишутся
+    только в `pub_channels`, случайная запись падает громко, а не мимо.
+    """
+    cols = {r[1] for r in c.execute("PRAGMA table_info(pub_channels)")}
+    own = [x for x in cols if x not in CHANNEL_PRESET_COLUMNS]
+    merged = [f"COALESCE(p.{x}, ch.{x}) {x}" for x in CHANNEL_PRESET_COLUMNS if x in cols]
+    fields = ", ".join([f"ch.{x}" for x in sorted(own)] + merged + ["p.name preset_channel_name"])
+    c.execute("DROP VIEW IF EXISTS pub_channels_live")
+    c.execute(f"CREATE VIEW pub_channels_live AS SELECT {fields} "
+              "FROM pub_channels ch "
+              "LEFT JOIN pub_channel_presets p "
+              # tenant_id в условии — та же защита от чужой ссылки, что и в
+              # `preset_links.resolve`: id чужого тенанта не должен ничего перекрывать.
+              "ON p.id = ch.preset_channel_id AND p.tenant_id = ch.tenant_id")
+
+
 def _migrate_channel_uc_optional(c: sqlite3.Connection) -> None:
     """Снять NOT NULL с `pub_channels.uc` на базах, заведённых до пункта 6.1 ТЗ.
 
@@ -85,6 +118,9 @@ def _migrate_channel_uc_optional(c: sqlite3.Connection) -> None:
         c.execute(create_sql)
         c.execute(f"INSERT INTO pub_channels_new({cols_csv}) "
                   f"SELECT {cols_csv} FROM pub_channels")
+        # Вид над таблицей мешает её пересобрать (и остался бы висеть на удалённой
+        # таблице). Снимаем перед заменой, поднимаем сразу после.
+        c.execute("DROP VIEW IF EXISTS pub_channels_live")
         c.execute("DROP TABLE pub_channels")
         c.execute("ALTER TABLE pub_channels_new RENAME TO pub_channels")
         for sql in idx_sql:
@@ -171,7 +207,31 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
             c.execute(f"ALTER TABLE pub_channels ADD COLUMN {_col} {_sql}")
         except Exception:
             pass
+    # Пресет канала (18.09.2026, решение владельца): те же настройки, что у канала, кроме
+    # языка — чтобы завести два канала на разных языках по одному набору правил.
+    # Привязка ЖИВАЯ: канал ссылается на пресет, правка пресета сразу меняет поведение
+    # всех каналов на нём. Поэтому значения не копируются в канал, а разрешаются на
+    # чтении — видом `pub_channels_live` ниже.
+    #
+    # Колонки, а не JSON: те же имена и типы, что у канала, и NULL значит «в пресете не
+    # задано, берём своё значение канала». С JSON пришлось бы разбирать его в каждом из
+    # двадцати пяти читателей таблицы, а часть из них фильтрует прямо в SQL (lead_days в
+    # `pub_engine.due_items`, niche в списке каналов) — там питоновский разбор бессилен.
+    c.execute("CREATE TABLE IF NOT EXISTS pub_channel_presets("
+              "id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, "
+              "name TEXT NOT NULL, note TEXT, "
+              "tz TEXT, schedule TEXT, horizon_days INTEGER, lead_days INTEGER, "
+              "deferred INTEGER, deferred_limit INTEGER, "
+              "preset_vsgen_id INTEGER, host_id INTEGER, niche TEXT, collaborator TEXT, "
+              "created REAL NOT NULL, updated REAL NOT NULL, UNIQUE(tenant_id,name))")
+    try:
+        c.execute("ALTER TABLE pub_channels ADD COLUMN preset_channel_id INTEGER")
+    except Exception:
+        pass   # колонка уже есть
+    # Вид создаётся ПОСЛЕ миграции таблицы: та пересобирает `pub_channels` целиком, и
+    # вид, созданный раньше, ссылался бы на таблицу, которой на время миграции нет.
     _migrate_channel_uc_optional(c)
+    _channel_live_view(c)
     # Теги: связь заводим сразу, интерфейс позже. Маршрут ролика они не определяют никогда.
     c.execute("CREATE TABLE IF NOT EXISTS pub_tags("
               "id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, "

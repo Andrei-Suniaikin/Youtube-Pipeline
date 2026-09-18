@@ -14751,6 +14751,52 @@ def save_fastgen_usage(c, usage: dict, now) -> None:
     c.commit()
 
 
+def lumean_template_info(template_id: str, key: str = "") -> dict:
+    """Что за шаблон Lumean скрывается за этим id. Только чтение (`GET /templates/{id}`),
+    оплаты не происходит.
+
+    Нужно человеку до запуска: сегодня id шаблона вписывают вслепую, и ошибка вскрывается
+    только в момент платного заказа (`workers/tts_worker.require_template_service`).
+    Возвращаем то, что отдал провайдер, плюс разобранные поля — имена полей у него свои,
+    и выдумывать их мы не станем.
+    """
+    tid = str(template_id or "").strip()
+    if not tid:
+        return {"ok": False, "why": "пустой id шаблона"}
+    cred = key or _first_credential(keys(), "elevenlabs") or _first_credential(keys(), "lumean")
+    if not cred:
+        return {"ok": False, "why": "ключ Lumean не задан"}
+    base = PROVIDERS["elevenlabs"]["base"].rstrip("/")
+    try:
+        r = requests.get(f"{base}/templates/{urllib.parse.quote(tid)}",
+                         headers={"X-API-Key": cred}, timeout=30)
+    except Exception as exc:                                       # noqa: BLE001
+        return {"ok": False, "why": f"Lumean не отвечает: {type(exc).__name__}"}
+    if r.status_code == 404:
+        return {"ok": False, "why": "шаблона с таким id нет"}
+    if r.status_code in (401, 403):
+        return {"ok": False, "why": "ключ Lumean не принят"}
+    if r.status_code >= 400:
+        return {"ok": False, "why": f"Lumean ответил {r.status_code}"}
+    try:
+        data = r.json() or {}
+    except Exception:                                              # noqa: BLE001
+        return {"ok": False, "why": "ответ Lumean не разобран"}
+    service = data.get("service") if isinstance(data.get("service"), dict) else {}
+    tts = data.get("tts_settings") if isinstance(data.get("tts_settings"), dict) else {}
+    return {
+        "ok": True,
+        "id": tid,
+        "name": str(data.get("name") or data.get("title") or ""),
+        "service": str(data.get("service_key") or service.get("code") or ""),
+        "language": str(data.get("language") or data.get("lang") or ""),
+        "voice": str(tts.get("voice_id") or data.get("voice_id") or ""),
+        "model": str(tts.get("model_id") or data.get("model_id") or ""),
+        # Имена полей самого шаблона — чтобы было видно, чем Lumean вообще управляет.
+        "fields": sorted(k for k in data.keys() if not str(k).startswith("_")),
+    }
+
+
 def save_fastgen_models(c, models: list, now) -> None:
     """Снимок «какая модель сейчас работает» в `admin_state.fastgen_models`.
 

@@ -178,7 +178,7 @@ def reflow_slots(c, now: float) -> int:
     placed = 0
     for row in waiting:
         cid = row["channel_id"]
-        ch = c.execute("SELECT * FROM pub_channels WHERE id=? AND status='active'",
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND status='active'",
                        (cid,)).fetchone()
         if not ch:
             continue                    # канал на паузе или в архиве — не его время
@@ -235,7 +235,7 @@ def reslot_pending_uploads(c, now: float) -> int:
         (now + 2400,)).fetchall()
     moved = 0
     for row in rows:
-        ch = c.execute("SELECT * FROM pub_channels WHERE id=?", (row["channel_id"],)).fetchone()
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=?", (row["channel_id"],)).fetchone()
         if not ch:
             continue
         try:
@@ -274,7 +274,7 @@ def due_items(c, now: float) -> list:
     """Строки плана, которым пора начинать: слот минус «готовить заранее» уже наступил."""
     return c.execute(
         "SELECT p.*, ch.lead_days lead_days, ch.status ch_status, ch.uc ch_uc "
-        "FROM pub_plan_items p JOIN pub_channels ch ON ch.id=p.channel_id "
+        "FROM pub_plan_items p JOIN pub_channels_live ch ON ch.id=p.channel_id "
         "WHERE p.status='planned' AND p.slot_at IS NOT NULL AND ch.status='active' "
         "AND p.slot_at - COALESCE(ch.lead_days,2)*86400 <= ? "
         "ORDER BY p.slot_at", (now,)).fetchall()
@@ -365,7 +365,7 @@ def live_releases(c) -> list:
         "ch.preset_cover preset_cover, ch.collaborator collaborator, ch.lang lang, "
         "ch.deferred deferred, ch.deferred_limit deferred_limit, "
         "p.donor_url donor_url, p.donor_title donor_title "
-        "FROM pub_releases r JOIN pub_channels ch ON ch.id=r.channel_id "
+        "FROM pub_releases r JOIN pub_channels_live ch ON ch.id=r.channel_id "
         "JOIN pub_plan_items p ON p.id=r.plan_item_id "
         "WHERE r.status IN ('pending','running') ORDER BY r.slot_at").fetchall()
     # Строки превращаются в словари: значения пресетов подменяются, а sqlite3.Row

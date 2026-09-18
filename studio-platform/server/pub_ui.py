@@ -732,7 +732,7 @@ def register_pub_routes(app, ctx):
             args += [needle] * 4
 
         c = db()
-        rows = c.execute(f"SELECT * FROM pub_channels WHERE {where}"
+        rows = c.execute(f"SELECT * FROM pub_channels_live WHERE {where}"
                          " ORDER BY lang, name COLLATE NOCASE", args).fetchall()
         now = _now()
         taken = plan_by_channel(c, tid, now - 86400, now + 92 * 86400)
@@ -742,7 +742,7 @@ def register_pub_routes(app, ctx):
             "SELECT lang, COUNT(*) n FROM pub_channels WHERE tenant_id=? AND status!='archived'"
             " AND lang IS NOT NULL AND lang!='' GROUP BY lang ORDER BY n DESC", (tid,)).fetchall()
         niches = c.execute(
-            "SELECT niche, COUNT(*) n FROM pub_channels WHERE tenant_id=? AND status!='archived'"
+            "SELECT niche, COUNT(*) n FROM pub_channels_live WHERE tenant_id=? AND status!='archived'"
             " AND niche IS NOT NULL AND niche!='' GROUP BY niche ORDER BY n DESC LIMIT 12",
             (tid,)).fetchall()
         own = all_tags(c, tid)
@@ -1024,7 +1024,7 @@ placeholder='[{"uc":"UC...","name":"Канал","lang":"pl","times":"10:00, 18:0
 
     def _load(u, cid):
         c = db()
-        row = c.execute("SELECT * FROM pub_channels WHERE id=? AND tenant_id=?",
+        row = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
                         (cid, _tid(u))).fetchone()
         c.close()
         return row

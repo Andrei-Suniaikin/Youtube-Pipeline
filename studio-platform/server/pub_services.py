@@ -681,7 +681,7 @@ class PubServices:
         import json as _json
         from channel_slots import upcoming_slots, ScheduleError
 
-        ch = c.execute("SELECT * FROM pub_channels WHERE id=?", (rel["channel_id"],)).fetchone()
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=?", (rel["channel_id"],)).fetchone()
         if not ch:
             return ""
         try:
