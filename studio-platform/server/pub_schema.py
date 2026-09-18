@@ -255,6 +255,27 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
         c.execute("ALTER TABLE pub_plan_items ADD COLUMN donor_title TEXT")
     except Exception:
         pass
+    # Идентификатор донорского ролика (19.09.2026). Проверка «этот донор уже взят» шла
+    # по строке ссылки, а одно и то же видео приходит в разных написаниях:
+    # `youtu.be/X`, `watch?v=X`, `watch?v=X&t=30`, ссылка с `si=…` из «Поделиться».
+    # Все они проходили как разные ролики — и канал получал дубль, оплаченный дважды
+    # (субтитры, рерайт, озвучка, картинки, рендер). Отдельная колонка, а не разбор
+    # ссылки при каждом чтении: по ней ищут и по ней же строится индекс.
+    try:
+        c.execute("ALTER TABLE pub_plan_items ADD COLUMN donor_video_id TEXT")
+    except Exception:
+        pass   # колонка уже есть
+    else:
+        # Разовое заполнение уже накопленных строк: без него старые строки не защищены,
+        # а новая ссылка на тот же ролик к ним не приклеится.
+        from pub_ids import video_id
+        for _id, _url in c.execute("SELECT id, donor_url FROM pub_plan_items").fetchall():
+            vid = video_id(_url)
+            if vid:
+                c.execute("UPDATE pub_plan_items SET donor_video_id=? WHERE id=?",
+                          (vid, _id))
+    c.execute("CREATE INDEX IF NOT EXISTS idx_pub_plan_donor_vid "
+              "ON pub_plan_items(channel_id, donor_video_id)")
     # Единственная настоящая защита от двух роликов в один слот: внешних ключей в этой
     # базе нет (PRAGMA foreign_keys не включается), поймать дубль больше нечем.
     # v2: карантинная строка ('error') ДЕРЖИТ слот — её ролик может уже стоять в Studio,

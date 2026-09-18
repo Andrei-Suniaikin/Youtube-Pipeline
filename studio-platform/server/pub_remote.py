@@ -25,6 +25,9 @@ import time
 import requests
 
 from pub_engine import ItemFailed, ResourceDown
+# Разбор донорской ссылки живёт в pub_ids: им пользуется и миграция схемы, куда requests
+# тянуть нельзя. Имена оставлены здесь же — на них ссылаются существующие вызовы.
+from pub_ids import YT_ID_RE, video_id            # noqa: F401
 
 # Адреса соседей. По умолчанию — три отдельных сервиса, как в production сегодня.
 # В единой платформе они живут в том же процессе под префиксами, и тогда адрес задаётся
@@ -58,8 +61,6 @@ SUBS_REST = float(os.environ.get("VS_SUBS_REST", "1800"))
 SUBS_TIMEOUT = float(os.environ.get("VS_SUBS_TIMEOUT", "25"))
 _subs_rest_until = {}          # выход → до какого времени отдыхает
 _subs_gate = threading.Lock()
-
-YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/embed/)([A-Za-z0-9_-]{11})")
 
 # Русские названия языков — их ждут оба соседа.
 LANG_TO_RU = {
@@ -142,14 +143,6 @@ def _detail(resp) -> str:
 
 
 # ─────────────────────────── субтитры донора ───────────────────────────
-
-def video_id(url: str) -> str:
-    m = YT_ID_RE.search(url or "")
-    if m:
-        return m.group(1)
-    tail = (url or "").rstrip("/").rsplit("/", 1)[-1]
-    return tail if re.fullmatch(r"[A-Za-z0-9_-]{11}", tail) else ""
-
 
 
 def _subs_live_exits() -> list:

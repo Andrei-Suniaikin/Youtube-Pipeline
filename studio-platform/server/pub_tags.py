@@ -16,6 +16,7 @@ import json
 import re
 
 from channel_slots import next_free_slot, upcoming_slots
+from pub_ids import video_id
 
 OEMBED = "https://www.youtube.com/oembed"
 YT_HOSTS = ("youtube.com", "youtu.be")
@@ -131,10 +132,18 @@ def add_links(c, tenant_id: str, channel, urls: list, now: float, slot=None,
         titles = {u: donor_title(u) for u in urls}
 
     for url in urls:
+        # Один и тот же ролик приходит в разных написаниях: `youtu.be/X`, `watch?v=X`,
+        # `watch?v=X&t=30`, ссылка с `si=…` из кнопки «Поделиться». Проверка по строке
+        # ссылки все их считала разными роликами, и канал получал дубль, оплаченный
+        # дважды — субтитры, рерайт, озвучка, картинки, рендер. Сравниваем по
+        # идентификатору ролика, а строку ссылки оставляем запасным признаком: у не-
+        # YouTube ссылок идентификатора нет.
+        vid = video_id(url)
         dup = c.execute(
-            "SELECT id FROM pub_plan_items WHERE channel_id=? AND donor_url=? "
+            "SELECT id FROM pub_plan_items WHERE channel_id=? "
+            "AND (donor_url=? OR (?!='' AND donor_video_id=?)) "
             "AND status IN ('planned','frozen','running','done')",
-            (channel["id"], url)).fetchone()
+            (channel["id"], url, vid, vid)).fetchone()
         if dup:
             skipped.append(url)
             continue
@@ -155,10 +164,11 @@ def add_links(c, tenant_id: str, channel, urls: list, now: float, slot=None,
                 queued += 1
         try:
             c.execute(
-                "INSERT INTO pub_plan_items(tenant_id,channel_id,donor_url,donor_title,slot_at,"
-                "slot_mode,position,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",
-                (tenant_id, channel["id"], url, (titles or {}).get(url, ""), stamp, mode,
-                 now, now, now))
+                "INSERT INTO pub_plan_items(tenant_id,channel_id,donor_url,donor_video_id,"
+                "donor_title,slot_at,slot_mode,position,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (tenant_id, channel["id"], url, vid, (titles or {}).get(url, ""), stamp,
+                 mode, now, now, now))
         except Exception as exc:
             if "UNIQUE" in str(exc):
                 skipped.append(url)      # двойной сабмит формы: выход уже занят — не роняем пачку
