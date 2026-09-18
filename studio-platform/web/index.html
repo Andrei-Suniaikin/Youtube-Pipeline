@@ -660,8 +660,10 @@ async function viewKeys(){
       </div>`
       : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
     ${rewriteRowHtml(d.rewrite || {})}
-    <div id="keyedit"></div>
-    <div style="margin-top:10px"><button class="ghost" id="addkey">Добавить ключ</button></div>
+    <div class="secbody" style="padding-top:0">
+      <div id="keyedit"></div>
+      <div style="margin-top:10px"><button class="ghost" id="addkey">Добавить ключ</button></div>
+    </div>
   </div>`);
   app.append(ownCard);
   wireKeys(ownCard, d);

@@ -42,6 +42,7 @@ FAILS = []
 MEASURE = r"""
 (() => {
   const MIN_GAP = %(gap)d, MIN_PAD = %(pad)d;
+  const OPEN_SELECTORS = %(open)s;
   const SKIP = 'table,.stage,.ev,.cal,.grid,.chgrid,.day,.sec,.empty,.upsteps,.toast,.inline-ask';
   const LEAF = 'input:not([type=hidden]):not([type=checkbox]),select,textarea,button,label,.note,p,h2,h3,img,.modes,.pill';
   const vis = el => { const r = el.getBoundingClientRect();
@@ -49,6 +50,15 @@ MEASURE = r"""
   const name = el => (el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
     (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/).join('.') : '') +
     ' «' + (el.textContent || el.placeholder || el.value || '').trim().replace(/\s+/g, ' ').slice(0, 40) + '»');
+  // Формы, которые открываются кнопкой, при обычной загрузке не видны — а слипаются
+  // именно они (жалоба владельца 18.09.2026: «Добавить ключ» и «Сохранить» вплотную к
+  // рамке). Перед замером открываем их: список кнопок приходит в OPEN_SELECTORS.
+  const openFirst = async () => {
+    for (const sel of OPEN_SELECTORS){
+      const el = document.querySelector(sel);
+      if (el){ el.click(); await new Promise(r => setTimeout(r, 400)); }
+    }
+  };
   const run = () => {
     const app = document.getElementById('app');
     const out = {route: location.hash, problems: [], blocks: 0, measured: 0,
@@ -103,7 +113,7 @@ MEASURE = r"""
     }
     document.documentElement.setAttribute('data-result', JSON.stringify(out));
   };
-  setTimeout(run, 6000);
+  setTimeout(async () => { await openFirst(); run(); }, 6000);
 })();
 """
 
@@ -114,6 +124,14 @@ def check(label, got, want):
     else:
         print(f"  FAIL {label}\n        ожидалось: {want!r}\n        получено:  {got!r}")
         FAILS.append(label)
+
+
+# Какие формы открыть перед замером на каком экране. Только то, что открывает форму
+# на месте и ничего не отправляет.
+OPEN_BUTTONS = {
+    "#/keys": ["#addkey"],
+    "#/projects": ["#newprj", "#newproj"],
+}
 
 
 def routes() -> list:
@@ -128,7 +146,8 @@ def routes() -> list:
                        (TENANT,)).fetchone()
     finally:
         c.close()
-    out = ["#/channels", "#/projects", "#/queue", "#/presets", "#/preset/new", "#/profile"]
+    out = ["#/channels", "#/projects", "#/queue", "#/presets", "#/preset/new",
+           "#/profile", "#/keys"]
     if ch:
         out += [f"#/channel/{ch["id"]}/roliki", f"#/channel/{ch["id"]}/nastroyki"]
     # Два проекта: свежий (часто пустой) и тот, где больше всего задач — у него есть
@@ -151,7 +170,10 @@ def routes() -> list:
 
 def main() -> int:
     sid = live_page.login(PLATFORM, LOGIN, PASSWORD)
-    base, stop = live_page.serve(PLATFORM, sid, MEASURE % {"gap": MIN_GAP, "pad": MIN_PAD})
+    measure = MEASURE % {"gap": MIN_GAP, "pad": MIN_PAD,
+                         "open": json.dumps(sorted({s for v in OPEN_BUTTONS.values()
+                                                    for s in v}))}
+    base, stop = live_page.serve(PLATFORM, sid, measure)
     shots = os.environ.get("SPACING_SHOTS", "")
     try:
         for route in routes():
