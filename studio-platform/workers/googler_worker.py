@@ -179,6 +179,17 @@ if env_openai_key:
 
 
 EX_TEMPFAIL = getattr(os, "EX_TEMPFAIL", 75)
+# Контракт кодов выхода для кабинета. Смысл в том, что отказ плана бывает ДВУХ пород:
+# «этот текст вообще не превращается в план» и «этот текст не превращается в план ИМЕННО
+# с этой галочкой проекта». Вторая порода лечится сама: у плана того же текста без
+# «разбора персонажей и мест» (analyze_story) или без «дробления длинных предложений»
+# (split_long_sentences) таких проверок нет вовсе. Отдельный код выхода — единственный
+# способ сказать об этом кабинету, не заставляя его разбирать текст ошибки.
+#   11 — канон разбора персонажей и мест отклонил план (story_bible);
+#   12 — смысловая нарезка длинных предложений не сошлась после всех повторов.
+# Любой другой отказ плана остаётся кодом 1: кабинет ничего выключать не должен.
+EX_PLAN_CANON_CONFLICT = 11
+EX_PLAN_SEMANTIC_EXHAUSTED = 12
 
 
 class ScenePlanError(RuntimeError):
@@ -195,6 +206,33 @@ class ScenePlanTerminalError(ScenePlanError):
 
 class ScenePlanSchemaError(ScenePlanTerminalError):
     """Модель вернула malformed JSON/scene schema; допустим точечный corrective retry."""
+
+
+class ScenePlanCanonConflictError(ScenePlanTerminalError):
+    """План отклонён каноном разбора персонажей и мест (story_bible).
+
+    Одно имя у двух сущностей, каноническое место, не отмеченное в сцене, или entities
+    сцены вне канона. Всё это порождено разбором персонажей: у плана того же текста без
+    разбора таких проверок нет. Сами проверки остаются fail-closed — план с неоднозначным
+    каноном публиковать нельзя. Отдельный класс нужен только затем, чтобы кабинет мог
+    ЯВНО перезапустить промпты с выключенным разбором и записать это в проект, а не
+    молча снять этап картинок.
+    """
+
+
+class ScenePlanCanonSchemaError(ScenePlanSchemaError, ScenePlanCanonConflictError):
+    """Канонический отказ, который ещё можно исправить точечным повтором одной сцены.
+
+    Наследует обе природы намеренно: повторы идут как у любой schema-ошибки, а если они
+    не помогли — код выхода всё равно канонический, и кабинет узнаёт настоящую причину.
+    """
+
+
+class ScenePlanSemanticExhaustedError(ScenePlanSchemaError):
+    """Смысловая нарезка (split_long, semantic v4) не сошлась после всех повторов блока.
+
+    Кабинет может ЯВНО перезапустить промпты без дробления длинных предложений.
+    """
 
 
 class OpenAIKeyError(Exception):
@@ -3192,7 +3230,7 @@ def _validate_scene_object(scene, chunk_idx: int, chunk_text: str,
         entities = scene.get("entities")
         if (not isinstance(entities, list)
                 or any(not isinstance(name, str) or name not in canon_names for name in entities)):
-            raise ScenePlanSchemaError(f"{label}: нарушена схема entities")
+            raise ScenePlanCanonSchemaError(f"{label}: нарушена схема entities")
     out = dict(scene)
     if visible_text is not None:
         out["visible_text"] = visible_text
@@ -3793,7 +3831,7 @@ Preferred maximum cadence inside SPLIT_REQUIRED units is roughly {float(preferre
                     "INFO",
                 )
                 last_error = exc
-        raise ScenePlanSchemaError(
+        raise ScenePlanSemanticExhaustedError(
             f"{label}: схема не исправлена после {SCENE_SCHEMA_MAX_RETRIES} повторов: {last_error}"
         )
 
@@ -4735,7 +4773,14 @@ This segment contains the sentence(s) shown above. Generate EXACTLY ONE scene th
                     )
                 last_schema_error = exc
 
-        raise ScenePlanSchemaError(
+        # Исчерпание сохраняет природу последнего отказа: если сцену не удалось
+        # согласовать с каноном, кабинет должен узнать об этом по коду выхода.
+        exhausted_class = (
+            ScenePlanCanonSchemaError
+            if isinstance(last_schema_error, ScenePlanCanonConflictError)
+            else ScenePlanSchemaError
+        )
+        raise exhausted_class(
             f"{label}: схема не исправлена после {SCENE_SCHEMA_MAX_RETRIES} "
             f"точечных повторов ({last_schema_error})"
         )
@@ -4930,7 +4975,7 @@ This segment contains the sentence(s) shown above. Generate EXACTLY ONE scene th
             # the missing-tag scene. scene.entities remains model authority.
             _validate_explicit_alias_entity_coverage([scene], canon)
         except ScenePlanTerminalError as exc:
-            raise ScenePlanSchemaError(
+            raise ScenePlanCanonSchemaError(
                 f"часть {chunk_idx + 1}: canonical entity coverage: {exc}"
             ) from exc
         out = [scene]                       # РОВНО одна сцена на чанк → счёт не плывёт
@@ -5876,7 +5921,7 @@ def _consolidate_characters(chars: List[dict], is_char: bool = True) -> List[dic
                 for right in component[position + 1:]
             )
             if has_exact_alias_overlap:
-                raise ScenePlanTerminalError(
+                raise ScenePlanCanonConflictError(
                     "story identity alias неоднозначен: "
                     f"{label!r}; explicit linker decided {link.get('decision')}"
                 )
@@ -6053,7 +6098,7 @@ def _validate_story_bible(bible) -> dict:
                     ) from exc
                 previous_owner = alias_owners.get(alias)
                 if previous_owner is not None and previous_owner != owner:
-                    raise ScenePlanTerminalError(
+                    raise ScenePlanCanonConflictError(
                         "story_bible cache: канонический alias "
                         f"{name!r} неоднозначен между {previous_owner} и {owner}"
                     )
@@ -6479,7 +6524,7 @@ def _validate_explicit_alias_entity_coverage(
         missing = sorted(explicit_ids - provided_ids)
         if missing:
             labels = [display_by_id.get(entity_id, entity_id) for entity_id in missing]
-            raise ScenePlanTerminalError(
+            raise ScenePlanCanonConflictError(
                 f"сцена {index + 1}: явный канонический alias "
                 f"{', '.join(repr(label) for label in labels)} отсутствует в "
                 "scene.entities; требуется replan"
@@ -13920,6 +13965,14 @@ def main():
     except ScenePlanTransientError as e:
         print_error_user_friendly(f"Временный сбой плана сцен: {e}")
         sys.exit(EX_TEMPFAIL)
+    # Обе ветки ниже стоят ПЕРЕД общим ScenePlanTerminalError намеренно: они его подклассы,
+    # и только по ним кабинет умеет выключить виноватую галочку и переставить задачу.
+    except ScenePlanCanonConflictError as e:
+        print_error_user_friendly(f"План сцен отклонён: {e}")
+        sys.exit(EX_PLAN_CANON_CONFLICT)
+    except ScenePlanSemanticExhaustedError as e:
+        print_error_user_friendly(f"План сцен отклонён: {e}")
+        sys.exit(EX_PLAN_SEMANTIC_EXHAUSTED)
     except ScenePlanTerminalError as e:
         print_error_user_friendly(f"План сцен отклонён: {e}")
         sys.exit(1)

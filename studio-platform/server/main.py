@@ -10308,6 +10308,145 @@ def _project_note(tid, pid, text, kinds=("prompts", "images")):
     return jid
 
 
+# Отказы плана сцен, которые кабинет обходит ЯВНО: код выхода воркера → настройка проекта,
+# без которой у того же текста такой проверки просто нет (googler_worker.EX_PLAN_*).
+# Ключ — это ровно то, что _run_task кладёт в queue_tasks.error при ненулевом коде (f"rc={rc}"),
+# то есть контракт между половинами держится на коде выхода, а не на разборе текста ошибки.
+_PLAN_DEGRADE_BY_ERROR = {
+    "rc=11": ("analyze_story", "разбор персонажей и мест"),
+    "rc=12": ("split_long_sentences", "дробление длинных предложений"),
+}
+# Список уже откаченных настроек живёт в самих настройках проекта, а не в памяти процесса:
+# иначе рестарт сервиса обнулил бы счётчик и мы бы крутили откат по кругу за деньги.
+# Имя боевое — так его пишет production, и импорт старого проекта не потеряет историю.
+_PLAN_DEGRADE_SETTING = "auto_degraded_plan"
+
+
+def _plan_failure_reason(job_id):
+    """Суть отказа из строки «План сцен отклонён» лога задачи — чтобы откат объяснял себя.
+
+    Без неё запись в логе звучит как «выключил галочку, потому что так решил»: пользователь
+    не узнает, что именно не поделили — «DuPont» как компанию и как место или длинный
+    период на шесть придаточных. Ошибки тут не критичны: нет строки — просто нет пояснения.
+    """
+    try:
+        c = db()
+        try:
+            row = c.execute(
+                "SELECT line FROM job_logs WHERE job_id=? AND line LIKE ? ORDER BY id DESC LIMIT 1",
+                (job_id, "%План сцен отклонён%"),
+            ).fetchone()
+        finally:
+            c.close()
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    return str(row["line"] or "").split("План сцен отклонён:", 1)[-1].strip()[:160]
+
+
+def _plan_auto_degrade(tid, pid, st, image_params, image_bundle_id, latest_prompt, iuid,
+                       image_failover, prompt_snapshot, projdir):
+    """Один явный откат плана сцен вместо снятия этапа картинок.
+
+    Воркер отвечает кодом 11, когда план отклонил канон разбора персонажей и мест (одно
+    имя у персонажа и места, неотмеченное каноническое место), и кодом 12, когда не сошлась
+    смысловая нарезка длинных предложений. У того же текста без этой настройки таких
+    проверок нет вовсе. Поэтому один раз на настройку: выключаем её В ПРОЕКТЕ (пользователь
+    видит это и в форме, и в логе), ставим промпты заново на ТОМ ЖЕ наборе референсов и
+    оставляем картинки ждать. Повторный отказ той же природы, уже выключенная настройка или
+    любой другой отказ — прежнее снятие этапа: молча крутить платный переплан нельзя.
+    Возвращает updates для settings или None.
+
+    Почему ровно один откат, а не «пока не заработает»: каждый переплан — оплаченный вызов
+    модели. Одна попытка снимает массовый случай (в бою 12.09 из 79 упавших планов 42
+    отклонил канон и 29 — смысловая нарезка, и пользователи пересоздавали эти проекты
+    руками), а вторая уже похожа на подбор за чужой счёт.
+    """
+    if not latest_prompt:
+        return None
+    rule = _PLAN_DEGRADE_BY_ERROR.get(str(latest_prompt["error"] or "").strip())
+    if not rule:
+        return None
+    setting, label = rule
+    failed_jid = latest_prompt["job_id"]
+
+    def _note(text, *job_ids):
+        """Строка в системный лог и в лог ПЕРЕЧИСЛЕННЫХ задач.
+
+        _project_note здесь не годится: он берёт последнюю задачу проекта по
+        ``ORDER BY job_id DESC``, а к моменту записи последняя — уже НОВАЯ задача
+        переплана. Пользователь же открывает красную карточку УПАВШЕЙ задачи и должен
+        прочитать объяснение там, а не искать его в задаче, которой при падении не было.
+        """
+        print(f"[deferred] {tid}/{pid}: {text}", flush=True)
+        for job_id in job_ids:
+            if job_id:
+                _log_line(job_id, text)
+
+    done = st.get(_PLAN_DEGRADE_SETTING)
+    done = [str(x) for x in done] if isinstance(done, list) else []
+    # Выключать уже выключенное бессмысленно: план упал не из-за этой галочки, и переплан
+    # с теми же параметрами упадёт так же — только за новые деньги.
+    if setting in done or not _truthy(image_params.get(setting), default=False):
+        return None
+    degraded = dict(image_params)
+    degraded[setting] = "0"
+    # Набор референсов ЗАКРЕПЛЁН заявкой, а не пересобирается под новые параметры: bundle
+    # уже собран и проверен в начале тика, и квитанция image_receipts.v1.json ссылается
+    # именно на него. Пересборка из живой папки молча перевела бы операцию на другой набор
+    # фото, если пользователь добавил или убрал снимок между заявкой и падением плана, —
+    # квитанция перестала бы описывать то, что заказывали. Поэтому передаём готовый id,
+    # ровно как соседняя ветка переплана. Совместимость при этом проверяется всё равно:
+    # _reference_prepare_bundle прогоняет _reference_gate с НОВЫМИ параметрами и упадёт,
+    # если без разбора персонажей этот набор героев недопустим — тогда отката не будет.
+    try:
+        bundle_id = _reference_prepare_bundle(projdir, degraded, image_bundle_id)
+    except reference_contract.ReferenceContractError as exc:
+        _note(f"⚠️ откат «{label}» не выполнен: контракт референсов ({exc})", failed_jid)
+        return None
+    degraded[_REFERENCE_BUNDLE_PARAM] = bundle_id
+    replan_jid = _enqueue(
+        iuid, tid, pid, "prompts", degraded,
+        prompt_failover=image_failover,
+        prompt_provider_snapshot=prompt_snapshot,
+        reference_bundle_id=bundle_id,
+    )
+    # Задача не встала (аккаунт заблокирован, дубль в очереди) — откат не состоялся, и
+    # записывать его в проект нельзя: иначе единственная попытка сгорит вхолостую.
+    if not replan_jid:
+        return None
+    # ДЕНЬГИ. Ниже этой строки платный вызов уже заказан: задача стоит в очереди. Отметку
+    # «попытка израсходована» пишем ОТДЕЛЬНЫМ немедленным апдейтом, а не общим в конце
+    # обхода проекта: между постановкой и концом тика процесс может умереть (деплой,
+    # рестарт, исключение на соседнем этапе того же проекта), и следующий тик увидел бы
+    # «откат ещё не делали» и оплатил бы второй переплан — ровно то, что здесь запрещено.
+    # Остальное (сама галочка и отложенные параметры картинок) не про деньги и спокойно
+    # уезжает общим апдейтом тика.
+    attempts = sorted(set(done) | {setting})
+    _mutate_project_settings(tid, pid, updates={_PLAN_DEGRADE_SETTING: attempts})
+    st[_PLAN_DEGRADE_SETTING] = attempts
+    reason = _plan_failure_reason(failed_jid)
+    deferred = dict(st.get("deferred_images_params") or {})
+    deferred[setting] = "0"
+    deferred[_REFERENCE_BUNDLE_PARAM] = bundle_id
+    updates = {
+        setting: "0",
+        "deferred_images_params": deferred,
+    }
+    st.update(updates)
+    _note(
+        f"🔁 {label}: план сцен отклонён"
+        + (f" ({reason})" if reason else "")
+        + "; эта настройка не справилась с текстом — выключил её в проекте "
+          f"и переставил задачу промптов (#{replan_jid})",
+        # упавшая задача первая — именно её карточку открывает пользователь; дубль в новой
+        # нужен, чтобы её лог начинался с причины, по которой галочка выключена
+        failed_jid, replan_jid,
+    )
+    return updates
+
+
 def _mark_stage_broken(tid, pid, reason):
     """Оставить видимый след того, что этап снят: строка queue_tasks(images, error).
 
@@ -10414,7 +10553,7 @@ def _deferred_render_tick():
                     pc = db()
                     try:
                         latest_prompt = pc.execute(
-                            "SELECT job_id,status FROM queue_tasks "
+                            "SELECT job_id,status,error FROM queue_tasks "
                             "WHERE tenant_id=? AND project_id=? AND kind='prompts' "
                             "ORDER BY job_id DESC LIMIT 1", (tid, pid),
                         ).fetchone()
@@ -10426,11 +10565,21 @@ def _deferred_render_tick():
                     # leave an older valid scenes.json behind. Only the latest prompt
                     # task reaching done is allowed to release images.
                     if prompt_status != "done":
-                        _drop_images(
-                            "последняя задача промптов не завершилась успешно "
-                            f"(status={prompt_status})"
+                        # Отказ отказу рознь: коды 11/12 значат «не справилась конкретная
+                        # галочка проекта», и это лечится одним откатом, а не потерей этапа.
+                        rollback = _plan_auto_degrade(
+                            tid, pid, st, image_params, image_bundle_id,
+                            latest_prompt, iuid,
+                            image_failover, prompt_snapshot, projdir,
                         )
-                        remove_keys += list(_IMAGES_FLAGS)
+                        if rollback:
+                            updates.update(rollback)
+                        else:
+                            _drop_images(
+                                "последняя задача промптов не завершилась успешно "
+                                f"(status={prompt_status})"
+                            )
+                            remove_keys += list(_IMAGES_FLAGS)
                     elif _scene_plan_ready(projdir, image_params):
                         active_writer = _active_image_mutation(tid, pid)
                         if active_writer and active_writer["kind"] != "images":
