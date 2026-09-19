@@ -21,6 +21,7 @@ import re
 import secrets
 import sqlite3
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -46,11 +47,15 @@ import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
 from pub_engine import channel_presets                            # noqa: E402
 from pub_remote import (COVER_BASE, REWRITE_BASE, donor_text,     # noqa: E402
-                        get_key, video_id)
-from pub_services import MEDIA_STAGES, OPTIONAL_STAGES           # noqa: E402
+                        get_key, subs_exits_state, subs_probe_async, video_id)
+from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
+                          MEDIA_STAGES, OPTIONAL_STAGES,
+                          collect_paid_texts, paid_texts_waiting)
 from pub_neighbors import (cover_presets, rewrite_presets,        # noqa: E402
                            vsgen_presets)
-from pub_tags import add_links, parse_links, plan_rows           # noqa: E402
+from pub_tags import (DONOR_UNKNOWN_WHY, add_links, check_donor,   # noqa: E402
+                      donor_facts_blank, donor_limits, donor_verdict,
+                      parse_links, plan_rows)
 import pub_ui                                                    # noqa: E402
 
 import pub_alerts                                                # noqa: E402
@@ -818,6 +823,244 @@ def ui_queue(service: str | None = None, channel: int | None = None,
     }
 
 
+# ───────────────── рубильник очереди: состояние словами ─────────────────
+
+def _cabinet():
+    """Модуль кабинета. Импорт ленивый — и это не осторожность ради осторожности.
+
+    Состояние паузы живёт в `server/main.py`, и считать его здесь заново нельзя:
+    посчитанная второй раз, она разойдётся с тем правилом, по которому шедулер на
+    самом деле отказывает выдавать задачи, — а экран, который врёт про рубильник,
+    хуже отсутствующего. В бою пульт и кабинет — один процесс (`web/platform.py`),
+    и модуль там уже поднят; при отдельном запуске пульта он поднимется на первый
+    запрос. Фоновых потоков импорт не заводит: планировщик поднимает startup
+    кабинета, а он здесь не выполняется.
+    """
+    import main                                                   # noqa: PLC0415
+    return main
+
+
+def _pause_story(request: Request) -> dict:
+    u = getattr(request.state, "user", None)
+    uid = tenant = None
+    if u is not None:
+        try:
+            uid = int(u["id"])
+            tenant = u["tenant_id"] or TENANT
+        except Exception:                                          # noqa: BLE001
+            uid, tenant = None, TENANT
+    return _cabinet()._queue_pause_story(uid=uid, tenant_id=tenant or TENANT)
+
+
+@app.get("/ui/queue-pause")
+def ui_queue_pause(request: Request):
+    """Что остановлено, с какого времени, кем и что держится прямо сейчас.
+
+    Владелец 18.09 полтора месяца смотрел на стоящие выпуски и не мог ответить ни
+    на один из этих вопросов: рубильник — одно поле `admin_state.queue_pause`, а
+    экран говорил только «ждём». Фразы приходят готовыми из кабинета (`_queue_pause_story`),
+    здесь они не сочиняются: иначе в пульте и в админ-панели будут разные слова про
+    одно состояние.
+
+    Снятия паузы тут нет и не будет: отпускать конвейер вслепую из двух разных мест —
+    это ровно августовский залп. Пульт показывает числа и отправляет в админ-панель.
+    """
+    story = _pause_story(request)
+    # Что можно прогнать вхолостую. «Всё» имеет смысл только при общей паузе, точечные
+    # цели — только те, которые реально стоят: кнопка, которая всегда есть и через раз
+    # отвечает «такой паузы нет», учит не нажимать её вовсе.
+    targets = []
+    if story.get("all"):
+        targets.append({"key": "all", "title": "снять общую паузу"})
+    m = _cabinet()
+    for prov in story.get("providers") or ():
+        targets.append({"key": prov,
+                        "title": "возобновить: " + str(m._provider_title(prov))})
+    if story.get("mine_prompt"):
+        targets.append({"key": "prompt_mine", "title": "возобновить тексты моего профиля"})
+    story["targets"] = targets
+    story["where_to_resume"] = ("Снимают паузу в админ-панели кабинета: у рубильника "
+                                "одна точка записи, и вторая кнопка означала бы два "
+                                "места, откуда конвейер отпускают вслепую.")
+    return story
+
+
+@app.get("/ui/queue-pause/dry-run")
+def ui_queue_pause_dry_run(request: Request, target: str = "all"):
+    """Сухой прогон: сколько задач уйдёт в работу немедленно, если это снять.
+
+    Ничего не меняет — только читает. Вопрос, на который отвечает экран, ровно один:
+    «сколько денег начнёт тратиться в первую же секунду после снятия».
+    """
+    story = _pause_story(request)
+    allowed = ({"all"} if story.get("all") else set()) | set(story.get("providers") or ())
+    if story.get("mine_prompt"):
+        allowed.add("prompt_mine")
+    if target not in allowed:
+        raise HTTPException(400, "такой паузы сейчас нет — прогонять нечего")
+    u = getattr(request.state, "user", None)
+    dry = _cabinet()._queue_pause_dry_run(target, u=u)
+    return {"target": target, "title": dry["title"], "text": dry["text"],
+            "freed": dry["freed"], "held": dry["held"], "money": dry["money"],
+            "changed": False,
+            "note": "Прогон ничего не снял и не записал: рубильник он только читает."}
+
+
+# ─────────────── оплачено, но не забрано: список и подбор ───────────────
+
+# Проход `collect_paid_texts` ходит в сеть: на каждую задачу запрос статуса и
+# скачивание файла, до ~30 с на неотвечающей. Держать на нём запрос пульта нельзя —
+# это и есть «экран завис». Поэтому проход живёт в фоновом потоке, а экран спрашивает
+# его состояние и показывает ожидание честно: сколько опрошено из скольких и кто
+# опрашивается прямо сейчас.
+_COLLECT_GATE = threading.Lock()
+_COLLECT = {"running": False, "started": 0.0, "finished": 0.0,
+            "total": 0, "done": 0, "taken": 0, "current": "", "res": None, "error": ""}
+
+
+def _collect_snapshot() -> dict:
+    with _COLLECT_GATE:
+        out = dict(_COLLECT)
+    now = time.time()
+    # Пока идёт — сколько уже ждём; когда кончился — сколько шёл. Иначе на законченном
+    # проходе экран продолжал бы наращивать «ждём уже», хотя ждать нечего.
+    end = now if out["running"] else (out["finished"] or now)
+    out["elapsed"] = int(end - out["started"]) if out["started"] else 0
+    out["reasons"] = dict(COLLECT_REASONS)
+    out["batch"] = COLLECT_BATCH
+    return out
+
+
+def _collect_worker(tenant_id: str, limit: int) -> None:
+    """Проход по одному выпуску за раз — ради честного «опрошено N из M».
+
+    Пачку целиком (`collect_paid_texts` со своим limit) экран бы тоже пережил, но
+    тогда он до самого конца показывал бы одно и то же: «идёт». На 25 задачах, каждая
+    из которых может думать полминуты, это неотличимо от зависшего пульта. Решение по
+    каждой задаче принимает та же функция кабинета — здесь только список и счётчики.
+    """
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    total = {"candidates": 0, "checked": 0, "taken": 0, "skipped": 0, "left": 0,
+             "stopped": "", "by_reason": {}, "items": []}
+    try:
+        rows = paid_texts_waiting(c, tenant_id=tenant_id)
+        total["candidates"] = len(rows)
+        todo = rows if limit <= 0 else rows[:limit]
+        with _COLLECT_GATE:
+            _COLLECT["total"] = len(todo)
+        for number, row in enumerate(todo):
+            with _COLLECT_GATE:
+                _COLLECT["current"] = (row.get("ch_name") or "") + " · " + str(row["release_id"])
+            res = collect_paid_texts(c, tenant_id=tenant_id,
+                                     release_ids=[row["release_id"]], limit=1)
+            total["checked"] += res["checked"]
+            total["taken"] += res["taken"]
+            total["skipped"] += res["skipped"]
+            total["items"] += res["items"]
+            for key, count in (res["by_reason"] or {}).items():
+                total["by_reason"][key] = total["by_reason"].get(key, 0) + count
+            with _COLLECT_GATE:
+                _COLLECT["done"] = number + 1
+                _COLLECT["taken"] = total["taken"]
+            if res["stopped"]:
+                # Сосед лёг или ключ не принят. Стучаться остальными сотнями
+                # бессмысленно и вредно — ждёт весь проход целиком.
+                total["stopped"] = res["stopped"]
+                total["left"] = total["candidates"] - (number + 1)
+                break
+        else:
+            total["left"] = total["candidates"] - len(todo)
+    except Exception as exc:                                       # noqa: BLE001
+        with _COLLECT_GATE:
+            _COLLECT["error"] = f"{type(exc).__name__}: {exc}"[:300]
+    finally:
+        try:
+            c.close()
+        except Exception:                                          # noqa: BLE001
+            pass
+        with _COLLECT_GATE:
+            _COLLECT["running"] = False
+            _COLLECT["finished"] = time.time()
+            _COLLECT["current"] = ""
+            _COLLECT["res"] = total
+
+
+class CollectIn(BaseModel):
+    limit: int = COLLECT_BATCH
+
+
+@app.get("/ui/paid-texts")
+def ui_paid_texts():
+    """За что уже заплачено, а текста у нас нет. Ни одного сетевого запроса.
+
+    Экран обязан открываться и тогда, когда рерайт лежит: он отвечает на вопрос «за
+    что деньги уже ушли», а не «что сосед думает об этом сейчас». 146 таких выпусков
+    простояли до 18.09 ровно потому, что списка не существовало.
+    """
+    c = db()
+    try:
+        rows = paid_texts_waiting(c, tenant_id=TENANT)
+    finally:
+        c.close()
+    out = []
+    for r in rows:
+        # `payload` — сырой ответ соседа на заказ, экрану он не нужен, а весит.
+        out.append({k: v for k, v in r.items() if k != "payload"})
+    return {
+        "rows": out,
+        "batch": COLLECT_BATCH,
+        "reasons": dict(COLLECT_REASONS),
+        "collect": _collect_snapshot(),
+        "free": "Подбор денег не тратит: он спрашивает статус уже оплаченной задачи "
+                "и скачивает готовый файл. Ничего не заказывает и паузу не трогает.",
+        "how": "Номер задачи взят из нашей строки о заказе либо из журнала оплат. "
+               "Повторный заказ такого текста — это вторые деньги за то же самое, "
+               "поэтому кнопки «заказать заново» здесь нет.",
+    }
+
+
+@app.post("/ui/paid-texts/collect")
+def ui_paid_texts_collect(body: CollectIn):
+    """Запустить подбор в фоне. Возвращает состояние, а не результат.
+
+    Результат приходит не сюда, а в GET того же адреса: проход может думать минуты,
+    и ответ «ждите, вот сколько уже сделано» честнее, чем молчащий запрос.
+    """
+    limit = int(body.limit or 0)
+    if limit < 0:
+        limit = 0
+    with _COLLECT_GATE:
+        if _COLLECT["running"]:
+            raise HTTPException(409, "подбор уже идёт — дождитесь его окончания")
+        _COLLECT.update({"running": True, "started": time.time(), "finished": 0.0,
+                         "total": 0, "done": 0, "taken": 0, "current": "",
+                         "res": None, "error": ""})
+    try:
+        threading.Thread(target=_collect_worker, args=(TENANT, limit),
+                         name="paid-texts-collect", daemon=True).start()
+    except Exception as exc:                                       # noqa: BLE001
+        # Флаг «идёт» ставится ДО старта намеренно: иначе два нажатия подряд запустили
+        # бы два прохода по одному списку. Но если поток не стартовал, снять флаг
+        # больше некому — он залипал навсегда, и все последующие нажатия получали 409
+        # «подбор уже идёт» до перезапуска пульта, а экран вечно показывал «идёт».
+        # Честный `error` рядом уже есть — сюда он просто не попадал.
+        with _COLLECT_GATE:
+            _COLLECT.update({"running": False, "finished": time.time(),
+                             "error": f"поток подбора не стартовал: "
+                                      f"{type(exc).__name__}: {exc}"[:300]})
+        raise HTTPException(503, "подбор не запустился: не удалось создать поток "
+                                 f"({type(exc).__name__}). Денег это не стоило — "
+                                 "проход ничего не заказывает. Попробуйте ещё раз.")
+    return _collect_snapshot()
+
+
+@app.get("/ui/paid-texts/collect")
+def ui_paid_texts_collect_state():
+    """Идёт ли подбор, сколько сделано и чем кончился прошлый."""
+    return _collect_snapshot()
+
+
 @app.get("/ui/keys")
 def ui_keys(request: Request):
     """Честная картина по ключам вместо «свободных слотов» (ТЗ §12).
@@ -1339,6 +1582,58 @@ def ui_disk():
     }
 
 
+@app.get("/ui/subs-exits")
+def ui_subs_exits():
+    """Живы ли выходы, через которые качаются субтитры донора.
+
+    Зачем отдельная плитка. Мёртвый туннель (`127.0.0.1:1080`, который никто не
+    поднял) раньше выглядел на экране как «всё встало»: выпуски стояли, задачи
+    не двигались, и причину искали в очереди, в ключах, в соседях — где угодно,
+    кроме связи. Сторож (`pub_remote`) знает ответ, здесь он просто показан.
+
+    Состояние читается ИЗ БАЗЫ (соединение передаём): сторож живёт в кабинете, и
+    при отдельном запуске пульта его память отсюда не видна, а таблица видна.
+    Сеть не трогаем вовсе — экран обязан открываться и тогда, когда выходов нет.
+    """
+    c = db()
+    try:
+        state = subs_exits_state(c)
+    finally:
+        c.close()
+    # Три вещи, которые экран не имеет права выдумать сам, и потому приходят словами
+    # с сервера: куда стучится проверка, чем «мёртв» отличается от «отдыхает» и что
+    # делать с адресом, которым два выхода видны снаружи одинаково.
+    state["how"] = ("Проверка стучится не в YouTube, а в нейтральный адрес: иначе она "
+                    "жгла бы ту же квоту и сама готовила бы бан выходам, живость "
+                    "которых проверяет.")
+    state["rest_vs_dead"] = ("«Отдыхает» — YouTube ответил 429 этому выходу, это "
+                             "проходит само. «Мёртв» — выход не отвечает на проверку: "
+                             "сам не починится, нужен владелец.")
+    state["shared_ip_note"] = ("Выходы, которые снаружи видны ОДНИМ адресом, делят и "
+                               "квоту, и репутацию: вторым выходом они только "
+                               "притворяются. Факт показан, списки не переставляются.")
+    return state
+
+
+@app.post("/ui/subs-exits/probe")
+def ui_subs_exits_probe():
+    """Разбудить обход выходов. Запрос не держим и в сеть из него не ходим.
+
+    Принудительный обход (`subs_probe_all(force=True)`) сюда НЕ вынесен намеренно:
+    он идёт по выходам по очереди, до ~10 с на каждом, и на списке владельца из
+    двух десятков это минуты в одном запросе пульта — то есть ровно «экран завис».
+    Здесь будится тот же фоновый обход, что и при заказе субтитров, и только если
+    сведения успели устареть. Когда будить нечего, так и сказано — кнопка не делает
+    вид, что что-то произошло.
+    """
+    started = subs_probe_async()
+    return {"started": started,
+            "text": ("Обход выходов запущен в фоне — обновите плитку через несколько "
+                     "секунд." if started else
+                     "Будить нечего: обход уже идёт либо все выходы проверены недавно. "
+                     "Новых сведений прямо сейчас не появится.")}
+
+
 # ──────────────────────────────── пресеты ────────────────────────────────
 
 def _neighbour_get(base: str, path: str, key: str) -> tuple:
@@ -1726,6 +2021,18 @@ def ui_links_preview(body: LinksIn):
         presets = _channel_presets(c, ch)
     finally:
         c.close()
+    # Что за ролики стоят за ссылками, спрашивается ОТДЕЛЬНЫМ запросом
+    # (`/ui/links/check`). Здесь сети нет и быть не должно: раскладка по датам обязана
+    # появляться мгновенно, а проверка донора на мёртвом туннеле думает минутами —
+    # склеенные в один запрос, они выглядят как зависший пульт.
+    # Отсев по ЗНАЧЕНИЮ здесь безопасен, и это держится на `parse_links`: она уже
+    # схлопывает буквальные повторы, поэтому одинаковых строк в `urls` не бывает и
+    # выбросить «обе копии разом» нечего. Повтор ОДНОГО РОЛИКА в разных написаниях
+    # (`youtu.be/X` и `watch?v=X`) — это две РАЗНЫЕ строки: `add_links` ловит его по
+    # `video_id` и кладёт в `skipped` именно ту, которая не встала, а вставшая
+    # остаётся в `fresh`. Заведётся второй вход в эту ручку, минующий `parse_links`, —
+    # отсев придётся считать по числу копий, а не по множеству.
+    skipped = set(res.get("skipped", []))
     return {
         "channel": {"id": ch["id"], "name": ch["name"], "lang": ch["lang"] or "",
                     "tz": ch["tz"], "horizon_days": ch["horizon_days"],
@@ -1734,7 +2041,207 @@ def ui_links_preview(body: LinksIn):
         "placed": [str(p) for p in res.get("placed", [])],
         "queued": res.get("queued", 0),
         "skipped": list(res.get("skipped", [])),
+        # Ссылки, которые действительно встанут, — их и надо проверять: донор, который
+        # никуда не встанет, зря дёргает выходы субтитров.
+        "fresh": [u for u in urls if u not in skipped],
         "note": "пресеты и язык берутся из настроек канала",
+    }
+
+
+# Потолок ожидания проверки доноров. Бюджет `check_donors` (VS_DONOR_CHECK_BUDGET_SEC)
+# спрашивается ПЕРЕД каждым походом в сеть, а не обрывает уже начатый: на мёртвом
+# туннеле один поход за субтитрами живёт минуту с лишним, и предпросмотр двух ссылок
+# держал запрос пульта три с половиной минуты (замерено 19.09.2026 на стенде с
+# VS_SUBS_PROXIES=socks5h://127.0.0.1:1080). Браузерный fetch таймаута не имеет, и
+# экран всё это время выглядит сломанным. Поэтому здесь свой предел по часам: что
+# успели — показываем, остальное честно называем непроверенным.
+# Умолчание «бюджет + 10 с» выбрано здесь, а не владельцем; вынесено в настройку.
+DONOR_WALL_EXTRA = float(os.environ.get("VS_DONOR_CHECK_WALL_SEC", "10"))
+
+
+def donor_unchecked(url: str, limits: dict, reason: str = "budget") -> dict:
+    """Ответ про ссылку, которую мы проверить не успели.
+
+    Разобрать ссылку здесь ОБЯЗАТЕЛЬНО, и это не мелочь: пустой лист фактов не имеет
+    `video_id`, а по его отсутствию вердикт выходит «это не ссылка на ролик» — то есть
+    ОТКАЗ по ссылке, про которую мы ничего не узнали. Ровно та подмена, которой на
+    экране быть не должно: «не смогли проверить» и «донор плохой» это разные вещи.
+    """
+    facts = donor_facts_blank(url, time.time())
+    facts["video_id"] = video_id(url)
+    facts.update({"fail": reason,
+                  "fail_text": DONOR_UNKNOWN_WHY.get(reason, "проверить не удалось")})
+    facts.update(donor_verdict(facts, limits))
+    return facts
+
+
+def donor_net_deadline(now: float, budget_sec, wall: float) -> float:
+    """Срок сетевой части для ФОНОВОГО потока проверки доноров.
+
+    `check_donors` трактует нулевой бюджет как «срока нет», и для синхронного вызова
+    это верно: кто позвал, тот и ждёт. Здесь — нет. Запрос пульта отпускается по
+    потолку ожидания (`wall`), а поток остаётся, и поток БЕЗ срока ходит в сеть, пока
+    не переберёт все ссылки: по 48 с на название и по таймауту на каждый выход
+    субтитров, уже после того, как экран получил ответ. Настройка
+    `VS_DONOR_CHECK_BUDGET_SEC=0`, задуманная как «не ограничивай проверку», давала
+    таким образом утечку потоков: каждое нажатие «Показать, что будет» оставляло
+    позади себя поток на минуты. Поэтому срок есть всегда: нет бюджета — живём по
+    потолку ожидания. Возвращается МОМЕНТ, а не None.
+    """
+    return float(now) + (float(budget_sec or 0) or float(wall))
+
+
+def donor_second_pass(found: dict, urls: list) -> tuple:
+    """Кого спрашивать сетью во втором проходе и в каком порядке.
+
+    Возвращает `(по_существу, косметика)` — списки `(номер, ссылка)`.
+
+    По существу — те, про кого кэш не сказал ничего (вердикт `unknown`): без вердикта
+    строка на экране бесполезна. Косметика — те, у кого не хватает одного названия.
+    Название по коду `check_donor` — украшение («из-за него проверка не падает»), но
+    добывается ПЕРВЫМ и стоит секунд: замер 19.09 — `donor_title` отвечает 48,4 с при
+    бюджете пачки 20 с. Пока оба разряда шли вперемешку, в порядке ссылок, один
+    безымянный сосед съедал срок целиком, и ссылки, про которые не известно НИЧЕГО,
+    возвращались как «не успели»: бюджет ушёл на косметику соседней строки. Строка без
+    названия читается («название не добыли»), строка без вердикта — нет.
+    """
+    need, cosmetic = [], []
+    for number, url in enumerate(urls):
+        known = found.get(url) or {}
+        if known.get("verdict") == "unknown":
+            need.append((number, url))
+        elif not known.get("title"):
+            cosmetic.append((number, url))
+    return need, cosmetic
+
+
+class LinksCheckIn(BaseModel):
+    # `channel_id` спрашивается ради ПРАВ, а не ради порогов: пороги здесь общие
+    # (`donor_limits`), канальных нет. Поле в контракте, которого нет в поведении, —
+    # будущая ошибка, поэтому канал проверяется так же, как в `/ui/links/preview`.
+    channel_id: int
+    urls: list[str] = []
+
+
+@app.post("/ui/links/check")
+def ui_links_check(body: LinksCheckIn):
+    """Есть ли у доноров субтитры и сколько в них знаков. Денег не тратит.
+
+    Отдельно от `/ui/links/preview` сознательно: раскладка по датам — это база, она
+    обязана отвечать мгновенно, а это — сеть через выходы субтитров, и её время нам
+    не принадлежит. Зовётся ПОСЛЕ отсева дублей: пульт присылает `fresh` из ответа
+    предпросмотра.
+
+    Повтор одной и той же ссылки внутри пачки проверяется ОДИН раз, и это сказано
+    числом `duplicates`: результаты всё равно лежат в словаре по url и схлопнулись бы
+    в одну строку — но молча, а экран считает строки и сдвинул бы весь список.
+    Поэтому строк в ответе ровно столько, сколько РАЗНЫХ ссылок пришло.
+
+    Что не успело за отведённые часы, возвращается вердиктом `unknown` с причиной
+    `budget` — «не смогли проверить», а НЕ «донор плохой». Разница здесь не
+    косметическая: unknown приходит ровно тогда, когда лёг наш туннель, и выбрасывать
+    из-за него исправные ссылки дороже, чем поставить сомнительную.
+    """
+    asked = [str(u).strip() for u in (body.urls or []) if str(u).strip()]
+    if not asked:
+        raise HTTPException(400, "нечего проверять")
+    urls, seen = [], set()
+    for u in asked:
+        if u in seen:
+            continue              # тот же ролик через дефицитный выход второй раз — нет
+        seen.add(u)
+        urls.append(u)
+    duplicates = len(asked) - len(urls)
+    c = db()
+    try:
+        # Канал спрашивается ради прав: у соседней `/ui/links/preview` проверка
+        # принадлежности есть, и разница между двумя соседними ручками ничем не
+        # объяснима. Пороги при этом общие — канальных порогов в схеме нет.
+        ch = c.execute("SELECT id FROM pub_channels_live WHERE id=? AND tenant_id=?",
+                       (body.channel_id, TENANT)).fetchone()
+        if not ch:
+            raise HTTPException(404, "канал не найден")
+        limits = donor_limits(c)
+    finally:
+        c.close()                 # соединение закрыто ДО сети: транзакций под сетью нет
+
+    found, gate = {}, threading.Lock()
+
+    def one(url, number, net, deadline):
+        try:
+            return check_donor(url, limits=limits, net=net, deadline=deadline,
+                               want_subs=number < int(limits["limit"]))
+        except Exception as exc:                                   # noqa: BLE001
+            item = donor_facts_blank(url, time.time())
+            item["video_id"] = video_id(url)
+            item.update({"fail": "ours",
+                         "fail_text": f"сбой проверки: {type(exc).__name__}"})
+            item.update(donor_verdict(item, limits))
+            return item
+
+    def worker():
+        # ДВА прохода, и это не оптимизация, а единственный способ вообще что-то
+        # показать на медленной сети. `check_donor` сначала добывает название (сеть) и
+        # только потом смотрит субтитры, поэтому один медленный ответ YouTube съедает
+        # весь наш срок — вместе с ответом про ролик, расшифровка которого уже лежит
+        # в кэше. Сначала спрашиваем ВСЕХ по кэшу (`net=False`, мгновенно), и только
+        # потом уточняем сетью тех, про кого кэш ничего не знает. Срежет нас потолок
+        # ожидания — на экране всё равно будут факты, а не пустота.
+        for number, url in enumerate(urls):
+            item = one(url, number, False, None)
+            with gate:
+                found[url] = item
+        # Срок сетевой части и порядок второго прохода — два отдельных решения,
+        # и оба вынесены рядом с ручкой: см. `donor_net_deadline` и `donor_second_pass`.
+        deadline = donor_net_deadline(time.time(), limits["budget_sec"], wall)
+        with gate:
+            snapshot = dict(found)
+        need, cosmetic = donor_second_pass(snapshot, urls)
+        for number, url in need:
+            item = one(url, number, True, deadline)
+            with gate:
+                found[url] = item
+        for number, url in cosmetic:
+            # За косметикой ходим, только пока срок ещё есть: строка без названия
+            # читается («название не добыли»), строка без вердикта — нет.
+            if time.time() >= deadline:
+                break
+            item = one(url, number, True, deadline)
+            with gate:
+                found[url] = item
+
+    started = time.time()
+    wall = float(limits["budget_sec"] or 0) + DONOR_WALL_EXTRA
+    thread = threading.Thread(target=worker, name="donor-check", daemon=True)
+    thread.start()
+    thread.join(wall)
+    with gate:
+        items = list(found.values())
+    # Недоделанное добираем заглушками в том же порядке, что пришли ссылки: экран
+    # показывает их строка к строке, и пропуск сдвинул бы весь список.
+    checked_urls = {i["url"] for i in items}
+    out = [i for i in items]
+    for url in urls:
+        if url not in checked_urls:
+            out.append(donor_unchecked(url, limits))
+    order = {u: n for n, u in enumerate(urls)}
+    out.sort(key=lambda i: order.get(i["url"], 0))
+    summary = {"ok": 0, "warn": 0, "reject": 0, "unknown": 0}
+    for item in out:
+        summary[item["verdict"]] = summary.get(item["verdict"], 0) + 1
+    return {
+        "donors": out,
+        "donor_summary": summary,
+        "donor_limits": limits,
+        "spent_sec": round(time.time() - started, 2),
+        "wall_sec": wall,
+        "timed_out": thread.is_alive(),
+        # Сколько повторов схлопнуто. Ноль — обычный случай; не ноль экран говорит
+        # словами, иначе строк окажется меньше, чем ссылок, и это выглядит пропуском.
+        "duplicates": duplicates,
+        "donor_note": "Проверка бесплатна: квоту YouTube Data API она не тратит. "
+                      "«Не смогли проверить» — это про нашу сторону (туннель, квота "
+                      "выходов, время), а не про донора: такую ссылку ставить можно.",
     }
 
 

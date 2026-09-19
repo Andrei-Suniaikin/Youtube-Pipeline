@@ -146,8 +146,11 @@ def routes() -> list:
                        (TENANT,)).fetchone()
     finally:
         c.close()
-    out = ["#/channels", "#/projects", "#/queue", "#/presets", "#/preset/new",
-           "#/profile", "#/keys"]
+    # «Админ» и «Оплачено, но не забрано» добавлены 19.09.2026 вместе с плиткой
+    # выходов субтитров и экраном подбора: новые блоки ставятся в те же карточки, и
+    # отступы у них обязаны быть общие, а не «как получилось».
+    out = ["#/channels", "#/projects", "#/queue", "#/paid-texts", "#/presets",
+           "#/preset/new", "#/profile", "#/keys", "#/admin"]
     if ch:
         out += [f"#/channel/{ch["id"]}/roliki", f"#/channel/{ch["id"]}/nastroyki"]
     # Два проекта: свежий (часто пустой) и тот, где больше всего задач — у него есть

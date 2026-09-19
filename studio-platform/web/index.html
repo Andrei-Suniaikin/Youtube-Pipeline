@@ -962,6 +962,8 @@ async function channelReleases(id, d){
                                    hour: '2-digit', minute: '2-digit'});
   };
   add.querySelector('#prev').onclick = async () => {
+    const pb = add.querySelector('#prev');
+    pb.disabled = true;
     pv.innerHTML = '';
     try{
       const out = await post('/ui/links/preview',
@@ -977,9 +979,15 @@ async function channelReleases(id, d){
         выходы освободятся`);
       if (skipped.length) parts.push(`<b>Пропустятся как дубли:</b> ${skipped.map(esc).join(', ')}`);
       pv.innerHTML = `<div class="note muted" style="margin-top:10px">${
-        parts.join('<br>') || 'ничего не разобрано — вставьте ссылки на YouTube'}</div>`;
+        parts.join('<br>') || 'ничего не разобрано — вставьте ссылки на YouTube'}</div>
+        <div id="pv-donors"></div>`;
       add.querySelector('#go').disabled = !(placed.length || queued);
-    }catch(e){ toast(e.message); }
+      // Даты показаны — теперь ролики. Отдельным запросом: он ходит в сеть через
+      // выходы субтитров, и на мёртвом туннеле это десятки секунд. Склеить его с
+      // датами значило бы держать пустой экран всё это время.
+      checkDonors(pv.querySelector('#pv-donors'), Number(id), out.fresh || []);
+    }catch(e){ pv.innerHTML = ''; toast(e.message); }
+    finally{ pb.disabled = false; }
   };
   add.querySelector('#go').onclick = async () => {
     const b = add.querySelector('#go');
@@ -1002,6 +1010,130 @@ async function channelReleases(id, d){
   if ((d.uploads || []).length) app.append(uploadsCard(d.uploads));
   app.append($(`<div class="note muted" style="margin-top:10px">
     <a href="#/releases">Все выпуски по всем каналам →</a></div>`));
+}
+
+/* ────────── предпросмотр ссылок: что за ролики за ними стоят (C4) ────────── */
+
+/* Вердикт проверки донора. Состояний четыре, и четвёртое — не украшение: «не смогли
+   проверить» и «донор плохой» это разные вещи, а первое случается ровно тогда, когда
+   лёг туннель субтитров. Покрасить его как отказ значит отправить владельца
+   выбрасывать исправные ссылки вместо того, чтобы поднять выход. */
+const DONOR_CLS   = {ok:'s-done', warn:'s-queued', reject:'s-error', unknown:'s-idle'};
+const DONOR_TITLE = {ok:'годится', warn:'с оговоркой', reject:'не годится',
+                     unknown:'не смогли проверить'};
+const DONOR_DOT   = {ok:'✓', warn:'!', reject:'✗', unknown:'?'};
+
+/* Что делать с «не смогли проверить» — у каждой причины свой ответ. Одной общей
+   строкой они неразличимы, и тогда владелец ждёт полчаса там, где надо поднимать
+   туннель, — или наоборот, лезет в туннель, когда достаточно подождать. */
+const DONOR_FAIL_ACT = {
+  exits_quota: 'пройдёт само: выходы упёрлись в квоту YouTube, позже проверится',
+  exit_dead:   'само не пройдёт: туннель выхода не отвечает — нужен владелец',
+  budget:      'не успели за отведённое время — нажмите «Показать, что будет» ещё раз',
+  over_limit:  'в пачке больше ссылок, чем проверяется за раз — разбейте на части',
+  off:         'проверка субтитров выключена настройкой',
+  no_lib:      'на сервере нет библиотеки расшифровок — чинится на сервере',
+  ours:        'сбой на нашей стороне — про ролик мы ничего не узнали',
+  no_net:      'в сети не спрашивали, а в кэше этого ролика нет',
+  not_checked: 'субтитры не проверяли',
+};
+
+/* Субтитры: три ответа, а не два. `has_subs === null` — «не проверяли», и писать
+   вместо него «субтитров нет» нельзя: по этой строке человек решает, выбрасывать
+   ссылку или платить за неё. */
+function donorSubsText(d){
+  if (d.has_subs === true) return `субтитры есть · ${d.chars} знаков`;
+  if (d.has_subs === false) return 'субтитров нет';
+  return 'субтитры не проверяли';
+}
+
+/* Длина: измеренная — числом, посчитанная из знаков — только как оценка. Показать
+   оценку как факт значит отклонять ролики по догадке. */
+function donorLengthText(d){
+  if (!d.minutes) return '';
+  const mins = Math.round(d.minutes);
+  return d.length_from === 'оценка по знакам'
+    ? `≈ ${mins} мин — оценка по знакам, длину не измеряли`
+    : `${mins} мин`;
+}
+
+/* Отдельный запрос про ролики: даты уже на экране, ожидание названо вслух и
+   ограничено сервером по часам. Ошибка отвечает на три вопроса — что упало, потрачены
+   ли деньги, что нажать. */
+async function checkDonors(box, channelId, urls){
+  if (!box || !urls.length) return;
+  box.innerHTML = `<div class="note muted" style="margin-top:10px">Проверяем ролики:
+    есть ли субтитры и сколько в них знаков. Это до полуминуты и денег не тратит.</div>`;
+  let out;
+  try{ out = await post('/ui/links/check', {channel_id: channelId, urls}); }
+  catch(e){
+    box.innerHTML = `<div class="note bad" style="margin-top:10px">Проверить ролики не
+      удалось: ${esc(e.message)}. Денег это не стоило — проверка бесплатна, и в план
+      ничего не записано. Ссылки можно ставить кнопкой «Поставить»: про сами ролики мы
+      ничего плохого не узнали.</div>`;
+    return;
+  }
+  if (!box.isConnected) return;          // ушли с экрана, пока проверяли
+  box.innerHTML = donorsHtml(out);
+}
+
+function donorsHtml(out){
+  const list = out.donors || [];
+  if (!list.length) return '';
+  const sum = out.donor_summary || {};
+  const unknown = list.filter(d => d.verdict === 'unknown');
+  const quota = unknown.filter(d => d.reason === 'exits_quota').length;
+  const dead  = unknown.filter(d => d.reason === 'exit_dead').length;
+  const rejects = list.filter(d => d.verdict === 'reject').length;
+  const head = [
+    sum.ok    ? `годятся: ${sum.ok}` : '',
+    sum.warn  ? `с оговоркой: ${sum.warn}` : '',
+    sum.reject ? `не годятся: ${sum.reject}` : '',
+    sum.unknown ? `не смогли проверить: ${sum.unknown}` : '',
+  ].filter(Boolean).join(' · ');
+  return `<div class="card" style="margin-top:12px">
+    <div class="sec">Что за ролики${head ? ` — ${esc(head)}` : ''}</div>
+    ${list.map(d => `<div class="stage">
+      <div class="dot ${DONOR_CLS[d.verdict] || 's-idle'}">${DONOR_DOT[d.verdict] || '?'}</div>
+      <div class="body">
+        <div class="name">${esc(d.title || 'название не добыли')}
+          <span class="pill ${DONOR_CLS[d.verdict] || 's-idle'}"
+                style="margin-left:8px">${esc(DONOR_TITLE[d.verdict] || d.verdict)}</span></div>
+        <div class="facts">${[
+            esc(donorSubsText(d)),
+            esc(donorLengthText(d)),
+            d.lang_ru ? esc(d.lang_ru) : '',
+            d.cached ? 'из кэша, в сеть не ходили' : '',
+          ].filter(Boolean).join(' · ')}</div>
+        <div class="note muted"><a href="${esc(d.url)}" target="_blank"
+          rel="noopener">${esc(d.url)}</a></div>
+        <div class="note ${d.verdict === 'reject' ? 'bad' : 'muted'}">${esc(d.why || '')}</div>
+        ${d.verdict === 'unknown' && DONOR_FAIL_ACT[d.reason]
+          ? `<div class="note muted">${esc(DONOR_FAIL_ACT[d.reason])}</div>` : ''}
+        ${(d.warns || []).length > 1 ? `<div class="note muted">${
+          d.warns.map(w => esc(w.why)).join('<br>')}</div>` : ''}
+      </div></div>`).join('')}
+    <div class="secbody">
+      ${dead ? `<div class="note bad">Туннель выхода субтитров не отвечает:
+        ${dead} ${dead === 1 ? 'ссылку' : 'ссылок'} проверить не смогли. Ждать
+        бесполезно — выход поднимает владелец. Ставить их можно: про сами ролики мы
+        ничего плохого не узнали.</div>` : ''}
+      ${quota ? `<div class="note muted">Выходы субтитров упёрлись в квоту YouTube:
+        ${quota} ${quota === 1 ? 'ссылка' : 'ссылок'} не проверены. Это проходит само —
+        повторите предпросмотр позже.</div>` : ''}
+      ${rejects ? `<div class="note bad">Проверка советует, а не запрещает: ${rejects}
+        отклонённых ${rejects === 1 ? 'ссылка встанет' : 'ссылок встанут'} в план, если
+        нажать «Поставить». Уберите их из поля, если платить за них не нужно.</div>` : ''}
+      ${out.duplicates ? `<div class="note muted">Одна и та же ссылка встречается в
+        пачке несколько раз: повторов ${out.duplicates}, проверены они по одному разу.
+        Строк поэтому меньше, чем ссылок в поле, — это не пропуск. В план повтор тоже
+        встанет один раз: канал не платит дважды за один ролик.</div>` : ''}
+      ${out.timed_out ? `<div class="note muted">Проверка не уложилась в
+        ${Math.round(out.wall_sec || 0)} с и была остановлена — что успели, показано
+        выше. Обычно так выглядит мёртвый выход субтитров: посмотрите плитку «Выходы
+        субтитров» в разделе Профиль → Админ.</div>` : ''}
+      <div class="note muted">${esc(out.donor_note || '')}</div>
+    </div></div>`;
 }
 
 // Заливка на YouTube. Кнопки «залить ещё раз» здесь нет намеренно: начиная со стадии
@@ -1115,17 +1247,249 @@ function calendarFeed(d){
 
 /* ────────────────────── сквозная очередь трёх сервисов ────────────────────── */
 
+/* ───────────── пауза очереди: состояние словами и сухой прогон (A5) ───────────── */
+
+/* Владелец полтора месяца смотрел на стоящие выпуски и не мог ответить ни на один
+   человеческий вопрос: что остановлено, с какого времени, кем и что это держит.
+   Рубильник — одно поле в базе, а экран говорил только «ждём». Фразы сюда приходят
+   готовыми из кабинета: считать их второй раз в браузере значит завести вторые
+   правила, которые разойдутся с теми, по которым шедулер на самом деле отказывает.
+
+   Кнопки «снять паузу» здесь нет намеренно. Снятие живёт в админ-панели кабинета:
+   две кнопки в разных местах — это два места, откуда конвейер отпускают вслепую,
+   а именно так в августе и случился залп. Пульт показывает числа. */
+function pauseCard(p){
+  p = p || {};
+  if (p.read_error)
+    return $(`<div class="card"><div class="sec">Пауза очереди</div>
+      <div class="secbody"><div class="note bad">Состояние паузы прочитать не удалось:
+        ${esc(p.read_error)}. Денег это не стоило — читается только состояние.
+        Список задач ниже настоящий, но сказать, выдаются ли новые, сейчас нечем.
+        Обновите страницу.</div></div></div>`);
+  if (!p.paused) return null;          // пауза не стоит — молчим, экран и так про работу
+
+  const card = $(`<div class="card">
+    <div class="sec">Выдача новых задач остановлена</div>
+    <div class="stage">
+      <div class="dot s-queued">⏸</div>
+      <div class="body">
+        ${(p.lines || []).map(l => `<div class="facts">${esc(l)}</div>`).join('')}
+        ${p.blocks_my_texts ? `<div class="note">Пока на паузе хоть один канал
+          промптов, новые тексты не заказываются ни в одном профиле — правило
+          унаследовано из боя.</div>` : ''}
+      </div>
+    </div>
+    <div class="secbody">
+      ${(p.targets || []).length ? `<div class="note muted" style="margin-bottom:10px"
+          >Прежде чем снимать — посмотрите, сколько уйдёт в работу в первую же
+          секунду:</div>
+        <div>${p.targets.map(t => `<button class="ghost small pause-dry"
+          data-target="${esc(t.key)}" style="margin:0 8px 8px 0"
+          >${esc(t.title)}: что будет?</button>`).join('')}</div>` : ''}
+      <div class="note muted">${esc(p.where_to_resume || '')}</div>
+    </div></div>`);
+
+  card.querySelectorAll('button.pause-dry').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try{
+      const dry = await api('/ui/queue-pause/dry-run?target='
+                            + encodeURIComponent(b.dataset.target));
+      // Окно, а не alert: текст длинный, и его читают, а не «ОК»-ают.
+      modal('Сухой прогон: ' + (dry.title || ''),
+            `<div class="facts" style="white-space:pre-wrap">${esc(dry.text || '')}</div>
+             <div class="note muted" style="margin-top:12px">${esc(dry.note || '')}</div>`,
+            {ok: 'Понятно', onOk: (body, close) => close()});
+    }catch(e){
+      toast('Прогон не сделан: ' + e.message
+            + '. Денег это не стоило и паузу не тронуло — прогон только читает. '
+            + 'Обновите страницу и попробуйте ещё раз.');
+    }finally{ b.disabled = false; }
+  });
+  return card;
+}
+
+/* ───────────── оплачено, но не забрано (A4) ───────────── */
+
+/* 146 выпусков стояли с оплаченным и не забранным текстом, потому что такого списка
+   не существовало. Экран отвечает на один вопрос: за что деньги уже ушли. Подбор
+   рядом — это НЕ заказ: он спрашивает статус уже оплаченной задачи и скачивает
+   готовый файл. Кнопки «заказать заново» здесь нет и быть не должно — повтор это
+   вторые деньги за тот же текст, и решает это человек, а не экран. */
+const PAID_SRC = {job: 'номер из нашей строки о заказе',
+                  calls: 'номер из журнала оплат — своя строка потерялась'};
+let PAID_POLL = 0;
+
+async function viewPaidTexts(){
+  const d = await api('/ui/paid-texts');
+  app.innerHTML = '';
+  app.append($(`<a class="back" href="#/queue">← к очереди</a>
+    <h1>Оплачено, но не забрано</h1>
+    <p class="sub">Выпуски, за текст которых рерайту уже заплачено, а текста у нас
+      нет.</p>`));
+
+  const run = $(`<div class="card">
+    <div class="sec">Забрать готовое</div>
+    <div class="secbody">
+      <div class="note">${esc(d.free || '')}</div>
+      <div class="note muted">За одно нажатие опрашивается до ${d.batch} задач; на
+        неотвечающей задаче ответ ждём до 30 секунд, поэтому проход идёт в фоне и
+        показывает, сколько уже опрошено.</div>
+      <div style="margin-top:12px">
+        <button id="pt-go">Забрать оплаченное (денег не тратит)</button></div>
+      <div id="pt-state"></div>
+    </div></div>`);
+  app.append(run);
+  const box = run.querySelector('#pt-state');
+  paintCollect(box, d.collect || {}, d.reasons || {});
+  run.querySelector('#pt-go').onclick = async () => {
+    const b = run.querySelector('#pt-go');
+    b.disabled = true;
+    try{
+      const st = await post('/ui/paid-texts/collect', {limit: d.batch});
+      paintCollect(box, st, d.reasons || {});
+      pollCollect(box, d.reasons || {});
+    }catch(e){
+      b.disabled = false;
+      box.innerHTML = `<div class="note bad">Подбор не запустился: ${esc(e.message)}.
+        Денег это не стоило — проход ничего не заказывает. Обновите страницу
+        и попробуйте ещё раз.</div>`;
+    }
+  };
+  if ((d.collect || {}).running){
+    run.querySelector('#pt-go').disabled = true;
+    pollCollect(box, d.reasons || {});
+  }
+
+  if (!d.rows.length){
+    app.append($(`<div class="card"><div class="empty">
+      Выпусков с оплаченным и не забранным текстом нет.</div></div>`));
+    return;
+  }
+
+  app.append($(`<div class="card"><table><thead><tr>
+      <th>Выпуск</th><th>Канал</th><th>Задача у рерайта</th><th>Ждём</th>
+    </tr></thead><tbody>${d.rows.map(r => `<tr>
+      <td><div style="font-weight:600">${esc(r.donor_title || 'название неизвестно')}</div>
+          <div class="muted" style="font-size:12px">
+            <a href="#/release/${encodeURIComponent(r.release_id)}"
+              >${esc(r.release_id)}</a></div></td>
+      <td>${esc(r.ch_name || '—')}<div class="muted">${esc(r.lang || '')}</div></td>
+      <td><span class="mono">${esc(String(r.job_id))}</span>
+          <div class="muted" style="font-size:12px">${esc(PAID_SRC[r.src] || r.src)}</div></td>
+      <td class="muted">${esc(ago(Math.round(r.waiting_sec || 0)))}</td>
+    </tr>`).join('')}</tbody></table>
+    <div class="secbody"><div class="note muted">${esc(d.how || '')}</div>
+      <div class="note muted">Выпуск, у которого задача пропала у соседа, из этого
+        списка уходит: забирать нечего, и повтор заказа — это вторые деньги, решает
+        человек. Искать такие надо среди выпусков на фазе «заведён»:
+        <a href="#/releases">все выпуски →</a></div></div>
+  </div>`));
+}
+
+/* Ожидание показывается честно: сколько опрошено из скольких и кого спрашиваем прямо
+   сейчас. Молчащая кнопка на проходе, который думает минуты, неотличима от зависшего
+   пульта — а нажать её второй раз означает ждать вдвое дольше. */
+function paintCollect(box, st, reasons){
+  if (!st || (!st.running && !st.res && !st.error)){ box.innerHTML = ''; return; }
+  if (st.error){
+    box.innerHTML = `<div class="note bad">Проход прервался: ${esc(st.error)}.
+      Деньги на этом не тратились — он только спрашивает и скачивает. Нажмите
+      «Забрать оплаченное» ещё раз.</div>`;
+    return;
+  }
+  if (st.running){
+    box.innerHTML = `<div class="note">Идёт подбор: опрошено ${st.done} из ${st.total},
+      забрано ${st.taken}. Ждём уже ${esc(ago(st.elapsed))}.
+      ${st.current ? 'Сейчас спрашиваем: ' + esc(st.current) + '.' : ''}
+      Окно можно не держать открытым — проход идёт на сервере.</div>`;
+    return;
+  }
+  const r = st.res || {};
+  const by = Object.entries(r.by_reason || {})
+    .map(([k, n]) => `${esc(reasons[k] || k)}: ${n}`).join(' · ');
+  box.innerHTML = `<div class="note ${r.stopped ? 'bad' : ''}">
+      Проход закончен: забрано текстов ${r.taken || 0} из ${r.checked || 0} опрошенных.
+      ${by ? '<br>' + by : ''}
+      ${r.stopped ? `<br>Обход прекращён: ${esc(r.stopped)}. Это значит, что остальные
+        НЕ опрошены, а не «всё забрано».` : ''}
+      ${r.left ? `<br>Осталось ${r.left} — нажмите «Забрать оплаченное» ещё раз.` : ''}
+      ${r.taken ? '<br>Список ниже показывает состояние на момент открытия экрана: '
+        + 'забранные из него уходят, обновите страницу, чтобы перечитать.' : ''}
+    </div>
+    ${(r.items || []).length ? `<table style="margin-top:10px"><tbody>${
+      r.items.map(i => `<tr><td>${esc(i.channel || '')}
+        <div class="muted mono" style="font-size:11px">${esc(i.release_id)}</div></td>
+        <td>${esc(reasons[i.result] || i.result)}
+        ${i.chars ? `<div class="muted">${i.chars} знаков</div>` : ''}
+        ${i.note ? `<div class="note muted">${esc(i.note)}</div>` : ''}</td>
+      </tr>`).join('')}</tbody></table>` : ''}`;
+}
+
+// Сколько неудач опроса ПОДРЯД терпим молча. Одна — обычное мигание связи, про неё
+// говорить незачем. Молчать бесконечно нельзя: опрос — единственный источник правды на
+// этом экране, и «идёт подбор» без опроса это просто враньё. Четыре попытки по 2 с ≈
+// восемь секунд тишины — столько переживает переключение сети, но не больше.
+const PAID_POLL_TRIES = 4;
+
+function pollCollect(box, reasons){
+  const hashAtStart = location.hash;
+  clearTimeout(PAID_POLL);
+  let misses = 0;
+  const unlock = () => {
+    const b = document.getElementById('pt-go');
+    if (b) b.disabled = false;
+  };
+  const tick = async () => {
+    if (location.hash !== hashAtStart || !box.isConnected) return;
+    let st;
+    try{ st = await api('/ui/paid-texts/collect'); }
+    catch(e){
+      if (location.hash !== hashAtStart || !box.isConnected) return;
+      // Сессия истекла — это не «опрос сломался», а «войдите снова»: тот же уход на
+      // экран входа, что и во всём остальном пульте. Раньше 401 проглатывался молча.
+      if (e instanceof NeedLogin){ ME = null; return viewLogin(''); }
+      // Связь мигнула — тик надо ПЕРЕПЛАНИРОВАТЬ здесь. Раньше `catch` выходил из tick
+      // до `setTimeout`, то есть одна-единственная неудача убивала цепочку навсегда:
+      // экран до конца сессии показывал «Идёт подбор: опрошено 0 из 25», хотя проход
+      // давно кончился, а кнопка оставалась заблокированной — включает её только
+      // успешная ветка этого же тика.
+      if (++misses < PAID_POLL_TRIES){ PAID_POLL = setTimeout(tick, 2000); return; }
+      box.innerHTML = `<div class="note bad">Состояние подбора не читается:
+        ${esc(e.message)} (неудач подряд: ${misses}). Денег это не стоило — сам проход
+        идёт на сервере и этим окном не держится. Обновите страницу, чтобы перечитать
+        состояние.</div>`;
+      unlock();
+      return;
+    }
+    if (location.hash !== hashAtStart || !box.isConnected) return;
+    misses = 0;                    // ответ пришёл — счёт неудач начинается заново
+    paintCollect(box, st, reasons);
+    if (st.running) PAID_POLL = setTimeout(tick, 2000);
+    else unlock();
+  };
+  PAID_POLL = setTimeout(tick, 2000);
+}
+
 const SVC_TITLE = {vsgen:'Видео', rewrite:'Текст', cover:'Обложки', release:'Выпуск'};
 
 let QFILTER = {service:'', channel:'', state:'', since:''};
 
 async function viewQueue(){
   const q = new URLSearchParams(Object.entries(QFILTER).filter(([,v]) => v)).toString();
-  const d = await api('/ui/queue' + (q ? '?' + q : ''));
+  // Состояние рубильника читается вместе с очередью и отдельной неудачей: «задач нет»
+  // и «выдача задач остановлена» — разные ответы, и путать их нельзя.
+  const [d, pause] = await Promise.all([
+    api('/ui/queue' + (q ? '?' + q : '')),
+    api('/ui/queue-pause').catch(e => ({read_error: e.message})),
+  ]);
 
   app.innerHTML = '';
   app.append($(`<h1>Очередь</h1>
-    <p class="sub">Всё, что сейчас делается, в одном списке.</p>`));
+    <p class="sub">Всё, что сейчас делается, в одном списке.
+      <a href="#/paid-texts" style="margin-left:8px">Оплачено, но не забрано →</a></p>`));
+
+  const pc = pauseCard(pause);
+  if (pc) app.append(pc);
 
   app.append($(`<div class="toolbar">${d.services.map(s => `
     <span class="pill ${s.ok ? 's-done' : 's-error'}" title="${esc(s.error)}">
@@ -1787,6 +2151,9 @@ const LOG_TIMERS = {};
 const LOG_TERMINAL = new Set(['done', 'error', 'cancelled', 'failed', 'deleted']);
 function clearAllLogTimers(){
   for (const jid of Object.keys(LOG_TIMERS)){ clearInterval(LOG_TIMERS[jid]); delete LOG_TIMERS[jid]; }
+  // Опрос фонового подбора оплаченных текстов останавливается тем же местом: он тоже
+  // переживает уход с экрана, и сам себя гасит только на следующем тике.
+  clearTimeout(PAID_POLL);
 }
 function stopJobLogPoll(jid){
   if (LOG_TIMERS[jid]){ clearInterval(LOG_TIMERS[jid]); delete LOG_TIMERS[jid]; }
@@ -4792,9 +5159,93 @@ const PUB_TITLE = {public:'вышел', unlisted:'только по ссылке
 const PUB_CLS   = {public:'s-done', unlisted:'s-error',
                    not_public:'s-queued', unknown:'s-idle'};
 
+/* ───────────── выходы субтитров: кто жив, кто отдыхает, кто мёртв (A1) ───────────── */
+
+/* Мёртвый туннель (`127.0.0.1:1080`, который никто не поднял) раньше выглядел с
+   экрана как «всё встало»: выпуски стоят, задачи не двигаются, причину ищут в
+   очереди, в ключах, у соседей — где угодно, кроме связи. Сторож в кабинете знает
+   ответ; эта плитка его показывает и ничего не решает сама. */
+const EXIT_CLS = {'работает':'s-done', 'мёртв':'s-error', 'отдыхает':'s-queued',
+                  'не проверялся':'s-idle', 'сведения устарели':'s-idle'};
+const EXIT_KIND_CLS = {ok:'s-done', warn:'s-queued', err:'s-error', none:'s-idle'};
+const EXIT_KIND_DOT = {ok:'✓', warn:'!', err:'!', none:'?'};
+
+function subsExitsCard(s){
+  if (s.read_error)
+    return $(`<div class="card"><div class="sec">Выходы субтитров</div>
+      <div class="secbody"><div class="note bad">Состояние выходов прочитать не удалось:
+        ${esc(s.read_error)}. Денег это не стоило — плитка только читает. Обновите
+        страницу; если не помогло, кабинет не отвечает.</div></div></div>`);
+
+  const card = $(`<div class="card">
+    <div class="sec">Выходы субтитров</div>
+    <div class="stage">
+      <div class="dot ${EXIT_KIND_CLS[s.kind] || 's-idle'}">${EXIT_KIND_DOT[s.kind] || '?'}</div>
+      <div class="body">
+        <div class="name">${esc(s.text || '')}</div>
+        <div class="facts">${[
+            s.checked_ago != null ? 'последняя проверка ' + ago(s.checked_ago) + ' назад'
+                                  : 'проверки ещё не было',
+            s.period ? 'проверяем раз в ' + dur(s.period) : 'сторож выключен настройкой',
+            s.running ? 'обход идёт прямо сейчас' : '',
+          ].filter(Boolean).map(esc).join(' · ')}</div>
+        ${s.trusted === false ? `<div class="note">Не отвечает ни один выход — ротация
+          этим сведениям не верит и работает по полному списку, выпуски идут. Так
+          выглядит не конец сети, а упавший адрес проверки или отсутствие PySocks на
+          сервере.</div>` : ''}
+        <div class="note muted">${esc(s.how || '')} Адрес проверки:
+          <span class="mono">${esc(s.probe_url || '')}</span></div>
+      </div>
+    </div>
+    ${(s.exits || []).length ? `<table><thead><tr>
+        <th>Выход</th><th>Состояние</th><th>Отвечал</th><th>Виден снаружи</th>
+      </tr></thead><tbody>${s.exits.map(e => `<tr>
+        <td class="mono">${esc(e.name)}</td>
+        <td><span class="pill ${EXIT_CLS[e.state] || 's-idle'}">${esc(e.state)}</span>
+            ${e.resting && e.rest_min ? `<div class="muted" style="margin-top:4px"
+              >ещё ${e.rest_min} мин</div>` : ''}</td>
+        <td class="muted">${e.ok_ago != null ? esc(ago(e.ok_ago) + ' назад')
+            : 'ни разу'}${e.ms ? esc(' · ' + Math.round(e.ms) + ' мс') : ''}
+            ${e.error ? `<div class="note bad">${esc(e.error)}</div>` : ''}</td>
+        <td class="mono muted">${esc(e.ip || '—')}${e.ip_shared
+            ? '<div class="note muted">адрес общий</div>' : ''}</td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Выходы не заданы: субтитры качаются напрямую.</div>'}
+    <div class="secbody">
+      ${Object.keys(s.shared_ip || {}).length ? `<div class="note">Одним адресом видны
+        несколько выходов: ${Object.entries(s.shared_ip).map(([ip, names]) =>
+          esc(ip + ' — ' + names.join(', '))).join('; ')}.
+        ${esc(s.shared_ip_note || '')}</div>` : ''}
+      <div class="note muted">${esc(s.rest_vs_dead || '')}</div>
+      <div class="note muted">Мёртвый выход убирать из настроек не нужно: он вернётся
+        в работу сам, как только снова ответит.</div>
+      <div style="margin-top:12px"><button class="ghost small" id="se-probe"
+        >Проверить сейчас</button></div>
+    </div></div>`);
+
+  card.querySelector('#se-probe').onclick = async () => {
+    const b = card.querySelector('#se-probe');
+    b.disabled = true;
+    try{
+      const out = await post('/ui/subs-exits/probe');
+      toast(out.text, out.started ? 'ok' : 'info');
+    }catch(e){
+      // Три вопроса: что упало, потрачены ли деньги, что нажать.
+      toast('Разбудить проверку не удалось: ' + e.message
+            + '. Денег это не стоило — проверка не ходит в YouTube. '
+            + 'Обновите страницу и попробуйте ещё раз.');
+    }finally{ b.disabled = false; }
+  };
+  return card;
+}
+
 async function viewAdmin(){
-  const [a, d, pb] = await Promise.all([api('/ui/alerts'), api('/ui/disk'),
-                                        api('/ui/public')]);
+  // Плитка выходов не имеет права уронить весь экран: она про связь, а связь как раз
+  // и ломается. Неудача чтения показывается отдельной строкой, остальное открывается.
+  const [a, d, pb, se] = await Promise.all([api('/ui/alerts'), api('/ui/disk'),
+                                            api('/ui/public'),
+                                            api('/ui/subs-exits').catch(
+                                              e => ({read_error: e.message}))]);
   app.innerHTML = '';
   app.append($(`<h1>Админ</h1>
     <p class="sub">Состояние системы: что мешает работе и сколько осталось места.
@@ -4836,6 +5287,9 @@ async function viewAdmin(){
         <td style="text-align:right">${a.disk_min_gb} ГБ</td></tr>
     </tbody></table>
   </div>`));
+
+  /* ── выходы субтитров ── */
+  app.append(subsExitsCard(se));
 
   /* ── диск ── */
   const sp = d.space || {};
@@ -4913,9 +5367,9 @@ async function viewAdmin(){
         </div>
       </td></tr>`).join('')}
     </tbody></table>
-    <div class="note muted">Синим — промежуточное, которое можно убрать.
-      Зелёным — пять артефактов выпуска: они остаются всегда.
-      Всего ${size(d.total)}, освободится ${size(d.freeable)}.</div>`
+    <div class="secbody"><div class="note muted">Синим — промежуточное, которое можно
+      убрать. Зелёным — пять артефактов выпуска: они остаются всегда.
+      Всего ${size(d.total)}, освободится ${size(d.freeable)}.</div></div>`
       : '<div class="empty">Проектов на диске нет.</div>'}
   </div>`));
 
@@ -4953,7 +5407,7 @@ async function viewAdmin(){
           ${x.error ? `<div class="note muted">${esc(x.error)}</div>` : ''}
           ${x.blocked ? `<div class="note bad">${esc(x.blocked)}</div>` : ''}
         </div></div>`).join('')}` : ''}
-    <div class="note muted">${esc(pb.blind_spot)}</div>
+    <div class="secbody"><div class="note muted">${esc(pb.blind_spot)}</div></div>
   </div>`));
 
   // Раздел людей появляется только у администратора: обычному он не показывается
@@ -4969,6 +5423,7 @@ async function viewAdmin(){
    она начала врать о подсветке. */
 const ROUTES = [
   ['queue',    h => h === '#/queue',              () => viewQueue()],
+  ['queue',    h => h === '#/paid-texts',         () => viewPaidTexts()],
   ['channels', h => h.startsWith('#/channel/'),
                                                  h  => viewChannel(h.split('/')[2])],
   ['profile',  h => h === '#/keys',               () => viewKeys()],
