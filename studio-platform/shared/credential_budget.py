@@ -88,7 +88,104 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_after_fork)
 
 
+# ── Локальные имена → ФИЗИЧЕСКИЙ вендор (наша правка, задача B8) ─────────────
+# Один и тот же секрет заведён у трёх сервисов под РАЗНЫМИ именами: ключ FastGen
+# кабинет зовёт семейством `googler` и провайдером `recrafter`, обложки — `fastgen`
+# и `flow`/`flower`/`grok`; подписку Codex кабинет зовёт `codex_home`, рерайт —
+# `codex`. Имя семейства входит в хэш, поэтому БЕЗ этой таблицы один физический ключ
+# даёт два-три независимых счёта — ровно тот утроенный лимит и оплаченные 429, ради
+# которых задача и делается.
+#
+# Таблица только ДОБАВЛЯЕТ имена: у пяти боевых (openai, fastgen, claude_oauth,
+# codex, veo) identity не меняется ни на бит, и замки, уже занятые рерайтом, остаются
+# теми же файлами. Иначе ребейз рерайта молча разошёлся бы с боем.
+#
+# Незнакомое имя НЕ становится молча новым вендором (см. vendor_of): потерянный
+# счётчик хуже отсутствующего — он выглядит как работающий учёт.
+VENDOR_ALIASES = {
+    # FastGen: один аккаунт, шесть имён на три сервиса
+    "googler": "fastgen",          # кабинет, семейство ключа
+    "recrafter": "fastgen",        # кабинет, провайдер картинок
+    "flow": "fastgen",             # обложки, видео
+    "flower": "fastgen",
+    "grok": "fastgen",
+    "openai_img": "fastgen",       # обложки: картинка ЧЕРЕЗ FastGen, не через OpenAI
+    # OpenAI: прямой ключ
+    "prompt_openai": "openai",     # кабинет, канал промптов
+    "gpt_image2": "openai",        # обложки, картинки напрямую у OpenAI
+    # Подписка Anthropic
+    "prompt_claude": "claude_oauth",
+    "claude": "claude_oauth",
+    # Подписка ChatGPT (Codex CLI): значение — каталог CODEX_HOME или тело auth.json
+    "codex_home": "codex",
+    "prompt_codex": "codex",
+}
+
+
+def vendor_of(name):
+    """Физический вендор по локальному имени семейства или провайдера.
+
+    None — «этот ключ в общем учёте не участвует». Так отвечают семейства с ОДНИМ
+    потребителем (voicer, lumean, elevenlabs, alt_llm): делить их не с кем, и заводить
+    им общий счёт значит добавить точку отказа без единого выигранного вызова.
+    """
+    key = str(name or "").strip().lower()
+    if key in CAPACITIES:
+        return key
+    return VENDOR_ALIASES.get(key)
+
+
+def capacity(family):
+    """Потолок вендора с учётом переменной окружения. None — вендор не наш."""
+    vendor = vendor_of(family)
+    return CAPACITIES[vendor] if vendor else None
+
+
+def usage(family, value):
+    """Сколько мест ключа занято прямо сейчас: {"used": n, "capacity": N} или None.
+
+    Нужно для ОДНОЙ человеческой строки в журнале («занято 12 из 12»): без неё
+    отложенная задача выглядит как зависшая. Замки берутся под тем же `.gate`, что и
+    выдача, и сразу отпускаются — иначе соседний try_acquire увидел бы занятым место,
+    которое мы всего лишь считали. Занятый gate (идёт чужая выдача) — не повод ждать:
+    возвращаем None, строка просто будет без цифр.
+
+    None здесь означает ровно «посчитать не смог», а НЕ «мест нет»: вызывающий обязан
+    сказать это человеку другими словами (см. main._key_budget_take), иначе строка
+    соврёт про причину простоя.
+    """
+    vendor = vendor_of(family)
+    if not vendor:
+        return None
+    try:
+        vendor, canonical = _canonical_credential(vendor, value)
+        identity = hashlib.sha256((vendor + "\0" + canonical).encode()).hexdigest()
+        root = _root()
+        gate = _open(root / (identity + ".gate"))
+    except BudgetConfigurationError:
+        return None
+    try:
+        try:
+            fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return None
+        free = 0
+        for index in range(CAPACITIES[vendor]):
+            fd = _open(root / (identity + "." + str(index)))
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                pass
+            else:
+                free += 1
+            _close(fd)
+        return {"used": CAPACITIES[vendor] - free, "capacity": CAPACITIES[vendor]}
+    finally:
+        _close(gate)
+
+
 def _canonical_credential(family, value):
+    family = VENDOR_ALIASES.get(str(family or "").strip().lower(), family)
     if family not in CAPACITIES:
         raise BudgetConfigurationError("Unknown credential budget family")
     value = str(value or "").strip()
@@ -178,8 +275,26 @@ class Lease:
         return "<SharedCredentialBudgetLease>"
 
 
+# Почему try_acquire вернул None. Два случая внешне одинаковы, а для человека это
+# разные слова: «ключ занят соседом» (ждать честно) и «сейчас не смог посчитать/выдать,
+# потому что ровно в этот миг выдаёт другой процесс» (миг, а не минута). Раньше оба
+# приезжали как «мест нет (нужно N)», и диагностическая строка врала про причину.
+BUSY_CAPACITY = "capacity"      # мест действительно нет
+BUSY_GATE = "gate"              # .gate держит чужая выдача — состояние неизвестно
+
+
 def try_acquire(family, value, units=1):
-    """Atomic all-or-none, nonblocking; None means ordinary capacity contention."""
+    """Atomic all-or-none, nonblocking; None means ordinary capacity contention.
+
+    Боевая сигнатура не меняется: рерайт зовёт ровно её и ждёт лизу или None.
+    Кому нужна ПРИЧИНА отказа — зовёт try_acquire_ex.
+    """
+    lease, _why = try_acquire_ex(family, value, units)
+    return lease
+
+
+def try_acquire_ex(family, value, units=1):
+    """(lease, None) | (None, BUSY_CAPACITY) | (None, BUSY_GATE)."""
     family, value = _canonical_credential(family, value)
     identity = hashlib.sha256((family + "\0" + value).encode()).hexdigest()
     units = int(units)
@@ -192,7 +307,7 @@ def try_acquire(family, value, units=1):
         try:
             fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
-            return None
+            return None, BUSY_GATE
         for index in range(CAPACITIES[family]):
             fd = _open(root / (identity + "." + str(index)))
             try:
@@ -204,8 +319,8 @@ def try_acquire(family, value, units=1):
             if len(acquired) == units:
                 lease = Lease(acquired, family, identity)
                 acquired = []
-                return lease
-        return None
+                return lease, None
+        return None, BUSY_CAPACITY
     finally:
         for fd in acquired:
             _close(fd)

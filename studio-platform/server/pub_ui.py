@@ -565,6 +565,10 @@ text-align:left;background:none;border:0;color:var(--text);font-size:13px;paddin
 border-radius:7px;cursor:pointer;text-decoration:none;font-family:inherit}
 .pub-menu-body button:hover,.pub-menu-body a:hover{background:var(--surface2)}
 .pub-menu-sep{height:1px;background:var(--border);margin:4px 2px}
+/* Карточка «конвейер остановлен»: жёлтая, а не красная — это не поломка, а чьё-то
+   решение, и читать её надо целиком, поэтому текст, а не значок. */
+.pub-pause{border-color:#e0a33e}
+.pub-pause b{color:#e0a33e}
 </style>"""
 
 PUB_JS = """<script>
@@ -600,6 +604,34 @@ document.addEventListener('click',function(e){
   });
 });
 </script>"""
+
+
+def pause_card(story) -> str:
+    """Пауза конвейера — словами, на экране кабинета.
+
+    Раньше кабинет о ней молчал: выпуски просто стояли «ждём», и 187 штук простояли
+    так с 31.08 до 18.09. Карточка отвечает сразу на четыре вопроса: что именно
+    остановлено, с какого времени, кем и что держится этим прямо сейчас. Ничем не
+    управляет: снимают паузу в админ-панели и только после сухого прогона — иначе
+    экран кабинета стал бы вторым местом, откуда конвейер можно отпустить вслепую.
+    """
+    if not isinstance(story, dict) or not story.get("paused"):
+        return ""
+    held = story.get("holding") or {}
+    # Чужая персональная пауза текстов этому кабинету ничего не говорит. Показываем
+    # только то, что реально касается его работы, иначе карточку перестанут читать.
+    touches = bool(story.get("all") or story.get("providers")
+                   or story.get("blocks_my_texts")
+                   or (held.get("releases_mine") or 0))
+    if not touches:
+        return ""
+    lines = "".join(f'<div style="margin-top:6px">{e(line)}</div>'
+                    for line in (story.get("lines") or []))
+    return ('<div class="card pub-pause" style="margin-bottom:12px">'
+            '<b>Конвейер остановлен</b>' + lines
+            + '<div class=hint style="margin-top:8px">Снять паузу можно только в '
+              'админ-панели, и она сначала покажет сухим прогоном, сколько задач и '
+              'выпусков уйдёт в работу немедленно.</div></div>')
 
 
 def tile_menu(row, back: str) -> str:
@@ -679,6 +711,20 @@ def register_pub_routes(app, ctx):
     _now = ctx["_now"]
     web_user = ctx["web_user"]
     require_web_user = ctx["require_web_user"]
+    # Состояние рубильника живёт в main.py — оттуда и берём его описание словами.
+    # Ключа может не быть (старый вызов, тест со своим ctx): тогда карточки просто
+    # нет, но каналы показать это не мешает.
+    queue_pause_story = ctx.get("queue_pause_story")
+
+    def pause_block(u, tid: str) -> str:
+        if queue_pause_story is None:
+            return ""
+        try:
+            return pause_card(queue_pause_story(u["id"], tid))
+        except Exception:
+            # Объяснение паузы — важное, но не главное на экране: сбой в нём не
+            # должен прятать от владельца сами каналы.
+            return ""
 
     def _err_page(u, text, back="/channels"):
         body = _header(u, "channels") + f"""<div class=wrap>
@@ -790,6 +836,7 @@ def register_pub_routes(app, ctx):
         opened = " open" if (tag or picked != ["active"]) else ""
         body = _header(u, "channels") + PUB_CSS + f"""<div class=wrap>
 <h1>Каналы <span class=muted style="font-size:14px;font-weight:400">{len(rows)}</span></h1>
+{pause_block(u, tid)}
 <div class=card>
   <form method=get action="/channels" style="display:flex;gap:8px;align-items:center;margin:0;flex-wrap:wrap">
     <input name=q value="{e(q)}" placeholder="название, ниша или ID канала" style="min-width:280px">
@@ -922,6 +969,7 @@ def register_pub_routes(app, ctx):
 <span class=muted style="font-size:13px">{e(lang_title(row['lang']))}{' · ' + e(row['niche']) if row['niche'] else ''}</span>
 <span style="flex:1"></span><a class="btn btn-ghost btn-sm" href="/channels">К списку</a></div>
 {err}
+{pause_block(u, tid)}
 <div class=panel style="margin-top:10px">
 <div class=panel-title>Ролики канала</div>
 <table class=pub-tab>

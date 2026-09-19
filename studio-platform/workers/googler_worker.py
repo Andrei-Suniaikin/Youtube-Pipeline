@@ -636,6 +636,59 @@ def _set_last_gen_error(msg) -> None:
 def _last_gen_error() -> str:
     return getattr(_GEN_LAST_ERROR, "msg", "")
 
+
+# ── Настоящая причина отказа провайдера (HTTP-код и суть) ────────────────────
+# Отдельно от _GEN_LAST_ERROR НАМЕРЕННО. _GEN_LAST_ERROR — вход ретрай-логики: по нему
+# решают, фатален ли отказ, транзиентен ли, часовая ли это квота. Дописывать туда ещё и
+# отказы транспорта значит менять решения о повторах. А здесь нужна только правда для
+# человека и для журнала вызовов: что именно ответил провайдер и каким кодом.
+# Зачем вообще: до этой правки отказ POST /api/v6/generations доезжал до кабинета
+# обёрткой «<модель>: v6 генерация не удалась», и по ней причину отказа установить
+# нельзя ВООБЩЕ — ни код, ни текст провайдера в неё не входят.
+_GEN_PROVIDER_REFUSAL = threading.local()
+
+
+def _set_provider_refusal(msg) -> None:
+    _GEN_PROVIDER_REFUSAL.msg = " ".join(str(msg or "").split())[:300]
+
+
+def _provider_refusal() -> str:
+    return getattr(_GEN_PROVIDER_REFUSAL, "msg", "")
+
+
+def _real_gen_reason() -> str:
+    """Причина отказа словами провайдера. "" — провайдер ничего внятного не сказал."""
+    return _provider_refusal() or _last_gen_error()
+
+
+# Наши обёртки: текст есть, причины в нём нет. Такой текст уступает место ответу
+# провайдера везде, где выбирают, что показать человеку и что записать в журнал.
+_WRAPPER_GEN_PATTERNS = ("генерация не удалась", "кадр не получен", "клип не получен",
+                         "результат пуст", "нет результата",
+                         # видео-ветки: та же обёртка, только другими словами
+                         "video не удалось", "video не удалась")
+
+
+def _is_wrapper_gen_error(msg) -> bool:
+    s = " ".join(str(msg or "").split()).lower()
+    return (not s) or any(p in s for p in _WRAPPER_GEN_PATTERNS)
+
+
+def _gen_failure_error(label: str, fallback: str = "v6 генерация не удалась") -> str:
+    """Текст неудачной генерации: правда провайдера, обёртка — только если правды нет.
+
+    Ровно эта строка печатается в «Попытка N неудачна» и «Все N попыток исчерпаны» и
+    уезжает в кабинет. Пока в ней стояла одна обёртка, причину отказа по логу задачи
+    установить было нельзя: ни HTTP-кода, ни слов провайдера в ней нет.
+
+    `fallback` — прежняя обёртка ЭТОЙ ветки (у картинок и у видео она разная). Менять
+    её нельзя: когда провайдер промолчал, человек должен увидеть ровно тот же текст,
+    что и до правки, иначе мы поменяли смысл строки, не добавив ни одного факта.
+    """
+    why = _real_gen_reason()
+    return f"{label}: {why}" if why else f"{label}: {fallback}"
+
+
 _FATAL_GEN_PATTERNS = ("danger_filter", "safety filter", "safety_filter", "inputisimproper",
                        "policy violation", "prominent_people", "prominent people", "filter_failed",
                        "child", "celebrity", "timed_out", "generation_timed_out")
@@ -7202,11 +7255,19 @@ def googler_request_v6(endpoint: str, method: str = "POST", data: Optional[dict]
                 if attempt < _tries - 1:
                     _wait(attempt)
                 continue
-            if sc in (400, 402, 403, 422):  # bad request / нет кредитов / auth / валидация — без ретрая
+            # 401 добавлен к списку «без ретрая»: мёртвый или отозванный ключ шесть раз
+            # подряд отвечает тем же самым, а до правки он уходил в raise_for_status и
+            # приезжал наверх как «HTTPError: 401 Client Error» БЕЗ тела ответа — то есть
+            # без единственного места, где провайдер называет причину.
+            if sc in (400, 401, 402, 403, 422):  # bad request / мёртвый ключ / нет кредитов / auth / валидация
                 try:
-                    return {"_error": response.json()}
+                    detail = json.dumps(response.json(), ensure_ascii=False)
                 except Exception:
-                    return {"_error": response.text[:300]}
+                    detail = response.text
+                # Код ОБЯЗАН быть в тексте: по нему человек понимает, менять ключ (401/403),
+                # пополнять счёт (402) или чинить запрос (400/422). Без кода все эти отказы
+                # выглядят одинаково.
+                return {"_error": f"HTTP {sc}: {str(detail or '').strip()[:300]}"}
             response.raise_for_status()
             j = response.json()
             # 200, НО пустой ответ / без operation id (мягкий троттл провайдера отдаёт {} вместо 429):
@@ -7269,9 +7330,15 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
             # transport reasons stay byte-for-byte unchanged; only an unclassified terminal
             # failure gets a private marker used by the OPENAI image retry bound.
             _set_last_gen_error(_typed_v6_terminal_error(err))
+            _set_provider_refusal(str(err))     # правда провайдера — в лог и в журнал
             print_user(f"❌ [{index}] v6 generation failed: {str(err)[:200]}", "ERROR")
             return None
         else:  # queued / running / unknown
+            if r.get("_error"):
+                # Заказ уже создан и оплачен, поэтому опрос НЕ прерываем. Но причину
+                # запоминаем: мёртвый ключ отвечает отказом на КАЖДЫЙ опрос, и без этого
+                # наверх уезжал голый «таймаут операции» без единого слова почему.
+                _set_provider_refusal(str(r["_error"]))
             el = time.time() - start
             if el - hb >= 15:
                 print_user(f"v6 операция [{index}]: {int(el)}с ({st})...", "PROCESS")
@@ -7612,10 +7679,15 @@ def googler_v6_generate(v6_model: str, prompt: str, aspect_ratio: Optional[str] 
         body["duration_seconds"] = int(duration_seconds)
     resp = googler_request_v6("generations", method="POST", data=body)
     if resp.get("_error"):
+        # Отказ на СОЗДАНИИ заказа — единственное место, где провайдер называет причину
+        # («HTTP 401: invalid api key»). Дальше она терялась: наверх уходила обёртка
+        # «v6 генерация не удалась», и в карточке с журналом оставалось «rc=3».
+        _set_provider_refusal(str(resp["_error"]))
         print_user(f"❌ [{index}] v6 generation отклонён: {str(resp['_error'])[:220]}", "ERROR")
         return None
     gid = resp.get("id")
     if not gid:
+        _set_provider_refusal(f"ответ без id операции: {str(resp)[:160]}")
         print_user(f"❌ [{index}] v6: нет id в ответе ({str(resp)[:160]})", "ERROR")
         return None
     # 03.09.2026: заказ создан и уже оплачен — фиксируем id ДО поллинга. Именно здесь
@@ -10514,9 +10586,16 @@ def _journal_close_frame(image_data, error: str = "") -> None:
     if image_data and (not path or os.path.exists(path)):
         state["journal"].delivered(state["call_id"], path)
     else:
+        # Порядок «сначала настоящая причина, обёртка — запасной вариант». До правки
+        # первым стоял `error`, и в колонку error журнала вызовов уезжала либо наша
+        # обёртка, либо вовсе «кадр не получен»: ни кода, ни слов провайдера. По таким
+        # строкам причину отказа установить нельзя, а именно за этим журнал и заведён.
+        # Текст исключения (`error`) причину называет и остаётся первым — обёртку он
+        # не содержит; безликие же варианты пропускают вперёд ответ провайдера.
         state["journal"].failed(
             state["call_id"],
-            error or _last_gen_error() or "кадр не получен",
+            (error if not _is_wrapper_gen_error(error) else "")
+            or _real_gen_reason() or error or "кадр не получен",
             ordered=state["ordered"],
         )
 
@@ -10627,6 +10706,14 @@ def _journal_frame_call(function):
     """
     @functools.wraps(function)
     def _wrapped(*args, **kwargs):
+        # Причина ПРЕДЫДУЩЕГО кадра этого же потока не имеет права закрыть нынешнюю
+        # строку журнала. Сброс стоял внутри цикла попыток, а ранние выходы
+        # (_v6_generic_terminal_frame_blocked, _account_limit_hit) возвращают None ДО
+        # цикла: кадр, к провайдеру вообще не ходивший, закрывался убедительным
+        # «HTTP 401: api key expired» от чужого кадра — пул потоков переиспользует
+        # thread-local. Чистим на ВХОДЕ в заявку: одна заявка — одна причина.
+        _set_provider_refusal("")
+        _set_last_gen_error("")
         try:
             result = function(*args, **kwargs)
         except BaseException as exc:
@@ -10928,6 +11015,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             _extra_attempts += 1          # ожидание не должно съедать попытку кадра
             continue
         _set_last_gen_error("")  # чистим перед попыткой (thread-local; пул переиспользует потоки)
+        _set_provider_refusal("")  # причина прошлой попытки не должна выдаваться за нынешнюю
         # Legacy fallback убран — endpoint /api/v2/images возвращает 404 (FastGen его убил)
         pass  # use_legacy_now stays False для всех попыток
         
@@ -10997,7 +11085,10 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                     save_base64_to_file(image_data, output_path)
                     print_user(f"✅ [{index+1}] Изображение через {_lbl} (v6)", "SUCCESS")
                 return (index, image_data)
-            result = {"success": False, "error": f"{_lbl}: v6 генерация не удалась"}
+            # Обёртка «v6 генерация не удалась» больше не побеждает правду провайдера:
+            # именно она печаталась в «Попытка N неудачна» и «Все N попыток исчерпаны»,
+            # и по этим строкам причину восьми боевых отказов установить было нельзя.
+            result = {"success": False, "error": _gen_failure_error(_lbl)}
             api_label = _lbl
 
         elif GOOGLER_MODEL == "WHISK_IMAGEN4":
@@ -11856,6 +11947,7 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
 
     for attempt in range(max_attempts):
         _set_last_gen_error("")  # чистим перед попыткой (thread-local)
+        _set_provider_refusal("")
         if max_attempts > 1:
             log(f"🔁 [{total_label}] Попытка {attempt + 1}/{max_attempts} ({api_label})")
         try:
@@ -11880,6 +11972,7 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
                 else:
                     err = (veo_res.get('error') if isinstance(veo_res, dict) else None) or 'No task_id'
                     _set_last_gen_error(err)
+                    _set_provider_refusal(err)   # та же правда — в журнал вызовов
                     log(f"❌ [{total_label}] Ошибка veo: {err}")
                     if isinstance(veo_res, dict) and veo_res.get("skip_retry"):
                         return (index, None)  # нет ключа/auth — не ретраим зря
@@ -11890,7 +11983,10 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
                                                  index=index, timeout=VIDEO_POLL_TIMEOUT)
                 if video_data:
                     return (index, video_data)
-                log(f"❌ [{total_label}] Ошибка {api_label}: v6 video не удалось")
+                # Клип — самый дорогой вызов, и до правки его отказ читался как
+                # «Ошибка flower: v6 video не удалось»: ни кода, ни слов провайдера.
+                log(f"❌ [{total_label}] Ошибка "
+                    f"{_gen_failure_error(api_label, 'v6 video не удалось')}")
         except Exception as e:
             log(f"❌ [{total_label}] Исключение {api_label}: {str(e)[:150]}")
         # Контент-фильтр (DANGER_FILTER и т.п.) детерминирован для того же промпта → GPT смягчает
@@ -11915,7 +12011,12 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
                 log(f"⏳ [{total_label}] Пауза {_delay}с перед повтором (cooldown reCAPTCHA)...")
             time.sleep(_delay)
 
-    log(f"❌ [{total_label}] Не удалось запустить генерацию видео после {max_attempts} попыток ({api_label})")
+    # Итоговая строка клипа — аналог «Все N попыток исчерпаны» у картинок: именно её
+    # человек и читает, когда сцена осталась без видео. Причина последней попытки в ней
+    # обязана быть, иначе отказ ключа на клипах по логу не устанавливается вообще.
+    _why = _real_gen_reason()
+    log(f"❌ [{total_label}] Не удалось запустить генерацию видео после {max_attempts} "
+        f"попыток ({api_label})" + (f": {_why}" if _why else ""))
     return (index, None)
 
 
@@ -11939,6 +12040,10 @@ def generate_video_from_prompt_only(prompt: str, aspect_ratio: str = "landscape"
             log(f"📋 [{total_label}] veo task_id: {task_id}")
             return (index, veo_poll_task(task_id, index, timeout=VEO_POLL_TIMEOUT))
         err = (veo_res.get('error') if isinstance(veo_res, dict) else None) or 'No task_id'
+        # Здесь _set_last_gen_error НЕ ставим: в t2v-ветке его читает ретрай-логика
+        # (_is_fatal_gen_error), и подмена её входа поменяла бы решения о повторах.
+        # А журналу и человеку правда нужна — для этого и заведён отдельный слот.
+        _set_provider_refusal(err)
         log(f"❌ [{total_label}] Ошибка veo: {err}")
         return (index, None)
 
@@ -11947,7 +12052,8 @@ def generate_video_from_prompt_only(prompt: str, aspect_ratio: str = "landscape"
     video_data = googler_v6_generate(v6vid, prompt, aspect_ratio=v_ar, index=index, timeout=VIDEO_POLL_TIMEOUT)
     if video_data:
         return (index, video_data)
-    log(f"❌ [{total_label}] Ошибка {api_label}: v6 text→video не удалось")
+    log(f"❌ [{total_label}] Ошибка "
+        f"{_gen_failure_error(api_label, 'v6 text→video не удалось')}")
     return (index, None)
 
 
@@ -11972,6 +12078,7 @@ def _t2v_generate_with_retry(prompt: str, aspect_ratio: str, index: int,
     _soften_rounds = 0  # раундов GPT-смягчения промпта после контент-фильтра (макс 3)
     for attempt in range(max_attempts):
         _set_last_gen_error("")
+        _set_provider_refusal("")
         try:
             _, data = generate_video_from_prompt_only(prompt, aspect_ratio=aspect_ratio, index=index)
         except Exception as e:
@@ -11996,6 +12103,11 @@ def _t2v_generate_with_retry(prompt: str, aspect_ratio: str, index: int,
             _delay = min(60, (VEO_RETRY_DELAY if VIDEO_METHOD == "veo" else RETRY_DELAY) * (attempt + 1))
             log(f"⏳ [{index+1}] Пауза {_delay}с перед повтором t2v (попытка {attempt+1}/{max_attempts})...")
             time.sleep(_delay)
+    # Цикл кончился молча: сцена остаётся без клипа, и до правки в логе на этом месте
+    # не было НИ ОДНОЙ строки с причиной — только отдельные строки попыток выше.
+    _why = _real_gen_reason()
+    log(f"❌ [{index+1}] t2v: клип не получен после {max_attempts} попыток"
+        + (f": {_why}" if _why else ""))
     return (index, None)
 
 

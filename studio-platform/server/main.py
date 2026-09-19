@@ -37,8 +37,17 @@ if HERE not in sys.path:
 RENDER_DIR = os.path.join(os.path.dirname(HERE), "render")
 if RENDER_DIR not in sys.path:
     sys.path.append(RENDER_DIR)
+# shared/ — общий учёт мест на ФИЗИЧЕСКИЙ ключ (credential_budget). Модуль приехал
+# из боя вместе с ребейзом рерайта и уже используется рерайтом; кабинет подключается
+# к нему тем же путём. Каталог кладёт в sys.path и web/platform.py, но кабинет
+# запускается и сам по себе (тесты, dev/run.sh), поэтому путь добавляем здесь тоже:
+# импорт модуля не должен зависеть от того, кто нас поднял.
+SHARED_DIR = os.path.join(os.path.dirname(HERE), "shared")
+if SHARED_DIR not in sys.path:
+    sys.path.append(SHARED_DIR)
 import card_jobs as card_contract
 import preset_links
+import pub_calls
 from pub_calls import ensure_calls_schema, node_disk, note_node_disk
 from pub_calls_api import register_calls_routes
 from pub_schema import ensure_pub_schema
@@ -972,6 +981,188 @@ def _clear_gen_limit(jid):
         _GEN_LIMIT_REASON.pop(str(jid), None)
 
 
+# ── ПЕРВАЯ настоящая причина отказа ключа ────────────────────────────────────
+# Почему отдельно от _scan_gen_limit_line и channel_incident. Оба помнят ПОСЛЕДНЮЮ
+# опознанную строку, и для их задач это правильно: у канала промптов первой прилетает
+# безликая «Command failed with exit code 1», и только следом «You've hit your limit» —
+# вердикт обязан обновиться. У отказа КЛЮЧА всё наоборот: провайдер называет причину
+# один раз, в первом же отказе («HTTP 401 key expired»), а дальше сыплются следствия —
+# оборванные скачивания, пустые результаты, «все попытки исчерпаны». В карточке человек
+# видел последнее следствие или голое «rc=3» и починить ключ по такой ошибке не мог.
+# Поэтому здесь запись ОДИН раз (setdefault по смыслу), а не update.
+_KEY_REFUSAL = {}                       # job_id -> {"kind","http","text","at"}
+_KEY_REFUSAL_LOCK = threading.Lock()
+
+# Код читаем СТРОГО из «HTTP <код>». Голое трёхзначное число в строке лога — это чаще
+# номер кадра, размер файла или кусок id заказа, чем статус ответа.
+_HTTP_CODE_RE = re.compile(r"\bhttp[ /_-]?(\d{3})\b", re.I)
+
+# Маркеры восстановления. Строка про ожидание, повтор или живой запасной канал тоже
+# содержит и «429», и «квоту», и «лимит», но отказом ключа НЕ является. Такую строку
+# скан пропускает целиком: иначе «жду сброса окна» заняло бы место первой причины, и
+# настоящий «HTTP 401 expired» следом уже не записался бы — ровно та подмена, из-за
+# которой задача и заводилась.
+_KEY_RECOVERY_MARKERS = (
+    "проверяю ещё раз", "проверяю еще раз", "жду сброса", "жду результат проверки",
+    "повтор через", "пробую снова", "пробую со смягчённым", "продолжает работать",
+    "запасным каналом", "восстанов", "↔️", "♻️", "✅", "🔄",
+)
+
+# Признаки берём ТОЛЬКО однозначные — та же дисциплина, что у воркера («признаки берём
+# ТОЛЬКО однозначные и ТОЛЬКО вместе с HTTP 429», googler_worker). Родового «rate limit»
+# и «too many requests» здесь нет намеренно: секундный троттл не отказ ключа, и объявить
+# по нему ключ мёртвым нельзя.
+_KEY_EXPIRED_WORDS = ("expired", "revoked", "token_expired", "key_expired",
+                      "истёк", "истек", "отозван", "отозвали", "просрочен")
+# Из уже выверенного _CRED_AUTH_MARKERS берём текстовую часть: голое «401» оттуда
+# заменено строгим разбором кода выше. «authentication» и «oauth token» не берём —
+# это слова и нейтральных строк тоже, а ложная ПЕРВАЯ причина закрывает место настоящей.
+_KEY_AUTH_WORDS = ("not logged in", "unauthorized", "invalid token", "invalid api key",
+                   "invalid_api_key", "incorrect api key", "permission denied",
+                   "невалиден", "не авторизована", "не авторизован")
+# Кончились деньги/квота ключа и исчерпан аккаунт провайдера. Списки НЕ переписываем —
+# берём те же, которыми пользуется сам воркер (он их и выверял двумя итерациями после
+# инцидентов 30.07 и 04.08). Своя копия рано или поздно разошлась бы с оригиналом, и
+# кабинет перестал бы узнавать строки, которые печатает воркер.
+_KEY_QUOTA_WORDS = tuple(gw._LLM_EXHAUSTED_PATTERNS) + ("исчерпан счёт", "кончились кредиты")
+_KEY_ACCOUNT_WORDS = tuple(gw._ACCOUNT_LIMIT_PATTERNS)
+# Коды, которыми провайдер ГЕНЕРАЦИИ отвечает «деньги/квота ключа»: 402 — нет кредитов,
+# 429 — квота исчерпана. Требование кода здесь не педантизм: _KEY_QUOTA_WORDS взяты у
+# воркера из списка про КАНАЛ ПРОМПТОВ (_LLM_EXHAUSTED_PATTERNS — «usage limit»,
+# «quota exceeded»), и без кода любая строка про чужой счёт приписывалась бы ключу
+# генерации вместе с ЕГО маской. Владелец шёл бы пополнять невиновный ключ.
+_KEY_QUOTA_HTTP = (402, 429)
+
+# Строки про ЧУЖОЙ ключ. У них свои механизмы: у канала промптов — _scan_prompt_channel_line
+# (пометка мёртвого канала, channel_incident, _park_failed_credential), у YouTube Data API —
+# собственный счётчик квоты. Ключ генерации к ним отношения не имеет, а «первая причина
+# побеждает» означает, что чужая строка закрыла бы место НАВСЕГДА: настоящий отказ ключа,
+# пришедший следом, уже не записался бы никогда.
+# Падеж имеет значение: воркер печатает и «Канал промптов «claude» недоступен», и
+# «У канала промптов «claude» исчерпан счёт/лимит (HTTP 429)» — вторая строка несёт
+# все признаки отказа ключа, кроме одного: ключ там чужой.
+_FOREIGN_KEY_RE = re.compile(r"кана\w*\s+промптов|prompt channel|youtube", re.I)
+
+# Доказательство, что ключ жив: платный вызов только что прошёл. Разовый «мигающий» 401
+# провайдера иначе получал бы статус окончательного вердикта — карточка объявила бы
+# отозванным ключ, которым через секунду успешно оплачен кадр. Порог по числу отказов
+# (как у сторожа субтитров) здесь не годится: у regen один кадр и ровно ОДИН отказ, и
+# порог 2 похоронил бы настоящую причину в самом частом случае отказа ключа.
+_KEY_ALIVE_MARKERS = ("изображение через", "видео готово", "видео сохранено",
+                      "v6 готово", "v4 операция завершена", "результат забран")
+
+# Что человек увидит в карточке. Для него это РАЗНЫЕ действия: заменить ключ, проверить
+# права, подождать окно, пополнить счёт. Поэтому виды и разделены.
+_KEY_REFUSAL_WORDS = {
+    "expired": "истёк или отозван",
+    "auth": "отказ авторизации при создании заказа",
+    "account_limit": "исчерпан лимит аккаунта провайдера",
+    "quota": "исчерпан счёт или квота ключа",
+}
+
+
+def _http_code_in(text):
+    """Код ответа из строки лога. 0 — в строке кода нет."""
+    m = _HTTP_CODE_RE.search(str(text or ""))
+    if not m:
+        return 0
+    try:
+        code = int(m.group(1))
+    except (TypeError, ValueError):
+        return 0
+    return code if 100 <= code <= 599 else 0
+
+
+def _key_refusal_kind(text, http):
+    """Вид отказа ключа по строке воркера. "" — строка про отказ ключа ничего не говорит."""
+    low = " ".join(str(text or "").split()).lower()
+    if not low:
+        return ""
+    if GEN_ACCOUNT_LIMIT_MARKER.lower() in low or (
+            http == 429 and any(w in low for w in _KEY_ACCOUNT_WORDS)):
+        return "account_limit"
+    if http in _KEY_QUOTA_HTTP and any(w in low for w in _KEY_QUOTA_WORDS):
+        return "quota"
+    # «expired» само по себе не улика: так же выглядит протухшая ссылка на скачивание
+    # уже ОПЛАЧЕННОГО результата. Ключом это становится рядом с отказом авторизации.
+    auth = http in (401, 403) or any(w in low for w in _KEY_AUTH_WORDS)
+    if auth and any(w in low for w in _KEY_EXPIRED_WORDS):
+        return "expired"
+    return "auth" if auth else ""
+
+
+def _key_refusal_body(text):
+    """Суть строки без нашего оформления: в карточку идёт причина, а не украшения лога."""
+    return " ".join(str(text or "").split()).lstrip("❌⛔⚠️😴ℹ️🔴🩹⏳🚫 ").strip()[:300]
+
+
+def _scan_key_refusal(jid, line):
+    """Строка вывода воркера → ПЕРВАЯ опознанная причина отказа ключа этой задачи."""
+    text = " ".join(str(line or "").split())
+    if not text:
+        return None
+    low = text.lower()
+    if any(m in low for m in _KEY_ALIVE_MARKERS):
+        # Ключ только что отработал ПЛАТНЫЙ вызов — значит он жив, и всё, что мы успели
+        # записать до этого, было мигающим отказом, а не вердиктом. Освобождаем место:
+        # настоящая причина, если она будет, придёт позже.
+        _clear_key_refusal(jid)
+        return None
+    if any(m in low for m in _KEY_RECOVERY_MARKERS):
+        return None                     # ожидание, повтор, живой фолбэк — не отказ ключа
+    if _FOREIGN_KEY_RE.search(low):
+        return None                     # отказал ЧУЖОЙ ключ — у него свой механизм
+    kind = _key_refusal_kind(text, _http_code_in(text))
+    if not kind:
+        return None
+    info = {"kind": kind, "http": _http_code_in(text),
+            "text": _key_refusal_body(text), "at": time.time()}
+    with _KEY_REFUSAL_LOCK:
+        if str(jid) in _KEY_REFUSAL:
+            return None                 # причина уже названа; следствия её не затирают
+        _KEY_REFUSAL[str(jid)] = info
+    return info
+
+
+def _key_refusal_reason(jid):
+    with _KEY_REFUSAL_LOCK:
+        return dict(_KEY_REFUSAL.get(str(jid)) or {})
+
+
+def _clear_key_refusal(jid):
+    with _KEY_REFUSAL_LOCK:
+        _KEY_REFUSAL.pop(str(jid), None)
+
+
+def _key_refusal_text(jid, key_value="", limit_msg=""):
+    """Человеческая строка для карточки: чей ключ, что с ним и что сказал провайдер.
+
+    Маска — существующая _cred_mask: наружу уходят только голова и хвост. Своего текста
+    для «лимита аккаунта» не сочиняем: у него уже есть выверенный (_scan_gen_limit_line,
+    с советом сменить модель) — мы добавляем к нему только маску, потому что ключей в
+    пуле несколько и без неё непонятно, какой именно исчерпан.
+    """
+    info = _key_refusal_reason(jid)
+    if not info:
+        return ""
+    body = limit_msg if (info.get("kind") == "account_limit" and limit_msg) else info.get("text")
+    code = f" (HTTP {info['http']})" if info.get("http") else ""
+    head = f"ключ {_cred_mask(key_value)}: " if key_value else "ключ: "
+    tail = f" — {str(body or '')[:120]}" if body else ""
+    return f"{head}{_KEY_REFUSAL_WORDS.get(info.get('kind'), 'отказ ключа')}{code}{tail}"
+
+
+def _worker_error_text(jid, rc, key_value="", limit_msg="", card_worker_error=""):
+    """Что увидит человек в карточке упавшей задачи. Порядок приоритетов — здесь.
+
+    Первая опознанная причина отказа ключа важнее и последней строки воркера, и кода
+    выхода: по ней понятно, ЧТО чинить. «rc=3» не чинит ничего и остаётся последним
+    словом — только когда ни одной причины не опознано.
+    """
+    return (_key_refusal_text(jid, key_value, limit_msg) or limit_msg
+            or card_worker_error or f"rc={rc}")
+
+
 def _prompt_policy():
     cfg = keys() or {}
     policy = cfg.get("_prompt_policy") or cfg.get("prompt_policy") or {}
@@ -1415,11 +1606,18 @@ class _CredentialLease:
         self.value = value
         self.units = units
         self._released = False
+        # Место на ФИЗИЧЕСКОМ ключе (общий счёт, B8). Живёт ровно столько же, сколько
+        # локальный слот, и отпускается ВМЕСТЕ с ним: два разных finally на один и тот
+        # же ресурс — это первый способ потерять ёмкость ключа до перезапуска.
+        self.key_hold = None
 
     def release(self):
         if not self._released:
             self._released = True
             self._owner.release(self)
+            hold, self.key_hold = self.key_hold, None
+            if hold is not None:
+                hold.release()
 
 
 class _ServerCredentialPool:
@@ -1556,6 +1754,263 @@ def _all_server_credential_values():
         if value:
             out.append(value)
     return list(dict.fromkeys(str(v) for v in out if v))
+
+
+# ── Общий счёт мест на ФИЗИЧЕСКИЙ ключ (задача B8) ───────────────────────────
+#
+# ЗАЧЕМ. Один и тот же ключ, вписанный владельцем в кабинет, в рерайт и в обложки,
+# сегодня даёт ТРОЙНОЙ лимит: каждый сервис считает ёмкость сам и про соседей не
+# знает (кабинет — _ServerCredentialPool и _provider_call_budget, рерайт — свой
+# ServerCredentialPool, обложки — _KeyBudget). Провайдер же считает ОДИН ключ, и
+# перебор возвращается оплаченными 429. Общий счёт ведёт shared/credential_budget.py:
+# он опознаёт ключ по sha256(вендор + значение), а места занимает файлами-замками,
+# которые видны всем процессам машины. Рерайт уже ходит через него.
+#
+# ЧТО ЗДЕСЬ НЕ ДЕЛАЕТСЯ. Арифметика ЗАДАЧ (_task_capacity_units, _provider_job_slots,
+# «проектов разом», _own_key_threads) не трогается вообще: это ответ на другой вопрос —
+# «сколько задач сервис запускает разом», а не «сколько вызовов держит ключ». Слить их
+# в один счётчик уже пробовали, и получился капкан с bing (см. комментарий в
+# _task_capacity_units). Общий счёт — ещё один предохранитель ПОВЕРХ, а не замена.
+try:
+    import credential_budget as _key_budget          # shared/, см. SHARED_DIR выше
+except Exception:                                    # noqa: BLE001
+    _key_budget = None                               # нет модуля — работаем как до B8
+
+# Режим. Умолчание «off» выбрано СОЗНАТЕЛЬНО и это не осторожность ради осторожности:
+#   off      — кабинет мест не занимает и не откладывается. Байт-в-байт сегодняшнее
+#              поведение: ни кабинет, ни рерайт ничего не замечают.
+#   observe  — кабинет ЗАНИМАЕТ места (рерайт наконец видит его нагрузку), но сам
+#              отказа не получает. Строже становится РЕРАЙТУ, не нам.
+#   enforce  — занимает и, если мест нет, откладывает свою задачу.
+# Пока из трёх сервисов подключены двое (обложки считают по-своему), любой режим,
+# кроме off, кого-то ограничивает сильнее сегодняшнего, а такое решение принимает
+# владелец, а не мы. Потолки (CAPACITIES в модуле) — боевые и тоже настраиваются
+# переменными VIDEO_STUDIO_CREDENTIAL_BUDGET_<СЕМЬЯ>; зашитых чисел здесь нет.
+_KEY_BUDGET_OFF, _KEY_BUDGET_OBSERVE, _KEY_BUDGET_ENFORCE = "off", "observe", "enforce"
+
+
+def _key_budget_mode():
+    raw = (os.environ.get("VS_KEY_BUDGET_MODE") or "").strip().lower()
+    if raw in (_KEY_BUDGET_OBSERVE, _KEY_BUDGET_ENFORCE, _KEY_BUDGET_OFF):
+        return raw
+    if raw in ("1", "on", "yes", "true"):
+        return _KEY_BUDGET_ENFORCE
+    return _KEY_BUDGET_OFF
+
+
+def _key_budget_retry_sec():
+    """На сколько отложить задачу, которой не хватило места на ключе.
+
+    Ждать освобождения прямо в шедулере нельзя: тик держит write-транзакцию очереди,
+    и сон в ней останавливает ВСЕ каналы, а не один занятый ключ. Поэтому не ждём, а
+    откладываем: 60 с — заметно больше типичного вызова картинки и заметно меньше
+    того, что человек сочтёт зависанием.
+    """
+    try:
+        return max(5, int(float(os.environ.get("VS_KEY_BUDGET_RETRY_SEC") or 60)))
+    except (TypeError, ValueError):
+        return 60
+
+
+def _key_budget_vendor(provider):
+    """Физический вендор ключа этого провайдера. Пусто — в общем счёте не участвует."""
+    if _key_budget is None:
+        return ""
+    try:
+        return (_key_budget.vendor_of(provider)
+                or _key_budget.vendor_of(_provider_credential_family(provider) or "")
+                or "")
+    except Exception:                                # noqa: BLE001
+        return ""
+
+
+def _key_budget_counts(provider):
+    """Участвует ли вызов этого провайдера в общем счёте ВООБЩЕ.
+
+    Нужна ровно для того, чтобы при умолчании `off` не делать лишней работы: счёт
+    одновременных вызовов (_key_budget_units) читает настройки потоков, а для картинок
+    — ещё и число активных задач из БД. Платить за это, когда учёт выключен, нельзя:
+    шедулер зовёт выдачу слота в каждом тике и внутри write-транзакции очереди.
+    """
+    if _key_budget is None or _key_budget_mode() == _KEY_BUDGET_OFF:
+        return False
+    return bool(_key_budget_vendor(provider))
+
+
+class _KeyBudgetHold:
+    """Занятые места физического ключа. Освобождение идемпотентно и не кидает.
+
+    Почему не кидает: держатель освобождается в finally рядом с освобождением
+    локального слота, и исключение здесь оставило бы локальный слот занятым — то есть
+    попытка честно посчитать ключ превратилась бы в потерю ёмкости кабинета.
+    """
+
+    squeezed = 0            # сколько потоков задаче выдали, если это больше потолка
+
+    def __init__(self, lease, vendor, identity, units):
+        self._lease = lease
+        self.vendor, self.identity, self.units = vendor, identity, units
+
+    def release(self):
+        lease, self._lease = self._lease, None
+        if lease is None:
+            return
+        try:
+            lease.release()
+        except Exception:                            # noqa: BLE001
+            log_exc("key_budget/release")
+
+
+def _key_budget_take(provider, value, units):
+    """Занять `units` мест на физическом ключе `value`.
+
+    Возвращает (hold, note):
+      (None, None)  — общий счёт к этому вызову не применяется: режим off, нет модуля,
+                      ключ не наш, значение пустое или каталог замков не настроен.
+                      Ведём себя ровно как до B8.
+      (hold, None)  — места заняты, отдать их обязан вызывающий (finally).
+      (None, note)  — мест нет. note несёт человеческие слова и цифры для журнала.
+    """
+    mode = _key_budget_mode()
+    if _key_budget is None or mode == _KEY_BUDGET_OFF or not value:
+        return None, None
+    vendor = _key_budget_vendor(provider)
+    if not vendor:
+        return None, None
+    units = max(1, int(units or 1))
+    try:
+        capacity = int(_key_budget.capacity(vendor) or 0)
+        if capacity <= 0:
+            return None, None
+        squeezed = 0
+        if units > capacity:
+            # Задаче выдано БОЛЬШЕ потоков, чем общий потолок ключа (у кабинета
+            # замерено 25 потоков FastGen, боевой потолок общего счёта — 18). Молча
+            # ужать до потолка нельзя: ужатое число никто не увидит, а воркер всё
+            # равно пойдёт в ключ своими 25. Поэтому берём ключ ЦЕЛИКОМ (никто
+            # другой в него не войдёт) и говорим об этом вслух — числа должен
+            # согласовать владелец, а не мы за него.
+            squeezed, units = units, capacity
+        identity = _key_budget.credential_identity(vendor, value)
+        # try_acquire_ex, а не try_acquire: «мест нет» и «ровно сейчас выдаёт сосед»
+        # выглядят одинаково (None), но для человека это разные слова и разное время
+        # ожидания. Строка, называющая занятым свободный ключ, стоит задаче минуты
+        # простоя и посылает владельца чинить не то.
+        lease, why = _key_budget.try_acquire_ex(vendor, value, units)
+    except getattr(_key_budget, "BudgetConfigurationError", Exception):
+        # Настройка общего счёта сломана (нет каталога замков, пустое значение,
+        # незнакомое семейство). Это НЕ повод ронять оплачиваемую задачу: учёт —
+        # предохранитель, а не условие работы. Пишем в journalctl и работаем как до B8.
+        log_exc("key_budget/config", provider)
+        return None, None
+    except Exception:                                # noqa: BLE001
+        log_exc("key_budget/acquire", provider)
+        return None, None
+    if lease is not None:
+        hold = _KeyBudgetHold(lease, vendor, identity, units)
+        if not squeezed:
+            return hold, None
+        hold.squeezed = squeezed
+        # Расхождение настроек должно быть СЛЫШНО. Молчаливый кламп здесь — худший из
+        # вариантов: воркер всё равно пойдёт в ключ своими потоками, а счёт будет
+        # думать, что их меньше, и общий учёт станет украшением.
+        return hold, {
+            "busy": False,
+            "squeezed": squeezed,
+            "vendor": vendor,
+            "signature": f"key-squeeze:{vendor}:{_cred_mask(value)}",
+            "line": (f"⚠️ ключ {_cred_mask(value)} ({vendor}): задаче выдано "
+                     f"{squeezed} потоков, а общий потолок ключа — {units}. Беру ключ "
+                     f"целиком, но лишние потоки никем не учтены: согласуйте числа "
+                     f"(VIDEO_STUDIO_CREDENTIAL_BUDGET_{vendor.upper()} или «потоков "
+                     f"на проект» в /server-limits)"),
+        }
+    busy = {}
+    try:
+        busy = _key_budget.usage(vendor, value) or {}
+    except Exception:                                # noqa: BLE001
+        busy = {}
+    if busy:
+        where = f"занято {busy['used']} из {busy['capacity']}"
+    elif why == getattr(_key_budget, "BUSY_GATE", "gate"):
+        # Выдачу держит сосед ровно в этот миг. Это доли секунды, а не занятый ключ;
+        # называть это «мест нет» — врать про причину.
+        where = "учёт ключа занят соседним сервисом, состояние неизвестно"
+    else:
+        where = f"мест нет (нужно {units})"
+    return None, {
+        "busy": True,
+        "observe": mode == _KEY_BUDGET_OBSERVE,
+        "vendor": vendor,
+        "units": units,
+        "signature": f"key:{vendor}:{_cred_mask(value)}",
+        "line": (f"⏳ ключ {_cred_mask(value)} ({vendor}): {where} — "
+                 + ("наблюдение, задача НЕ задержана"
+                    if mode == _KEY_BUDGET_OBSERVE else
+                    f"задача отложена на {_key_budget_retry_sec()} с; "
+                    f"это НАШ общий счёт мест, а не отказ провайдера")),
+    }
+
+
+# Отпечаток ключа, выданного ЖИВОЙ задаче. Нужен журналу платных вызовов: строку
+# заводит движок по HTTP, а какой ключ ему выдали, знает только кабинет. Значение —
+# хэш, не секрет; словарь чистится в finally вместе с остальным состоянием задачи.
+_JOB_KEY_IDENTITY = {}
+_JOB_KEY_IDENTITY_LOCK = threading.Lock()
+
+
+def _key_identity(provider, value):
+    """Отпечаток физического ключа. Пусто — вендор не наш или модуль недоступен."""
+    if _key_budget is None or not value:
+        return ""
+    vendor = _key_budget_vendor(provider)
+    if not vendor:
+        return ""
+    try:
+        return str(_key_budget.credential_identity(vendor, value) or "")
+    except Exception:                                # noqa: BLE001
+        return ""
+
+
+def _remember_job_credential(jid, provider, value):
+    identity = _key_identity(provider, value)
+    with _JOB_KEY_IDENTITY_LOCK:
+        if identity:
+            _JOB_KEY_IDENTITY[int(jid)] = identity
+        else:
+            _JOB_KEY_IDENTITY.pop(int(jid), None)
+    return identity
+
+
+def _forget_job_credential(jid):
+    with _JOB_KEY_IDENTITY_LOCK:
+        _JOB_KEY_IDENTITY.pop(int(jid), None)
+
+
+def _job_credential_identity(jid):
+    try:
+        with _JOB_KEY_IDENTITY_LOCK:
+            return _JOB_KEY_IDENTITY.get(int(jid), "")
+    except (TypeError, ValueError):
+        return ""
+
+
+pub_calls.set_job_credential_resolver(_job_credential_identity)
+
+
+def _key_budget_attach(lease, provider, value, units):
+    """Взять общее место под уже выданный локальный слот.
+
+    True — можно работать (место занято, не нужно или учёт выключен).
+    (False, note) — мест нет и режим enforce: локальный слот вызывающий отдаёт сам.
+    """
+    hold, note = _key_budget_take(provider, value, units)
+    if hold is not None:
+        lease.key_hold = hold
+        return True, note           # note тут бывает не про отказ, а про расхождение чисел
+    if note and note.get("busy") and not note.get("observe"):
+        return False, note
+    return True, note
 
 
 # ── BYOK: свой ключ юзера имеет приоритет над серверным пулом ─────────────────
@@ -1911,7 +2366,30 @@ def _own_credential_for_task(u, provider, kind=None):
     return credential
 
 
-def _own_credential_with_pool(u, provider, kind, params):
+class _KeyBudgetOnlyLease:
+    """Держатель ТОЛЬКО общего места: локального слота у задачи нет.
+
+    Так бывает у своего ключа владельца, когда ключ один (раздавать нечего, слот не
+    берётся), а место на физическом ключе занять всё равно надо — ключ может быть тот
+    же самый, что вписан в рерайт или в обложки. Наружу выглядит как обычный lease,
+    потому что вызывающий делает с ним ровно одно: release() в finally.
+    """
+
+    value = ""
+    family = ""
+    units = 0
+    slot_id = ""
+
+    def __init__(self, hold, lane=""):
+        self.key_hold, self.lane = hold, lane
+
+    def release(self):
+        hold, self.key_hold = self.key_hold, None
+        if hold is not None:
+            hold.release()
+
+
+def _own_credential_with_pool(u, provider, kind, params, note=None):
     """Свой ключ задачи и slot под него. Возвращает (credential, lease|None).
 
     ИСПРАВЛЕНО 03.09.2026. Раньше свой ключ был просто vals[0], и второй ключ семейства
@@ -1934,17 +2412,48 @@ def _own_credential_with_pool(u, provider, kind, params):
     family = _provider_credential_family(provider)
     if not family:
         return credential, None
+    units = _task_capacity_units(kind, params, provider)
+    # Мест на ФИЗИЧЕСКОМ ключе — по числу одновременных вызовов, а не по числу задач;
+    # у своего ключа потоки задаёт его владелец, поэтому их и считаем (см.
+    # _key_budget_units). Локальный slot по-прежнему меряется units — это разные счета.
+    own_opt = (_key_opts_from_row(u) or {}).get(provider)
+    key_units = (
+        _key_budget_units(
+            kind, params, provider,
+            own_threads=(own_opt.get("threads") if isinstance(own_opt, dict) else None))
+        if _key_budget_counts(provider) else units)
     values = _own_pool_values(u, family)
     if len(values) < 2:
-        return credential, None          # раздавать нечего
+        # Ключ один, раздавать нечего — но посчитать его надо: свой ключ владельца
+        # физически может быть ТЕМ ЖЕ, что вписан в рерайт или в обложки, и тогда это
+        # один кошелёк, а не два. Потоки на своём ключе мы при этом не зажимаем
+        # (_own_key_threads): чужой ключ — чужие деньги, у него своё число мест.
+        hold, busy = _key_budget_take(provider, credential, key_units)
+        if isinstance(note, dict) and busy:
+            # note заполняем ДО выхода: при hold is not None здесь лежит не отказ, а
+            # расхождение чисел («выдано 25 потоков, потолок ключа 18»). Раньше эта
+            # ветка возвращалась сразу, и единственное место, где расхождение вообще
+            # могло прозвучать — свой ключ владельца, — молчало навсегда.
+            note.update(busy)
+        if hold is not None:
+            return credential, _KeyBudgetOnlyLease(hold, lane=f"byok:{provider}")
+        return credential, None
     lease = SERVER_CREDENTIAL_POOL.try_acquire(
         family,
-        units=_task_capacity_units(kind, params, provider),
+        units=units,
         capacity=_provider_slot_capacity_units(provider),
         lane=f"byok:{provider}",
         own_values=values,
     )
-    if lease is not None and lease.value:
+    if lease is None:
+        return credential, None
+    ok, busy = _key_budget_attach(lease, provider, lease.value or credential, key_units)
+    if isinstance(note, dict) and busy:
+        note.update(busy)
+    if not ok:
+        lease.release()
+        return credential, None
+    if lease.value:
         return lease.value, lease
     return credential, lease
 
@@ -2141,6 +2650,25 @@ def init_db():
     c.execute("CREATE TABLE IF NOT EXISTS admin_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, "
               "admin_id INTEGER, admin_name TEXT, action TEXT, target TEXT, detail TEXT, result TEXT)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_ts ON admin_audit(id DESC)")
+    # Журнал рубильника очереди — ОТДЕЛЬНОЙ таблицей, а не строкой в admin_audit.
+    # Три причины, все из практики:
+    #   1. admin_audit хранит ЗАПРОС (имя действия и payload), а не состояние. По
+    #      строке `resume_queue {"target":"all"}` нельзя ответить, что именно стояло
+    #      рядом и что изменилось, — а вопрос владельца звучит ровно так.
+    #   2. admin_audit — общий поток (рестарты, квоты, пароли), панель читает из него
+    #      последние 40 строк. Пауза держит выпуски неделями и в этом потоке тонет.
+    #   3. Строка пишется в момент ЗАПИСИ состояния (_queue_pause_apply), а не в
+    #      HTTP-слое, поэтому любое изменение queue_pause оставляет след. Правку
+    #      мимо панели журнал опознаёт сам — сравнением с последним записанным
+    #      состоянием (14.08 паузу снимали скриптом, и доказательства не осталось).
+    # Имена колонок state_before/state_after, а не before/after: BEFORE и AFTER —
+    # ключевые слова SQLite, и как идентификаторы они работают не везде.
+    c.execute("CREATE TABLE IF NOT EXISTS queue_pause_audit("
+              "id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, "
+              "actor_id INTEGER, actor_name TEXT, origin TEXT, action TEXT, "
+              "state_before TEXT, state_after TEXT, summary TEXT, holding TEXT)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_queue_pause_audit_ts "
+              "ON queue_pause_audit(id DESC)")
     ensure_pub_schema(c)   # контур публикаций: каналы → план → выпуски
     ensure_calls_schema(c)  # журнал платных вызовов: строка на ОДИН вызов провайдера
     c.execute("CREATE TABLE IF NOT EXISTS admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL)")
@@ -6701,6 +7229,41 @@ def _task_capacity_units(kind, params, provider=None):
     # (_reserve_task_credential), и заведомо ≤ общей ёмкости провайдера.
     return max(1, min(units, _provider_slot_capacity_units(provider)))
 
+
+def _key_budget_units(kind, params, provider=None, own_threads=None):
+    """Сколько ОДНОВРЕМЕННЫХ вызовов задача сделает в ОДИН физический ключ (B8).
+
+    ЭТО НЕ _task_capacity_units, и путать их нельзя — они отвечают на разные вопросы.
+    _task_capacity_units — «сколько ЁМКОСТИ СЕРВЕРА занимает задача», и для провайдеров
+    без взвешенного бюджета он намеренно равен 1 («проектов разом» = число задач, см.
+    капкан с bing выше). Общий счёт физического ключа считает другое: ключ у провайдера
+    один, и ему всё равно, одна у нас задача или три, — ему важно, сколько запросов
+    придёт ОДНОВРЕМЕННО. Рерайт на тех же файлах-замках берёт место НА ВЫЗОВ
+    (rewrite_core: try_acquire(family, value, 1) вокруг одного вызова), поэтому считать
+    задачами значит складывать несравнимые величины: одна задача канала промптов на
+    codex — это до 20 одновременных вызовов подписки, потолок которой 1.
+
+    Замерено на боевых умолчаниях: prompts/codex 20 потоков, prompts/openai 10,
+    images/GPT_IMAGE2 (вендор openai) 3, свой ключ FastGen владельца — 25 при потолке 18.
+    Раньше все они резервировали по одному месту.
+
+    `own_threads` — настройка потоков СВОЕГО ключа (BYOK): чужой ключ оплачивает его
+    владелец, серверным потолком он не зажимается (_own_key_threads), значит и мест в
+    общем счёте занимает столько, сколько реально пойдёт запросов.
+    """
+    provider = provider or _task_provider(kind, params)
+    if kind == "cards":
+        return 1                      # карточка — ровно один вызов в канал
+    if provider in _PROMPT_PROVIDER_GROUPS:
+        return max(1, _prompt_threads_setting(provider.removeprefix("prompt_")))
+    if kind in ("regen", "regen_video"):
+        return 1                      # перегенерация одного кадра/клипа — один вызов
+    if kind == "images":
+        return max(1, _own_key_threads(_server_image_threads(params), own_threads))
+    if kind == "video":
+        return max(1, _own_key_threads(_server_video_threads(params), own_threads))
+    return 1
+
 # Оверрайд лимитов параллельности из настроек ключей: блок "_concurrency" в video_studio_api_keys.json.
 # Формат: {"voicer": {"global": 5, "per_tenant": 5}, ...}. Кэш ~10с — не читать файл на каждой
 # итерации шедулера. Меняется правкой JSON + рестартом vsgen (или подхватится в течение 10с).
@@ -9649,6 +10212,32 @@ def _judge_success(kind, projdir, jid, params=None):
     return (True, "")               # нет фатала, файл есть (кэш/повтор) → ок
 
 
+# Минимальная длина НАЧАЛА ключа, которую мы вырезаем как сам ключ. Зачем вообще:
+# текст отказа провайдера режут по дороге сюда как минимум четырежды (воркер —
+# detail[:300], call_journal — [:500], pub_calls_api — [:500], pub_services — [:400]),
+# и ключ, попавший на границу любой из этих обрезок, доезжает ОГРЫЗКОМ, которого
+# str.replace уже не находит. Огрызок не работает как ключ, но навсегда оседает в
+# колонке error и в выгрузках. 16 символов выбраны так, чтобы совпадение случайного
+# текста с началом ключа было невозможно на практике.
+_SECRET_PREFIX_MIN = 16
+
+
+def _cut_secret_prefixes(out, secret):
+    """Вырезать любое НАЧАЛО секрета длиной ≥ _SECRET_PREFIX_MIN (обрезанный ключ)."""
+    if len(secret) < _SECRET_PREFIX_MIN:
+        return out
+    head = secret[:_SECRET_PREFIX_MIN]
+    pos = out.find(head)
+    while pos >= 0:
+        end = pos + _SECRET_PREFIX_MIN
+        while (end < len(out) and end - pos < len(secret)
+               and out[end] == secret[end - pos]):
+            end += 1
+        out = out[:pos] + "[REDACTED]" + out[end:]
+        pos = out.find(head, pos + len("[REDACTED]"))
+    return out
+
+
 def _redact_worker_output(line, worker_env=None, extra_secrets=None):
     """Не допускает server credentials и их debug-префиксы в job_logs/SSE."""
     out = str(line or "")
@@ -9665,7 +10254,60 @@ def _redact_worker_output(line, worker_env=None, extra_secrets=None):
         if len(secret) >= 4:
             out = out.replace(secret[:4] + "...", "[REDACTED]")
             out = out.replace(secret[:4] + "…", "[REDACTED]")
+        out = _cut_secret_prefixes(out, secret)
     return out
+
+
+# ── Редактура текста провайдера на пути в журнал вызовов ─────────────────────
+# Второй путь записи ошибки — HTTP-ручка POST /api/calls/{id}/failed: текст приходит от
+# движка (в том числе с другой машины) и раньше ложился в SQLite как есть. В ответе
+# провайдера бывает наш же ключ или подписанный URL, а _redact_worker_output стоял
+# только на стриме логов. Прецедент, что резать надо дважды, уже есть: _cred_park режет
+# секрет второй раз, не полагаясь на редактора выше по стеку.
+_CALLS_SECRETS_TTL = 10.0               # тот же кэш, что у keys(): файл на каждую строку не читаем
+_CALLS_SECRETS_LOCK = threading.Lock()
+_CALLS_SECRETS = {"at": 0.0, "values": []}
+
+
+def _calls_redaction_secrets():
+    """Всё, что может оказаться в тексте отказа: серверные ключи и свои ключи юзеров.
+
+    Свои ключи берём по ВСЕМ юзерам, а не по владельцу задачи: на входе в журнал (одна
+    колонка error, четыре вызывающих) владелец задачи известен не везде, а редактура,
+    которая иногда не применяется, защитой не является. Список кэшируется на 10 с и
+    живёт только в памяти — наружу уходит уже вырезанный текст.
+    """
+    now = time.time()
+    with _CALLS_SECRETS_LOCK:
+        if _CALLS_SECRETS["values"] and now - _CALLS_SECRETS["at"] < _CALLS_SECRETS_TTL:
+            return list(_CALLS_SECRETS["values"])
+    values = list(_all_server_credential_values())
+    try:
+        c = db()
+        try:
+            rows = c.execute(
+                "SELECT keys FROM users WHERE keys IS NOT NULL AND keys!=''").fetchall()
+        finally:
+            c.close()
+    except Exception:                                          # noqa: BLE001
+        rows = []          # база занята — серверные ключи вырезать всё равно обязаны
+    for row in rows:
+        try:
+            values.extend(_own_credential_secret_values(_user_own_credentials(row)))
+        except Exception:                                      # noqa: BLE001
+            continue
+    values = [v for v in dict.fromkeys(str(v) for v in values if v) if len(v) >= 8]
+    with _CALLS_SECRETS_LOCK:
+        _CALLS_SECRETS["at"], _CALLS_SECRETS["values"] = now, list(values)
+    return values
+
+
+def _redact_calls_error(text):
+    """Редактор для pub_calls.mark_failed — единственного места записи колонки error."""
+    return _redact_worker_output(text, extra_secrets=_calls_redaction_secrets())
+
+
+pub_calls.set_error_redactor(_redact_calls_error)
 
 
 def _task_provider_from_row(t, params=None):
@@ -9710,15 +10352,42 @@ def _running_lane(row, provider):
     return "byok" if _task_uses_own_credential(uid, provider, kind) else "server"
 
 
-def _reserve_task_credential(provider, kind, params):
+def _reserve_task_credential(provider, kind, params, note=None):
+    """Слот серверного ключа под задачу. None — сейчас не выдан.
+
+    `note` — необязательный словарь-ответ: в него кладётся причина, если слот не выдан
+    из-за ОБЩЕГО счёта мест физического ключа (B8). Без него вызывающий не отличил бы
+    «ключ занят соседним сервисом» от «все серверные ключи заняты своими задачами», а
+    это разные слова для человека и разные действия: во втором случае ждём своей
+    очереди, в первом — откладываем задачу и говорим, чей ключ занят.
+    """
     family = _provider_credential_family(provider)
     if not family:
         return None
     units = _task_capacity_units(kind, params, provider)
-    return SERVER_CREDENTIAL_POOL.try_acquire(
+    lease = SERVER_CREDENTIAL_POOL.try_acquire(
         family, units=units, capacity=_provider_slot_capacity_units(provider),
         lane=provider,
     )
+    if lease is None:
+        return None
+    # Локальный слот меряется units (ёмкость сервера), место на физическом ключе —
+    # числом одновременных вызовов: см. _key_budget_units, это разные величины.
+    ok, busy = _key_budget_attach(
+        lease, provider, lease.value,
+        _key_budget_units(kind, params, provider)
+        if _key_budget_counts(provider) else units)
+    if not ok:
+        # Общий счёт отказал: локальный слот отдаём СРАЗУ. Держать его, стоя в
+        # ожидании чужого ключа, значит отнимать ёмкость у задач, которым он бы
+        # достался, — то есть чинить перебор ценой простоя.
+        lease.release()
+        if isinstance(note, dict):
+            note.update(busy or {})
+        return None
+    if isinstance(note, dict) and busy:
+        note.update(busy)                    # режим наблюдения: цифры есть, отказа нет
+    return lease
 
 
 def _park_failed_credential(jid, lease, incident):
@@ -9891,6 +10560,14 @@ def _run_task(t):
     channel_incident = {}
     card_worker_error = ""
 
+    def _task_key_value():
+        """Чей ключ отказал: свой ключ юзера, если задача ушла на него, иначе серверный.
+
+        Значение нужно ровно для маски (_cred_mask) в тексте ошибки — в карточке должно
+        быть видно, КАКОЙ из ключей пула истёк, иначе владелец меняет наугад.
+        """
+        return own_credential or (getattr(lease, "value", "") if lease is not None else "")
+
     def _wait_for_window():
         """True — окно подписки исчерпано, задача возвращена в очередь до сброса.
 
@@ -9922,15 +10599,34 @@ def _run_task(t):
         c = db(); u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(); c.close()
         # BYOK-first: вписан свой ключ нужного провайдера → задача идёт на него и
         # серверный lease не берётся (ёмкость общего ключа не расходуется).
+        key_note = {}
         own_credential, own_lease = _own_credential_with_pool(
-            u, provider, t["kind"], params)
+            u, provider, t["kind"], params, note=key_note)
         if own_credential and lease is not None:
             # Шедулер зарезервировал серверный слот (снимок ключей был другим) —
             # отдаём его СРАЗУ: держать весь бюджет ключа на время BYOK-задачи нельзя.
             lease.release()
             lease = None
+        if (own_credential and own_lease is None and key_note.get("busy")
+                and not key_note.get("observe")):
+            # Свой ключ владельца занят — тем же ключом сейчас работает сосед (он
+            # вписан и в рерайт, и в обложки). Ждать очереди на чужом кошельке честнее,
+            # чем идти в него сверх потолка и получить оплаченный 429.
+            if _defer_task_for_busy_key(jid, claim_token, key_note):
+                return
+            key_note.clear()             # возврат не дали — работаем как до B8
         if lease is None and not own_credential:
-            lease = _reserve_task_credential(provider, t["kind"], params)
+            lease = _reserve_task_credential(provider, t["kind"], params,
+                                             note=key_note)
+        if lease is None and not own_credential and key_note.get("busy"):
+            # Место на физическом ключе держит сосед (рерайт/обложки на том же ключе).
+            # Это не ошибка задачи и не повод её хоронить: возвращаем в очередь с той же
+            # отложкой, что и в шедулере, и пишем ОДНУ строку словами. Счётчик здесь
+            # СВОЙ (_key_budget_wait_allowed): бюджет возвратов byok придуман против
+            # вечного цикла «ключ исчез», и тратить его на нормальное ожидание значит
+            # через пять минут перестать быть enforce.
+            if _defer_task_for_busy_key(jid, claim_token, key_note):
+                return
         if family == "codex_home" and not own_credential and not _codex_allowed(u):
             # Серверный CODEX_HOME — личная подписка ВЛАДЕЛЬЦА. Даже если группа задачи
             # оказалась prompt_codex (устаревший snapshot: свою авторизацию удалили
@@ -9951,14 +10647,25 @@ def _run_task(t):
                     _log_line(jid, "↩️ свой ключ исчез до старта, серверный слот занят "
                                    "— задача возвращена в очередь")
                 return
+            # Причину называем ТУ, которая случилась: серверный слот мог быть свободен
+            # и отдан обратно из-за общего счёта ключа. Текст «слотов нет» послал бы
+            # владельца чинить пул ключей вместо того, чтобы посмотреть на соседний
+            # сервис, который этот ключ сейчас держит.
             _finish_worker_task(
                 jid,
                 "error",
-                "server credential slot недоступен",
+                ("место на физическом ключе держит соседний сервис дольше "
+                 f"{VS_KEY_BUDGET_WAIT_MAX_SEC // 60} мин — задача снята с ожидания"
+                 if key_note.get("busy") else "server credential slot недоступен"),
                 claim_token=claim_token,
             )
             return
         _byok_requeue_clear(jid)
+        _key_budget_wait_clear(jid)
+        # Расхождение чисел («задаче выдано 25 потоков, потолок ключа 18»): задача
+        # идёт, но молчать об этом нельзя — воркер пойдёт в ключ своими потоками, а
+        # общий счёт будет думать, что их меньше.
+        _announce_key_budget_note(jid, key_note)
         # Свои ключи юзера редактируются в логах ровно так же, как серверные (для своей
         # подписки Codex — и строковые листья auth.json). Берём ВСЕ свои credentials,
         # как в SSE-пути job_logs_sse: воркер может напечатать не только credential той
@@ -9967,6 +10674,11 @@ def _run_task(t):
                              + _own_credential_secret_values(_user_own_credentials(u)))
         if lease and lease.value:
             redaction_secrets.append(lease.value)
+        # Каким ключом пошла задача — знает только кабинет. Запоминаем ОТПЕЧАТОК (хэш,
+        # не ключ): журнал платных вызовов заводит движок по HTTP и спросит его отсюда,
+        # по номеру задачи. Без этого в журнале нечему держать правило «продолжать
+        # начатый заказ можно только ключом с тем же отпечатком».
+        _remember_job_credential(jid, provider, _task_key_value())
         if not _mark_worker_running(jid, claim_token):
             return
         _log_line(jid, f"▶ старт: {t['kind']}"
@@ -10081,6 +10793,10 @@ def _run_task(t):
             # RATE_LIMIT у VeoNonStop). Запоминаем текст, чтобы ошибка задачи была
             # «кончился лимит аккаунта — смените модель», а не голое «rc=3».
             _scan_gen_limit_line(jid, clean)
+            # Первая настоящая причина отказа КЛЮЧА (истёк, отказ авторизации, исчерпан
+            # аккаунт). Запоминаем именно первую: дальше воркер печатает следствия, и
+            # раньше в карточку уезжало последнее из них или голое «rc=3».
+            _scan_key_refusal(jid, clean)
             _heartbeat(jid, claim_token)   # heartbeat только своего run-token
         proc.wait()
         rc = proc.returncode
@@ -10123,6 +10839,9 @@ def _run_task(t):
                 if _wait_for_window():
                     return
                 _limit_wait_clear(jid)
+                # rc=0 без результата: _judge_success берёт ПОСЛЕДНЮЮ ❌-строку лога, а
+                # отказавший ключ называет себя в ПЕРВОЙ. Причина важнее следствия.
+                why = _key_refusal_text(jid, _task_key_value()) or why
                 if _finish_worker_task(
                         jid, "error", why[:200], claim_token=claim_token,
                         error_code=("contract_error" if t["kind"] == "cards" else None)):
@@ -10170,7 +10889,8 @@ def _run_task(t):
                 _record_card_failure_artifacts(t, params, projdir)
             _limit_wait_clear(jid)
             limit_msg = _gen_limit_reason(jid)
-            err = limit_msg or card_worker_error or f"rc={rc}"
+            err = _worker_error_text(jid, rc, _task_key_value(), limit_msg,
+                                     card_worker_error)
             card_error_code = None
             if t["kind"] == "cards":
                 card_error_code = ("contract_error" if rc == card_contract.PERMANENT_EXIT
@@ -10179,7 +10899,7 @@ def _run_task(t):
             if _finish_worker_task(
                     jid, "error", err[:200], claim_token=claim_token,
                     error_code=card_error_code):
-                _log_line(jid, f"❌ ошибка (код {rc}): {err}" if limit_msg
+                _log_line(jid, f"❌ ошибка (код {rc}): {err}" if err != f"rc={rc}"
                           else f"❌ ошибка (код {rc})")
     except Exception as e:
         msg = _redact_worker_output(
@@ -10201,6 +10921,8 @@ def _run_task(t):
             _log_line(jid, f"❌ исключение: {msg}")
     finally:
         _clear_gen_limit(jid)
+        _clear_key_refusal(jid)
+        _forget_job_credential(jid)
         with RUNNING_LOCK:
             # Старый run после lease-reclaim не имеет права удалить Popen нового claim.
             if (proc is not None and RUNNING_PROCS.get(jid) is proc
@@ -10280,6 +11002,45 @@ def _byok_requeue_clear(jid):
         _BYOK_REQUEUES.pop(str(jid), None)
 
 
+# ── Ожидание занятого ФИЗИЧЕСКОГО ключа (B8) — свой счёт, не байковский ───────
+# Отложка из-за того, что место на ключе держит СОСЕД (рерайт, обложки), — состояние
+# нормальное, а не аварийное: ключ занят ровно потому, что им работают. Считать такие
+# отложки бюджетом _byok_requeue_allowed (5 возвратов, придуманных против вечного
+# цикла «свой ключ исчез») нельзя: через пять минут ожидания enforce молча переставал
+# быть enforce — на своём ключе задача шла в переполненный ключ, а на серверной дорожке
+# умирала с текстом «server credential slot недоступен», называющим неверную причину.
+# Поэтому здесь ограничивается СУММАРНОЕ ВРЕМЯ ожидания, а не число подходов: сосед
+# держит ключ столько, сколько работает, и подходов за час набирается шестьдесят.
+VS_KEY_BUDGET_WAIT_MAX_SEC = max(
+    60, int(os.environ.get("VS_KEY_BUDGET_WAIT_MAX_SEC", "3600") or 3600))
+_KEY_BUDGET_WAITS = {}                  # job_id -> ts первой отложки из-за чужого ключа
+_KEY_BUDGET_WAIT_LOCK = threading.Lock()
+
+
+def _key_budget_wait_allowed(jid):
+    """Можно ли ещё раз отложить задачу из-за занятого чужим сервисом ключа."""
+    now = time.time()
+    with _KEY_BUDGET_WAIT_LOCK:
+        # Уборка тут же: чистить это в finally нельзя — finally выполняется и на самой
+        # отложке (она делает return), и счётчик обнулялся бы при каждом подходе, то
+        # есть ожидание стало бы вечным. Поэтому запись живёт до двух потолков и
+        # выбрасывается следующим же ожидающим.
+        for key, at in list(_KEY_BUDGET_WAITS.items()):
+            if now - float(at) > 2 * VS_KEY_BUDGET_WAIT_MAX_SEC:
+                _KEY_BUDGET_WAITS.pop(key, None)
+        first = _KEY_BUDGET_WAITS.get(str(jid))
+        if first is None:
+            _KEY_BUDGET_WAITS[str(jid)] = now
+            return True
+        return (now - float(first)) <= VS_KEY_BUDGET_WAIT_MAX_SEC
+
+
+def _key_budget_wait_clear(jid):
+    """Задача стартовала или кончилась → счётчик ожидания не нужен."""
+    with _KEY_BUDGET_WAIT_LOCK:
+        _KEY_BUDGET_WAITS.pop(str(jid), None)
+
+
 # ── Ожидание сброса окна подписки ──────────────────────────────────────────────
 # Задача, которую исчерпанное окно застало в работе, возвращается в очередь и ждёт
 # сброса. Потолки обязательны: CRED_COOLDOWN_MAX допускает парковку на неделю, а
@@ -10333,6 +11094,66 @@ def _requeue_running_task(jid, claim_token):
         return True
     finally:
         c.close()
+
+
+def _announce_key_budget_note(jid, note):
+    """Сказать задаче то, что общий счёт сообщил, но что НЕ является отказом.
+
+    Сегодня это одна вещь: «задаче выдано N потоков, а общий потолок ключа — M»
+    (busy=False). Раньше строка печаталась только под условием key_note['busy'], то
+    есть у squeeze не печаталась нигде — а это единственный случай, когда расхождение
+    настроек вообще может прозвучать: на серверном ключе units зажаты ёмкостью слота,
+    и до потолка вендора не дотягивают. Получался ровно тот молчаливый кламп, против
+    которого написан комментарий в _key_budget_take.
+    """
+    if not isinstance(note, dict) or note.get("busy") or not note.get("line"):
+        return False
+    _log_key_budget_wait(jid, note)
+    return True
+
+
+def _defer_task_for_busy_key(jid, claim_token, note):
+    """Вернуть задачу в очередь: место на физическом ключе держит соседний сервис.
+
+    True — отложили, вызывающий обязан выйти. False — ждать больше нельзя (или строку
+    перехватил другой claim), и дальше работает обычный разбор.
+
+    Отдельной функцией, потому что это РЕШЕНИЕ, а не три строки подряд: какой счётчик
+    ограничивает ожидание (свой, а не бюджет возвратов byok), какая отложка и одна ли
+    строка в журнале — всё это должно быть в одном месте и проверяться тестом. Раньше
+    оно было дважды скопировано внутрь _run_task и проверялось только глазами.
+    """
+    if not _key_budget_wait_allowed(jid):
+        return False
+    if not _requeue_running_task(jid, claim_token):
+        return False
+    _requeue_delay_task(jid, _key_budget_retry_sec())
+    _log_key_budget_wait(jid, note)
+    return True
+
+
+def _requeue_delay_task(jid, delay):
+    """Отодвинуть уже возвращённую в очередь задачу на `delay` секунд.
+
+    Отдельной функцией, а не частью _requeue_running_task: тот возвращает задачу
+    НЕМЕДЛЕННО и это правильно для убитого воркера, а ожидание чужого ключа — другой
+    случай: подобрать её тем же тиком значит снова получить отказ и снова написать
+    строку. Колонка retry_after у шедулера уже уважается (SELECT ... AND (retry_after
+    IS NULL OR retry_after<=?)), поэтому своего механизма отложки не заводим.
+    """
+    try:
+        c = db()
+        try:
+            c.execute("UPDATE queue_tasks SET retry_after=? "
+                      "WHERE job_id=? AND status='queued'",
+                      (_now() + max(1, int(delay)), jid))
+            c.commit()
+        finally:
+            c.close()
+        return True
+    except Exception:                                              # noqa: BLE001
+        log_exc("key_budget/delay")
+        return False
 
 
 _WORKER_TEMPFAIL = getattr(os, "EX_TEMPFAIL", 75)
@@ -10951,6 +11772,38 @@ def _note_paused_task(job_id, pause_signature, reason, created, now):
     return f"⏸️ [queue-pause] {reason}; в очереди уже {age}"
 
 
+def _note_key_budget_wait(job_id, signature, line, now):
+    """ОДНА строка про занятый физический ключ, а не одна на каждый тик шедулера.
+
+    Задача, ждущая ключ, проходит через шедулер каждые несколько секунд. Без этого
+    троттлинга журнал задачи за час ожидания превратился бы в тысячу одинаковых
+    строк, и в нём стало бы невозможно найти настоящие события. Хранилище то же, что
+    у пауз очереди (_PAUSE_WAIT_LOGGED), поэтому и чистится оно тем же уборщиком.
+    """
+    key = (int(job_id), str(signature))
+    with _PAUSE_WAIT_LOG_LOCK:
+        last = float(_PAUSE_WAIT_LOGGED.get(key) or 0.0)
+        if last and now - last < _PAUSE_WAIT_LOG_EVERY:
+            return None
+    return line
+
+
+def _log_key_budget_wait(job_id, note):
+    """Написать в журнал задачи строку про занятый ключ — не чаще, чем раз в окно.
+
+    Тот же троттлинг, что у шедулера, но для пути _run_task: byok-задачу шедулер по
+    общему счёту не проверяет вовсе, поэтому её отложки приходят сюда, и без троттлинга
+    час ожидания дал бы те же шестьдесят одинаковых строк.
+    """
+    signature = str(note.get("signature") or "")
+    now = time.time()
+    line = _note_key_budget_wait(job_id, signature, note.get("line") or "", now)
+    if not line:
+        return
+    if _log_line(job_id, line):
+        _mark_paused_task_logged(job_id, signature, now)
+
+
 def _mark_paused_task_logged(job_id, pause_signature, now):
     """Start throttle only after the job-log INSERT has actually committed."""
     key = (int(job_id), str(pause_signature))
@@ -10958,12 +11811,21 @@ def _mark_paused_task_logged(job_id, pause_signature, now):
         _PAUSE_WAIT_LOGGED[key] = float(now)
 
 
-def _purge_pause_wait_logs(alive_keys):
-    """Do not retain throttle state after a task leaves its paused queue."""
+def _purge_pause_wait_logs(alive_keys, queued_jobs=None):
+    """Do not retain throttle state after a task leaves its paused queue.
+
+    `queued_jobs` — номера задач, которые ВСЁ ЕЩЁ стоят в очереди, включая спрятанные
+    собственной отложкой (retry_after в будущем). Без них троттлинг не работал в бою
+    вовсе: задача, отложенная из-за занятого ключа, выпадает из выборки шедулера
+    (`AND (retry_after IS NULL OR retry_after<=?)`), её ключа нет в alive_keys, отметка
+    «про этот ключ уже сказано» стиралась — и каждая отложка печатала строку заново.
+    Проверено: час ожидания = ~60 одинаковых строк в журнале задачи.
+    """
     alive = set(alive_keys)
+    jobs = {int(j) for j in (queued_jobs or ())}
     with _PAUSE_WAIT_LOG_LOCK:
         for key in list(_PAUSE_WAIT_LOGGED):
-            if key not in alive:
+            if key not in alive and key[0] not in jobs:
                 _PAUSE_WAIT_LOGGED.pop(key, None)
 
 
@@ -11010,6 +11872,13 @@ def _adm_state_get(key, default=None):
 
 
 def _adm_state_set(key, value):
+    # Рубильник очереди сюда не ходит: у него своя точка записи (_queue_pause_apply),
+    # где состояние и строка журнала уходят одной транзакцией. Проверка нужна не от
+    # злого умысла, а от будущей правки «по аналогии»: запись мимо журнала вернула бы
+    # ровно ту ситуацию, из-за которой 187 выпусков простояли без объяснения.
+    if key == "queue_pause":
+        raise RuntimeError("queue_pause пишется только через _queue_pause_apply — "
+                           "иначе изменение не попадёт в журнал паузы")
     c = db()
     try:
         c.execute("INSERT INTO admin_state(k,v,updated) VALUES(?,?,?) "
@@ -11108,9 +11977,11 @@ def _active_queue_pause_reason(rows=None, uid=None):
     """
     st = _queue_pause_state()
     if st["all"]:
-        return "Общая очередь студии приостановлена администратором"
+        return ("Общая очередь студии приостановлена администратором"
+                + _pause_reason_suffix())
     if _prompt_uid_paused(uid):
-        return "Генерация текстов и промптов в вашем профиле временно приостановлена"
+        return ("Генерация текстов и промптов в вашем профиле временно приостановлена"
+                + _pause_reason_suffix())
     paused = set(st["providers"])
     active = sorted({prov for status, _uid, _kind, prov, _created in (rows or [])
                      if status in ("queued", "running") and prov in paused})
@@ -11118,7 +11989,617 @@ def _active_queue_pause_reason(rows=None, uid=None):
         return ""
     titles = ", ".join(_provider_title(prov) for prov in active)
     return (f"Приостановлены провайдеры: {titles}. "
-            "Новые задачи через них не принимаются")
+            "Новые задачи через них не принимаются" + _pause_reason_suffix())
+
+
+def _pause_reason_suffix():
+    """Хвост к любой причине паузы: «· с 31.08.2026 в 14:05, поставил: Андрей».
+
+    Полоску очереди видит каждый кабинет на каждой странице. Слово «приостановлено»
+    без даты и имени за две недели превращается в фон, который перестают читать, —
+    а именно так 187 выпусков и простояли с 31.08.
+    """
+    last = _queue_pause_last()
+    if not last["ts"]:
+        return ""
+    return f" · с {last['when']}, поставил: {last['actor'] or 'неизвестно'}"
+
+
+# ── Рубильник очереди: журнал, сухой прогон, состояние словами ────────────────
+# Что было не так. `admin_state.queue_pause` — единственный тормоз конвейера, и при
+# этом про него нельзя было ответить ни на один человеческий вопрос: кто поставил,
+# когда, что именно держится этим прямо сейчас и что стартует, если снять. Паузу
+# поставили 31.08, 187 выпусков простояли до 18.09 — а в `admin_audit` лежал только
+# ЗАПРОС («resume_queue {"target":"all"}»), но не состояние: по нему не видно ни того,
+# что уже стояло рядом, ни того, что изменилось.
+#
+# Ниже три вещи, и ни одна не ослабляет саму паузу:
+#   _queue_pause_apply    — единственная точка записи: состояние и строка журнала
+#                           уходят ОДНОЙ транзакцией, поэтому «стоит, а почему — не
+#                           записано» невозможно;
+#   _queue_pause_dry_run  — что именно тронется с места, если снять: задачи, профили,
+#                           провайдеры, выпуски и порядок денег по журналу вызовов;
+#   _queue_pause_story    — то же самое словами, для экрана кабинета и полосы админки.
+_PAUSE_ORIGIN_DEFAULT = "админ-панель"
+# Кэш «кто последний трогал рубильник»: полоску очереди опрашивает каждый открытый
+# кабинет раз в несколько секунд, а журнал меняется руками — читать его на каждый
+# запрос незачем. Инвалидируется сразу при записи, как и кэш самого состояния.
+_PAUSE_LAST_TTL = 20.0
+_PAUSE_LAST_CACHE = {"ts": 0.0, "val": None}
+
+
+def _pause_when_human(ts):
+    """«31.08.2026 в 14:05». Часовой пояс не указываем: сервер и владелец в одном."""
+    try:
+        return datetime.datetime.fromtimestamp(float(ts)).strftime("%d.%m.%Y в %H:%M")
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "?"
+
+
+def _pause_ago_human(ts):
+    """«19 сут 4 ч назад» — то же время, но так виднее, что пауза стоит давно."""
+    try:
+        gap = time.time() - float(ts)
+    except (TypeError, ValueError):
+        return ""
+    return (_human_wait(gap) + " назад") if gap >= 60 else "только что"
+
+
+def _pause_norm(state):
+    """Сравнимый снимок рубильника: порядок ключей и списков — не изменение.
+
+    Нормализация нужна именно журналу: без неё перезапись того же состояния другим
+    порядком провайдеров выглядела бы как правка, и «что изменилось» врало бы.
+    Незнакомые поля отбрасываем ТОЛЬКО в копии для сравнения — само состояние
+    сохраняет их (см. _queue_pause_state).
+    """
+    state = state if isinstance(state, dict) else {}
+    uids = set()
+    for raw in (state.get("prompt_uids") or []):
+        try:
+            uid = int(raw)
+        except (TypeError, ValueError):
+            continue
+        if uid > 0:
+            uids.add(uid)
+    out = {
+        "all": bool(state.get("all")),
+        "providers": sorted({str(x).strip() for x in (state.get("providers") or [])
+                             if str(x).strip()}),
+        "prompt_uids": sorted(uids),
+    }
+    if "prompt_project_allowlist" in state:
+        raw_allow = state.get("prompt_project_allowlist") or []
+        out["prompt_project_allowlist"] = sorted(
+            {x.strip() for x in raw_allow if isinstance(x, str) and x.strip()}
+            if isinstance(raw_allow, (list, tuple, set)) else set())
+    return out
+
+
+def _pause_user_names(c, uids):
+    """id → имя. Пауза, подписанная числом, человеку ничего не объясняет."""
+    names = {}
+    for uid in sorted({int(x) for x in uids}):
+        try:
+            row = c.execute("SELECT name FROM users WHERE id=?", (uid,)).fetchone()
+        except Exception:
+            row = None
+        names[uid] = (row["name"] if row and row["name"] else f"профиль #{uid}")
+    return names
+
+
+def _pause_blocks_new_text(st, uid=None, project_id=None):
+    """Зеркало pub_services._new_prompt_work_paused — ТОЛЬКО чтобы считать и показывать.
+
+    Правило «любой провайдер `prompt_*` на паузе останавливает новые тексты ВСЕМ
+    профилям» унаследовано из боя дословно. Считать надо ровно тем правилом, каким
+    движок отказывает, иначе сухой прогон покажет одно, а конвейер сделает другое.
+    Решение по-прежнему принимает pub_services; эта копия ничего не разрешает.
+    Дубль правила в двух файлах — известная плата: guard живёт в модуле, который
+    трогать нельзя, и снимается он переносом guard'а в общий модуль, а не здесь.
+    """
+    if st.get("all"):
+        return True
+    if any(str(p).startswith("prompt_") for p in (st.get("providers") or [])):
+        return True
+    if uid is None or int(uid) not in set(st.get("prompt_uids") or []):
+        return False
+    allow = st.get("prompt_project_allowlist") or []
+    return not (isinstance(project_id, str) and project_id in allow)
+
+
+def _pause_holds_task(st, provider, uid, project_id=None):
+    """Какая из трёх пауз держит эту задачу в очереди. Пусто — не держит ни одна."""
+    if st.get("all"):
+        return "общая пауза"
+    provider = str(provider or "")
+    if provider and provider in (st.get("providers") or []):
+        return f"пауза провайдера {_provider_title(provider)}"
+    if provider in _PROMPT_PROVIDER_GROUPS:
+        try:
+            uid_i = int(uid)
+        except (TypeError, ValueError):
+            uid_i = None
+        if uid_i is not None and uid_i in set(st.get("prompt_uids") or []):
+            allow = st.get("prompt_project_allowlist") or []
+            if isinstance(project_id, str) and project_id in allow:
+                return ""
+            return "пауза текстов профиля"
+    return ""
+
+
+def _queue_pause_words(state, names=None):
+    """Что именно остановлено — фразами, без кодов и сокращений."""
+    st = _pause_norm(state)
+    names = names or {}
+    out = []
+    if st["all"]:
+        out.append("вся очередь студии — новые задачи не выдаются никому")
+    if st["providers"]:
+        out.append("провайдеры: " + ", ".join(_provider_title(p) for p in st["providers"]))
+    if st["prompt_uids"]:
+        out.append("тексты и промпты профилей: "
+                   + ", ".join(names.get(uid, f"профиль #{uid}") for uid in st["prompt_uids"]))
+    allow = st.get("prompt_project_allowlist") or []
+    if allow:
+        out.append(f"исключение: {len(allow)} проект(ов) работают несмотря на паузу текстов")
+    # Самое неочевидное в этом рубильнике: пауза ОДНОГО канала текстов останавливает
+    # заказ новых текстов у ВСЕХ. Это поведение боя (pub_services), и молчать о нём
+    # на экране нельзя — иначе человек ищет причину в своём профиле.
+    if any(p.startswith("prompt_") for p in st["providers"]):
+        out.append("следствие: пока на паузе хотя бы один канал текстов (prompt_*), "
+                   "новые тексты не заказываются ни в одном профиле — правило "
+                   "унаследовано из боевого кабинета")
+    return out
+
+
+def _queue_pause_diff_words(before, after, names=None):
+    """«Что изменилось» одной фразой: журнал читают глазами, а не diff'ом JSON."""
+    b, a = _pause_norm(before), _pause_norm(after)
+    names = names or {}
+    bits = []
+    if a["all"] != b["all"]:
+        bits.append("включена общая пауза" if a["all"] else "снята общая пауза")
+    added = [p for p in a["providers"] if p not in b["providers"]]
+    gone = [p for p in b["providers"] if p not in a["providers"]]
+    if added:
+        bits.append("на паузу поставлены провайдеры: " + ", ".join(added))
+    if gone:
+        bits.append("возобновлены провайдеры: " + ", ".join(gone))
+    u_add = [u for u in a["prompt_uids"] if u not in b["prompt_uids"]]
+    u_gone = [u for u in b["prompt_uids"] if u not in a["prompt_uids"]]
+    if u_add:
+        bits.append("остановлены тексты: " + ", ".join(names.get(u, f"профиль #{u}") for u in u_add))
+    if u_gone:
+        bits.append("возобновлены тексты: " + ", ".join(names.get(u, f"профиль #{u}") for u in u_gone))
+    if a.get("prompt_project_allowlist") != b.get("prompt_project_allowlist"):
+        bits.append("изменён список проектов-исключений")
+    return "; ".join(bits) or "состояние не изменилось"
+
+
+def _queue_pause_audit_row(c, u, origin, action, before, after, summary="", holding=""):
+    """Одна строка журнала рубильника. Пишется ТОЛЬКО из транзакции, меняющей состояние."""
+    names = _pause_user_names(c, set(_pause_norm(before)["prompt_uids"])
+                             | set(_pause_norm(after)["prompt_uids"]))
+    c.execute(
+        "INSERT INTO queue_pause_audit(ts,actor_id,actor_name,origin,action,"
+        "state_before,state_after,summary,holding) VALUES(?,?,?,?,?,?,?,?,?)",
+        (time.time(),
+         (u["id"] if u is not None else None),
+         (u["name"] if u is not None else "неизвестно"),
+         str(origin or _PAUSE_ORIGIN_DEFAULT)[:120], str(action or "")[:60],
+         json.dumps(_pause_norm(before), ensure_ascii=False),
+         json.dumps(_pause_norm(after), ensure_ascii=False),
+         (summary or _queue_pause_diff_words(before, after, names))[:500],
+         str(holding or "")[:1000]))
+
+
+def _queue_pause_note_drift(c, current):
+    """Состояние изменили мимо журнала — записать это отдельным событием.
+
+    14.08 глобальную паузу снимали не панелью, а скриптом прямо в `admin_state`:
+    в `admin_audit` осталась строка, которую наш код произвести не мог. Сравнение
+    «что лежит в БД» с «что записано последним» ловит такой случай само. Автора мы
+    не знаем и не выдумываем — но сам факт и момент обнаружения фиксируем, иначе
+    журнал начинает врать о состоянии, а это хуже, чем его отсутствие.
+    """
+    row = c.execute("SELECT state_after FROM queue_pause_audit "
+                    "ORDER BY id DESC LIMIT 1").fetchone()
+    if row is None:
+        return False            # журнала ещё не было: первая запись — не «правка в обход»
+    try:
+        known = json.loads(row["state_after"] or "{}")
+    except (TypeError, ValueError):
+        known = {}
+    if _pause_norm(known) == _pause_norm(current):
+        return False
+    names = _pause_user_names(c, set(_pause_norm(known)["prompt_uids"])
+                              | set(_pause_norm(current)["prompt_uids"]))
+    _queue_pause_audit_row(
+        c, None, "мимо панели — прямая правка admin_state", "изменение вне журнала",
+        known, current,
+        summary=_queue_pause_diff_words(known, current, names)
+        + "; запись сделана постфактум, автор неизвестен")
+    return True
+
+
+def _queue_pause_forget_cache():
+    _ADM_PAUSE_CACHE["ts"] = 0.0        # вызывается под _ADM_PAUSE_LOCK или после COMMIT
+    _PAUSE_LAST_CACHE["ts"] = 0.0
+    _PAUSE_HOLD_CACHE.clear()
+
+
+def _queue_pause_apply(u, origin, action, state, summary="", holding=""):
+    """Единственная точка записи рубильника: состояние и журнал — одной транзакцией.
+
+    Почему не через _adm_state_set: там значение сохраняется отдельно от журнала, и
+    отказ между двумя записями давал бы ровно то, с чего всё началось, — «очередь
+    стоит, а почему и с чьей руки, не записано». Здесь обе записи либо есть обе,
+    либо нет ни одной.
+    """
+    before = {}
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT v FROM admin_state WHERE k='queue_pause'").fetchone()
+        try:
+            before = json.loads(row["v"]) if row and row["v"] else {}
+        except (TypeError, ValueError):
+            before = {}
+        if not isinstance(before, dict):
+            before = {}
+        _queue_pause_note_drift(c, before)
+        c.execute("INSERT INTO admin_state(k,v,updated) VALUES('queue_pause',?,?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated=excluded.updated",
+                  (json.dumps(state, ensure_ascii=False), time.time()))
+        _queue_pause_audit_row(c, u, origin, action, before, state, summary, holding)
+        c.commit()
+    finally:
+        c.close()
+    with _ADM_PAUSE_LOCK:               # свежее значение видно сразу, не через TTL
+        _queue_pause_forget_cache()
+    return before
+
+
+def _queue_pause_sync_journal(c):
+    """Догнать журнал, если состояние поменяли в обход панели. Тихо: это фон чтения."""
+    try:
+        row = c.execute("SELECT v FROM admin_state WHERE k='queue_pause'").fetchone()
+        try:
+            cur = json.loads(row["v"]) if row and row["v"] else {}
+        except (TypeError, ValueError):
+            cur = {}
+        if not isinstance(cur, dict):
+            cur = {}
+        if _queue_pause_note_drift(c, cur):
+            c.commit()
+    except Exception:
+        log_exc("queue_pause/sync")
+
+
+def _queue_pause_last(force=False):
+    """Кто, когда и с какого экрана трогал рубильник в последний раз."""
+    now = time.time()
+    cached = _PAUSE_LAST_CACHE["val"]
+    if not force and cached is not None and now - _PAUSE_LAST_CACHE["ts"] < _PAUSE_LAST_TTL:
+        return cached
+    out = {"ts": None, "actor": "", "origin": "", "action": "", "summary": "",
+           "holding": "", "when": "", "ago": ""}
+    try:
+        c = db()
+        try:
+            _queue_pause_sync_journal(c)
+            row = c.execute("SELECT * FROM queue_pause_audit "
+                            "ORDER BY id DESC LIMIT 1").fetchone()
+        finally:
+            c.close()
+        if row is not None:
+            out = {"ts": row["ts"], "actor": row["actor_name"] or "неизвестно",
+                   "origin": row["origin"] or "", "action": row["action"] or "",
+                   "summary": row["summary"] or "", "holding": row["holding"] or "",
+                   "when": _pause_when_human(row["ts"]), "ago": _pause_ago_human(row["ts"])}
+    except Exception:
+        log_exc("queue_pause/last")
+    _PAUSE_LAST_CACHE["ts"], _PAUSE_LAST_CACHE["val"] = now, out
+    return out
+
+
+def _queue_pause_history(limit=20):
+    """Журнал рубильника для админ-панели: новые сверху."""
+    try:
+        c = db()
+        try:
+            rows = c.execute("SELECT * FROM queue_pause_audit ORDER BY id DESC LIMIT ?",
+                             (int(limit),)).fetchall()
+        finally:
+            c.close()
+    except Exception:
+        log_exc("queue_pause/history")
+        return []
+    return [{"ts": r["ts"], "when": _pause_when_human(r["ts"]), "ago": _pause_ago_human(r["ts"]),
+             "actor": r["actor_name"] or "неизвестно", "origin": r["origin"] or "",
+             "action": r["action"] or "", "summary": r["summary"] or "",
+             "holding": r["holding"] or ""} for r in rows]
+
+
+def _pause_bucket():
+    return {"tasks": 0, "by_kind": {}, "by_provider": {}, "profiles": {},
+            "oldest": None, "releases": 0, "releases_mine": 0, "release_oldest": None}
+
+
+def _pause_bucket_add(bucket, row, prov, names):
+    bucket["tasks"] += 1
+    kind = row["kind"] or "—"
+    bucket["by_kind"][kind] = bucket["by_kind"].get(kind, 0) + 1
+    label = _provider_title(prov) if prov else "без провайдера"
+    bucket["by_provider"][label] = bucket["by_provider"].get(label, 0) + 1
+    try:
+        uid = int(row["uid"])
+    except (TypeError, ValueError):
+        uid = 0
+    who = names.get(uid, f"профиль #{uid}") if uid else "неизвестный профиль"
+    bucket["profiles"][who] = bucket["profiles"].get(who, 0) + 1
+    created = row["created"]
+    if created is not None and (bucket["oldest"] is None or created < bucket["oldest"]):
+        bucket["oldest"] = created
+
+
+# Выпуск, который движок остановил из-за паузы, помечен строкой ResourceDown:
+# `blocked_reason = "ждём: генерация текстов и промптов этого профиля приостановлена"`
+# (pub_engine.advance). Машиночитаемого поля «почему заблокирован» у выпуска нет, а
+# pub_services править нельзя, поэтому ищем по тексту. Следствие честное: если
+# формулировку в pub_services поменяют, счётчик занизит, но не завысит — экран скажет
+# «меньше, чем есть», и это безопаснее, чем обратное.
+_PAUSE_RELEASE_LIKE = "ждём:%приостановлен%"
+
+
+def _queue_pause_scan(state_now, state_after=None, tenant_id=None):
+    """Один проход по очереди и выпускам: что держится сейчас и что отпустит переход.
+
+    Провайдера берём из СОХРАНЁННОЙ строки задачи (queue_tasks.provider) — так же, как
+    админ-таблица задач. Пересчитывать маршрут через _task_provider ради счётчика значит
+    повторять работу шедулера на каждом открытии экрана.
+    """
+    now_st = _pause_norm(state_now)
+    after_st = _pause_norm(state_after) if state_after is not None else None
+    held, freed = _pause_bucket(), _pause_bucket()
+    c = db()
+    try:
+        rows = c.execute(
+            "SELECT job_id, uid, kind, COALESCE(provider,'') provider, project_id, created "
+            "FROM queue_tasks WHERE status='queued'").fetchall()
+        names = _pause_user_names(c, {r["uid"] for r in rows if r["uid"]}
+                                  | set(now_st["prompt_uids"]))
+        for r in rows:
+            prov = r["provider"] or ("render" if r["kind"] == "render" else "")
+            if not _pause_holds_task(now_st, prov, r["uid"], r["project_id"]):
+                continue
+            _pause_bucket_add(held, r, prov, names)
+            if after_st is not None and not _pause_holds_task(
+                    after_st, prov, r["uid"], r["project_id"]):
+                _pause_bucket_add(freed, r, prov, names)
+        rel_rows = c.execute(
+            "SELECT release_id, tenant_id, project_id, updated FROM pub_releases "
+            "WHERE status='pending' AND blocked_reason LIKE ?",
+            (_PAUSE_RELEASE_LIKE,)).fetchall()
+        owners = {}
+        for rel in rel_rows:
+            tid = rel["tenant_id"]
+            if tid not in owners:
+                row = c.execute("SELECT id FROM users WHERE tenant_id=? ORDER BY id LIMIT 1",
+                                (tid,)).fetchone()
+                owners[tid] = (row["id"] if row else None)
+            uid = owners[tid]
+            if not _pause_blocks_new_text(now_st, uid, rel["project_id"]):
+                continue            # стоит не из-за рубильника — в его счёт не ставим
+            held["releases"] += 1
+            if tenant_id is not None and tid == tenant_id:
+                held["releases_mine"] += 1
+            upd = rel["updated"]
+            if upd is not None and (held["release_oldest"] is None
+                                    or upd < held["release_oldest"]):
+                held["release_oldest"] = upd
+            if after_st is not None and not _pause_blocks_new_text(
+                    after_st, uid, rel["project_id"]):
+                freed["releases"] += 1
+                if tenant_id is not None and tid == tenant_id:
+                    freed["releases_mine"] += 1
+        money = _pause_money_hint(c, freed["releases"] or held["releases"])
+    finally:
+        c.close()
+    return {"held": held, "freed": freed, "money": money,
+            "state": now_st, "after": after_st}
+
+
+# Обсчёт «что держится» стоит два запроса, а админ-панель опрашивает состояние раз в
+# несколько секунд. Полминуты кэша достаточно: за это время числа не меняются заметно,
+# а при любой записи рубильника кэш сбрасывается целиком.
+_PAUSE_HOLD_TTL = 30.0
+_PAUSE_HOLD_CACHE = {}
+
+
+def _queue_pause_scan_cached(tenant_id=None):
+    key = tenant_id or ""
+    now = time.time()
+    hit = _PAUSE_HOLD_CACHE.get(key)
+    if hit and now - hit[0] < _PAUSE_HOLD_TTL:
+        return hit[1]
+    val = _queue_pause_scan(_queue_pause_state(), None, tenant_id)
+    _PAUSE_HOLD_CACHE[key] = (now, val)
+    if len(_PAUSE_HOLD_CACHE) > 64:     # кэш, а не хранилище: протухшее выкидываем
+        for stale in [k for k, v in _PAUSE_HOLD_CACHE.items() if now - v[0] > _PAUSE_HOLD_TTL]:
+            _PAUSE_HOLD_CACHE.pop(stale, None)
+    return val
+
+
+def _pause_money_hint(c, releases):
+    """Порядок денег — по журналу платных вызовов, а не по прайсу: прайса у нас нет.
+
+    Считаем медиану доставленных платных вызовов на ОДИН завершённый выпуск и
+    умножаем на число тех, что тронутся с места. Это оценка, и названа она оценкой:
+    сколько стоит конкретный выпуск, заранее не знает никто — у него своё число кадров.
+
+    Окно — последние сорок выпусков, и это число выбрано, а не вычислено: меньше
+    десятка даёт медиану, которую перекашивает один длинный ролик, а месячное окно
+    смешало бы разные настройки конвейера. Если окажется, что оценка систематически
+    врёт, менять надо именно эту цифру — числа сухого прогона считаются здесь и
+    больше нигде. Медиана, а не среднее: один выпуск на 500 кадров не должен
+    превращать оценку залпа в пугалку.
+    """
+    releases = int(releases or 0)
+    if releases <= 0:
+        return ""
+    try:
+        rows = c.execute(
+            "SELECT project_id FROM pub_releases WHERE status='done' "
+            "AND project_id IS NOT NULL AND project_id!='' "
+            "ORDER BY updated DESC LIMIT 40").fetchall()
+        per = []
+        for r in rows:
+            got = c.execute(
+                "SELECT COUNT(*), COALESCE(SUM(cost),0) FROM provider_calls "
+                "WHERE project_id=? AND status='delivered'", (r["project_id"],)).fetchone()
+            if got and got[0]:
+                per.append((int(got[0]), float(got[1] or 0)))
+    except Exception:
+        log_exc("queue_pause/money")
+        return ""
+    if not per:
+        return ("Деньги: оценить не по чему — в журнале платных вызовов нет ни одного "
+                "завершённого выпуска. Считать надо по факту, а не по догадке.")
+    per.sort()
+    calls, cost = per[len(per) // 2]
+    tail = f" (≈{cost:.0f} кр. за выпуск)" if cost else " (стоимость в кредитах не записана)"
+    return (f"Деньги: по {len(per)} последним завершённым выпускам медиана — "
+            f"{calls} оплаченных вызовов на выпуск{tail}. "
+            f"Залп из {releases} выпусков — это порядка {calls * releases} платных вызовов. "
+            f"Это оценка по истории, а не счёт провайдера.")
+
+
+def _pause_top(counter, limit=6):
+    """«картинки 120, озвучка 40» — крупное первым, хвост одной цифрой."""
+    items = sorted(counter.items(), key=lambda kv: (-kv[1], kv[0]))
+    head = ", ".join(f"{name} {n}" for name, n in items[:limit])
+    if len(items) > limit:
+        head += f" и ещё {sum(n for _n, n in items[limit:])} в {len(items) - limit} других"
+    return head
+
+
+def _queue_pause_dry_run(target, u=None, preserve=()):
+    """Сухой прогон снятия паузы: что тронется с места и на какой это порядок денег.
+
+    Владелец обжёгся на августовском залпе: пауза снималась вслепую, и конвейер уходил
+    в работу целиком. Поэтому «снять» — это два шага: сначала числа, потом кнопка.
+    Сам рубильник прогон не трогает: он только читает.
+    """
+    state = _queue_pause_state()
+    after = dict(state)
+    keep_note = ""
+    if target == "all":
+        keep_raw = {str(v).strip() for v in (preserve or [])}
+        keep = [p for p in _pause_norm(state)["providers"] if str(p).strip() in keep_raw]
+        after["all"] = False
+        after["providers"] = keep
+        title = "снятие общей паузы"
+        if keep:
+            keep_note = "На точечной паузе останутся: " + ", ".join(keep) + "."
+    elif target == "prompt_mine":
+        uid = int(u["id"]) if u is not None else None
+        after["prompt_uids"] = [x for x in _pause_norm(state)["prompt_uids"] if x != uid]
+        title = "возобновление текстов вашего профиля"
+    else:
+        after["providers"] = [p for p in _pause_norm(state)["providers"] if p != target]
+        title = f"возобновление провайдера {_provider_title(target)}"
+    scan = _queue_pause_scan(state, after)
+    freed, held = scan["freed"], scan["held"]
+    lines = [f"Сухой прогон: {title}."]
+    if freed["tasks"]:
+        lines.append(f"Немедленно стартуют задачи: {freed['tasks']} шт. — "
+                     + _pause_top(freed["by_kind"]) + ".")
+        lines.append("Провайдеры: " + _pause_top(freed["by_provider"]) + ".")
+        lines.append("Профили: " + _pause_top(freed["profiles"]) + ".")
+        if freed["oldest"]:
+            lines.append(f"Самая старая из них ждёт с {_pause_when_human(freed['oldest'])}.")
+    else:
+        lines.append("Задач, которые стартуют прямо сейчас, в очереди нет.")
+    if freed["releases"]:
+        lines.append(f"Выпусков сдвинется с места: {freed['releases']} — каждый закажет "
+                     "новый текст у рерайта, а дальше пойдёт по всему конвейеру.")
+    elif held["releases"]:
+        lines.append(f"Выпуски останутся стоять: {held['releases']} (их держит не эта часть паузы).")
+    if scan["money"]:
+        lines.append(scan["money"])
+    if keep_note:
+        lines.append(keep_note)
+    if held["tasks"] - freed["tasks"] > 0:
+        lines.append(f"Под паузой останется задач: {held['tasks'] - freed['tasks']}.")
+    return {"title": title, "after": after, "freed": freed, "held": held,
+            "money": scan["money"], "text": "\n".join(lines)}
+
+
+def _queue_pause_story(uid=None, tenant_id=None, with_holding=True):
+    """Состояние рубильника словами: что остановлено, с какого времени, кем, что держит.
+
+    Одна функция на три экрана (кабинет, полоска очереди, админ-панель): иначе
+    формулировки разойдутся, и «что именно остановлено» в каждом месте будет своё.
+    """
+    state = _queue_pause_state()
+    st = _pause_norm(state)
+    last = _queue_pause_last()
+    out = {
+        "paused": bool(st["all"] or st["providers"] or st["prompt_uids"]),
+        "all": st["all"], "providers": st["providers"],
+        "mine_prompt": bool(uid is not None and _prompt_uid_paused(uid)),
+        "blocks_my_texts": _pause_blocks_new_text(st, uid),
+        "since": last["ts"], "since_human": last["when"], "ago": last["ago"],
+        "by": last["actor"], "origin": last["origin"], "action": last["action"],
+        "last_summary": last["summary"], "last_holding": last["holding"],
+        "what": [], "lines": [], "holding": None,
+    }
+    if not out["paused"]:
+        return out
+    names = {}
+    if st["prompt_uids"]:
+        # Соединение открываем только когда есть чьи имена доставать: это описание
+        # читает и полоска очереди, и она дёргается с каждой открытой страницы.
+        try:
+            c = db()
+            try:
+                names = _pause_user_names(c, st["prompt_uids"])
+            finally:
+                c.close()
+        except Exception:
+            log_exc("queue_pause/story")
+    out["what"] = _queue_pause_words(state, names)
+    out["lines"] = ["Что остановлено: " + w for w in out["what"]]
+    if last["ts"]:
+        out["lines"].append(
+            f"С какого времени: {last['when']}"
+            + (f" ({last['ago']})" if last["ago"] else "")
+            + f" · поставил: {last['actor'] or 'неизвестно'}"
+            + (f" · экран: {last['origin']}" if last["origin"] else ""))
+    else:
+        out["lines"].append("С какого времени и с чьей руки — в журнале нет: пауза "
+                            "появилась до того, как журнал завели.")
+    if with_holding:
+        scan = _queue_pause_scan_cached(tenant_id)
+        held = scan["held"]
+        out["holding"] = held
+        bits = []
+        if held["tasks"]:
+            bits.append(f"задач в очереди: {held['tasks']} ({_pause_top(held['by_kind'], 4)})")
+        if held["releases"]:
+            mine = (f", из них ваших {held['releases_mine']}"
+                    if tenant_id is not None and held["releases_mine"] else "")
+            bits.append(f"выпусков ждут новый текст: {held['releases']}{mine}")
+        if bits:
+            oldest = held["release_oldest"] or held["oldest"]
+            tail = (f" Самое старое стоит с {_pause_when_human(oldest)}." if oldest else "")
+            out["lines"].append("Держится прямо сейчас: " + "; ".join(bits) + "." + tail)
+        else:
+            out["lines"].append("Держится прямо сейчас: ничего — очередь и так пуста.")
+    out["lines"].append("Уже идущие задачи пауза не обрывает: остановлена только выдача новых.")
+    return out
 
 
 def _prompt_provider_paused(provider_or_channel):
@@ -11159,6 +12640,7 @@ def _claim_fair_tasks(c, claim_now=None):
     wait_logs = []                  # (job_id, строка) — пишем ПОСЛЕ commit, вне транзакции
     pause_logs = []                 # (job_id, строка, signature) — mark only after INSERT
     paused_wait_keys = set()
+    queued_job_ids = set()          # вся очередь, включая спрятанных своей отложкой
     # Пропуск считаем не чаще одного раза за ВЫЗОВ (= тик шедулера ≈ 1с): внутренний
     # while перебирает RR-круги много раз подряд, и без этого порог накопления
     # срабатывал бы в первую же секунду — ёмкость резервировалась бы раньше, чем
@@ -11218,6 +12700,15 @@ def _claim_fair_tasks(c, claim_now=None):
             run_uid_jobs[(prov, r["uid"])] = run_uid_jobs.get((prov, r["uid"]), 0) + 1
             if prov in _PROMPT_PROVIDER_GROUPS:
                 run_uid_prompt[r["uid"]] = run_uid_prompt.get(r["uid"], 0) + 1
+
+        # Кто ещё стоит в очереди — ВЕСЬ список, без фильтра по retry_after. Нужен
+        # только уборщику троттлинга: отложенная задача не видна выборке ниже, и без
+        # этого списка отметка «про занятый ключ уже сказано» стиралась на каждом тике.
+        queued_job_ids = {
+            int(r["job_id"]) for r in c.execute(
+                "SELECT job_id FROM queue_tasks WHERE status='queued' AND kind!='render'"
+            ).fetchall()
+        }
 
         # dict сохраняет порядок первого появления: без cursor первым идёт uid
         # с самой старой ожидающей задачей, затем устойчивый RR.
@@ -11395,8 +12886,32 @@ def _claim_fair_tasks(c, claim_now=None):
                                 wait_logs.append((t["job_id"], note))
                         continue
                     # BYOK: серверный слот не берём вообще — ни ждать его, ни занимать.
+                    key_note = {}
                     lease = (None if byok else
-                             _reserve_task_credential(prov, t["kind"], task_params))
+                             _reserve_task_credential(prov, t["kind"], task_params,
+                                                      note=key_note))
+                    if key_note.get("line"):
+                        # Занятое место физического ключа — это НЕ ошибка задачи и не
+                        # молчаливое ожидание: человеку уходит одна строка словами и с
+                        # цифрами, а задача получает честную отложку (ниже). Без строки
+                        # общий счёт выглядел бы как «всё стало медленнее без причины» —
+                        # ровно то, чего ждать от него и надо, но объяснённое.
+                        pause_key = (int(t["job_id"]), key_note["signature"])
+                        paused_wait_keys.add(pause_key)
+                        _line = _note_key_budget_wait(t["job_id"], pause_key[1],
+                                                      key_note["line"], claim_now)
+                        if _line:
+                            pause_logs.append((t["job_id"], _line, pause_key[1]))
+                    if not byok and lease is None and key_note.get("busy"):
+                        # Отложка, а не пропуск тика: без retry_after задача крутилась бы
+                        # в шедулере вхолостую каждые две секунды, занимая его выдачей,
+                        # которая заведомо не состоится, пока сосед держит ключ.
+                        c.execute(
+                            "UPDATE queue_tasks SET retry_after=? "
+                            "WHERE job_id=? AND status='queued'",
+                            (claim_now + _key_budget_retry_sec(), t["job_id"]),
+                        )
+                        continue
                     if not byok and _provider_credential_family(prov) and lease is None:
                         continue
                     if lease:
@@ -11468,7 +12983,7 @@ def _claim_fair_tasks(c, claim_now=None):
                 if not claimed_any:
                     break
         c.commit()
-        _purge_pause_wait_logs(paused_wait_keys)
+        _purge_pause_wait_logs(paused_wait_keys, queued_job_ids)
         # Логи ожидания пишем ПОСЛЕ commit (отдельным соединением), чтобы не держать
         # write-транзакцию шедулера. Человек должен видеть, почему задача стоит.
         for _jid, _msg in wait_logs:
@@ -17334,6 +18849,8 @@ def _adm_act_restart_service(u, p):
 
 
 def _adm_act_pause_queue(u, p):
+    """Поставить паузу. Сухого прогона здесь нет намеренно: остановка — безопасная
+    сторона, и ставить между человеком и стоп-краном лишний вопрос нельзя."""
     target = (p.get("target") or "all").strip()
     # Копия нужна и для сохранения будущих/неизвестных полей, и чтобы не мутировать
     # объект, опубликованный в TTL-кэше, до успешного COMMIT admin_state.
@@ -17350,48 +18867,63 @@ def _adm_act_pause_queue(u, p):
     else:
         st["providers"] = sorted(set(st["providers"]) | {target})
         msg = f"Провайдер {target} на паузе"
-    _adm_state_set("queue_pause", st)
+    # Что пауза забирает с собой — считаем ДО записи и кладём в ту же строку журнала:
+    # через месяц вопрос будет звучать «а что она тогда остановила», и ответ должен
+    # быть в журнале, а не в чьей-то памяти.
+    try:
+        held = _queue_pause_scan(st)["held"]
+        holding = (f"под паузой осталось: задач {held['tasks']}, "
+                   f"выпусков {held['releases']}")
+    except Exception:
+        log_exc("queue_pause/hold_note")
+        holding = ""
+    _queue_pause_apply(u, p.get("origin"), "пауза: " + target, st, holding=holding)
     return {"ok": True, "msg": msg}
 
 
 def _adm_act_resume_queue(u, p):
-    """Снятие паузы. `target="all"` снимает и глобальный стоп, и точечные паузы.
+    """Снятие паузы В ДВА ШАГА: сухой прогон, потом кнопка.
 
-    `preserve_providers` — снять глобальный стоп, но оставить перечисленные
-    провайдеры на точечной паузе. Ровно этой операции здесь не было, и 14.08 при
-    откате глобальной паузы её сделали в обход админ-API: в admin_audit осталась
-    строка resume_queue с `preserve_providers`, которую этот код произвести не мог
-    (detail и result здесь зашиты, target идёт через json.dumps). Пока операции нет
-    в API, её будут делать скриптом — а тогда журнал аудита перестаёт быть
-    доказательством того, кто и когда менял состояние очереди.
+    `target="all"` снимает глобальный стоп; `preserve_providers` — список тех, кого
+    оставить на точечной паузе. Ровно этой операции здесь когда-то не было, и 14.08
+    при откате глобальной паузы её сделали в обход админ-API: в admin_audit осталась
+    строка resume_queue с `preserve_providers`, которую этот код произвести не мог.
+    Теперь состояние пишется только через _queue_pause_apply, и правку мимо панели
+    журнал опознаёт сам.
+
+    Первый вызов (без `confirm`) ничего не меняет и возвращает `preview` с числами:
+    сколько и каких задач стартует немедленно, чьи это профили, через каких
+    провайдеров и сколько выпусков сдвинется. Августовский залп случился потому, что
+    паузу сняли вслепую; показать числа дешевле, чем оплатить их повторно.
     """
     target = (p.get("target") or "all").strip()
-    st = dict(_queue_pause_state())
+    if target == "prompt_mine" and u is None:
+        raise HTTPException(403, "нужен пользователь")
+    keep_raw = p.get("preserve_providers") or []
+    if not isinstance(keep_raw, (list, tuple, set)):
+        return {"ok": False, "msg": "preserve_providers должен быть списком провайдеров"}
+    # «Сохранить» — это про неснятие существующей паузы, а не про её постановку задним
+    # числом: _queue_pause_dry_run оставляет из списка только реально стоящих.
+    dry = _queue_pause_dry_run(target, u, keep_raw)
+    if not p.get("confirm"):
+        # Предпросмотр — ещё не действие: рубильник не тронут и в журнал не пишем.
+        return {"ok": True, "preview": True, "msg": dry["text"]}
+    st = dict(dry["after"])
     if target == "all":
-        keep_raw = p.get("preserve_providers") or []
-        if not isinstance(keep_raw, (list, tuple, set)):
-            return {"ok": False, "msg": "preserve_providers должен быть списком провайдеров"}
-        # Оставляем только то, что и так стоит на паузе: «сохранить» — это про
-        # неснятие существующей паузы, а не про её постановку задним числом.
-        keep = [x for x in st["providers"] if str(x).strip() in {str(v).strip() for v in keep_raw}]
-        st["all"] = False
-        st["providers"] = keep
+        keep = list(_pause_norm(st)["providers"])
         if keep:
             msg = "Глобальная пауза снята; на точечной паузе оставлены: " + ", ".join(keep)
-        elif st["prompt_uids"]:
+        elif _pause_norm(st)["prompt_uids"]:
             msg = "Глобальная пауза снята; персональные паузы текстов сохранены"
         else:
             msg = "Очередь возобновлена полностью"
     elif target == "prompt_mine":
-        if u is None:
-            raise HTTPException(403, "нужен пользователь")
-        uid = int(u["id"])
-        st["prompt_uids"] = [x for x in st["prompt_uids"] if x != uid]
         msg = "Генерация текстов и промптов в вашем профиле возобновлена"
     else:
-        st["providers"] = [x for x in st["providers"] if x != target]
         msg = f"Провайдер {target} возобновлён"
-    _adm_state_set("queue_pause", st)
+    # В журнал кладём тот самый прогон, который человек видел перед нажатием: это и
+    # есть ответ на будущий вопрос «что мы тогда отпустили и на сколько это было».
+    _queue_pause_apply(u, p.get("origin"), "снятие: " + target, st, holding=dry["text"])
     return {"ok": True, "msg": msg}
 
 
@@ -17741,11 +19273,24 @@ def admin_state_api(request: Request, tabs: str = "overview", status: str = "", 
                                       uid=uid or None, provider=provider or None,
                                       q=q or None, limit=200))
     pause = _queue_pause_state()
+    # Словами, а не флагами: панель обязана отвечать «что остановлено, с какого
+    # времени, кем и что держится прямо сейчас» без похода в БД руками.
+    try:
+        story = _queue_pause_story(u["id"])
+    except Exception:
+        log_exc("admin/state/pause")
+        story = {"lines": [], "since_human": "", "ago": "", "by": "", "origin": "",
+                 "holding": None}
     out["pause"] = {
         "all": pause["all"],
         "providers": pause["providers"],
         "mine_prompt": _prompt_uid_paused(u["id"]),
+        "lines": story["lines"],
+        "since_human": story["since_human"], "ago": story["ago"],
+        "by": story["by"], "origin": story["origin"],
+        "holding": story["holding"],
     }
+    _safe("pause_history", lambda: _queue_pause_history(20))
     return JSONResponse(out)
 
 
@@ -17783,7 +19328,7 @@ var TABBLOCKS = {
   keys:'keys,providers',
   logs:'journal',
   maint:'resources,audit,services,drift',
-  audit:'audit'
+  audit:'audit,pause_history'
 };
 function stateUrl(){
   var p=['tabs='+encodeURIComponent(TABBLOCKS[ADM.tab]||'scheduler')];
@@ -17844,17 +19389,21 @@ function renderPauseBar(d){
   var el=document.getElementById('pausebar'); var p=d.pause||{all:false,providers:[]};
   var pausedProviders=p.providers||[];
   if(!p.all && !pausedProviders.length && !p.mine_prompt){ el.style.display='none'; return; }
+  /* Кнопка «возобновить» не снимает паузу сразу: сервер отвечает предпросмотром с
+     числами (act() показывает его и спрашивает ещё раз). origin попадает в журнал —
+     с сервера не видно, с какого экрана нажали. */
   var resumeButton=p.all
-    ? ' <button class="btn btn-sm" style="margin-left:10px" onclick="act(\'resume_queue\',{target:\'all\'})">Возобновить всю очередь</button>'
+    ? ' <button class="btn btn-sm" style="margin-left:10px" onclick="act(\'resume_queue\',{target:\'all\',origin:\'админ · полоса паузы\'})">Возобновить всю очередь</button>'
     : (p.mine_prompt
-      ? ' <button class="btn btn-sm" style="margin-left:10px" onclick="act(\'resume_queue\',{target:\'prompt_mine\'})">Возобновить тексты в моём профиле</button>'
+      ? ' <button class="btn btn-sm" style="margin-left:10px" onclick="act(\'resume_queue\',{target:\'prompt_mine\',origin:\'админ · полоса паузы\'})">Возобновить тексты в моём профиле</button>'
       : '');
   var pausedLabels=[];
   if(p.mine_prompt) pausedLabels.push('тексты и промпты вашего профиля');
   if(pausedProviders.length) pausedLabels.push(pausedProviders.map(esc).join(', '));
+  var lines=(p.lines||[]).map(function(t){ return '<div class=hint>'+esc(t)+'</div>'; }).join('');
   el.style.display='block';
   el.innerHTML='<div class="admalert warn"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-pause"/></svg> <b>'+(p.all?'Очередь на паузе':'На паузе: '+pausedLabels.join('; '))+
-    '</b> — новые задачи не запускаются. Уже идущие продолжают работу.'+resumeButton+'</div>';
+    '</b> — новые задачи не запускаются. Уже идущие продолжают работу.'+resumeButton+lines+'</div>';
 }
 
 /* ---------- ОБЗОР ---------- */
@@ -17930,8 +19479,8 @@ function servicesHtml(d){
 function providersHtml(d){
   var minePromptPaused=Boolean((d.pause||{}).mine_prompt);
   var promptControl=minePromptPaused
-    ? '<button class="btn btn-sm" onclick="act(\'resume_queue\',{target:\'prompt_mine\'})">Возобновить тексты в моём профиле</button>'
-    : '<button class="btn btn-sm btn-ghost" onclick="act(\'pause_queue\',{target:\'prompt_mine\'},null,\'Приостановить генерацию текстов и промптов только в моём профиле? Уже идущие задачи продолжат работу.\')">Приостановить тексты в моём профиле</button>';
+    ? '<button class="btn btn-sm" onclick="act(\'resume_queue\',{target:\'prompt_mine\',origin:\'админ · провайдеры\'})">Возобновить тексты в моём профиле</button>'
+    : '<button class="btn btn-sm btn-ghost" onclick="act(\'pause_queue\',{target:\'prompt_mine\',origin:\'админ · провайдеры\'},null,\'Приостановить генерацию текстов и промптов только в моём профиле? Уже идущие задачи продолжат работу.\')">Приостановить тексты в моём профиле</button>';
   var rows=(d.providers||[]).map(function(p){
     var lanes=Object.keys(p.lanes||{}).map(function(ln){
       var l=p.lanes[ln];
@@ -17960,8 +19509,8 @@ function providersHtml(d){
         '<div class=hint>в работе '+p.running+' · в очереди '+p.queued+'</div></div>'+
       '<div>'+(lanes||'<span class=hint>нет активных дорожек</span>')+resv+pool+'</div>'+
       '<div>'+(p.paused
-        ? '<button class="btn btn-sm" onclick="act(\'resume_queue\',{target:\''+esc(p.provider)+'\'})">Возобновить</button>'
-        : '<button class="btn btn-sm btn-ghost" onclick="act(\'pause_queue\',{target:\''+esc(p.provider)+'\'},null,\'Поставить '+esc(p.provider)+' на паузу? Идущие задачи продолжат работу.\')">Пауза</button>')+
+        ? '<button class="btn btn-sm" onclick="act(\'resume_queue\',{target:\''+esc(p.provider)+'\',origin:\'админ · провайдеры\'})">Возобновить</button>'
+        : '<button class="btn btn-sm btn-ghost" onclick="act(\'pause_queue\',{target:\''+esc(p.provider)+'\',origin:\'админ · провайдеры\'},null,\'Поставить '+esc(p.provider)+' на паузу? Идущие задачи продолжат работу.\')">Пауза</button>')+
       '</div></div>';
   }).join('');
   return '<div class=panel><div class=panel-title style="display:flex;justify-content:space-between;gap:12px;align-items:center"><span>Провайдеры: загрузка ключей и очередей</span>'+promptControl+'</div>'+
@@ -18170,9 +19719,22 @@ function renderMaint(d){
     '</div>'+
     '<div class=panel><div class=panel-title>Аварийный стоп</div>'+
     '<div class=row><button class="btn btn-sm btn-danger" onclick="act(\'pause_queue\',{target:\'all\'},null,\'Остановить выдачу новых задач по всей очереди?\')">Поставить всю очередь на паузу</button>'+
-    '<button class="btn btn-sm btn-secondary" onclick="act(\'resume_queue\',{target:\'all\'})">Возобновить</button></div>'+
+    '<button class="btn btn-sm btn-secondary" onclick="act(\'resume_queue\',{target:\'all\',origin:\'админ · обслуживание\'})">Возобновить</button></div>'+
     '<div class=hint style="margin-top:8px">Пауза переживает перезапуск сервиса: аварийный стоп не должен сниматься сам.</div></div>'+
     auditHtml(d);
+}
+function pauseJournalHtml(d){
+  /* Отдельной панелью, а не строкой в общем журнале: рубильник держит выпуски
+     неделями, и его история не должна тонуть между рестартами и сбросами паролей. */
+  var rows=(d.pause_history||[]).map(function(a){
+    return '<div class="admrow" style="grid-template-columns:auto 1fr 1.4fr">'+
+      '<div class=hint style="white-space:nowrap">'+esc(a.when||'')+'<div>'+esc(a.ago||'')+'</div></div>'+
+      '<div><b>'+esc(a.action||'')+'</b><div class=hint>'+esc(a.actor||'')+' · '+esc(a.origin||'')+'</div></div>'+
+      '<div class=hint style="word-break:break-word">'+esc(a.summary||'')+
+        (a.holding?'<div class=hint style="opacity:.75;white-space:pre-wrap">'+esc(a.holding)+'</div>':'')+'</div></div>';
+  }).join('');
+  return '<div class=panel><div class=panel-title>Журнал паузы очереди: кто, когда, что было и что стало</div><div class=admlist>'+
+    (rows||'<div class=hint>рубильник ещё не трогали</div>')+'</div></div>';
 }
 function auditHtml(d){
   var rows=(d.audit||[]).map(function(a){
@@ -18181,7 +19743,8 @@ function auditHtml(d){
       '<div><b>'+esc(a.action)+'</b><div class=hint>'+esc(a.admin||'')+' · '+esc(a.target||'')+'</div></div>'+
       '<div class=hint style="word-break:break-word">'+esc(a.result||'')+'</div></div>';
   }).join('');
-  return '<div class=panel><div class=panel-title>Журнал действий администратора</div><div class=admlist>'+
+  return pauseJournalHtml(d)+
+    '<div class=panel style="margin-top:12px"><div class=panel-title>Журнал действий администратора</div><div class=admlist>'+
     (rows||'<div class=hint>действий пока не было</div>')+'</div></div>';
 }
 function renderAudit(d){ document.getElementById('pane-audit').innerHTML=auditHtml(d); }
@@ -18330,4 +19893,7 @@ register_pub_routes(app, {
     "_now": _now,
     "web_user": web_user,
     "require_web_user": require_web_user,
+    # Кабинет обязан объяснять простой конвейер словами, а не молчать: что именно
+    # остановлено, с какого времени, кем и что держится прямо сейчас.
+    "queue_pause_story": _queue_pause_story,
 })

@@ -25,6 +25,12 @@
 Если между 1 и 2 процесс умер, при следующем reserve() вернётся состояние `reserved`:
 это НЕ разрешение повторить, а требование сходить к провайдеру и выяснить судьбу заказа.
 Единственное состояние, разрешающее новую попытку, — `failed`.
+
+Второе правило, младше первого: **начатый заказ продолжается только тем ключом, которым
+начат**. В строке закрепляется отпечаток ключа (`credential_id` — sha256 вендора и
+значения, сам ключ сюда не попадает никогда). Для чужого ключа заказа просто «нет», а
+«нет» неотличимо от «не создавался» — и следующим шагом стал бы второй платёж за тот же
+кадр. Проверка: `credential_conflict()` / `assert_same_credential()`.
 """
 
 from __future__ import annotations
@@ -33,6 +39,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 
@@ -66,6 +73,12 @@ def ensure_calls_schema(c: sqlite3.Connection) -> None:
         "provider TEXT NOT NULL DEFAULT '', "
         "model TEXT NOT NULL DEFAULT '', "
         "remote_order_id TEXT NOT NULL DEFAULT '', "
+        # Отпечаток КЛЮЧА, которым начат вызов (sha256 вендора и значения, см.
+        # shared/credential_budget.credential_identity). Не ключ и не его кусок:
+        # по отпечатку нельзя восстановить секрет, но можно ответить на два вопроса,
+        # на которые журнал до сих пор ответить не мог, — «сколько этот ключ уже
+        # съел» и «тем ли ключом мы продолжаем начатый заказ».
+        "credential_id TEXT NOT NULL DEFAULT '', "
         "status TEXT NOT NULL, "
         "result_path TEXT NOT NULL DEFAULT '', "
         "cost REAL, "
@@ -83,6 +96,14 @@ def ensure_calls_schema(c: sqlite3.Connection) -> None:
     # Поиск незавершённых при восстановлении после рестарта.
     c.execute("CREATE INDEX IF NOT EXISTS idx_calls_open "
               "ON provider_calls(status, updated)")
+    # Миграция баз, заведённых до отпечатка ключа. Пустая строка на старых строках —
+    # честный признак «ключ неизвестен»: правило «продолжать тем же ключом» на них не
+    # применяется, потому что применять его не к чему (см. credential_conflict).
+    for _col, _typ in [("credential_id", "TEXT NOT NULL DEFAULT ''")]:
+        try:
+            c.execute(f"ALTER TABLE provider_calls ADD COLUMN {_col} {_typ}")
+        except sqlite3.OperationalError:
+            pass                        # колонка уже есть — это и есть «идемпотентно»
     ensure_quota_schema(c)
 
 
@@ -99,9 +120,77 @@ def fingerprint(**parts) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
+# ── Отпечаток ключа задачи ───────────────────────────────────────────────────
+# Строку журнала для движка заводит HTTP-ручка (`POST /api/calls/reserve`), а движок
+# про отпечаток своего ключа не знает и знать не должен: ключ ему выдал кабинет, и
+# спрашивать у движка, чем он работает, — значит верить на слово тому, кого мы как раз
+# и страхуем. Поэтому отпечаток отдаёт кабинет по НОМЕРУ ЗАДАЧИ: он один решает, какой
+# ключ ушёл воркеру, и он же держит это в памяти, пока задача жива.
+_JOB_CREDENTIAL_RESOLVER = None
+
+
+def set_job_credential_resolver(fn) -> None:
+    """Подключить поиск отпечатка ключа по номеру задачи. None — снять."""
+    global _JOB_CREDENTIAL_RESOLVER
+    _JOB_CREDENTIAL_RESOLVER = fn
+
+
+def job_credential(job_id) -> str:
+    """Отпечаток ключа, выданного этой задаче. Пусто — неизвестен, и это не ошибка."""
+    fn = _JOB_CREDENTIAL_RESOLVER
+    if fn is None:
+        return ""
+    try:
+        return str(fn(job_id) or "")
+    except Exception:                                              # noqa: BLE001
+        return ""
+
+
+class CredentialMismatch(RuntimeError):
+    """Начатый заказ пытаются продолжить ДРУГИМ ключом."""
+
+
+def _row_value(row, column, default=""):
+    """Значение колонки, которой в этой строке может и не быть.
+
+    Строку могли прочитать из базы, ещё не прошедшей миграцию, — падать на этом
+    нельзя: журнал решает, можно ли повторять платный вызов, и он обязан отвечать
+    даже на неполных данных.
+    """
+    try:
+        return row[column]
+    except (IndexError, KeyError):
+        return default
+
+
+def credential_conflict(row, credential_id: str) -> bool:
+    """True — этим ключом продолжать нельзя.
+
+    Правило одно: заказ, начатый ключом A, продолжается только ключом A. Причина не
+    в аккуратности, а в деньгах. Идентификатор заказа выдан аккаунтом ключа A; ключ B
+    его не видит, и вопрос «что с моим заказом?» вернёт «нет такого» — то есть выглядеть
+    это будет как «заказа не было», а следующим шагом станет ВТОРОЙ оплаченный заказ
+    за тот же кадр. Пустой отпечаток с любой стороны — не конфликт: на строках, заведённых
+    до этой колонки, ключ неизвестен, и придумывать за них нельзя.
+    """
+    was = str(_row_value(row, "credential_id") or "")
+    now_id = str(credential_id or "")
+    return bool(was and now_id and was != now_id)
+
+
+def assert_same_credential(row, credential_id: str) -> None:
+    """Жёсткая форма того же правила для вызывающего, который идёт ДОПЛАЧИВАТЬ."""
+    if credential_conflict(row, credential_id):
+        raise CredentialMismatch(
+            "заказ начат другим ключом (…%s), продолжать этим (…%s) нельзя — "
+            "нужен ключ с тем же отпечатком либо разбор руками"
+            % (str(_row_value(row, "credential_id"))[:12], str(credential_id)[:12]))
+
+
 def reserve(c: sqlite3.Connection, *, tenant_id: str, project_id: str, kind: str,
             unit: str, fp: str, provider: str = "", model: str = "",
-            release_id: str = "", now: float | None = None) -> dict:
+            release_id: str = "", credential_id: str = "",
+            now: float | None = None) -> dict:
     """Заявить вызов ДО обращения к провайдеру.
 
     Возвращает {"action": …, "status": …, "call_id": …, "row": …}:
@@ -114,37 +203,83 @@ def reserve(c: sqlite3.Connection, *, tenant_id: str, project_id: str, kind: str
 
     Гонка двух воркеров разрешается уникальным индексом: проигравший получит `verify`,
     а не вторую заявку.
+
+    `credential_id` — отпечаток ключа, которым вызов делается СЕЙЧАС (не сам ключ).
+    В ответе к нему добавляются два поля:
+
+      credential_id         отпечаток, закреплённый за строкой
+      credential_mismatch   True — строка начата ДРУГИМ ключом
+
+    При `credential_mismatch` действие остаётся `verify` (никогда не `new`): второй
+    оплаченный заказ за тот же кадр хуже любой другой ошибки, поэтому выбор между
+    «спросить» и «заплатить» всегда решается в пользу «спросить». Продолжать заказ
+    этим ключом при этом НЕЛЬЗЯ — см. assert_same_credential.
     """
     now = time.time() if now is None else now
+    credential_id = str(credential_id or "")
     cur = c.execute(
         "INSERT OR IGNORE INTO provider_calls(tenant_id,project_id,release_id,kind,unit,"
-        "fingerprint,provider,model,status,attempts,created,updated) "
-        "VALUES(?,?,?,?,?,?,?,?,?,1,?,?)",
+        "fingerprint,provider,model,credential_id,status,attempts,created,updated) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,1,?,?)",
         (tenant_id, project_id, release_id, kind, unit, fp, provider, model,
-         RESERVED, now, now))
+         credential_id, RESERVED, now, now))
     row = c.execute(
         "SELECT * FROM provider_calls WHERE project_id=? AND kind=? AND unit=? "
         "AND fingerprint=?", (project_id, kind, unit, fp)).fetchone()
     if cur.rowcount == 1:
-        return {"action": "new", "status": RESERVED, "call_id": row["id"], "row": row}
+        return {"action": "new", "status": RESERVED, "call_id": row["id"], "row": row,
+                "credential_id": credential_id, "credential_mismatch": False}
 
     status = row["status"]
     action = _ACTION.get(status, VERIFY)
+    mismatch = credential_conflict(row, credential_id)
     if action == RETRY:
         # Прошлая попытка не дошла до заказа — открываем строку заново, считая попытку.
+        # Заказа не было, денег не было, значит и ключ не закреплён: новая попытка
+        # вправе пойти другим ключом, и отпечаток перезаписывается. Пустой новый
+        # отпечаток старый НЕ стирает: «не сказали, каким ключом» — не то же самое,
+        # что «ключ сменился».
         c.execute("UPDATE provider_calls SET status=?, error='', attempts=attempts+1, "
-                  "updated=? WHERE id=?", (RESERVED, now, row["id"]))
+                  "credential_id=COALESCE(NULLIF(?,''),credential_id), "
+                  "updated=? WHERE id=?", (RESERVED, credential_id, now, row["id"]))
         row = c.execute("SELECT * FROM provider_calls WHERE id=?", (row["id"],)).fetchone()
-        return {"action": "new", "status": RESERVED, "call_id": row["id"], "row": row}
-    return {"action": action, "status": status, "call_id": row["id"], "row": row}
+        return {"action": "new", "status": RESERVED, "call_id": row["id"], "row": row,
+                "credential_id": str(_row_value(row, "credential_id") or ""),
+                "credential_mismatch": False}
+    return {"action": action, "status": status, "call_id": row["id"], "row": row,
+            "credential_id": str(_row_value(row, "credential_id") or ""),
+            "credential_mismatch": mismatch}
 
 
 def mark_ordered(c: sqlite3.Connection, call_id: int, remote_order_id: str,
-                 now: float | None = None) -> None:
-    """Заказ создан. С этого момента повтор запрещён — только проверка существующего."""
+                 credential_id: str = "", now: float | None = None) -> None:
+    """Заказ создан. С этого момента повтор запрещён — только проверка существующего.
+
+    Здесь же за строкой закрепляется ключ. Закрепление проверяется, а не просто
+    записывается: попытка привязать к начатому заказу ВТОРОЙ отпечаток означает, что
+    выше по стеку потеряли связь «этот заказ — этого ключа», и дальше такая строка
+    разрешила бы «продолжить» заказ в чужом аккаунте. Это ошибка программиста, и она
+    должна быть слышна сразу, а не превратиться в лишний платёж через неделю.
+
+    ВНИМАНИЕ ТОМУ, КТО ПОДКЛЮЧИТ `credential_id` К ВЫЗЫВАЮЩИМ. Сегодня ни один из них
+    отпечаток не передаёт (pub_calls_api.py:91, pub_services.py:309), поэтому проверка
+    ниже не срабатывает никогда. Как только отпечаток появится, ручку
+    `POST /api/calls/{id}/ordered` придётся чинить вместе с ним: она зовёт mark_ordered
+    СРАЗУ ПОСЛЕ создания ПЛАТНОГО заказа, и необработанное исключение уедет движку как
+    500 уже после списания денег. Ручка обязана поймать CredentialMismatch и ответить
+    словами «заказ начат другим ключом», оставив строку в `reserved`: `failed` —
+    единственное состояние, разрешающее ВТОРОЙ платный заказ за тот же кадр.
+    """
     now = time.time() if now is None else now
-    c.execute("UPDATE provider_calls SET status=?, remote_order_id=?, updated=? "
-              "WHERE id=?", (ORDERED, str(remote_order_id or ""), now, call_id))
+    credential_id = str(credential_id or "")
+    if credential_id:
+        row = c.execute("SELECT * FROM provider_calls WHERE id=?", (call_id,)).fetchone()
+        if row is not None:
+            assert_same_credential(row, credential_id)
+    c.execute("UPDATE provider_calls SET status=?, remote_order_id=?, "
+              "credential_id=COALESCE(NULLIF(?,''),credential_id), updated=? "
+              "WHERE id=?", (ORDERED, str(remote_order_id or ""), credential_id,
+                             now, call_id))
 
 
 def mark_delivered(c: sqlite3.Connection, call_id: int, result_path: str,
@@ -155,6 +290,65 @@ def mark_delivered(c: sqlite3.Connection, call_id: int, result_path: str,
     now = time.time() if now is None else now
     c.execute("UPDATE provider_calls SET status=?, result_path=?, cost=?, error='', "
               "updated=? WHERE id=?", (DELIVERED, result_path, cost, now, call_id))
+
+
+# ── Редактура секретов на записи в колонку error ─────────────────────────────
+# Текст отказа провайдера приезжает сюда ДВУМЯ путями: из кабинета (pub_services) и по
+# HTTP от движка, который может работать на другой машине (POST /api/calls/{id}/failed).
+# В ответе провайдера бывает наш же ключ или подписанный URL, а редактор кабинета
+# (_redact_worker_output) стоит только на стриме логов — второй путь писал в SQLite как
+# есть. Ставим редактуру в ЕДИНСТВЕННОЕ место записи: так её нельзя обойти, заведя
+# третий путь. Сам журнал про секреты кабинета не знает и знать не должен — редактор
+# подкладывает тот, кто их знает (server/main.py).
+#
+# НО опираться на то, что кабинет импортирован, нельзя. `set_error_redactor` вызывается
+# побочным эффектом импорта server/main.py; при голом `import pub_calls` (отдельный
+# процесс обслуживания, будущий сервис, тест) редактора не было бы вовсе, и сырой ответ
+# провайдера лёг бы в SQLite — ровно тот сценарий, который эта правка закрывает. Поэтому
+# ниже стоит СОБСТВЕННЫЙ консервативный редактор по образцу строки, а подключаемый —
+# уточнение поверх него (он знает конкретные значения ключей и вырезает их точно).
+_ERROR_REDACTOR = None
+
+# Что режем без всякого знания о ключах: `sk-…`-подобные токены, значение после слов
+# вроде api key/token/authorization и подпись в query подписанного URL. Список нарочно
+# узкий: редактор по образцу обязан вырезать секрет, но не имеет права съесть причину
+# отказа — по ней решают, можно ли повторять платный вызов.
+_SECRET_LIKE_RE = re.compile(
+    r"(?:sk|rk|pk|api)-[A-Za-z0-9_\-]{12,}"
+    r"|(?:api[-_ ]?key|apikey|access[-_ ]?token|refresh[-_ ]?token|authorization|"
+    r"bearer|x-api-key)[\"']?\s*[:=]\s*[\"']?[A-Za-z0-9_\-\.]{12,}"
+    r"|[?&](?:x-amz-signature|signature|sig|token|apikey|api_key|key)=[^&\s\"']{8,}",
+    re.I)
+
+
+def set_error_redactor(fn) -> None:
+    """Подключить редактуру секретов для колонки error. None — снять."""
+    global _ERROR_REDACTOR
+    _ERROR_REDACTOR = fn
+
+
+def default_redactor(text: str) -> str:
+    """Редактура по образцу: работает всегда, даже когда кабинет не импортирован."""
+    return _SECRET_LIKE_RE.sub("[REDACTED]", str(text or ""))
+
+
+def _redacted(error: str) -> str:
+    text = str(error or "")
+    if not text:
+        return text
+    fn = _ERROR_REDACTOR
+    if fn is None:
+        return default_redactor(text)
+    try:
+        # Сначала точная редактура (знает значения ключей), потом сетка по образцу:
+        # ключ ПАРТНЁРА, заведённый после последнего обновления кэша секретов, точной
+        # редактуре ещё неизвестен, а на образец он похож.
+        return default_redactor(str(fn(text)))
+    except Exception:                                          # noqa: BLE001
+        # Редактор сломался — сырой текст в базу НЕ кладём. Строка журнала ценна сама
+        # по себе (она решает, можно ли повторять вызов), а нередактированный текст
+        # может нести ключ, и отсюда он уйдёт на экран и в выгрузки.
+        return "текст отказа скрыт: редактура секретов не отработала"
 
 
 def mark_failed(c: sqlite3.Connection, call_id: int, error: str,
@@ -170,12 +364,20 @@ def mark_failed(c: sqlite3.Connection, call_id: int, error: str,
     повтор разрешён только на явный 429.
     """
     now = time.time() if now is None else now
+    # Режем ПОСЛЕ редактуры: «[REDACTED]» длиннее ключа, и обрезка до неё оставила бы
+    # в базе хвост секрета. Своей обрезкой мы, впрочем, распоряжаемся только здесь:
+    # по дороге сюда текст режут ещё четверо (воркер — detail[:300], call_journal —
+    # [:500], pub_calls_api — [:500], pub_services — [:400]), и ключ, попавший на
+    # границу ЛЮБОЙ из них, приезжает огрызком, которого точная редактура по значению
+    # уже не найдёт. Поэтому редактор кабинета вырезает и длинные НАЧАЛА ключа
+    # (main._cut_secret_prefixes), а здешняя сетка по образцу ловит то, чего он не знал.
+    text = _redacted(error)[:500]
     if ordered:
         c.execute("UPDATE provider_calls SET error=?, updated=? WHERE id=?",
-                  (str(error or "")[:500], now, call_id))
+                  (text, now, call_id))
         return
     c.execute("UPDATE provider_calls SET status=?, error=?, updated=? WHERE id=?",
-              (FAILED, str(error or "")[:500], now, call_id))
+              (FAILED, text, now, call_id))
 
 
 def open_calls(c: sqlite3.Connection, project_id: str) -> list:
