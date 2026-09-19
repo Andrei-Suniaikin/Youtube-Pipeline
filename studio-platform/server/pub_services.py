@@ -21,9 +21,16 @@ import hashlib
 import json
 import os
 import sqlite3
+import time
 
 import pub_calls
 from pub_engine import ItemFailed, ResourceDown
+# Фазу выпуска двигает не только движок: проход «забрать уже оплаченное» (в конце
+# файла) доводит до `source_ready` текст, который сосед написал ещё во время паузы.
+# Охрана по статусу («владелец мог отменить выпуск, пока мы ходили в сеть») обязана
+# быть одна на всех, поэтому берём ту же функцию, а не переписываем UPDATE рядом.
+from pub_engine import DEFAULT_DEADLINE, PHASE_DEADLINES, log_phase
+from pub_engine import _set as set_release_fields
 from pub_log import add as log_line
 from pub_neighbors import rewrite_preset_config
 from pub_publish import (
@@ -1063,3 +1070,346 @@ def describe_waiting(reason: str) -> str:
         return ""
     text = reason.replace("ждём: ", "")
     return text[:200]
+
+
+# ════════════ проход «забрать уже оплаченное» (19.09.2026) ════════════
+#
+# Зачем он есть. Движок выпусков стоит на паузе с 31.08, а рерайт всё это время
+# доделывал заказанное: в кабинете владельца 146 задач со статусом completed —
+# текст написан, ОПЛАЧЕН и лежит у соседа, но никем не забран. Ещё 187 выпусков
+# ждут в очереди. Снять паузу ради этих текстов нельзя: пауза держит НОВЫЕ траты,
+# и вместе с забором готового поехали бы новые заказы озвучки, картинок и рендера.
+#
+# Поэтому забор сделан отдельным проходом, который невозможно перепутать с работой
+# движка:
+#   * он никогда не зовёт `create_job` и вообще ничего не заказывает;
+#   * он ходит ТОЛЬКО по уже записанному номеру задачи — нашему (`pub_release_jobs`)
+#     или записанному в журнале оплат (`provider_calls.remote_order_id`);
+#   * он не снимает паузу и не обходит её: тратить ему нечего, спрашивать не о чем;
+#   * пропавшая у соседа задача (404/410) НЕ превращается в новый заказ — строка
+#     помечается `missing` и ждёт человека, ровно как в штатном пути;
+#   * текст принимается той же приёмкой по доле донора, что и обычно.
+#
+# Правило проекта «повтор чтения безопасен, повтор оплачиваемого создания — нет»
+# здесь выполняется буквально: проход состоит из одних чтений.
+
+# Что у соседа значит «готово», а что «не справился». Слова у разных версий рерайта
+# разные (`done` у нашего форка, `completed` у боевого 18.09), поэтому списком.
+REWRITE_DONE = ("done", "completed", "finished", "success")
+REWRITE_BAD = ("error", "failed", "cancelled")
+
+# Строки о задаче, которые проход не трогает: `done` — текст уже забран,
+# `missing` — сосед уже сказал «такой задачи нет», и до разбора человеком повторный
+# стук ничего не изменит, а строку он бы перетирал.
+COLLECT_SKIP_JOB = ("done", "missing")
+
+# Сколько задач опрашивать за один проход по умолчанию. Каждая задача — это запрос
+# статуса и скачивание файла, то есть до TIMEOUT секунд на неотвечающей; 146 штук
+# подряд держали бы запрос пульта минутами, и экран выглядел бы зависшим. Ответ
+# честно говорит, сколько осталось, — кнопку жмут ещё раз.
+# `limit=0` в аргументе снимает ограничение: так проход зовут из консоли, когда
+# ждать некому.
+COLLECT_BATCH = int(os.environ.get("VS_COLLECT_BATCH", "25"))
+
+# Что случилось с каждым выпуском — кодом для машины и словами для экрана.
+COLLECT_REASONS = {
+    "taken": "текст забран, фаза двинута",
+    "waiting": "у соседа ещё не готово",
+    "missing": "задача пропала у соседа — нужен разбор, повтор оплачивается заново",
+    "failed": "сосед сообщил об отказе по задаче",
+    "rejected": "текст пришёл, но не прошёл приёмку",
+    "ask_failed": "статус задачи спросить не удалось",
+    "cancelled": "выпуск отменён, пока шёл проход",
+}
+
+
+def _text_only_services() -> PubServices:
+    """Обработчик стадий для прохода, которому нечего заказывать.
+
+    Проходу нужны только четыре вещи из `PubServices`: приёмка текста по длине,
+    сохранение текста, закрытие строки журнала оплат и отметка исхода задачи. Ни
+    создание проекта, ни очередь кабинета ему не нужны — он забирает готовый файл.
+    Заглушки стоят намеренно и падают громко: если через них кто-то позовёт стадию,
+    это ошибка вызова, а не тихий пропуск оплаченной работы.
+    """
+    def _refuse(*_a, **_kw):
+        raise RuntimeError("проход «забрать оплаченное» ничего не заказывает "
+                           "и не создаёт проектов")
+
+    return PubServices({"create_project": _refuse, "enqueue": _refuse,
+                        "project_dir": _refuse})
+
+
+def _dicts(cur) -> list:
+    """Строки запроса словарями независимо от `row_factory` соединения.
+
+    Кабинет всегда ставит `sqlite3.Row`, но проход зовут и из пульта, и из консоли,
+    и с чужим соединением: `dict(row)` на голом кортеже падает, а разбирать это в
+    чужом процессе дорого. Имена берём из описания курсора — они есть всегда.
+    """
+    names = [d[0] for d in (cur.description or [])]
+    return [dict(zip(names, row)) for row in cur.fetchall()]
+
+
+def paid_text_candidates(c, tenant_id: str = "", release_ids=None,
+                         include_blocked: bool = False) -> list:
+    """Выпуски, за текст которых уже заплачено, а текста у нас нет.
+
+    Два источника номера задачи, и оба — уже записанные, ни одного нового:
+
+      * `pub_release_jobs` (service='rewrite', kind='job') — наша копия «что заказано
+        соседу». Обычный случай тех самых 146;
+      * `provider_calls.remote_order_id` со статусом `ordered` — журнал оплат. Сюда
+        попадают выпуски, у которых наша строка о задаче потерялась (ручной сброс,
+        переезд базы): деньги записаны, номер известен, спрашивать по нему безопасно.
+        Штатный путь их тоже подхватывает, но только после повторной загрузки
+        субтитров донора — ради того же номера это лишняя работа и лишний риск.
+
+    Берём только фазу `created`: текст забирается ровно на переходе «заведён → текст
+    готов», дальше его уже забрали. Выпуски в разборе (`blocked`) по умолчанию не
+    трогаем — их остановил человек или движок, и возвращать их в работу это решение
+    человека (`pub_engine.revive`), а не побочный эффект забора текста.
+    """
+    live = ["pending", "running"] + (["blocked"] if include_blocked else [])
+    where = ["r.phase='created'", "r.status IN (%s)" % ",".join("?" * len(live))]
+    args = list(live)
+    if tenant_id:
+        where.append("r.tenant_id=?")
+        args.append(str(tenant_id))
+    ids = [str(x) for x in (release_ids or []) if str(x).strip()]
+    if ids:
+        where.append("r.release_id IN (%s)" % ",".join("?" * len(ids)))
+        args += ids
+    # Текст уже лежит у нас — забирать нечего, чем бы ни кончилась строка задачи.
+    no_text = ("NOT EXISTS(SELECT 1 FROM pub_release_jobs t WHERE t.release_id=r.release_id"
+               " AND t.service='rewrite' AND t.kind='text')")
+    head = ("SELECT r.release_id, r.tenant_id, r.project_id, r.status rel_status, "
+            "r.slot_at, ch.name ch_name, ch.lang lang, p.donor_title donor_title, ")
+    common = ("FROM pub_releases r JOIN pub_channels_live ch ON ch.id=r.channel_id "
+              "JOIN pub_plan_items p ON p.id=r.plan_item_id ")
+
+    out, seen = [], set()
+    own = _dicts(c.execute(
+        head + "j.remote_job_id job_id, j.payload payload, j.status job_status, "
+        "j.updated ordered_at, 'job' src " + common +
+        "JOIN pub_release_jobs j ON j.release_id=r.release_id AND j.service='rewrite' "
+        "AND j.kind='job' WHERE " + " AND ".join(
+            where + ["IFNULL(j.remote_job_id,'')<>''",
+                     "j.status NOT IN (%s)" % ",".join("?" * len(COLLECT_SKIP_JOB)),
+                     no_text]) + " ORDER BY r.slot_at",
+        args + list(COLLECT_SKIP_JOB)))
+    for row in own:
+        out.append(row)
+        seen.add(row["release_id"])
+
+    try:
+        paid = _dicts(c.execute(
+            head + "pc.remote_order_id job_id, NULL payload, '' job_status, "
+            "pc.updated ordered_at, 'calls' src " + common +
+            "JOIN provider_calls pc ON pc.release_id=r.release_id AND pc.kind='text' "
+            # Язык и есть единица этой строки журнала — та же пара (выпуск, язык),
+            # по которой штатный путь закрывает оплату (`_close_text_call`).
+            "AND pc.unit=COALESCE(NULLIF(ch.lang,''),'ru') AND pc.status='ordered' "
+            "WHERE " + " AND ".join(
+                where + ["IFNULL(pc.remote_order_id,'')<>''", no_text,
+                         "NOT EXISTS(SELECT 1 FROM pub_release_jobs j "
+                         "WHERE j.release_id=r.release_id AND j.service='rewrite' "
+                         "AND j.kind='job')"]) + " ORDER BY r.slot_at, pc.id DESC",
+            args))
+    except sqlite3.OperationalError:
+        # База старше журнала оплат. Это не повод ронять проход: свой источник
+        # номеров у него уже есть.
+        paid = []
+    for row in paid:
+        if row["release_id"] in seen:
+            continue                 # одна задача на выпуск, дубля быть не должно
+        out.append(row)
+        seen.add(row["release_id"])
+    return out
+
+
+def paid_texts_waiting(c, tenant_id: str = "", include_blocked: bool = False,
+                       now: float = None) -> list:
+    """То же самое для экрана «оплачено, но не забрано»: без единого сетевого запроса.
+
+    Экран обязан открываться, даже когда сосед лежит: он отвечает на вопрос «за что
+    уже заплачено», а не «что сосед думает об этом сейчас».
+    """
+    moment = time.time() if now is None else now
+    rows = paid_text_candidates(c, tenant_id=tenant_id, include_blocked=include_blocked)
+    for row in rows:
+        row["waiting_sec"] = max(0.0, moment - float(row.get("ordered_at") or moment))
+    return rows
+
+
+def _take_paid_text(c, svc, client, item: dict, now: float) -> tuple:
+    """Забрать текст одной уже оплаченной задачи. Возвращает (код, словами, знаков).
+
+    Ничего не заказывает: единственное обращение к соседу — статус задачи и файл
+    результата по её номеру.
+    """
+    rid = item["release_id"]
+    job_id = str(item["job_id"])
+    # Обработчикам нужен «выпуск» с четырьмя полями: по ним пишется журнал, ищется
+    # строка оплаты и принимается текст. Время ставим текущее — оно уходит в отметки
+    # created/updated сохранённого текста.
+    rel = {"release_id": rid, "tenant_id": item["tenant_id"],
+           "project_id": item["project_id"], "lang": item["lang"] or "ru",
+           "updated": now}
+
+    if item.get("src") == "calls":
+        # Номер задачи взят из журнала оплат: восстановим свою строку, иначе исход
+        # (готово/пропала) записать некуда и движок после паузы спросит заново.
+        svc._remember_remote(c, rid, "rewrite", job_id, now)
+        log_line(c, rid, "рерайт",
+                 f"задача {job_id} числится оплаченной в журнале — подхватываю её, "
+                 f"нового заказа не создаю", level="warn", now=now)
+
+    try:
+        info = client.job(job_id)
+    except RemoteJobMissing as exc:
+        # Ровно то же, что делает штатный путь: пометить пропажу и остановиться.
+        # Заказать заново значит заплатить второй раз за тот же текст.
+        svc._close_text_call(c, rel, error=str(exc))
+        svc._finish_remote(c, rid, "rewrite", "missing", str(exc))
+        log_line(c, rid, "рерайт", str(exc), level="error", now=now)
+        c.commit()
+        return ("missing", str(exc)[:200], 0)
+    except ResourceDown:
+        raise                      # сосед лёг — это дело всего прохода, не строки
+    except Exception as exc:       # noqa: BLE001
+        # Спросить не вышло, а судьба задачи неизвестна. Ничего не помечаем: запись
+        # «не справился» по неудавшемуся вопросу стоила бы оплаченного текста.
+        return ("ask_failed", str(exc)[:200], 0)
+
+    state = str(info.get("status") or "").lower()
+    if state in REWRITE_BAD:
+        reason = "рерайт не справился: " + str(info.get("error") or state)
+        svc._close_text_call(c, rel, error=reason)
+        svc._finish_remote(c, rid, "rewrite", "error", reason)
+        log_line(c, rid, "рерайт", reason, level="error", now=now)
+        c.commit()
+        return ("failed", reason[:200], 0)
+    if state not in REWRITE_DONE:
+        return ("waiting", f"у соседа «{state or 'без статуса'}»", 0)
+
+    donor_chars = PubServices._donor_chars(item)
+    try:
+        code = client.result_code(info, rel["lang"])
+        text = client.result_text(job_id, code)
+        svc._check_text_length(c, rel, text, donor_chars)
+        svc.store_source_text(c, rid, text, now)
+    except ResourceDown:
+        raise
+    except Exception as exc:       # noqa: BLE001
+        svc._close_text_call(c, rel, error=str(exc))
+        svc._finish_remote(c, rid, "rewrite", "error", str(exc))
+        c.commit()
+        return ("rejected", str(exc)[:200], 0)
+
+    svc._close_text_call(c, rel, result=job_id)
+    svc._finish_remote(c, rid, "rewrite", "done")
+    body = len(text.strip())
+    share = (f", {body / donor_chars * 100:.1f}% донора" if donor_chars > 0 else "")
+
+    # Двигаем фазу той же функцией, что и движок: охрана по статусу должна быть одна
+    # на всех. Владелец мог отменить выпуск, пока мы ходили к соседу, — воскрешать
+    # его отсюда нельзя.
+    moved = set_release_fields(
+        c, rid, now, phase="source_ready", status="running", heartbeat=now,
+        blocked_reason=None,
+        deadline=now + PHASE_DEADLINES.get("source_ready", DEFAULT_DEADLINE))
+    if not moved:
+        # Текст всё равно сохранён: он оплачен, и терять его из-за отмены незачем.
+        # Фаза неживого выпуска — не наше дело.
+        log_line(c, rid, "рерайт",
+                 f"текст забран ({body} символов{share}), но выпуск уже не в работе — "
+                 f"фазу не двигаю", level="warn", now=now)
+        c.commit()
+        return ("cancelled", "выпуск отменён, пока шёл проход — текст сохранён", body)
+
+    log_line(c, rid, "рерайт",
+             f"текст забран проходом «оплачено, но не забрано»: {body} символов{share}, "
+             f"задача {job_id} заказана раньше, нового заказа не создавал", now=now)
+    log_phase(c, rid, "source_ready", now, payload={"chars": body})
+    log_line(c, rid, "движок", "шаг «source_ready» готов", now=now)
+    c.commit()
+    return ("taken", f"{body} символов{share}", body)
+
+
+def collect_paid_texts(c, tenant_id: str = "", release_ids=None,
+                       limit: int = COLLECT_BATCH, now: float = None,
+                       include_blocked: bool = False, services=None) -> dict:
+    """Забрать у рерайта тексты, за которые уже заплачено. Ничего не заказывает.
+
+    Соединение — кабинета, как его отдаёт `main.db()` (с `row_factory=sqlite3.Row`):
+    исход записывается в журнал оплат, а он читается по именам колонок. Чтение
+    кандидатов (`paid_text_candidates`, `paid_texts_waiting`) работает с любым
+    соединением — экран не должен зависеть от того, кто его открыл.
+
+    Аргументы:
+      tenant_id       ограничить кабинетом (пусто — все);
+      release_ids     ограничить списком выпусков (пусто — все подходящие);
+      limit           сколько задач опросить за проход; 0 или меньше — без предела;
+      now             момент времени (для тестов);
+      include_blocked брать и выпуски в разборе (по умолчанию нет, см.
+                      `paid_text_candidates`);
+      services        готовый `PubServices`, если он уже собран вызывающим.
+
+    Ответ:
+      {"candidates": сколько выпусков подходит под проход,
+       "checked":    у скольких спросили статус,
+       "taken":      сколько текстов забрано и фаз двинуто,
+       "skipped":    сколько опрошенных остались без текста,
+       "left":       сколько подходящих не опрошено (предел или остановка),
+       "stopped":    "" или причина, по которой проход прекратился,
+       "by_reason":  {код: сколько раз} — коды из COLLECT_REASONS,
+       "items":      [{"release_id","channel","job_id","lang","result","note","chars"}]}
+    """
+    moment = time.time() if now is None else now
+    out = {"candidates": 0, "checked": 0, "taken": 0, "skipped": 0, "left": 0,
+           "stopped": "", "by_reason": {}, "items": []}
+
+    key = get_key(c, "rewrite")
+    if not key:
+        # Не отказ строки, а ненастроенный кабинет: сказать словами и не делать вид,
+        # что проход отработал.
+        out["stopped"] = "не сохранён ключ доступа к рерайту"
+        return out
+    client = RewriteClient(key)
+    svc = services or _text_only_services()
+
+    rows = paid_text_candidates(c, tenant_id=tenant_id, release_ids=release_ids,
+                                include_blocked=include_blocked)
+    out["candidates"] = len(rows)
+    todo = rows if limit is None or limit <= 0 else rows[:limit]
+    out["left"] = len(rows) - len(todo)
+
+    for item in todo:
+        try:
+            reason, note, chars = _take_paid_text(c, svc, client, item, moment)
+        except ResourceDown as exc:
+            # Сосед лёг, ключ не принят, упёрлись в его лимит запросов. Стучаться
+            # оставшимися сотнями бессмысленно и вредно: ждёт весь проход целиком.
+            out["stopped"] = str(exc)
+            out["left"] = len(rows) - out["checked"]
+            break
+        except Exception as exc:                                   # noqa: BLE001
+            # Одна строка не имеет права уронить проход: остальные тексты оплачены
+            # так же, как эта.
+            reason, note, chars = "ask_failed", str(exc)[:200], 0
+        out["checked"] += 1
+        out["by_reason"][reason] = out["by_reason"].get(reason, 0) + 1
+        if reason == "taken":
+            out["taken"] += 1
+        else:
+            out["skipped"] += 1
+        out["items"].append({"release_id": item["release_id"],
+                             "channel": item["ch_name"] or "",
+                             "job_id": str(item["job_id"]), "lang": item["lang"] or "ru",
+                             "result": reason, "note": note, "chars": chars})
+    # Ветки «ещё не готово» ничего не пишут, но подхваченная из журнала оплат строка
+    # о задаче — пишет, и потерять её из-за незакрытой записи было бы обидно: на
+    # следующем проходе выпуск снова искали бы длинным путём.
+    c.commit()
+    return out
