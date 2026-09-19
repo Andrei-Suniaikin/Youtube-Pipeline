@@ -27,6 +27,16 @@ BACKGROUND_ENABLED = os.environ.get("VS_SERVER_DISABLE_BACKGROUND", "").strip().
 # even when background workers are disabled in tests.
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
+# render/ — общий каталог кабинета и рендер-ноды. Там лежит render_narration.py: ОДИН файл
+# на обе стороны, а не две похожие реализации. Сервер закрепляет набор файлов озвучки при
+# выдаче задачи, нода тем же кодом его проверяет — расхождение выбора невозможно по
+# построению. Копию в server/ не заводим: две копии разъедутся, и в ролике окажется не тот
+# звук, про который написано в логе (ровно та ловушка, что уже случилась с 14 дублями
+# desktop↔server). Путь добавляется в КОНЕЦ sys.path — каталог чужой, затенять им наши
+# модули нечем и незачем; сам импорт ленивый, внутри render_claim.
+RENDER_DIR = os.path.join(os.path.dirname(HERE), "render")
+if RENDER_DIR not in sys.path:
+    sys.path.append(RENDER_DIR)
 import card_jobs as card_contract
 import preset_links
 from pub_calls import ensure_calls_schema, node_disk, note_node_disk
@@ -2091,7 +2101,14 @@ def init_db():
                        ("lane", "TEXT"),
                        # рендер (kind='render', исполняется удалённым пуллером, НЕ локальным шедулером):
                        ("progress", "REAL"), ("output_rel", "TEXT"), ("error", "TEXT"),
-                       ("claimed", "REAL"), ("stage", "TEXT"), ("claim_token", "TEXT")]:
+                       ("claimed", "REAL"), ("stage", "TEXT"), ("claim_token", "TEXT"),
+                       # квитанция о рендере: sha256 и размер ПРИНЯТОГО mp4 и хэш текста
+                       # ошибки. По ним нода сверяет, что её результат доехал целым, и
+                       # только тогда удаляет свою копию. На строках, принятых до этой
+                       # правки, значения NULL — и это честный признак «квитанции нет»:
+                       # уборка исходников по такому рендеру ничего сносить не вправе.
+                       ("render_sha256", "TEXT"), ("render_size", "INTEGER"),
+                       ("render_error_sha256", "TEXT")]:
         try:
             c.execute(f"ALTER TABLE queue_tasks ADD COLUMN {_col} {_typ}")
         except Exception:
@@ -2225,6 +2242,14 @@ async def _lifespan(app):
     except Exception:
         log_exc("_lifespan/byok_pool_hint")
     if BACKGROUND_ENABLED:
+        try:
+            # Первым делом — огрызки прерванных заливок рендера. Именно рестарт их и
+            # порождает (деплой, OOM, kill), поэтому старт сервиса и есть тот момент,
+            # когда их гарантированно никто не пишет: нода про свой оборванный запрос
+            # уже забыла и спросит квитанцию заново.
+            _sweep_incoming_renders()
+        except Exception:
+            log_exc("_lifespan/incoming_renders")
         try:
             threading.Thread(target=_pub_engine_loop, daemon=True,
                              name="pub-engine").start()
@@ -2942,33 +2967,60 @@ def _narration_dirs(proj):
 
 
 def _narration_conflict(tid, pid, settings=None):
-    """Почему рендер запускать нельзя, пока озвучек несколько. Пусто — всё однозначно.
+    """Почему кабинет не может выбрать основную озвучку. Пусто — выбор однозначен.
 
-    Рендер-нода собирает ВСЕ `_FINAL_AUDIO_*` рекурсивно и склеивает их в одну дорожку
-    (об этом же предупреждает комментарий у `_ENGINE_AUDIO_DIR`). Поэтому две сохранившиеся
-    озвучки — это не выбор из двух, а гарантированно задвоенный звук в готовом ролике.
-    Штатно лишние папки сносит `_clear_other_audio_dirs` перед НОВОЙ озвучкой, но проект
-    доезжает до рендера и в обход: движок сменили после озвучки, задача упала на полпути,
-    материалы пришли из старого проекта.
+    ОДИН ИСТОЧНИК ПРАВДЫ. Раньше здесь жило собственное правило («папок с mp3 больше
+    одной — стоп»), а на выдаче задачи работало другое — `render_narration.select_narration`,
+    тот самый модуль, которым выбирает файлы и нода. Два правила отвечали по-разному:
+    своё не видело папку с wav и не отличало «папка не того движка», зато запрещало
+    случай, который модуль разбирает прекрасно (две папки при ЯВНО выбранном движке).
+    Хуже того, расхождение было односторонним: своё правило стояло гейтом в
+    `_render_inputs_ready`, поэтому задача с таким проектом просто не попадала в
+    кандидаты на выдачу — и человеческую причину из `select_narration` не видел никто,
+    задача молча висела в очереди «нет задач».
 
-    Мы только останавливаем и объясняем. Удалять готовую озвучку за человека нельзя: она
-    оплачена, и какую из двух оставить — решение владельца, а не догадка кабинета.
+    Теперь правило ровно одно — модуль, а эта функция только ПЕРЕСКАЗЫВАЕТ его отказ
+    человеку и добавляет то, чего модуль не знает: что именно лежит в проекте и какая
+    папка соответствует выбранному движку. Никаких собственных условий здесь нет.
+
+    Удалять готовую озвучку за человека по-прежнему нельзя: она оплачена, и какую из
+    двух оставить — решение владельца, а не догадка кабинета.
     """
-    dirs = _narration_dirs(_project_dir(tid, pid))
-    if len(dirs) < 2:
+    proj = _project_dir(tid, pid)
+    # «Озвучки нет вовсе» — не конфликт, а отдельный ответ `_materials_ready`, и
+    # спрашивать про него модуль незачем: без единой папки `_FINAL_AUDIO_*` он ушёл бы
+    # искать аудио рекурсивно по всему проекту, а это сотни stat'ов на каждую отрисовку
+    # карточки проекта. Выбор при этом тот же самый — пусто.
+    if not glob.glob(os.path.join(proj, "_FINAL_AUDIO_*")):
         return ""
     if settings is None:
         _p = _get_project(tid, pid)
         settings = _psettings(_p) if _p else {}
-    eng = str((settings or {}).get("engine") or (settings or {}).get("tts_engine")
-              or "").strip().lower()
+    snapshot = dict(settings or {})
+    # Закрепление ПРОШЛОГО захвата — не ответ на вопрос «что выберется сейчас»: модуль
+    # просто проверил бы старый список. Ровно так же его выбрасывает и render_claim.
+    snapshot.pop("narration_files", None)
+    try:
+        from render_narration import select_narration
+        select_narration(proj, snapshot)
+        return ""
+    except ValueError as exc:
+        why = str(exc)
+    except Exception:
+        # Модуль не импортировался. Пугать человека нечем: рендер в этом случае всё
+        # равно не выдаётся (render_claim вернёт wait_reason="narration"), а выдумывать
+        # причину за сломанный модуль — врать.
+        log_exc("_narration_conflict")
+        return ""
+    dirs = _narration_dirs(proj)
+    eng = str(snapshot.get("engine") or snapshot.get("tts_engine") or "").strip().lower()
     want = _ENGINE_AUDIO_DIR.get(eng)
     tail = (f"Сейчас в проекте выбран движок «{eng}» — его папка {want}. "
             if want else "Движок озвучки в проекте не выбран. ")
-    return ("В проекте несколько озвучек: " + ", ".join(dirs) + ". Рендер склеил бы их в "
-            "одну дорожку, поэтому он остановлен. " + tail +
-            "Оставьте одну папку (лишнюю удалите) или переозвучьте нужным движком — "
-            "тогда лишние папки уберутся сами.")
+    here = ("Папки озвучки в проекте: " + ", ".join(dirs) + ". ") if dirs else ""
+    return (why + ". " + here + tail +
+            "Оставьте одну папку (лишнюю удалите), выберите движок в настройках проекта "
+            "или переозвучьте нужным движком — тогда лишние папки уберутся сами.")
 
 
 IMG_RENDER_MIN_RATIO = 0.70   # авто/отложенный рендер не стартует, пока картинок < 70% от ожидаемого
@@ -3436,9 +3488,23 @@ def _render_inputs_ready(tid, pid):
         return False
     _p = _get_project(tid, pid)
     _st = _psettings(_p) if _p else None
-    # Две озвучки в проекте — это задвоенный звук в ролике, а не выбор из двух.
-    if _narration_conflict(tid, pid, _st):
-        return False
+    # Озвучки здесь НЕТ СОЗНАТЕЛЬНО, хотя раньше был стоп `_narration_conflict`.
+    #
+    # Он стоял ради одного: нода обходит каталог проекта рекурсивно и склеивает всё
+    # найденное аудио, поэтому две сохранившиеся папки давали задвоенный звук. С
+    # закреплением озвучки этого больше не бывает по построению: на выдаче задачи
+    # `render_claim` фиксирует конкретный список файлов, а `render_assets` кладёт в tar
+    # ТОЛЬКО его — лишней папки на ноде просто нет, чего бы она ни сканировала.
+    #
+    # А вред у стопа остался. `_render_inputs_ready` — это фильтр кандидатов на выдачу
+    # (render_claim) и условие «отложить, а не ставить» (gen_submit). Пока он возвращал
+    # False из-за озвучки, уже стоящая в очереди задача не попадала на выдачу НИКОГДА:
+    # её не выдавали, но и в ошибку не переводили — человек видел «нет задач». Причину
+    # словами умеет сказать только `select_narration`, и добраться до него можно лишь
+    # выдачей. Поэтому решение: неоднозначную озвучку ловит выдача и пишет причину в
+    # задачу (status='error' + строка в журнале), а карточка проекта показывает то же
+    # самое заранее плашкой через `_narration_conflict` — один источник правды, два
+    # места показа, и ни одного молчаливого исхода.
     return _images_gap_ok(tid, pid, _st)
 
 
@@ -5302,8 +5368,10 @@ document.addEventListener('keydown',function(e){{var o=document.getElementById('
             f'<b>не завершена</b> (прервана или упала на первых фразах). Видео собирается по длине озвучки: '
             f'получится ролик на ~{max(1, int(_aud_est))} сек, и почти все картинки в него не попадут. '
             f'Сначала запустите «Озвучить проект» на вкладке Озвучка и дождитесь конца — потом рендерите.</div>')
-    # Две озвучки разом: рендер склеил бы обе дорожки, поэтому он остановлен. Объясняем
-    # прямо здесь, иначе проект молча висит «материалы не готовы» при готовых материалах.
+    # Озвучка неоднозначна (две папки без выбранного движка, папка не того движка,
+    # пустые файлы): рендер такую задачу переведёт в ошибку на выдаче. Говорим об этом
+    # ЗАРАНЕЕ и здесь же — иначе человек узнает причину только по красной задаче в
+    # очереди. Текст один и тот же: и плашка, и ошибка выдачи идут от select_narration.
     _two_audio = _narration_conflict(tid, pid, s)
     if _two_audio:
         short_audio_note += (
@@ -6021,11 +6089,22 @@ def _preset_project_payload(settings, preset_id):
 # engine → папка озвучки (каждый TTS-воркер пишет в свою). Рендер собирает ВСЕ _FINAL_AUDIO_*/*.mp3
 # рекурсивно и склеивает → если остались озвучки двух движков, звук задваивается. Поэтому перед
 # новой озвучкой чистим папки ДРУГИХ движков.
-_ENGINE_AUDIO_DIR = {"edge": "_FINAL_AUDIO_EDGETTS", "voicer": "_FINAL_AUDIO_VOICER",
-                     "voicegencore": "_FINAL_AUDIO_VGC",
-                     # legacy-значение из старых пресетов: там озвучка лежит в своей папке
-                     "tts": "_FINAL_AUDIO_ELEVENLABS",
-                     "lumean": "_FINAL_AUDIO_LUMEAN"}
+#
+# Таблица НЕ переписана здесь руками, а взята из `render/render_narration.ENGINE_DIRS` —
+# того самого модуля, которым и кабинет, и нода выбирают файлы озвучки. Две копии одной
+# таблицы разъезжаются молча: добавили движок в одном месте — в другом его папка стала
+# «чужой», и `_clear_other_audio_dirs` снесла бы свежую оплаченную озвучку. Сам
+# `render_narration.py` не правим ни на байт: он побайтово равен боевому и на VPS, и на
+# минской ноде (live_2026-09-18/код/{кабинет,рендер/нода_минск}/render_narration.py),
+# и это единственное доказательство, что выбор файлов у нас и в бою совпадает. Поэтому
+# сведение идёт в одну сторону: кабинет читает модуль, а не модуль подстраивается.
+# Импорт здесь жёсткий (RENDER_DIR добавлен в sys.path в шапке файла): без этого модуля
+# рендер всё равно не выдаётся ни одной ноде (render_claim → wait_reason="narration"),
+# а тихое пустое умолчание превратило бы «нет модуля» в «перестали чистить чужие папки»,
+# то есть ровно в задвоенный звук.
+from render_narration import ENGINE_DIRS as _RENDER_ENGINE_DIRS
+
+_ENGINE_AUDIO_DIR = dict(_RENDER_ENGINE_DIRS)
 
 
 def _clear_other_audio_dirs(projdir, engine, jid=None):
@@ -7273,10 +7352,39 @@ def _mark_worker_running(jid, claim_token):
     return ok
 
 
+def _storage_project_held(connection, project_id, now=None):
+    """Держит ли уборка исходников этот проект прямо сейчас.
+
+    Замок нужен потому, что уборка удаляет файлы НЕ мгновенно: она читает финальный
+    mp4 целиком, потом сносит исходники пачками по 64 файла. Всё это время проект
+    обязан выглядеть занятым — иначе между проверкой «задач нет» и последней пачкой
+    успеет начаться новый рендер по уже наполовину убранным материалам.
+
+    Значение читается функцией `held` из того же модуля, и она отвечает «занято» на
+    любую неразборчивую запись: перепутать сломанный замок с отсутствующим — значит
+    удалять под чужой уборкой. Аренда короткая (120 с) и сама протухает, поэтому
+    зависший замок отпускает проект без вмешательства.
+    """
+    row = connection.execute("SELECT v FROM admin_state WHERE k=?",
+                             ("storage_cleanup:" + str(project_id),)).fetchone()
+    if not row:
+        return False
+    from source_retention import held
+    return held(row["v"], now)
+
+
 def _cancel_project_queue_tasks(tid, pid):
     """Отменить queued/running задачи перед удалением проекта; активные локальные процессы убить."""
     c = db()
     c.execute("BEGIN IMMEDIATE")
+    # Проверка ВНУТРИ транзакции, а не до неё: уборка берёт свой замок тоже под
+    # BEGIN IMMEDIATE, и только так «увидел замок» и «взял замок» упорядочены между
+    # собой. Пакетное удаление проектов получит 409 и остановится на занятом проекте
+    # — повтор безопасен, уже удалённые пропускаются по отсутствию строки.
+    if _storage_project_held(c, pid):
+        c.rollback(); c.close()
+        raise HTTPException(409, "Проект архивируется: идёт уборка исходников. "
+                                 "Повторите удаление через пару минут.")
     rows = c.execute("SELECT job_id FROM queue_tasks WHERE tenant_id=? AND project_id=? "
                      "AND status IN ('queued','running')", (tid, pid)).fetchall()
     jids = [r["job_id"] for r in rows]
@@ -11388,6 +11496,13 @@ def _claim_fair_tasks(c, claim_now=None):
 # а rmtree звался лишь при ручном удалении проекта. При 300 роликах/сутки это
 # 155 ГБ в день — свободное место кончилось бы за трое суток посреди прогона.
 #
+# Первая версия этой уборки решала «можно удалять» по условию «в render/ лежит ЛЮБОЙ
+# *.mp4» и сносила каталоги через rmtree(ignore_errors=True). Файл мог быть от прошлого
+# рендера, оборванным или чужим — и в бою ровно эта версия стёрла 761 МБ исходников,
+# которые нечем восстановить. Теперь разрешение даёт КВИТАНЦИЯ рендера (output_rel +
+# render_sha256 + render_size, их пишет приём результата), сверка идёт по точному
+# совпадению файла на диске, а вся логика живёт в server/source_retention.py.
+#
 # Убираем ТОЛЬКО перегенерируемое медиа и только у проектов, чей рендер давно готов.
 # Никогда не трогаем:
 #   *.json          — scenes.json и scenes.meta.json лежат ВНУТРИ googler/ рядом с
@@ -11398,90 +11513,38 @@ def _claim_fair_tasks(c, claim_now=None):
 RETENTION_DAYS = float(os.environ.get("VS_RETENTION_DAYS", "7") or 7)
 RETENTION_EVERY_SEC = int(os.environ.get("VS_RETENTION_EVERY_SEC", "3600") or 3600)
 RETENTION_BUDGET_SEC = float(os.environ.get("VS_RETENTION_BUDGET_SEC", "20") or 20)
+# Выключатель уборки. ПО УМОЛЧАНИЮ ВЫКЛЮЧЕНА: тик ходит теми же проверками, но ничего
+# не удаляет — печатает отчёт «что убрал бы и почему не убрал». Ровно так устроен
+# соседний уборщик (pub_retention, VS_RETENTION_AUTO) и по той же причине: ошибка
+# необратима и стоит денег. Прежняя версия удаляла без всякого согласия владельца.
+# Включать после того, как в отчёте появятся проекты с готовой квитанцией.
+RETENTION_AUTO = (os.environ.get("VS_SOURCE_RETENTION_AUTO", "") or "").strip().lower() \
+    in ("1", "true", "yes", "on")
 _RETENTION_TICK = {"at": 0.0}
-_RETENTION_MEDIA_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
-_RETENTION_DIRS = ("googler video", "Images", ".thumbs")
-_RETENTION_DIR_PREFIX = ("_FINAL_AUDIO_",)
-_RETENTION_MARKER = "_sources_purged.json"
 
 
 def _sweep_project_sources():
-    """Снять исходники у давно отрендеренных проектов. Бюджет по времени: тик
-    планировщика ходит раз в секунду, и обход 700 каталогов его блокировать не должен."""
-    import shutil          # в main.py на уровне модуля его нет — импортируем локально
-    started = time.time()
-    freed_total = 0
-    swept = 0
-    try:
-        c = db()
-        cutoff = time.time() - RETENTION_DAYS * 86400
-        rows = c.execute(
-            "SELECT tenant_id, project_id, MAX(COALESCE(finished, created)) AS ts "
-            "FROM queue_tasks WHERE kind='render' AND status='done' "
-            "GROUP BY tenant_id, project_id HAVING ts < ?", (cutoff,)).fetchall()
-        busy = {r[0] for r in c.execute(
-            "SELECT DISTINCT project_id FROM queue_tasks "
-            "WHERE status IN ('queued','claimed','running')")}
-        c.close()
-    except Exception:
-        log_exc("_sweep_project_sources:db")
-        return
+    """Снять исходники у давно отрендеренных проектов — по квитанции и под замком.
 
-    for r in rows:
-        if time.time() - started > RETENTION_BUDGET_SEC:
-            break
-        pid = r["project_id"]
-        if pid in busy:
-            continue
-        try:
-            d = _project_dir(r["tenant_id"], pid)
-            if not os.path.isdir(d) or os.path.exists(os.path.join(d, _RETENTION_MARKER)):
-                continue
-            # нет готового mp4 → исходники единственное, что есть у проекта
-            rd = os.path.join(d, "render")
-            if not (os.path.isdir(rd) and any(f.endswith(".mp4") for f in os.listdir(rd))):
-                continue
-            freed = 0
-            g = os.path.join(d, "googler")
-            if os.path.isdir(g):
-                for f in os.listdir(g):
-                    fp = os.path.join(g, f)
-                    if os.path.isfile(fp) and os.path.splitext(f)[1].lower() in _RETENTION_MEDIA_EXT:
-                        try:
-                            freed += os.path.getsize(fp)
-                            os.remove(fp)
-                        except OSError:
-                            pass
-            for sub in os.listdir(d):
-                sp = os.path.join(d, sub)
-                if not os.path.isdir(sp):
-                    continue
-                if sub in _RETENTION_DIRS or any(sub.startswith(x) for x in _RETENTION_DIR_PREFIX):
-                    for rr, _, ff in os.walk(sp):
-                        for f in ff:
-                            try:
-                                freed += os.path.getsize(os.path.join(rr, f))
-                            except OSError:
-                                pass
-                    shutil.rmtree(sp, ignore_errors=True)
-            if freed <= 0:
-                continue
-            with open(os.path.join(d, _RETENTION_MARKER), "w", encoding="utf-8") as fh:
-                json.dump({"purged_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-                           "freed_bytes": freed, "retention_days": RETENTION_DAYS,
-                           "note": "исходники убраны после рендера; scenes.json и mp4 на месте"},
-                          fh, ensure_ascii=False)
-            freed_total += freed
-            swept += 1
-        except Exception:
-            log_exc("_sweep_project_sources:project")
-            continue
-    if swept:
-        try:
-            print("[retention] проектов убрано: %d, освобождено %.1f ГБ"
-                  % (swept, freed_total / 2 ** 30), flush=True)
-        except Exception:
-            pass
+    Тело переехало в server/source_retention.py: это не «вынесли для красоты», а
+    условие проверяемости. Уборка удаляет НЕвосстановимое, поэтому её решение должно
+    складываться из отдельных гейтов, каждый со своей причиной отказа и своим тестом,
+    а не из одного `if` посреди веб-сервера.
+
+    Здесь остаётся только выбор режима: без VS_SOURCE_RETENTION_AUTO=1 проход идёт
+    вхолостую и печатает отчёт. Исключение наружу не выпускаем — уборка не имеет
+    права уронить тик планировщика, который раздаёт задачи.
+    """
+    try:
+        from source_retention import sweep
+        result = sweep(DB, TENANTS_DIR, RETENTION_DAYS, RETENTION_BUDGET_SEC,
+                       dry_run=not RETENTION_AUTO)
+        # Молчим только когда обходить было нечего: список причин отказа — это и есть
+        # отчёт уборки, по нему видно, почему место не освобождается.
+        if result["projects"] or result["retained"] or result.get("would_purge"):
+            print("[retention] " + json.dumps(result, ensure_ascii=False), flush=True)
+    except Exception:
+        log_exc("_sweep_project_sources:fenced")
 
 
 def _scheduler_loop():
@@ -11537,6 +11600,14 @@ def _scheduler_loop():
             if time.time() - _RETENTION_TICK["at"] >= RETENTION_EVERY_SEC:
                 _RETENTION_TICK["at"] = time.time()
                 _sweep_project_sources()
+                # Тем же часом — брошенные тела заливки рендера. Отдельным вызовом, а не
+                # внутри уборки исходников: та по умолчанию ВЫКЛЮЧЕНА и только отчитывается,
+                # а здесь удаляется наш собственный недописанный временный файл, ничего
+                # пользовательского. Ждать включения уборки для этого незачем.
+                try:
+                    _sweep_incoming_renders()
+                except Exception:
+                    log_exc("_scheduler_loop/incoming_renders")
             _pass_ms = (time.time() - _pass_started) * 1000.0
             _SCHED_HB["last_pass"] = time.time()
             _SCHED_HB["passes"] += 1
@@ -11959,6 +12030,19 @@ def _enqueue_card_task(uid, tenant_id, project_id, context):
     c = db()
     try:
         c.execute("BEGIN IMMEDIATE")
+        # Карточки не проходят через `_enqueue`: он отдаёт их сюда ДО своей транзакции,
+        # а значит и до своей проверки замка уборки. Без этой строки карточка — это
+        # единственный вид задачи, который может появиться посреди прохода уборки:
+        # гейт уборки («ни одной нетерминальной задачи») уже пройден, замок стоит, а
+        # новая строка queue_tasks всё равно ложится. Уборка карточке не мешает (она
+        # читает source.txt и пишет в `_cards/`, см. NON_SOURCE_KINDS в
+        # server/source_retention.py), но дыра в порядке «проверил → взял» не должна
+        # зависеть от того, что именно эта задача делает с диском: завтра она станет
+        # делать другое. Проверка стоит ВНУТРИ BEGIN IMMEDIATE — как и у `_enqueue`,
+        # иначе «увидел замок» и «взял замок» не упорядочены между собой.
+        if _storage_project_held(c, project_id):
+            raise HTTPException(409, "Проект архивируется: идёт уборка исходников. "
+                                     "Повторите запуск через пару минут.")
         existing = c.execute(
             "SELECT job_id,status,request_sha256 FROM card_jobs "
             "WHERE tenant_id=? AND project_id=? AND narration_sha256=? AND contract_version=?",
@@ -12196,6 +12280,14 @@ def _enqueue(uid, tenant_id, project_id, kind, params,
         return None
     c = db()
     c.execute("BEGIN IMMEDIATE")
+    # Новую работу по проекту под уборкой не ставим: гейт уборки — «ни одной
+    # нетерминальной задачи», и задача, поставленная посреди прохода, увидела бы
+    # исходники, часть которых уже снесена. Отказ явный, а не тихий: человек нажал
+    # кнопку и должен узнать, почему этап не начался.
+    if _storage_project_held(c, project_id):
+        c.rollback(); c.close()
+        raise HTTPException(409, "Проект архивируется: идёт уборка исходников. "
+                                 "Повторите запуск через пару минут.")
     if kind == "render":
         duplicate = c.execute(
             "SELECT 1 FROM queue_tasks WHERE tenant_id=? AND project_id=? "
@@ -13391,6 +13483,13 @@ def _render_config_from_params(p):
                 _ovl.append({"path": _rel(o["file"]), "opacity": _op})
         if _ovl:
             cfg["overlays"] = _ovl
+    # Закреплённый на claim набор основной озвучки едет на ноду как есть (образец —
+    # боевой кабинет). Новая нода прогонит этот список через тот же render_narration и
+    # возьмёт ровно его; старая про ключ не знает — её страхует фильтр материалов в
+    # render_assets. Пути относительные: корень проекта на ноде другой, а раскладка
+    # внутри tar та же.
+    if "narration_files" in p:
+        cfg["narration_files"] = p["narration_files"]
     return cfg
 
 
@@ -13435,6 +13534,13 @@ async def render_claim(request: Request):
               "SELECT job_id FROM queue_tasks WHERE kind='render' AND status='queued') "
               "AND status='running'")
     c.commit()
+    # Дальше — одна транзакция на «выбрал строку → закрепил озвучку → отдал задачу».
+    # BEGIN IMMEDIATE берёт писательскую блокировку сразу, а не на первом UPDATE: иначе
+    # между SELECT кандидатов и UPDATE помещается второй пуллер, и снимок озвучки,
+    # записанный в params, может оказаться не от того захвата, который реально поехал
+    # рендерить. busy_timeout=30000 уже стоит (см. db()), поэтому при занятой БД ручка
+    # подождёт, а не ответит «нет задач».
+    c.execute("BEGIN IMMEDIATE")
     candidates = c.execute(
         "SELECT r.* FROM queue_tasks r "
         "WHERE r.kind='render' AND r.status='queued' "
@@ -13443,19 +13549,80 @@ async def render_claim(request: Request):
         "AND w.kind!='render' AND w.status IN ('queued','running')) "
         "ORDER BY r.created ASC LIMIT 100"
     ).fetchall()
-    row = next((r for r in candidates if _render_inputs_ready(r["tenant_id"], r["project_id"])), None)
+    # Проект под уборкой пропускаем так же, как проект с неготовыми материалами:
+    # задача остаётся в очереди и уедет следующим опросом, когда аренда снимется.
+    # Отдать её сейчас — значит рендерить по исходникам, которые прямо сейчас удаляют.
+    row = next((r for r in candidates
+                if not _storage_project_held(c, r["project_id"])
+                and _render_inputs_ready(r["tenant_id"], r["project_id"])), None)
     if not row:
         c.commit(); c.close()
         return JSONResponse({"job": None})
     jid = row["job_id"]
+    # ЗАКРЕПЛЕНИЕ ОЗВУЧКИ. До этой правки сервер проверял только факт «есть хоть один
+    # mp3», а какие именно файлы попадут в дорожку, решала нода: она сканирует каталог
+    # проекта рекурсивно и склеивает ВСЁ найденное. Значит набор зависел от того, что
+    # лежало на диске в момент рендера, а не от того, что решил кабинет, — и мог
+    # измениться после постановки в очередь (ручная заливка файла, отложенный рендер).
+    # Теперь набор выбирается здесь, один раз, и уезжает вместе с задачей.
+    try:
+        _params = json.loads(row["params"] or "{}")
+        if not isinstance(_params, dict):
+            _params = {}
+    except Exception:
+        _params = {}
+    _project = _get_project(row["tenant_id"], row["project_id"])
+    try:
+        _psnap = _psettings(_project) if _project else {}
+    except Exception:
+        _psnap = {}
+    # Движок и файлы фона/финального трека живут в настройках проекта, форма рендера их
+    # перекрывает — выбору озвучки нужна именно такая склейка.
+    _snapshot = {**(_psnap or {}), **_params}
+    # Закрепление ПРЕДЫДУЩЕГО захвата в расчёт не берём: иначе модуль просто проверил бы
+    # старый список и вернул его. Перезахват случается после упавшей попытки, и человек
+    # к этому моменту мог озвучку починить — удалить лишнюю папку, переозвучить нужным
+    # движком. Унаследованный список такую починку не увидел бы никогда: удалённый файл
+    # из него навсегда превратил бы задачу в «файл основной озвучки отсутствует», а новые
+    # файлы остались бы за бортом. (Боевой кабинет здесь наследует — считаю это его
+    # историческим упущением, в отчёте сказано.)
+    _snapshot.pop("narration_files", None)
+    try:
+        from render_narration import select_narration
+        _selected = select_narration(_project_dir(row["tenant_id"], row["project_id"]), _snapshot)
+        if not _selected:
+            raise ValueError("Нет файлов основной озвучки")
+    except ValueError as exc:
+        # Выбор не состоялся — это ответ человеку, а не «нет задач». Раньше непригодная
+        # к рендеру задача просто пропускалась в цикле кандидатов и висела в очереди
+        # молча, без единой строчки о причине.
+        c.execute("UPDATE queue_tasks SET status='error',error=?,finished=? WHERE job_id=? AND status='queued'",
+                  (str(exc), _now(), jid))
+        c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?", (str(exc), jid))
+        c.commit(); c.close()
+        _log_line(jid, "⛔ рендер не начат: " + str(exc))
+        return JSONResponse({"job": None})
+    except Exception:
+        # Модуль не импортировался или сломался. Отдать задачу вслепую нельзя: нода
+        # склеит всё, что найдёт, — то есть вернётся ровно тот дефект, ради которого
+        # закрепление и делалось. Задача остаётся в очереди, проект не ломаем.
+        c.rollback(); c.close()
+        log_exc("render_claim/narration")
+        return JSONResponse({"job": None, "wait_reason": "narration"})
+    _params["narration_files"] = _selected
     claim_token = secrets.token_urlsafe(24)
     cur = c.execute(
+        # params переписываются ТОЙ ЖЕ транзакцией, что и claim_token: закрепление,
+        # которое легло бы отдельным коммитом, при перезахвате оставило бы задачу с
+        # чужим списком файлов. Квитанция предыдущего прогона (render_sha256 и соседи)
+        # здесь же обнуляется — она относится к старому mp4, а не к тому, который
+        # нода только начинает считать.
         "UPDATE queue_tasks SET status='running', started=?, claimed=?, progress=0, stage='claimed', "
-        "error=NULL, claim_token=? "
+        "error=NULL, claim_token=?, params=?, render_sha256=NULL, render_size=NULL, render_error_sha256=NULL "
         "WHERE job_id=? AND status='queued' AND NOT EXISTS (SELECT 1 FROM queue_tasks w "
         "WHERE w.tenant_id=queue_tasks.tenant_id AND w.project_id=queue_tasks.project_id "
         "AND w.kind!='render' AND w.status IN ('queued','running'))",
-        (_now(), time.time(), claim_token, jid),
+        (_now(), time.time(), claim_token, json.dumps(_params, ensure_ascii=False), jid),
     )
     if cur.rowcount == 1:
         c.execute("UPDATE gen_jobs SET status='running',error=NULL WHERE id=?", (jid,))
@@ -13480,7 +13647,7 @@ async def render_claim(request: Request):
 async def render_assets(jid: int, request: Request):
     """Стримит tar.gz материалов проекта (googler/ + _ASSETS/ + _FINAL_AUDIO_*/)."""
     _require_puller(request)
-    c = db(); t = c.execute("SELECT tenant_id, project_id, status, claim_token FROM queue_tasks WHERE job_id=? AND kind='render'", (jid,)).fetchone(); c.close()
+    c = db(); t = c.execute("SELECT tenant_id, project_id, status, claim_token, params FROM queue_tasks WHERE job_id=? AND kind='render'", (jid,)).fetchone(); c.close()
     if not t:
         raise HTTPException(404)
     _require_render_claim(request, t)
@@ -13496,7 +13663,40 @@ async def render_assets(jid: int, request: Request):
     # Включать обратно ТОЛЬКО вместе с выкаткой рендерера на Минск (см. auto_sound.py).
     # «googler video» — сгенерированные видео-клипы: БЕЗ них рендер на боксе соберёт слайдшоу без видео (audit 02.07)
     items = [d for d in ("googler", "Images", "googler video", "_ASSETS", "_RENDER_MEDIA") if os.path.isdir(os.path.join(proj, d))]
-    items += [os.path.basename(p) for p in glob.glob(os.path.join(proj, "_FINAL_AUDIO_*")) if os.path.isdir(p)]
+    # ОЗВУЧКА: в tar кладём только закреплённые на claim файлы, а не все папки
+    # _FINAL_AUDIO_*. Рендерер (и боевой 02.09, и наш стендовый) обходит каталог проекта
+    # рекурсивно и склеивает ВСЁ найденное аудио — отдай ему две папки, и в ролике
+    # прозвучат обе озвучки подряд. Про ключ narration_files старая нода не знает, а вот
+    # «чего нет в архиве, то не склеится» понимают обе. Поэтому предохранитель стоит
+    # здесь: один и тот же звук на любой ноде, не дожидаясь её обновления.
+    try:
+        _pinned = json.loads(t["params"] or "{}").get("narration_files")
+    except Exception:
+        _pinned = None
+    _audio, _lost = [], []
+    if isinstance(_pinned, list) and _pinned:
+        for _rel in _pinned:
+            _rel = str(_rel).replace("\\", "/").lstrip("/") if isinstance(_rel, str) else ""
+            if not _rel or ".." in _rel.split("/") or os.path.isabs(_rel) \
+                    or not os.path.isfile(os.path.join(proj, _rel)):
+                _lost.append(str(_rel))
+                continue
+            # Файл, который и так уезжает целой папкой (озвучка в Images/ у старых
+            # проектов), вторым членом архива не кладём: tar дубль примет, но архив
+            # распухнет, а на ноде распакуется то же самое.
+            if _rel.split("/")[0] not in items:
+                _audio.append(_rel)
+        if _lost:
+            # Закрепление есть, а файла на диске нет: проект почистили между выдачей
+            # задачи и скачиванием материалов. Отдать архив с ЧАСТЬЮ озвучки хуже всего —
+            # ролик соберётся, будет выглядеть готовым и молча потеряет кусок текста.
+            raise HTTPException(409, "закреплённая озвучка пропала из проекта ("
+                                + ", ".join(_lost[:3]) + ") — поставьте рендер заново")
+        items += _audio
+    else:
+        # Задача захвачена до выкатки закрепления (params без narration_files) — везём
+        # всё, как раньше. Отдельной миграции для таких задач не нужно, они доедут сами.
+        items += [os.path.basename(p) for p in glob.glob(os.path.join(proj, "_FINAL_AUDIO_*")) if os.path.isdir(p)]
     if not items:
         raise HTTPException(404, "нет материалов")
     # карта «картинка→видео»: абсолютные VPS-пути внутри не существуют на GPU-боксе → относим к project_dir
@@ -13549,52 +13749,289 @@ async def render_progress(jid: int, request: Request):
     return JSONResponse({"ok": True})
 
 
+# Потолок принимаемого mp4. Наш самый длинный ролик — двухчасовой, это единицы гигабайт;
+# 64 GiB — не рабочий предел, а защита от ноды, которая льёт в нас поток без конца.
+# В env, чтобы поднять или опустить без правки кода; умолчание — как в бою.
+# `or` вокруг чтения обязателен: в .env переменная живёт как `VS_RENDER_MAX_BYTES=`
+# (закомментировали значение, строку оставили), и тогда getenv отдаёт ПУСТУЮ строку,
+# а не умолчание. `int("")` — ValueError на импорте, то есть кабинет не поднимается
+# целиком из-за настройки одной ручки. Так сделаны соседние настройки (VS_RETENTION_*).
+RENDER_MAX_BYTES = int((os.environ.get("VS_RENDER_MAX_BYTES", "") or "").strip()
+                       or 64 * 1024 ** 3)
+
+
+def _render_row(jid, c=None):
+    """Строка render-задачи ЦЕЛИКОМ; нет такой задачи — 404.
+
+    Именно целиком, а не перечнем колонок, как было: квитанции нужны и claim_token,
+    и output_rel, и render_sha256 — при списке колонок каждое новое поле кончается
+    вопросом «почему в ответе None».
+    """
+    own = c is None
+    c = c or db()
+    try:
+        t = c.execute("SELECT * FROM queue_tasks WHERE job_id=? AND kind='render'", (jid,)).fetchone()
+    finally:
+        if own:
+            c.close()
+    if not t:
+        raise HTTPException(404, "нет такого рендера")
+    return t
+
+
+def _render_receipt(t):
+    """Квитанция о судьбе рендера — то, чем нода доказывает себе, что файл доехал целым.
+
+    Считается ПО ДИСКУ, а не по строке в базе. «В базе done» и «лежит тот самый файл» —
+    разные утверждения: по второму нода удаляет свою единственную копию ролика, и
+    ошибка здесь стоит оплаченного рендера.
+
+    Дорого (одно чтение mp4 на выдачу), зато честно. Нода зовёт квитанцию редко:
+    перед повторной заливкой и при примирении после перезапуска.
+
+    Рендеры, принятые ДО этой правки, хэша не имеют — по ним квитанция не выдаётся
+    (503 «держи копию»), а не сочиняется. На скачивание и заливку это не влияет: там
+    читается output_rel, и он у старых строк на месте.
+    """
+    receipt = {"ok": True, "accepted": False, "job_id": t["job_id"], "status": t["status"]}
+    if t["status"] == "done":
+        path = os.path.join(_project_dir(t["tenant_id"], t["project_id"]), t["output_rel"] or "")
+        if not t["render_sha256"] or not os.path.isfile(path) or os.path.getsize(path) != t["render_size"]:
+            raise HTTPException(503, "квитанция не подтверждена файлом; MP4 на ноде необходимо сохранить")
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+        if h.hexdigest() != t["render_sha256"]:
+            raise HTTPException(503, "контрольная сумма MP4 изменилась; сохраните копию на ноде")
+        receipt.update(accepted=True, sha256=h.hexdigest(), size=t["render_size"])
+    elif t["status"] == "error" and t["render_error_sha256"]:
+        receipt.update(accepted=True, error_sha256=t["render_error_sha256"])
+    elif t["status"] != "running":
+        # running → accepted:false, это сигнал ноде «я тебя не приняла, заливай».
+        # Остальное (cancelled, queued после возврата аренды) — уже не её результат.
+        raise HTTPException(409, "задача отменена или передана другому исполнителю")
+    return receipt
+
+
+def _render_fsync_dir(path):
+    """Сбросить на диск сам КАТАЛОГ: имя файла живёт в нём, и без этого переименование
+    может не пережить потерю питания (файл есть, имени нет)."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+RENDER_INCOMING_PREFIX = ".incoming-"
+# Возраст, после которого недокачанный `.incoming-*` считается брошенным.
+# Умолчание выбрано по времени жизни ЖИВОЙ заливки, а не на глаз: нода льёт тело
+# одним запросом с timeout=1200 c (dev/render_puller.post_done), то есть у работающей
+# доставки mtime файла обновляется минимум раз в двадцать минут, а вся она укладывается
+# в двадцать минут целиком. Шесть часов — восемнадцатикратный запас: снести идущую
+# доставку такой порог не может, а огрызок от вчерашнего OOM переживёт максимум один
+# час до ближайшего тика. Спорное место — именно эта цифра, поэтому она в настройке.
+RENDER_INCOMING_MAX_AGE_SEC = float((os.environ.get("VS_RENDER_INCOMING_MAX_AGE_SEC", "")
+                                     or "").strip() or 6 * 3600)
+
+
+def _render_staged_file(directory):
+    """Открытый временный файл В ТОЙ ЖЕ папке, куда ляжет результат.
+
+    Та же файловая система → os.replace атомарен. Точка в начале имени прячет
+    недокачанное тело от glob('*.mp4'): и от наших уборщиков, и от find_video,
+    который при двух mp4 в папке честно отказывается угадывать.
+    """
+    os.makedirs(directory, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix=RENDER_INCOMING_PREFIX, dir=directory)
+    return os.fdopen(fd, "wb"), path
+
+
+def _sweep_incoming_renders(max_age_sec=None):
+    """Снести недокачанные тела рендера, которые не убрал за собой их же запрос.
+
+    `finally` в `render_result` закрывает штатные исходы — 400, 409, обрыв соединения.
+    Он не закрывает НЕштатный: SIGKILL при деплое, падение процесса, OOM-killer. Тогда
+    файл остаётся навсегда, и это худший вид мусора — невидимый. Имя начинается с точки,
+    поэтому огрызок не попадает ни в `find_video` (он смотрит `*.mp4`), ни в подсчёт
+    занятого места, ни в уборку исходников (она ходит по `Images`/`googler`/озвучкам, а
+    `render/` не трогает вовсе). Несколько прерванных заливок двухчасового ролика — это
+    десятки гигабайт, которых «нет» ни в одном отчёте.
+
+    Удаляем ТОЛЬКО по возрасту: файл, в который прямо сейчас пишут, моложе порога.
+    Симлинк под таким именем не трогаем вовсе — мы кладём сюда обычные файлы, а
+    подменённое имя означает, что по этой ссылке удалили бы чужое.
+    """
+    horizon = time.time() - (RENDER_INCOMING_MAX_AGE_SEC if max_age_sec is None
+                             else float(max_age_sec))
+    removed = freed = 0
+    pattern = os.path.join(TENANTS_DIR, "*", "projects", "*", "render",
+                           RENDER_INCOMING_PREFIX + "*")
+    for path in glob.glob(pattern):
+        try:
+            if os.path.islink(path) or not os.path.isfile(path):
+                continue
+            info = os.lstat(path)
+            if info.st_mtime > horizon:
+                continue
+            os.unlink(path)
+        except OSError:
+            continue                      # исчез сам или нет прав — не наша забота
+        removed += 1
+        freed += info.st_size
+    if removed:
+        log_info(f"брошенных тел рендера убрано: {removed}, освобождено {freed} байт "
+                 f"(старше {int(RENDER_INCOMING_MAX_AGE_SEC)} с)")
+    return {"removed": removed, "freed_bytes": freed}
+
+
+@app.get("/api/render/{jid}/receipt")
+async def render_receipt(jid: int, request: Request):
+    """Нода спрашивает «мой результат принят?» — прежде чем заливать ролик заново.
+
+    Ручка появилась не для красоты: боевая нода (файлы 14.09) зовёт её сама. Пока её
+    нет, нода получает 404, считает доставку несостоявшейся, перезаливает готовый mp4
+    до двадцати раз и уходит в карантин, держа гигабайты на своём диске.
+    """
+    _require_puller(request)
+    t = _render_row(jid)
+    _require_render_claim(request, t)
+    return JSONResponse(await run_in_threadpool(_render_receipt, t))
+
+
 @app.post("/api/render/{jid}/result")
 async def render_result(jid: int, request: Request):
-    """Пуллер отдаёт результат: ?status=done с mp4 в СЫРОМ body (без multipart), либо ?status=error&error=..."""
+    """Пуллер отдаёт результат: ?status=done с mp4 в СЫРОМ body (без multipart), либо ?status=error&error=...
+
+    Тело сперва ложится во временный `.incoming-*`, сверяется с Content-Length и
+    X-Render-SHA256 и только потом переезжает на место одним os.replace. Раньше поток
+    писался прямо в финальный файл: оборванная заливка оставляла обрезанный mp4 под
+    штатным именем, и на YouTube уезжал именно он.
+
+    Ответ — квитанция (ok/accepted/job_id/status/sha256/size), а не {"ok": true}:
+    по ней нода решает, можно ли удалить свою единственную копию ролика.
+    """
     _require_puller(request)
     status = request.query_params.get("status", "done")
-    err = (request.query_params.get("error", "") or "")[:500]
-    c = db(); t = c.execute("SELECT tenant_id, project_id, status, claim_token, uid, params FROM queue_tasks "
-                            "WHERE job_id=? AND kind='render'", (jid,)).fetchone(); c.close()
-    if not t:
-        raise HTTPException(404)
+    if status not in ("done", "error"):
+        raise HTTPException(400, "неверный статус рендера")
+    t = _render_row(jid)
     _require_render_claim(request, t)
+    expected = request.headers.get("X-Render-SHA256", "").lower()
+    if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise HTTPException(400, "неверный SHA256")
+    # 480, а не «примерно 500»: нода считает хэш ошибки ровно от первых 480 символов
+    # (render_delivery.acknowledge_error) и по нему сверяет квитанцию об ошибке.
+    # Хэш берём от ПРИСЛАННОГО текста, а не от подставленного нами умолчания: иначе
+    # пустое сообщение превращается в «SHA256 ошибки не совпадает» на ровном месте.
+    sent = (request.query_params.get("error", "") or "")[:480]
+    error_hash = hashlib.sha256(sent.encode("utf-8")).hexdigest()
+    err = sent or "ошибка рендера"
+    supplied_error = request.headers.get("X-Render-Error-SHA256", "").lower()
+    if status == "error" and supplied_error and supplied_error != error_hash:
+        raise HTTPException(400, "SHA256 ошибки не совпадает")
     if t["status"] != "running":
-        raise HTTPException(409, "render job отменён или завершён")
-    if status == "done":
-        proj = _project_dir(t["tenant_id"], t["project_id"])
-        os.makedirs(os.path.join(proj, "render"), exist_ok=True)
-        out_rel = f"render/{jid}.mp4"
-        dst = os.path.join(proj, out_rel)
-        size = 0
-        with open(dst, "wb") as f:
-            async for chunk in request.stream():
-                if chunk:
-                    f.write(chunk); size += len(chunk)
-        if size < 1024:
+        # Повтор доставки после обрыва ответа — не повод городить второй файл: пришло
+        # то же самое → та же квитанция. Пустой X-Render-SHA256 здесь не «то же самое»,
+        # а «сверить нечем»: подтверждать приём вслепую нельзя, это разрешение ноде
+        # удалить ролик. Другой результат на ту же задачу → отказ.
+        same = ((status == "done" and t["status"] == "done"
+                 and expected and expected == t["render_sha256"])
+                or (status == "error" and t["status"] == "error"
+                    and error_hash == t["render_error_sha256"]))
+        if not same:
+            raise HTTPException(409, "другой результат уже принят")
+        return JSONResponse(await run_in_threadpool(_render_receipt, t))
+    proj = _project_dir(t["tenant_id"], t["project_id"])
+    render_dir = os.path.join(proj, "render")
+    stage = None
+    size = 0
+    digest = None
+    try:
+        if status == "done":
+            f, stage = _render_staged_file(render_dir)
+            h = hashlib.sha256()
+            with f:
+                async for chunk in request.stream():
+                    if not chunk:
+                        continue
+                    size += len(chunk)
+                    if size > RENDER_MAX_BYTES:
+                        raise HTTPException(413, f"MP4 больше потолка {RENDER_MAX_BYTES} байт")
+                    await run_in_threadpool(f.write, chunk)
+                    h.update(chunk)
+                await run_in_threadpool(f.flush)
+                # fsync до проверок и до replace: принять файл, который ещё в кэше,
+                # значит разрешить ноде удалить копию того, чего на диске нет.
+                await run_in_threadpool(os.fsync, f.fileno())
+            digest = h.hexdigest()
+            # «Если прислано»: наш стендовый пуллер этих заголовков не шлёт. Пустой
+            # заголовок = проверять нечем; непустой и неверный = тело битое.
+            length = request.headers.get("Content-Length")
+            if length and (not length.isdigit() or int(length) != size):
+                raise HTTPException(400, "тело не совпало с объявленным Content-Length")
+            if size < 1024:
+                raise HTTPException(400, "пустой mp4 от пуллера")
+            if expected and digest != expected:
+                raise HTTPException(400, "SHA256 MP4 не совпадает")
+
+        def commit_result():
+            """Финал одной транзакцией BEGIN IMMEDIATE: состояние перечитывается, claim
+            проверяется заново. Между началом заливки (минуты) и этой секундой задачу
+            могли отменить, удалить или перезахватить другой нодой."""
+            nonlocal stage
             c = db()
-            cur = c.execute("UPDATE queue_tasks SET status='error', error=?, finished=? "
-                            "WHERE job_id=? AND status='running' AND claim_token=?",
-                            ("пустой mp4 от пуллера", _now(), jid, t["claim_token"]))
-            if cur.rowcount == 1:
-                c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?",
-                          ("пустой mp4 от пуллера", jid))
-            c.commit(); c.close()
-            try: os.remove(dst)
-            except OSError: pass
-            raise HTTPException(400, "empty mp4")
-        c = db()
-        cur = c.execute("UPDATE queue_tasks SET status='done', progress=100, stage='done', output_rel=?, finished=? "
-                        "WHERE job_id=? AND status='running' AND claim_token=?",
-                        (out_rel, _now(), jid, t["claim_token"]))
-        if cur.rowcount == 1:
-            c.execute("UPDATE gen_jobs SET status='done',error=NULL WHERE id=?", (jid,))
-        c.commit(); c.close()
-        if cur.rowcount != 1:
-            try: os.remove(dst)
-            except OSError: pass
-            raise HTTPException(409, "render job отменён во время загрузки")
+            try:
+                c.execute("PRAGMA synchronous=FULL")
+                c.execute("BEGIN IMMEDIATE")
+                live = _render_row(jid, c)
+                _require_render_claim(request, live)
+                if live["status"] != "running":
+                    same = ((status == "done" and live["status"] == "done"
+                             and digest == live["render_sha256"])
+                            or (status == "error" and live["status"] == "error"
+                                and error_hash == live["render_error_sha256"]))
+                    if not same:
+                        raise HTTPException(409, "состояние рендера изменилось во время загрузки")
+                    c.rollback()
+                    return _render_receipt(live), False
+                if status == "done":
+                    # Имя результата прежнее: его знают find_video (фолбэк «штатное имя»),
+                    # карточка проекта и уборщики. Защита здесь не в имени, а в том, что
+                    # под этим именем оказывается только проверенный целиком файл.
+                    out_rel = f"render/{jid}.mp4"
+                    os.replace(stage, os.path.join(proj, out_rel))
+                    stage = None
+                    _render_fsync_dir(render_dir)
+                    c.execute("UPDATE queue_tasks SET status='done', progress=100, stage='done', "
+                              "output_rel=?, render_sha256=?, render_size=?, finished=? WHERE job_id=?",
+                              (out_rel, digest, size, _now(), jid))
+                    c.execute("UPDATE gen_jobs SET status='done',error=NULL WHERE id=?", (jid,))
+                else:
+                    c.execute("UPDATE queue_tasks SET status='error', error=?, render_error_sha256=?, "
+                              "finished=? WHERE job_id=?", (err, error_hash, _now(), jid))
+                    c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?", (err, jid))
+                c.commit()
+                # Квитанцию считаем по УЖЕ записанной строке и по файлу на диске: если
+                # между replace и коммитом что-то разошлось, нода узнает об этом сразу.
+                return _render_receipt(_render_row(jid, c)), status == "done"
+            except Exception:
+                c.rollback()
+                raise
+            finally:
+                c.close()
+
+        receipt, accepted_now = await run_in_threadpool(commit_result)
+    finally:
+        # Временный файл не переживает запрос ни при каком исходе: ни при 400, ни при
+        # отмене задачи, ни при обрыве соединения. Иначе .incoming-* копятся молча.
+        if stage:
+            try:
+                os.unlink(stage)
+            except OSError:
+                pass
+    if accepted_now:
         # Главы: считаются ПОСЛЕ рендера, потому что таймкоды берутся из транскрипта, который
         # рендер-нода снимает тем же whisper-прогоном, что и синхрон картинок. Ставим только
         # если транскрипт реально доехал — иначе задача упала бы с «нет транскрипта».
@@ -13617,19 +14054,7 @@ async def render_result(jid: int, request: Request):
                                "пропускаю (нужна свежая версия render_worker/puller на ноде)")
         except Exception as e:
             _log_line(jid, f"⚠️ Главы не поставлены: {e}")
-    else:
-        render_error = err or "ошибка рендера"
-        c = db()
-        cur = c.execute("UPDATE queue_tasks SET status='error', error=?, finished=? "
-                        "WHERE job_id=? AND status='running' AND claim_token=?",
-                        (render_error, _now(), jid, t["claim_token"]))
-        if cur.rowcount == 1:
-            c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?",
-                      (render_error, jid))
-        c.commit(); c.close()
-        if cur.rowcount != 1:
-            raise HTTPException(409, "render job уже не активен")
-    return JSONResponse({"ok": True})
+    return JSONResponse(receipt)
 
 
 _TRANSCRIPT_MAX_BYTES = 8 * 1024 * 1024      # 2 ч речи ≈ 270 КБ; 8 МБ — заведомый потолок
