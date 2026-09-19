@@ -70,6 +70,12 @@ PASSWORD = os.environ.get("VS_DEV_PASSWORD", "dev-local-only")
 
 NOW = 1_800_000_000.0
 FAILS = []
+# Пропущенные из-за отсутствия стенда проверки. Молчаливый пропуск — это зелень, купленная
+# за то, что проверка не выполнялась: в прогоне и в CI «проверено» и «не проверялось»
+# выглядели одинаково. Теперь код выхода честный (2), а осознанный пропуск объявляется
+# переменной, как в tests/test_pult_wave3_browser.py.
+SKIPPED = []
+NO_STAND_OK = os.environ.get("VS_PULT_TEST_NO_STAND", "") not in ("", "0")
 
 
 def check(label, got, want):
@@ -640,9 +646,11 @@ def check_pult_channels():
     try:
         code, body = me.go("/ui/login", {"login": LOGIN, "password": PASSWORD})
     except SystemExit as exc:
+        SKIPPED.append(f"сквозная часть по HTTP: {exc}")
         print(f"  ПРОПУЩЕНО: {exc}")
         return
     if code != 200:
+        SKIPPED.append(f"сквозная часть по HTTP: вход не удался ({code})")
         print(f"  ПРОПУЩЕНО: вход не удался ({code}): {body}")
         return
 
@@ -729,7 +737,16 @@ def main() -> int:
         for f in FAILS:
             print("  -", f)
         return 1
-    print("все проверки прошли")
+    if SKIPPED and not NO_STAND_OK:
+        print("СТЕНД НЕ ПОДНЯТ — проверки не выполнены:")
+        for s_ in SKIPPED:
+            print("  -", s_)
+        print("Это не успех: без стенда не проверено главное — что обычная форма настроек"
+              " канала не подменяет и не заводит идентификатор в обход. Поднимите стенд"
+              " (см. заголовок файла) либо объявите пропуск осознанно:"
+              " VS_PULT_TEST_NO_STAND=1.")
+        return 2
+    print("все проверки прошли" + (" (стенд пропущен осознанно)" if SKIPPED else ""))
     return 0
 
 

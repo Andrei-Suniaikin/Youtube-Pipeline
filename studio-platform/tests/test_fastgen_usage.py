@@ -60,6 +60,11 @@ USAGE_RAW = {
 }
 
 FAILS = []
+# Пропуск из-за отсутствия стенда раньше не влиял на код выхода: «проверено» и «не
+# проверялось» выглядели одинаково. Теперь пропуск честно даёт 2, а осознанный объявляется
+# переменной — тем же приёмом, что в tests/test_pult_wave3_browser.py.
+SKIPPED = []
+NO_STAND_OK = os.environ.get("VS_PULT_TEST_NO_STAND", "") not in ("", "0")
 
 
 def check(label, got, want):
@@ -472,6 +477,7 @@ def main() -> int:
         else:
             me = anon
     except SystemExit as exc:
+        SKIPPED.append(f"экран ключей по HTTP: {exc}")
         print(f"  ПРОПУЩЕНО: {exc}")
         me = None
 
@@ -511,7 +517,15 @@ def main() -> int:
         for f in FAILS:
             print("  -", f)
         return 1
-    print("все проверки прошли")
+    if SKIPPED and not NO_STAND_OK:
+        print("СТЕНД НЕ ПОДНЯТ — проверки не выполнены:")
+        for s_ in SKIPPED:
+            print("  -", s_)
+        print("Это не успех: без стенда не проверено, что блок FastGen на экране ключей"
+              " показывает снимок, а не выдумывает цифры. Поднимите стенд либо объявите"
+              " пропуск осознанно: VS_PULT_TEST_NO_STAND=1.")
+        return 2
+    print("все проверки прошли" + (" (стенд пропущен осознанно)" if SKIPPED else ""))
     return 0
 
 
