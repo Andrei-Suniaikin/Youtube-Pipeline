@@ -45,10 +45,17 @@ class FakeClient:
     def __init__(self, *_a, **_k):
         pass
 
+    def resolve_model(self, preset):
+        # 19.09.2026: имя модели больше не зашито в теле заказа — кабинет выясняет его
+        # до брони и передаёт в create_job готовым (pub_remote.RewriteClient).
+        # Здесь деньги считаются, а не модель выбирается, поэтому ответ постоянный.
+        return (preset or {}).get("model") or "terra"
+
     def upload_text(self, text, filename=""):
         return "file-1"
 
-    def create_job(self, file_id, lang, preset, channel_name="", idempotency_key=""):
+    def create_job(self, file_id, lang, preset, channel_name="", idempotency_key="",
+                   model=""):
         if FakeClient.fail_create:
             raise RuntimeError("рерайт отказал до создания задачи")
         FakeClient.made += 1

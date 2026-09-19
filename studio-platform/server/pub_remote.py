@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import http.cookiejar
 import json
 import os
@@ -95,6 +96,15 @@ def set_key(c, name: str, value: str, now: float) -> None:
 
 # ─────────────────────────── общее ───────────────────────────
 
+class RemoteRejected(ItemFailed):
+    """Сосед разобрал запрос и отказал по смыслу (422): не та модель, не тот язык.
+
+    Отдельный класс нужен, чтобы вызывающий мог объяснить отказ человеку своими
+    словами («не принял модель X»), а не пересказывать чужой HTTP-код. Наследник
+    ItemFailed: для движка это по-прежнему отказ ЭТОЙ строки, очередь не встаёт.
+    """
+
+
 def _call(method: str, url: str, key: str, service: str, **kw):
     """Запрос к соседу с переводом его ответа в наши два класса отказа."""
     # `missing_job=True` ставят только опросы уже созданной задачи: там 404/410 значит
@@ -124,7 +134,7 @@ def _call(method: str, url: str, key: str, service: str, **kw):
             f"заказана с другого стенда. Автоматическое создание дубля остановлено: "
             f"новый заказ это новые деньги, решение за человеком")
     if resp.status_code == 422:
-        raise ItemFailed(f"{service} не принял запрос: {_detail(resp)}")
+        raise RemoteRejected(f"{service} не принял запрос: {_detail(resp)}")
     if resp.status_code >= 400:
         raise ItemFailed(f"{service} ответил {resp.status_code}: {_detail(resp)}")
     return resp
@@ -382,6 +392,68 @@ class RemoteJobMissing(ItemFailed):
     """
 
 
+# Сколько времени живёт запомненный список моделей соседа. Список меняется редко —
+# правкой переменной окружения у рерайта и его рестартом, — а заказы идут пачками:
+# двадцать выпусков подряд спросили бы одно и то же двадцать раз. Пять минут снимают
+# почти все повторные запросы и при этом не требуют нашего рестарта после правки
+# у соседа. Ноль отключает память полностью (для разбора инцидента).
+MODELS_TTL = float(os.environ.get("VS_REWRITE_MODELS_TTL", "300"))
+# отпечаток (адрес + ключ) → (до какого времени годен, список моделей)
+_models_cache = {}
+_models_gate = threading.Lock()
+
+# Что сказать человеку, когда модель выбрать не из чего. Молча подставить литерал
+# нельзя: именно так у нас и появился зашитый gpt-4.1-nano, которого с 17.09 нет в
+# списке серверных ключей рерайта.
+CHOOSE_MODEL = "выберите модель в пресете рерайта этого канала"
+
+
+def _parse_models(body) -> list:
+    """Ответ соседа на /models → [{"value": имя, "default": помечена ли}].
+
+    Формат разбираем терпимо нарочно. Боевой рерайт отдаёт сессии список словарей
+    `{value,label,default}` (live_2026-09-18/код/рерайт/server.py:2283); ручку по
+    ключу `GET /api/v1/models` мы дописали сами 19.09 (studio-platform/rewrite/api.py)
+    и держим ровно тот же формат. Но ребейз форка 31.08 → 18.09 (B7) накладывает наши
+    правки заново, и ответ может приехать обёрнутым (`{"models": [...]}`) или списком
+    строк. Упасть из-за обёртки, когда нужное имя в ответе есть, значило бы остановить
+    очередь на ровном месте.
+    """
+    if isinstance(body, dict):
+        for field in ("models", "items", "data"):
+            if isinstance(body.get(field), list):
+                body = body[field]
+                break
+    if not isinstance(body, list):
+        return []
+    out = []
+    for item in body:
+        if isinstance(item, str):
+            value, marked = item.strip(), False
+        elif isinstance(item, dict):
+            value = str(item.get("value") or item.get("id") or item.get("model")
+                        or item.get("name") or "").strip()
+            marked = bool(item.get("default") or item.get("is_default"))
+        else:
+            continue
+        if value:
+            out.append({"value": value, "default": marked})
+    return out
+
+
+def _about_model(detail: str, model: str) -> bool:
+    """Отказ соседа именно про модель, а не про язык или размер куска.
+
+    Судим по тексту ответа: имя модели в нём или слово «модель». Текст отказа у
+    рерайта свой (`server_key_model_error`), кода ошибки для этого случая нет —
+    422 у него один на всё. Ошибиться безопасно: не узнали — покажем отказ как есть.
+    """
+    low = (detail or "").lower()
+    if "модел" in low or "model" in low:
+        return True
+    return bool(model) and model.lower() in low
+
+
 class RewriteClient:
     def __init__(self, key: str, base: str = REWRITE_BASE):
         self.key = key
@@ -409,16 +481,93 @@ class RewriteClient:
                     return entry
         return {}
 
+    def models(self) -> list:
+        """Модели, которые сосед готов принять ОТ ЭТОГО КЛЮЧА.
+
+        Список зависит от ключа: кабинету на серверном ключе рерайт с 17.09 разрешает
+        только свой короткий перечень, а кабинету со своим ключом провайдера — прежний
+        общий. Поэтому и память по ключу, а не общая на процесс. Сам ключ в памяти не
+        лежит: ключом служит его отпечаток, чтобы секрет не всплыл в дампе состояния.
+        """
+        slot = hashlib.sha256(f"{self.base}\n{self.key}".encode("utf-8")).hexdigest()[:16]
+        now = time.time()
+        with _models_gate:
+            cached = _models_cache.get(slot)
+            if cached and cached[0] > now:
+                return list(cached[1])
+        resp = _call("GET", self._url("/models"), self.key, "рерайт")
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            # Код 200, а тело не JSON — так выглядит чужой прокси, страница входа или
+            # обрезанный ответ. Переводим здесь, чтобы наружу из клиента уходил ровно
+            # один класс отказа: иначе ValueError улетает мимо `except ItemFailed`
+            # в общий обработчик движка, и человек видит загадочную поломку вместо
+            # понятного «список моделей получить не удалось».
+            raise ItemFailed(f"рерайт ответил на список моделей не-JSON: {exc}") from exc
+        items = _parse_models(body)
+        # Запоминаем только НЕПУСТОЙ разбор. Отказ должен спрашиваться заново, иначе
+        # починка у соседа не видна нам ещё пять минут. Пустой разбор при коде 200 —
+        # это тот же отказ, только замаскированный: у соседа поменялась форма ответа
+        # или пропали кредиты провайдера. Запомнить его значит увести в карантин всю
+        # идущую следом пачку выпусков и не заметить, что сосед уже починился.
+        if items:
+            with _models_gate:
+                _models_cache[slot] = (now + MODELS_TTL, items)
+        return list(items)
+
+    def resolve_model(self, preset: dict) -> str:
+        """Какой моделью заказывать рерайт.
+
+        Первое слово за пресетом: это выбор владельца канала. Пусто — спрашиваем
+        соседа и берём ту, которую он пометил как «по умолчанию». До 19.09.2026 здесь
+        стоял литерал `gpt-4.1-nano`; с 17.09 рерайт на серверном ключе отвечает на
+        него 422 (`rewrite_core.server_key_model_error`), то есть в момент снятия паузы
+        все наши заказы встали бы разом.
+
+        Не спросили список — честный отказ, а не другой литерал. Подстановка наугад
+        стоит денег: модели в списке различаются ценой в разы, и выбирать за владельца
+        мы не вправе.
+        """
+        chosen = str((preset or {}).get("model") or "").strip()
+        if chosen:
+            return chosen
+        try:
+            items = self.models()
+        except ItemFailed as exc:
+            # Сюда приходит всё, чем сосед может не отдать список: 404 (сервис старше
+            # ручки `/api/v1/models`), 400/422, а также не-JSON в теле — `models()`
+            # переводит его в ItemFailed сам, чтобы здесь не было второго класса.
+            # Это настройка канала, а не авария ресурса: ждать нечего.
+            raise ItemFailed(f"в пресете не выбрана модель, а список моделей рерайта "
+                             f"получить не удалось ({exc}) — {CHOOSE_MODEL}") from exc
+        marked = [item["value"] for item in items if item["default"]]
+        if marked:
+            return marked[0]
+        if len(items) == 1:
+            return items[0]["value"]      # выбора нет ни у нас, ни у владельца
+        if not items:
+            raise ItemFailed(f"в пресете не выбрана модель, а сосед вернул пустой "
+                             f"список моделей — {CHOOSE_MODEL}")
+        names = ", ".join(item["value"] for item in items[:10])
+        raise ItemFailed(f"в пресете не выбрана модель, а сосед не пометил ни одну из "
+                         f"{len(items)} своих как «по умолчанию» ({names}) — {CHOOSE_MODEL}")
+
     def create_job(self, file_id: str, lang_code: str, preset: dict,
-                   channel_name: str = "", idempotency_key: str = "") -> str:
+                   channel_name: str = "", idempotency_key: str = "",
+                   model: str = "") -> str:
         preset = preset or {}
         lang_entry = self.preset_language(preset, lang_code)
+        # Модель выясняется здесь, до тела запроса. Явный аргумент сильнее пресета:
+        # он нужен тому, кто пересоздаёт заказ после отказа «модель не принята» и уже
+        # знает, чем заменить. Пусто — обычный порядок: пресет, потом подсказка соседа.
+        model = str(model or "").strip() or self.resolve_model(preset)
         body = {
             "files": [file_id],
             # В languages допустим ТОЛЬКО code: сервис запрещает лишние поля,
             # название канала передаётся отдельным полем channel_name.
             "languages": [{"code": lang_ru(lang_code)}],
-            "model": preset.get("model") or "gpt-4.1-nano",
+            "model": model,
             "chunk_size": int(preset.get("chunk") or 3500),
             "preserve_paragraphs": bool(preset.get("preserve_paragraphs", True)),
             "address_style": (preset.get("address") or "")[:8],
@@ -435,9 +584,18 @@ class RewriteClient:
         # текста; тот же ключ с другим текстом/моделью/языком он обязан отвергнуть.
         # Наш форк рерайта этого ещё не умеет (ребейз 31.08 → 18.09 впереди) — заголовок
         # он просто не заметит, а после ребейза защита включится сама.
-        resp = _call("POST", self._url("/jobs"), self.key, "рерайт", json=body,
-                     headers={"Idempotency-Key": idempotency_key}
-                     if idempotency_key else {})
+        try:
+            resp = _call("POST", self._url("/jobs"), self.key, "рерайт", json=body,
+                         headers={"Idempotency-Key": idempotency_key}
+                         if idempotency_key else {})
+        except RemoteRejected as exc:
+            # 422 про модель — это не загадочная поломка, а решение, которое человек
+            # может принять за минуту. Показываем его именно так.
+            if _about_model(str(exc), model):
+                raise ItemFailed(f"сосед не принял модель «{model}»: {exc}. "
+                                 f"Выберите другую модель в пресете рерайта "
+                                 f"этого канала") from exc
+            raise
         return resp.json()["job_id"]
 
     def job(self, job_id: str) -> dict:

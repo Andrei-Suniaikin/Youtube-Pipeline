@@ -20,6 +20,7 @@ import preset_links
 import hashlib
 import json
 import os
+import sqlite3
 
 import pub_calls
 from pub_engine import ItemFailed, ResourceDown
@@ -54,6 +55,23 @@ OPTIONAL_STAGES = ("chapters",)
 
 TERMINAL_OK = ("done",)
 TERMINAL_BAD = ("error", "cancelled")
+
+# Приёмка текста рерайта: какую долю донора обязан сохранить результат.
+#
+# Почему 0,6. Рерайт — пересказ, а не перевод: нормальный результат держится около
+# длины донора или длиннее. При этом честно короче он быть может — субтитры идут без
+# пунктуации, с повторами строк и служебными вставками, и аккуратный пересказ
+# ужимается процентов на двадцать-тридцать. Порог 0,6 оставляет этот запас и ловит
+# случай из боя 18.09: донор 3271 слово, результат 1332 (46%) со статусом «Готово».
+# Цена пропуска — не один испорченный текст, а три оплаченные стадии следом
+# (озвучка, картинки, рендер) и ролик-половинка на канале.
+#
+# Ноль отключает проверку целиком: осознанный откат без правки кода.
+TEXT_MIN_RATIO = float(os.environ.get("VS_TEXT_MIN_RATIO", "0.6"))
+
+# Абсолютный пол длины: текст короче просто не о чем озвучивать, каким бы коротким
+# ни был донор. Проверка существовала и до доли — она остаётся как была.
+TEXT_MIN_CHARS = int(os.environ.get("VS_TEXT_MIN_CHARS", "500"))
 
 
 class PubServices:
@@ -118,11 +136,45 @@ class PubServices:
                         " AND kind='job'", (release_id, service)).fetchone()
         return row
 
-    def _remember_remote(self, c, release_id: str, service: str, job_id: str, now: float):
-        c.execute(
-            "INSERT OR REPLACE INTO pub_release_jobs(release_id,service,kind,remote_job_id,"
-            "status,created,updated) VALUES(?,?,?,?,?,?,?)",
-            (release_id, service, "job", str(job_id), "running", now, now))
+    def _remember_remote(self, c, release_id: str, service: str, job_id: str, now: float,
+                         donor_chars: int = 0):
+        """Запомнить задачу соседа. `donor_chars` — длина исходника в момент заказа.
+
+        Почему длина донора живёт здесь, а не в `provider_calls`. Журнал платных
+        вызовов отвечает на вопрос «платили ли мы за это» — у него фиксированный набор
+        колонок и своя уникальность, и дописывать туда мерку приёмки значило бы менять
+        общую схему ради одной стадии. А строка `pub_release_jobs` — это и есть наша
+        копия «что мы заказали соседу»: у неё уже есть свободное поле `payload`, она
+        живёт ровно столько же, сколько задача, и читается там же, где забирается
+        результат. Донор на момент получения текста недоступен (субтитры качались тиком
+        раньше), поэтому запомнить его надо именно при заказе.
+        """
+        blob = (json.dumps({"donor_chars": int(donor_chars)}, ensure_ascii=False)
+                if donor_chars > 0 else None)
+        try:
+            c.execute(
+                "INSERT OR REPLACE INTO pub_release_jobs(release_id,service,kind,"
+                "remote_job_id,status,payload,created,updated) VALUES(?,?,?,?,?,?,?,?)",
+                (release_id, service, "job", str(job_id), "running", blob, now, now))
+        except sqlite3.OperationalError:
+            # База старше колонки `payload`. Длина донора — мерка приёмки, а не условие
+            # работы: без неё проверка доли молчит, но выпуск идёт своим ходом.
+            c.execute(
+                "INSERT OR REPLACE INTO pub_release_jobs(release_id,service,kind,"
+                "remote_job_id,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+                (release_id, service, "job", str(job_id), "running", now, now))
+
+    @staticmethod
+    def _donor_chars(row) -> int:
+        """Длина донора, запомненная при заказе. 0 — «не знаем», а не «ноль знаков»."""
+        try:
+            raw = row["payload"]
+        except (KeyError, IndexError, TypeError):
+            return 0
+        try:
+            return int((json.loads(raw) or {}).get("donor_chars") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0
 
     def _finish_remote(self, c, release_id: str, service: str, status: str,
                        error: str = "") -> None:
@@ -220,6 +272,28 @@ class PubServices:
             lang = rel["lang"] or "ru"
             # 04.09.2026: по общему идентификатору, а не по логину владельца тенанта.
             preset = rewrite_preset_config(rel["tenant_id"], rel["preset_rewrite"] or "")
+            # Модель выясняем ЗДЕСЬ — до брони и до загрузки донора соседу. Раньше её
+            # выбирал сам `create_job`, то есть уже после `pub_calls.reserve` и после
+            # того, как весь донор уехал к соседу: денег это не стоило, но каждый тик
+            # зря гонял файл по сети и открывал строку журнала заново.
+            #
+            # Отказ держим в руках, а не бросаем сразу. Ветки «уже оплачен» и «уже
+            # заказан» ниже модель не заказывают — им нужно только подхватить чужой
+            # результат, и уронить их из-за недоступного списка моделей значило бы
+            # бросить оплаченный текст (те самые 146 из разбора 18.09). Поэтому сначала
+            # разбираем бронь, и только на ветке настоящего заказа отказ становится
+            # отказом. А вот ResourceDown (сосед лёг) отсюда уходит наверх как есть:
+            # у лежачего рерайта и результат не заберёшь, ждать должна вся очередь.
+            try:
+                model, model_error = client.resolve_model(preset), None
+            except ItemFailed as exc:
+                model, model_error = "", exc
+            # Отпечаток намеренно остаётся на модели ПРЕСЕТА, хотя заказ с 19.09 может
+            # уйти на модели, подсказанной соседом (pub_remote.resolve_model). Отпечаток
+            # отвечает на один вопрос: «за это уже платили?». Добавить туда вычисленную
+            # модель значило бы объявить новыми все строки, где пресет молчит, — а это
+            # ровно те 146 оплаченных и не забранных текстов из разбора 18.09. Смена
+            # модели В ПРЕСЕТЕ отпечаток меняет, как и меняла.
             fp = pub_calls.fingerprint(
                 text=hashlib.sha256(text.encode("utf-8")).hexdigest(),
                 lang=lang, preset=rel["preset_rewrite"] or "",
@@ -239,8 +313,12 @@ class PubServices:
                          f"(задача {done or 'неизвестна'}) — новый заказ не создаю",
                          level="warn")
                 if done:
+                    # Донора передаём и здесь: подхват уже оплаченной задачи всё равно
+                    # закончится приёмкой текста на следующем тике, а без длины донора
+                    # приёмка по доле промолчит — ровно на тех выпусках, ради которых
+                    # она и писалась.
                     self._remember_remote(c, rel["release_id"], "rewrite", done,
-                                          rel["updated"])
+                                          rel["updated"], donor_chars=len(text))
                     return {"wait": True}
                 raise ItemFailed("рерайт числится оплаченным, но задача не записана — "
                                  "нужен разбор, повторно платить нельзя")
@@ -254,14 +332,24 @@ class PubServices:
                 log_line(c, rel["release_id"], "рерайт",
                          f"задача {was} уже заказана раньше — подхватываю её, "
                          f"нового заказа не создаю", level="warn")
+                # Та же причина, что и в ветке «уже оплачен»: текст по этой задаче мы
+                # ещё будем принимать, и длина донора нужна именно сейчас.
                 self._remember_remote(c, rel["release_id"], "rewrite", was,
-                                      rel["updated"])
+                                      rel["updated"], donor_chars=len(text))
                 return {"wait": True}
+            if model_error is not None:
+                # Настоящий заказ без выбранной модели невозможен. Строку журнала
+                # закрываем как «до провайдера не дошли»: денег нет, повтор безопасен,
+                # и следующий тик после правки пресета пойдёт заново.
+                pub_calls.mark_failed(c, decision["call_id"], str(model_error)[:400],
+                                      ordered=False)
+                c.commit()
+                raise model_error
             file_id = client.upload_text(text, filename=f'{rel["release_id"]}.txt')
             try:
                 job_id = client.create_job(
                     file_id, lang, preset, channel_name=rel["ch_name"] or "",
-                    idempotency_key=f'release:{rel["release_id"]}')
+                    idempotency_key=f'release:{rel["release_id"]}', model=model)
             except Exception as exc:
                 # Заказа нет — денег нет: строку открываем заново, повтор безопасен.
                 pub_calls.mark_failed(c, decision["call_id"], str(exc)[:400],
@@ -274,7 +362,10 @@ class PubServices:
             # «оплачено» и «получено».
             pub_calls.mark_ordered(c, decision["call_id"], job_id)
             c.commit()
-            self._remember_remote(c, rel["release_id"], "rewrite", job_id, rel["updated"])
+            # Длину донора запоминаем вместе с задачей: при получении текста её уже
+            # неоткуда взять, а без неё приёмку по доле делать не из чего.
+            self._remember_remote(c, rel["release_id"], "rewrite", job_id,
+                                  rel["updated"], donor_chars=len(text))
             log_line(c, rel["release_id"], "рерайт",
                      f"субтитры донора {len(text)} символов, заказал задачу {job_id}, "
                      f"пресет «{rel['preset_rewrite'] or 'не выбран'}»")
@@ -298,11 +389,11 @@ class PubServices:
         if state not in ("done", "completed", "finished", "success"):
             return {"wait": True}
 
+        donor_chars = self._donor_chars(known)
         try:
             code = client.result_code(info, rel["lang"] or "ru")
             text = client.result_text(known["remote_job_id"], code)
-            if len(text.strip()) < 500:
-                raise ItemFailed("рерайт вернул слишком короткий текст")
+            self._check_text_length(c, rel, text, donor_chars)
             self.store_source_text(c, rel["release_id"], text, rel["updated"])
         except Exception as exc:
             self._close_text_call(c, rel, error=str(exc))
@@ -310,8 +401,49 @@ class PubServices:
             raise
         self._close_text_call(c, rel, result=known["remote_job_id"])
         self._finish_remote(c, rel["release_id"], "rewrite", "done")
-        log_line(c, rel["release_id"], "рерайт", f"текст готов, {len(text)} символов")
-        return {"payload": {"chars": len(text)}}
+        # Одна мера длины на всю строку: и «сколько знаков», и доля считаются от
+        # `text.strip()` — от того же числа, которым мерила приёмка. Раньше рядом
+        # стояли len(text) и доля от len(text.strip()), и на тексте с хвостом пустых
+        # строк человек делил одно на другое и не сходился.
+        body = len(text.strip())
+        share = (f", {body / donor_chars * 100:.1f}% донора" if donor_chars > 0 else "")
+        log_line(c, rel["release_id"], "рерайт", f"текст готов, {body} символов{share}")
+        return {"payload": {"chars": body}}
+
+    def _check_text_length(self, c, rel, text: str, donor_chars: int) -> None:
+        """Приёмка результата рерайта по длине. Не прошло — выпуск дальше не идёт.
+
+        Зачем вообще. Единственной проверкой была нижняя планка в 500 знаков, а в бою
+        18.09 случилось другое: донор 3271 слово, результат 1332 (46%) — и статус
+        «Готово». Половина сюжета — это не короткий текст, это другой текст, и стоит
+        он ровно столько же: следом идут озвучка, картинки и рендер, каждый за деньги.
+        Дешевле остановиться здесь, чем получить оплаченный ролик-половинку.
+
+        Почему не считаем слова: знаки уже есть под рукой в обоих концах и не зависят
+        от языка — у польского и немецкого слова разной длины, доля по знакам честнее.
+        """
+        body = len(text.strip())
+        if body < TEXT_MIN_CHARS:
+            raise ItemFailed(f"рерайт вернул слишком короткий текст: {body} знаков "
+                             f"при минимуме {TEXT_MIN_CHARS}")
+        if TEXT_MIN_RATIO <= 0 or donor_chars <= 0:
+            # Порог снят владельцем либо длина донора неизвестна: задача заказана до
+            # появления этой мерки или база старше колонки `payload`. Молчим честно —
+            # выдумать долю не из чего, а придираться к старым задачам не за что.
+            return
+        share = body / donor_chars
+        if share >= TEXT_MIN_RATIO:
+            return
+        # Знак после запятой обязателен. С округлением до целых текст на 59,6% давал
+        # «(60% при пороге 60%) — дальше не пускаю», то есть человек читал равенство
+        # там, где сработало строгое «меньше», и шёл искать несуществующий баг.
+        message = (f"текст короче донора: {body} знаков против {donor_chars} у донора "
+                   f"({share * 100:.1f}% при пороге {TEXT_MIN_RATIO * 100:.1f}%) — "
+                   f"дальше не пускаю, следом три оплачиваемых шага")
+        # Пишем строку сами, отдельно от карантинной: человеку нужен шаг «рерайт» и
+        # обе длины рядом, а не только итог «убрал в разбор».
+        log_line(c, rel["release_id"], "рерайт", message, level="error")
+        raise ItemFailed(message)
 
     def _close_text_call(self, c, rel, result: str = "", error: str = "") -> None:
         """Закрыть строку журнала за этот текст: получено или не получено.

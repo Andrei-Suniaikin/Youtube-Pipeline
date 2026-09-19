@@ -6,6 +6,9 @@ api.py — REST API v1 для Rewrite Studio.
 Сосуществует со старыми session-based routes — никаких breaking changes.
 
 Endpoints:
+  GET    /api/v1/languages                      — список поддерживаемых языков
+  GET    /api/v1/presets                        — пресеты пользователя (добавлено 03.09)
+  GET    /api/v1/models                         — модели, доступные ЭТОМУ ключу (19.09)
   POST   /api/v1/files                          — upload входного файла
   POST   /api/v1/jobs                           — создать rewrite-job
   GET    /api/v1/jobs                           — список jobs юзера (paginated)
@@ -465,7 +468,7 @@ def build_api_router(
     user_is_active: Optional[Callable[[str], bool]] = None,
     presets_provider: Optional[Callable[[str], Dict]] = None,
 ) -> APIRouter:
-    """Создаёт APIRouter с 8 endpoints. Все требуют api-key через Depends(get_api_user)."""
+    """Создаёт APIRouter с 10 endpoints. Все требуют api-key через Depends(get_api_user)."""
 
     router = APIRouter(
         prefix="/api/v1",
@@ -540,6 +543,110 @@ def build_api_router(
         if presets_provider is None:
             raise HTTPException(status_code=503, detail="presets provider not configured")
         return presets_provider(_api_user_id(user))
+
+    # ----- 0.3 GET /models -----
+    # ДОБАВЛЕНО 19.09.2026. Это ШЕСТАЯ наша правка в форке рерайта: в задаче B7
+    # перечислены четыре (SSO, ADMIN_USER_ID, SESSION_DB, /presets), пятая — соседняя
+    # правка этого же захода. При ребейзе 31.08 → 18.09 её надо наложить ЗАНОВО:
+    # в бою список моделей отдаёт только сессионный `GET /models`
+    # (live_2026-09-18/код/рерайт/server.py:2283), по ключу такой ручки нет ни в форке,
+    # ни в бою, и ребейз её НЕ принесёт.
+    #
+    # Зачем она кабинету. В теле заказа рерайта у кабинета стоял зашитый
+    # `gpt-4.1-nano`; с 17.09 рерайт на серверном ключе отвечает на него 422. Имя
+    # модели нельзя ни зашивать, ни выбирать наугад — модели различаются ценой в разы.
+    # Значит кабинету нужен способ спросить: «что ты примешь ОТ ЭТОГО КЛЮЧА».
+    # Ответ зависит именно от ключа (свои креды провайдера против серверных),
+    # поэтому сессионную ручку переиспользовать нельзя — там пользователь берётся
+    # из куки.
+    #
+    # Логика повторяет сессионную намеренно: это тот же вопрос к тем же функциям
+    # rewrite_core. Импортировать сам `server.get_models` нельзя — server.py импортирует
+    # этот модуль, и он же достаёт пользователя из куки.
+    @router.get(
+        "/models",
+        summary="List models this key may order",
+        description=(
+            "Модели, которые сервис примет в `model` у POST /jobs ОТ ЭТОГО КЛЮЧА. "
+            "Список зависит от кредов тенанта: свои ключи провайдера дают один набор, "
+            "серверные — другой, более короткий. Элемент `default: true` означает, что "
+            "модель назначена сервером; его ставит только Codex-ветка (см. комментарий "
+            "в коде) — если пометки нет, выбор модели остаётся за вызывающим."
+        ),
+    )
+    def list_models_api(user: Dict = Depends(get_api_user)) -> List[Dict]:
+        uid = _api_user_id(user)
+        labels = {
+            "gpt-4.1-nano": "GPT-4.1 Nano",
+            "gpt-4.1-mini": "GPT-4.1 Mini",
+            "gpt-4o-mini": "GPT-4o Mini",
+        }
+        base: List[Dict] = []
+        # Не рекламируем API-модели, которые admission всё равно отклонит с 503.
+        if credential_source("openai", uid) != "none" and provider_user_allowed(
+            "openai", uid
+        ):
+            base.extend(
+                {"value": model, "label": labels.get(model, model)}
+                for model in sorted(get_allowed_openai_models())
+            )
+        shared: List[Dict] = []
+        if credential_source("claude", uid) != "none" and provider_user_allowed(
+            "claude", uid
+        ):
+            shared.extend(
+                {"value": model, "label": model}
+                for model in sorted(get_allowed_claude_models())
+            )
+        if provider_user_allowed("codex", uid) and credential_source("codex", uid) != "none":
+            codex_models = sorted(get_allowed_codex_models())
+            # Пометку `default` ставим ТОЛЬКО здесь и ТОЛЬКО той модели, которую сервер
+            # и так подставит сам (`server._resolve_studio_model`, та же переменная и то
+            # же запасное значение). Это не наш выбор за владельца, а отчёт о выборе,
+            # который сервер уже сделал.
+            #
+            # ОСОЗНАННОЕ РЕШЕНИЕ: для OpenAI- и Claude-моделей `default` не ставим
+            # ВООБЩЕ. У этих списков нет понятия «предпочтительная» — это перечень
+            # разрешённых политикой. Взять первую по алфавиту значит повторить дефект,
+            # который бой чинил 13.09 (FIX-2026-09-13-models: интерфейс выбирал первую
+            # Codex-модель по алфавиту и попадал на снятую OpenAI gpt-5.4-mini), только
+            # теперь за чужие деньги. Следствие принимаем открыто: кабинету без
+            # Codex-кредов список придёт без единой пометки, и на пустом `model`
+            # в пресете кабинет честно откажет словами «выберите модель в пресете»
+            # вместо того, чтобы заказать наугад.
+            #
+            # ВНИМАНИЕ при ребейзе B7: литерал обязан совпадать с запасным значением
+            # в `server._resolve_studio_model`. В форке 31.08 это `codex:gpt-5.4`,
+            # в бою 18.09 — `codex:gpt-5.6-terra`. Разойдутся — ручка пометит одну
+            # модель, а сервер закажет другую.
+            preferred = os.environ.get(
+                "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.4"
+            ).strip()
+            default_codex = (
+                preferred if preferred in codex_models else next(iter(codex_models), "")
+            )
+            for model in codex_models:
+                item = {"value": model, "label": model.replace("codex:", "") + " — Codex"}
+                if model == default_codex:
+                    item["default"] = True
+                shared.append(item)
+        base = shared + base
+        # Отсев моделей вне списка серверных ключей появился в бою 17.09
+        # (FIX-2026-09-17-server-models). В форке 31.08 функции ещё нет, поэтому импорт
+        # мягкий: без неё ручка работает как раньше, а после ребейза отсев включится
+        # сам и не придётся вспоминать про это место.
+        try:
+            from rewrite_core import server_key_model_error
+        except ImportError:
+            server_key_model_error = None
+        if server_key_model_error is not None:
+            base = [item for item in base if not server_key_model_error(item["value"], uid)]
+        if uid == ADMIN_USER_ID:
+            for model in get_keys_config(uid).get("custom_models", []):
+                model = str(model).strip()
+                if model and not any(item["value"] == model for item in base):
+                    base.append({"value": model, "label": model})
+        return base
 
     # ----- 1.1 POST /files -----
     @router.post(
