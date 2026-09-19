@@ -160,7 +160,8 @@ class TextClient:
         return "file-1"
 
     def create_job(self, file_id, lang, preset, channel_name="", idempotency_key="",
-                   model=""):
+                   model="", source_sha=""):
+        # source_sha добавлен 19.09.2026 (ребейз B7): см. pub_remote._order_digest.
         TextClient.seen.append(f"create_job:{model}")
         return "job-1"
 
@@ -606,6 +607,9 @@ def part_models_endpoint():
     """
     print("\nНовая ручка рерайта GET /api/v1/models (по ключу, а не по сессии)")
     sys.path.insert(0, os.path.join(BASE, "rewrite"))
+    # shared/ — с ребейза 19.09: боевой rewrite_core импортирует credential_budget
+    # БЕЗ try, и без этого каталога не импортируется вообще ничего из рерайта.
+    sys.path.insert(0, os.path.join(BASE, "shared"))
     import api as rewrite_api                                         # noqa: E402
     import rewrite_core                                              # noqa: E402
 
@@ -636,25 +640,30 @@ def part_models_endpoint():
 
         print("\n  есть Codex — помечена та модель, которую сервер и так подставит")
         creds["codex"] = "server"
-        allowed["codex"] = {"codex:gpt-5.4", "codex:gpt-5.9-sol"}
+        # Литерал обязан совпадать с запасным в `server._resolve_studio_model`.
+        # Ребейз 19.09 переставил его с `codex:gpt-5.4` (форк 31.08) на
+        # `codex:gpt-5.6-terra` (бой 18.09); список нарочно включает обе модели,
+        # чтобы пометка досталась НАЗНАЧЕННОЙ, а не первой по алфавиту. Иначе
+        # проверка проходила бы сама собой и ничего не охраняла.
+        allowed["codex"] = {"codex:gpt-5.4", "codex:gpt-5.6-terra"}
         body = handler(user={"user_id": "u1"})
         marked = [i["value"] for i in body if i.get("default")]
-        # Значение обязано совпадать с запасным в server._resolve_studio_model:375
-        # нашего форка. Разойдутся — ручка пометит одну модель, а сервер закажет другую.
-        check("помечена ровно одна", marked, ["codex:gpt-5.4"])
+        check("помечена ровно одна", marked, ["codex:gpt-5.6-terra"])
         check("а вторая без пометки", len(body), 2)
 
         print("\n  ответ понятен кабинету без переводчика")
         items = pub_remote._parse_models(body)
         check("кабинет разобрал ответ", [i["value"] for i in items],
-              ["codex:gpt-5.4", "codex:gpt-5.9-sol"])
-        check("и выбрал бы помеченную", _chosen_from(items), "codex:gpt-5.4")
+              ["codex:gpt-5.4", "codex:gpt-5.6-terra"])
+        check("и выбрал бы помеченную", _chosen_from(items), "codex:gpt-5.6-terra")
 
         print("\n  переменная сервера переставляет пометку")
-        os.environ["REWRITE_STUDIO_CODEX_MODEL"] = "codex:gpt-5.9-sol"
+        # Берём ВТОРУЮ модель из того же списка: смысл проверки в том, что пометка
+        # идёт за переменной, а не за запасным литералом и не за алфавитом.
+        os.environ["REWRITE_STUDIO_CODEX_MODEL"] = "codex:gpt-5.4"
         body = handler(user={"user_id": "u1"})
         check("помечена назначенная сервером",
-              [i["value"] for i in body if i.get("default")], ["codex:gpt-5.9-sol"])
+              [i["value"] for i in body if i.get("default")], ["codex:gpt-5.4"])
         os.environ.pop("REWRITE_STUDIO_CODEX_MODEL")
 
         print("\n  осознанно: не-Codex модели НЕ помечаются, и кабинет честно отказывает")
@@ -673,17 +682,29 @@ def part_models_endpoint():
         check("значит кабинет на пустом пресете откажет, а не закажет наугад",
               _refusal_for(pub_remote._parse_models(body)), True)
 
-        print("\n  отсев по серверным ключам подхватится сам после ребейза B7")
-        rewrite_core.server_key_model_error = (
+        print("\n  отсев по серверным ключам: ребейз B7 его привёз, он работает")
+        # До ребейза функции в форке не было и импорт в ручке был мягким. Теперь она
+        # приехала и импортируется модулем `api` наравне с остальным rewrite_core —
+        # значит и подменять надо ИМЕННО там. Подмена в `rewrite_core` после ребейза
+        # ничего бы не сделала, и проверка молча перестала бы что-либо охранять.
+        was_filter = rewrite_api.server_key_model_error
+        rewrite_api.server_key_model_error = (
             lambda model, user_id="": "" if model == "claude-opus-5" else "нельзя")
         try:
             body = handler(user={"user_id": "u1"})
             check("остались только разрешённые серверным ключом",
                   [i["value"] for i in body], ["claude-opus-5"])
         finally:
-            del rewrite_core.server_key_model_error
-        body = handler(user={"user_id": "u1"})
-        check("без этой функции ручка работает как раньше", len(body), 3)
+            rewrite_api.server_key_model_error = was_filter
+        # Настоящая функция при пустом REWRITE_SERVER_KEY_MODELS не режет ничего —
+        # это и есть наше сегодняшнее умолчание на стенде (список не задан).
+        was_models = os.environ.pop("REWRITE_SERVER_KEY_MODELS", None)
+        try:
+            body = handler(user={"user_id": "u1"})
+            check("пустой список серверных моделей ничего не запрещает", len(body), 3)
+        finally:
+            if was_models is not None:
+                os.environ["REWRITE_SERVER_KEY_MODELS"] = was_models
     finally:
         for name, fn in saved.items():
             setattr(rewrite_api, name, fn)

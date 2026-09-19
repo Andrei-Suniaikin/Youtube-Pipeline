@@ -19,6 +19,7 @@ SESSION_TIMEOUT = int(os.environ.get("REWRITE_SESSION_TIMEOUT", "2592000"))
 # FIX-2026-07-17: 30 дней rolling (паритет с gen-кабинетом), переопределяется env.
 # История: 600с → 401-шторм; C9 FIX-2026-07-02: 7200 — всё равно вылет после 2ч простоя.
 SESSION_PING_THROTTLE = 30  # C9: last_ping в validate обновляем не чаще раза в 30с (не долбить БД на каждый запрос)
+SESSION_CLEANUP_INTERVAL_SEC = 600  # FIX-2026-09-13: просроченные сессии удаляем не чаще раза в 10 мин (было — на каждый запрос)
 PBKDF2_ITERATIONS = 200_000  # хеш паролей аккаунтов (pbkdf2_hmac sha256, stdlib — без внешних зависимостей)
 # ИСПРАВЛЕНО 04.09.2026: путь считался от РАБОЧЕГО каталога процесса.
 # В трёх сервисах это скрывал systemd WorkingDirectory; в одном процессе
@@ -40,6 +41,8 @@ class LicenseManager:
     def __init__(self, db_path: str = SESSION_DB):
         self.db_path = db_path
         self._lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()  # отдельный: self._lock держит отключение аккаунта до 15с
+        self._last_cleanup = 0.0
         self._init_db()
 
     def _init_db(self):
@@ -88,9 +91,21 @@ class LicenseManager:
             conn.execute("UPDATE users SET status='active' WHERE status IS NULL OR status=''")
 
     def _cleanup_expired(self):
-        cutoff = time.time() - SESSION_TIMEOUT
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
-            conn.execute("DELETE FROM sessions WHERE last_ping < ?", (cutoff,))
+        # FIX-2026-09-13: DELETE шёл на КАЖДЫЙ запрос веб-интерфейса — лишняя запись в sessions.db
+        # в ту же блокировку, что и API-опрос. Теперь не чаще SESSION_CLEANUP_INTERVAL_SEC;
+        # просроченную, но ещё не удалённую сессию validate не пускает сам (условие по last_ping).
+        now = time.time()
+        with self._cleanup_lock:
+            if now - self._last_cleanup < SESSION_CLEANUP_INTERVAL_SEC:
+                return
+            self._last_cleanup = now
+        cutoff = now - SESSION_TIMEOUT
+        try:
+            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+                conn.execute("DELETE FROM sessions WHERE last_ping < ?", (cutoff,))
+        except sqlite3.OperationalError as exc:
+            # Уборка служебная: занятая база (locked/busy) не должна ронять запрос пользователя.
+            print(f"[auth] уборка просроченных сессий пропущена: {exc}")
 
     def _create_session(self, user_id: str, user_name: str, ip: str) -> str:
         """Создаёт сессию для аккаунта (user_id — свой у аккаунта). Возвращает session_id.
@@ -471,11 +486,13 @@ class LicenseManager:
         self._cleanup_expired()
         now = time.time()
         with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+            # FIX-2026-09-13: уборка теперь редкая — просроченную сессию отсекаем здесь же,
+            # иначе до ближайшей уборки она бы проходила и «оживала» через last_ping.
             row = conn.execute(
                 "SELECT s.user_id, s.user_name, s.ip, s.last_ping "
                 "FROM sessions s JOIN users u ON u.user_id=s.user_id "
-                "WHERE s.session_id = ? AND u.status='active'",
-                (session_id,),
+                "WHERE s.session_id = ? AND u.status='active' AND s.last_ping >= ?",
+                (session_id, now - SESSION_TIMEOUT),
             ).fetchone()
             if row and (now - row[3]) > SESSION_PING_THROTTLE:
                 conn.execute("UPDATE sessions SET last_ping = ? WHERE session_id = ?", (now, session_id))

@@ -18,6 +18,8 @@ import stat
 import tempfile
 import hashlib
 import sqlite3
+sys.path.insert(0, os.environ.get("VIDEO_STUDIO_SHARED_DIR", "/opt/video-studio-shared"))
+import credential_budget as _host_budget
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Iterable, List, Dict, Tuple, Optional, Set, Union, Callable
@@ -28,14 +30,21 @@ import random
 import unicodedata
 import urllib.request
 import urllib.error
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - Windows fallback for local tooling
+    _fcntl = None
 
 try:
     import anthropic
     import httpx
     ANTHROPIC_AVAILABLE = True
 except ImportError:
+    anthropic = None
+    httpx = None
     ANTHROPIC_AVAILABLE = False
 try:
     import anyio
@@ -193,7 +202,21 @@ def server_credential_owner(user_id: str = "") -> bool:
     uid = _resolve_user_id(user_id)
     if uid in ADMIN_USER_IDS:
         return True
-    return uid in _allowed_values("REWRITE_SERVER_SUBSCRIPTION_USER_IDS", "")
+    allowed = _allowed_values("REWRITE_SERVER_SUBSCRIPTION_USER_IDS", "")
+    # 04.09.2026: список поимённый, и новый партнёр в него не попадал — доступ к
+    # серверной подписке молча не выдавался, пока кто-то не вспомнит дописать id.
+    # "*" = «всем аккаунтам сервиса», решение владельца; пустой список по-прежнему
+    # означает «только админ», поведение без звёздочки не меняется.
+    return "*" in allowed or uid in allowed
+
+
+def own_credentials_only(user_id: str = "") -> bool:
+    """Per-owner fail-closed policy; old accounts retain server fallback."""
+    uid = _resolve_user_id(user_id)
+    forced = _allowed_values("REWRITE_OWN_ONLY_USER_IDS", "")
+    if "*" in forced or uid in forced:
+        return True
+    return get_keys_config(uid, strict=True).get("credential_mode") == "own_only"
 
 
 def get_user_openai_keys(user_id: str = "") -> List[str]:
@@ -266,7 +289,7 @@ def get_effective_anthropic_keys(user_id: str = "") -> List[str]:
     own = get_user_anthropic_keys(user_id)
     if own:
         return own
-    if server_credential_owner(user_id):
+    if not own_credentials_only(user_id) and server_credential_owner(user_id):
         return get_server_anthropic_keys()
     return []
 
@@ -302,7 +325,8 @@ def get_effective_anthropic_key(user_id: str = "") -> str:
 
 def get_effective_openai_keys(user_id: str = "") -> List[str]:
     """BYOK-first: own tenant keys, otherwise the shared server pool."""
-    return get_user_openai_keys(user_id) or get_server_openai_keys()
+    own = get_user_openai_keys(user_id)
+    return own or ([] if own_credentials_only(user_id) else get_server_openai_keys())
 
 
 def get_effective_openai_key(user_id: str = "") -> str:
@@ -312,7 +336,8 @@ def get_effective_openai_key(user_id: str = "") -> str:
 
 def get_effective_claude_oauth_tokens(user_id: str = "") -> List[str]:
     """BYOK-first: own tenant tokens, otherwise the shared server pool."""
-    return get_user_claude_oauth_tokens(user_id) or get_server_claude_oauth_tokens()
+    own = get_user_claude_oauth_tokens(user_id)
+    return own or ([] if own_credentials_only(user_id) else get_server_claude_oauth_tokens())
 
 
 def get_claude_admission_credential(user_id: str = "") -> Optional[List[str]]:
@@ -336,6 +361,8 @@ def get_claude_admission_credential(user_id: str = "") -> Optional[List[str]]:
         return own_oauth
     if get_user_anthropic_keys(user_id):
         return []
+    if own_credentials_only(user_id):
+        return None
     server_oauth = get_server_claude_oauth_tokens()
     if server_oauth:
         return server_oauth
@@ -350,7 +377,7 @@ def credential_source(provider: str, user_id: str = "") -> str:
     if provider == "openai":
         if get_user_openai_keys(user_id):
             return "user"
-        return "server" if get_server_openai_keys() else "none"
+        return "server" if not own_credentials_only(user_id) and get_server_openai_keys() else "none"
     if provider == "claude":
         if get_user_claude_oauth_tokens(user_id):
             return "user"
@@ -359,14 +386,14 @@ def credential_source(provider: str, user_id: str = "") -> str:
         # свой ключ тенанта (и лог/кабинет врали про подписку владельца).
         if get_user_anthropic_keys(user_id):
             return "user"
-        if get_server_claude_oauth_tokens():
+        if not own_credentials_only(user_id) and get_server_claude_oauth_tokens():
             return "server"
         # Своего/серверного OAuth нет — Claude ещё доступен по API-ключу.
         return credential_source("anthropic", user_id)
     if provider == "anthropic":
         if get_user_anthropic_keys(user_id):
             return "user"
-        if server_credential_owner(user_id) and get_server_anthropic_keys():
+        if not own_credentials_only(user_id) and server_credential_owner(user_id) and get_server_anthropic_keys():
             return "server"
         return "none"
     if provider == "codex":
@@ -374,9 +401,7 @@ def credential_source(provider: str, user_id: str = "") -> str:
         # серверная подписка владельца — только владельцу (задача B).
         if get_user_codex_auth(user_id):
             return "user"
-        if server_credential_owner(user_id) and (
-            get_server_codex_homes() or [_DEFAULT_CODEX_HOME]
-        ):
+        if not own_credentials_only(user_id) and server_credential_owner(user_id) and get_server_codex_homes():
             return "server"
         return "none"
     return "none"
@@ -388,12 +413,30 @@ def has_provider_credential(provider: str, user_id: str = "") -> bool:
 
 
 def get_server_codex_homes() -> List[str]:
-    """Unique explicit server-owned CODEX_HOME directories."""
+    """Unique server-owned CODEX_HOME directories with persistent auth."""
     values = _parse_server_secret_list(os.environ.get("REWRITE_CODEX_HOMES", ""))
     scalar = (os.environ.get("REWRITE_CODEX_HOME") or "").strip()
     if scalar and scalar not in values:
         values.append(scalar)
+    if not values:
+        default_home = os.path.join(os.path.expanduser("~"), ".codex")
+        if os.path.isfile(os.path.join(default_home, "auth.json")):
+            values.append(default_home)
     return values
+
+
+def validate_codex_auth_document(payload: Any) -> None:
+    """Reject Codex subscription credentials that cannot refresh themselves."""
+    if not isinstance(payload, dict):
+        raise ValueError("auth.json must be a JSON object")
+    if payload.get("auth_mode") != "chatgpt":
+        raise ValueError("auth.json must use ChatGPT subscription login")
+    tokens = payload.get("tokens")
+    if not isinstance(tokens, dict):
+        raise ValueError("auth.json must contain a tokens object")
+    for field in ("access_token", "refresh_token"):
+        if not isinstance(tokens.get(field), str) or not tokens[field].strip():
+            raise ValueError(f"auth.json must contain tokens.{field}")
 
 
 # ---------- BYOK-2026-07-30: своя подписка Codex у тенанта ----------
@@ -553,39 +596,75 @@ def _codex_home_owner(home: str) -> str:
         return _CODEX_HOME_OWNERS.get(os.path.realpath(home), "")
 
 
-def get_user_codex_homes(user_id: str = "") -> List[str]:
-    """Materialize the tenant's own Codex auth into a private CODEX_HOME.
-
-    Возвращает ``[]``, если своей подписки нет. Каталог назван хешем user_id
-    (никакого пути из пользовательских данных), права 0700, ``auth.json`` 0600.
-    Файл перезаписывается только когда изменилось сохранённое значение — иначе
-    обновлённый самим Codex токен (``_sync_codex_auth_back``) не затирается.
-    """
-    payload = get_user_codex_auth(user_id, register_secrets=True)
-    if not payload:
+def _codex_payloads(raw: str) -> List[str]:
+    if not raw:
         return []
+    parsed = json.loads(raw)
+    docs = parsed if isinstance(parsed, list) else [parsed]
+    if len(docs) > 100:
+        raise ValueError("at most 100 own Codex accounts are supported")
+    result, seen = [], set()
+    for doc in docs:
+        validate_codex_auth_document(doc)
+        if isinstance(parsed, list) and not ((doc.get("tokens") or {}).get("account_id") or doc.get("account_id")):
+            raise ValueError("each Codex account in a pool requires account_id for stable refresh")
+        payload = raw if not isinstance(parsed, list) else json.dumps(doc, ensure_ascii=False, sort_keys=True)
+        identity = _codex_account_identity(payload)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(payload)
+    return result
+
+
+def _codex_account_identity(payload: str) -> str:
+    doc = json.loads(payload)
+    tokens = doc.get("tokens") or {}
+    identity = tokens.get("account_id") or doc.get("account_id")
+    # Older single-auth documents did not require account_id. Their refresh
+    # token is a private fallback identity, never exposed in responses/logs.
+    identity = str(identity or tokens.get("refresh_token") or "")
+    return hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+
+_CODEX_HOME_AUTH_IDENTITIES: Dict[str, str] = {}
+
+
+def get_user_codex_homes(user_id: str = "") -> List[str]:
+    raw = get_user_codex_auth(user_id, register_secrets=True)
+    if not raw:
+        return []
+    payloads = _codex_payloads(raw)
     uid = _resolve_user_id(user_id)
     digest = hashlib.sha256(uid.encode("utf-8")).hexdigest()[:16]
     root = _codex_user_homes_root()
-    home = os.path.join(root, digest)
-    auth_path = os.path.join(home, "auth.json")
-    stamp_path = os.path.join(home, ".rewrite_source_sha256")
-    source_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
-    try:
-        parent = os.path.dirname(os.path.abspath(root))
-        if parent and not os.path.isdir(parent):
-            os.makedirs(parent, mode=0o700, exist_ok=True)
-        _ensure_private_dir(root)
-        _ensure_private_dir(home)
-        current = _read_private_file(stamp_path).strip()
-        if current != source_hash or not os.path.isfile(auth_path):
-            _write_private_file(auth_path, payload)
-            _write_private_file(stamp_path, source_hash)
-    except OSError as exc:
-        raise RuntimeError(f"cannot materialize own Codex auth: {exc}") from exc
-    with _CODEX_HOME_OWNERS_LOCK:
-        _CODEX_HOME_OWNERS[os.path.realpath(home)] = uid
-    return [home]
+    homes = []
+    legacy_object = isinstance(json.loads(raw), dict)
+    for payload in payloads:
+        identity = _codex_account_identity(payload)
+        # Preserve the existing home for a legacy object and resume tokens.
+        home = os.path.join(root, digest if legacy_object else digest + "-" + identity)
+        auth_path = os.path.join(home, "auth.json")
+        stamp_path = os.path.join(home, ".rewrite_source_sha256")
+        source_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        try:
+            parent = os.path.dirname(os.path.abspath(root))
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent, mode=0o700, exist_ok=True)
+            _ensure_private_dir(root)
+            _ensure_private_dir(home)
+            current = _read_private_file(stamp_path).strip()
+            if current != source_hash or not os.path.isfile(auth_path):
+                _write_private_file(auth_path, payload)
+                _write_private_file(stamp_path, source_hash)
+        except OSError as exc:
+            raise RuntimeError(f"cannot materialize own Codex auth: {exc}") from exc
+        with _CODEX_HOME_OWNERS_LOCK:
+            canonical = os.path.realpath(home)
+            _CODEX_HOME_OWNERS[canonical] = uid
+            _CODEX_HOME_AUTH_IDENTITIES[canonical] = identity
+        homes.append(home)
+    return homes
 
 
 
@@ -649,16 +728,30 @@ class _CredentialEntry:
     cooldown_until: float = 0.0     # ключ упёрся в окно подписки и спит до сброса
 
 
+# One process-wide lock makes duplicate physical credentials obey one limit,
+# even when configured by more than one owner. Values remain private to pools.
+_PHYSICAL_CREDENTIAL_CONDITION = threading.Condition(threading.RLock())
+_PHYSICAL_CREDENTIAL_IN_USE = {}
+_PHYSICAL_CREDENTIAL_LIMITS = {}
+
+
+def _physical_credential_id(provider, value):
+    identity = globals().get("_CODEX_HOME_AUTH_IDENTITIES", {}).get(value, value) if provider == "codex" else value
+    return provider + ":" + hashlib.sha256(identity.encode()).hexdigest()
+
+
 class CredentialLease:
     """Opaque lease. Its repr never contains the credential."""
 
-    __slots__ = ("_pool", "_index", "_value", "_released")
+    __slots__ = ("_pool", "_entry", "_physical_id", "_value", "_released", "_host_lease")
 
-    def __init__(self, pool: "ServerCredentialPool", index: int, value: str):
+    def __init__(self, pool: "ServerCredentialPool", entry: _CredentialEntry, value: str, host_lease=None):
         self._pool = pool
-        self._index = index
+        self._entry = entry
+        self._physical_id = _physical_credential_id(pool.provider, value)
         self._value = value
         self._released = False
+        self._host_lease = host_lease
 
     def __repr__(self) -> str:
         return "<CredentialLease redacted>"
@@ -668,9 +761,7 @@ class CredentialLease:
         return self._value
 
     def release(self) -> None:
-        if not self._released:
-            self._released = True
-            self._pool._release(self._index)
+        self._pool._release(self)
 
     def __enter__(self) -> str:
         return self._value
@@ -690,8 +781,10 @@ class ServerCredentialPool:
         per_credential_limit: int = 1,
     ):
         self.provider = provider
-        self._condition = threading.Condition(threading.Lock())
+        self._condition = _PHYSICAL_CREDENTIAL_CONDITION
         self._entries: List[_CredentialEntry] = []
+        self._retired_entries: List[_CredentialEntry] = []
+        self._physical_ids = set()
         self._cursor = -1
         self._per_credential_limit = max(1, int(per_credential_limit))
         self.configure(credentials or [], self._per_credential_limit)
@@ -715,44 +808,63 @@ class ServerCredentialPool:
                 and limit == self._per_credential_limit
             ):
                 return
-            if any(entry.in_use for entry in self._entries):
-                # In-flight leases retain their pool shape; refresh on next call.
-                return
-            self._entries = [_CredentialEntry(value=value) for value in unique]
+            old = {entry.value: entry for entry in self._entries}
+            self._retired_entries = [entry for entry in self._retired_entries if entry.in_use]
+            self._retired_entries.extend(entry for entry in self._entries if entry.value not in unique and entry.in_use)
+            self._entries = [old.get(value) or _CredentialEntry(value=value) for value in unique]
+            for identity in self._physical_ids:
+                registrations = _PHYSICAL_CREDENTIAL_LIMITS.get(identity, {})
+                registrations.pop(id(self), None)
+                if not registrations:
+                    _PHYSICAL_CREDENTIAL_LIMITS.pop(identity, None)
+            self._physical_ids = {_physical_credential_id(self.provider, value) for value in unique}
+            for identity in self._physical_ids:
+                _PHYSICAL_CREDENTIAL_LIMITS.setdefault(identity, {})[id(self)] = limit
             self._per_credential_limit = limit
             self._cursor = -1
             self._condition.notify_all()
 
     def acquire(self, timeout: Optional[float] = None) -> CredentialLease:
         deadline = None if timeout is None else time.monotonic() + max(0.0, timeout)
+        host_deadline = time.monotonic() + 2.0
+        host_blocked = False
+        event = getattr(globals().get("STOP_FLAG", None), "_thread_local", None)
+        job_id = getattr(getattr(event, "stop_event", None), "_rewrite_job_id", "")
         with self._condition:
             while True:
                 now_ts = time.time()
+                if job_id and host_budget_wait_until(job_id):
+                    raise CredentialPoolExhausted(HOST_BUDGET_WAIT_PREFIX + "общий лимит ключа занят")
+                if globals().get("STOP_FLAG") and STOP_FLAG.is_stopped():
+                    raise CredentialPoolExhausted("Остановлено во время ожидания ключа до вызова провайдера")
                 eligible = [
                     index
                     for index, entry in enumerate(self._entries)
                     if entry.in_use < self._per_credential_limit
+                    and _PHYSICAL_CREDENTIAL_IN_USE.get(_physical_credential_id(self.provider, entry.value), 0)
+                        < min(_PHYSICAL_CREDENTIAL_LIMITS.get(_physical_credential_id(self.provider, entry.value), {id(self): self._per_credential_limit}).values())
                     and entry.cooldown_until <= now_ts
                     and _shared_limit_until(entry.value) <= now_ts
                 ]
                 if eligible:
-                    minimum = min(self._entries[index].in_use for index in eligible)
-                    least_loaded = {
-                        index
-                        for index in eligible
-                        if self._entries[index].in_use == minimum
-                    }
                     count = len(self._entries)
-                    chosen = next(
-                        index
-                        for offset in range(1, count + 1)
-                        if (index := (self._cursor + offset) % count) in least_loaded
-                    )
-                    self._entries[chosen].in_use += 1
-                    self._cursor = chosen
-                    return CredentialLease(
-                        self, chosen, self._entries[chosen].value
-                    )
+                    ordered = sorted(eligible, key=lambda i: (self._entries[i].in_use, (i-self._cursor-1)%count))
+                    for chosen in ordered:
+                        entry = self._entries[chosen]
+                        family = {"openai":"openai", "claude":"claude_oauth", "codex":"codex"}.get(self.provider)
+                        host = (_host_budget.try_acquire(family, entry.value, 1)
+                                if family else _host_budget.Lease())
+                        if host is None:
+                            host_blocked = True
+                            continue
+                        identity = _physical_credential_id(self.provider, entry.value)
+                        entry.in_use += 1
+                        _PHYSICAL_CREDENTIAL_IN_USE[identity] = _PHYSICAL_CREDENTIAL_IN_USE.get(identity, 0) + 1
+                        self._cursor = chosen
+                        return CredentialLease(self, entry, entry.value, host)
+                if host_blocked and time.monotonic() >= host_deadline:
+                    remember_host_budget_wait(job_id)
+                    raise CredentialPoolExhausted(HOST_BUDGET_WAIT_PREFIX + "общий лимит ключа занят; ожидание в очереди до вызова провайдера")
                 if not self._entries:
                     raise CredentialPoolExhausted(
                         f"{self.provider} server credential pool is empty"
@@ -775,13 +887,24 @@ class ServerCredentialPool:
                     raise CredentialPoolExhausted(
                         f"{self.provider} credential lease timeout"
                     )
-                self._condition.wait(remaining)
+                self._condition.wait(min(0.1, remaining) if remaining is not None else 0.1)
 
-    def _release(self, index: int) -> None:
+    def _release(self, lease: CredentialLease) -> None:
         with self._condition:
-            if 0 <= index < len(self._entries) and self._entries[index].in_use:
-                self._entries[index].in_use -= 1
-            self._condition.notify()
+            if lease._released:
+                return
+            lease._released = True
+            if lease._host_lease is not None:
+                lease._host_lease.release()
+            lease._entry.in_use = max(0, lease._entry.in_use - 1)
+            identity = lease._physical_id
+            remaining = _PHYSICAL_CREDENTIAL_IN_USE.get(identity, 0) - 1
+            if remaining > 0:
+                _PHYSICAL_CREDENTIAL_IN_USE[identity] = remaining
+            else:
+                _PHYSICAL_CREDENTIAL_IN_USE.pop(identity, None)
+            self._retired_entries = [entry for entry in self._retired_entries if entry.in_use]
+            self._condition.notify_all()
 
     def mark_limited(self, value: str, until_ts: float) -> None:
         """Ключ упёрся в окно подписки — не выдавать его до until_ts.
@@ -819,7 +942,7 @@ class ServerCredentialPool:
         with self._condition:
             return {
                 "credentials": len(self._entries),
-                "in_use": sum(entry.in_use for entry in self._entries),
+                "in_use": sum(entry.in_use for entry in self._entries + self._retired_entries),
                 "capacity": len(self._entries) * self._per_credential_limit,
                 "per_credential_limit": self._per_credential_limit,
             }
@@ -839,17 +962,21 @@ def _credential_limit(provider: str, owner: str = "") -> int:
     таймауту лизы (300 c). Лимит пользовательских пулов задаётся отдельно и
     только сервером (ENV) — запрос/клиент поднять его не может.
     """
-    defaults = {"openai": 1, "claude": 3, "codex": 1}
+    defaults = {"openai": 1, "claude": 3, "codex": 1, "anthropic": 1}
     names = {
+        "anthropic": "REWRITE_ANTHROPIC_PER_KEY_CONCURRENCY",
         "openai": "REWRITE_OPENAI_PER_KEY_CONCURRENCY",
         "claude": "REWRITE_CLAUDE_PER_TOKEN_CONCURRENCY",
         "codex": "REWRITE_CODEX_PER_HOME_CONCURRENCY",
     }
     if owner:
-        # Codex остаётся 1: refresh-токен в auth.json одноразовый, параллельные
-        # вызовы одного home сериализуются намеренно (см. _codex_isolated_call).
-        defaults = {"openai": 8, "claude": 3, "codex": 1}
+        # Codex у СВОЕГО home остаётся 1: тенантский каталог материализуется под
+        # его же auth.json, гонки там не окупаются. Серверный home с 04.09.2026
+        # ходит параллельно — замок сужен до окна ротации, запись обратно под CAS
+        # (см. _codex_refresh_possible и _sync_codex_auth_back).
+        defaults = {"openai": 8, "claude": 3, "codex": 1, "anthropic": 1}
         names = {
+            "anthropic": "REWRITE_USER_ANTHROPIC_PER_KEY_CONCURRENCY",
             "openai": "REWRITE_USER_OPENAI_PER_KEY_CONCURRENCY",
             "claude": "REWRITE_USER_CLAUDE_PER_TOKEN_CONCURRENCY",
             "codex": "REWRITE_USER_CODEX_PER_HOME_CONCURRENCY",
@@ -873,10 +1000,12 @@ def get_server_credential_pool(
     provider = (provider or "").strip().lower()
     if provider == "openai":
         values = get_server_openai_keys()
+    elif provider == "anthropic":
+        values = get_server_anthropic_keys()
     elif provider == "claude":
         values = get_server_claude_oauth_tokens()
     elif provider == "codex":
-        values = get_server_codex_homes() or [_DEFAULT_CODEX_HOME]
+        values = get_server_codex_homes()
     else:
         raise ValueError("unsupported provider")
     return _credential_pool_for(provider, "", values)
@@ -919,6 +1048,8 @@ def get_effective_credential_pool(
     uid = _resolve_user_id(user_id)
     if provider == "openai":
         own = get_user_openai_keys(uid)
+    elif provider == "anthropic":
+        own = get_user_anthropic_keys(uid)
     elif provider == "claude":
         own = get_user_claude_oauth_tokens(uid)
     elif provider == "codex":
@@ -933,15 +1064,44 @@ def get_effective_credential_pool(
         stale = _SERVER_CREDENTIAL_POOLS.get(f"{provider}\x00user\x00{uid}")
     if stale is not None:
         stale.configure([], _credential_limit(provider, uid))
-    if provider == "codex" and not server_credential_owner(uid):
+    if own_credentials_only(uid):
+        raise CredentialPoolExhausted(f"Own-only mode: no own {provider} credential configured")
+    if provider in {"codex", "anthropic"} and not server_credential_owner(uid):
         # Задача B: серверная подписка владельца (его codex-home) чужому тенанту
         # не достаётся. Fail closed с внятным текстом — не тихая работа на
         # кредах владельца.
         raise CredentialPoolExhausted(
-            "Codex credential is not configured: paste your own Codex auth.json "
-            "in settings (the server subscription belongs to the owner)"
+            f"{provider} credential is not configured: add your own credential "
+            "in settings (server credentials belong to the owner)"
         )
     return get_server_credential_pool(provider)
+
+
+def credential_job_budget(provider: str, user_id: str = "") -> Tuple[str, int]:
+    """Shared machine caps are separate from per-owner credential capacity."""
+    uid = _resolve_user_id(user_id)
+    source = credential_source(provider, uid)
+    owner = uid if source == "user" else ""
+    credential_provider = provider
+    if provider == "openai":
+        count = len(get_user_openai_keys(uid)) if owner else len(get_server_openai_keys())
+    elif provider == "claude":
+        if owner:
+            oauth_count = len(get_user_claude_oauth_tokens(uid))
+            count = oauth_count or len(get_user_anthropic_keys(uid))
+        else:
+            oauth_count = len(get_server_claude_oauth_tokens())
+            count = oauth_count or len(get_server_anthropic_keys())
+        if not oauth_count:
+            credential_provider = "anthropic"
+    elif provider == "codex":
+        count = len(_codex_payloads(get_user_codex_auth(uid))) if owner else len(get_server_codex_homes())
+    else:
+        raise ValueError("unsupported provider")
+    # Missing credentials get one validation slot, so an old queued job fails
+    # visibly instead of waiting forever after the owner removes their key.
+    capacity = max(1, count * _credential_limit(credential_provider, owner)) if source != "none" else 1
+    return provider + ("\x00user\x00" + uid if owner or source == "none" else "\x00server"), capacity
 
 
 def server_credential_pool_stats() -> Dict[str, Dict[str, int]]:
@@ -1013,6 +1173,104 @@ async def _deny_claude_tool(_tool_name, _tool_input, _context):
     )
 
 
+# FIX-2026-09-17-alt-route: кабинеты на серверных ключах пишут через альт-ключ
+# (OpenAI- и Anthropic-совместимый прокси) вместо подписок владельца. Меняется только
+# транспорт CLI: промпты, куски, повторы и чистка — те же. Владелец и кабинеты со
+# своим ключом провайдера идут прежним путём. Без REWRITE_ALT_API_KEY всё как раньше.
+ALT_ROUTE_TOKEN = "ALT-PROXY-ROUTE"
+ALT_ERROR_PREFIX = "ALT_PROXY:"
+_alt_ctx = threading.local()
+_ALT_SLOTS = threading.BoundedSemaphore(
+    max(1, min(6, int(os.environ.get("REWRITE_ALT_CONCURRENCY", "5") or "5")))
+)
+
+
+def _alt_setting(name: str, default: str = "") -> str:
+    return (os.environ.get(name) or default).strip()
+
+
+def _alt_pairs(name: str, default: str) -> Dict[str, str]:
+    pairs = {}
+    for item in _alt_setting(name, default).split(","):
+        if "=" in item:
+            key, value = item.split("=", 1)
+            if key.strip() and value.strip():
+                pairs[key.strip()] = value.strip()
+    return pairs
+
+
+def _alt_key() -> str:
+    key = _alt_setting("REWRITE_ALT_API_KEY")
+    if key:
+        _register_server_secret_tree({"alt_proxy_key": key})
+    return key
+
+
+def alt_route_for(provider: str) -> bool:
+    """True — вызов идёт через альт-ключ: кабинет не владельца и ключ провайдера серверный."""
+    if not _alt_setting("REWRITE_ALT_API_KEY"):
+        return False
+    uid = get_current_user_id()
+    if not uid or uid == "default" or uid in ADMIN_USER_IDS:
+        return False
+    return credential_source(provider, uid) == "server"
+
+
+def _alt_model(model: str) -> str:
+    """Модель, которую не пускает альт-ключ, заменяется разрешённой (судья sonnet-4-6 → sonnet-5)."""
+    mapping = _alt_pairs(
+        "REWRITE_ALT_MODEL_MAP",
+        "claude-sonnet-4-6=claude-sonnet-5,claude-haiku-4-5=claude-sonnet-5",
+    )
+    return mapping.get((model or "").strip(), (model or "").strip())
+
+
+def _alt_codex_flags(model: str) -> List[str]:
+    slug = (model or "").split(":", 1)[-1]
+    # = default_reasoning_level боевого Codex CLI для этих моделей (models_cache, 17.09.2026)
+    effort = _alt_pairs(
+        "REWRITE_ALT_CODEX_EFFORT",
+        "gpt-5.6-sol=low,gpt-5.6-terra=medium,gpt-5.6-luna=medium",
+    ).get(slug)
+    base_url = _alt_setting("REWRITE_ALT_OPENAI_BASE_URL", "https://alt-proxy.example.invalid/v1")
+    flags = [
+        "-c", 'model_provider="rewrite_alt"',
+        "-c", 'model_providers.rewrite_alt.name="rewrite_alt"',
+        "-c", f'model_providers.rewrite_alt.base_url="{base_url}"',
+        "-c", 'model_providers.rewrite_alt.env_key="REWRITE_ALT_API_KEY"',
+        "-c", 'model_providers.rewrite_alt.wire_api="responses"',
+    ]
+    if effort:
+        flags += ["-c", f'model_reasoning_effort="{effort}"']
+    return flags
+
+
+@contextmanager
+def _alt_slot(provider: str, model: str):
+    """Общий потолок одновременных вызовов через альт-ключ (Codex + Claude вместе).
+
+    Ждём без таймаута, но с проверкой остановки и отмены задачи. Никаких
+    HOST_BUDGET_WAIT: задача не откладывается, просто ждёт свободного слота.
+    """
+    depth = getattr(_alt_ctx, "depth", 0)
+    if depth == 0:
+        while not _ALT_SLOTS.acquire(timeout=0.25):
+            if STOP_FLAG.is_stopped():
+                raise RuntimeError("Остановлено пользователем")
+            ensure_provider_execution_allowed(provider)
+    previous = (getattr(_alt_ctx, "active", False), getattr(_alt_ctx, "model", ""))
+    _alt_ctx.depth = depth + 1
+    _alt_ctx.active = True
+    _alt_ctx.model = model
+    try:
+        yield
+    finally:
+        _alt_ctx.depth = depth
+        _alt_ctx.active, _alt_ctx.model = previous
+        if depth == 0:
+            _ALT_SLOTS.release()
+
+
 def build_provider_child_env(
     provider: str,
     *,
@@ -1051,8 +1309,19 @@ def build_provider_child_env(
             os.makedirs(directory, mode=0o700, exist_ok=True)
     provider = (provider or "").strip().lower()
     if provider == "claude":
-        env["CLAUDE_CODE_OAUTH_TOKEN"] = credential
+        if credential == ALT_ROUTE_TOKEN:
+            # FIX-2026-09-17-alt-route: тот же Claude Code CLI, но на альт-ключе.
+            env["ANTHROPIC_BASE_URL"] = _alt_setting(
+                "REWRITE_ALT_ANTHROPIC_BASE_URL", "https://alt-proxy.example.invalid"
+            )
+            env["ANTHROPIC_API_KEY"] = _alt_key()
+            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        else:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = credential
         env["CLAUDE_CODE_ENTRYPOINT"] = "sdk-py"
+    elif provider == "codex" and getattr(_alt_ctx, "active", False):
+        # FIX-2026-09-17-alt-route: без CODEX_HOME и auth.json, ключ — из env.
+        env["REWRITE_ALT_API_KEY"] = _alt_key()
     elif provider == "codex" and codex_home:
         env["CODEX_HOME"] = codex_home
     return env
@@ -1340,10 +1609,61 @@ def get_allowed_claude_models() -> Set[str]:
 
 
 def get_allowed_codex_models() -> Set[str]:
+    # FIX-2026-09-13-models: по умолчанию только живые модели. gpt-5.4 и gpt-5.4-mini
+    # OpenAI сняла (05.09 и ~12.09), gpt-5.5 на этом аккаунте отвечала 404, у luna нет
+    # ни одного успешного ответа — потерянная переменная не должна их вернуть.
     return _allowed_values(
         "REWRITE_ALLOWED_CODEX_MODELS",
-        "codex:gpt-5.6-terra,codex:gpt-5.6-sol,codex:gpt-5.6-luna,"
-        "codex:gpt-5.5,codex:gpt-5.4,codex:gpt-5.4-mini",
+        "codex:gpt-5.6-terra,codex:gpt-5.6-sol",
+    )
+
+
+def codex_model_unavailable_message(model: str) -> str:
+    """Причина для человека: провайдер не даёт эту модель (FIX-2026-09-13-models)."""
+    name = (model or "").strip()
+    if name.lower().startswith("codex:"):
+        name = name.split(":", 1)[1]
+    return (
+        f"Модель {name} сейчас недоступна у провайдера — "
+        "выберите другую модель и запустите заново"
+    )
+
+
+def codex_model_admission_error(model: str) -> str:
+    """Модель Codex из сохранённой задачи вне списка разрешённых → текст отказа, иначе "".
+
+    FIX-2026-09-13-models: «Повторить» и авто-возобновление берут модель из задачи,
+    а не из формы, поэтому сверяем её заново и отвечаем по-русски. Claude и OpenAI
+    не трогаем — у них прежние проверки и тексты.
+    """
+    model = (model or "").strip()
+    if classify_provider(model) != "codex" or model in get_allowed_codex_models():
+        return ""
+    return codex_model_unavailable_message(model)
+
+
+# FIX-2026-09-17-server-models: кабинету на серверных ключах — только модели из
+# REWRITE_SERVER_KEY_MODELS. Владелец и кабинеты со своим ключом провайдера живут по
+# прежним общим спискам. Пустая переменная = ограничения нет (откат без правки кода).
+def get_server_key_models() -> Set[str]:
+    return _allowed_values("REWRITE_SERVER_KEY_MODELS", "")
+
+
+def server_key_model_error(model: str, user_id: str = "") -> str:
+    """Текст отказа, если модель не из списка для серверных ключей, иначе ""."""
+    allowed = get_server_key_models()
+    model = (model or "").strip()
+    if not allowed or not model or model in allowed:
+        return ""
+    uid = _resolve_user_id(user_id)
+    if uid in ADMIN_USER_IDS:
+        return ""
+    if credential_source(classify_provider(model), uid) != "server":
+        return ""
+    names = ", ".join(sorted(item.split(":", 1)[-1] for item in allowed))
+    return (
+        f"Модель {model.split(':', 1)[-1]} недоступна на серверных ключах. "
+        f"Выберите одну из: {names} — или добавьте свой ключ в настройках"
     )
 
 
@@ -1367,7 +1687,7 @@ DEFAULT_MODEL = "claude-sonnet-4-20250514"  # Sonnet 4 (Sonnet 4.5 может б
 # "claude-sonnet-4-20250514" - Sonnet 4
 # "claude-3-5-haiku-20241022" - Haiku 3.5 (дешевле)
 # "gpt-4o-mini" - для OpenAI
-PROGRESS_FILE = os.path.join(os.path.expanduser("~"), "rewrite_progress_v2.json")
+PROGRESS_FILE = os.environ.get("REWRITE_PROGRESS_FILE", os.path.join(os.path.expanduser("~"), "rewrite_progress_v2.json"))
 LAST_LANGUAGES_FILE = os.path.join(os.path.expanduser("~"), ".rewrite_last_languages.json")
 LAST_COOKIES_FILE = os.path.join(os.path.expanduser("~"), ".rewrite_last_cookies.json")
 LAST_OAUTH_TOKEN_FILE = os.path.join(os.path.expanduser("~"), ".rewrite_oauth_token.json")
@@ -1652,6 +1972,7 @@ def get_keys_config(user_id: str = "", strict: bool = False) -> Dict:
         "oauth_tokens": [],
         # BYOK-2026-07-30: своя подписка Codex тенанта (содержимое auth.json).
         "codex_auth": "",
+        "credential_mode": "server_fallback",
         "gpt_service_tier": "default",
         "gpt_use_cache": True,
         "postprocess_check_model": "gpt-5-mini",
@@ -1726,6 +2047,10 @@ def get_keys_config(user_id: str = "", strict: bool = False) -> Dict:
     # работать). Здесь же отсутствие колонки просто даёт "".
     try:
         with sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0) as conn:
+            if _user_keys_has_column(conn, "credential_mode"):
+                mode = conn.execute("SELECT credential_mode FROM user_keys WHERE user_id=?", (uid,)).fetchone()
+                if mode:
+                    default["credential_mode"] = mode[0] or "server_fallback"
             if _user_keys_has_column(conn, "codex_auth"):
                 row = conn.execute(
                     "SELECT codex_auth FROM user_keys WHERE user_id = ?", (uid,)
@@ -1816,6 +2141,7 @@ def save_keys_config(
     openai_api_key: Optional[str] = None,
     oauth_tokens: Optional[List[str]] = None,
     codex_auth: Optional[str] = None,
+    credential_mode: Optional[str] = None,
     gpt_service_tier: Optional[str] = None,
     gpt_use_cache: Optional[bool] = None,
     postprocess_check_model: Optional[str] = None,
@@ -1834,6 +2160,8 @@ def save_keys_config(
     считал подписку сохранённой, а её не было.
     """
     uid = _resolve_user_id(user_id)
+    if credential_mode is not None and credential_mode not in {"own_only", "server_fallback"}:
+        return False
     # M9 FIX-2026-07-02: весь read-modify-write под локом — перечитываем актуальное
     # состояние строки ПОД локом, сливаем только реально переданные поля, затем пишем.
     # Так конкурентные апдейты разных полей одного user_id не затирают друг друга.
@@ -1886,6 +2214,8 @@ def save_keys_config(
             # POST /settings/keys отдавал 500 «settings were not saved» — юзер
             # думал, что не сохранилось НИЧЕГО. Теперь либо пишем всё, либо не
             # пишем ничего и честно отвечаем «не сохранено».
+            if credential_mode is not None and not _user_keys_has_column(conn, "credential_mode"):
+                conn.execute("ALTER TABLE user_keys ADD COLUMN credential_mode TEXT NOT NULL DEFAULT 'server_fallback'")
             if codex_auth is not None and not _ensure_user_keys_codex_column(conn):
                 print(
                     f"[save_keys_config] codex_auth NOT saved for user_id={uid}: "
@@ -1931,6 +2261,8 @@ def save_keys_config(
             # обеспечена выше), чтобы основной UPSERT остался совместимым с БД
             # без этой колонки — иначе один ALTER-пробел ронял бы сохранение
             # ВСЕХ ключей тенанта.
+            if credential_mode is not None:
+                conn.execute("UPDATE user_keys SET credential_mode=? WHERE user_id=?", (credential_mode, uid))
             if codex_auth is not None:
                 conn.execute(
                     "UPDATE user_keys SET codex_auth = ? WHERE user_id = ?",
@@ -3497,6 +3829,65 @@ def split_text_to_chunks_by_paragraphs(text: str, max_chars: int) -> Tuple[List[
     return chunks, para_counts
 
 
+# FIX-2026-09-17-length-retry: повтор по недобору длины куска.
+# Замер боя 17.09 (153 срабатывания в job_logs): при слабом недоборе (80–90%) успех был на 1-й попытке
+# 73 раза, на 2-й 19, на 3-й 2, на 4-й ни разу — 16 раз все четыре впустую. «Самый длинный» ответ
+# принимался без верхней границы: в логах есть рост в 1,4–1,7 раза (87% → 128–141%), а sol на чешской
+# теологии дал 87% → 158% — ложный финал на двух третях и пересказ заново. Знаки меряют плохо:
+# чешский перевод английского естественно ~87%. Все пороги — через env, без правки кода.
+def _env_number(name: str, default: float, cast=float) -> float:
+    """Порог из окружения. Мусор («0,85» с запятой, пустая строка) не роняет импорт — берём умолчание."""
+    raw = str(os.environ.get(name, "") or "").strip().replace(",", ".")
+    if not raw:
+        return default
+    try:
+        return cast(float(raw)) if cast is int else cast(raw)
+    except (TypeError, ValueError):
+        return default
+
+
+SHORT_RETRY_RATIO = _env_number("REWRITE_SHORT_RETRY_RATIO", 0.90)
+SHORT_RETRY_MILD_FLOOR = _env_number("REWRITE_SHORT_RETRY_MILD_FLOOR", 0.80)
+SHORT_RETRY_MILD_MAX = _env_number("REWRITE_SHORT_RETRY_MILD_MAX", 2, int)
+SHORT_RETRY_MAX_GROWTH = _env_number("REWRITE_SHORT_RETRY_MAX_GROWTH", 1.35)
+# Рост в разах сам по себе не довод: после обрезанного первого ответа (70%) полный перевод (95%)
+# законно в 1,36 раза длиннее, а румынский/польский перевод английского идёт на 1,1–1,25.
+# Поэтому по росту отклоняем только ответ длиннее этого абсолютного пола (замечание проверки 17.09).
+SHORT_RETRY_GROWTH_FLOOR = _env_number("REWRITE_SHORT_RETRY_GROWTH_FLOOR", 1.30)
+# Плотное письмо: повтор пропускаем только с этой доли. Ниже итоговая проверка куска (0.30)
+# всё равно пометит его браком — лучше дать модели повторить (замечание проверки 17.09).
+DENSE_SCRIPT_SKIP_FROM = 0.30
+# Ниже этой доли первый ответ — нарратив-преамбула или обрыв: большой рост повтора там законен.
+SHORT_RETRY_GROWTH_CHECK_FROM = 0.70
+
+
+def short_retry_limit(first_ratio: float, default_max: int) -> int:
+    """Сколько повторов делать. Слабый недобор — не больше SHORT_RETRY_MILD_MAX."""
+    default_max = int(default_max)
+    if default_max <= 0:
+        return 0  # NARRATION_MAX_RETRIES=0 — выключатель повторов, как было
+    if first_ratio >= SHORT_RETRY_MILD_FLOOR:
+        return max(1, min(default_max, SHORT_RETRY_MILD_MAX))
+    return default_max
+
+
+def short_retry_candidate_ok(first_ratio: float, retry_ratio: float) -> Tuple[bool, str]:
+    """Можно ли принять ответ повтора. Раздутый ответ хуже короткого: там дописанное от модели."""
+    if retry_ratio > MAX_CHUNK_LENGTH_RATIO:
+        return False, f"раздут до {retry_ratio:.0%} исходника (потолок {MAX_CHUNK_LENGTH_RATIO:.0%})"
+    if (first_ratio >= SHORT_RETRY_GROWTH_CHECK_FROM
+            and retry_ratio > max(SHORT_RETRY_MAX_GROWTH * first_ratio, SHORT_RETRY_GROWTH_FLOOR)):
+        return False, (f"вырос в {retry_ratio / first_ratio:.2f} раза против первого ответа "
+                       f"(потолок {SHORT_RETRY_MAX_GROWTH:.2f}) — похоже на дописанное")
+    return True, ""
+
+
+def chunk_is_dense_script(text: str) -> bool:
+    """Иероглифы / кана / хангыль / тайский: сверка длины по знакам с латиницей бессмысленна."""
+    visible = len(re.findall(r"\S", text or ""))
+    return visible > 0 and len(_DENSE_SCRIPT_RE.findall(text)) > 0.2 * visible
+
+
 def _accept_retry_if_paragraphs_ok(
     current: str,
     candidate: str,
@@ -3520,11 +3911,53 @@ def _accept_retry_if_paragraphs_ok(
     actual = count_paragraphs(norm)
     if actual == expected_paragraphs:
         return norm
+    # FIX-2026-09-13-short-retry: ждём 1 абзац = у куска нет структуры абзацев (субтитры
+    # без пустых строк), выравнивать 1:1 нечего. Раньше повтор полной длины отклонялся
+    # из-за «46/1 абзацев», и в файл уходил кусок на 46% (88e89ffa81a8, 12.09: 3271 → 1332
+    # слова). Склеиваем абзацы повтора в один — счёт 1/1 сходится для всех проверок ниже.
+    # Какой ответ лучше по длине, решает вызывающий (narration: самый длинный). Где во
+    # входе абзацев больше одного, защита остаётся: несовпадение ломает финальную сверку.
+    # Склеиваем только там, где длину уже держит вызывающий (narration — самый длинный ответ,
+    # long-retry-success — 90–140%). У long-retry-shorter нижней границы нет: склейка пустила бы
+    # в файл повтор на 38% вместо полного куска (замечание проверки 13.09).
+    if expected_paragraphs == 1 and where in ("narration-retry-loop", "long-retry-success"):
+        merged = _PARAGRAPH_SPLIT_RE.sub("\n", candidate.strip())
+        if count_paragraphs(merged) == 1:
+            log_msg(
+                log_queue,
+                f"   📐 Chunk {chunk_idx+1}: {where} даёт {actual}/1 абзацев — во входе абзацев нет, склеиваю в один"
+            )
+            return merged
     log_msg(
         log_queue,
         f"   ⚠️ Chunk {chunk_idx+1}: {where} даёт {actual}/{expected_paragraphs} абзацев — отклоняю, оставляю прежний"
     )
     return current
+
+
+# FIX-2026-09-13-short-output: итоговая сверка длины файла рерайта против исходника.
+# Меряем СИМВОЛЫ, а не слова (замер боевых файлов 12.09): у финского по словам ниже 0.7
+# все 9 файлов, даже полный fi_33333 (0.65 слова при 0.98 символа). По символам ниже 0.7
+# только реально сжатые: no 0.46/0.55/0.63/0.66, fi 0.50/0.69. Порог — env, без правки кода.
+SHORT_OUTPUT_RATIO = float(os.environ.get("REWRITE_SHORT_OUTPUT_RATIO", "0.70"))
+# Иероглифы / кана / хангыль / тайский: полный перевод с английского в разы короче
+# по символам — сверка по символам там бессмысленна, молчим.
+_DENSE_SCRIPT_RE = re.compile(r"[\u0e00-\u0e7f\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]")
+
+
+def output_shorter_than_source(source_text: str, output_text: str) -> Optional[Tuple[int, int]]:
+    """(слов в файле, слов в исходнике), если файл короче SHORT_OUTPUT_RATIO исходника
+    по символам. None — длина в норме или сверять нечем."""
+    src = (source_text or "").strip()
+    out = (output_text or "").strip()
+    if not src or not out:
+        return None
+    for t in (src, out):
+        if len(_DENSE_SCRIPT_RE.findall(t)) > 0.2 * len(re.findall(r"\S", t)):
+            return None
+    if len(out) >= SHORT_OUTPUT_RATIO * len(src):
+        return None
+    return len(out.split()), len(src.split())
 
 
 def split_text_to_chunks(text: str, max_chars: int) -> List[str]:
@@ -3765,50 +4198,28 @@ def _normalize_literal_escapes(text: str) -> str:
 
 
 def extract_from_brackets(text: str) -> str:
-    """Извлекает текст из квадратных скобок, убирая все логи и служебные сообщения.
-
-    Для основного рерайта мы жёстко просим модель возвращать ВЕСЬ текст
-    в одних скобках, без заголовков и чек-листов. Эта функция:
-    1) Если находит такие скобки — возвращает самый длинный фрагмент внутри них.
-    2) Если скобок нет — делает мягкую очистку от служебных строк.
-    """
     if not text:
-        return ""
-    text = _normalize_literal_escapes(text)   # FIX-2026-06-29: литеральные \n\n → реальные переносы
-
-    # Ищем текст в квадратных скобках
-    matches = re.findall(r'\[([^\]]+)\]', text, re.DOTALL)
-    if matches:
-        # Берём самый длинный матч (обычно это адаптированный текст)
-        result = max(matches, key=len).strip()
-        if len(result) > 50:  # Если результат разумной длины
-            return result
-    
-    # Fallback: если скобок нет или результат слишком короткий, берём весь текст
-    # но убираем возможные префиксы и логи
-    cleaned = text.strip()
-    
-    # Убираем возможные префиксы
-    for prefix in ["Output:", "Adapted text:", "Text:", "Result:", "✅", "⚠️", "❌", "🔍", "📊", "💾", "🔑"]:
-        if cleaned.startswith(prefix):
-            cleaned = cleaned[len(prefix):].strip()
-    
-    # Убираем строки, которые выглядят как логи (содержат эмодзи или паттерны логов)
-    lines = cleaned.split('\n')
-    cleaned_lines = []
-    for line in lines:
-        line = line.strip()
-        # Пропускаем строки с эмодзи или паттернами логов
-        if any(emoji in line for emoji in ["✅", "⚠️", "❌", "🔍", "📊", "💾", "🔑", "📈", "🔧"]):
-            continue
-        # Пропускаем строки с паттернами типа "Chunk X:", "Input:", "Output:"
-        if re.match(r'^(Chunk|Input|Output|Ratio|Original|Your output|TASK|OUTPUT):', line, re.IGNORECASE):
-            continue
-        if line:
-            cleaned_lines.append(line)
-    
-    cleaned = '\n'.join(cleaned_lines).strip()
-
+        return ''
+    cleaned = (text.replace('\\r\\n', '\n').replace('\\n', '\n')
+               .replace('\\r', '\n').replace('\\t', ' ')).strip()
+    if cleaned.startswith('```'):
+        lines = cleaned.splitlines()
+        if len(lines) > 2 and lines[-1].strip() == '```':
+            cleaned = '\n'.join(lines[1:-1]).strip()
+    cleaned = re.sub(r'^(?:Output|Adapted text|Text|Result):\s*', '', cleaned, count=1)
+    # The contract has one OUTER pair. Never select an internal annotation and
+    # discard the remainder of the story (the production regex does that).
+    if cleaned.startswith('[') and cleaned.endswith(']'):
+        depth = 0
+        for index, char in enumerate(cleaned):
+            if char == '[':
+                depth += 1
+            elif char == ']':
+                depth -= 1
+            if depth == 0:
+                if index == len(cleaned) - 1:
+                    cleaned = cleaned[1:-1].strip()
+                break
     return cleaned
 
 
@@ -3845,96 +4256,10 @@ _SANITIZE_TAIL_KEYWORDS = (
 
 
 def sanitize_claude_output(text: str, lang_name: str = "") -> Tuple[str, int]:
-    """Лёгкая структурная чистка Claude-rewrite output.
-
-    Удаляет: markdown-заголовки/separators, явные block-маркеры (целая строка
-    «Блок 1», «Part 3 of 5» и т.п.), короткие meta-преамбулы/хвосты со стоп-словами
-    («Вот переписанный текст:» в начале / «Я изменил...» в конце).
-
-    Снимает обёртку **bold** / __italic__ (оставляет текст).
-    Схлопывает 3+ подряд пустых строк до 2.
-
-    Returns: (cleaned_text, removed_lines_count).
-    Консервативна: при любом сомнении строку оставляем (false-positive хуже false-negative).
-    """
     if not text:
         return text, 0
-    src = text.strip()
-    if not src:
-        return text, 0
-    src = _normalize_literal_escapes(src)   # FIX-2026-06-29: литеральные \n\n → реальные переносы
-
-    # 1. Если обёрнут [..] — снять (уже есть extract_from_brackets, переиспользуем)
-    bracket_matches = re.findall(r'\[([^\]]+)\]', src, re.DOTALL)
-    if bracket_matches:
-        longest = max(bracket_matches, key=len).strip()
-        if len(longest) > 100:  # уверены что это контент, не короткий tag
-            src = longest
-
-    lines = src.split("\n")
-    removed = 0
-    out_lines: List[str] = []
-
-    for line in lines:
-        stripped = line.strip()
-        # Pure separator (---, ===, ***)
-        if _SANITIZE_MD_SEPARATOR_RE.match(stripped):
-            removed += 1
-            continue
-        # Markdown heading (#, ##, ###...)
-        if _SANITIZE_MD_HEADING_RE.match(stripped):
-            removed += 1
-            continue
-        # Block marker как отдельная строка
-        if _SANITIZE_BLOCK_MARKER_RE.match(stripped):
-            removed += 1
-            continue
-        out_lines.append(line)
-
-    # 2. Снять **bold**/__italic__ маркеры (оставить текст)
-    body = "\n".join(out_lines)
-    body = _SANITIZE_BOLD_ITALIC_MARKERS_RE.sub(r"\2", body)
-
-    # 3. Преамбула: первые 1-2 короткие meta-строки (<120 chars), заканчиваются ":",
-    #    за ними пустая строка, содержат стоп-слово
-    body_lines = body.split("\n")
-    while body_lines:
-        first = body_lines[0].strip()
-        if not first:
-            body_lines.pop(0)
-            continue
-        if (len(first) <= 120 and first.endswith(":")
-            and len(body_lines) > 1 and not body_lines[1].strip()):
-            low = first.lower()
-            if any(kw in low for kw in _SANITIZE_PREAMBLE_KEYWORDS):
-                body_lines.pop(0)  # remove preamble line
-                removed += 1
-                # consume blank line after
-                if body_lines and not body_lines[0].strip():
-                    body_lines.pop(0)
-                continue
-        break
-
-    # 4. Хвостовые meta-строки: последние 1-2 короткие со стоп-словами
-    while body_lines:
-        last = body_lines[-1].strip()
-        if not last:
-            body_lines.pop()
-            continue
-        if len(last) <= 200:
-            low = last.lower()
-            if any(kw in low for kw in _SANITIZE_TAIL_KEYWORDS):
-                body_lines.pop()
-                removed += 1
-                continue
-        break
-
-    cleaned = "\n".join(body_lines)
-
-    # 5. Схлопнуть 3+ пустых строк → 2 (т.е. макс 1 пустая между блоками)
-    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
-
-    return cleaned, removed
+    cleaned = sanitize_final_text(text, lang_name)
+    return cleaned, max(0, len(text.splitlines()) - len(cleaned.splitlines()))
 
 
 def find_sentences_with_cyrillic(text: str) -> List[Tuple[str, int, int]]:
@@ -4371,10 +4696,16 @@ def merge_branding(
     main_character_name: str = "",
     log_queue: Optional[queue.Queue] = None,
     skip_name_replacement: bool = False,
+    rewrite_contract: bool = False,
 ) -> str:
     """
     Применяет фиксы брендинга к тексту по результатам Pass A (Branding Audit).
     Замена старых имён/каналов, вставка intro/outro при отсутствии.
+
+    rewrite_contract (CONTRACT-C-2026-09-15): режим рерайта — один свой призыв (только с именем канала),
+    прощание только при обоих именах, представление один раз; чужой брендинг не копируется
+    вставляется только если заданы ОБА имени и аудит его не нашёл (шаблон
+    с «the host»/«the channel» вместо пустого имени — выдумка, её не вставляем).
     
     ВАЖНО: Разграничение имён:
     - host_name: имя автора канала/диктора (используется в intro/outro для брендинга)
@@ -4518,9 +4849,12 @@ def merge_branding(
             text = re.sub(r"\b" + re.escape(oc) + r"\b", channel or "", text)
 
     # 3. Нет intro — вставляем около 30% текста (после ближайшего параграфа)
-    if not audit_json.get("has_intro") and (host or channel):
+    if rewrite_contract and not audit_json.get("has_intro") and not (host and channel):
+        if log_queue and (host or channel):
+            log_msg(log_queue, "   ⚠️ Контракт рерайта: задано только одно имя — шаблонное представление не вставляю")
+    elif not audit_json.get("has_intro") and (host or channel):
         suggested = audit_json.get("suggested_intro", "").strip()
-        if suggested:
+        if suggested and not rewrite_contract:
             intro_line = suggested
         else:
             key = _lang_key(lang_name)
@@ -4547,9 +4881,11 @@ def merge_branding(
             text = "\n\n".join(paragraphs)
 
     # 4. Нет mid-CTA — вставляем в середину текста (около 40–50%, по границе параграфа)
+    # CONTRACT-C-2026-09-15: в рерайте свой призыв нужен — шаблонная подстраховка, если модель его не написала;
+    # подсказанную строку берём только если в ней есть точное имя канала, иначе шаблон.
     if not audit_json.get("has_mid_cta") and channel:
         suggested = audit_json.get("suggested_mid_cta", "").strip()
-        if suggested:
+        if suggested and (not rewrite_contract or channel in suggested):
             mid_cta_line = suggested
         else:
             key = _lang_key(lang_name)
@@ -4572,9 +4908,14 @@ def merge_branding(
             text = "\n\n".join(paragraphs)
 
     # 5. Нет outro — добавляем в конец (fallback по языку)
-    if not audit_json.get("has_outro") and (host or channel):
+    # CONTRACT-C-2026-09-15: в рерайте прощание подставляется шаблоном только при ОБОИХ именах
+    # (шаблон с «the host»/«the channel» — выдуманная сущность); подсказка — только с точными именами.
+    if rewrite_contract and not (host and channel):
+        if log_queue and not audit_json.get("has_outro") and (host or channel):
+            log_msg(log_queue, "   ⚠️ Контракт рерайта: задано только одно имя — шаблонное прощание не вставляю")
+    elif not audit_json.get("has_outro") and (host or channel):
         suggested = audit_json.get("suggested_outro", "").strip()
-        if suggested:
+        if suggested and (not rewrite_contract or (host in suggested and channel in suggested)):
             outro_line = suggested
         else:
             key = _lang_key(lang_name)
@@ -4983,6 +5324,9 @@ RULES: Reduce repetitive intensifiers (max 2 total). Break formulaic transitions
 CRITICAL: NEVER change character names (protagonists, antagonists, side characters). Keep ALL character names exactly as written. Only change stylistic phrases, not names of people.
 
 NARRATIVE VOICE PROTECTION:
+- Do NOT touch a section marker of the source (a chapter line, or a short 1-4 word label that opens a segment). Never rephrase it, never merge it into the next sentence.
+- Do NOT touch a forward-looking bridge sentence ("But what came next was stranger still."). It is deliberate retention work, not filler.
+- Do NOT replace a key term that repeats through the text with a synonym: the repetition is the through-line.
 - Do NOT remove dramatic repetitions if they build tension (e.g. "Dark. Too dark. Impossibly dark.").
 - Do NOT flatten emotional escalation patterns (short → shorter → punch).
 - Do NOT replace sensory language with abstract descriptions.
@@ -5255,6 +5599,7 @@ def run_postprocess_pipeline(
     lang_code: str = "",
     main_character_name: str = "",
     is_generated_text: bool = False,  # True для генерации, False для рерайта
+    rewrite_contract: bool = False,   # CONTRACT-C-2026-09-15: рерайт — свой призыв/прощание по контракту, чужое не копировать
 ) -> str:
     """
     Постпроцесс: Pass A+B параллельно → merge брендинга → Pass C (Nativeness) → Pass D (Language Purity).
@@ -5336,16 +5681,16 @@ def run_postprocess_pipeline(
     merged = pass_b_text
     merge_actions: List[str] = []
     if pass_a_ok and audit_json:
-        merged = merge_branding(pass_b_text, audit_json, host_name or "", channel_name or "", lang_name, main_character_name="", log_queue=log_queue, skip_name_replacement=is_generated_text)
+        merged = merge_branding(pass_b_text, audit_json, host_name or "", channel_name or "", lang_name, main_character_name="", log_queue=log_queue, skip_name_replacement=is_generated_text, rewrite_contract=rewrite_contract)
         for old_name in audit_json.get("old_names_found") or []:
             if old_name and str(old_name).strip():
                 merge_actions.append(f"name: {old_name!r} → {host_name!r}")
         for old_ch in audit_json.get("old_channels_found") or []:
             if old_ch and str(old_ch).strip():
                 merge_actions.append(f"channel: {old_ch!r} → {channel_name!r}")
-        if not audit_json.get("has_intro") and (host_name or channel_name):
+        if not audit_json.get("has_intro") and (host_name or channel_name) and (not rewrite_contract or (host_name and channel_name)):
             merge_actions.append("inserted intro")
-        if not audit_json.get("has_outro") and (host_name or channel_name):
+        if not audit_json.get("has_outro") and (host_name or channel_name) and not rewrite_contract:
             merge_actions.append("inserted outro")
         log_msg(log_queue, f"   ✅ {lang_display}: брендинг применён (merge)")
 
@@ -5433,230 +5778,22 @@ def _dedup_sentences(text: str) -> str:
     return '\n\n'.join(result_paragraphs)
 
 
+_REWRITE_CAPTION_TAG_RE = re.compile(
+    r'\[(?:music|applause|laughter|silence|inaudible|background music|музыка|аплодисменты|смех|'
+    r'muzyka|oklaski|śmiech|hudba|potlesk|muzică|aplauze)\]', re.I)
+
+
 def sanitize_final_text(text: str, lang_name: str) -> str:
-    """
-    Финальная очистка текста перед сохранением в .txt для TTS.
-    - убирает явные служебные заголовки/чек-листы/логовые строки
-    - правит некоторые типичные тех. артефакты (для чешского/польского/румынского)
-    - удаляет случайные иероглифы и подобный мусор вне алфавита языка
-    """
     if not text:
         return text
-
-    # Удаляем типичные лог-заголовки и чек-листы постфактум (на случай старых моделей)
-    lines: List[str] = []
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            lines.append(line)
-            continue
-        upper = stripped.upper()
-        if stripped.startswith("#"):
-            continue
-        if upper.startswith(("KONTROLA", "VERIFICATION", "INPUT METRICS", "ANALÝZA", "ANALIZA", "CHECKLIST")):
-            continue
-        if "VERIFICATION CHECKLIST" in upper:
-            continue
-        if any(m in stripped for m in ["☑", "✓", "►"]):
-            continue
-        lines.append(line)
-
-    cleaned = "\n".join(lines)
-
-    # Удаляем редкие иероглифы / CJK (например, случайный '超')
-    cleaned = re.sub(r"[\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF]+", "", cleaned)
-    # === ARTIFACT-STRIPPER (subtitle/SFX) ===
-    # Удаление субтитровых/SFX-артефактов из исходных транскриптов, которые модель
-    # иногда протаскивает в результат ('>>' смена диктора, [music]/[applause], ноты).
-    # ВАЖНО: только [ \t] (не \s) — чтобы не задеть \n\n и структуру абзацев.
-    # '>>' — субтитровая метка смены диктора
-    cleaned = re.sub(r"[ \t]*>>+[ \t]*", " ", cleaned)
-    # музыкальные ноты
-    cleaned = re.sub(r"[\u266a\u266b\u266c\u2669]+", " ", cleaned)
-    # скобочные теги: короткий тег без конечной пунктуации ([music],[applause],[aplauze]) -> удалить;
-    # длинную фразу/предложение в скобках -> развернуть (текст сохраняем, убираем только скобки)
-    def _strip_caption(_m):
-        inner = _m.group(1).strip()
-        if len(inner.split()) <= 3 and not re.search(r"[.!?\u2026]$", inner):
-            return ""
-        return inner
-    cleaned = re.sub(r"\[([^\]\n]{1,200})\]", _strip_caption, cleaned)
-    # косметика после удаления (двойные пробелы, пробел перед пунктуацией) — горизонтально
-    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
-    cleaned = re.sub(r"[ \t]+([,.!?;:])", r"\1", cleaned)
-    # # === ARTIFACT-STRIPPER (subtitle/SFX) === END
-
-
-    lang_lower = lang_name.lower()
-
-    # Языко-специфические быстрые фиксы известных артефактов
-    if lang_lower == "polish":
-        # 'działko' → 'działo' для серьёзного орудия
-        cleaned = re.sub(r"\bdziałko\b", "działo", cleaned)
-        # убрать возможный случайный иероглиф '超'
-        cleaned = cleaned.replace("超", "")
-    elif lang_lower == "czech":
-        # Jagdtiger не должен становиться "Jaguár tygr" и подобными монстрами
-        cleaned = re.sub(r"Jagu[aá]r[ -]?tygr", "Jagdtiger", cleaned)
-        # IS-2 не должен становиться "Ioškin", "Joškin" и т.п.
-        cleaned = re.sub(r"Io[šs]kin-?2", "IS-2", cleaned)
-        cleaned = re.sub(r"Io[šs]kin", "IS-2", cleaned)
-        # Рост гигантов: 8–10 футов = 2.5–3 м, не 4–5 м (аудит)
-        cleaned = re.sub(r"stojící čtyři až někdy pět metrů vysoké", "stojící dva a půl až někdy tři metry vysoké", cleaned)
-    elif lang_lower == "turkish":
-        # Рост гигантов: 8–10 футов = 2.5–3 м, не 8–10 м (аудит)
-        cleaned = re.sub(r"sekiz metre, bazen on metre boyunda duran", "iki buçuk, bazen üç metre boyunda duran", cleaned)
-    elif lang_lower == "romanian":
-        # Слишком частая галлюцинация 'pantof' вместо люка/двери → заменяем на нейтральный 'ușă'
-        cleaned = re.sub(r"\bpantof\b", "ușă", cleaned)
-        # На всякий случай приводим 'Jaguar tiger' к Jagdtiger
-        cleaned = re.sub(r"Jaguar[ -]?tiger", "Jagdtiger", cleaned)
-
-    # === UNIVERSAL FIXES (all languages) ===
-
-    # 1. Fix stuck sentences: "word.Word" → "word. Word" — Unicode-aware через str.isupper(),
-    #    ловит заглавную ЛЮБОГО скрипта (латиница с диакритикой, кириллица, греческий, …)
-    #    БЕЗ перечисления алфавитов. Десятичные "3.14" не задеты (цифра не isupper).
-    #    Известный минор: "U.S." → "U. S." (в этих текстах редкость, допустимо).
-    def _space_after_sentence(s: str) -> str:
-        out = []
-        for i, ch in enumerate(s):
-            out.append(ch)
-            if ch in ".!?" and i + 1 < len(s) and s[i + 1].isupper():
-                out.append(" ")
-        return "".join(out)
-    cleaned = _space_after_sentence(cleaned)
-
-    # 1b. Fix stuck after comma: "word,Word" → "word, Word"
-    cleaned = re.sub(
-        r',([A-ZА-ЯÀ-ÖØ-ÝĀ-ŽŐŰĐŁŃŚŹŻĆÓĄĘÅÆØÞÐÝÉÍÓÚÜŐŰŘŤŇĎŠŽČĚÖÜÄẞЁҐЄІЇȘȚĂ])',
-        r', \1',
-        cleaned
-    )
-
-    # 1c. Fix double dots ".." → "." (but preserve "..." ellipsis)
-    cleaned = re.sub(r'\.{4,}', '...', cleaned)  # 4+ dots → ellipsis
-    cleaned = re.sub(r'(?<!\.)\.\.(?!\.)', '.', cleaned)  # exactly 2 dots → 1 dot
-
-    # 1d. Remove Russian patronymics from non-Russian texts
-    # Patronymics match pattern: word ending in -ewicz/-owicz/-jewicz/-owna/-jewna/-iewna (transliterated)
-    # or Cyrillic -евич/-ович/-овна/-евна
-    if lang_lower not in ("russian", "ukrainian", "belarusian"):
-        # Transliterated patronymics (Latin script): "Siergiejewicz", "Aleksiejewna", "Nikołajewicz"
-        # WARNING: \s+ съедает \n\n и ломает 1:1 структуру абзацев в preserve_paragraphs режиме —
-        # используем [\t ]+ (только горизонтальный whitespace).
-        cleaned = re.sub(r'[\t ]+[A-ZА-Я]\w*(?:jewicz|iewicz|owicz|jewna|iewna|owna)\b', '', cleaned, flags=re.IGNORECASE)
-        # Cyrillic patronymics that leaked into non-Russian text
-        cleaned = re.sub(r'[\t ]+[А-Я]\w*(?:евич|ович|евна|овна)\b', '', cleaned, flags=re.IGNORECASE)
-
-    # 2. German: capitalize after period (after fix 1)
-    if lang_lower in ("german", "deutsch"):
-        def _cap_after_period(m):
-            return m.group(1) + ' ' + m.group(2).upper()
-        cleaned = re.sub(r'([.!?])\s+([a-zäöüß])', _cap_after_period, cleaned)
-
-    # 3. Remove duplicate sentences
-    cleaned = _dedup_sentences(cleaned)
-    
-    # 3.5. Fix Rewrite 1 issues (stuttering, repeated phrases)
-    # Удаляем заикания типа "stworzony, stworzony" или "ukończony, ukończony"
-    # Паттерн: слово, запятая, пробел, то же слово
-    cleaned = re.sub(r'\b(\w+),\s+\1\b', r'\1', cleaned, flags=re.IGNORECASE)
-    
-    # Удаляем повторяющиеся фразы в одном предложении
-    # Например: "w kościołach i pałacach... w kościołach i pałacach"
-    # Разбиваем на предложения и проверяем каждое
-    sentence_endings = re.finditer(r'[.!?]+\s*', cleaned)
-    sentence_starts = [0] + [m.end() for m in sentence_endings]
-    sentence_starts.append(len(cleaned))
-    
-    fixed_parts = []
-    for i in range(len(sentence_starts) - 1):
-        sentence = cleaned[sentence_starts[i]:sentence_starts[i+1]]
-        
-        # Ищем повторяющиеся фразы длиной 3-7 слов в предложении
-        words = sentence.split()
-        found_repeat = False
-        if len(words) >= 6:  # Минимум 6 слов для поиска повторов
-            # Ищем фразы из 3-7 слов, которые повторяются
-            for phrase_len in range(7, 2, -1):  # От 7 до 3 слов
-                if found_repeat:
-                    break
-                for start in range(len(words) - phrase_len * 2 + 1):
-                    phrase = words[start:start + phrase_len]
-                    phrase_text = ' '.join(phrase).lower().strip('.,;:!?')
-                    if len(phrase_text) < 15:  # Слишком короткая фраза
-                        continue
-                    # Ищем повтор этой фразы дальше в предложении
-                    for check_start in range(start + phrase_len, len(words) - phrase_len + 1):
-                        check_phrase = words[check_start:check_start + phrase_len]
-                        check_phrase_text = ' '.join(check_phrase).lower().strip('.,;:!?')
-                        if phrase_text == check_phrase_text:
-                            # Найден повтор - удаляем второй экземпляр
-                            words = words[:check_start] + words[check_start + phrase_len:]
-                            found_repeat = True
-                            break
-                    if found_repeat:
-                        break
-        
-        if found_repeat:
-            sentence = ' '.join(words)
-        
-        fixed_parts.append(sentence)
-    
-    cleaned = ''.join(fixed_parts)
-    
-    # Удаляем повторяющиеся фразы типа "zburzony w roku..." в разных предложениях
-    # Паттерн: глагол + "w roku" + дата/текст
-    date_verb_pattern = r'\b(zburzony|zbudowany|ukończony|stworzony|rozpoczęty|zakończony)\s+w\s+roku[^.!?]{0,50}'
-    matches = list(re.finditer(date_verb_pattern, cleaned, re.IGNORECASE))
-    if len(matches) > 1:
-        seen_phrases = {}
-        # Проходим в обратном порядке, чтобы удалять последние дубликаты
-        for match in reversed(matches):
-            phrase = match.group(0).lower().strip()
-            # Нормализуем фразу (убираем лишние пробелы)
-            phrase_normalized = re.sub(r'\s+', ' ', phrase)
-            if phrase_normalized in seen_phrases:
-                # Дубликат - удаляем этот экземпляр
-                start, end = match.span()
-                cleaned = cleaned[:start] + cleaned[end:]
-            else:
-                seen_phrases[phrase_normalized] = match
-
-    # 4. Remove double outro
-    last_paragraphs = cleaned.rstrip().split('\n\n')
-    if len(last_paragraphs) >= 2:
-        # Outro markers by language
-        outro_markers = [
-            # Thanks patterns
-            r'(?i)\b(děkuj|merci|danke|grazie|dziękuj|obrigad|mulțumesc|спасибо|thanks|thank you)\b',
-            # Subscribe patterns  
-            r'(?i)\b(subskr|subscri|abonn|abonați|iscri|přihlás|подпис|odběr)\b',
-            # "Good night" patterns
-            r'(?i)\b(dobrou noc|bonne nuit|gute nacht|buona notte|dobranoc|boa noite|noapte bună|спокойной ночи|good night)\b',
-            # "See you" patterns
-            r'(?i)\b(nashledanou|au revoir|auf wiedersehen|arrivederci|do zobaczenia|até|ne vedem|до встречи|увидимся)\b',
-        ]
-        
-        def _is_outro(paragraph: str) -> bool:
-            matches = sum(1 for pattern in outro_markers if re.search(pattern, paragraph))
-            return matches >= 2  # At least 2 different outro signals
-        
-        last = last_paragraphs[-1]
-        second_last = last_paragraphs[-2]
-        
-        if _is_outro(last) and _is_outro(second_last):
-            # Both are outros — remove the last one (added by merge_branding)
-            cleaned = '\n\n'.join(last_paragraphs[:-1])
-
-    # FINAL re-guard: блок удаления повторов (выше) делает ' '.join(sentence.split()),
-    # что СЪЕДАЕТ граничный пробел предложения и пере-склеивает "wort.Wort". Date-dedup
-    # и outro-removal тоже могут склеить. Повторно проставляем пробел после .!? перед
-    # заглавной ЛЮБОГО скрипта — идемпотентно, гарантирует отсутствие склеек в выводе.
-    cleaned = _space_after_sentence(cleaned)
-
-    return cleaned
+    cleaned = _REWRITE_CAPTION_TAG_RE.sub('', text)
+    cleaned = re.sub(r'(?m)^[ \t]*>>+[ \t]*', '', cleaned)
+    cleaned = re.sub(r'[♪♫♬♩]+', '', cleaned)
+    cleaned = re.sub(r'[ \t]{2,}', ' ', cleaned)
+    cleaned = re.sub(r'[ \t]+([,.!?;:])', r'\1', cleaned)
+    # Only presentation artefacts. Names, words, units, dates, quoted repetition,
+    # unknown bracketed annotations and cross-script proper names are content.
+    return cleaned.strip()
 
 
 # ============== ПРОМПТЫ ==============
@@ -5889,8 +6026,16 @@ Based on the TEXT CONTEXT above, you understand:
 RETENTION — INTEREST HOOKS THROUGHOUT (critical for watch-time & re-watches)
 ═══════════════════════════════════════════════════════════
 Keep the viewer hooked across the ENTIRE text, not only at the opening.
-Roughly every 3000-5000 characters, place an interest trigger that makes
-the listener want to keep going (and come back to re-watch):
+Place an interest trigger at every STRUCTURAL SEAM — seams are visible in the text,
+so you can actually check them:
+  - immediately BEFORE every section marker of the source;
+  - at every switch to a new topic, a new person, a new place or a new time period;
+  - immediately AFTER a rhetorical question or a climax, before the next block opens.
+NEVER open a block with a bare date or a bare new name right after a question or a
+climax — put one connecting sentence there first.
+That works out to roughly every 3000-5000 characters, but the SEAM is what you look
+for, not the character count. Each trigger makes the listener want to keep going
+(and come back to re-watch):
   - open a curiosity loop / pose an intriguing question;
   - tease what is coming ("but the strangest part is still ahead...");
   - a gentle mini-cliffhanger or surprising turn taken FROM the source;
@@ -5899,8 +6044,14 @@ HOW (without breaking the no-invention rule): build these hooks ONLY by
 FRAMING and emphasis of material that is ALREADY in the source — rephrase
 for intrigue, foreground the most surprising existing fact, vary sentence
 rhythm to build a small wave of curiosity. Do NOT invent new facts, events,
-characters or details. Keep the calm, sleep-friendly tone — hooks are soft
-pulls of curiosity, NEVER loud clickbait or jarring cliffhangers.
+characters or details. MATCH THE SOURCE'S OWN ENERGY. If the source is calm and slow
+(sleep, relaxation, meditation, bedtime content), keep the calm, sleep-friendly tone
+and make the hooks soft pulls of curiosity. If the source is a punchy list, an
+investigation, a battle or a revelation, keep THAT energy: short punch sentences and
+a direct, confident statement are the CORRECT register there, not a flaw.
+Banned in EVERY register is invented drama: fake stakes, fake urgency, exclamation
+chains, ALL-CAPS, "you won't believe" phrasing, and any promise the source does not
+deliver. A hook may be energetic; it may never promise something that is not there.
 
 ABSOLUTE REQUIREMENTS:
 
@@ -5908,9 +6059,25 @@ ABSOLUTE REQUIREMENTS:
    Per-paragraph output length: 0.7×–1.3× of corresponding input paragraph (in characters).
    Do NOT pad to hit a length target. Do NOT shorten by omitting content.
    If source paragraph is short — output stays short. If source is long — output stays long.
-   NEVER add new actions, descriptions, sensory details, atmosphere, or characters
-   that are not present in the source. Faithful transfer of meaning is the goal,
-   not enrichment.
+   NEVER add new FACTS: no new actions, events, sensory details, atmosphere,
+   characters, names, numbers, dates or claims that are not present in the source.
+   Faithful transfer of meaning is the goal, not enrichment.
+
+   ONE BOUNDED EXCEPTION — CONNECTIVE SENTENCES ARE ALLOWED AND EXPECTED:
+   At a seam between two blocks you MAY write ONE short bridging sentence of your own
+   (max 25 words) whose only job is to point forward to material that ALREADY follows
+   in this same source text. Such a sentence is NOT enrichment and is NOT a new fact.
+   - It must contain NO new fact, name, number, date, place, event or description.
+   - It must promise only what the source actually delivers later in this text.
+   - It may withhold a name or an outcome to create curiosity, but may not invent one.
+   - At most one such sentence per seam, and never two in a row.
+   THE TEST, apply it to every sentence you add: could a listener learn a single new
+   fact from this sentence? If NO — it is a legal connective sentence, keep it.
+   If YES — it is an invention, delete it.
+   ALLOWED: "But what happened to one other patient is stranger still."
+   FORBIDDEN: "The case of Karl Liebmann from the nineteen-thirties is stranger still."
+   (it names a person and a decade — those are facts, and the source introduces them
+   a moment later by itself).
 
 2. CONTENT TYPE PRESERVATION
    Based on content_breakdown above:
@@ -6041,12 +6208,13 @@ CRITICAL RULES:
    - RHYTHM: Avoid robotic, list-like syntax ("X matched, Y matched, Z fell correctly"). Rephrase for natural flow and voice-over (e.g. "Grain, light, shadows — everything was authentic").
    - REGISTER: Keep one consistent tone (e.g. engaging, slightly informal for video). No mixing formal/colloquial or switching "you" forms within the same text.
 
-10. REPLACE FOREIGN BRANDING:
-   - Remove old greetings/channel names/author names
-   - Replace with new branding from instructions
+10. FOREIGN BRANDING AND NONCONTENT:
+   - Remove the donor's greetings, channel/host self-introduction, like/subscribe/comment requests, sponsor lines and farewells
+   - Add only what the branding instructions of this chunk allow: at most one brief introduction, one call-to-action for OUR channel where those instructions ask for it, and the sign-off in the last part; never copy the donor's calls-to-action, never add extra ones and never repeat the introduction
+   - Historical first-person testimony, letters, diaries and quotations are content: keep them attributed to their real speakers
 
 11. Numbers and dates: {numbers_rule}. ALL dates and centuries IN WORDS in {lang_name} (e.g. nineteenth century, not "19th" or "XIX").
-12. Length: Preserve all content (95-110% of input)
+12. Length: preserve all content. Target 95-115% of the input in characters. The extra room exists ONLY for the connective sentences and the source's own section markers allowed above — never for padding, never for restating what was already said, and never a reason to drop content. Where a PARAGRAPH STRUCTURE 1:1 / HARD CONSTRAINT block appears in the task, that block wins.
 13. Remove markers: [музыка], [hudba], etc.
 14. Output: [adapted text in {lang_name}]
 15. SENTENCE START DIVERSITY:
@@ -6060,6 +6228,29 @@ CRITICAL RULES:
    - Words to vary: "один/одна/одно", "jeden/jedna/jedno", "какой-то", "pewien", "某".
    - Use synonyms instead: "некий", "определённый", "тот самый", "pewien", "jakiś", "nějaký".
    - Scan your output: if you see "один" 5+ times in 1000 words, replace some with synonyms.
+   - SCOPE — EMPTY FILLER WORDS ONLY. This rule NEVER applies to the key term that names the subject of the video, to a word the source repeats on purpose as a refrain, or to any technical term. Pick ONE short native word for such a key term and use THAT SAME word every single time, however often it occurs. Splitting a key term into two synonyms breaks the through-line and is a FAILURE.
+   - Keep the source's parallel constructions parallel: if the source ends three clauses with the same word, your three clauses end with the same word too.
+
+17. DO NOT SOFTEN WHAT THE SOURCE ASSERTS:
+   - If the source states something as a fact, state it as a fact. Do NOT add a hedge
+     that is not in the source ("perhaps", "it may be", "it seems", "it appears",
+     "possibly", "a possible path to", "cannot be regarded as certain", "remains
+     uncertain", "researchers suggest").
+   - If the SOURCE itself hedges, keep its hedge exactly, in the same place, once —
+     never strengthen a claim the source qualifies, and never double its hedge.
+   - This matters most in the sentence that closes a block: a hedge there kills the payoff.
+   - Keep the source's forward-looking constructions as announcements ("a poet WOULD
+     write", "an architect WOULD arrive", "they WERE TO discover"). Flattening them
+     into a plain past tense turns a promise into a summary and loses meaning.
+
+18. KEEP THE SOURCE'S GRAMMATICAL PERSON:
+   - If the source addresses the listener directly ("your liver", "your heart", "think
+     about that for a moment", "picture them"), keep the direct address, the imperative
+     and the possessive in {lang_name} — not "the liver", not "one might think", not
+     "let us imagine".
+   - If the source speaks impersonally, stay impersonal. Never switch person mid-text.
+   - Formal vs informal "you" is decided by the ADDRESS rule above; this rule is about
+     PERSON (second person vs impersonal), not about formality.
 
 FINAL REMINDER: Your success metric is COMPLETENESS + QUALITY, not brevity.
 YouTube viewers want FULL detailed stories, not compressed summaries."""
@@ -6218,127 +6409,111 @@ def get_rewrite_prompt(lang_name: str, text: str, chunk_index: int, total_chunks
     
     # Простые инструкции брендирования только для нужных чанков
     branding_instructions = ""
-    actual_host_name = host_name if host_name and host_name.strip() else "Anatolij Eugenjanovič Kazancev"
+    # CONTRACT-2026-09-15 (rewrite noncontent/branding): пустое имя остаётся пустым —
+    # раньше сюда подставлялся выдуманный «Anatolij Eugenjanovič Kazancev».
+    actual_host_name = (host_name or "").strip()
+    actual_channel_name = (channel_name or "").strip()
 
     # STRICT NAMING block — добавляется во все ветки чтобы убить галлюцинации имён.
-    _strict_naming = f"""
-
-STRICT NAMING — NEVER INVENT, NEVER TRANSLATE, NEVER SUBSTITUTE:
-- Host name MUST be EXACTLY: "{actual_host_name}" (character-for-character, including diacritics).
-  Do NOT output "Pedro", "Carlos", "Anatolij" or any other name if host is "{actual_host_name}".
-  Do NOT translate the name to a {lang_name} equivalent. Use the name AS GIVEN.
-- Channel name MUST be EXACTLY: "{channel_name}" (character-for-character, including special chars).
-  Do NOT output "Canal Café", "Channel X", or any variation if channel is "{channel_name}".
-  Do NOT translate the channel name. Use the name AS GIVEN.
-- If you write any host/channel name that differs from these exact strings — that is a FAILURE."""
-
-    if total_chunks == 1 and (channel_name or host_name):
-        # 2026-06-04 #11 fix: single-chunk случай — комбинируем FIRST (intro after hook)
-        # И LAST (sign-off в конце). Раньше if/elif брал только FIRST → sign-off терялся.
-        branding_instructions = f"""
-
-CRITICAL BRANDING REPLACEMENT FOR SINGLE-CHUNK TEXT (BOTH intro AND sign-off):
-
-1. SCAN AND REPLACE existing branding (if any in source):
-   - Replace old greetings / old author names / old channel names with the new branding below.
-   - If source has no branding — just add the new branding at the right places.
-
-2. INTRO (after the hook, around 20-40% of text):
-   - Start with the hook — NO branding in hook itself.
-   - After the hook, insert a brief introduction (1-2 sentences) using:
-     * Host: "{actual_host_name}"
-     * Channel: "{channel_name}"
-   - Format examples (adapt to {lang_name}):
-     * Czech: "Jsem {actual_host_name}, a toto je {channel_name}, kde odkrýváme..."
-     * Polish: "Jestem {actual_host_name}, a to jest {channel_name}, na którym odkrywamy..."
-     * Portuguese (pt-BR): "Sou {actual_host_name}, e aqui no canal {channel_name} contamos..."
-
-3. SIGN-OFF AS A SEPARATE FINAL SENTENCE (mandatory):
-   - Keep the source's closing/reflective sentence INTACT. Do NOT rewrite its meaning.
-     Do NOT make "{actual_host_name}" the grammatical subject of an author's reflective
-     sentence (NEVER «{actual_host_name} thought about...»).
-   - THEN append the sign-off as a NEW, SEPARATE final sentence using ONLY "{actual_host_name}"
-     and "{channel_name}".
-   - Format examples (adapt to {lang_name}):
-     * English: "With you was {actual_host_name}. See you in the next episode of {channel_name}."
-     * Russian: "С вами был {actual_host_name}. До встречи на канале {channel_name}."
-     * Polish:  "Z wami był {actual_host_name}. Do zobaczenia na kanale {channel_name}."
-     * Portuguese (pt-BR): "Aqui foi {actual_host_name}. Até o próximo episódio do canal {channel_name}."
-   - Then ONE short call to subscribe and like (separate sentence).
-
-4. APPLY CONSISTENTLY across languages — if host/channel are provided, sign-off MUST appear
-   at the end. Never "in one language present, in another absent".{_strict_naming}"""
-
-    elif chunk_index == 0 and (channel_name or host_name):
-        # Первый чанк: хук без брендирования, затем интро после хука
-        branding_instructions = f"""
-
-CRITICAL BRANDING REPLACEMENT FOR FIRST CHUNK:
-1. SCAN AND REPLACE existing branding/author introduction (MANDATORY):
-   - Look for greetings at the start: "Добро пожаловать в закрытый архив" / "Vítejte v uzavřeném archivu" / "Witajcie w zamkniętym archiwum" / "Bun venit în arhiva închisă" / "Welcome to closed archive"
-   - Look for author introductions: "Меня зовут Анатолий Евгеньевич Казанцев" / "Jmenuji se Anatolij Eugenjanovič Kazancev" / "Nazywam się Anatolij Eugenjanovič Kazancev" / "Mă numesc Anatolij Eugenjanovič Kazanțev" / "My name is Anatolij Eugenjanovič Kazancev"
-   - Look for old channel names: "Uzavřený archiv", "Zamknięte archiwum", "Arhiva închisă", "Zamknięte archiwum", "closed archive"
-   - These are from the ORIGINAL text - you MUST find and REPLACE them, not keep them
-   - If text starts with any greeting or channel name - REMOVE it completely
-   - If text contains old author name - REPLACE it with: "{actual_host_name}" (or {lang_name} equivalent)
-   - If text contains old channel name - REPLACE it with: "{channel_name}" (if provided)
-
-2. Structure:
-   - Start with the hook (most intense moment from story) - NO branding in hook
-   - After the hook (around 30-40% of text), add NEW introduction:
-     * Use ONLY: "{actual_host_name}" (or {lang_name} equivalent) for author
-     * Use ONLY: "{channel_name}" (if provided) for channel
-     * Format examples:
-       - Czech: "Jsem {actual_host_name}, a toto je {channel_name}, kde odkrýváme..."
-       - Polish: "Jestem {actual_host_name}, a to jest {channel_name}, na którym odkrywamy..."
-       - Romanian: "Sunt {actual_host_name}, iar acesta este {channel_name}, unde descoperim..."
-     * Keep it brief (1-2 sentences), natural transition after hook
-   - CRITICAL: Do NOT keep old greetings, old author names, or old channel names - they MUST be replaced{_strict_naming}"""
-    
-    elif chunk_index == total_chunks - 1 and (channel_name or host_name):
-        # Последний чанк: аутро в конце
-        branding_instructions = f"""
-
-CRITICAL BRANDING REPLACEMENT FOR LAST CHUNK:
-1. REMOVE AND REPLACE existing branding/author mentions:
-   - If text contains old author name "Анатолий Евгеньевич Казанцев" / "Anatolij Eugenjanovič Kazancev" in outro - REPLACE with new name
-   - If text contains old channel names in outro - REPLACE with new channel name
-   - Do NOT keep old branding - REPLACE it
-
-2. Structure — SIGN-OFF AS A SEPARATE FINAL SENTENCE (2026-06-04):
-   - Keep the original closing/reflective sentence INTACT. Do NOT rewrite its meaning.
-     Do NOT make "{actual_host_name}" the grammatical subject of an author's reflective
-     sentence (e.g. NEVER «{actual_host_name} thought about...»). The author's closing
-     belongs to the author, not the host.
-   - THEN append the sign-off as a NEW, SEPARATE final sentence using ONLY "{actual_host_name}"
-     and "{channel_name}".
-     * Format examples (adapt to {lang_name}):
-       - English: "With you was {actual_host_name}. See you in the next episode of {channel_name}."
-       - Russian: "С вами был {actual_host_name}. До встречи на канале {channel_name}."
-       - Polish:  "Z wami był {actual_host_name}. Do zobaczenia na kanale {channel_name}."
-       - Portuguese (pt-BR): "Aqui foi {actual_host_name}. Até o próximo episódio do canal {channel_name}."
-     * Then ONE short call to subscribe and like (separate sentence).
-   - APPLY CONSISTENTLY in EVERY language — if host/channel are provided, the sign-off
-     MUST appear at the end. Never "in one language present, in another absent".{_strict_naming}"""
-    
+    _naming_lines = []
+    if actual_host_name:
+        _naming_lines.append(
+            f'- Host name MUST be EXACTLY: "{actual_host_name}" (character-for-character, including diacritics). '
+            f'Do NOT translate it, do NOT replace it with any other name.')
     else:
-        # Средний чанк: CTA в середине (если это средний чанк)
-        middle_chunk = total_chunks // 2
-        if chunk_index == middle_chunk and channel_name:
-            branding_instructions = f"""
+        _naming_lines.append(
+            '- NO host name is given: do NOT introduce, invent or imply any narrator name.')
+    if actual_channel_name:
+        _naming_lines.append(
+            f'- Channel name MUST be EXACTLY: "{actual_channel_name}" (character-for-character, including special chars). '
+            f'Do NOT translate it, do NOT replace it with any other channel.')
+    else:
+        _naming_lines.append(
+            '- NO channel name is given: do NOT introduce, invent or imply any channel name.')
+    _strict_naming = ("\n\nSTRICT NAMING — NEVER INVENT, NEVER TRANSLATE, NEVER SUBSTITUTE:\n"
+                      + "\n".join(_naming_lines)
+                      + "\n- Any host/channel name that differs from these rules is a FAILURE.")
 
-CRITICAL BRANDING REPLACEMENT FOR MIDDLE CHUNK:
-1. REMOVE AND REPLACE existing CTA/branding:
-   - If text contains old channel names in CTA sections - REPLACE with new channel name
-   - Do NOT keep old channel mentions - REPLACE them
+    # Что удаляется и что остаётся — одинаково для всех частей и всех режимов имён.
+    _noncontent_rules = """
 
-2. Structure:
-   - Continue the story naturally
-   - In the middle, after a natural pause, add NEW brief CTA:
-     * Use ONLY the channel name: "{channel_name}"
-     * Format: "Friends, a small request. Support [channel] with a like, it helps the channel grow." (adapt to {lang_name})
-     * Keep it SHORT (1-2 sentences), then continue story
-   - Replace any existing CTA with the new one"""
+NONCONTENT — REMOVE, NEVER REPLACE:
+- Delete the donor's greeting, the donor's channel/host self-introduction, every request to like / subscribe / comment / share / ring the bell, sponsor and promo-code lines, merch and donation asks, production notes, the creator's present-day personal asides (his editing, coffee, holidays, opinions about his channel) and the farewell / promise of the next episode.
+- BUT the donor's RETENTION devices are content, not advertising: a tease of what is coming, a promise to return to something later, a direct question to the viewer, a short recap before a new block. KEEP the pull, in the same place, rewritten without the donor's name, channel and links — and WITHOUT any request. Only the request itself is deleted; the pull that carried it stays. This never creates a second call-to-action: asking the viewer for anything is allowed ONLY where the branding rules of THIS part explicitly ask for it.
+- Never copy, translate or paraphrase the donor's calls-to-action or farewell. OUR OWN call-to-action and sign-off exist ONLY where the branding rules of THIS part explicitly ask for them below (exact names given there). Where this part's rules ask for none, a text with NO call-to-action and NO sign-off is CORRECT.
+- Historical testimony STAYS: a witness's "I / we", diary and letter quotations, dialogue between historical people and the witness's own reflections are story content. Keep them in the witness's voice or clearly attributed to the witness. Never turn them into the narrator's own experience and never delete them as "noncontent".
+- Never rename a historical person. Names of soldiers, officers, doctors, civilians and the author of the source stay as in the source (transliterated into {lang_name} spelling if needed)."""
+
+    _who = " and ".join(
+        [f'the host "{actual_host_name}"'] * bool(actual_host_name)
+        + [f'the channel "{actual_channel_name}"'] * bool(actual_channel_name))
+    _intro_once = f"""
+
+INTRODUCTION — EXACTLY ONCE, AFTER THE HOOK:
+- Start with the hook — NO branding inside the hook.
+- After the hook, insert ONE brief, natural introduction of 1-2 sentences that presents {_who}. Use the exact strings above; nothing else is named.
+- PLACE IT BY MEANING, NOT BY PERCENTAGE: put it at the FIRST CLEAN SEAM after the hook — the end of a scene, the end of a self-contained thought, or the point just before a new section begins. It MUST still fall inside the FIRST QUARTER of this part.
+- NEVER place it between a set-up and its punchline, between a question and its answer, between a fact and the line that lands it, or anywhere inside a scene, an anecdote or a quotation. If no clean seam has arrived yet, continue the story until one does.
+- FOLD IT INTO THE PROMISE: name {_who} while pointing at what this video is about, instead of stopping the story for an announcement. FORBIDDEN dead formulas: "My name is X and you are listening to channel Y.", "Today we will look at...", "We continue to follow...".
+- Do NOT repeat the introduction anywhere else. The host or channel may appear again ONLY inside the call-to-action / sign-off that the rules of THIS part explicitly ask for below — nowhere else.""" if _who else """
+
+NO BRANDING: no host name, no channel name, no narrator identity anywhere in the text. Do not invent one."""
+
+    # CONTRACT-C-2026-09-15: свой призыв (лайк+подписка на НАШ канал) — ровно один, в середине;
+    # своё прощание с именами + одна просьба — ровно один раз, в самом конце. Только с заданными именами.
+    _mid_cta = f"""
+
+CALL-TO-ACTION — EXACTLY ONCE, IN THE MIDDLE OF THIS PART:
+- Around the middle of this part, after a natural pause in the story, add ONE short call-to-action of 1-2 sentences in {lang_name} asking the viewer to like and subscribe to "{actual_channel_name}" (exact string) — ONLY like and subscribe, no requests to comment, share or ring the bell. Example to adapt: "Friends, a small request: support {actual_channel_name} with a like and subscribe — it helps the channel grow." Then continue the story. No other call-to-action anywhere in this part.""" if actual_channel_name else ""
+    _signoff_example = " ".join(
+        ([f"With you was {actual_host_name}."] if actual_host_name else [])
+        + ([f"See you in the next episode of {actual_channel_name}."] if actual_channel_name else ["See you in the next episode."])
+        + ["Leave a like and subscribe."])
+    _signoff = f"""
+
+SIGN-OFF — EXACTLY ONCE, AT THE VERY END:
+- Keep the source's own closing/reflective sentences INTACT and attributed to the witness/author. Do NOT make {_who} the grammatical subject of the witness's reflection.
+- THEN append the sign-off as NEW, SEPARATE final sentences in {lang_name}: name {_who} (exact strings) and ask ONCE, briefly, to like and subscribe — ONLY like and subscribe: no requests to comment, share, ring the bell or write where viewers are from. Example to adapt: "{_signoff_example}"
+- Nothing after the sign-off. No second farewell and no other call-to-action.""" if _who else """
+
+NO SIGN-OFF: end with the source's own ending, in the witness's voice — no farewell, no call-to-action, no narrator identity."""
+    _cta_part = total_chunks // 2   # центральная часть (как в build_chunk_prompt); при двух частях это последняя — призыв там не ставим
+
+    if total_chunks == 1:
+        # Одна часть: представление после хука, один призыв в середине, прощание в самом конце.
+        branding_instructions = (_noncontent_rules.format(lang_name=lang_name) + _intro_once + _mid_cta + _signoff
+                                 + _strict_naming)
+
+    elif chunk_index == 0:
+        # Первая часть: хук без брендинга, одно представление после хука; призыва и прощания здесь нет.
+        branding_instructions = (_noncontent_rules.format(lang_name=lang_name) + _intro_once
+                                 + "\n- Later parts of this text will NOT introduce anyone again."
+                                 + "\n- NO call-to-action and NO sign-off in this part."
+                                 + _strict_naming)
+    
+    elif chunk_index == total_chunks - 1:
+        # Последняя часть: без повторного представления; прощание + одна просьба в самом конце (если имена заданы).
+        branding_instructions = (_noncontent_rules.format(lang_name=lang_name) + """
+
+LAST PART:
+- The host and the channel were already introduced in the first part. Do NOT introduce them again and do NOT mention them inside the story."""
+                                 + _signoff + _strict_naming)
+
+    elif chunk_index == _cta_part and actual_channel_name:
+        # Центральная часть: один призыв; без представления и прощания.
+        branding_instructions = (_noncontent_rules.format(lang_name=lang_name) + """
+
+MIDDLE PART — CALL-TO-ACTION ONLY:
+- Do NOT add any introduction, host name or sign-off in this part. The story continues, plus the single call-to-action below."""
+                                 + _mid_cta + _strict_naming)
+
+    else:
+        # Остальные средние части: ничего не добавляется — ни представления, ни призыва, ни прощания.
+        branding_instructions = (_noncontent_rules.format(lang_name=lang_name) + """
+
+MIDDLE PART — NOTHING ADDED:
+- Do NOT add any introduction, host name, channel name, call-to-action or sign-off in this part. Only the story continues."""
+                                 + _strict_naming)
     
     # Всегда используем слова для чисел (пример для напоминания модели)
     if lang_name.lower() == "russian":
@@ -6372,7 +6547,8 @@ CRITICAL BRANDING REPLACEMENT FOR MIDDLE CHUNK:
 - Translation expansion 1.0×–1.4× is normal for Russian/German/Turkish (longer words, diacritics).
 - Output <0.8× of input = under-compression — restore content; do NOT over-summarize.
 - Output >2.0× of input = bloat — compress; do NOT enrich.
-- NEVER add new actions, descriptions, sensory details, atmosphere, or characters not present in source.
+- NEVER add new FACTS: no new actions, events, sensory details, atmosphere, characters, names, numbers or dates that are not present in the source.
+- The ONE bounded exception from ABSOLUTE REQUIREMENTS #1 still applies here: a short connective sentence that only points forward to material already present in the source, and carries no new fact, is allowed — but it must live INSIDE an existing paragraph and must never add a paragraph.
 - NEVER expand a short action like "X tips water" into a multi-sentence reflection.
 
 ═══════════════════════════════════════════════════════════
@@ -6413,9 +6589,9 @@ Branding instructions (apply only inside the story text, not as separate headers
 
 TASK:
 - Rewrite the following source text into fluent, native‑sounding {lang_name}, preserving ALL facts, technical details, dates, names and narrative flow.
-- Remove any existing greetings/outros and old channel/author names, and use ONLY these if provided:
-  * Author name: "{actual_host_name}"
-  * Channel name: "{channel_name}" (if not empty)
+- RETENTION IN THIS PART (applies to EVERY part, the last one included): put a bridge sentence or an open question before every switch to a new topic, scene or section; keep every section marker the source has, in its own position and shape; never let the final third of this part run without a forward pull. A bridge adds NO new fact, and every promise must be paid off by the text that follows it.
+- DO NOT WEAKEN THE SOURCE: keep its assertions unhedged, keep its concrete images concrete (never replace a vivid detail of the source with a generic summary), keep its address to the viewer in the same grammatical person, and keep its punchlines short.
+- Follow the NONCONTENT and branding rules above: remove the donor's greetings, self-introductions, calls-to-action, sponsor lines and farewells; add ONLY what the branding rules of this part explicitly ask for (introduction / call-to-action / sign-off, each at most once, exact names), nothing else of that kind.
 - Remove any subtitle markers like [музыка], [music], [muzika], [muzică], [muzyka], etc.
 - Render EVERY number, year, decade, ordinal, range and quantity as fully spelled-out words IN {lang_name} (e.g. {numbers_ex}). The output must contain ZERO digits and ZERO English number-words. Decade phrases like "nineteen-nineties", "the 1990s", "nineteen-twenties" MUST become the {lang_name} words for that decade — never left in English. If you are about to write "nineteen", "twenty", "-nineties", a digit, or "19th" — stop and spell it in {lang_name}.
 - Ensure ZERO Russian words remain (no Cyrillic, no Latin transliteration) – always replace them with natural {lang_name} words.
@@ -6426,7 +6602,10 @@ TASK:
 
 OUTPUT FORMAT (STRICT, FOR TTS):
 - Return ONLY the final adapted story text for this chunk, ready to be read by a voice over.
-- NO headings, NO titles, NO section labels, NO \"analysis\", NO \"verification\", NO checklists, NO bullet lists, NO metrics, NO debug/log lines.
+- NO service labels of YOUR OWN: NO \"analysis\", NO \"verification\", NO checklists, NO bullet lists, NO metrics, NO debug/log lines, and no part/chunk numbering of your own invention.
+- THE SOURCE'S OWN CHAPTER LINES ARE CONTENT, NOT FORMATTING — KEEP EVERY ONE OF THEM. A chapter line is a sentence of the source that names a section, e.g. \"Chapter 5, McLean's famous patients.\" Reproduce it in {lang_name} at the SAME position in the text, and spell any number inside it in {lang_name} WORDS, never digits.
+- A chapter line NEVER becomes a separate paragraph of its own: keep it as the first sentence of the paragraph it opens. This rule is about chapter lines only. How many paragraphs you write is decided elsewhere: when a PARAGRAPH STRUCTURE 1:1 block is present, keep the paragraph count equal to it; otherwise split the story into normal readable paragraphs separated by a blank line, even if the source arrived as one unbroken block.
+- NEVER invent a chapter line, section title or segment label that has no counterpart in the source. If the source has no chapter lines, your output has none.
 - Do NOT include things like: "KONTROLA PŘED VÝSTUPEM", "VERIFICATION CHECKLIST", "INPUT METRICS", "ANALÝZA", \"CHECKLIST\", \"PART 3/9\", etc.
 - Do NOT include any Markdown syntax such as '#', '##', '---', '***', lists, checkboxes, emojis or decorative separators.
 - Enclose the ENTIRE adapted story text in ONE SINGLE pair of square brackets, like:
@@ -6758,7 +6937,12 @@ def _call_claude_api_once(
     use_caching: bool = True
 ) -> Tuple[bool, str]:
     """Одиночный вызов Claude API (без ретраев). Возвращает __RETRY__:... при ошибках, пригодных для ретрая."""
+    if not ANTHROPIC_AVAILABLE:
+        return False, "Anthropic API недоступен: в Python процесса сервиса не установлены anthropic/httpx. Администратору: установите зависимости requirements-anthropic.txt и перезапустите сервис."
+    client = None
+    httpx_client = None
     try:
+        ensure_provider_execution_allowed("claude")
         # Создаём кастомный HTTPX клиент с увеличенными таймаутами
         # Проблема: HTTPX по умолчанию имеет connect timeout 60 секунд, что вызывает "Client disconnected"
         # Решение: создаём HTTPX клиент с увеличенными таймаутами для всех операций
@@ -7008,6 +7192,12 @@ def _call_claude_api_once(
         debug_log(log_queue, "Claude Exception:", f"{type(e).__name__}: {e}\n{traceback.format_exc()}")
         return False, f"__RETRY__:EXC:{error_str}"
 
+    finally:
+        if client is not None:
+            client.close()
+        elif httpx_client is not None:
+            httpx_client.close()
+
 
 def _wait_with_stop_check(wait_time: float) -> bool:
     """Ждём wait_time секунд с проверкой STOP_FLAG. Возвращает True если остановлено."""
@@ -7018,6 +7208,11 @@ def _wait_with_stop_check(wait_time: float) -> bool:
         time.sleep(min(1.0, wait_time - waited))
         waited += 1.0
     return False
+
+
+_ANTHROPIC_CALL_SEMAPHORE = threading.BoundedSemaphore(
+    _bounded_env_int("REWRITE_ANTHROPIC_MAX_CONCURRENT_CALLS", 32, 1, 128)
+)
 
 
 @redact_provider_output
@@ -7033,18 +7228,12 @@ def call_claude_api(
     Вызывает Claude API с итеративными ретраями (без рекурсии).
     Счётчики ретраев — локальные, не расшарены между потоками.
     """
-    # BYOK-2026-07-30: если вызывающий ключ не передал — резолвим сами
-    # (свой Anthropic-ключ тенанта → серверный только владельцу). Провайдерная
-    # граница не должна молча уходить в запрос без ключа: 401 от вендора
-    # выглядел бы как «сломался Anthropic», а не «не настроен ключ».
-    if not (api_key or "").strip():
-        api_key = get_effective_anthropic_key()
-        if not api_key:
-            return False, (
-                "Anthropic credential is not configured: add your own Anthropic "
-                "API key (or a Claude OAuth token) in settings; no server key "
-                "is available for this account."
-            )
+    if not ANTHROPIC_AVAILABLE:
+        return False, "Anthropic API недоступен: в Python процесса сервиса не установлены anthropic/httpx. Администратору: установите зависимости requirements-anthropic.txt и перезапустите сервис."
+    # Ignore request/job-provided keys at the provider boundary. Resolve the
+    # current owner pool for every attempt, so settings edits also take effect.
+    if not get_effective_anthropic_keys():
+        return False, "Anthropic credential is not configured for this account"
     max_retries = {"disconnect": 3, "server": 5, "timeout": 3, "connection": 3, "rate_limit": 20}
     retries = {"disconnect": 0, "server": 0, "timeout": 0, "connection": 0, "rate_limit": 0}
     # FIX-2026-07-30 (P1 №7): backoff по владельцу Anthropic-ключа, а не общий
@@ -7052,7 +7241,14 @@ def call_claude_api(
     limiter = rate_limiter_for("anthropic")
 
     while True:
-        success, response = _call_claude_api_once(messages, api_key, model, log_queue, task_info, use_caching)
+        try:
+            ensure_provider_execution_allowed("claude")
+            pool = get_effective_credential_pool("anthropic")
+            with _ANTHROPIC_CALL_SEMAPHORE:
+                with pool.acquire(timeout=300.0) as leased_key:
+                    success, response = _call_claude_api_once(messages, leased_key, model, log_queue, task_info, use_caching)
+        except (CredentialPoolExhausted, RuntimeError) as exc:
+            return False, str(exc)
 
         if success:
             limiter.on_success()
@@ -7146,7 +7342,57 @@ def _is_token_switch_signal(text_lower: str) -> bool:
         # токен сдох / разлогинен / протух → тоже «кончился», переключаемся
         or "not logged in" in t or "please run /login" in t or "/login" in t
         or "invalid bearer token" in t or "authentication" in t and "fail" in t
+        # 04.09.2026: у мёртвого токена CLI отвечает «Your organization does not
+        # have access to Claude… contact your administrator» и выходит с кодом 1.
+        # Раньше этот текст не распознавался: пул не переключался на следующий
+        # токен, а кусок падал как «сбой обработки». Так канал простоял 9 дней.
+        or "does not have access" in t
+        or "contact your administrator" in t
+        or "please login again" in t
     )
+
+
+_CLAUDE_PROBE_TTL_SEC = 600
+_CLAUDE_PROBE_CACHE: Dict[str, Any] = {}
+_CLAUDE_PROBE_LOCK = threading.Lock()
+
+
+def _claude_faceless_reason(timeout: float = 60.0) -> str:
+    """Причина безликого «exit code 1» у CLI Claude — одним дешёвым зондом.
+
+    SDK читает stdout как поток JSON, а отказ авторизации CLI печатает туда же
+    ОБЫЧНЫМ текстом: поток рвётся, наружу выходит «Command failed with exit code 1»
+    при пустом stderr, и настоящая причина теряется совсем. Спрашиваем её у CLI
+    напрямую тем же токеном и кэшируем: зонд стоит один вызов на токен в 10 минут,
+    а не по вызову на каждый упавший кусок.
+    """
+    token = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
+    if not token:
+        return ""
+    key = hashlib.sha256(token.encode("utf-8")).hexdigest()
+    now = time.time()
+    with _CLAUDE_PROBE_LOCK:
+        cached = _CLAUDE_PROBE_CACHE.get(key)
+        if cached and now - cached[0] < _CLAUDE_PROBE_TTL_SEC:
+            return cached[1]
+    reason = ""
+    try:
+        env = dict(os.environ)
+        env.pop("ANTHROPIC_API_KEY", None)
+        probe = subprocess.run(
+            ["claude", "-p", "ping"],
+            env=env, capture_output=True, text=True,
+            stdin=subprocess.DEVNULL, timeout=timeout,
+        )
+        if probe.returncode != 0:
+            reason = " ".join(
+                ((probe.stdout or "") + " " + (probe.stderr or "")).split()
+            )[:300]
+    except Exception as exc:                                  # noqa: BLE001
+        reason = f"зонд не ответил: {type(exc).__name__}"
+    with _CLAUDE_PROBE_LOCK:
+        _CLAUDE_PROBE_CACHE[key] = (now, reason)
+    return reason
 
 
 class _ClaudeSlotUnavailable(RuntimeError):
@@ -7266,7 +7512,8 @@ def _call_claude_subscription_impl(
     # Логируем очищенный токен (первые и последние 10 символов для безопасности)
     if log_queue:
         # M6 PATCH-2026-06-25-secfix: не логируем хвост секрета и точную длину (раньше last10 + len).
-        log_msg(log_queue, "  🔍 OAuth токен загружен из серверных настроек")
+        log_msg(log_queue, "  🔀 Через альт-ключ" if oauth_token == ALT_ROUTE_TOKEN
+                else "  🔍 OAuth токен загружен из серверных настроек")
 
     # Извлекаем system prompt и user message из формата OpenAI
     system_prompt = ""
@@ -7532,12 +7779,25 @@ def _call_claude_subscription_impl(
         stderr_output = stderr_capture.getvalue()
         is_limit_error = False
         debug_log(log_queue, "Subscription Exception:", f"{type(e).__name__}: {error_msg}\nstderr: {stderr_output}\n{traceback.format_exc()}")
+        faceless = (
+            not stderr_output
+            and ("exit code 1" in error_msg.lower() or "command failed" in error_msg.lower())
+        )
+        alt_call = oauth_token == ALT_ROUTE_TOKEN
+        # FIX-2026-09-17-alt-route: проба идёт на токене владельца — на альт-ключе её не зовём.
+        probe_reason = _claude_faceless_reason() if faceless and not alt_call else ""
+        if probe_reason:
+            error_msg = f"{error_msg} | CLAUDE_AUTH: {probe_reason}"
         if log_queue:
             log_msg(log_queue, f"  ❌ Subscription error: {error_msg[:300]}")
             if stderr_output:
                 log_msg(log_queue, f"  ❌ Stderr: {stderr_output[:500]}")
+            elif probe_reason:
+                log_msg(log_queue, f"  ❌ Причина от CLI: {probe_reason[:300]}")
             else:
                 log_msg(log_queue, "  ❌ Stderr пустой")
+        if alt_call:
+            return False, f"{ALT_ERROR_PREFIX} {error_msg}"
         if not is_limit_error and ("exit code 1" in error_msg.lower() or "command failed" in error_msg.lower()):
             is_limit_error = _is_token_switch_signal(error_msg)
         if is_limit_error:
@@ -7545,6 +7805,23 @@ def _call_claude_subscription_impl(
         return False, error_msg
     # finally блок c restore os.environ + _env_lock.release() удалён 2026-05-24:
     # токен теперь идёт per-call через options.env, глобальная env не трогается → нечего восстанавливать.
+
+
+HOST_BUDGET_WAIT_PREFIX = "HOST_BUDGET_WAIT:"
+_JOB_HOST_BUDGET_WAITS = {}
+_HOST_BUDGET_WAIT_LOCK = threading.Lock()
+
+
+def remember_host_budget_wait(job_id):
+    if job_id:
+        with _HOST_BUDGET_WAIT_LOCK:
+            _JOB_HOST_BUDGET_WAITS[str(job_id)] = time.time() + 5
+
+
+def host_budget_wait_until(job_id, pop=False):
+    with _HOST_BUDGET_WAIT_LOCK:
+        return (_JOB_HOST_BUDGET_WAITS.pop(str(job_id), 0) if pop else
+                _JOB_HOST_BUDGET_WAITS.get(str(job_id), 0))
 
 
 SUBSCRIPTION_LIMIT_PREFIX = "SUBSCRIPTION_LIMIT:"
@@ -7578,6 +7855,32 @@ def pop_limit_hit(job_id: str) -> float:
     """Забрать и очистить отметку о лимите. 0 — джоб падал не из-за окна."""
     with _JOB_LIMIT_LOCK:
         return _JOB_LIMIT_HITS.pop(str(job_id), 0.0)
+
+
+# FIX-2026-09-13-models: job_id → причина «модель недоступна у провайдера». Пишется на
+# первом таком отказе; читается перед каждой частью (соседний язык не тратит вызовы),
+# авто-ретраем языка (повтор той же модели даст тот же отказ) и финализацией джоба.
+_JOB_MODEL_UNAVAILABLE: Dict[str, str] = {}
+
+
+def remember_model_unavailable(job_id: str, model: str) -> None:
+    """Запомнить, что провайдер отказал этому джобу в самой модели."""
+    if not job_id:
+        return
+    with _JOB_LIMIT_LOCK:
+        _JOB_MODEL_UNAVAILABLE[str(job_id)] = codex_model_unavailable_message(model)
+
+
+def model_unavailable_reason(job_id: str) -> str:
+    """Причина для человека, если джоб уже упёрся в недоступную модель. "" — нет."""
+    with _JOB_LIMIT_LOCK:
+        return _JOB_MODEL_UNAVAILABLE.get(str(job_id or ""), "")
+
+
+def pop_model_unavailable(job_id: str) -> str:
+    """Забрать и очистить отметку: повторный запуск снова пробует модель."""
+    with _JOB_LIMIT_LOCK:
+        return _JOB_MODEL_UNAVAILABLE.pop(str(job_id or ""), "")
 SUBSCRIPTION_TIMEOUT_PREFIX = "SUBSCRIPTION_TIMEOUT:"
 # Watchdog для Claude Code CLI hang — known upstream bug, regression в 2.1.42.
 # Anthropic issue: https://github.com/anthropics/claude-code/issues/25979
@@ -7923,6 +8226,30 @@ def _call_claude_conversation_impl(
     """
     if not _credential_leased:
         try:
+            alt = alt_route_for("claude")
+        except Exception as exc:
+            return False, [], f"{ALT_ERROR_PREFIX} {exc}"
+        if alt:
+            # FIX-2026-09-17-alt-route: слот держится на весь разговор, лизы OAuth нет.
+            alt_model = _alt_model(model)
+            try:
+                with _alt_slot("claude", alt_model):
+                    return call_claude_conversation(
+                        turn_prompts=turn_prompts,
+                        system_prompt=system_prompt,
+                        model=alt_model,
+                        oauth_token=ALT_ROUTE_TOKEN,
+                        log_queue=log_queue,
+                        task_info=task_info,
+                        target_words_per_turn=target_words_per_turn,
+                        max_recovery_turns=max_recovery_turns,
+                        progress_cb=progress_cb,
+                        hard_cap_sec=hard_cap_sec,
+                        _credential_leased=True,
+                    )
+            except RuntimeError as exc:
+                return False, [], str(exc)
+        try:
             ensure_provider_execution_allowed("claude")
             # BYOK-2026-07-30: own tenant token if configured, else server pool.
             lease = get_effective_credential_pool("claude").acquire(timeout=300.0)
@@ -7956,7 +8283,8 @@ def _call_claude_conversation_impl(
     if log_queue:
         log_msg(log_queue, f"  💬 Conversation: {len(turn_prompts)} turn(s), model={model}")
         # M6 PATCH-2026-06-25-secfix: не логируем хвост секрета и точную длину (раньше last10 + len).
-        log_msg(log_queue, "  🔍 OAuth токен загружен из серверных настроек")
+        log_msg(log_queue, "  🔀 Через альт-ключ" if oauth_token == ALT_ROUTE_TOKEN
+                else "  🔍 OAuth токен загружен из серверных настроек")
 
     options, claude_child_env, claude_isolation_root = _claude_isolated_options(
         oauth_token,
@@ -7994,6 +8322,10 @@ def _call_claude_conversation_impl(
                 last_data_time = [time.monotonic()]
                 iterate_done = anyio.Event()
                 turn_text: List[str] = []
+                # FIX-2026-09-17-convdup: как got_assistant в call_claude_subscription —
+                # ResultMessage.result повторяет текст AssistantMessage этого же хода
+                # («Париж.Париж.»), поэтому берём его ТОЛЬКО если текста ассистента не было.
+                got_assistant = [False]
 
                 async def _stream_watchdog():
                     while not iterate_done.is_set():
@@ -8017,12 +8349,15 @@ def _call_claude_conversation_impl(
                                 content = getattr(message, "content", None)
                                 if isinstance(content, str):
                                     turn_text.append(content)
+                                    if content:
+                                        got_assistant[0] = True
                                 elif isinstance(content, list):
                                     for block in content:
                                         text = getattr(block, "text", None)
                                         if text and isinstance(text, str):
                                             turn_text.append(text)
-                            elif msg_type == "ResultMessage":
+                                            got_assistant[0] = True
+                            elif msg_type == "ResultMessage" and not got_assistant[0]:
                                 result = getattr(message, "result", None)
                                 if result and isinstance(result, str):
                                     turn_text.append(result)
@@ -8241,14 +8576,16 @@ def _prepare_codex_isolation(
     for directory in (home_dir, work_dir, auth_dir):
         os.makedirs(directory, mode=0o700, exist_ok=True)
     isolated_codex_home = ""
-    if leased_codex_home and leased_codex_home != _DEFAULT_CODEX_HOME:
+    if leased_codex_home:
         source_auth = os.path.join(leased_codex_home, "auth.json")
         if not os.path.isfile(source_auth):
             raise RuntimeError("CODEX_AUTH: leased CODEX_HOME has no auth.json")
         with open(source_auth, "r", encoding="utf-8") as source_fh:
             source_payload = json.load(source_fh)
-        if not isinstance(source_payload, dict):
-            raise RuntimeError("CODEX_AUTH: leased auth.json is invalid")
+        try:
+            validate_codex_auth_document(source_payload)
+        except ValueError as exc:
+            raise RuntimeError(f"CODEX_AUTH: leased auth.json is invalid: {exc}") from exc
         _register_server_secret_tree(source_payload)
         _secure_copy_file(source_auth, os.path.join(auth_dir, "auth.json"))
         isolated_codex_home = auth_dir
@@ -8260,30 +8597,115 @@ def _prepare_codex_isolation(
     return work_dir, isolated_codex_home, child_env
 
 
+def _codex_file_digest(path: str) -> str:
+    """SHA-256 файла; "" — файла нет или не прочитался."""
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return ""
+
+
+def _codex_refresh_possible(codex_home: str) -> bool:
+    """Может ли ЭТОТ вызов задеть ротацию refresh-токена → нужен полный замок.
+
+    Полный замок на весь вызов CLI сериализует канал начисто: ёмкость Codex у
+    рерайтов была 1 при любых настройках, и задача из трёх языков ждала сама себя
+    (у одного партнёра 36 кусков отвалились по «codex credential lease timeout»).
+    При этом ротация — событие редкое: access_token живёт неделями, а auth.json
+    не меняется сотнями вызовов подряд.
+
+    Поэтому замок берём только у границы обновления токена. Всё остальное время
+    вызовы идут параллельно, а возврат обновлённого auth.json защищён отдельно —
+    compare-and-swap в ``_sync_codex_auth_back``: более старый вызов не может
+    затереть более новый токен.
+
+    Порог — ``REWRITE_CODEX_REFRESH_MARGIN_H`` (48 ч). 0 возвращает прежнее
+    поведение «замок всегда». Не смогли прочитать срок — считаем, что ротация
+    возможна (перестраховка).
+    """
+    raw = os.environ.get("REWRITE_CODEX_REFRESH_MARGIN_H")
+    try:
+        margin = float(raw) if raw else 48.0
+    except ValueError:
+        margin = 48.0
+    if margin <= 0:
+        return True
+    import base64 as _b64                      # в модуле не импортирован
+    try:
+        with open(os.path.join(codex_home, "auth.json"), encoding="utf-8") as fh:
+            data = json.load(fh)
+        token = ((data.get("tokens") or {}).get("access_token") or "").strip()
+        payload = token.split(".")[1]
+        payload += "=" * (-len(payload) % 4)
+        exp = json.loads(_b64.urlsafe_b64decode(payload)).get("exp")
+        if not exp:
+            return True
+        return (float(exp) - time.time()) < margin * 3600.0
+    except Exception:                                           # noqa: BLE001
+        return True
+
+
 def _codex_auth_copy_lock(codex_home: str):
     key = os.path.realpath(codex_home)
     with _CODEX_AUTH_COPY_LOCKS_GUARD:
         return _CODEX_AUTH_COPY_LOCKS.setdefault(key, threading.RLock())
 
 
+@contextmanager
+def _codex_auth_lifecycle_lock(codex_home: str):
+    """Serialize a complete auth lifecycle across threads and OS processes."""
+    thread_lock = _codex_auth_copy_lock(codex_home)
+    with thread_lock:
+        lock_fd = -1
+        try:
+            if _fcntl is not None:
+                lock_path = os.path.join(codex_home, ".auth.json.lifecycle.lock")
+                flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+                lock_fd = os.open(lock_path, flags, 0o600)
+                os.fchmod(lock_fd, 0o600)
+                _fcntl.flock(lock_fd, _fcntl.LOCK_EX)
+            yield
+        finally:
+            if lock_fd >= 0:
+                try:
+                    _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+                finally:
+                    os.close(lock_fd)
+
+
 def _sync_codex_auth_back(
     isolated_codex_home: str,
     leased_codex_home: str,
+    original_digest: str = "",
 ) -> None:
-    if (
-        not isolated_codex_home
-        or not leased_codex_home
-        or leased_codex_home == _DEFAULT_CODEX_HOME
-    ):
+    """Вернуть обновлённый Codex'ом auth.json в общий каталог — только если он свой.
+
+    ``original_digest`` — то, что было в каталоге на момент копирования внутрь.
+    Два следствия, обязательных для параллельных вызовов:
+      * токен не менялся → не пишем вовсе (это подавляющее большинство вызовов);
+      * каталог успел измениться, пока мы работали → НЕ затираем: там уже более
+        свежий токен, а наш устарел. Иначе долгий вызов откатывал бы семью токенов.
+    """
+    if not isolated_codex_home or not leased_codex_home:
         return
     source = os.path.join(isolated_codex_home, "auth.json")
     destination = os.path.join(leased_codex_home, "auth.json")
+    if original_digest and _codex_file_digest(source) == original_digest:
+        return
     with open(source, "r", encoding="utf-8") as fh:
         parsed = json.load(fh)
-    if not isinstance(parsed, dict):
-        raise RuntimeError("CODEX_AUTH: refreshed auth.json is invalid")
-    lock = _codex_auth_copy_lock(leased_codex_home)
-    with lock:
+    try:
+        validate_codex_auth_document(parsed)
+    except ValueError as exc:
+        raise RuntimeError(f"CODEX_AUTH: refreshed auth.json is invalid: {exc}") from exc
+    _register_server_secret_tree(parsed)
+    # Замок берём межпроцессный: каталог общий с gen-сервером, и одного
+    # threading-замка мало. Он нужен ТОЛЬКО здесь — на редкой записи, а не на
+    # каждом вызове CLI, поэтому параллельности не мешает.
+    with _codex_auth_lifecycle_lock(leased_codex_home):
+        if original_digest and _codex_file_digest(destination) != original_digest:
+            return                      # каталог обновил кто-то другой — он новее
         temp_path = os.path.join(
             leased_codex_home,
             f".auth.json.rewrite-{os.getpid()}-{threading.get_ident()}-"
@@ -8331,16 +8753,34 @@ def _persist_refreshed_codex_auth(leased_codex_home: str, source_path: str) -> N
         return
     try:
         refreshed = _read_private_file(source_path).strip()
-        if not refreshed or refreshed == get_user_codex_auth(owner):
+        if not refreshed:
             return
+        validate_codex_auth_document(json.loads(refreshed))
         _register_server_secret_tree(_codex_secret_strings(refreshed))
-        save_keys_config(codex_auth=refreshed, user_id=owner)
-        # Штамп источника обязан совпасть с новым значением из БД, иначе
-        # следующая материализация перезапишет свежий файл старым payload'ом.
         stamp_path = os.path.join(leased_codex_home, ".rewrite_source_sha256")
-        _write_private_file(
-            stamp_path, hashlib.sha256(refreshed.encode("utf-8")).hexdigest()
-        )
+        expected_hash = _read_private_file(stamp_path).strip()
+        identity = _CODEX_HOME_AUTH_IDENTITIES.get(os.path.realpath(leased_codex_home), "")
+        with _KEYS_WRITE_LOCK:
+            current_raw = get_user_codex_auth(owner)
+            current = json.loads(current_raw) if current_raw else None
+            payloads = _codex_payloads(current_raw)
+            match = next((i for i, item in enumerate(payloads)
+                          if _codex_account_identity(item) == identity), None)
+            if match is None or hashlib.sha256(payloads[match].encode()).hexdigest() != expected_hash:
+                return  # account removed/replaced while this call was running
+            if isinstance(current, list):
+                docs = [json.loads(item) for item in payloads]
+                docs[match] = json.loads(refreshed)
+                updated = json.dumps(docs, ensure_ascii=False, sort_keys=True)
+                saved_payload = json.dumps(docs[match], ensure_ascii=False, sort_keys=True)
+            else:
+                updated = saved_payload = refreshed
+            with sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0) as conn:
+                cur = conn.execute("UPDATE user_keys SET codex_auth=?,updated_at=? WHERE user_id=? AND codex_auth=?",
+                                   (updated, time.time(), owner, current_raw))
+                if cur.rowcount != 1:
+                    return
+        _write_private_file(stamp_path, hashlib.sha256(saved_payload.encode()).hexdigest())
     except Exception as exc:  # хранилище недоступно — вызов не валим
         print(f"[codex_auth] cannot persist refreshed auth for {owner}: {exc}")
 
@@ -8353,10 +8793,9 @@ def _codex_isolated_call(
     # Refresh tokens are single-use on some auth backends. Serialize the full
     # copy-in/call/copy-back lifecycle per leased home to prevent stale writes.
     call_lock = (
-        _codex_auth_copy_lock(leased_codex_home)
-        if leased_codex_home
-        and leased_codex_home != _DEFAULT_CODEX_HOME
-        else threading.RLock()
+        _codex_auth_lifecycle_lock(leased_codex_home)
+        if leased_codex_home and _codex_refresh_possible(leased_codex_home)
+        else nullcontext()
     )
     with call_lock:
         with tempfile.TemporaryDirectory(prefix=prefix) as isolation_root:
@@ -8364,10 +8803,17 @@ def _codex_isolated_call(
                 isolation_root,
                 leased_codex_home,
             )
+            original_digest = (
+                _codex_file_digest(os.path.join(isolated_auth, "auth.json"))
+                if isolated_auth
+                else ""
+            )
             try:
                 yield isolation_root, work_dir, isolated_auth, child_env
             finally:
-                _sync_codex_auth_back(isolated_auth, leased_codex_home)
+                _sync_codex_auth_back(
+                    isolated_auth, leased_codex_home, original_digest
+                )
 
 
 def _find_codex_bwrap() -> str:
@@ -8483,9 +8929,91 @@ def _codex_command_base(
         "-C",
         work_dir,
     ]
+    if getattr(_alt_ctx, "active", False):
+        command.extend(_alt_codex_flags(getattr(_alt_ctx, "model", "")))
     if ephemeral:
         command.append("--ephemeral")
     return command
+
+
+# FIX-2026-09-13-models: отказ провайдера в самой модели — не временный сбой.
+# 400: «The 'gpt-5.4-mini' model is not supported when using Codex with a ChatGPT account.»
+# 404: «The model `gpt-5.5` does not exist or you do not have access to it.»
+# «Unable to verify model access right now. Please retry.» — временная, сюда не входит.
+CODEX_MODEL_UNAVAILABLE_PREFIX = "CODEX_MODEL_UNAVAILABLE"
+_CODEX_MODEL_UNAVAILABLE_RE = re.compile(
+    r"not allowed to use the requested model"  # FIX-2026-09-17-alt-route: отказ альт-ключа
+    r"|"
+    r"model is not supported when using codex"
+    r"|\bmodel\b.{0,120}?does not exist or you do not have access"
+    r"|\bmodel_not_found\b",
+    re.IGNORECASE,
+)
+
+
+def _codex_model_unavailable(
+    stderr_text: str, event_errors: Optional[List[str]] = None
+) -> str:
+    """Строка отказа в модели или "".
+
+    Смотрим только строки самого CLI («ERROR: …») и события --json: в хвост stderr
+    codex exec дублирует промпт, а в тексте статьи легко встретить и «400», и
+    цитату с теми же словами.
+    """
+    candidates = [
+        line.strip()
+        for line in str(stderr_text or "").splitlines()
+        if line.strip().startswith("ERROR:")
+    ]
+    candidates.extend(str(item) for item in (event_errors or []))
+    for line in candidates:
+        if _CODEX_MODEL_UNAVAILABLE_RE.search(line):
+            return line[:300]
+    return ""
+
+
+# FIX-2026-09-13 (log-bloat): Codex печатает в stderr весь присланный промпт — текст
+# статьи клиента. В сообщение об ошибке уходили последние 4000 символов stderr, и на
+# каждой упавшей части лог задачи рос на кусок статьи (abd7dc2b0c02: 4 МБ за 588
+# вызовов на мёртвой модели). Берём суть: строки ERROR/warning (код и текст
+# провайдера) и последние строки вывода, остальное вырезаем с пометкой.
+_CODEX_ERROR_DETAIL_MAX_CHARS = 1500
+_CODEX_ERROR_TAIL_LINES = 3
+_CODEX_ERROR_LINE_RE = re.compile(
+    r"^\s*(?:\S+Z\s+)?(?:ERROR|WARN)\b"  # ERROR: … и 2026-…Z ERROR codex_api::…
+    r"|^\s*(?i:error|warning|fatal)\s*:"  # warning: … / Error: …
+    r"|panicked at"
+    r"|\"type\"\s*:\s*\"(?:error|turn\.failed)\""  # события codex --json
+)
+
+
+def _compact_codex_error_detail(
+    text: str, max_chars: int = _CODEX_ERROR_DETAIL_MAX_CHARS
+) -> str:
+    """Суть ошибки Codex без эха промпта: короткий вывод — как есть, длинный — сжатый."""
+    text = (text or "").strip()
+    if len(text) <= max_chars:
+        return text
+    lines = text.splitlines()
+    tail_from = max(0, len(lines) - _CODEX_ERROR_TAIL_LINES)
+    kept: List[str] = []
+    dropped = 0
+    for idx, line in enumerate(lines):
+        if idx >= tail_from or _CODEX_ERROR_LINE_RE.search(line):
+            if dropped:
+                kept.append(f"…обрезано {dropped} символов…")
+                dropped = 0
+            kept.append(line)
+        else:
+            dropped += len(line) + 1
+    detail = "\n".join(kept)
+    if len(detail) > max_chars:
+        # одна гигантская строка или сотни строк ERROR: начало и конец, середину вон
+        head = max_chars // 3
+        tail = max_chars - head
+        cut = len(detail) - head - tail
+        detail = f"{detail[:head]}\n…обрезано {cut} символов…\n{detail[-tail:]}"
+    return detail
 
 
 @redact_provider_output
@@ -8499,6 +9027,23 @@ def call_codex_subscription(
 ) -> Tuple[bool, str]:
     """Вызвать GPT через авторизованный Codex CLI, не читая его auth.json."""
     if not _credential_leased:
+        try:
+            alt = alt_route_for("codex")
+        except Exception as exc:
+            return False, f"CODEX_ERROR: {ALT_ERROR_PREFIX} {exc}"
+        if alt:
+            try:
+                with _alt_slot("codex", model):
+                    return call_codex_subscription(
+                        messages=messages,
+                        model=model,
+                        log_queue=log_queue,
+                        task_info=task_info,
+                        _credential_leased=True,
+                        _codex_home_override="",
+                    )
+            except RuntimeError as exc:
+                return False, f"CODEX_STOPPED: {exc}"
         try:
             ensure_provider_execution_allowed("codex")
             # BYOK-2026-07-30: своя подписка тенанта, иначе серверная — и только
@@ -8547,7 +9092,7 @@ def call_codex_subscription(
 
     try:
         if log_queue:
-            log_msg(log_queue, f"🤖 Codex subscription: model={actual_model}, task={task_info or '-'}")
+            log_msg(log_queue, f"🤖 Codex {'через альт-ключ' if getattr(_alt_ctx, 'active', False) else 'subscription'}: model={actual_model}, task={task_info or '-'}")
         with _codex_isolated_call(
             _codex_home_override,
             "rewrite-codex-isolated-",
@@ -8613,13 +9158,22 @@ def call_codex_subscription(
                 return True, final_text
 
             error_lower = stderr_text.lower()
+            unavailable = _codex_model_unavailable(stderr_text)
+            if unavailable:
+                # FIX-2026-09-13-models: модель снята — повтор даст тот же отказ.
+                return False, (
+                    f"{CODEX_MODEL_UNAVAILABLE_PREFIX}: "
+                    f"{codex_model_unavailable_message(model)} [{unavailable}]"
+                )
             if any(x in error_lower for x in ("not logged in", "authentication", "unauthorized", "401")):
                 prefix = "CODEX_AUTH"
             elif any(x in error_lower for x in ("usage limit", "rate limit", "quota", "limit reached")):
                 prefix = "CODEX_LIMIT"
             else:
                 prefix = "CODEX_ERROR"
-            return False, f"{prefix}: {stderr_text or f'codex exited with code {return_code}'}"
+            # класс ошибки — по прежнему хвосту, в сообщение (и лог задачи) — только суть
+            detail = _compact_codex_error_detail(stderr_text)
+            return False, f"{prefix}: {detail or f'codex exited with code {return_code}'}"
     except Exception as exc:
         return False, f"CODEX_ERROR: {type(exc).__name__}: {exc}"
     finally:
@@ -8669,6 +9223,27 @@ def call_codex_conversation(
     """Run all chunks in one persisted Codex session via ``codex exec resume``."""
     if not _credential_leased:
         try:
+            alt = alt_route_for("codex")
+        except Exception as exc:
+            return False, [], f"CODEX_ERROR: {ALT_ERROR_PREFIX} {exc}"
+        if alt:
+            try:
+                with _alt_slot("codex", model):
+                    return call_codex_conversation(
+                        turn_prompts=turn_prompts,
+                        system_prompt=system_prompt,
+                        model=model,
+                        log_queue=log_queue,
+                        task_info=task_info,
+                        target_words_per_turn=target_words_per_turn,
+                        max_recovery_turns=max_recovery_turns,
+                        progress_cb=progress_cb,
+                        _credential_leased=True,
+                        _codex_home_override="",
+                    )
+            except RuntimeError as exc:
+                return False, [], f"CODEX_STOPPED: {exc}"
+        try:
             ensure_provider_execution_allowed("codex")
             # BYOK-2026-07-30: своя подписка тенанта, иначе серверная (задача B).
             lease = get_effective_credential_pool("codex").acquire(timeout=300.0)
@@ -8715,17 +9290,24 @@ def call_codex_conversation(
     def _classify_error(stderr_text: str, event_errors: List[str], return_code: int) -> str:
         detail = ("\n".join(event_errors) or stderr_text or f"codex exited with code {return_code}")[-4000:]
         lowered = detail.lower()
+        unavailable = _codex_model_unavailable(stderr_text, event_errors)
+        if unavailable:
+            # FIX-2026-09-13-models: модель снята — повтор даст тот же отказ.
+            return (
+                f"{CODEX_MODEL_UNAVAILABLE_PREFIX}: "
+                f"{codex_model_unavailable_message(model)} [{unavailable}]"
+            )
         if any(x in lowered for x in ("not logged in", "authentication", "unauthorized", "401")):
             prefix = "CODEX_AUTH"
         elif any(x in lowered for x in ("usage limit", "rate limit", "quota", "limit reached")):
             prefix = "CODEX_LIMIT"
         else:
             prefix = "CODEX_ERROR"
-        return f"{prefix}: {detail.strip()}"
+        return f"{prefix}: {_compact_codex_error_detail(detail)}"
 
     try:
         if log_queue:
-            log_msg(log_queue, f"  💬 Codex conversation: {len(turn_prompts)} turn(s), model={actual_model}")
+            log_msg(log_queue, f"  💬 Codex conversation{' (альт-ключ)' if getattr(_alt_ctx, 'active', False) else ''}: {len(turn_prompts)} turn(s), model={actual_model}")
         with _codex_isolated_call(
             _codex_home_override,
             "rewrite-codex-conv-isolated-",
@@ -8914,6 +9496,20 @@ def call_api_universal(
         return call_codex_subscription(messages, model, log_queue, task_info)
     if provider == "subscription":
         try:
+            alt = alt_route_for("claude")
+        except Exception as exc:
+            return False, f"{ALT_ERROR_PREFIX} {exc}"
+        if alt:
+            # FIX-2026-09-17-alt-route: без лизы OAuth, без проб и парковки токенов владельца.
+            alt_model = _alt_model(model)
+            try:
+                with _alt_slot("claude", alt_model):
+                    return call_claude_subscription(
+                        messages, log_queue, task_info, alt_model, ALT_ROUTE_TOKEN
+                    )
+            except RuntimeError as exc:
+                return False, str(exc)
+        try:
             ensure_provider_execution_allowed("claude")
             # BYOK-2026-07-30: own tenant token if configured, else server pool.
             lease = get_effective_credential_pool("claude").acquire(timeout=300.0)
@@ -9010,6 +9606,14 @@ _DEAD_TOKEN_MARKERS = ("not logged in", "please run /login", "invalid bearer tok
 
 
 def _probe_token_state(token: str, log_queue=None) -> Tuple[str, float]:
+    host = _host_budget.try_acquire("claude_oauth", token, 1) if token else None
+    if host is None:
+        return "busy", 0.0
+    with host:
+        return _probe_token_state_reserved(token, log_queue)
+
+
+def _probe_token_state_reserved(token: str, log_queue=None) -> Tuple[str, float]:
     """Спросить провайдера правду про ЭТОТ токен: ('ok'|'limited'|'dead', время сброса).
 
     Единственный способ отличить исчерпанное окно от настоящей поломки на пути
@@ -9121,8 +9725,8 @@ def translate_paragraphs_recursive(
     Логика:
     - Один API-вызов на весь блок. Если число абзацев совпало — возвращаем.
     - Если не совпало — режем pополам по абзацам и рекурсивно переводим каждую половину.
-    - Базовый случай: 1 абзац — переводим как есть и возвращаем (даже если что-то странное,
-      это будет ровно 1 абзац для alignment).
+    - Базовый случай: непустой успешный ответ нормализуем в один абзац.
+      Ошибку провайдера, пустой ответ и исчерпание глубины не выдаём за перевод.
 
     Возвращает строку с абзацами через \\n\\n.
     """
@@ -9153,38 +9757,952 @@ def translate_paragraphs_recursive(
         actual = count_paragraphs(text)
         log_msg(log_queue, f"{indent}⚠️ split d={depth}: {actual}/{n} — режу пополам")
     else:
-        log_msg(log_queue, f"{indent}⚠️ split d={depth}: API error — режу пополам")
+        raise RuntimeError("Paragraph recovery API failed; do not split a provider failure")
 
-    # Базовый случай: 1 абзац — обработать как есть, даже если получилось плохо
+    # Базовый случай: сохраняем только непустой успешный ответ.
     if n == 1 or depth >= max_depth:
         # n == 1 — корректный лист, гарантируем 1 абзац (без \n\n внутри).
-        # n > 1 при исчерпанной глубине — degraded fallback: возвращаем n маркеров
-        # через \n\n, чтобы вверх по рекурсии count_paragraphs == n и chunk
-        # пометился failed валидатором, а не молча терял разделители.
+        # n > 1 при исчерпанной глубине — явная ошибка, не текст с маркерами.
         if n == 1:
             if success:
                 text = extract_from_brackets(response).strip()
                 if not text:
-                    text = paragraphs[0]
+                    raise RuntimeError("Paragraph recovery returned empty output")
                 text = re.sub(r"\n\s*\n+", " ", text).strip()
                 return text
-            return paragraphs[0]
+            raise RuntimeError("Paragraph recovery API failed; source is not a translation")
         # n > 1: depth исчерпан
-        return "\n\n".join(f"[FAIL_para_{i}]" for i in range(n))
+        raise RuntimeError("Paragraph recovery exhausted its depth")
 
     # Делим пополам и рекурсивно
     half = n // 2
     left = translate_paragraphs_recursive(
-        paragraphs[:half], lang_name, lang_display, chunk_index, total_chunks,
+        paragraphs[:half], lang_name, lang_display, chunk_index * 2, total_chunks * 2,
         channel_name, host_name, analysis, prev_context,
         system_prompt, api_call_fn, log_queue, depth + 1, max_depth,
     )
     right = translate_paragraphs_recursive(
-        paragraphs[half:], lang_name, lang_display, chunk_index, total_chunks,
-        channel_name, host_name, analysis, "",  # prev_context уже использован в left
+        paragraphs[half:], lang_name, lang_display, chunk_index * 2 + 1, total_chunks * 2,
+        channel_name, host_name, analysis, " ".join(re.split(r"(?<=[.!?])\s+", left)[-3:]),  # preserve legacy naming contract; child index controls role
         system_prompt, api_call_fn, log_queue, depth + 1, max_depth,
     )
     return left + "\n\n" + right
+
+
+# ============== ОДНОПРОХОДНАЯ ЧИСТКА ТЕКСТА (CLEANUP-2026-09-16) ==============
+# Зачем: постпроцесс Pass A/B/C/D мёртв — серверный ключ OpenAI пуст, свой ключ есть
+# у 7 кабинетов из 20, поэтому все четыре прохода падали на отказе авторизации и молча
+# возвращали текст без изменений. Для Claude постпроцесс отключён веткой кода с 03.06.
+#
+# Что вместо: ОДИН вызов подписки Codex на язык (текст длиннее лимита режется по
+# границе абзаца). Модель НЕ переписывает текст — она возвращает список точечных
+# замен «было → стало» (JSON); применяет их код, по границам слова, с проверкой
+# каждой правки и полным откатом к исходному тексту при любом сомнении.
+#
+# Замер (8 текстов, 3 языка): 36 с и 13.5К входных токенов на текст, мусор
+# распознавания 41 вхождение → 1, длина 100.0-101.4%, число абзацев не изменилось
+# ни разу.
+#
+# Три вещи, которые этот код делает НЕ ради качества текста, а ради сохранности задачи:
+#   1. На время чистки с потока снимается метка задачи (_rewrite_job_id). Иначе
+#      ожидание общего слота Codex (ёмкость машины — 1) поставило бы пометку
+#      «общий лимит ключа занят» на ВСЮ задачу, и соседний язык, который в этот
+#      момент спокойно рерайтит через Claude, оборвался бы без повтора.
+#   2. Чистка зовётся один раз на (задача, язык): авто-ретрай таски крутит
+#      rewrite_single_language до трёх раз, и без этой памяти чистка платила бы
+#      за каждый круг.
+#   3. Первый же отказ подписки (лимит, нет кредов, снятая модель) гасит чистку
+#      для всей задачи — остальные языки не долбят выбранный аккаунт.
+#
+# Переменные окружения:
+#   REWRITE_CLEANUP             — общий выключатель (по умолчанию включено)
+#   REWRITE_CLEANUP_PRESERVE    — чистка в режиме сохранения абзацев (по умолчанию включено)
+#   REWRITE_CLEANUP_MODEL       — модель (по умолчанию codex:gpt-5.6-terra)
+#   REWRITE_CLEANUP_MAX_CALLS   — потолок вызовов модели на язык (по умолчанию 3)
+#   REWRITE_CLEANUP_BUDGET_SEC  — потолок времени на язык (по умолчанию 900)
+#   REWRITE_CLEANUP_CHUNK_CHARS — длина куска для одного вызова (по умолчанию 45000)
+#   REWRITE_CLEANUP_MIN_CHARS   — короче этого текст не чистим (по умолчанию 400)
+
+# Правок за один вызов: реальному тексту нужно 12-25, 40 — с запасом.
+CLEANUP_MAX_FIXES = 40
+# Одна правка не имеет права переписать весь текст.
+CLEANUP_MAX_OCCURRENCES = 60
+# Допустимый рост длины: замер 100.0-101.4%, потолок с запасом на разворачивание
+# цифр в слова, но не больше 15% — иначе проверка перестаёт быть проверкой.
+CLEANUP_GROWTH_PER_FIX = 60
+CLEANUP_GROWTH_MIN_SHARE = 0.06
+CLEANUP_GROWTH_MAX_SHARE = 0.15
+# Усадка — главный риск (пропало содержание), поэтому порог жёстче роста.
+CLEANUP_SHRINK_PER_FIX = 20
+CLEANUP_SHRINK_MIN_SHARE = 0.01
+CLEANUP_SHRINK_MAX_SHARE = 0.03
+# Абсолютный пол на коротком тексте: доля от 400-1000 знаков меньше одной честной
+# правки «цифра → слова» (до ~60 знаков), и законная чистка откатывалась бы целиком.
+# На боевых длинах (40К+) правят доли, а не пол: 15% и 3% остаются в силе.
+CLEANUP_GROWTH_FLOOR = 400
+CLEANUP_SHRINK_FLOOR = 60
+# Замена короче 60% цитаты — это не правка, а срезание фрагмента.
+CLEANUP_MIN_REPLACEMENT_SHARE = 0.6
+
+_CLEANUP_CODE_RE = re.compile(r"\b[A-ZА-Я]{1,6}[- ]?\d+[A-Za-z\-]*\b")
+_CLEANUP_DIGIT_RE = re.compile(r"(?<![A-Za-z])\d[\d\s.,-]*")
+_CLEANUP_BROKEN_RE = re.compile(r"(?<=\w)\s+([^\W\d_])(?=\s)", re.UNICODE)
+_CLEANUP_GLUED_RE = re.compile(r"\b\w{24,}\b")
+_CLEANUP_ABBR_RE = re.compile(r"\b[A-Z]{2,6}\b")
+# Имя собственное = заглавное слово в середине предложения (после строчной буквы и пробела).
+_CLEANUP_PROPER_NAME_RE = re.compile(r"[a-zа-яё]\s+[A-ZА-ЯЁ][\wÀ-ɏ]{2,}")
+# Предложение: до конечной пунктуации либо до конца строки.
+_CLEANUP_SENTENCE_RE = re.compile(r"[^.!?…\n]*[.!?…]+|[^.!?…\n]+", re.UNICODE)
+_CLEANUP_LATIN_RE = re.compile(r"[A-Za-zÀ-ɏ]")
+_CLEANUP_CYRILLIC_RE = re.compile(r"[а-яёА-ЯЁ]")
+# Одиночные буквы, которые в наших языках — нормальные слова (pl/cs/ro/sk и др.).
+# Без этого фильтра детектор отдаёт модели сотни предлогов «i, w, z, o» с приказом
+# «почини каждое», то есть прямо подталкивает склеивать самые частые слова языка.
+_CLEANUP_REAL_ONE_LETTER_WORDS = frozenset(
+    "aáàâäeéèêiíîoóòôöuúùûüwyzsvkéşăâîєіїяю"
+)
+# Языки, где кириллица — целевой алфавит (тот же кортеж, что в postprocess_remove_russian_words).
+_CLEANUP_CYRILLIC_LANGS = ("russian", "ukrainian", "belarusian", "bulgarian", "macedonian")
+# Что нельзя трогать никогда: ссылки и упоминания каналов (контракт брендинга).
+_CLEANUP_ALWAYS_PROTECTED = ("http", "www.", "youtube", "@")
+_CLEANUP_FALSE_VALUES = ("0", "false", "no", "off", "нет", "")
+
+# Память на процесс: чистка один раз на (задача, язык) и общий выключатель на задачу.
+_CLEANUP_STATE_LOCK = threading.Lock()
+_CLEANUP_DONE: Dict[str, float] = {}
+_CLEANUP_JOB_OFF: Dict[str, str] = {}
+_CLEANUP_STATE_MAX = 2000
+# Отказы, после которых пробовать снова в этой же задаче бессмысленно.
+_CLEANUP_FATAL_MARKERS = (
+    "CODEX_LIMIT",
+    "CODEX_AUTH",
+    "CODEX_MODEL_UNAVAILABLE",
+    "SUBSCRIPTION_LIMIT",
+    "HOST_BUDGET_WAIT",
+    "credential is not configured",
+    "credential pool is empty",
+    "Own-only mode",
+    "codex CLI not found",
+)
+
+
+def _cleanup_flag(name: str, default: bool = True) -> bool:
+    """Выключатель через переменную окружения: 0/false/no/off/нет — выключено."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() not in _CLEANUP_FALSE_VALUES
+
+
+def _cleanup_int(name: str, default: int, minimum: int = 1) -> int:
+    try:
+        return max(minimum, int(str(os.environ.get(name, default)).strip()))
+    except (TypeError, ValueError):
+        return default
+
+
+def cleanup_enabled(preserve_paragraphs: bool = False) -> bool:
+    """Включена ли чистка. Общий выключатель + отдельный для режима сохранения абзацев."""
+    if not _cleanup_flag("REWRITE_CLEANUP", True):
+        return False
+    if preserve_paragraphs:
+        return _cleanup_flag("REWRITE_CLEANUP_PRESERVE", True)
+    return True
+
+
+def cleanup_model_name() -> str:
+    """Модель чистки. Только подписка Codex: ключа OpenAI на сервере нет."""
+    return (os.environ.get("REWRITE_CLEANUP_MODEL") or "codex:gpt-5.6-terra").strip()
+
+
+def _cleanup_state_put(store: Dict[str, Any], key: str, value: Any) -> None:
+    """Запоминает факт с ограничением размера — процесс живёт неделями."""
+    with _CLEANUP_STATE_LOCK:
+        if key not in store and len(store) >= _CLEANUP_STATE_MAX:
+            try:
+                store.pop(next(iter(store)))
+            except StopIteration:
+                pass
+        store[key] = value
+
+
+def cleanup_job_disabled(job_id: str) -> str:
+    """Причина, по которой чистка выключена для всей задачи (пусто — не выключена)."""
+    if not job_id:
+        return ""
+    with _CLEANUP_STATE_LOCK:
+        return _CLEANUP_JOB_OFF.get(str(job_id), "")
+
+
+def cleanup_disable_job(job_id: str, reason: str) -> None:
+    """Первый же отказ подписки гасит чистку для остальных языков этой задачи."""
+    if job_id:
+        _cleanup_state_put(_CLEANUP_JOB_OFF, str(job_id), str(reason)[:200])
+
+
+def cleanup_already_done(job_id: str, lang_name: str, base_name: str = "") -> bool:
+    """Чистка для этого языка задачи уже отработала (идёт круг авто-ретрая)."""
+    if not job_id:
+        return False
+    key = f"{job_id}\x00{lang_name}\x00{base_name}"
+    with _CLEANUP_STATE_LOCK:
+        return key in _CLEANUP_DONE
+
+
+def cleanup_mark_done(job_id: str, lang_name: str, base_name: str = "") -> None:
+    if job_id:
+        _cleanup_state_put(_CLEANUP_DONE, f"{job_id}\x00{lang_name}\x00{base_name}", time.time())
+
+
+@contextmanager
+def cleanup_detached_job_id():
+    """Снимает с потока метку задачи на время вызова чистки.
+
+    ServerCredentialPool.acquire читает job_id из thread-local stop_event и, если
+    общий слот провайдера занят дольше двух секунд, ставит на ВСЮ задачу пометку
+    «ожидание общего лимита ключа». Ёмкость Codex на машине — один вызов, поэтому
+    без этого снятия косметическая чистка обрывала бы соседние языки той же задачи
+    (в том числе идущие через Claude) и отправляла готовую задачу обратно в очередь.
+    Сам вызов чистки при занятом слоте просто мягко откажет через две секунды.
+    """
+    holder = getattr(STOP_FLAG, "_thread_local", None)
+    stop_event = getattr(holder, "stop_event", None)
+    saved = getattr(stop_event, "_rewrite_job_id", None) if stop_event is not None else None
+    detached = False
+    if stop_event is not None and saved is not None:
+        try:
+            delattr(stop_event, "_rewrite_job_id")
+            detached = True
+        except Exception:
+            detached = False
+    try:
+        yield
+    finally:
+        if detached:
+            try:
+                setattr(stop_event, "_rewrite_job_id", saved)
+            except Exception:
+                pass
+
+
+def cleanup_collect_suspects(text: str) -> Dict[str, List[str]]:
+    """Бесплатный детектор: собирает подозрительные места без обращения к модели.
+
+    Модель получает список готовым, поэтому не тратит рассуждения на поиск
+    и не пропускает механические дефекты.
+    """
+    out: Dict[str, List[str]] = {}
+    # буквенно-цифровые коды: MG42, FW190A-8, WN62
+    out["codes"] = sorted(set(_CLEANUP_CODE_RE.findall(text)))[:30]
+    # голые цифры (для озвучки всё должно быть словами)
+    out["digits"] = sorted(set(value.strip() for value in _CLEANUP_DIGIT_RE.findall(text)))[:40]
+    # разорванные слова: осиротевшая буква между словами. Одиночные буквы, которые
+    # в целевых языках являются словами (i, w, z, o, a, u, k, s, v), отсеиваются —
+    # иначе это сотни ложных кандидатов и приказ «почини каждое».
+    broken = set()
+    for match in _CLEANUP_BROKEN_RE.finditer(text):
+        letter = match.group(1)
+        if letter.lower() in _CLEANUP_REAL_ONE_LETTER_WORDS:
+            continue
+        start = max(0, match.start() - 24)
+        broken.add(text[start:match.end() + 12].replace("\n", " ").strip())
+    out["broken"] = sorted(broken)[:20]
+    # слипшиеся: неправдоподобно длинные токены
+    out["glued"] = sorted(set(_CLEANUP_GLUED_RE.findall(text)))[:20]
+    # латинские аббревиатуры без расшифровки
+    out["abbr"] = sorted(set(_CLEANUP_ABBR_RE.findall(text)))[:30]
+    return {key: values for key, values in out.items() if values}
+
+
+def cleanup_has_proper_names(text: str) -> bool:
+    """Есть ли в тексте имена собственные — заглавное слово в середине предложения."""
+    return bool(_CLEANUP_PROPER_NAME_RE.search(text or ""))
+
+
+def cleanup_is_cyrillic_language(lang_name: str) -> bool:
+    """Кириллица — целевой алфавит этого языка."""
+    return str(lang_name or "").strip().lower() in _CLEANUP_CYRILLIC_LANGS
+
+
+CLEANUP_PROMPT_TEMPLATE = """Ты редактор {lang} текста для озвучки. Текст сделан рерайтом транскрипта
+с распознавания речи, поэтому в нём могли остаться искажённые имена и мусор распознавания.
+
+Найди и верни замены по категориям:
+1. ИСКАЖЁННЫЕ ИМЕНА СОБСТВЕННЫЕ и несуществующие слова. Имена исторических лиц, библейских
+   персонажей и географические названия сверяй с реальностью: искажение пришло из распознавания
+   английской речи, поэтому {name_example}.
+   Имя меняй, только если старое — искажение ТОГО ЖЕ имени и звучит похоже. Никогда не подставляй
+   другого человека, учёного, место или книгу вместо того, что написано.
+2. РАЗНОБОЙ НАПИСАНИЙ: одно имя в разных местах текста написано по-разному. Приведи к одной форме
+   и укажи ту, что встречается в начале текста.
+3. СЛОВА ИЗ ЧУЖИХ ЯЗЫКОВ и кальки, которых нет в {lang}.
+4. ЦИФРЫ, КОДЫ И АББРЕВИАТУРЫ: запиши словами на {lang}. Код MG42 читается как «эм-ге сорок два».
+5. ГРУБЫЕ ОШИБКИ: разорванные и слипшиеся слова, опечатки внутри слова.
+   Падежные и родовые окончания НЕ меняй: это грамматика, а не мусор распознавания
+   (в чешском «dnešního Polska» — верный родительный падеж).
+
+{alphabet_rule}
+НЕ ТРОГАЙ: содержание, порядок предложений, длину текста, имена, которые написаны верно,
+устоявшиеся иноязычные термины. Отдельно запрещено трогать брендинг: обращения к зрителю,
+призыв подписаться, прощание в конце, имя ведущего, названия каналов и ссылки.
+
+Цитата old должна быть САМОСТОЯТЕЛЬНЫМ фрагментом: целое слово или несколько слов подряд.
+Не давай обрывок слова — замена применяется только по границам слова.
+
+Подозрительные места, найденные автоматически (проверь каждое, но не ограничивайся ими):
+{suspects}
+
+Верни ТОЛЬКО JSON-массив: [{{"old": "точная цитата из текста", "new": "исправление", "why": "категория"}}]
+Цитата old должна встречаться в тексте ДОСЛОВНО. Максимум {limit} пунктов. Если ошибок нет, верни [].
+
+ТЕКСТ:
+{text}"""
+
+
+def cleanup_build_prompt(
+    text: str,
+    lang_name: str,
+    suspects: Dict[str, List[str]],
+    limit: int = CLEANUP_MAX_FIXES,
+) -> str:
+    """Собирает промпт чистки: список найденных кандидатов + сам текст."""
+    titles = {
+        "codes": "коды",
+        "digits": "цифры",
+        "broken": "разрывы слов",
+        "glued": "слипшиеся слова",
+        "abbr": "аббревиатуры",
+    }
+    lines: List[str] = []
+    for key, values in suspects.items():
+        shown = ", ".join(str(value).strip() for value in values[:20] if str(value).strip())
+        if shown:
+            lines.append(f"- {titles.get(key, key)}: {shown}")
+    if cleanup_is_cyrillic_language(lang_name):
+        # Для кириллического текста пример с латинским написанием — прямая инструкция
+        # завести латиницу в текст для озвучки. Даём пример в целевом алфавите.
+        name_example = "«Ирвин Рамль» это «Эрвин Роммель», «Вельзебуб» это «Вельзевул»"
+        alphabet_rule = (
+            "АЛФАВИТ: текст кириллический. Все исправления пиши кириллицей — "
+            "латинских букв в тексте для озвучки быть не должно.\n"
+        )
+    else:
+        name_example = "«Irvin Raml» это Erwin Rommel, «Beelible» это Beelzebub"
+        alphabet_rule = (
+            f"АЛФАВИТ: пиши исправления в том же алфавите, что и текст ({lang_name}), "
+            "не вставляй кириллицу.\n"
+        )
+    return CLEANUP_PROMPT_TEMPLATE.format(
+        lang=lang_name,
+        name_example=name_example,
+        alphabet_rule=alphabet_rule,
+        suspects="\n".join(lines) or "не найдено",
+        limit=limit,
+        text=text,
+    )
+
+
+def cleanup_split(text: str, limit: int = 0) -> List[str]:
+    """Режет по границе абзаца, только если текст длиннее лимита.
+
+    Обычный ролик уходит одним куском. Склейка обратно через "\\n\\n" возвращает
+    ровно исходный текст — разделители абзацев не теряются.
+    """
+    limit = limit or _cleanup_int("REWRITE_CLEANUP_CHUNK_CHARS", 45000, 4000)
+    if len(text) <= limit:
+        return [text]
+    parts: List[str] = []
+    current = ""
+    for para in text.split("\n\n"):
+        if current and len(current) + len(para) + 2 > limit:
+            parts.append(current)
+            current = para
+        else:
+            current = (current + "\n\n" + para) if current else para
+    parts.append(current)
+    return parts
+
+
+def cleanup_parse_fixes(raw: str) -> Optional[List[Dict[str, Any]]]:
+    """Разбирает ответ модели в список правок.
+
+    None — ответ не разобрался (мягкий отказ), [] — модель честно не нашла правок.
+    """
+    if not raw or not str(raw).strip():
+        return None
+    text = str(raw).strip()
+    if text.startswith("```"):
+        first_newline = text.find("\n")
+        if first_newline != -1:
+            text = text[first_newline + 1:]
+        if text.endswith("```"):
+            text = text[:-3].rstrip()
+    payload: Any = None
+    try:
+        payload = json.loads(text)
+    except (json.JSONDecodeError, TypeError, ValueError):
+        start = text.find("[")
+        if start >= 0:
+            try:
+                payload, _end = json.JSONDecoder().raw_decode(text[start:])
+            except (json.JSONDecodeError, TypeError, ValueError):
+                payload = None
+    if isinstance(payload, dict):
+        # модель иногда заворачивает массив в объект
+        for key in ("fixes", "replacements", "items", "result", "edits"):
+            if isinstance(payload.get(key), list):
+                payload = payload[key]
+                break
+    if not isinstance(payload, list):
+        return None
+    return [item for item in payload if isinstance(item, dict)]
+
+
+def cleanup_protected_terms(channel_name: str = "", host_name: str = "") -> List[str]:
+    """Термины брендинга в нижнем регистре: полные имена и их основы.
+
+    Основа нужна из-за склонений: в польском и чешском имя ведущего в призыве
+    стоит не в именительном падеже, и сравнение по точной строке промахивается.
+    """
+    terms: List[str] = []
+    for raw in (channel_name, host_name):
+        value = str(raw or "").strip()
+        if not value:
+            continue
+        terms.append(value.lower())
+        for word in re.findall(r"[^\W\d_]{4,}", value, re.UNICODE):
+            stem = word.lower()[: max(4, len(word) - 2)]
+            terms.append(stem)
+    terms.extend(_CLEANUP_ALWAYS_PROTECTED)
+    return sorted({term for term in terms if len(term) >= 3})
+
+
+def cleanup_protected_spans(text: str, terms: List[str]) -> List[Tuple[int, int]]:
+    """Границы предложений, в которых живёт брендинг.
+
+    Защищаем ПРЕДЛОЖЕНИЕ целиком, а не строку с именем: призыв подписаться,
+    представление и прощание — это предложения, и правка, нацеленная в обычное
+    слово, не должна докатиться до них глобальной заменой.
+    """
+    if not terms:
+        return []
+    spans: List[Tuple[int, int]] = []
+    for match in _CLEANUP_SENTENCE_RE.finditer(text):
+        piece = match.group(0)
+        if not piece.strip():
+            continue
+        low = piece.lower()
+        if any(term in low for term in terms):
+            spans.append((match.start(), match.end()))
+    return spans
+
+
+# FIX-2026-09-17-cleanup-guards: проверка 489 правок чистки по исходникам (17.09) нашла две системные
+# порчи. 1) Правка только окончания: «Polska → Polsko» девять раз сломала чешский падеж,
+# «Knocking → Knockin'» исказила название. 2) Подмена фамилии другим человеком: «Wasmer → Schwarz»,
+# «Steinhauser → Much» — это выдуманный факт, а не мусор распознавания. Настоящие исправления
+# распознавания сохраняют начальный звук («Verluskart → Pluskat», «Seau → Severloh»,
+# «Leonare → Lion-sur-Mer») или приводят имя к форме, которая уже есть в тексте.
+_CLEANUP_EDGE_PUNCT = "\"'«»„“”‚‘’()[]{}.,;:!?…—–-"
+_CLEANUP_SOUND_PREFIXES = (("sch", "S"), ("sh", "S"), ("sz", "S"), ("ts", "S"), ("tz", "S"),
+                           ("ch", "K"), ("kh", "K"), ("ph", "P"), ("th", "T"))
+_CLEANUP_SOUND_LETTERS = {
+    "p": "P", "b": "P", "v": "P", "w": "P", "f": "P", "s": "S", "z": "S", "c": "K", "k": "K", "g": "K",
+    "q": "K", "x": "K", "t": "T", "d": "T", "m": "N", "n": "N", "l": "L", "r": "R", "j": "J",
+}
+
+
+def _cleanup_fold(word: str) -> str:
+    return unicodedata.normalize("NFKD", word or "").encode("ascii", "ignore").decode().lower()
+
+
+_CLEANUP_VOWELS = set("aeiouyáàâäãåąéèêëěęíìîïıóòôöõőúùûüůűýÿ")
+CLEANUP_INFLECTION_MIN_OCCURRENCES = 2
+
+
+def _cleanup_sounds_compatible(a: str, b: str) -> bool:
+    """Совпадает ли начальный звук. «Ch» читается по-разному (Cherbourg — «ш», Christ — «к»)."""
+    sounds_a, sounds_b = {_cleanup_initial_sound(a)}, {_cleanup_initial_sound(b)}
+    for word, sounds in ((a, sounds_a), (b, sounds_b)):
+        folded = _cleanup_fold(word)
+        if folded.startswith("ch"):
+            sounds |= {"S", "K"}
+        if folded[:1] in ("y", "j"):
+            sounds |= {"J", "V"}  # Yahweh → Jahve, Yalta → Jalta: английская запись против славянской
+    return bool(sounds_a & sounds_b)
+
+
+def _cleanup_initial_sound(word: str) -> str:
+    folded = _cleanup_fold(word)
+    if not folded:
+        return ""
+    for prefix, sound in _CLEANUP_SOUND_PREFIXES:
+        if folded.startswith(prefix):
+            return sound
+    first = folded[0]
+    if first in "aeiouyh":
+        return "V"
+    return _CLEANUP_SOUND_LETTERS.get(first, first.upper())
+
+
+def cleanup_semantic_guard(old: str, new: str, text: str) -> str:
+    """Причина отказа для правки, которая портит смысл или грамматику. Пусто — правка допустима.
+
+    Оба правила узкие намеренно: на 273 реальных правках 17.09 широкий запрет «только окончание»
+    отсекал и верные исправления (грамматика с контекстом, «Stag → Stagg», «Beliel → Belial»).
+    """
+    if re.search(r"\d", old or ""):
+        return ""  # цифры и коды разворачиваются в слова — это не про смысл
+    old_words, new_words = (old or "").split(), (new or "").split()
+    # 1) Одно слово без контекста, меняется только гласный хвост, слово частое и новая форма в тексте
+    #    уже есть: модель «унифицирует» два падежа одного слова как разнобой написаний.
+    if len(old_words) == 1 and len(new_words) == 1:
+        a, b = old_words[0].strip(_CLEANUP_EDGE_PUNCT), new_words[0].strip(_CLEANUP_EDGE_PUNCT)
+        la, lb = a.lower(), b.lower()
+        prefix = 0
+        while prefix < min(len(la), len(lb)) and la[prefix] == lb[prefix]:
+            prefix += 1
+        tail_a, tail_b = la[prefix:], lb[prefix:]
+        if (prefix >= 3 and tail_a and tail_b and len(tail_a) <= 2 and len(tail_b) <= 2
+                and all(ch in _CLEANUP_VOWELS for ch in tail_a + tail_b)):
+            word_re = lambda w: r"(?<!\w)" + re.escape(w) + r"(?!\w)"
+            if (len(re.findall(word_re(a), text or "")) >= CLEANUP_INFLECTION_MIN_OCCURRENCES
+                    and re.search(word_re(b), text or "")):
+                return ("меняет падежную форму частого слова на другую его форму, которая уже есть в тексте "
+                        "— это грамматика, а не разнобой написаний")
+    # 2) Подмена имени другим: заглавное слово меняется на непохожее по начальному звуку,
+    #    которого нет в тексте и которое не является перестановкой слов цитаты.
+    if len(old_words) == len(new_words):
+        pairs = [(x.strip(_CLEANUP_EDGE_PUNCT), y.strip(_CLEANUP_EDGE_PUNCT)) for x, y in zip(old_words, new_words)]
+    else:
+        caps_old = [w.strip(_CLEANUP_EDGE_PUNCT) for w in old_words if w.strip(_CLEANUP_EDGE_PUNCT)[:1].isupper()]
+        caps_new = [w.strip(_CLEANUP_EDGE_PUNCT) for w in new_words if w.strip(_CLEANUP_EDGE_PUNCT)[:1].isupper()]
+        pairs = [(caps_old[0], caps_new[0])] if caps_old and caps_new else []
+    old_stems = {_cleanup_fold(w.strip(_CLEANUP_EDGE_PUNCT))[:4] for w in old_words}
+    for a, b in pairs:
+        if not a or not b or a == b or not (a[:1].isupper() and b[:1].isupper()):
+            continue
+        if _cleanup_fold(b)[:4] in old_stems:
+            continue  # перестановка или склонение слов самой цитаты
+        if re.search(r"(?<!\w)" + re.escape(b) + r"(?!\w)", text or ""):
+            continue  # приведение к написанию, которое уже есть в тексте
+        if not _cleanup_sounds_compatible(a, b):
+            return f"подменяет «{a}» на непохожее по звучанию «{b}», которого нет в тексте — похоже на другой факт"
+    return ""
+
+
+def cleanup_apply_fixes(
+    text: str,
+    fixes: List[Dict[str, Any]],
+    terms: Optional[List[str]] = None,
+    limit: int = CLEANUP_MAX_FIXES,
+) -> Tuple[str, Dict[str, Any]]:
+    """Применяет правки с защитой. Возвращает (текст, отчёт).
+
+    Замена идёт ТОЛЬКО по границам слова: обычный str.replace переписывает куски
+    посторонних слов (правка «Ana» → «Anna» превратила бы Anatol в Annatol), и ни
+    длина, ни абзацы, ни алфавит этого не видят. Всё, что непохоже на точечную
+    замену целого слова, отбрасывается.
+    """
+    report: Dict[str, Any] = {
+        "предложено": 0,
+        "применено": 0,
+        "замен": 0,
+        "отброшено": 0,
+        "причины": [],
+    }
+    out = text
+    terms = terms or []
+
+    def _drop(quote: str, reason: str) -> None:
+        report["отброшено"] += 1
+        if len(report["причины"]) < 8:
+            report["причины"].append(f"«{quote[:40]}» — {reason}")
+
+    for item in (fixes or [])[:limit]:
+        old = str(item.get("old") or "")
+        new = str(item.get("new") or "")
+        report["предложено"] += 1
+        if not old or not new.strip():
+            _drop(old, "пустая замена")
+            continue
+        if old == new:
+            _drop(old, "ничего не меняет")
+            continue
+        if len(old) < 3:
+            _drop(old, "слишком короткая цитата")
+            continue
+        if "\n" in old or "\n" in new:
+            # Перенос строки внутри правки — это сдвиг структуры, а не чистка слова.
+            # Запрещаем во ВСЕХ режимах: в режиме сохранения абзацев такая правка
+            # ломает 1:1, в обычном — незаметно склеивает или разрывает абзацы.
+            _drop(old, "правка содержит перенос строки")
+            continue
+        low_old, low_new = old.lower(), new.lower()
+        if any(term in low_old or term in low_new for term in terms):
+            _drop(old, "трогает брендинг или ссылку")
+            continue
+        # Правка не должна раздувать фрагмент. Исключение — цифры и коды: «1944» →
+        # «tysiąc dziewięćset czterdzieści cztery» это законное разворачивание в слова
+        # для озвучки, поэтому короткой цитате с цифрой даётся запас по длине.
+        has_digit = bool(re.search(r"\d", old))
+        max_new = (len(old) * 12 + 40) if (has_digit and len(old) <= 16) else (2 * len(old) + 20)
+        if len(new) > max_new:
+            _drop(old, "замена неправдоподобно длинная")
+            continue
+        # Срезание — главный риск чистки: так из текста пропадает содержание
+        # (и прощание в конце ролика).
+        if len(new) < CLEANUP_MIN_REPLACEMENT_SHARE * len(old) - 8:
+            _drop(old, "замена срезает фрагмент")
+            continue
+        guard_reason = cleanup_semantic_guard(old, new, out)
+        if guard_reason:
+            _drop(old, guard_reason)
+            continue
+        pattern = r"(?<!\w)" + re.escape(old) + r"(?!\w)"
+        try:
+            matches = list(re.finditer(pattern, out))
+        except re.error:
+            _drop(old, "цитата не разобралась")
+            continue
+        if not matches:
+            _drop(old, "цитаты нет в тексте как отдельного фрагмента")
+            continue
+        if len(matches) > CLEANUP_MAX_OCCURRENCES:
+            _drop(old, f"слишком много вхождений ({len(matches)})")
+            continue
+        spans = cleanup_protected_spans(out, terms)
+        if spans and any(
+            any(start < span_end and span_start < end for span_start, span_end in spans)
+            for start, end in ((m.start(), m.end()) for m in matches)
+        ):
+            _drop(old, "попадает в предложение с брендингом")
+            continue
+        out = re.sub(pattern, lambda _m, value=new: value, out)
+        report["применено"] += 1
+        report["замен"] += len(matches)
+    return out, report
+
+
+def cleanup_verify(
+    before: str,
+    after: str,
+    lang_name: str = "",
+    protected_names: Optional[List[str]] = None,
+    applied: int = 0,
+) -> Tuple[bool, List[str]]:
+    """Сверяет текст до и после. Любое подозрение — откат на стороне вызывающего.
+
+    Порог по длине несимметричный и с абсолютным потолком: рост — ожидаемое
+    поведение (цифры разворачиваются в слова), срезание — пропавшее содержание.
+    Алфавит проверяется в ОБЕ стороны: для латинского текста ловим появление
+    кириллицы, для кириллического — появление латиницы (промпт чистки сам склонен
+    подсунуть «Erwin Rommel» в русский текст).
+    """
+    problems: List[str] = []
+    base = max(1, len(before))
+    applied = max(1, applied)
+    allowed_growth = min(
+        max(CLEANUP_GROWTH_MIN_SHARE * base, CLEANUP_GROWTH_PER_FIX * applied),
+        max(CLEANUP_GROWTH_MAX_SHARE * base, CLEANUP_GROWTH_FLOOR),
+    )
+    allowed_shrink = min(
+        max(CLEANUP_SHRINK_MIN_SHARE * base, CLEANUP_SHRINK_PER_FIX * applied),
+        max(CLEANUP_SHRINK_MAX_SHARE * base, CLEANUP_SHRINK_FLOOR),
+    )
+    delta = len(after) - len(before)
+    if delta > allowed_growth:
+        problems.append(f"текст вырос на {delta} знаков (допустимо {int(allowed_growth)})")
+    if -delta > allowed_shrink:
+        problems.append(f"текст срезан на {-delta} знаков (допустимо {int(allowed_shrink)})")
+    paras_before, paras_after = count_paragraphs(before), count_paragraphs(after)
+    if paras_before != paras_after:
+        problems.append(f"число абзацев {paras_before} → {paras_after}")
+    breaks_before, breaks_after = before.count("\n"), after.count("\n")
+    if breaks_before != breaks_after:
+        problems.append(f"число переносов строк {breaks_before} → {breaks_after}")
+    digits_before = len(re.findall(r"\d", before))
+    digits_after = len(re.findall(r"\d", after))
+    if digits_after > digits_before:
+        problems.append(f"появились цифры: было {digits_before}, стало {digits_after}")
+    if cleanup_is_cyrillic_language(lang_name):
+        lat_before = len(_CLEANUP_LATIN_RE.findall(before))
+        lat_after = len(_CLEANUP_LATIN_RE.findall(after))
+        if lat_after > lat_before:
+            problems.append(f"появилась латиница: было {lat_before}, стало {lat_after}")
+    else:
+        cyr_before = len(_CLEANUP_CYRILLIC_RE.findall(before))
+        cyr_after = len(_CLEANUP_CYRILLIC_RE.findall(after))
+        if cyr_after > cyr_before:
+            problems.append(f"появилась кириллица: было {cyr_before}, стало {cyr_after}")
+    for name in [str(n).strip() for n in (protected_names or []) if n and str(n).strip()]:
+        was = len(re.findall(re.escape(name), before, re.IGNORECASE))
+        now = len(re.findall(re.escape(name), after, re.IGNORECASE))
+        if now < was:
+            problems.append(f"пропало имя «{name}»: было {was}, стало {now}")
+    return (not problems), problems
+
+
+def cleanup_one_piece(
+    piece: str,
+    lang_name: str,
+    lang_display: str,
+    model: str,
+    log_queue: queue.Queue,
+    terms: Optional[List[str]] = None,
+    protected_names: Optional[List[str]] = None,
+    task_info: str = "",
+    label: str = "",
+) -> Tuple[str, bool, str]:
+    """Чистит один кусок. Возвращает (текст, был_ли_вызов, причина_отказа).
+
+    Любой сбой — вызов не удался, ответ не разобрался, сверка не прошла — возвращает
+    ИСХОДНЫЙ кусок. Задача от чистки не падает никогда.
+    """
+    if not piece or not piece.strip():
+        return piece, False, ""
+    suspects = cleanup_collect_suspects(piece)
+    candidates = sum(len(values) for values in suspects.values())
+    if not suspects and not cleanup_has_proper_names(piece):
+        log_msg(log_queue, f"🧹 {lang_display}{label}: чистка не нужна — ни кандидатов, ни имён собственных")
+        return piece, False, ""
+    if STOP_FLAG.is_stopped():
+        return piece, False, ""
+
+    messages = [{"role": "user", "content": cleanup_build_prompt(piece, lang_name, suspects)}]
+    with cleanup_detached_job_id():
+        ok, response = call_codex_subscription(messages, model, log_queue, task_info)
+    if not ok:
+        reason = str(response)[:200]
+        log_msg(
+            log_queue,
+            f"🧹 {lang_display}{label}: чистка пропущена — модель не ответила ({reason[:160]}); "
+            f"текст оставлен как был"
+        )
+        return piece, True, reason
+
+    fixes = cleanup_parse_fixes(response)
+    if fixes is None:
+        log_msg(
+            log_queue,
+            f"🧹 {lang_display}{label}: чистка пропущена — ответ не разобрался как JSON; текст оставлен как был"
+        )
+        return piece, True, ""
+    if not fixes:
+        log_msg(log_queue, f"🧹 {lang_display}{label}: кандидатов {candidates}, правок модель не нашла")
+        return piece, True, ""
+
+    cleaned, report = cleanup_apply_fixes(piece, fixes, terms=terms)
+    ok_verify, problems = cleanup_verify(
+        piece, cleaned, lang_name=lang_name,
+        protected_names=protected_names, applied=report["применено"],
+    )
+    if not ok_verify:
+        log_msg(
+            log_queue,
+            f"🧹 {lang_display}{label}: сверка целостности не прошла ({'; '.join(problems)}) — "
+            f"откат, текст оставлен как был"
+        )
+        return piece, True, ""
+
+    log_msg(
+        log_queue,
+        f"🧹 {lang_display}{label}: кандидатов {candidates}, предложено {report['предложено']}, "
+        f"применено {report['применено']} (замен {report['замен']}), отброшено {report['отброшено']}"
+    )
+    if report["причины"]:
+        log_msg(log_queue, f"🧹 {lang_display}{label}: отброшено — {'; '.join(report['причины'])}")
+    return cleaned, True, ""
+
+
+def _cleanup_rewrite_results(
+    results: List[str],
+    lang_name: str,
+    lang_display: str,
+    log_queue: queue.Queue,
+    channel_name: str = "",
+    host_name: str = "",
+    preserve_paragraphs: bool = False,
+    job_id: str = "",
+    base_name: str = "",
+    task_info: str = "",
+    allow: bool = True,
+) -> List[str]:
+    """Однопроходная чистка готового рерайта. Чистится склейка, а не куски по отдельности.
+
+    Почему склейкой: ёмкость Codex на машине — ОДИН одновременный вызов на все три
+    сервиса, а кусков рерайта на язык бывает 6-26. По кускам это десятки занятий
+    единственного слота на один язык; склейка даёт один вызов и вдобавок ловит
+    разнобой написаний МЕЖДУ кусками, который по кускам не виден в принципе.
+    Возврат одного элемента безопасен: ниже по коду results всё равно склеиваются
+    через "\\n\\n" в final_text.
+    """
+    if not results:
+        return results
+    if not allow:
+        return results
+    if not cleanup_enabled(preserve_paragraphs):
+        log_msg(
+            log_queue,
+            f"🧹 {lang_display}: чистка выключена переменной окружения"
+            f"{' (режим сохранения абзацев)' if preserve_paragraphs else ''}"
+        )
+        return results
+    off_reason = cleanup_job_disabled(job_id)
+    if off_reason:
+        log_msg(log_queue, f"🧹 {lang_display}: чистка выключена для этой задачи — {off_reason[:120]}")
+        return results
+    if cleanup_already_done(job_id, lang_name, base_name):
+        log_msg(log_queue, f"🧹 {lang_display}: чистка уже выполнялась для этого языка — повторно не зову")
+        return results
+
+    model = cleanup_model_name()
+    if classify_provider(model) != "codex":
+        log_msg(
+            log_queue,
+            f"🧹 {lang_display}: чистка пропущена — модель «{model}» не из подписки Codex "
+            f"(проверь REWRITE_CLEANUP_MODEL)"
+        )
+        return results
+    if model not in get_allowed_codex_models():
+        log_msg(
+            log_queue,
+            f"🧹 {lang_display}: чистка пропущена — модель «{model}» вне списка разрешённых "
+            f"(REWRITE_ALLOWED_CODEX_MODELS)"
+        )
+        return results
+
+    texts = [value if isinstance(value, str) else str(value or "") for value in results]
+    if any(text.startswith("[ОШИБКА:") for text in texts):
+        return results
+    joined = "\n\n".join(texts)
+    min_chars = _cleanup_int("REWRITE_CLEANUP_MIN_CHARS", 400, 0)
+    if len(joined.strip()) < min_chars:
+        return results
+    if STOP_FLAG.is_stopped():
+        return results
+
+    terms = cleanup_protected_terms(channel_name, host_name)
+    protected_names = [str(n).strip() for n in (channel_name, host_name) if n and str(n).strip()]
+    deadline = time.monotonic() + _cleanup_int("REWRITE_CLEANUP_BUDGET_SEC", 900, 60)
+    calls_left = _cleanup_int("REWRITE_CLEANUP_MAX_CALLS", 3, 1)
+    pieces = cleanup_split(joined)
+    cleaned_pieces: List[str] = []
+    calls_made = 0
+    budget_reported = False
+    fatal_reason = ""
+
+    for index, piece in enumerate(pieces):
+        if fatal_reason or calls_left <= 0 or time.monotonic() >= deadline or STOP_FLAG.is_stopped():
+            if not budget_reported and not fatal_reason:
+                log_msg(
+                    log_queue,
+                    f"🧹 {lang_display}: бюджет чистки исчерпан — оставшиеся части оставлены как были"
+                )
+                budget_reported = True
+            cleaned_pieces.append(piece)
+            continue
+        label = f" часть {index + 1}/{len(pieces)}" if len(pieces) > 1 else ""
+        cleaned_piece, called, reason = cleanup_one_piece(
+            piece,
+            lang_name,
+            lang_display,
+            model,
+            log_queue,
+            terms=terms,
+            protected_names=protected_names,
+            task_info=f"{task_info or 'cleanup'}_{index + 1}",
+            label=label,
+        )
+        if called:
+            calls_left -= 1
+            calls_made += 1
+        if reason and any(marker.lower() in reason.lower() for marker in _CLEANUP_FATAL_MARKERS):
+            # Подписка отказала по существу: остальным частям и языкам этой задачи
+            # ответят тем же. Дальше не платим ни слотом, ни минутами.
+            fatal_reason = reason
+            cleanup_disable_job(job_id, reason)
+        cleaned_pieces.append(cleaned_piece)
+
+    if calls_made:
+        cleanup_mark_done(job_id, lang_name, base_name)
+    if fatal_reason:
+        log_msg(
+            log_queue,
+            f"🧹 {lang_display}: чистка отключена до конца задачи — подписка отказала ({fatal_reason[:120]})"
+        )
+
+    cleaned_full = "\n\n".join(cleaned_pieces)
+    if cleaned_full == joined:
+        return results
+
+    # Вторая, независимая сверка — уже по всему тексту языка. В режиме сохранения
+    # абзацев это тот же инвариант, который проверяется при сохранении файла,
+    # и считается он той же функцией count_paragraphs.
+    ok_verify, problems = cleanup_verify(
+        joined, cleaned_full, lang_name=lang_name,
+        protected_names=protected_names, applied=max(1, calls_made),
+    )
+    if not ok_verify:
+        log_msg(
+            log_queue,
+            f"🧹 {lang_display}: общая сверка не прошла ({'; '.join(problems)}) — "
+            f"чистка отменена целиком, текст оставлен как был"
+        )
+        return results
+
+    log_msg(
+        log_queue,
+        f"🧹 {lang_display}: чистка завершена — вызовов модели {calls_made}, модель {model}, "
+        f"длина {len(joined)} → {len(cleaned_full)} знаков, абзацев {count_paragraphs(cleaned_full)}"
+    )
+    return [cleaned_full]
+
+
+def cleanup_rewrite_results(
+    results: List[str],
+    lang_name: str,
+    lang_display: str,
+    log_queue: queue.Queue,
+    channel_name: str = "",
+    host_name: str = "",
+    preserve_paragraphs: bool = False,
+    job_id: str = "",
+    base_name: str = "",
+    task_info: str = "",
+    allow: bool = True,
+) -> List[str]:
+    """Единственная точка входа чистки — и последняя страховка.
+
+    rewrite_single_language ловит Exception и помечает язык failed, поэтому ни одна
+    ошибка чистки не имеет права вылететь наружу: рерайт уже сделан и оплачен,
+    терять его из-за косметической постобработки нельзя.
+    """
+    try:
+        return _cleanup_rewrite_results(
+            results,
+            lang_name,
+            lang_display,
+            log_queue,
+            channel_name=channel_name,
+            host_name=host_name,
+            preserve_paragraphs=preserve_paragraphs,
+            job_id=job_id,
+            base_name=base_name,
+            task_info=task_info,
+            allow=allow,
+        )
+    except Exception as exc:
+        try:
+            log_msg(
+                log_queue,
+                f"🧹 {lang_display}: чистка пропущена — внутренняя ошибка "
+                f"{type(exc).__name__}: {exc}; текст оставлен как был"
+            )
+        except Exception:
+            pass
+        return results
+
 
 
 # ============== ОСНОВНАЯ ФУНКЦИЯ РЕРАЙТА ==============
@@ -9208,6 +10726,8 @@ def rewrite_single_language(
     start_token_index: int = 0,
     preserve_paragraphs: bool = False,
     job_id: str = "",
+    output_basename: str = "",
+    progress_scope: str = "",
 ) -> Tuple[str, bool]:
     """
     Рерайтит файл на один язык с сохранением прогресса.
@@ -9288,15 +10808,19 @@ def rewrite_single_language(
         
         # B5 PATCH-2026-06-25-secfix: user_id для tenant-scoped ключа прогресса.
         # output_dir = outputs/<user_id> -> basename = user_id (== job.user_id).
-        _uid = os.path.basename(os.path.normpath(output_dir)) if output_dir else ""
+        _progress_job_id = progress_scope or job_id
+        _uid = get_current_user_id() or (os.path.basename(os.path.normpath(output_dir)) if output_dir else "")
         # Получаем или создаём задачу в менеджере прогресса
         task = PROGRESS_MANAGER.get_or_create_task(
             source_file, lang_name, lang_display, total_chunks,
-            user_id=_uid, job_id=job_id,
+            user_id=_uid, job_id=_progress_job_id,
         )
         
         # Проверяем, не завершена ли уже
-        if task.status == TaskStatus.COMPLETED.value:
+        if (task.status == TaskStatus.COMPLETED.value
+                and getattr(task, "output_file", "")
+                and os.path.isfile(task.output_file)
+                and os.path.getsize(task.output_file) > 0):
             log_msg(log_queue, f"✅ {lang_display}: уже завершено ранее")
             return (lang_display, True)
         
@@ -9304,8 +10828,7 @@ def rewrite_single_language(
         incomplete_chunks = PROGRESS_MANAGER.get_incomplete_chunks(task)
         
         if not incomplete_chunks:
-            log_msg(log_queue, f"✅ {lang_display}: все части готовы")
-            return (lang_display, True)
+            log_msg(log_queue, f"🔄 {lang_display}: все части готовы; завершаю сохранение")
         
         completed_count = total_chunks - len(incomplete_chunks)
         if completed_count > 0:
@@ -9337,6 +10860,12 @@ def rewrite_single_language(
             if STOP_FLAG.is_stopped():
                 log_msg(log_queue, f"⏹️ {lang_display}: остановлено, прогресс сохранён")
                 return (lang_display, False)
+            # FIX-2026-09-13-models: соседний язык уже упёрся в недоступную модель —
+            # эта часть получит тот же отказ, вызов не тратим.
+            _model_reason = model_unavailable_reason(job_id)
+            if _model_reason:
+                log_msg(log_queue, f"❌ {lang_display}: {CODEX_MODEL_UNAVAILABLE_PREFIX}: {_model_reason}")
+                return (lang_display, False)
             
             chunk_text = chunks[chunk_idx]
             
@@ -9344,7 +10873,7 @@ def rewrite_single_language(
             prev_chunk_context = ""
             if chunk_idx > 0:
                 prev_task_key = PROGRESS_MANAGER._task_key(
-                    source_file, lang_name, user_id=_uid, job_id=job_id
+                    source_file, lang_name, user_id=_uid, job_id=_progress_job_id
                 )
                 prev_task = PROGRESS_MANAGER.tasks.get(prev_task_key)
                 if prev_task:
@@ -9357,7 +10886,7 @@ def rewrite_single_language(
             # Отмечаем как in_progress
             PROGRESS_MANAGER.update_chunk(
                 source_file, lang_name, chunk_idx, "in_progress",
-                user_id=_uid, job_id=job_id,
+                user_id=_uid, job_id=_progress_job_id,
             )
             
             # Системный промт (для кэширования!)
@@ -9367,6 +10896,28 @@ def rewrite_single_language(
             
             # Логируем хеш system prompt для проверки идентичности
             system_hash = hashlib.md5(system_prompt.encode()).hexdigest()[:8]
+            # CONTRACT-2026-09-15: retry-промпты ниже не строятся через get_rewrite_prompt, поэтому
+            # правило брендинга повторяется здесь — иначе повтор по длине терял единственное
+            # представление диктора/канала (smoke 15.09, режим «оба имени»: 154% → retry → без имён).
+            _brand_names = " and ".join(
+                ([f'the host "{(host_name or "").strip()}"'] if (host_name or "").strip() else [])
+                + ([f'the channel "{(channel_name or "").strip()}"'] if (channel_name or "").strip() else []))
+            # CONTRACT-C-2026-09-15: роли частей те же, что в get_rewrite_prompt: представление в первой,
+            # один призыв в центральной (или в единственной), прощание + просьба в последней.
+            _ch = (channel_name or "").strip()
+            _brand_bits = []
+            if _brand_names and chunk_idx == 0:
+                _brand_bits.append(f"after the hook, introduce ONCE (1-2 sentences) {_brand_names} — exact strings, nowhere else in the story")
+            if _ch and (total_chunks == 1 or (chunk_idx == total_chunks // 2 and chunk_idx != total_chunks - 1)):
+                _brand_bits.append(f'ONE short like-and-subscribe call-to-action for the channel "{_ch}" around the middle of this part (in the MIDDLE of the story, NOT at the end; only like and subscribe — no comment/share/bell requests)')
+            if _brand_names and chunk_idx == total_chunks - 1:
+                _brand_bits.append(f"at the very END, after the source's own ending, a separate sign-off naming {_brand_names} plus ONE short like-and-subscribe request — these are the LAST sentences of the text; only like and subscribe, no comment/share/bell requests, no 'write where you are from', no thanks-for-watching")
+            if _brand_bits:
+                _brand_line = "- Branding (CONTRACT, exactly as listed, nothing more): " + "; ".join(_brand_bits) + "."
+            elif _brand_names:
+                _brand_line = "- Branding: the host/channel are handled in other parts — do NOT mention them, add NO call-to-action and NO sign-off in this part."
+            else:
+                _brand_line = "- Branding: NO host name, NO channel name, NO narrator identity, NO call-to-action, NO sign-off anywhere; do not invent one."
             system_length = len(system_prompt)
             estimated_tokens = system_length // 4
             
@@ -9419,13 +10970,22 @@ def rewrite_single_language(
             if not success:
                 # Критическая ошибка (не rate limit)
                 remember_limit_hit(job_id, response)
+                if str(response).startswith(HOST_BUDGET_WAIT_PREFIX):
+                    remember_host_budget_wait(job_id)
+                    log_msg(log_queue, f"⏳ {lang_display}: ожидание общего лимита ключа")
+                    return (lang_display, False)
                 log_msg(log_queue, f"❌ {lang_display}: часть {chunk_idx+1} - {response}")
                 PROGRESS_MANAGER.update_chunk(
                     source_file, lang_name, chunk_idx, "failed",
-                    error=response, user_id=_uid, job_id=job_id,
+                    error=response, user_id=_uid, job_id=_progress_job_id,
                 )
                 
                 if "API ключ" in response or "не найдена" in response:
+                    return (lang_display, False)
+                if response.startswith(CODEX_MODEL_UNAVAILABLE_PREFIX):
+                    # FIX-2026-09-13-models: провайдер не даёт модель — остальные части,
+                    # круги авто-ретрая и соседние языки получат тот же отказ.
+                    remember_model_unavailable(job_id, model)
                     return (lang_display, False)
                 continue
             
@@ -9530,7 +11090,7 @@ def rewrite_single_language(
                         PROGRESS_MANAGER.update_chunk(
                             source_file, lang_name, chunk_idx, "failed",
                             error=f"paragraphs {fallback_count}/{expected_paragraphs}",
-                            user_id=_uid, job_id=job_id,
+                            user_id=_uid, job_id=_progress_job_id,
                         )
                         continue
                 else:
@@ -9549,12 +11109,12 @@ def rewrite_single_language(
                 log_msg(log_queue, f"   ⚠️ WARNING: Extracted text very short ({extracted_len} chars), response length: {len(response)}")
                 log_msg(log_queue, f"   🔍 Response preview: {response[:200]}...")
 
-            if ratio < 0.90:  # короткий ИЛИ нарратив-преамбула («I need to… Let me first…»)
+            if ratio < SHORT_RETRY_RATIO and not (ratio >= DENSE_SCRIPT_SKIP_FROM and chunk_is_dense_script(extracted)):  # короткий ИЛИ нарратив-преамбула
                 log_msg(log_queue, f"   ⚠️ Chunk {chunk_idx+1}: SHORT ({ratio:.1%}, {extracted_len}/{orig_len} chars) — анти-нарратив retry...")
                 # FIX-2026-06-28-narration: нарратив opus-4-6 интермиттентный (~17%, детерминированно не убрать).
                 # Лечим ПОВТОРАМИ с жёстким анти-нарратив-промптом (старт с '[', запрет плана/«I need to»/«Let me»).
                 # До N попыток: 0.17^N → при 4 ≈ 0.08% что все нарративят. Берём лучший (самый длинный) результат.
-                _NARR_MAX = int(os.environ.get("NARRATION_MAX_RETRIES", "4"))
+                _NARR_MAX = short_retry_limit(ratio, int(os.environ.get("NARRATION_MAX_RETRIES", "4")))
                 best_extracted, best_len = extracted, extracted_len
                 for _ratt in range(1, _NARR_MAX + 1):
                     retry_prompt = f"""STOP. Your previous reply was NOT the translation — it was planning / a preamble (like "I need to...", "Let me first...") or far too short. That is a FAILURE.
@@ -9563,7 +11123,11 @@ Output ONLY the COMPLETE translation/adaptation of the text below, inside [squar
 - Your VERY FIRST character MUST be '[' — start translating IMMEDIATELY.
 - Do NOT write ANY analysis, planning, thinking, notes, or commentary.
 - NEVER begin with "I need to", "Let me", "I will", "First", "Here", "I'll", "Okay", "The".
-- Translate EVERY sentence. Length must be >= the original (>={int(orig_len * 0.95)} characters). Numbers and dates as words. Keep ALL facts.
+- Translate EVERY sentence and keep ALL facts. Numbers and dates as words.
+- Do NOT add anything that is not in the text below to make the output longer: no new facts, quotes, examples, explanations, disclaimers, summaries and no second ending. A complete {lang_name} version is often shorter in characters than the original — that is fine.
+- This is a REWRITE for a voice-over, not a plain translation: keep the role of this part, keep every section marker of the source in its own position and shape, keep a bridge sentence before every switch of topic or scene, do not hedge what the source asserts, and spell every name exactly as it was spelled earlier in this text.
+- Do NOT restore or add the donor's greetings, like/subscribe/comment requests, sponsor lines or farewells even if that makes the text longer; add no call-to-action and no sign-off except exactly what the Branding line below asks for. Keep historical testimony and quotations attributed to their real speakers; never rename a historical person.
+{_brand_line}
 
 TEXT TO TRANSLATE:
 {chunk_text}
@@ -9584,9 +11148,13 @@ Now output the full translation, starting with '[':"""
                     extracted_retry = extract_from_brackets(response_retry)
                     retry_len = len(extracted_retry)
                     retry_ratio = retry_len / orig_len if orig_len > 0 else 1.0
+                    _cand_ok, _cand_why = short_retry_candidate_ok(ratio, retry_ratio)
+                    if not _cand_ok:
+                        log_msg(log_queue, f"   ⛔ retry {_ratt}/{_NARR_MAX}: {retry_len} chars отклонён — {_cand_why}")
+                        continue
                     if retry_len > best_len:
                         best_extracted, best_len = extracted_retry, retry_len
-                    if retry_ratio >= 0.90:
+                    if retry_ratio >= SHORT_RETRY_RATIO:
                         log_msg(log_queue, f"   ✅ анти-нарратив retry {_ratt}/{_NARR_MAX} OK: {retry_len} chars ({retry_ratio:.1%})")
                         break
                     log_msg(log_queue, f"   ⚠️ retry {_ratt}/{_NARR_MAX}: всё ещё {retry_ratio:.1%} ({retry_len}/{orig_len}) — повтор")
@@ -9603,6 +11171,8 @@ Now output the full translation, starting with '[':"""
 Original: {orig_len} characters. Your output: {extracted_len} (max allowed: {max_allowed}).
 
 Do NOT add new content, examples, or padding. Preserve meaning and style but stay within 95-{int(MAX_CHUNK_LENGTH_RATIO*100)}% of original length.
+Do NOT add or restore the donor's greetings, calls-to-action (like/subscribe/comment), sponsor lines or farewells; add only what the Branding line below asks for; keep historical testimony and quotations attributed to their real speakers.
+{_brand_line}
 
 Original text:
 {chunk_text}
@@ -9752,7 +11322,7 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
                     PROGRESS_MANAGER.update_chunk(
                         source_file, lang_name, chunk_idx, "failed",
                         error=f"paragraph structure broken after rollback: {final_para_after}/{expected_paragraphs}",
-                        user_id=_uid, job_id=job_id,
+                        user_id=_uid, job_id=_progress_job_id,
                     )
                     continue
 
@@ -9770,20 +11340,20 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
                 PROGRESS_MANAGER.update_chunk(
                     source_file, lang_name, chunk_idx, "failed",
                     error=f"output too short: {_final_ratio:.1%} ({len(extracted)}/{orig_len} chars) — likely plan/preface instead of rewrite",
-                    user_id=_uid, job_id=job_id,
+                    user_id=_uid, job_id=_progress_job_id,
                 )
                 continue
 
             PROGRESS_MANAGER.update_chunk(
                 source_file, lang_name, chunk_idx, "completed",
-                result=extracted, user_id=_uid, job_id=job_id,
+                result=extracted, user_id=_uid, job_id=_progress_job_id,
             )
             log_msg(log_queue, f"   ✅ {lang_display}: часть {chunk_idx+1}/{total_chunks}")
         
         # Собираем результат
         task = PROGRESS_MANAGER.tasks.get(
             PROGRESS_MANAGER._task_key(
-                source_file, lang_name, user_id=_uid, job_id=job_id
+                source_file, lang_name, user_id=_uid, job_id=_progress_job_id
             )
         )
         
@@ -9799,7 +11369,7 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
                     errors += 1
 
             # 3-ступенчатый постпроцесс: Pass A (Branding) + Pass B (AI Declutter) параллельно → merge → Pass C (Nativeness)
-            base_name = os.path.splitext(os.path.basename(source_file))[0][:50]
+            base_name = output_basename or os.path.splitext(os.path.basename(source_file))[0][:50]
             lang_code = lang_name.lower().replace(" ", "_")[:15]  # для логов/постпроцесса
             # При preserve_paragraphs пропускаем pipeline: intro/outro/merge ломают 1:1 структуру
             if preserve_paragraphs:
@@ -9833,9 +11403,42 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
                     output_dir=output_dir,
                     base_name=base_name,
                     lang_code=lang_code,
-                    is_generated_text=True,  # Это генерация, не рерайт
+                    is_generated_text=True,  # имена персонажей не подменяются на диктора
+                    rewrite_contract=True,   # CONTRACT-C-2026-09-15: свой призыв/прощание по контракту
                 )
                 results = [full_text]
+
+            # CLEANUP-2026-09-16: однопроходная чистка вместо мёртвого Pass A/B/C/D.
+            # Pass A/B/C/D падал на отказе авторизации (серверный ключ OpenAI пуст), а у
+            # Claude был отключён веткой кода с 03.06 — ветки выше оставлены как есть и
+            # служат точкой отката. Здесь ОДИН вызов подписки Codex на язык: модель
+            # возвращает список точечных замен, применяет их код — по границам слова,
+            # с проверкой каждой правки и полным откатом при любом сомнении.
+            # Чистка идёт во ВСЕХ режимах, включая сохранение абзацев: правки точечные,
+            # переносы строк там запрещены, а число абзацев сверяется дважды (внутри
+            # чистки и штатным гейтом ниже). Откат без правки кода: REWRITE_CLEANUP=0.
+            # При провале чанков не зовём вовсе — файл всё равно не сохранится.
+            try:
+                results = cleanup_rewrite_results(
+                    results,
+                    lang_name,
+                    lang_display,
+                    log_queue,
+                    channel_name=channel_name,
+                    host_name=host_name,
+                    preserve_paragraphs=preserve_paragraphs,
+                    job_id=job_id,
+                    base_name=base_name,
+                    task_info=f"cleanup_{lang_code}",
+                    allow=(errors == 0),
+                )
+            except Exception as _cleanup_exc:
+                # Косметика не имеет права ронять готовый оплаченный рерайт.
+                log_msg(
+                    log_queue,
+                    f"🧹 {lang_display}: чистка упала ({type(_cleanup_exc).__name__}: {_cleanup_exc}) — "
+                    f"текст оставлен как был"
+                )
 
             # M5 PATCH-2026-06-25-secfix: НЕ сохраняем файл при ЛЮБЫХ ошибках чанков.
             # Раньше гард был только для preserve_paragraphs, а Claude/non-preserve путь писал
@@ -9895,7 +11498,7 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
                     log_msg(log_queue, f"⚠️ {lang_display}: {_note} → флаг needs_review (не автофикс)")
                     PROGRESS_MANAGER.set_needs_review(
                         source_file, lang_name, _note,
-                        user_id=_uid, job_id=job_id,
+                        user_id=_uid, job_id=_progress_job_id,
                     )
 
             with open(output_file, 'w', encoding='utf-8') as f:
@@ -9903,7 +11506,7 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
 
             PROGRESS_MANAGER.set_task_output(
                 source_file, lang_name, output_file,
-                user_id=_uid, job_id=job_id,
+                user_id=_uid, job_id=_progress_job_id,
             )
 
             if errors == 0:

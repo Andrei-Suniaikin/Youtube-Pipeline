@@ -11,6 +11,7 @@ Plain key format: rws_live_<32 url-safe random chars>  (≈190 bits entropy)
 import hashlib
 import secrets
 import sqlite3
+import threading
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -21,12 +22,29 @@ MAX_ACTIVE_API_KEYS = 10        # soft-limit на user
 PLAIN_KEY_PREFIX = "rws_live_"   # для grep в логах + UI display
 PLAIN_KEY_RANDOM_LEN = 32        # символы (token_urlsafe(24) ≈ 32 chars)
 PREFIX_DISPLAY_LEN = 16          # сколько символов показывать в UI (rws_live_ + 8)
+API_KEY_TOUCH_INTERVAL_SEC = 60  # FIX-2026-09-13: last_used_at пишем не чаще раза в минуту на ключ
+SESSIONS_DB_TIMEOUT_SEC = 5.0    # ожидание блокировки sessions.db в get_api_user (как в auth.py)
+
+# FIX-2026-09-13: когда в последний раз брались писать last_used_at, key_id → time (память процесса).
+_last_touch: Dict[str, float] = {}
+_last_touch_lock = threading.Lock()
 
 
 # --- Helpers ---
 
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+
+def _touch_due(key_id: str, now: float) -> bool:
+    """Пора ли писать last_used_at для ключа. True — слот занят этим запросом до now+интервал.
+    Слот занимается ДО записи: пачка параллельных опросов одним ключом не встаёт в очередь
+    за блокировкой, а при сбое записи следующая попытка — через интервал, без повторной давки."""
+    with _last_touch_lock:
+        if now - _last_touch.get(key_id, 0.0) < API_KEY_TOUCH_INTERVAL_SEC:
+            return False
+        _last_touch[key_id] = now
+        return True
 
 
 def _generate_plain_key() -> str:
@@ -179,7 +197,7 @@ def get_api_user(
     if raw:
         key_hash = _sha256(raw)
         now = time.time()
-        with sqlite3.connect(_ApiAuthState.sessions_db) as conn:
+        with sqlite3.connect(_ApiAuthState.sessions_db, timeout=SESSIONS_DB_TIMEOUT_SEC) as conn:
             row = conn.execute(
                 "SELECT k.key_id, k.user_id, k.license_key, k.status, k.name, "
                 "       COALESCE(u.status, 'disabled') "
@@ -191,7 +209,20 @@ def get_api_user(
                 key_id, user_id, license_key, st, name, user_status = row
                 if st != "active" or user_status != "active":
                     raise HTTPException(status_code=401, detail="api key is revoked")
-                conn.execute("UPDATE api_keys SET last_used_at=? WHERE key_id=?", (now, key_id))
+                # FIX-2026-09-13: раньше UPDATE шёл на КАЖДЫЙ запрос (опрос статуса — до 120 тыс.
+                # записей в сутки, в т.ч. на 404) и под давкой падал «database is locked» → 500
+                # на GET /api/v1/jobs/<id>. Отметка «когда ключ использовали» — только учёт:
+                # пишем не чаще раза в минуту на ключ, а занятая база запрос не роняет.
+                if _touch_due(key_id, now):
+                    try:
+                        conn.execute("UPDATE api_keys SET last_used_at=? WHERE key_id=?", (now, key_id))
+                        conn.commit()
+                    except sqlite3.OperationalError as exc:
+                        try:
+                            conn.rollback()
+                        except sqlite3.Error:
+                            pass
+                        print(f"[api_auth] last_used_at ключа «{name}» не записан, запрос продолжен: {exc}")
                 return {
                     "user_id": user_id,
                     "license_key": license_key,

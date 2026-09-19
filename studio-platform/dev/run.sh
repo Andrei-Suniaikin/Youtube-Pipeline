@@ -45,6 +45,22 @@ export VS_DEV_INSECURE_COOKIE=1
 # а не по зашитому литералу. Значения должны совпадать, иначе админ теряет права молча.
 export REWRITE_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
 export COVER_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
+# ─── Пресеты рерайта: стенд не пишет в репозиторий ───────────────────────────
+# rewrite/server.py держит пресеты тенантов в REWRITE_PRESETS_DIR, а по умолчанию —
+# прямо в рабочем дереве (rewrite/presets/<тенант>/generation.json). Переменную никто
+# не задавал, поэтому каждый прогон стенда правил ОТСЛЕЖИВАЕМЫЙ файл: одна генерация
+# — и в git diff висит чужое «updated_at». Пресеты стенда — это состояние, а не
+# исходник, и живут они рядом с dev-базой, как всё остальное состояние.
+export REWRITE_PRESETS_DIR="${REWRITE_PRESETS_DIR:-$ROOT/dev/data/rewrite-presets}"
+# Первый запуск: каталога ещё нет и пресетов в нём тоже, а стенд без них показывает
+# пустой список. Стартовый набор берётся из репозитория ОДИН раз — дальше стенд живёт
+# своей копией и в дерево уже не возвращается. Нужен чистый лист — удалить каталог.
+if [ -z "$(ls -A "$REWRITE_PRESETS_DIR" 2>/dev/null)" ]; then
+  mkdir -p "$REWRITE_PRESETS_DIR"
+  if [ -d "$ROOT/rewrite/presets" ]; then
+    cp -R "$ROOT/rewrite/presets/." "$REWRITE_PRESETS_DIR/"
+  fi
+fi
 # Рендер делает отдельная машина, опрашивая /api/render/claim с этим токеном. Пустой
 # токен сервер отвергает всегда, поэтому локально даётся значение по умолчанию — то же,
 # что берёт dev/render-node.sh. В бою токен настоящий и живёт в .env.
@@ -53,6 +69,25 @@ export PULLER_TOKEN="${PULLER_TOKEN:-dev-render-node}"
 # на домашней машине — напрямую. Без этого значения стенд пытался бы лезть в туннель,
 # которого здесь нет, и отвечал «Missing dependencies for SOCKS support».
 export VS_SUBS_PROXIES="${VS_SUBS_PROXIES:-direct}"
+# ─── Общий на машину учёт мест под ФИЗИЧЕСКИЙ ключ (приехал с ребейзом 18.09) ───
+# Боевой rewrite_core.py импортирует credential_budget БЕЗ try. Нет модуля — не
+# поднимается вся платформа: у нас это один процесс на три сервиса.
+export VIDEO_STUDIO_SHARED_DIR="${VIDEO_STUDIO_SHARED_DIR:-$ROOT/shared}"
+# Замки — это файлы, и каталог обязан быть приватным (0700, наш uid): модуль это
+# проверяет и иначе падает BudgetConfigurationError на ПЕРВОМ платном заказе, а не
+# на старте. В бою каталог лежит в /run на tmpfs (пережить перезагрузку не должен,
+# пережить перезапуск сервиса — обязан); на macOS /run нет, поэтому кладём рядом с
+# остальным состоянием стенда.
+export VIDEO_STUDIO_CREDENTIAL_BUDGET_DIR="${VIDEO_STUDIO_CREDENTIAL_BUDGET_DIR:-$ROOT/dev/data/credential-budget}"
+mkdir -p "$VIDEO_STUDIO_CREDENTIAL_BUDGET_DIR" && chmod 700 "$VIDEO_STUDIO_CREDENTIAL_BUDGET_DIR"
+# Потолки одновременных вызовов на один физический ключ. Умолчания — БОЕВЫЕ
+# (fastgen 18, openai 12, veo 24, claude_oauth 1, codex 1), поэтому здесь ничего не
+# задаётся. Знать про них надо вот что: боевой claude_oauth=1 СТРОЖЕ нашего
+# сегодняшнего поведения — форк 31.08 разрешал три параллельных вызова на токен
+# (REWRITE_CLAUDE_PER_TOKEN_CONCURRENCY=3). Решение «оставить как в бою или вернуть
+# три» — владельца, поэтому ручка есть, а умолчание не трогаем:
+#   export VIDEO_STUDIO_CREDENTIAL_BUDGET_CLAUDE_OAUTH=3
+# Значение задаётся на МАШИНУ целиком: разные числа в разных процессах ломают общий счёт.
 
 trap 'kill 0' EXIT
 ( cd "$ROOT" && "$PY" -m uvicorn web.platform:app --port "$PORT" --log-level warning ) &

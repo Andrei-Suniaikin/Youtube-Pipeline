@@ -10,7 +10,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import sqlite3
 import sys
 
@@ -19,6 +21,7 @@ BASE = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(BASE, "server"))
 
 import pub_calls                                                  # noqa: E402
+import pub_remote                                                 # noqa: E402
 import pub_services                                               # noqa: E402
 from pub_engine import ItemFailed, ResourceDown                   # noqa: E402
 
@@ -55,7 +58,10 @@ class FakeClient:
         return "file-1"
 
     def create_job(self, file_id, lang, preset, channel_name="", idempotency_key="",
-                   model=""):
+                   model="", source_sha=""):
+        # source_sha добавлен 19.09.2026 (ребейз B7): настоящий клиент подмешивает хэш
+        # донора в ключ повтора, и подделка обязана принимать тот же набор аргументов —
+        # иначе она молча разойдётся с тем, что проверяет тест.
         if FakeClient.fail_create:
             raise RuntimeError("рерайт отказал до создания задачи")
         FakeClient.made += 1
@@ -110,6 +116,86 @@ def services(store):
                                   "project_dir": lambda *a, **k: ""})
     s.store_source_text = lambda c, rid, text, upd: store.append(text)
     return s
+
+
+def with_real_client() -> None:
+    """Связка кабинет → клиент рерайта целиком, без подделки клиента.
+
+    Зачем отдельно. Подделка `FakeClient` принимает `source_sha` и молчит, если его
+    забыли передать: убери `source_sha=text_sha` из `do_source_ready` — все проверки
+    выше остаются зелёными, а в бою это ValueError на КАЖДОМ заказе рерайта
+    (`pub_remote._order_digest` падает без отпечатка исходника). Поэтому здесь
+    подменяется не клиент, а сеть под настоящим клиентом, и одним прогоном
+    закрывается сразу две вещи: отпечаток донора доехал, и в заголовок ушёл ровно
+    `release:<выпуск>:<отпечаток заказа>`.
+    """
+    print("\nКабинет и настоящий клиент: отпечаток исходника реально доезжает")
+    seen = []          # [(метод, адрес, что послали)] — весь разговор с соседом
+    uploads = []       # загрузки донора: у соседа каждая даёт НОВЫЙ file_id
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, data=None, text=""):
+            self._data, self.text = data, text
+
+        def json(self):
+            return self._data
+
+    def fake_call(method, url, key, service, **kw):
+        seen.append((method, url, kw))
+        if url.endswith("/files"):                       # загрузка донора
+            uploads.append(url)
+            return Resp({"file_id": f"file-{len(uploads)}"})
+        if "/files/" in url:                             # готовый текст
+            return Resp(text="П" * 900)
+        if url.endswith("/jobs"):                        # заказ
+            return Resp({"job_id": "job-1"})
+        return Resp({"status": "done", "output_files": {"pl": "out.txt"}})
+
+    def order(donor: str):
+        """Один полный заказ настоящим клиентом. Возвращает (заголовок, тело)."""
+        seen.clear()
+        pub_services.donor_text = lambda url: donor
+        svc = services([])
+        svc.do_source_ready(fresh(), REL)
+        post = [(url, kw) for method, url, kw in seen
+                if method == "POST" and url.endswith("/jobs")]
+        check("заказ ушёл один раз", len(post), 1)
+        _, kw = post[0]
+        return (kw.get("headers") or {}).get("Idempotency-Key", ""), kw.get("json") or {}
+
+    saved_call = pub_remote._call
+    saved_client = pub_services.RewriteClient
+    saved_text = pub_services.donor_text
+    pub_remote._call = fake_call
+    pub_services.RewriteClient = pub_remote.RewriteClient
+    try:
+        donor = "Исходный текст донора. " * 40
+        key, body = order(donor)
+        sha = hashlib.sha256(donor.encode("utf-8")).hexdigest()
+        # Ровно то, что должно уйти: выпуск и отпечаток ЭТОГО заказа с ЭТИМ донором.
+        check("в заголовке выпуск и отпечаток заказа",
+              key, f"release:rel-1:{pub_remote._order_digest(body, sha)}")
+        check("отпечаток на месте, а не голый release:",
+              bool(re.fullmatch(r"release:rel-1:[0-9a-f]{32}", key)), True)
+
+        # Главное: отпечаток считается от СОДЕРЖИМОГО донора. Другой текст — другой
+        # ключ, иначе второй заказ упёрся бы в «тот же ключ, другое тело» навсегда.
+        other_key, _ = order(donor + " и ещё абзац")
+        check("другой донор — другой ключ", other_key != key, True)
+
+        # И обратно: новая загрузка того же текста даёт новый file_id (подделка сети
+        # нумерует их подряд), а ключ обязан остаться прежним — на нём и держится
+        # защита от второй оплаты после потерянного ответа на POST.
+        again_key, again_body = order(donor)
+        check("тот же донор — тот же ключ", again_key, key)
+        check("а file_id при этом был другой",
+              body["files"] != again_body["files"], True)
+    finally:
+        pub_remote._call = saved_call
+        pub_services.RewriteClient = saved_client
+        pub_services.donor_text = saved_text
 
 
 def main() -> int:
@@ -209,7 +295,9 @@ def main() -> int:
 
         print("\nКлюч повтора уходит вместе с заказом (перенос правки production 14.09)")
         # Если ответ на POST потерялся по дороге, тот же ключ вернёт ТУ ЖЕ задачу.
-        # Ключ — «release:<выпуск>», то есть один заказ на один выпуск.
+        # Здесь видно только то, что кабинет ПЕРЕДАЁТ клиенту: «release:<выпуск>».
+        # Отпечаток заказа к нему добавляет сам клиент, и то, что реально уходит в
+        # заголовок, проверяется ниже — настоящим `RewriteClient`, а не подделкой.
         check("ключ повтора привязан к выпуску",
               [k for k in FakeClient.keys if k], ["release:rel-1"] * len(
                   [k for k in FakeClient.keys if k]))
@@ -245,6 +333,8 @@ def main() -> int:
         check("деньги за пропавшую задачу считаются потраченными", call["status"], "ordered")
         check("и причина записана в журнал вызовов",
               "отсутствует" in (call["error"] or ""), True)
+
+        with_real_client()
     finally:
         pub_services.RewriteClient = saved_client
         pub_services.donor_text = saved_text

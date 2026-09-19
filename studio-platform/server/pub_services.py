@@ -294,8 +294,9 @@ class PubServices:
             # модель значило бы объявить новыми все строки, где пресет молчит, — а это
             # ровно те 146 оплаченных и не забранных текстов из разбора 18.09. Смена
             # модели В ПРЕСЕТЕ отпечаток меняет, как и меняла.
+            text_sha = hashlib.sha256(text.encode("utf-8")).hexdigest()
             fp = pub_calls.fingerprint(
-                text=hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                text=text_sha,
                 lang=lang, preset=rel["preset_rewrite"] or "",
                 model=(preset or {}).get("model") or "")
             decision = pub_calls.reserve(
@@ -349,7 +350,13 @@ class PubServices:
             try:
                 job_id = client.create_job(
                     file_id, lang, preset, channel_name=rel["ch_name"] or "",
-                    idempotency_key=f'release:{rel["release_id"]}', model=model)
+                    idempotency_key=f'release:{rel["release_id"]}', model=model,
+                    # Тот же хэш донора, что и в отпечатке платежа, но работает он на
+                    # другой вопрос. Отпечаток решает «за это уже платили?», ключ
+                    # повтора — «это тот же самый запрос?». Сосед с 18.09 сравнивает
+                    # ТЕЛО заказа, а `file_id` у него новый на каждую загрузку, поэтому
+                    # в ключ идёт содержимое, а не номер файла (pub_remote._order_digest).
+                    source_sha=text_sha)
             except Exception as exc:
                 # Заказа нет — денег нет: строку открываем заново, повтор безопасен.
                 pub_calls.mark_failed(c, decision["call_id"], str(exc)[:400],

@@ -18,6 +18,7 @@ Endpoints:
   POST   /api/v1/jobs/{id}/retry?full=false     — повторить (full=true → с нуля)
 """
 import json
+from job_idempotency import identity as create_identity, bind as bind_create, lookup as lookup_create, IdempotencyError, file_hash, snapshot_inputs
 import os
 import secrets
 import time
@@ -39,6 +40,8 @@ from rewrite_core import (
     get_allowed_openai_models,
     get_allowed_claude_models,
     get_allowed_codex_models,
+    codex_model_admission_error,
+    server_key_model_error,
     get_keys_config,
     get_server_openai_keys,
     get_server_claude_oauth_tokens,
@@ -442,6 +445,8 @@ def _job_to_detail(job: Job, request_base: str, include_log: bool = False) -> Di
         "progress_detail": getattr(job, "progress_detail", ""),
         "progress_by_lang": _progress_by_lang(job),
         "error": getattr(job, "error", "") or "",
+        # FIX-2026-09-13-length: успешная задача, но текст короче исходника / цели.
+        "warning": getattr(job, "warning", "") or "",
         "model": getattr(job, "model", ""),
         "preserve_paragraphs": bool(getattr(job, "rewrite_preserve_paragraphs", False)),
         "languages": lang_codes,
@@ -480,7 +485,10 @@ def build_api_router(
         user_id = job.user_id or ADMIN_USER_ID
         if user_is_active is not None and not user_is_active(user_id):
             raise HTTPException(status_code=403, detail="account is disabled")
-        job_id = queue.add_job(job)
+        try:
+            job_id = queue.add_job(job)
+        except IdempotencyError as exc:
+            raise HTTPException(exc.status, str(exc)) from exc
         if user_is_active is not None and not user_is_active(user_id):
             queue.cancel_jobs_for_user(user_id)
             raise HTTPException(status_code=403, detail="account is disabled")
@@ -545,12 +553,10 @@ def build_api_router(
         return presets_provider(_api_user_id(user))
 
     # ----- 0.3 GET /models -----
-    # ДОБАВЛЕНО 19.09.2026. Это ШЕСТАЯ наша правка в форке рерайта: в задаче B7
-    # перечислены четыре (SSO, ADMIN_USER_ID, SESSION_DB, /presets), пятая — соседняя
-    # правка этого же захода. При ребейзе 31.08 → 18.09 её надо наложить ЗАНОВО:
-    # в бою список моделей отдаёт только сессионный `GET /models`
-    # (live_2026-09-18/код/рерайт/server.py:2283), по ключу такой ручки нет ни в форке,
-    # ни в бою, и ребейз её НЕ принесёт.
+    # ДОБАВЛЕНО 19.09.2026, НАЛОЖЕНО ЗАНОВО при ребейзе 31.08 → 18.09 (задача B7).
+    # В бою список моделей отдаёт только сессионный `GET /models`
+    # (live_2026-09-18/код/рерайт/server.py:2283); по api-ключу такой ручки нет ни в
+    # бою, ни в архиве, поэтому ребейз её не принёс и не принесёт.
     #
     # Зачем она кабинету. В теле заказа рерайта у кабинета стоял зашитый
     # `gpt-4.1-nano`; с 17.09 рерайт на серверном ключе отвечает на него 422. Имя
@@ -615,12 +621,12 @@ def build_api_router(
             # в пресете кабинет честно откажет словами «выберите модель в пресете»
             # вместо того, чтобы заказать наугад.
             #
-            # ВНИМАНИЕ при ребейзе B7: литерал обязан совпадать с запасным значением
-            # в `server._resolve_studio_model`. В форке 31.08 это `codex:gpt-5.4`,
-            # в бою 18.09 — `codex:gpt-5.6-terra`. Разойдутся — ручка пометит одну
-            # модель, а сервер закажет другую.
+            # ЗАПАСНОЕ ЗНАЧЕНИЕ обязано совпадать с `server._resolve_studio_model`
+            # (live server.py:398 и :2322). При ребейзе 19.09 оно поехало с
+            # `codex:gpt-5.4` (форк 31.08) на `codex:gpt-5.6-terra` (бой 18.09) —
+            # разойдутся, и ручка пометит одну модель, а сервер закажет другую.
             preferred = os.environ.get(
-                "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.4"
+                "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-terra"
             ).strip()
             default_codex = (
                 preferred if preferred in codex_models else next(iter(codex_models), "")
@@ -632,15 +638,12 @@ def build_api_router(
                 shared.append(item)
         base = shared + base
         # Отсев моделей вне списка серверных ключей появился в бою 17.09
-        # (FIX-2026-09-17-server-models). В форке 31.08 функции ещё нет, поэтому импорт
-        # мягкий: без неё ручка работает как раньше, а после ребейза отсев включится
-        # сам и не придётся вспоминать про это место.
-        try:
-            from rewrite_core import server_key_model_error
-        except ImportError:
-            server_key_model_error = None
-        if server_key_model_error is not None:
-            base = [item for item in base if not server_key_model_error(item["value"], uid)]
+        # (FIX-2026-09-17-server-models). До ребейза импорт был мягким — в форке 31.08
+        # функции ещё не существовало. Ребейз её привёз, она импортируется модулем
+        # выше наравне с остальным rewrite_core, и мягкость стала бы маскировкой
+        # опечатки: отсев молча выключился бы, а кабинет получал бы 422 на моделях,
+        # которых ему показывать не следовало.
+        base = [item for item in base if not server_key_model_error(item["value"], uid)]
         if uid == ADMIN_USER_ID:
             for model in get_keys_config(uid).get("custom_models", []):
                 model = str(model).strip()
@@ -715,7 +718,7 @@ def build_api_router(
             422: {"model": ApiErrorEnvelope},
         },
     )
-    def create_job(body: ApiJobCreate, user: Dict = Depends(get_api_user)) -> ApiJobCreateResponse:
+    def create_job(body: ApiJobCreate, request: Request, user: Dict = Depends(get_api_user)) -> ApiJobCreateResponse:
         if body.webhook_url is not None:
             raise HTTPException(status_code=422, detail="webhook_url is reserved and not supported in v1 (planned for v1.1)")
         user_id = _api_user_id(user)
@@ -724,6 +727,15 @@ def build_api_router(
         if not resolved:
             raise HTTPException(status_code=400, detail=f"file_id '{file_id}' not found for this user")
 
+        # Uploaded IDs may differ after a lost upload ACK; content identifies the input.
+        frozen_inputs = snapshot_inputs(upload_dir/user_id, [str(resolved)])
+        fingerprint = body.model_dump()
+        fingerprint['files'] = [file_hash(upload_dir/user_id/frozen_inputs[0])]
+        intent = create_identity(request, fingerprint, 'api-rewrite')
+        existing = lookup_create(queue, user_id, intent)
+        if existing:
+            return ApiJobCreateResponse(job_id=existing.id, status=existing.status,
+                                        created_at=existing.created_at, languages_count=len(body.languages))
         user_output = output_dir / user_id
         user_output.mkdir(parents=True, exist_ok=True)
 
@@ -734,6 +746,10 @@ def build_api_router(
             raise HTTPException(
                 status_code=403, detail="provider is not enabled for this account"
             )
+        # FIX-2026-09-17-server-models: на серверных ключах — только модели из списка.
+        server_model_error = server_key_model_error(body.model, user_id)
+        if server_model_error:
+            raise HTTPException(status_code=422, detail=server_model_error)
         if model_is_claude:
             if body.model not in get_allowed_claude_models():
                 raise HTTPException(
@@ -815,7 +831,7 @@ def build_api_router(
             # Inner concurrency is fixed by the server; request value is legacy.
             max_threads=API_MAX_THREADS_PER_JOB,
             output_dir=str(user_output),
-            rewrite_files=json.dumps([str(resolved)], ensure_ascii=False),
+            rewrite_files=json.dumps(frozen_inputs, ensure_ascii=False),
             rewrite_languages=json.dumps(
                 [
                     {
@@ -839,11 +855,12 @@ def build_api_router(
             parallel=False,
             user_id=user_id,
         )
-        job_id = _add_for_active_user(job)
+        job_id = _add_for_active_user(bind_create(job, intent))
+        saved = queue.get_job(job_id)
         return ApiJobCreateResponse(
             job_id=job_id,
-            status=JobStatus.PENDING.value,
-            created_at=time.time(),
+            status=saved.status,
+            created_at=saved.created_at,
             languages_count=len(body.languages),
         )
 
@@ -890,7 +907,9 @@ def build_api_router(
         include_log: bool = Query(False, description="Include last 5KB of log"),
     ) -> Dict:
         user_id = _api_user_id(user)
-        job = queue.get_job(job_id)
+        # FIX-2026-09-13 (log-bloat): опросчики дёргают статус ~100 тыс. раз в сутки
+        # без include_log — лог задачи тогда из базы не читаем вовсе.
+        job = queue.get_job(job_id, include_log=include_log)
         if not job:
             raise HTTPException(status_code=404, detail="job not found")
         if not _job_belongs(job, user_id):
@@ -991,6 +1010,12 @@ def build_api_router(
             raise HTTPException(status_code=403, detail="access denied")
         if user_is_active is not None and not user_is_active(user_id):
             raise HTTPException(status_code=403, detail="account is disabled")
+        # FIX-2026-09-13-models: модель задачи могли убрать из списка — не ставим в очередь.
+        model_error = codex_model_admission_error(job.model) or server_key_model_error(
+            job.model, job.user_id or user_id
+        )
+        if model_error:
+            raise HTTPException(status_code=422, detail=model_error)
         cleared = 0
         if full:
             from rewrite_core import PROGRESS_MANAGER, make_output_filename

@@ -6,6 +6,15 @@
 не только «переехало», но и то, что перенос **обратим** и что он останавливается там,
 где мог бы затереть чужое.
 
+19.09.2026, ребейз рерайта на боевой 18.09. Вместе с боем в `job_queue.db` приезжает
+таблица `create_intents(user_id, scope, key_hash, payload_hash, job_id)` — ключи
+повтора создания задачи. Перенос личности её не знал и переписывал `user_id` только
+в `jobs`/`fair_queue_*`. Тихая двойная оплата: у задач владелец новый, у ключей —
+старый, `lookup_create` под новым id не находит ничего, и тот же `Idempotency-Key`
+создаёт ВТОРУЮ ОПЛАЧЕННУЮ задачу. Снаружи это выглядит как обычный повтор, никто
+ничего не замечает. Проверяется и перенос, и откат: ключ обязан ходить вместе
+с задачей, на которую он указывает, в обе стороны.
+
     .venv/bin/python tests/test_identity.py
 """
 from __future__ import annotations
@@ -65,6 +74,14 @@ def make_world(root, cabinet=(("dev", 1, "1"),),
             q.execute("INSERT INTO jobs(id,user_id,data) VALUES(?,?,?)",
                       (f"{uid}-job", uid,
                        json.dumps({"output_dir": f"/srv/{svc_dir}/outputs/{uid}/x"})))
+            # Ключи повтора есть только у рерайта: таблица приехала с ребейзом 18.09.
+            # Строку кладём ровно там, где сервис её объявил, — так фикстура остаётся
+            # снимком настоящей схемы, а не общим знаменателем двух соседей.
+            if "create_intents" in queue_cols:
+                q.execute("INSERT INTO create_intents(user_id,scope,key_hash,"
+                          "payload_hash,job_id) VALUES(?,?,?,?,?)",
+                          (uid, "api-rewrite", f"key-{uid}", f"payload-{uid}",
+                           f"{uid}-job"))
         q.commit(); q.close()
         for login, uid in users:
             for d in ("presets", "outputs", "uploads"):
@@ -77,7 +94,11 @@ def make_world(root, cabinet=(("dev", 1, "1"),),
           "CREATE TABLE user_keys(user_id TEXT PRIMARY KEY);",
           "CREATE TABLE jobs(id TEXT PRIMARY KEY, user_id TEXT, data TEXT);"
           "CREATE TABLE fair_queue_users(provider TEXT, user_id TEXT);"
-          "CREATE TABLE fair_queue_state(provider TEXT, last_user_id TEXT);")
+          "CREATE TABLE fair_queue_state(provider TEXT, last_user_id TEXT);"
+          # Схема слово в слово из боевого job_queue.py:201 (ребейз 18.09).
+          "CREATE TABLE create_intents(user_id TEXT NOT NULL, scope TEXT NOT NULL, "
+          "key_hash TEXT NOT NULL, payload_hash TEXT NOT NULL, job_id TEXT NOT NULL, "
+          "PRIMARY KEY(user_id,scope,key_hash));")
     build("cover", "cover_sessions.db", "cover_job_queue.db", cover, "",
           "CREATE TABLE jobs(id TEXT PRIMARY KEY, user_id TEXT, data TEXT);"
           "CREATE TABLE api_keys(key_id TEXT PRIMARY KEY, user_id TEXT);")
@@ -108,7 +129,10 @@ def main() -> int:
         print("\nПодсчёт до переноса")
         rw = [s for s in I.services(root) if s.name == "rewrite"][0]
         c = I.count(rw, "aaaaaaaaaaaa")
-        check("строки посчитаны", sum(c["rows"].values()), 5)  # users + 3 сессии + задача
+        # users + 3 сессии + задача + ключ повтора
+        check("строки посчитаны", sum(c["rows"].values()), 6)
+        check("ключ повтора попал в подсчёт",
+              c["rows"].get("job_queue.db:create_intents.user_id"), 1)
         check("каталоги найдены", len(c["dirs"]), 3)
         check("путь в задаче замечен", c["json"], 1)
 
@@ -125,6 +149,20 @@ def main() -> int:
         check("задача переехала",
               q(os.path.join(root, "cover", "cover_job_queue.db"),
                 "SELECT COUNT(*) FROM jobs WHERE user_id='1'"), 1)
+        # Без этой строки перенос молча раздваивает оплату: задача под новым id,
+        # ключ повтора — под старым, и следующий тот же Idempotency-Key оплачивается
+        # заново. Проверяем и то, что под старым id не осталось НИЧЕГО: половинчатый
+        # перенос выглядел бы снаружи точно так же, как удачный.
+        check("ключ повтора переехал за задачей",
+              q(os.path.join(root, "rewrite", "job_queue.db"),
+                "SELECT COUNT(*) FROM create_intents WHERE user_id='1'"), 1)
+        check("под старым id ключей не осталось",
+              q(os.path.join(root, "rewrite", "job_queue.db"),
+                "SELECT COUNT(*) FROM create_intents WHERE user_id='aaaaaaaaaaaa'"), 0)
+        check("ключ по-прежнему указывает на ту же задачу",
+              q(os.path.join(root, "rewrite", "job_queue.db"),
+                "SELECT job_id FROM create_intents WHERE user_id='1'"),
+              "aaaaaaaaaaaa-job")
         check("каталог переименован",
               os.path.isdir(os.path.join(root, "rewrite", "presets", "1")), True)
         check("старого каталога нет",
@@ -160,6 +198,11 @@ def main() -> int:
         check("путь в задаче вернулся",
               "bbbbbbbbbbbb" in q(os.path.join(root, "cover", "cover_job_queue.db"),
                                   "SELECT data FROM jobs LIMIT 1"), True)
+        # Откат обязан быть полным по тем же причинам: ключ, оставшийся под новым id
+        # после возврата задач, — это та же двойная оплата, только с другой стороны.
+        check("ключ повтора вернулся",
+              q(os.path.join(root, "rewrite", "job_queue.db"),
+                "SELECT COUNT(*) FROM create_intents WHERE user_id='aaaaaaaaaaaa'"), 1)
         check("журнал опустел",
               json.load(open(I.journal_path(root), encoding="utf-8")), [])
         shutil.rmtree(root)

@@ -321,10 +321,6 @@
         <span>Нет активности — сессия будет продлена автоматически при любом действии. Данные форм сохранены.</span>
         <button onclick="renewSession()" class="btn-warn btn-sm">Продлить сейчас</button>
       </div>
-      <div id="provider-notice" role="status">
-        <span>⚠</span>
-        <span>Claude сейчас временно не работает. Для рерайта и генерации выбирайте <strong>любой GPT</strong> — GPT работает.</span>
-      </div>
       <header class="header-bar">
         <div class="flex items-center gap-2">
           <span class="text-sm font-semibold text-muted">Многотенантный рерайт и генерация</span>
@@ -623,6 +619,11 @@
         </div>
       </div>
 
+      <div class="card space-y-3">
+        <div class="card-title">Источник ключей</div>
+        <label class="flex items-center gap-2"><input id="set-own-only" type="checkbox" onchange="saveCredentialMode()"> Только мои ключи и подписки</label>
+        <p class="text-xs text-faint">В этом режиме отсутствие или лимит личного ключа не переключает задачу на серверный. До 100 ключей или подписок каждого типа; общая параллельность ограничена сервером.</p>
+      </div>
       <!-- Claude: свой токен (доступно всем) + статус серверного pool.
            BYOK-2026-07-30: значения (ни свои, ни серверные) в браузер не отдаются. -->
       <div class="card space-y-3">
@@ -633,7 +634,7 @@
         <p id="claude-own-status" class="text-xs text-faint">Свой токен: проверяю…</p>
         <div class="flex gap-2">
           <input id="set-own-claude-token" type="password" class="input flex-1" autocomplete="off"
-                 placeholder="Свой Claude OAuth-токен (оставьте пустым — будет серверный)">
+                 placeholder="Claude OAuth-токены через запятую">
           <button onclick="saveOwnCredential('claude')" class="btn btn-primary btn-sm">Сохранить</button>
           <button onclick="clearOwnCredential('claude')" class="btn btn-ghost btn-sm">Удалить свой</button>
         </div>
@@ -651,7 +652,7 @@
         <p id="anthropic-own-status" class="text-xs text-faint">Свой ключ: проверяю…</p>
         <div class="flex gap-2">
           <input id="set-own-anthropic-key" type="password" class="input flex-1" autocomplete="off"
-                 placeholder="Свой Anthropic API-ключ (альтернатива OAuth-подписке)">
+                 placeholder="Anthropic API-ключи через запятую">
           <button onclick="saveOwnCredential('anthropic')" class="btn btn-primary btn-sm">Сохранить</button>
           <button onclick="clearOwnCredential('anthropic')" class="btn btn-ghost btn-sm">Удалить свой</button>
         </div>
@@ -666,7 +667,7 @@
         <p id="codex-server-status" class="text-xs text-faint">Проверяю серверную подписку…</p>
         <p id="codex-own-status" class="text-xs text-faint">Своя подписка: проверяю…</p>
         <textarea id="set-own-codex-auth" rows="3" class="input w-full" autocomplete="off"
-                  placeholder='Содержимое своего ~/.codex/auth.json (JSON-объект)'></textarea>
+                  placeholder='auth.json: один JSON-объект или JSON-массив личных подписок'></textarea>
         <div class="flex gap-2">
           <button onclick="saveOwnCredential('codex')" class="btn btn-primary btn-sm">Сохранить</button>
           <button onclick="clearOwnCredential('codex')" class="btn btn-ghost btn-sm">Удалить свою</button>
@@ -684,7 +685,7 @@
         <p id="openai-own-status" class="text-xs text-faint">Свой ключ: проверяю…</p>
         <div class="flex gap-2">
           <input id="set-own-openai-key" type="password" class="input flex-1" autocomplete="off"
-                 placeholder="Свой OpenAI API-ключ (оставьте пустым — будет серверный)">
+                 placeholder="OpenAI API-ключи через запятую">
           <button onclick="saveOwnCredential('openai')" class="btn btn-primary btn-sm">Сохранить</button>
           <button onclick="clearOwnCredential('openai')" class="btn btn-ghost btn-sm">Удалить свой</button>
         </div>
@@ -883,13 +884,81 @@ function toast(msg, kind) {
 function confirmAction(msg) { return window.confirm(msg); }
 
 // ==================== API ====================
+const pendingCreateRequests = new Map();
+const removedJobIds = new Set();
+const pendingLogRequests = new Map();
+
+function canonicalIntent(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonicalIntent).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + canonicalIntent(value[k])).join(',') + '}';
+  return JSON.stringify(value);
+}
+function withIntentLock(name, action) {
+  return navigator.locks ? navigator.locks.request(name, action) : Promise.resolve().then(action);
+}
+function readIntents(storageKey) {
+  const raw = localStorage.getItem(storageKey);
+  if (!raw) return [];
+  const records = JSON.parse(raw);
+  if (!Array.isArray(records) || records.some(r => !r || typeof r.body !== 'string' || typeof r.key !== 'string')) throw new Error('Повреждено хранилище неподтверждённых отправок; отправка остановлена');
+  return records;
+}
+async function requestJson(url, options, headers) {
+  // Префикс ставится ЗДЕСЬ и только здесь: это единственный сетевой вызов, общий
+  // для apiFetch и durableCreate. Ключ повтора в durableCreate намеренно строится
+  // из непрефиксованного url — иначе тот же заказ, открытый по /rewrite/… и
+  // напрямую, получил бы два разных ключа и оплатился бы дважды.
+  const resp = await fetch(API + url, { ...options, headers });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    const error = new Error(resp.status === 401 ? 'Сессия истекла' : data.error || data.detail || `HTTP ${resp.status}`);
+    error.status = resp.status;
+    if (resp.status === 401) showLoginScreen();
+    throw error;
+  }
+  return resp.json();
+}
+async function durableCreate(url, options, headers, owner, body) {
+  // Keep unresolved requests across reload and login changes. Never evict an
+  // uncertain request: retrying it must use the same key before another POST.
+  const storageKey = 'rewrite.pending-create.v1:' + encodeURIComponent(owner) + ':' + url;
+  const intent = await withIntentLock(storageKey, () => {
+    const records = readIntents(storageKey);
+    const previous = records.find(r => r.body === body);
+    if (previous) return previous;
+    if (records.length >= 100) throw new Error('Слишком много неподтверждённых отправок. Сначала повторите их и проверьте очередь');
+    const bytes = new Uint8Array(16); crypto.getRandomValues(bytes);
+    const next = { body, key: Array.from(bytes, n => n.toString(16).padStart(2, '0')).join('') };
+    records.push(next);
+    try { localStorage.setItem(storageKey, JSON.stringify(records)); }
+    catch (_) { throw new Error('Не удалось сохранить идентификатор отправки. Освободите хранилище браузера и повторите'); }
+    return next;
+  });
+  const result = await requestJson(url, options, { ...headers, 'Idempotency-Key': intent.key });
+  // Only a confirmed successful response retires the intent. 5xx/network/JSON
+  // errors leave it intact, including when the server already created the job.
+  await withIntentLock(storageKey, () => {
+    const records = readIntents(storageKey).filter(r => r.key !== intent.key);
+    if (records.length) localStorage.setItem(storageKey, JSON.stringify(records));
+    else localStorage.removeItem(storageKey);
+  });
+  return result;
+}
 async function apiFetch(url, options = {}) {
   const headers = { 'Content-Type': 'application/json', 'X-Session-Id': SESSION_ID, ...(options.headers || {}) };
-  if (options.body instanceof FormData) { delete headers['Content-Type']; }
-  const resp = await fetch(API + url, { ...options, headers });
-  if (resp.status === 401) { showLoginScreen(); throw new Error('Сессия истекла'); }
-  if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || err.detail || `HTTP ${resp.status}`); }
-  return resp.json();
+  if (options.body instanceof FormData) delete headers['Content-Type'];
+  if (String(options.method || 'GET').toUpperCase() === 'POST' && ['/jobs/rewrite', '/jobs/generation'].includes(url)) {
+    const owner = USER_ID;
+    if (!owner) throw new Error('Войдите в аккаунт перед отправкой задачи');
+    const body = canonicalIntent(JSON.parse(options.body || '{}'));
+    const requestKey = owner + '\0' + url + '\0' + body;
+    if (pendingCreateRequests.has(requestKey)) return pendingCreateRequests.get(requestKey);
+    const promise = durableCreate(url, options, headers, owner, body);
+    pendingCreateRequests.set(requestKey, promise);
+    try { return await promise; }
+    finally { if (pendingCreateRequests.get(requestKey) === promise) pendingCreateRequests.delete(requestKey); }
+  }
+  return requestJson(url, options, headers);
 }
 
 // ==================== AUTH ====================
@@ -1137,10 +1206,22 @@ function isAvailableCodexModel(model) {
   return isCodexModel(selected) && allModels.some(m => m.value === selected);
 }
 
+// FIX-2026-09-17-server-models: /models отдаёт только то, что аккаунту реально можно
+// запустить (ключ + список сервера). Явно выбранная доступная модель — любой провайдер —
+// сохраняется; на Codex переводим только недоступный/старый выбор.
+function isAvailableModel(model) {
+  const selected = String(model || '').trim();
+  return !!selected && allModels.some(m => m.value === selected);
+}
+
 function getAvailableCodexModel() {
-  const found = allModels.find(m =>
+  // FIX-2026-09-13: модель по умолчанию назначает сервер — /models помечает её
+  // default=true (REWRITE_STUDIO_CODEX_MODEL). Раньше бралась первая Codex-модель
+  // по алфавиту, и 13.09 это была снятая OpenAI gpt-5.4-mini. Без пометки — как раньше.
+  const codex = allModels.filter(m =>
     m && typeof m.value === 'string' && isCodexModel(m.value)
   );
+  const found = codex.find(m => m.default === true) || codex[0];
   return found ? found.value : '';
 }
 
@@ -1150,7 +1231,7 @@ function migrateTabModelToCodex(storageKey, codexModel) {
     if (!raw) return;
     const value = JSON.parse(raw);
     if (!value || typeof value !== 'object') return;
-    if (!isAvailableCodexModel(value.model)) {
+    if (!isAvailableModel(value.model)) {
       value.model = codexModel;
       localStorage.setItem(storageKey, JSON.stringify(value));
     }
@@ -1166,7 +1247,7 @@ function getAutomaticDefaultModel() {
   // Пока Codex доступен, любой старый API/Claude/пустой дефолт переводим на
   // него при каждой загрузке. Конкретную явно выбранную Codex-модель сохраняем.
   const savedDefault = localStorage.getItem('default_model');
-  if (!isAvailableCodexModel(savedDefault)) {
+  if (!isAvailableModel(savedDefault)) {
     localStorage.setItem('default_model', codexModel);
   }
   migrateTabModelToCodex('gen_tab_settings', codexModel);
@@ -1177,7 +1258,7 @@ function getAutomaticDefaultModel() {
 function requireCodexModelForSubmit(selectId) {
   const sel = document.getElementById(selectId);
   const selected = String((sel && sel.value) || '').trim();
-  if (isAvailableCodexModel(selected)) return selected;
+  if (isAvailableModel(selected)) return selected;
 
   // Если Codex доступен — он всегда выигрывает у API/Claude/stale выбора.
   // Если его у аккаунта нет, не ломаем BYOK: сохраняем доступную выбранную
@@ -1999,19 +2080,9 @@ async function pollQueue() {
     const jobs = await apiFetch('/jobs');
     renderJobsTable(jobs);
     if (selectedJobId) {
-      // PATCH-2026-06-18-poll-seljob-log: лог тянем только для выбранной задачи (/jobs/{id}); список без логов.
-      const job = jobs.find(j => j.id === selectedJobId);
-      if (job) {
-        try {
-          const full = await apiFetch('/jobs/' + encodeURIComponent(selectedJobId));
-          const logEl = document.getElementById('job-log-' + selectedJobId);
-          if (logEl) {
-            const _atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
-            logEl.textContent = full.log || '(ожидание лога...)';
-            if (_atBottom) logEl.scrollTop = logEl.scrollHeight;
-          }
-        } catch (e) {}
-      }
+      const id = selectedJobId;
+      if (jobs.some(j => j.id === id)) await loadJobLogInto(id);
+      else forgetRemovedJob(id);
     }
     const hasRunning = jobs.some(j => j.status === 'running');
     queueTimer = setTimeout(pollQueue, hasRunning ? 2000 : 10000);
@@ -2172,6 +2243,7 @@ let _lastJobsSnapshot = null;
 
 // РЕНДЕР ОЧЕРЕДИ: карточки задач с DIFF по data-job-id (не innerHTML всего контейнера).
 function renderJobsTable(jobs) {
+  jobs = jobs.filter(j => !removedJobIds.has(j.id));
   _lastJobsSnapshot = jobs;
   const cont = document.getElementById('jobs-container');
   const empty = document.getElementById('jobs-empty');
@@ -2182,6 +2254,7 @@ function renderJobsTable(jobs) {
   const live = new Set(jobs.map(j => j.id));
   selectedJobIds.forEach(id => { if (!live.has(id)) selectedJobIds.delete(id); });
   expandedJobIds.forEach(id => { if (!live.has(id)) expandedJobIds.delete(id); });
+  if (selectedJobId && !live.has(selectedJobId)) selectedJobId = null;
 
   const filtered = jobs.filter(j => jobMatchesFilter(j, queueFilter));
   if (!jobs.length) { cont.innerHTML = ''; if (empty) empty.classList.remove('hidden'); updateDlSelectedBtn(); return; }
@@ -2230,6 +2303,11 @@ function updateJobCard(card, j) {
     const acts = spec.actions.map(([label, code]) =>
       `<button class="${label.includes('Удал') ? 'btn-err' : 'btn-ghost btn-sm'}" onclick="${code}">${escHtml(label)}</button>`).join('');
     errStripHtml = `<div class="err-strip ${spec.warn ? 'warn' : ''}"><b>${escHtml(spec.title)}</b><p>${escHtml(spec.hint)}</p><div class="strip-actions">${acts}</div></div>`;
+  }
+  // FIX-2026-09-13-length: задача успешна, но текст короче исходника / цели — жёлтая плашка
+  // (раньше это было видно, только если пересчитать слова руками).
+  if (!errStripHtml && j.warning) {
+    errStripHtml = `<div class="err-strip warn"><b>Текст получился короче ожидаемого</b><p>${escHtml(j.warning).replace(/\n/g, '<br>')}</p></div>`;
   }
 
   if (!card.dataset.built) {
@@ -2318,14 +2396,33 @@ function toggleJobExpand(id) {
   if (card) card.classList.toggle('expanded', expandedJobIds.has(id));
 }
 
+function forgetRemovedJob(id) {
+  removedJobIds.add(id);
+  expandedJobIds.delete(id); selectedJobIds.delete(id);
+  if (selectedJobId === id) selectedJobId = null;
+  const card = document.querySelector('.job-card[data-job-id="' + id + '"]');
+  if (card) card.remove();
+  if (_lastJobsSnapshot) _lastJobsSnapshot = _lastJobsSnapshot.filter(j => j.id !== id);
+  updateDlSelectedBtn();
+}
 async function loadJobLogInto(id) {
+  if (removedJobIds.has(id)) return;
+  if (pendingLogRequests.has(id)) return pendingLogRequests.get(id);
   const logEl = document.getElementById('job-log-' + id);
   if (!logEl) return;
-  try {
-    const job = await apiFetch('/jobs/' + encodeURIComponent(id));
-    logEl.textContent = job.log || '(нет лога)';
-    logEl.scrollTop = logEl.scrollHeight;
-  } catch (e) { logEl.textContent = '(ошибка загрузки лога)'; }
+  const pending = (async () => {
+    try {
+      const job = await apiFetch('/jobs/' + encodeURIComponent(id));
+      const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+      logEl.textContent = job.log || '(нет лога)';
+      if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+    } catch (e) {
+      if (e.status === 404 || e.status === 410) forgetRemovedJob(id);
+      else logEl.textContent = '(ошибка загрузки лога)';
+    }
+  })();
+  pendingLogRequests.set(id, pending);
+  try { await pending; } finally { pendingLogRequests.delete(id); }
 }
 
 // ---- per-job actions (id-based; вызываются из карточек) ----
@@ -2385,11 +2482,14 @@ async function retryAllUnfinished() {
   const RETRYABLE = ['failed', 'partial', 'cancelled', 'interrupted'];
   const targets = _lastJobsSnapshot.filter(j => selectedJobIds.has(j.id) && RETRYABLE.includes(j.status));
   if (!targets.length) { toast('Среди выбранных нет незавершённых задач', 'warn'); return; }
-  let ok = 0;
+  let ok = 0, firstError = '';
   for (const j of targets) {
-    try { await apiFetch(`/jobs/${j.id}/retry`, { method: 'POST' }); ok++; } catch (e) {}
+    try { await apiFetch(`/jobs/${j.id}/retry`, { method: 'POST' }); ok++; }
+    catch (e) { if (!firstError) firstError = (e && (e.detail || e.message)) || String(e); }
   }
-  toast(`Повтор запущен для ${ok} задач`, 'ok');
+  // Отказ сервера (например, «модель недоступна» 422) не должен превращаться в зелёное «0 задач».
+  if (ok === targets.length) toast(`Повтор запущен для ${ok} задач`, 'ok');
+  else toast(`Повтор запущен для ${ok} из ${targets.length}. ${firstError}`, ok ? 'warn' : 'err');
 }
 
 function downloadAllCompleted() {
@@ -2452,14 +2552,31 @@ function renderOwnCredentialStatus(provider, isSet, source) {
 // Все виды credential рисуются из ОДНОГО ответа /settings/keys — значений там нет,
 // только признаки «задан» и источник (user/server/none).
 function renderAllOwnCredentialStatuses(cfg) {
+  const mode = document.getElementById('set-own-only');
+  if (mode) { mode.checked = cfg.credential_mode === 'own_only'; mode.disabled = !!cfg.credential_mode_forced; }
+
   renderOwnCredentialStatus('openai', cfg.own_openai_key_set, cfg.openai_key_source);
   renderOwnCredentialStatus('claude', cfg.own_claude_token_set, cfg.claude_key_source);
   renderOwnCredentialStatus('anthropic', cfg.own_anthropic_key_set, cfg.anthropic_key_source);
   renderOwnCredentialStatus('codex', cfg.own_codex_auth_set, cfg.codex_key_source);
+  for (const [provider, meta] of Object.entries(OWN_CREDENTIAL_FIELDS)) {
+    const el = document.getElementById(meta.status);
+    if (el) el.textContent += ' · своих: ' + ((cfg.own_credential_counts || {})[provider] || 0);
+  }
+}
+
+async function saveCredentialMode() {
+  try {
+    await apiFetch('/settings/keys', {method: 'POST', body: JSON.stringify({credential_mode: document.getElementById('set-own-only').checked ? 'own_only' : 'server_fallback'})});
+    renderAllOwnCredentialStatuses(await apiFetch('/settings/keys'));
+    allModels = await apiFetch('/models');
+    populateModelDropdowns();
+    toast('Источник ключей сохранён', 'ok');
+  } catch (e) { toast('Не сохранено: ' + e.message, 'err'); }
 }
 
 function _ownCredentialBody(provider, value) {
-  if (provider === 'claude') return { oauth_tokens: value ? [value] : [] };
+  if (provider === 'claude') return { oauth_tokens: value ? value.split(/[\r\n,]+/).map(v => v.trim()).filter(Boolean) : [] };
   if (provider === 'anthropic') return { anthropic_api_key: value };
   if (provider === 'codex') return { codex_auth: value };
   return { openai_api_key: value };
@@ -2492,7 +2609,7 @@ async function saveOwnCredential(provider) {
 async function clearOwnCredential(provider) {
   const meta = OWN_CREDENTIAL_FIELDS[provider];
   if (!meta) return;
-  if (!confirmAction('Удалить свой ключ? Задачи снова пойдут на серверный ключ (если он настроен).')) return;
+  if (!confirmAction('Удалить личные ключи этого типа? В режиме «Только мои» новые задачи без личного ключа не запустятся.')) return;
   try {
     await _postOwnCredential(provider, '');
     toast(meta.label + ' удалён', 'ok');

@@ -45,8 +45,15 @@ BASE = os.path.abspath(os.path.join(HERE, ".."))
 
 # Порядок важен: каталог пульта первым, чтобы его собственные модули не перекрывались
 # одноимёнными у соседей. Имена уже разведены, но правило дешевле надежды.
+#
+# `shared/` добавлен 19.09.2026 вместе с ребейзом рерайта на боевой 18.09. Боевой
+# `rewrite_core.py` импортирует `credential_budget` БЕЗ try и ищет его по
+# VIDEO_STUDIO_SHARED_DIR (в бою — /opt/video-studio-shared, каталога с таким именем
+# на нашей машине нет). Нет модуля — не поднимается ВСЯ платформа, а не только рерайт:
+# у нас один процесс. Поэтому каталог даётся здесь безусловно, а не надеждой на то,
+# что стенд подняли через dev/run.sh с выставленной переменной.
 for path in (HERE, os.path.join(BASE, "server"), os.path.join(BASE, "rewrite"),
-             os.path.join(BASE, "cover")):
+             os.path.join(BASE, "cover"), os.path.join(BASE, "shared")):
     if path not in sys.path:
         sys.path.append(path)
 
