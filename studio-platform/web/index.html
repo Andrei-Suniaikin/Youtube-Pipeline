@@ -4102,6 +4102,13 @@ function fieldForm(groups){
                <div class="langmap-rows"></div>
                <button type="button" class="ghost small langmap-add"${
                  locked ? ' disabled' : ''}>+ строка</button>
+               <!-- Шаблон Lumean заводится ПРЯМО ЗДЕСЬ (20.09.2026). Раньше карточка
+                    шаблонов жила только на экране списка пресетов: человек выбирал
+                    движок Lumean, искал, где создать голос, и не находил — id надо было
+                    принести с другого экрана. Кнопка появляется только у Lumean: у
+                    остальных движков в строке обычный id голоса, заводить нечего. -->
+               <button type="button" class="ghost small langmap-lum" hidden${
+                 locked ? ' disabled' : ''}>+ шаблон в Lumean</button>
              </div>`
           : f.kind === 'select'
           ? `<select id="${id}" data-key="${esc(f.key)}"${(f.off || locked) ? ' disabled' : ''}>
@@ -4209,6 +4216,8 @@ function wireLangMap(card, f, group, locked){
     // Кнопка проверки шаблона нужна только у Lumean: у остальных движков проверять
     // нечего — там обычный id голоса, а не ссылка на чужой шаблон.
     rows.querySelectorAll('.lm-check').forEach(b => { b.hidden = !lum; });
+    const lumBtn = box.querySelector('.langmap-lum');
+    if (lumBtn) lumBtn.hidden = !lum || locked;
     const texts = (f.by_engine || {})[lum ? 'lumean' : 'other'];
     if (!texts || !fld) return;
     const label = fld.querySelector('label');
@@ -4285,6 +4294,40 @@ function wireLangMap(card, f, group, locked){
 
   parseVoiceMapRows(f.value).forEach(([lang, voice]) => addRow(lang, voice));
   if (!locked) box.querySelector('.langmap-add').onclick = () => addRow('', '');
+  const lumBtn = box.querySelector('.langmap-lum');
+  // Начальное состояние ставим здесь, а не разметкой: `fieldForm` собирает её до того,
+  // как известен выбранный движок (значение читается из соседнего поля этой группы).
+  // Без этой строки кнопка появлялась только после того, как человек трогал «Движок».
+  if (lumBtn) lumBtn.hidden = !lumeanNow() || locked;
+  if (lumBtn && !locked) lumBtn.onclick = async () => {
+    // Поля формы шаблона отдаёт сервер: их список зависит от того, что принимает
+    // провайдер, и дублировать его здесь значило бы разойтись с ним при первой правке.
+    let lum;
+    try{ lum = await api('/ui/lumean/templates'); }
+    catch(e){ toast(e.message); return; }
+    if (!lum.ok){
+      toast(lum.why || 'Lumean не ответил');
+      return;
+    }
+    lumeanTemplateModal(null, lum.fields, {
+      // Экран НЕ перерисовываем: человек стоит в незаполненной форме пресета, и
+      // render() стёр бы всё, что он успел набрать.
+      reload: false,
+      onCreated: id => {
+        // Заведённый шаблон сразу становится строкой карты: id — это ровно то, что
+        // идёт в пресет, и переносить его руками больше не нужно.
+        const empty = [...rows.querySelectorAll('.langmap-row')].find(
+          r => !r.querySelector('.lm-voice').value.trim());
+        if (empty){
+          empty.querySelector('.lm-voice').value = id;
+        }else{
+          addRow('', id);
+        }
+        sync();
+        toast('Шаблон подставлен в карту голосов — выберите язык', 'ok');
+      },
+    });
+  };
   sync();
 }
 
@@ -4784,7 +4827,7 @@ function wirePresets(root){
 // Окно шаблона озвучки Lumean. Поля описывает сервер (те же имена, что у провайдера),
 // здесь только отрисовка. Создание возвращает id — показываем его и предлагаем
 // скопировать: именно он вписывается в карту «язык → шаблон» пресета.
-async function lumeanTemplateModal(id, fields){
+async function lumeanTemplateModal(id, fields, opts){
   const creating = !id;
   let d = {fields: fields || [], used_by: []};
   if (!creating){
@@ -4834,13 +4877,20 @@ async function lumeanTemplateModal(id, fields){
         close();
         // id нужен человеку сразу: именно он идёт в карту голосов пресета.
         toast(`Шаблон заведён, id: ${out.id}`, 'ok');
-        try{ await navigator.clipboard.writeText(out.id); }catch(e){}
+        if (opts && opts.onCreated) opts.onCreated(out.id);
+        // Копия id в буфер — удобство, а не часть дела, и ЖДАТЬ её нельзя: в браузере
+        // без фокуса (или когда доступ к буферу не разрешён) этот вызов не отвечает
+        // вовсе. Пока он стоял выше и под `await`, всё, что идёт следом, не выполнялось:
+        // заведённый шаблон не попадал в карту голосов, хотя у провайдера уже создан.
+        try{ navigator.clipboard.writeText(out.id).catch(() => {}); }catch(e){}
       }else{
         await post(`/ui/lumean/templates/${encodeURIComponent(id)}`, {values});
         close();
         toast('Шаблон обновлён у провайдера', 'ok');
       }
-      await render();
+      // Перерисовка нужна списку пресетов (там карточка шаблонов), но вредна форме
+      // пресета: она стёрла бы незаписанные правки. Зовущий решает сам.
+      if (!opts || opts.reload !== false) await render();
     }});
 }
 
