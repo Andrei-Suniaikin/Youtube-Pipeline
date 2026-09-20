@@ -1813,6 +1813,194 @@ function wireReleaseDrop(root){
   });
 }
 
+/* ── Пакетные карточки «Текст» и «Обложка» (20.09.2026) ─────────────────────────
+   Эти два вида — не задачи очереди кабинета, а СОСЕДНИЕ СЕРВИСЫ (Rewrite и Cover):
+   пульт ходит к ним сам, поэтому и пакет для них пультовый — POST
+   /ui/projects/batch/text и /ui/projects/batch/cover, а не кабинетный
+   /api/batch/{kind}. Отсюда и отдельная разметка: у кабинетных карточек поля общие
+   (из пресета), у этих — свои.
+
+   Компоновка следует из главного: источник берётся ИЗ ПРОЕКТА (ссылка донора
+   выпуска, а если донора нет — сценарий проекта). Значит обычный случай — отметить
+   проекты и нажать «Сделать», ничего не заполняя. Всё, что в карточке, —
+   необязательная ЗАМЕНА, и замена источника лежит в свёрнутом блоке: развёрнутое
+   поле человек читает как «надо заполнить», а заполнять тут нечего. */
+
+// Варианты полей (языки, модели, пресеты) спрашиваем у тех же ручек, что кормят
+// одиночные экраны текста и обложек, — второго списка тех же значений в пульте быть
+// не должно. Каждая из них ходит к соседу по 4–5 раз, а экран «Проекты» перерисовывает
+// себя сам после каждой пачки, поэтому спрашиваем ОДИН раз за загрузку страницы и
+// держим обещание. Отказ соседа карточку не ломает: пустое поле и так значит «как в
+// проекте», просто выбрать другое будет нельзя.
+let PULT_BATCH_OPTS = null;
+function pultBatchOptions(){
+  if (!PULT_BATCH_OPTS)
+    PULT_BATCH_OPTS = Promise.all([
+      api('/ui/text').catch(e => ({_err: e.message})),
+      api('/ui/covers').catch(e => ({_err: e.message})),
+    ]).then(([text, cover]) => ({text, cover}));
+  return PULT_BATCH_OPTS;
+}
+
+// «Пусто — как в проекте» написано у каждого поля обеих карточек: это не украшение,
+// а единственное место, где сказано, что произойдёт, если ничего не трогать. У списка
+// языков подпись стоит ОТДЕЛЬНОЙ строкой под чипами, а не внутри них: чипы заполняются
+// вариантами, и надпись внутри коробки исчезла бы ровно тогда, когда выбор появился.
+const PULT_LANGS_WAIT = '<span class="muted" style="font-size:12px">' +
+  'языки загружаются…</span>';
+const PULT_LANGS_HINT = '<div class="note muted" style="margin-top:6px">' +
+  'ничего не отмечено — уедет язык канала проекта</div>';
+
+function pultBatchCardHtml(kind, title){
+  const isText = kind === 'text';
+  // Подпись про источник честная: у текста по умолчанию уезжает ссылка донора, а
+  // сценарий проекта — только когда донора нет (или когда так выбрали ниже).
+  const about = isText
+    ? 'Источник — из проекта: ссылка донора выпуска, а если донора нет — сценарий проекта.'
+    : 'Источник — из проекта: превью донора выпуска.';
+  // Главное поле сверху, как у соседних карточек: у текста это языки (за язык и
+  // платят отдельно), у обложки — пресет.
+  const main = isText
+    ? `<label class="k" style="display:block;margin-top:4px">Языки</label>
+       <div class="langs" data-pf="languages">${PULT_LANGS_WAIT}</div>
+       ${PULT_LANGS_HINT}`
+    : `<select data-pf="preset" style="width:100%;margin-top:6px">
+         <option value="">Пресет обложки: как в проекте</option></select>`;
+  const more = isText
+    ? `<label class="k" style="display:block;margin-top:8px">Модель</label>
+       <select data-pf="model" style="width:100%;margin-top:4px">
+         <option value="">Модель: по умолчанию</option></select>`
+    : `<label class="k" style="display:block;margin-top:8px">Языки</label>
+       <div class="langs" data-pf="languages">${PULT_LANGS_WAIT}</div>
+       ${PULT_LANGS_HINT}
+       <label class="k" style="display:block;margin-top:8px">Чем рисовать</label>
+       <select data-pf="option" style="width:100%;margin-top:4px">
+         <option value="">Чем рисовать: по умолчанию</option></select>
+       <label class="muted" style="display:block;margin-top:8px;font-size:12px">
+         <input type="checkbox" data-pf="edit_preview"> дорисовать превью донора,
+         а не рисовать заново</label>`;
+  const swap = isText
+    ? `<label class="k" style="display:block;margin-top:8px">Что считать источником</label>
+       <select data-pf="source_from" style="width:100%;margin-top:4px">
+         <option value="auto">Как в проекте: донор, без донора — сценарий</option>
+         <option value="donor">Только ссылка донора</option>
+         <option value="text">Только сценарий проекта</option>
+       </select>
+       <input data-pf="source_url" style="width:100%;margin-top:8px"
+         placeholder="Другая ссылка — уедет всем отмеченным">
+       <textarea data-pf="source_text" style="width:100%;margin-top:8px;height:70px"
+         placeholder="Или текст — уедет одному отмеченному проекту"></textarea>
+       <label class="muted" style="display:block;margin-top:6px;font-size:12px">
+         или файлом .txt: <input type="file" data-pf="source_file"
+           accept=".txt,text/plain"></label>
+       <div class="note muted pult-one" style="margin-top:6px"></div>`
+    : `<input data-pf="reference_url" style="width:100%;margin-top:8px"
+         placeholder="Ссылка на референс — уедет всем отмеченным">
+       <div class="note muted" style="margin-top:6px">Пусто — у каждого проекта берётся
+         превью его донора. Заполнено — один и тот же референс уедет всем отмеченным,
+         и такие строки в отчёте помечены.</div>`;
+  return `<div data-pult="${kind}" style="flex:1 1 260px;min-width:260px;
+      border:1px solid var(--line);border-radius:10px;padding:12px">
+    <div style="font-weight:600;margin-bottom:8px">${esc(title)}</div>
+    <div class="note muted" style="margin:0 0 8px">${about}</div>
+    ${main}
+    <button class="small pgo" data-pult="${kind}" disabled
+      style="width:100%;margin-top:10px">Сделать</button>
+    <details style="margin-top:9px">
+      <summary class="muted" style="cursor:pointer;font-size:12px">Доп. настройки</summary>
+      ${more}
+      <label class="muted" style="display:block;margin-top:8px;font-size:12px">
+        <input type="checkbox" data-pf="one_at_a_time" checked> не ставить второй заказ,
+        пока по проекту идёт первый</label>
+    </details>
+    <details style="margin-top:6px">
+      <summary class="muted" style="cursor:pointer;font-size:12px">Взять другой источник</summary>
+      ${swap}
+    </details>
+  </div>`;
+}
+
+// Варианты подставляются ПОСЛЕ отрисовки и без ожидания: «Сделать» с пустыми полями
+// работает и до того, как соседи ответят, а если они не ответят вовсе — карточка
+// останется в режиме «как в проекте», и это сказано словами, а не пустым местом.
+async function pultBatchFill(batch){
+  const opts = await pultBatchOptions();
+  const chips = (box, list, err) => {
+    if (!box) return;
+    if (err){
+      box.innerHTML = `<span class="muted" style="font-size:12px">список языков не
+        загрузился (${esc(err)}) — уедет язык канала проекта</span>`;
+      return;
+    }
+    if (!list.length){
+      box.innerHTML = '<span class="muted" style="font-size:12px">список языков пуст — '
+                    + 'уедет язык канала проекта</span>';
+      return;
+    }
+    box.innerHTML = list.map(l => `<label data-code="${esc(l.code)}"><input
+      type="checkbox">${esc(l.title)}</label>`).join('');
+    box.querySelectorAll('label').forEach(l => {
+      const cb = l.querySelector('input');
+      cb.onchange = () => l.classList.toggle('on', cb.checked);
+    });
+  };
+  const fill = (sel, list) => {
+    if (!sel || !list.length) return;
+    sel.insertAdjacentHTML('beforeend', list.map(o =>
+      `<option value="${esc(o.value)}">${esc(o.title)}</option>`).join(''));
+  };
+  const t = opts.text || {}, c = opts.cover || {};
+  const tbox = batch.querySelector('[data-pult="text"]');
+  if (tbox){
+    chips(tbox.querySelector('[data-pf="languages"]'),
+          (t.languages || []).filter(l => l && l.code), t._err);
+    fill(tbox.querySelector('[data-pf="model"]'),
+         (t.models || []).map(m => ({value: m.value, title: m.label})));
+  }
+  const cbox = batch.querySelector('[data-pult="cover"]');
+  if (cbox){
+    // Cover ждёт ОТОБРАЖАЕМОЕ имя языка («Русский»), а не код: подставить сюда коды
+    // Rewrite значило бы отказ на каждой задаче. Поэтому значением чипа идёт имя.
+    chips(cbox.querySelector('[data-pf="languages"]'),
+          (c.languages || []).map(n => ({code: n, title: n})), c._err);
+    fill(cbox.querySelector('[data-pf="preset"]'),
+         (c.presets || []).map(p => ({value: p, title: p})));
+    fill(cbox.querySelector('[data-pf="option"]'),
+         (c.options || []).map(o => ({value: o.provider + '|' + o.model, title: o.label})));
+  }
+}
+
+// Как назвать строку отчёта. `order` — сухой прогон («уйдёт»), `ordered` — уже
+// поставлено: путать их нельзя, это разница между «посмотрели» и «заплатили».
+const PULT_ACT = {order: ['уйдёт', 's-queued'], ordered: ['поставлено', 's-done'],
+                  skip: ['пропуск', 's-idle'], error: ['ошибка', 's-error']};
+const PULT_SRC = {donor: 'ссылка донора', text: 'сценарий проекта',
+                  'replacement-url': 'ссылка из карточки',
+                  'replacement-text': 'вставленный текст'};
+
+// Строки по проектам. Отчёт пофайловый не из любви к подробностям: платят за каждый
+// проект отдельно, и «ок» без строк не отвечает на вопрос, за что ушли деньги.
+function pultBatchRows(out){
+  return (out.projects || []).map(p => {
+    const said = PULT_ACT[p.action] || [p.action, 's-idle'];
+    const langs = (p.languages || []).map(esc).join(', ');
+    const note = [langs && ('языки: ' + langs),
+                  p.source && esc(PULT_SRC[p.source] || p.source),
+                  p.source_note && esc(p.source_note)].filter(Boolean).join(' · ');
+    return `<div style="border-top:1px solid var(--line);padding:7px 0">
+      <span class="pill ${said[1]}">${esc(said[0])}</span> <b>${esc(p.name)}</b>
+      ${p.replaced ? '<span class="pill s-error">не свой источник</span>' : ''}
+      ${note ? `<div class="muted" style="font-size:12px">${note}</div>` : ''}
+      ${p.why ? `<div class="note ${p.action === 'error' ? 'bad' : 'muted'}"
+        style="margin:2px 0 0">${esc(p.why)}</div>` : ''}
+      ${(p.skipped_languages || []).map(s => `<div class="note muted"
+        style="margin:2px 0 0">${esc(s.code)}: ${esc(s.why)}</div>`).join('')}
+      ${p.repeat_checked === false ? `<div class="note muted" style="margin:2px 0 0">
+        повтор проверим при запуске: расшифровки донора ещё нет в кэше</div>` : ''}
+    </div>`;
+  }).join('');
+}
+
 // Поле карточки пакетного запуска: select — если у поля есть варианты (их даёт
 // `preset_fields`), иначе обычный ввод. Пустое значение всегда первое: «как в проекте».
 function fieldSelectHtml(kind, f){
@@ -1859,10 +2047,16 @@ async function viewProjects(){
   // Частичный прогон пачкой (18.09.2026): по кнопке на каждый этап, как было в
   // кабинете. «Сделать всё» осталось — теперь одним запросом на весь пакет, а не
   // отдельным на каждый проект.
-  let batchFields = {};
-  try{ batchFields = (await api('/ui/projects/batch/fields')).kinds || {}; }
-  catch(e){ toast(e.message); }
+  let batchFields = {}, batchPult = {};
+  try{
+    const bf = await api('/ui/projects/batch/fields');
+    batchFields = bf.kinds || {};
+    // Карточки текста и обложки рисуем только если сервер про них знает: на старом
+    // сервере экран останется прежним, а не обзаведётся кнопками в никуда.
+    batchPult = bf.pult || {};
+  }catch(e){ toast(e.message); }
   const BATCH_ORDER = ['tts', 'images', 'video', 'render'];
+  const PULT_ORDER = ['text', 'cover'].filter(k => batchPult[k] && batchPult[k].post);
   const batch = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Запуск для отмеченных
       <span class="muted" id="batchn" style="float:right;font-weight:400;
@@ -1886,6 +2080,7 @@ async function viewProjects(){
               ${extra.map(f => fieldSelectHtml(kind, f)).join('')}</details>` : ''}
           </div>`;
         }).join('')}
+        ${PULT_ORDER.map(k => pultBatchCardHtml(k, batchPult[k].title || k)).join('')}
       </div>
       <button id="batchgo" class="small" disabled
         style="width:100%;margin-top:14px">Сделать всё для отмеченных</button>
@@ -1894,7 +2089,11 @@ async function viewProjects(){
       <div class="note muted" style="margin-top:10px">Пустое поле — «как в проекте»:
         настройки проекта не перетираются. Видео и рендер у неготовых проектов ставятся
         отложенно — стартуют сами, когда материалы дозреют. «Отменить» снимает и уже
-        идущие задачи, и отложенный авто-запуск; готовые файлы не удаляются.</div>
+        идущие задачи, и отложенный авто-запуск; готовые файлы не удаляются.${
+        PULT_ORDER.length ? ` Текст и обложку делают соседние сервисы: у них своя
+        очередь, поэтому «Отменить» для них здесь нет — начатый заказ виден на
+        экранах «Текст» и «Обложки».` : ''}</div>
+      <div id="pultres" style="margin-top:12px"></div>
     </div></div>`);
   app.append(batch);
   const card = $(`<div class="card"><table>
@@ -1944,11 +2143,16 @@ async function viewProjects(){
   const goBtn = batch.querySelector('#batchgo');
   const countEl = batch.querySelector('#batchn');
   const picks = () => [...card.querySelectorAll('input.pick:checked')].map(cb => cb.dataset.id);
+  // Подпись под полем текста ставится ниже, когда пультовые карточки нарисованы.
+  // Через переменную, а не прямым вызовом: счётчик объявлен раньше карточек, и
+  // ссылаться на ещё не созданное значило бы падать на первой же галочке.
+  let pultNote = () => {};
   const refreshCount = () => {
     const n = picks().length;
     countEl.textContent = `отмечено: ${n}`;
-    batch.querySelectorAll('button.bgo, button.bcancel, #batchgo')
+    batch.querySelectorAll('button.bgo, button.bcancel, button.pgo, #batchgo')
       .forEach(b => b.disabled = n === 0);
+    pultNote();
   };
   card.querySelectorAll('input.pick').forEach(cb => cb.onchange = refreshCount);
   card.querySelector('#pickall').onchange = (e) => {
@@ -1997,6 +2201,151 @@ async function viewProjects(){
         finally{ b.disabled = false; setTimeout(() => viewProjects(), 1200); }
       });
   });
+  // ── Текст и обложка: сухой прогон → подтверждение → деньги ──────────────────
+  // Отдельно от кнопок кабинета намеренно. Там ставится задача в очередь, и повтор
+  // ловит сам кабинет; здесь уходит ПЛАТНЫЙ вызов соседу, и уходит сразу на пачку
+  // проектов — цена ошибки умножается на число галочек. Поэтому сначала тот же
+  // запрос с dry_run, где сервер считает, кому и что уйдёт, и только после
+  // подтверждения — настоящий.
+  const pultBox = kind => batch.querySelector(`[data-pult="${kind}"]`);
+  const pultValues = kind => {
+    const box = pultBox(kind);
+    const val = k => { const el = box.querySelector(`[data-pf="${k}"]`);
+                       return el ? String(el.value || '').trim() : ''; };
+    const flag = k => { const el = box.querySelector(`[data-pf="${k}"]`);
+                        return !!(el && el.checked); };
+    const langs = [...box.querySelectorAll('[data-pf="languages"] label')]
+      .filter(l => l.querySelector('input').checked).map(l => l.dataset.code);
+    if (kind === 'text'){
+      const area = box.querySelector('[data-pf="source_text"]');
+      return {languages: langs, model: val('model'),
+              source_from: val('source_from') || 'auto',
+              source_url: val('source_url'),
+              source_text: area ? area.value : '',
+              one_at_a_time: flag('one_at_a_time')};
+    }
+    // Провайдер и модель обложки — одна пара в одном списке (так их проверяет сам
+    // Cover), поэтому в значении они склеены и здесь разбираются обратно.
+    const pair = val('option');
+    const cut = pair.indexOf('|');
+    return {languages: langs, preset: val('preset'),
+            provider: cut < 0 ? '' : pair.slice(0, cut),
+            model: cut < 0 ? '' : pair.slice(cut + 1),
+            reference_url: val('reference_url'),
+            edit_preview: flag('edit_preview'),
+            one_at_a_time: flag('one_at_a_time')};
+  };
+  // То, что сервер отвергнет, говорим ДО нажатия: отказ, прилетевший после клика по
+  // платной кнопке, читается как «сломалось», а не как «я сам так выбрал».
+  const pultRefusal = (kind, body, n) => {
+    if (kind !== 'text') return '';
+    if (body.source_url && body.source_text.trim())
+      return 'Замена источника одна: либо ссылка, либо текст. Денег не потрачено — '
+           + 'запрос не уходил. Уберите одно из двух и нажмите «Сделать».';
+    if (body.source_text.trim() && n > 1)
+      return `Вставленный текст (или файл) уходит одному проекту, а отмечено ${n}. `
+           + 'Денег не потрачено — запрос не уходил. Снимите лишние галочки или '
+           + 'очистите текст.';
+    return '';
+  };
+  const textBox = pultBox('text');
+  if (textBox){
+    const area = textBox.querySelector('[data-pf="source_text"]');
+    // Предупреждение живёт рядом с полем и знает число отмеченных: «одному проекту» —
+    // это про то, что человек уже отметил, а не про отвлечённое правило.
+    pultNote = () => {
+      const el = textBox.querySelector('.pult-one');
+      const n = picks().length;
+      const busy = !!area.value.trim();
+      el.classList.toggle('bad', busy && n > 1);
+      el.classList.toggle('muted', !(busy && n > 1));
+      el.textContent = busy && n > 1
+        ? `Вставленный текст уходит одному проекту, а отмечено ${n}: снимите лишние `
+          + 'галочки или очистите текст — иначе сервер откажет.'
+        : 'Ссылка уезжает всем отмеченным, а файл и вставленный текст — одному '
+          + `проекту. Сейчас отмечено: ${n}.`;
+    };
+    area.oninput = pultNote;
+    pultNote();
+    // Файл читается в браузере, как на вкладке «Сценарий»: серверу нужен текст, а не
+    // файл. TextDecoder с fatal — единственный способ отличить не-UTF-8 от кракозябр,
+    // которые иначе уедут в рерайт и вернутся мусором за деньги.
+    textBox.querySelector('[data-pf="source_file"]').onchange = async e => {
+      const file = e.target.files && e.target.files[0];
+      if (!file) return;
+      try{
+        const txt = new TextDecoder('utf-8', {fatal: true}).decode(await file.arrayBuffer());
+        area.value = txt;
+        pultNote();
+        toast(`Файл прочитан: ${txt.length} знаков — проверьте и нажмите «Сделать»`, 'ok');
+      }catch(readErr){
+        toast(`Файл «${file.name}» не в UTF-8 — пересохраните его в этой кодировке. `
+              + 'Денег не потрачено: файл никуда не уходил.');
+      }finally{ e.target.value = ''; }
+    };
+  }
+  const pultReport = (out, title) => {
+    const box = batch.querySelector('#pultres');
+    box.innerHTML = `<div style="font-weight:600;margin-bottom:4px">${esc(title)}:
+        что уехало</div>
+      <div class="muted" style="font-size:12px">поставлено: ${out.ordered || 0} ·
+        пропущено: ${out.skipped || 0} · с ошибкой: ${out.failed || 0}</div>
+      ${pultBatchRows(out)}`;
+  };
+  batch.querySelectorAll('button.pgo').forEach(b => b.onclick = async () => {
+    const kind = b.dataset.pult;
+    const cardDef = batchPult[kind] || {};
+    const title = cardDef.title || kind;
+    const ids = picks();
+    if (!ids.length) return;
+    const body = pultValues(kind);
+    const stop = pultRefusal(kind, body, ids.length);
+    if (stop){ toast(stop); return; }
+    b.disabled = true;
+    let dry;
+    try{
+      dry = await post(cardDef.post, Object.assign({}, body, {pids: ids, dry_run: true}));
+    }catch(e){
+      // Сессия истекла — это не отказ по проекту, а «войдите снова» (как у «Сделать всё»).
+      if (e instanceof NeedLogin){ ME = null; return viewLogin(''); }
+      // Сюда приходят и отказы про сам список (слишком много отмечено), поэтому
+      // подсказка говорит и про галочки, и про поля.
+      toast(`Проверка не прошла: ${e.message}. Денег не потрачено — ничего не заказано. `
+            + 'Поправьте отмеченное или поля карточки и нажмите «Сделать» ещё раз.');
+      return;
+    }finally{ b.disabled = false; }
+    const head = `<div class="note muted" style="margin:0 0 8px">Это проверка: ничего
+        не заказано и не оплачено, в сеть за деньгами не ходили.</div>
+      <div>Уйдёт в работу: <b>${dry.planned || 0}</b> из ${ids.length} ·
+        пропущено: ${dry.skipped || 0}${dry.failed ? ` · с ошибкой: ${dry.failed}` : ''}${
+        dry.replaced ? ` · получат не свой источник: ${dry.replaced}` : ''}</div>`;
+    modal(`${title}: проверка перед заказом`, head + pultBatchRows(dry),
+      {ok: dry.planned ? `Заказать: ${dry.planned}` : 'Закрыть',
+       onOk: async (mb, close) => {
+         if (!dry.planned){ close(); return; }
+         let out;
+         try{
+           out = await post(cardDef.post,
+                            Object.assign({}, body, {pids: ids, dry_run: false}));
+         }catch(e){
+           // Обрыв ПОСЛЕ начала заказа неоднозначен: часть пачки могла уже уехать и
+           // быть оплачена. Поэтому не «повторите», а «посмотрите и не нажимайте».
+           throw new Error(`${e.message}. Часть пачки могла уже уехать — посмотрите `
+                           + `задачи на экране «${title}» и не нажимайте второй раз.`);
+         }
+         close();
+         pultReport(out, title);
+         toast(`поставлено: ${out.ordered || 0}, пропущено: ${out.skipped || 0}`
+               + (out.failed ? `, с ошибкой: ${out.failed}` : ''),
+               out.ordered ? 'ok' : 'bad');
+         // Экран НЕ перерисовываем, в отличие от кабинетных кнопок: заказ ушёл
+         // соседнему сервису, в таблице проектов от него сейчас ничего не изменится,
+         // а отчёт по пачке — единственное место, где видно, за что заплачено.
+       }});
+  });
+  // Варианты полей подтягиваются в фоне: пустая карточка уже рабочая.
+  if (PULT_ORDER.length) pultBatchFill(batch).catch(e => console.warn(e));
+
   goBtn.onclick = async () => {
     const ids = picks();
     if (!ids.length) return;
@@ -4216,6 +4565,12 @@ function wireLangMap(card, f, group, locked){
     // Кнопка проверки шаблона нужна только у Lumean: у остальных движков проверять
     // нечего — там обычный id голоса, а не ссылка на чужой шаблон.
     rows.querySelectorAll('.lm-check').forEach(b => { b.hidden = !lum; });
+    // Список шаблонов — только у Lumean, и только когда он вообще собрался.
+    if (lum) loadLumTemplates();
+    rows.querySelectorAll('.langmap-row').forEach(row => {
+      const pick = row.querySelector('.lm-pick');
+      if (pick) pick.hidden = !lum || !(lumTemplates && lumTemplates.length);
+    });
     const lumBtn = box.querySelector('.langmap-lum');
     if (lumBtn) lumBtn.hidden = !lum || locked;
     const texts = (f.by_engine || {})[lum ? 'lumean' : 'other'];
@@ -4253,10 +4608,52 @@ function wireLangMap(card, f, group, locked){
     hidden.value = parts.join(', ');
   };
 
+  // Шаблоны Lumean грузятся ОДИН раз на карточку и только когда выбран Lumean: у других
+  // движков в строке обычный id голоса, и ходить за чужим списком незачем. Отказ (нет
+  // ключа, сосед молчит) список просто не показывает — поле id продолжает работать,
+  // как работало.
+  let lumTemplates = null;
+  let lumLoading = null;
+  const loadLumTemplates = () => {
+    if (lumTemplates || lumLoading) return lumLoading || Promise.resolve();
+    lumLoading = api('/ui/lumean/templates')
+      .then(d => { lumTemplates = d && d.ok ? (d.templates || []) : []; })
+      .catch(() => { lumTemplates = []; })
+      .then(() => { rows.querySelectorAll('.langmap-row').forEach(fillPick); });
+    return lumLoading;
+  };
+  const fillPick = (row) => {
+    const pick = row.querySelector('.lm-pick');
+    if (!pick) return;
+    const cur = (row.querySelector('.lm-voice').value || '').trim();
+    if (!lumTemplates || !lumTemplates.length){
+      pick.hidden = true;
+      return;
+    }
+    const known = lumTemplates.some(t => t.id === cur);
+    pick.innerHTML = `<option value=""${known ? '' : ' selected'}>${
+      cur && !known ? '— вписан вручную —' : '— выберите шаблон —'}</option>`
+      + lumTemplates.map(t => `<option value="${esc(t.id)}"${t.id === cur ? ' selected' : ''}
+          >${esc(t.name || t.id)}${t.service ? ' · ' + esc(t.service) : ''} · ${
+          esc(String(t.id).slice(0, 8))}…</option>`).join('');
+    pick.hidden = !lumeanNow();
+  };
+  const syncPick = (row) => {
+    const pick = row.querySelector('.lm-pick');
+    if (!pick || pick.hidden || !pick.options.length) return;
+    const cur = (row.querySelector('.lm-voice').value || '').trim();
+    const known = [...pick.options].some(o => o.value && o.value === cur);
+    pick.value = known ? cur : '';
+    if (!known) pick.options[0].textContent = cur ? '— вписан вручную —' : '— выберите шаблон —';
+  };
+
   const addRow = (lang, voice) => {
     const wrap = $(`<div class="langmap-row" style="display:flex;gap:8px;margin-bottom:6px">
       <select class="lm-lang" style="width:180px;flex:0 0 auto"${locked ? ' disabled' : ''}
         >${langOptionsHtml(lang || '')}</select>
+      <select class="lm-pick" hidden style="flex:1.1;width:auto;min-width:0"${
+        locked ? ' disabled' : ''}
+        title="шаблоны из вашего аккаунта Lumean"></select>
       <input class="lm-voice" style="flex:1;width:auto;min-width:0"${locked ? ' disabled' : ''}
              placeholder="${esc(idPlaceholder)}" value="${esc(voice || '')}">
       ${locked ? '' : `<button type="button" class="ghost small lm-check"
@@ -4270,7 +4667,20 @@ function wireLangMap(card, f, group, locked){
     // не уходит вовсе (скрытый input тоже `disabled`, см. вызывающий код).
     if (!locked){
       wrap.querySelector('.lm-lang').onchange = sync;
-      wrap.querySelector('.lm-voice').oninput = sync;
+      // Список шаблонов и поле id — одно и то же значение, показанное дважды: выбор в
+      // списке пишет id в поле, правка поля переводит список в «вписан вручную». Поле
+      // оставлено видимым нарочно: по нему работает кнопка «проверить», по нему же
+      // человек узнаёт свой id в чужом шаблоне и может вставить тот, которого в списке
+      // нет (чужой аккаунт, только что заведённый шаблон).
+      const pick = wrap.querySelector('.lm-pick');
+      const voiceInput = wrap.querySelector('.lm-voice');
+      voiceInput.oninput = () => { syncPick(wrap); sync(); };
+      if (pick) pick.onchange = () => {
+        if (!pick.value) return;                 // «вписать вручную» — поле не трогаем
+        voiceInput.value = pick.value;
+        sync();
+      };
+      fillPick(wrap);
       wrap.querySelector('.lm-del').onclick = () => { wrap.remove(); sync(); };
       // Проверка шаблона Lumean до оплаты (18.09.2026): id вписывают вслепую, и ошибка
       // вскрывалась платным заказом — теперь видно, что за шаблоном стоит.
@@ -4299,6 +4709,10 @@ function wireLangMap(card, f, group, locked){
   // как известен выбранный движок (значение читается из соседнего поля этой группы).
   // Без этой строки кнопка появлялась только после того, как человек трогал «Движок».
   if (lumBtn) lumBtn.hidden = !lumeanNow() || locked;
+  // Список шаблонов при ПЕРВОЙ отрисовке: `applyEngine` висит только на смене движка, а
+  // пресет открывают уже с выбранным Lumean — без этой строки список появлялся, только
+  // если человек трогал «Движок».
+  if (lumeanNow() && !locked) loadLumTemplates();
   if (lumBtn && !locked) lumBtn.onclick = async () => {
     // Поля формы шаблона отдаёт сервер: их список зависит от того, что принимает
     // провайдер, и дублировать его здесь значило бы разойтись с ним при первой правке.

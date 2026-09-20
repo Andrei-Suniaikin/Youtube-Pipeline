@@ -115,6 +115,77 @@ SCENARIO = r"""
 """
 
 
+PICK_SCENARIO = r"""
+(async () => {
+  const out = {errs: []};
+  addEventListener('error', e => out.errs.push(e.message));
+  try {
+  window.api = async (p) => (p === '/ui/lumean/templates')
+    ? {ok: true, fields: [], templates: [
+        {id: '01a0be22-e505-7076-b88e-2615117febcb', name: 'тест андрей', service: 'heygen'},
+        {id: '01a023e8-2627-7246-a500-391eaa23ad31', name: 'Стандартный шаблон',
+         service: 'elevenlabs'}]}
+    : {};
+  const group = (value, engine) => ({fields: [
+    {key: 'engine', kind: 'select', label: 'Движок', value: engine,
+     options: [{value: 'lumean', title: 'Lumean'}, {value: 'edge', title: 'Edge'}]},
+    {key: 'voice_by_lang', kind: 'langmap', label: 'Карта', value: value,
+     options: [{value: 'ru', title: 'Русский'}],
+     by_engine: {lumean: {label: 'Пресеты Lumean', hint: ''},
+                 other: {label: 'Карта голосов', hint: ''}}}]});
+
+  const card = fieldForm([group('ru: 01a0be22-e505-7076-b88e-2615117febcb', 'lumean')]);
+  document.getElementById('app').append(card);
+  await new Promise(r => setTimeout(r, 500));
+  const pick = card.querySelector('.lm-pick');
+  out.виден_сразу = pick ? !pick.hidden : null;
+  out.варианты = pick ? [...pick.options].map(o => o.textContent.trim()) : [];
+  out.текущий_выбран = pick ? pick.value : '';
+
+  pick.value = '01a023e8-2627-7246-a500-391eaa23ad31';
+  pick.dispatchEvent(new Event('change'));
+  out.поле = card.querySelector('.lm-voice').value;
+  out.в_пресет = card.querySelector('[data-key="voice_by_lang"]').value;
+
+  const inp = card.querySelector('.lm-voice');
+  inp.value = 'чужой-id'; inp.dispatchEvent(new Event('input'));
+  out.после_ручной = pick.value === '' ? pick.options[0].textContent.trim() : 'не переключился';
+
+  const sel = card.querySelector('#f-engine');
+  sel.value = 'edge'; sel.dispatchEvent(new Event('change'));
+  out.на_другом_движке = pick.hidden;
+  } catch (e) { out.упало = String(e && e.message || e); }
+  document.documentElement.setAttribute('data-result', JSON.stringify(out));
+})();
+"""
+
+
+def pick_checks() -> None:
+    """Список шаблонов вместо вслепую вписанного id (просьба владельца 20.09.2026)."""
+    res = browser_harness.run_scenario(PICK_SCENARIO, budget_ms=9000)
+    if res.get("error"):
+        FAILS.append(f"список шаблонов не проверен: {res['error']}")
+        print("  ПРОПУЩЕНО:", res["error"])
+        return
+    print("\nСписок шаблонов в карте голосов")
+    check("падений нет", (res.get("упало"), res.get("errs")), (None, []))
+    check("список виден сразу при движке Lumean", res.get("виден_сразу"), True)
+    check("в списке имя, сервис и начало id",
+          res.get("варианты"),
+          ["— выберите шаблон —",
+           "тест андрей · heygen · 01a0be22…",
+           "Стандартный шаблон · elevenlabs · 01a023e8…"])
+    check("текущий шаблон строки выбран", res.get("текущий_выбран"),
+          "01a0be22-e505-7076-b88e-2615117febcb")
+    check("выбор пишет id в поле", res.get("поле"), "01a023e8-2627-7246-a500-391eaa23ad31")
+    check("и уходит в пресет", res.get("в_пресет"), "ru: 01a023e8-2627-7246-a500-391eaa23ad31")
+    # Поле остаётся рабочим: по нему живёт кнопка «проверить», и через него вписывают
+    # шаблон, которого в списке нет (чужой аккаунт, только что заведённый).
+    check("ручная правка переводит список в «вписан вручную»",
+          res.get("после_ручной"), "— вписан вручную —")
+    check("на другом движке списка нет", res.get("на_другом_движке"), True)
+
+
 def main() -> int:
     res = browser_harness.run_scenario(SCENARIO, budget_ms=9000)
     if res.get("error"):
@@ -141,6 +212,8 @@ def main() -> int:
 
     print("\nОшибок в консоли нет")
     check("консоль чистая", res.get("errs"), [])
+
+    pick_checks()
 
     print()
     if FAILS:
