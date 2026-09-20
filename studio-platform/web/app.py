@@ -48,7 +48,7 @@ import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
 from pub_engine import channel_presets                            # noqa: E402
 from pub_remote import (COVER_BASE, LANG_TO_RU, REWRITE_BASE,     # noqa: E402
-                        donor_subs, donor_text, get_key, subs_exits_state,
+                        YT_ID_RE, donor_subs, donor_text, get_key, subs_exits_state,
                         subs_probe_async, video_id)
 from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
                           MEDIA_STAGES, OPTIONAL_STAGES, REWRITE_BAD, REWRITE_DONE,
@@ -957,12 +957,16 @@ def _name_neighbour_rows(c, service: str, rows: list) -> None:
     Оба — ОДНИМ запросом на сервис: очередь на сотню строк не должна превращаться в
     сотню обращений за именем.
 
-    Чего в этой цепочке нет. Названия ролика для задачи, заказанной ссылкой прямо с
-    экрана проекта: ссылку кабинет нигде не сохраняет (`ui_text_create` превращает её
-    в текст и забывает), а спросить название у YouTube отсюда нельзя — `donor_title`
-    ходит в сеть и стоит до 48 с на ссылку (замер 19.09). В таком случае в строке
-    стоит имя проекта, а `title_why` говорит, почему имя именно такое. «Без названия»
-    не годится: человек должен понимать, что это за задача.
+    Третий повод — заказ ссылкой прямо с экрана проекта. С 20.09.2026 такая ссылка
+    у проекта ЗАПОМИНАЕТСЯ (`project_origin`), и очередь показывает её вместо имени
+    проекта. Отдельным запросом, а не join'ом к двум запросам выше: таблица заводится
+    лениво, и на базе, где ею ещё не пользовались, join уронил бы имена ВСЕХ строк.
+
+    Чего в этой цепочке по-прежнему нет — настоящего НАЗВАНИЯ ролика по ссылке:
+    спросить его у YouTube отсюда нельзя, `donor_title` ходит в сеть и стоит до 48 с
+    на ссылку (замер 19.09). Нет ни названия, ни ссылки — в строке стоит имя проекта,
+    а `title_why` говорит, почему имя именно такое. «Без названия» не годится: человек
+    должен понимать, что это за задача.
     """
     ids = [r["id"] for r in rows if r.get("id")]
     if not ids:
@@ -1010,6 +1014,20 @@ def _name_neighbour_rows(c, service: str, rows: list) -> None:
         # Имя — это удобство. Потерять из-за него всю очередь нельзя: строка без
         # названия хуже названной, но лучше пустого экрана.
         found = {}
+
+    # Ссылка, записанная на экране проекта, — последний шанс назвать задачу. Своим
+    # запросом и со своим отказом: нет таблицы — теряем одну подпись, а не все.
+    try:
+        own = sorted({v.get("project_id") for v in found.values() if v.get("project_id")})
+        if own:
+            links = {r["project_id"]: (r["donor_url"] or "") for r in c.execute(
+                "SELECT project_id, donor_url FROM project_origin WHERE tenant_id=? "
+                f"AND project_id IN ({','.join('?' * len(own))})", (TENANT, *own))}
+            for info in found.values():
+                if not (info.get("donor_url") or "").strip():
+                    info["donor_url"] = links.get(info.get("project_id")) or ""
+    except sqlite3.Error:
+        pass
 
     for row in rows:
         info = found.get(row["id"]) or {}
@@ -2825,6 +2843,419 @@ def _link_project_jobs(pid: str, service: str, out) -> None:
         c.close()
 
 
+# ─────────────── из чего делается проект: ссылка донора, тема, файл ───────────────
+# Жалоба владельца 20.09.2026: «попробовал видос по новой запустить, ссылку на донора не
+# сохранило». Так и было: `ui_text_create` превращал ссылку в текст и забывал её —
+# у проекта не оставалось НИЧЕГО, из чего он сделан, и поле на экране открывалось
+# пустым. Заодно от этого страдала очередь: `_name_neighbour_rows` не могла назвать
+# задачу иначе как именем проекта, потому что ссылки нигде не было.
+#
+# Почему источник живёт своей строкой, а не в `projects.settings`. Две причины, обе
+# проверены по коду кабинета, и обе стоят денег:
+#   * новый проект наследует настройки последнего заведённого целиком
+#     (`server/main.py` ≈4872: `SELECT settings … ORDER BY created DESC LIMIT 1`,
+#     отсекаются только `_DEFERRED_KEYS`) — ссылка донора сама переехала бы в
+#     следующий проект, и пакетный заказ текста оплатил бы рерайт ЧУЖОГО ролика;
+#   * «снимок пресета» кладёт в пресет всё, что не начинается с подчёркивания
+#     (`server/main.py` ≈14275), а «применить пресет» ЗАМЕНЯЕТ настройки проекта
+#     целиком (≈14332) — источник то разъезжался бы по пресетам, то исчезал бы от
+#     нажатия, к нему не относящегося.
+# Таблицу пульт заводит сам и лениво — тем же способом, каким `pub_calls` заводит
+# журнал платных вызовов: в кабинет (`server/**`) за схемой не ходим.
+_ORIGIN_FIELDS = ("kind", "donor_url", "video_id", "topic", "file_name", "ordered")
+
+
+def _origin_schema(c) -> None:
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS project_origin("
+        "tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, "
+        # Чем человек пользовался последним: link | text | topic | file. Это ответ на
+        # вопрос «какой источник подставить в поле», а не «что лежит в проекте».
+        "kind TEXT NOT NULL DEFAULT '', "
+        # Ссылка — как её вставил человек: он её такой и узнаёт.
+        "donor_url TEXT NOT NULL DEFAULT '', "
+        # Тот же ролик в другом написании (`youtu.be/X` и `watch?v=X`) — это один
+        # ролик, и повтор заказа узнаётся по id, а не по строке.
+        "video_id TEXT NOT NULL DEFAULT '', "
+        "topic TEXT NOT NULL DEFAULT '', "
+        "file_name TEXT NOT NULL DEFAULT '', "
+        # Когда по ЭТОМУ источнику реально заказывали текст. 0 — «вставил, но не
+        # заказывал»: предупреждать о повторе не о чем.
+        "ordered REAL NOT NULL DEFAULT 0, "
+        "updated REAL NOT NULL DEFAULT 0, "
+        "PRIMARY KEY(tenant_id, project_id))")
+
+
+def _origin_read(c, pid: str) -> dict:
+    """Запомненный источник проекта. Нет строки или нет таблицы — пустой словарь.
+
+    Схему тут НЕ заводим, хотя это и было бы короче: чтение — горячий путь (экран
+    проекта, разбор поля на каждое нажатие), а `CREATE TABLE` это запись, и на занятой
+    базе она отвечала бы «database is locked» — то есть поле на экране пустело бы под
+    нагрузкой. Таблицу создаёт запись (`_origin_write`); пока её нет, читать всё равно
+    нечего.
+    """
+    if not pid:
+        return {}
+    try:
+        r = c.execute("SELECT * FROM project_origin WHERE tenant_id=? AND project_id=?",
+                      (TENANT, pid)).fetchone()
+    except sqlite3.Error:
+        return {}
+    return dict(r) if r else {}
+
+
+def _origin_write(pid: str, **fields) -> None:
+    """Запомнить источник проекта. Меняются только переданные поля.
+
+    Сбой записи не превращаем в ошибку: заказ текста к этому моменту уже может быть
+    оплачен, и отказ заставил бы человека нажать ещё раз — то есть заплатить дважды.
+    Потеряем строку на экране, а не деньги.
+    """
+    cols = [k for k in _ORIGIN_FIELDS if k in fields]
+    if not pid or not cols:
+        return
+    try:
+        c = db()
+    except HTTPException:
+        return
+    try:
+        # Запись источника — отдельной сделкой и первой. Уборка ниже делит с ней и
+        # `try`, и `commit`, и это стоило бы ровно того, ради чего всё затевалось:
+        # `projects` — чужая таблица кабинета, её `DELETE … NOT IN (SELECT … FROM
+        # projects)` спотыкается на занятой базе («database is locked») и на любой
+        # правке чужой схемы, а один `except` на двоих откатывал бы вместе с уборкой
+        # САМУ ЗАПИСЬ ССЫЛКИ — уже после того, как за текст заплатили.
+        try:
+            _origin_schema(c)
+            c.execute(
+                "INSERT INTO project_origin(tenant_id, project_id, updated, "
+                + ", ".join(cols) + ") VALUES (?,?,?" + ",?" * len(cols) + ") "
+                "ON CONFLICT(tenant_id, project_id) DO UPDATE SET "
+                "updated=excluded.updated, "
+                + ", ".join(f"{k}=excluded.{k}" for k in cols),
+                (TENANT, pid, time.time(), *[fields[k] for k in cols]))
+            c.commit()
+        except sqlite3.Error:
+            return
+        # Проект удаляют в кабинете, и его триггер знает только про свою таблицу
+        # (`project_service_jobs`, server/main.py ≈2588). Свой триггер в чужую схему
+        # пульт не ставит: триггер переживёт нашу таблицу и сломает удаление проекта
+        # всем сразу. Поэтому осиротевшие строки подметаем здесь — их одна на проект,
+        # и запись бывает раз на заказ, а не в цикле. Не вышло — не беда: строка ничья,
+        # никому не мешает и уйдёт со следующей записью.
+        try:
+            c.execute("DELETE FROM project_origin WHERE tenant_id=? AND project_id "
+                      "NOT IN (SELECT id FROM projects WHERE tenant_id=?)",
+                      (TENANT, TENANT))
+            c.commit()
+        except sqlite3.Error:
+            pass
+    finally:
+        c.close()
+
+
+def _origin_link(pid: str, url: str, *, ordered: bool = False) -> None:
+    """Запомнить ссылку донора у проекта.
+
+    `ordered` — «по ней прямо сейчас поставлен заказ текста». Ссылку запоминаем ДО
+    похода за субтитрами: человек её вставил, и даже если донор не отдал расшифровку,
+    поле на экране должно открыться с ней, а не пустым — вставлять второй раз незачем.
+    Сменилась ссылка — прежняя отметка о заказе к ней не относится и сбрасывается.
+    """
+    url = (url or "").strip()
+    if not pid or not url:
+        return
+    # Идентификатор — узким разбором (`_yt_video_id`), а не `pub_ids.video_id`: та
+    # достаёт «идентификатор» из хвоста ЛЮБОГО адреса, и чужая ссылка получила бы
+    # чужой id. По нему потом сверяется повтор оплаты — сверять было бы нечего.
+    vid = _yt_video_id(url)
+    try:
+        c = db()
+    except HTTPException:
+        return
+    try:
+        row = _origin_read(c, pid)
+    finally:
+        c.close()
+    fields = {"kind": "link", "donor_url": url, "video_id": vid}
+    if ordered:
+        fields["ordered"] = time.time()
+    elif not _origin_same_link(row, url, vid):
+        fields["ordered"] = 0.0
+    _origin_write(pid, **fields)
+
+
+def _origin_topic(pid: str, topic: str) -> None:
+    """Запомнить тему генерации с нуля. Сменилась тема — прежний заказ не про неё."""
+    topic = (topic or "").strip()
+    if not pid or not topic:
+        return
+    try:
+        c = db()
+    except HTTPException:
+        return
+    try:
+        row = _origin_read(c, pid)
+    finally:
+        c.close()
+    fields = {"kind": "topic", "topic": topic}
+    if topic != (row.get("topic") or "").strip():
+        fields["ordered"] = 0.0
+    _origin_write(pid, **fields)
+
+
+def _origin_same_link(row: dict, url: str, vid: str = None) -> bool:
+    """Та же ли это ссылка, что запомнена. По id ролика, а не по строке: `youtu.be/X`,
+    `watch?v=X` и `watch?v=X&t=30` — один и тот же донор и один и тот же платёж."""
+    if not row:
+        return False
+    url = (url or "").strip()
+    vid = _yt_video_id(url) if vid is None else vid
+    if vid and (row.get("video_id") or ""):
+        return vid == row["video_id"]
+    return bool(url) and url == (row.get("donor_url") or "")
+
+
+def _release_donor(c, pid: str) -> str:
+    """Ссылка донора ВЫПУСКА, если проект заведён ночным движком по плану канала.
+
+    Тот же путь, которым её читает пакетный запуск (`_project_release`): выпуск →
+    строка плана. Это другая ссылка, чем запомненная на экране, и подменять одну
+    другой нельзя — по ссылке выпуска ходит движок, а деньги считаются по ней же.
+    """
+    if not pid:
+        return ""
+    try:
+        r = c.execute("SELECT i.donor_url donor_url FROM pub_releases r "
+                      "LEFT JOIN pub_plan_items i ON i.id=r.plan_item_id "
+                      "WHERE r.project_id=? AND r.tenant_id=? "
+                      "ORDER BY r.updated DESC LIMIT 1", (pid, TENANT)).fetchone()
+    except sqlite3.Error:
+        return ""
+    return ((r["donor_url"] if r else "") or "").strip()
+
+
+def _when(ts) -> str:
+    """Момент по-человечески — тем же видом, что и в остальном пульте (ДД.ММ ЧЧ:ММ)."""
+    try:
+        return dt.datetime.fromtimestamp(float(ts)).strftime("%d.%m %H:%M")
+    except (TypeError, ValueError, OSError):
+        return ""
+
+
+def _project_origin(c, pid: str, scenario: str = "") -> dict:
+    """Из чего делается проект — одним куском для экрана.
+
+    Экран показывает ОДНО поле источника (заявка владельца 20.09.2026), поэтому здесь
+    же сказано, что в него подставить (`kind` + `value`) и почему именно это (`why`).
+    Сценарий проекта (`source.txt`) остаётся отдельным полем ответа `/ui/projects/{pid}`
+    — он тут не дублируется, только меряется в знаках.
+
+    Ссылка выпуска показывается ВСЕГДА, когда она есть и её нет в самом поле, — своим
+    полем `release_url`. Сравнивать её с `donor_url`, как было до 20.09.2026 вечера,
+    нельзя: `donor_url` подставляется ИЗ НЕЁ ЖЕ, если своей ссылки у проекта нет, и
+    первое же «Сохранить текст» (оно проставляет `kind='text'`) уводило поле в сценарий,
+    а `release_url` при этом оставался пустым как «совпадающий». Ссылка выпуска
+    пропадала с экрана целиком — у проекта ночного движка, то есть ровно там, где по
+    ней и работают.
+    """
+    row = _origin_read(c, pid)
+    release = _release_donor(c, pid)
+    kind = (row.get("kind") or "").strip()
+    donor = (row.get("donor_url") or "").strip()
+    topic = (row.get("topic") or "").strip()
+    src, from_release = ("project" if row else ""), False
+    if not donor and release:
+        # Проект заведён движком по плану канала: его источник — ссылка выпуска, и
+        # другой у него не было. Это не догадка, а та же строка плана, из которой
+        # ночной движок брал расшифровку.
+        donor, src, from_release = release, "release", True
+        if not kind:
+            kind = "link"
+    if not kind:
+        kind = "link" if donor else ("text" if (scenario or "").strip() else "")
+    ordered = float(row.get("ordered") or 0)
+    # Что реально встанет в поле источника. Дальше всё считается от него, а не от
+    # `donor`: у поля, занятого темой, файлом или сценарием, ссылки нет вовсе.
+    value = donor if kind == "link" else (topic if kind == "topic" else "")
+    aside = bool(release) and release != value
+    why = ""
+    if from_release and kind == "link":
+        why = "ссылка выпуска канала — из неё заведён проект"
+    if kind == "link" and ordered:
+        why = f"по этой ссылке заказывали текст {_when(ordered)}"
+    if aside:
+        # Ссылка выпуска есть, а в поле её нет. Молчать нельзя: кнопки экрана возьмут
+        # то, что в поле, а ночной движок и пакетный запуск — ссылку выпуска, и человек
+        # получит ролик не по той.
+        why = ((why + "; ") if why else "") + (
+            "у выпуска канала записана другая ссылка — движок берёт её" if kind == "link"
+            else "из неё заведён проект, по ней же работает ночной движок")
+    return {
+        "kind": kind, "value": value,
+        "donor_url": donor, "video_id": (row.get("video_id") or ""),
+        "topic": topic, "file_name": (row.get("file_name") or ""),
+        "release_url": release if aside else "",
+        "from": src, "ordered": ordered, "updated": float(row.get("updated") or 0),
+        "scenario_chars": len(scenario or ""), "why": why,
+    }
+
+
+def _project_origin_now(pid: str) -> dict:
+    """То же самое, но со своим соединением — для ответов на действие: экран сразу
+    получает новое состояние поля и не обязан перезагружать проект целиком."""
+    if not pid:
+        return {}
+    try:
+        c = db()
+    except HTTPException:
+        return {}
+    try:
+        return _project_origin(c, pid, _project_scenario(sys.modules.get("main"), pid))
+    except sqlite3.Error:
+        return {}
+    finally:
+        c.close()
+
+
+# ───────────────── разбор того, что человек вставил в поле источника ─────────────────
+# Поле одно на все источники (заявка владельца 20.09.2026: «желательно чтобы в строку он
+# и текст и ссылку распознавал»), и решать, ссылка это или текст, обязан сервер: экран,
+# который судит об этом сам, рано или поздно разойдётся с сервером — и разойдётся на
+# платном заказе. Разбор бесплатный и без сети: только регулярки и уже записанное в базе.
+#
+# Что здесь считается роликом YouTube — и почему так узко.
+#
+# `pub_ids.video_id` шире, чем кажется по имени: не найдя `v=`, `youtu.be/`, `/shorts/`
+# или `/embed/`, она берёт ПОСЛЕДНИЙ сегмент любого адреса, если в нём одиннадцать
+# разрешённых знаков. Ей это нужно для миграции (в колонке лежал голый идентификатор), и
+# трогать её нельзя — она в кабинете и ею пользуются схема, план и клиент субтитров. Но
+# здесь та же широта врала человеку в лицо: `example.com/aAbBcCdDeEf` объявлялся
+# «ссылкой на ролик YouTube», а `donor_subs` шла с этим огрызком в YouTube — то есть
+# жгла выход из общей ротации (их на всю систему два десятка, и отказ отправляет выход
+# отдыхать ДЛЯ ВСЕХ) ради ролика, которого нет.
+#
+# Поэтому ссылка считается роликом, только если совпало ОБА: хост из списка YouTube и
+# идентификатор, найденный именно шаблонами `YT_ID_RE`, а не хвостом пути.
+SOURCE_TOPIC_MAX = 160          # сколько знаков ещё похоже на тему, а не на сценарий
+_BARE_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
+# Домены, с которых приходит ссылка на ролик. Короткие ссылки телефона (`youtu.be`),
+# мобильный и музыкальный поддомены, встраивание без cookie — всё это один и тот же
+# YouTube. Чужой домен сюда не попадает никогда, даже если хвост у него похож.
+_YT_HOSTS = ("youtube.com", "youtu.be", "youtube-nocookie.com")
+# Два вида пути, которых в `YT_ID_RE` нет: трансляция `/live/<id>` и старый `/v/<id>`.
+# Дописываем их ЗДЕСЬ, а не в кабинете: от той регулярки зависят схема, постановка
+# ссылок в план и клиент субтитров, и править её ради разбора одного поля нельзя.
+# Канальные пути (`/c/Имя`, `/@имя`, `/channel/UC…`) сюда не попадают намеренно:
+# «SomeChannel» — тоже одиннадцать разрешённых знаков, и хвостом пути их не отличить.
+_YT_PATH_RE = re.compile(r"/(?:live|v)/([A-Za-z0-9_-]{11})(?:[/?#]|$)")
+
+
+def _yt_host(url: str) -> bool:
+    """Это адрес YouTube? Именно хост, а не «строка, где встретилось слово youtube»:
+    `evil.com/?u=youtube.com/watch?v=…` словом обмануло бы, хостом — нет."""
+    try:
+        host = urllib.parse.urlsplit(str(url or "")).hostname or ""
+    except ValueError:
+        return False
+    host = host.lower().rstrip(".")
+    return any(host == h or host.endswith("." + h) for h in _YT_HOSTS)
+
+
+def _yt_video_id(url: str) -> str:
+    """Идентификатор ролика YouTube из ссылки — или пусто.
+
+    Сужение `pub_ids.video_id` до того, за что можно отвечать: хост YouTube плюс
+    идентификатор из шаблона — `v=`, `youtu.be/`, `/shorts/`, `/embed/` (`YT_ID_RE`)
+    либо `/live/`, `/v/` (`_YT_PATH_RE`). Хвост пути сам по себе идентификатором не
+    считается: именно на нём `pub_ids.video_id` и объявляла роликом что угодно.
+    """
+    url = str(url or "")
+    if not _yt_host(url):
+        return ""
+    m = YT_ID_RE.search(url) or _YT_PATH_RE.search(url)
+    return m.group(1) if m else ""
+
+
+def _looks_like_id(token: str) -> bool:
+    """Похоже ли это на голый идентификатор ролика.
+
+    Только «похоже»: роликом мы такую строку НЕ считаем (см. `detect_source`) —
+    одиннадцать знаков с цифрой или дефисом это и «Top-10-2026», и «Cyberpunk77», то
+    есть обычная тема. Ответ нужен ровно для подсказки «если это ролик — вставьте
+    ссылку целиком».
+    """
+    if not _BARE_ID_RE.fullmatch(token or ""):
+        return False
+    return not (token.isalpha() and (token.islower() or token.isupper()))
+
+
+def detect_source(value: str) -> dict:
+    """Что человек вставил в поле источника: ссылка, текст или ничего.
+
+    Возвращает `kind` (`empty`/`link`/`link_other`/`many_links`/`text`), `mode` — режим
+    для `POST /ui/text` (пусто означает «так заказывать нельзя») и человеческое
+    объяснение. Ссылки ищутся той же `parse_links`, которой разбирается поле вставки
+    ссылок в план: две разные «правды» о том, что такое ссылка, развели бы экраны.
+    """
+    raw = (value or "").strip()
+    if not raw:
+        return {"kind": "empty", "mode": "", "value": "", "url": "", "video_id": "",
+                "chars": 0, "links": [], "title": "пусто", "note": "",
+                "problem": "источник не задан", "topic_possible": False}
+    links = parse_links(raw)
+    rest = raw
+    for one in links:
+        rest = rest.replace(one, " ")
+    only_links = bool(links) and not rest.strip(" \t\r\n,;·—–-")
+    if only_links and len(links) > 1:
+        return {"kind": "many_links", "mode": "", "value": raw, "url": "", "video_id": "",
+                "chars": len(raw), "links": links, "title": "несколько ссылок", "note": "",
+                "problem": f"в поле {len(links)} ссылки, а ролик делается из одного "
+                           f"донора — оставьте одну",
+                "topic_possible": False}
+    if only_links:
+        url = links[0]
+        vid = _yt_video_id(url)
+        if vid:
+            return {"kind": "link", "mode": "link", "value": url, "url": url,
+                    "video_id": vid, "chars": len(raw), "links": links,
+                    "title": "ссылка на ролик YouTube",
+                    "note": "текст возьмём из субтитров этого ролика",
+                    "problem": "", "topic_possible": False}
+        return {"kind": "link_other", "mode": "", "value": url, "url": url,
+                "video_id": "", "chars": len(raw), "links": links,
+                "title": "ссылка не на ролик YouTube", "note": "",
+                "problem": "это ссылка, но ролик в ней не опознан — субтитры брать "
+                           "неоткуда; вставьте ссылку вида youtube.com/watch?v=… "
+                           "или сам текст",
+                "topic_possible": False}
+    # Всё остальное — текст. Ссылка ВНУТРИ текста его текстом быть не перестаёт:
+    # сценарий со ссылкой в теле — обычное дело, и заказывать по ней донора нельзя.
+    short = len(raw) <= SOURCE_TOPIC_MAX and "\n" not in raw and not links
+    if links:
+        note = ("в тексте есть ссылка, но текстом он быть не перестаёт: отправим в "
+                "рерайт как есть. Нужен донор — оставьте в поле одну ссылку")
+    elif _looks_like_id(raw):
+        # Голые одиннадцать знаков роликом НЕ считаем. Раньше считали — и тема
+        # «Top-10-2026» уезжала в YouTube как идентификатор: выход из общей ротации
+        # сожжён, текста нет, а человек видел «ссылка на ролик» и не понимал, откуда
+        # она взялась. Цена ошибки несимметрична: промах стоит выхода и платного
+        # рерайта чужого ролика, а отказ — одной лишней вставки.
+        note = ("похоже на идентификатор ролика. Если это ролик YouTube — вставьте "
+                "ссылку целиком (youtube.com/watch?v=…): по одиннадцати знакам мы "
+                "гадать не будем. Иначе это тема или текст")
+    elif short:
+        note = ("строка короткая — если это тема для генерации с нуля, выберите режим "
+                "«С нуля по теме»: там нужен бриф")
+    else:
+        note = f"{len(raw)} знаков — отправим в рерайт как есть"
+    return {"kind": "text", "mode": "text", "value": raw, "url": "", "video_id": "",
+            "chars": len(raw), "links": links, "title": "текст", "note": note,
+            "problem": "", "topic_possible": short}
+
+
 def _project_job_rows(pid: str, service: str, listed: list, fetch_one) -> list:
     """Задачи проекта в порядке постановки, новые первыми.
 
@@ -2937,6 +3368,62 @@ def ui_text(request: Request, project_id: str = ""):
     }
 
 
+class DetectIn(BaseModel):
+    value: str = ""
+    project_id: str = ""             # с проектом ответ ещё скажет, что тот уже знает
+
+
+@app.post("/ui/source/detect")
+def ui_source_detect(body: DetectIn):
+    """«Вот что вставил человек — что это?» Бесплатно, без сети, до всякого заказа.
+
+    Ответ — разбор (`detect_source`) плюс, если назван проект, то, что о его источнике
+    уже записано, и предупреждение о повторе. Предупреждение здесь, а не в ответе на
+    заказ, именно потому, что заказ платный: узнать «по этой ссылке уже заказывали»
+    нужно ДО нажатия, а не после списания.
+
+    Ручка ничего не записывает: разбор поля не должен менять память проекта, пока
+    человек ещё печатает.
+    """
+    out = detect_source(body.value)
+    pid = (body.project_id or "").strip()
+    if not pid:
+        return out
+    c = db()
+    try:
+        _project_or_404(c, pid)
+        row = _origin_read(c, pid)
+        scenario = _project_scenario(sys.modules.get("main"), pid)
+    finally:
+        c.close()
+    same = out["kind"] == "link" and _origin_same_link(row, out["url"], out["video_id"])
+    ordered = float(row.get("ordered") or 0)
+    warn = ""
+    if same and ordered:
+        warn = (f"по этой ссылке текст для проекта уже заказывали {_when(ordered)} — "
+                f"повтор создаст вторую задачу и второй платный рерайт")
+    elif out["kind"] == "link" and (row.get("donor_url") or "") and not same:
+        warn = (f"у проекта записана другая ссылка ({_short(row['donor_url'])}) — "
+                f"заказ по новой её заменит")
+    if out["mode"] and scenario.strip():
+        # Вторая половина путаницы, на которую жаловался владелец: сверху ссылка, снизу
+        # «исходный текст какой-то». Сценарий заказом не перезаписывается — это делает
+        # только «Взять в проект», и сказать об этом надо прямо.
+        warn = ((warn + ". ") if warn else "") + \
+            (f"в проекте уже есть сценарий ({len(scenario)} знаков): новый текст его "
+             f"не заменит, пока вы не нажмёте «Взять в проект»")
+    out["project"] = {
+        "id": pid, "kind": (row.get("kind") or ""),
+        "donor_url": (row.get("donor_url") or ""),
+        "video_id": (row.get("video_id") or ""),
+        "topic": (row.get("topic") or ""),
+        "ordered": ordered, "same_link": same,
+        "scenario_chars": len(scenario),
+    }
+    out["warn"] = warn
+    return out
+
+
 class TextIn(BaseModel):
     mode: str
     source: str = ""                 # ссылка, текст или тема — по режиму
@@ -2954,6 +3441,10 @@ def ui_text_create(body: TextIn, request: Request):
     Ссылка превращается в текст здесь, кабинетом: `donor_text` уже умеет доставать
     субтитры, ходит по нескольким выходам при исчерпанной квоте и кэширует результат
     для соседних каналов. Дублировать это в интерфейсе незачем.
+
+    Источник при этом ЗАПОМИНАЕТСЯ у проекта (жалоба владельца 20.09.2026: «ссылку на
+    донора не сохранило»), и запоминается ДО похода за субтитрами: вставленное человеком
+    не должно пропадать от того, что донор не отдал расшифровку.
     """
     sid = getattr(request.state, "sid", "")
     mode = (body.mode or "").strip()
@@ -2973,6 +3464,10 @@ def ui_text_create(body: TextIn, request: Request):
     if mode == "topic":
         if not body.preset:
             raise HTTPException(400, "для генерации с нуля нужен бриф (пресет)")
+        # Тему помним по той же причине, что и ссылку: это единственная запись о том,
+        # из чего сделан проект, заведённый «с нуля». Текст в этом режиме пишет модель,
+        # и без темы на экране не остаётся вообще ничего.
+        _origin_topic(pid, body.source)
         code, out = _rw("/jobs/generation", sid, {
             "preset_name": body.preset, "topic": body.source,
             "languages": [{"code": x, "display": x} for x in langs],
@@ -2980,9 +3475,15 @@ def ui_text_create(body: TextIn, request: Request):
         if code >= 400:
             raise HTTPException(_pass_code(code), out)
         _link_project_jobs(pid, "rewrite", out)
-        return {"ok": True, "job": out}
+        if (body.source or "").strip():
+            # Отметка об оплате — только когда есть чему её принадлежать: заказ без
+            # темы пометил бы «заказывали» пустую строку и предупреждал бы о повторе
+            # того, чего не было.
+            _origin_write(pid, ordered=time.time())
+        return {"ok": True, "job": out, "origin": _project_origin_now(pid)}
 
     if mode == "link":
+        _origin_link(pid, body.source)
         try:
             text = donor_text(body.source)
         except Exception as exc:                                 # noqa: BLE001
@@ -2991,6 +3492,20 @@ def ui_text_create(body: TextIn, request: Request):
     else:
         text = body.source or ""
         name = "вставленный.txt"
+        # Вставленный текст своей строки не заводит и НЕ трогает запомненную ссылку:
+        # его дом — `source.txt` проекта (кнопки «Сохранить текст» и «Взять в проект»),
+        # а копия в памяти источника была бы вторым, расходящимся экземпляром сценария.
+        # Меняется только отметка «чем пользовались последним», и только если проект
+        # ещё ничем не помечен, — иначе заказ вставленным текстом стирал бы с экрана
+        # ссылку, из которой этот проект сделан.
+        if pid:
+            c0 = db()
+            try:
+                known = bool((_origin_read(c0, pid).get("kind") or "").strip())
+            finally:
+                c0.close()
+            if not known:
+                _origin_write(pid, kind="text")
     if not text.strip():
         raise HTTPException(400, "текста нет — рерайтить нечего")
 
@@ -3012,7 +3527,12 @@ def ui_text_create(body: TextIn, request: Request):
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
     _link_project_jobs(pid, "rewrite", out)
-    return {"ok": True, "job": out, "chars": len(text)}
+    if mode == "link":
+        # Отметка «по этой ссылке уже заказывали» ставится только теперь: до этой
+        # строки денег не тратили, и пугать повтором было бы не за что.
+        _origin_link(pid, body.source, ordered=True)
+    return {"ok": True, "job": out, "chars": len(text),
+            "origin": _project_origin_now(pid)}
 
 
 # ──────────────────────────────── обложки ────────────────────────────────
@@ -3311,6 +3831,190 @@ def _file_kind(name: str) -> str:
     if ext in (".txt", ".md", ".srt", ".json"):
         return "text"
     return "file"
+
+
+# ─────────────────────── настоящий лог задачи соседа ───────────────────────
+# Повод, дословно: «можем добавить лог?». 20.09.2026 владелец полтора часа чинил
+# интернет, которого не ломал. Заказ текста трижды падал с «Ошибка: сеть недоступна
+# (E-NET)», а настоящая причина лежала строкой ниже в СЫРОМ логе задачи:
+#     [SSL: CERTIFICATE_VERIFY_FAILED] … unable to get local issuer certificate
+# Публичный фильтр рерайта (`rewrite/log_public.py`, `_classify_error`) по правилу
+# default-deny заменяет текст исключения кодом: слово «сеть» в сообщении → `E-NET`.
+# Для клиента чужого сервиса это правильно, для владельца собственной платформы —
+# дыра: сама поломка чинится (`dev/run.sh` даёт связку certifi), а ВИДИМОСТЬ причины
+# без этой ручки остаётся нулевой.
+#
+# Откуда берём лог. У соседей он лежит по-разному, и это не прихоть, а разная история:
+#
+#   рерайт — публичный прогресс в своей SQLite, сырой лог ФАЙЛОМ на диске
+#            (`rewrite/server.py: _raw_log_path`, «наружу не отдаётся никогда»).
+#            По HTTP сырого лога нет вовсе: и `GET /jobs/{id}`, и
+#            `GET /api/v1/jobs/{id}?include_log=true` отдают ту самую колонку `log`,
+#            то есть уже переведённый E-NET. Звать их за причиной бессмысленно —
+#            получим ровно то, от чего убегаем;
+#   Cover  — весь лог целиком в своей SQLite и целиком же в `GET /jobs/{id}`
+#            (`_job_public_dict`, поле `log`); никакого файла у него нет.
+#
+# Поэтому путь один на обоих и состоит из двух шагов, и оба нужны:
+#   1. спрашиваем у соседа `GET /jobs/{id}` КУКОЙ ВОШЕДШЕГО. Это одновременно
+#      проверка прав (сосед сам знает, чья это задача, и отвечает 403/404 — пульт
+#      её не повторяет и не может ослабить, как и в `/ui/files`), номер владельца
+#      для пути к файлу и готовый запасной лог;
+#   2. если у сервиса есть файл сырого лога и он читается — отдаём его хвост.
+#
+# Так ручка работает в обоих развёртываниях. В одном процессе (`web/platform.py`,
+# `dev/run.sh` — один порт на всё) файл лежит рядом и виден шагу 2. Разнесённые по
+# машинам, шаг 2 файла не находит — и тогда отдаётся то, что дал шаг 1, с прямо
+# сказанным «это публичный лог, настоящий остался на машине рерайта, вот путь».
+# Молча подсунуть публичный лог вместо сырого нельзя: это и есть исходная ловушка.
+LOG_TAIL_DEFAULT = 64 * 1024     # хвоста в 64 КБ хватает на причину падения
+LOG_TAIL_MAX = 512 * 1024        # потолок: лог задачи растёт до 20 МБ (JOB_LOG_MAX_BYTES)
+# Тот же каталог и те же правила имени, что у рерайта (`rewrite/server.py`): вторая
+# «правда» о том, где лежит лог, разошлась бы с первой на первой же смене переменной.
+REWRITE_LOG_DIR = (os.environ.get("REWRITE_JOB_LOG_DIR")
+                   or os.path.join(BASE, "rewrite", "job_logs"))
+_LOG_NAME_BAD = re.compile(r"[^A-Za-z0-9_.-]")
+
+
+def _log_part(value: str, default: str) -> str:
+    """Кусок пути к логу — ровно как его строит рерайт, плюс запрет на «..».
+
+    Рерайт чистит имя от всего, кроме `[A-Za-z0-9_.-]`, — точки при этом остаются, то
+    есть `..` его чистку переживает. У него это безопасно (имя приходит из его же базы),
+    у нас номер задачи приходит из URL, и повторять чужую выкладку буквально мы не
+    обязаны: на выходе имя, которое не умеет выводить из каталога логов.
+    """
+    part = _LOG_NAME_BAD.sub("_", str(value or ""))[:64] or default
+    return default if part in (".", "..") else part
+
+
+def _redact_log(text: str) -> tuple:
+    """Секреты из лога вон. Возвращает (текст, чем чистили).
+
+    Сырой лог рерайта уже почищен на записи (`redact_server_credentials`), но только от
+    СВОИХ серверных ключей. В логе задачи бывает и ответ провайдера с нашим же ключом, и
+    свой ключ пользователя (BYOK), и подписанный URL, а обрезанный по дороге ключ
+    («огрызок») точную замену переживает — ровно для этого в кабинете есть
+    `_redact_worker_output` с `_cut_secret_prefixes`. Гоним хвост через него вторым
+    проходом: редактура, которая иногда не применяется, защитой не является.
+
+    Сетка по образцу (`pub_calls.default_redactor`) идёт ВСЕГДА и последней. Она не
+    знает значений ключей, зато не зависит от того, поднят ли кабинет, — а не поднят он
+    ровно в том режиме (пульт отдельным процессом), где лог и смотрят руками.
+    """
+    text = str(text or "")
+    exact = True
+    try:
+        text = _cabinet()._redact_calls_error(text)
+    except Exception:                                            # noqa: BLE001
+        # Кабинет не поднят или редактура сломалась. Лог всё равно показываем: он для
+        # того и нужен, чтобы видеть причину. Но говорим, чем именно чистили.
+        exact = False
+    text = pub_calls.default_redactor(text)
+    return text, ("точная и по образцу" if exact else "только по образцу")
+
+
+def _tail_file(path: str, limit: int) -> dict:
+    """Хвост файла с потолком. Только чтение, целую строку, без падений.
+
+    Первую строку хвоста отбрасываем, если обрезали не по границе: половина строки в
+    начале лога выглядит как отдельное сообщение и врёт про причину.
+    """
+    size = os.path.getsize(path)
+    start = max(0, size - limit)
+    with open(path, "rb") as fh:
+        fh.seek(start)
+        raw = fh.read()
+    text = raw.decode("utf-8", "replace")
+    if start and "\n" in text:
+        text = text.split("\n", 1)[1]
+    return {"text": text, "bytes": size, "cut": start > 0}
+
+
+@app.get("/ui/jobs/{service}/{job_id}/log")
+def ui_job_log(service: str, job_id: str, request: Request, tail: int = 0):
+    """Настоящий лог задачи соседа — тот, где написана причина, а не её код.
+
+    Только чтение: ручка ничего не запускает, не повторяет и не стоит денег, поэтому
+    её можно дёргать сколько угодно, в том числе у идущей задачи.
+
+    `tail` — сколько байт хвоста вернуть (по умолчанию 64 КБ, потолок 512 КБ). Обрезка
+    названа в ответе своим именем (`truncated`, `total_bytes`): молчаливый хвост
+    заставляет искать в логе то, чего в выдаче нет. `bytes` и `total_bytes` — оба в
+    БАЙТАХ, а не в знаках: лог русский, в UTF-8 это два байта на букву, и «отдали 6395
+    из 9174» с разными единицами выглядело бы как потеря трети лога.
+    """
+    base = RESULT_BASES.get(service)
+    if not base:
+        raise HTTPException(404, f"нет сервиса «{service}»")
+    limit = max(4096, min(int(tail or LOG_TAIL_DEFAULT), LOG_TAIL_MAX))
+    # Шаг 1. Права, владелец и запасной лог — одним вопросом у самого соседа.
+    # `safe=""` — слэш в номере задачи тоже кодируем: иначе «a/b» ушло бы соседу
+    # отдельным сегментом пути и спросило бы у него не ту ручку.
+    code, job = _proxy_get(base, f"/jobs/{urllib.parse.quote(job_id, safe='')}",
+                           getattr(request.state, "sid", ""))
+    if code >= 400:
+        raise HTTPException(_pass_code(code), job)
+    if not isinstance(job, dict):
+        raise HTTPException(502, f"сервис «{service}» ответил не задачей")
+    out = {"service": service, "job_id": job_id,
+           "status": str(job.get("status") or ""),
+           "error": _short(job.get("error") or "", 300),
+           "source": "", "why": "", "problem": "", "path": "",
+           "text": "", "bytes": 0, "chars": 0, "total_bytes": 0, "truncated": False,
+           "redacted": ""}
+    # Шаг 2. Файл сырого лога — он есть только у рерайта и только на его машине.
+    path = ""
+    if service == "rewrite":
+        path = os.path.join(REWRITE_LOG_DIR,
+                            _log_part(job.get("user_id"), "anon"),
+                            _log_part(job_id, "job") + ".log")
+        out["path"] = path
+    if path and os.path.isfile(path):
+        try:
+            got = _tail_file(path, limit)
+        except OSError as exc:
+            # Внятно, а не пустотой: человек должен понимать, идти ли ему на машину
+            # рерайта руками или файла там и нет.
+            out["problem"] = (f"сырой лог есть, но не прочитан ({type(exc).__name__}): "
+                              f"{path}")
+        else:
+            out.update(source="raw", text=got["text"], total_bytes=got["bytes"],
+                       truncated=got["cut"],
+                       why="сырой лог задачи с диска — то, что писал сам пайплайн")
+    if not out["source"]:
+        # Запасной путь: публичный лог из ответа соседа. Для Cover он же и
+        # единственный — и он же полный: публичного фильтра у Cover нет.
+        text = str(job.get("log") or job.get("log_tail") or "")
+        # Размер меряем ДО обрезки: `total_bytes` отвечает на вопрос «сколько всего
+        # лога», и посчитанный после хвоста он всегда равнялся бы самому хвосту, то
+        # есть `truncated: true` при равных числах — ложь на ровном месте.
+        whole = len(text.encode("utf-8"))
+        if len(text) > limit:
+            text, out["truncated"] = text[-limit:], True
+        out.update(source=("service" if service == "cover" else "public"),
+                   text=text, total_bytes=whole)
+        out["why"] = ("лог задачи, как его отдаёт Cover: у него он один и не фильтруется"
+                      if service == "cover" else
+                      "ПУБЛИЧНЫЙ лог: настоящая причина заменена кодом (E-NET, E-TIMEOUT "
+                      "и т. п.). Сырой лежит файлом на машине рерайта — "
+                      f"{out['path'] or REWRITE_LOG_DIR}")
+        if service == "rewrite" and not out["problem"]:
+            out["problem"] = ("файла сырого лога здесь нет: либо рерайт работает на "
+                              "другой машине, либо задача ещё ничего не писала")
+    if not out["text"]:
+        # Пустой ответ сам по себе ничего не объясняет: «ничего не показали» и «нечего
+        # показывать» человек различить не может, а разница между ними — это разница
+        # между «ищи дальше» и «задача ещё не начиналась».
+        out["problem"] = ((out["problem"] + ". ") if out["problem"] else "") + \
+            "лог пуст: задача ещё не начиналась или ничего не записала"
+    out["text"], out["redacted"] = _redact_log(out["text"])
+    # Причину отказа сосед отдаёт отдельным полем, и это тоже текст провайдера — путь
+    # в обход редактуры был бы ровно той дырой, ради которой она здесь стоит.
+    out["error"] = _redact_log(out["error"])[0]
+    out["bytes"] = len(out["text"].encode("utf-8"))
+    out["chars"] = len(out["text"])
+    return out
 
 
 # ────────────────────────── пресеты: копия и удаление ──────────────────────────
@@ -5249,6 +5953,19 @@ def ui_project(pid: str):
         except FileNotFoundError:
             source = ""
     groups = _project_files(mod, pid)
+    # Из чего проект делается — рядом с самим сценарием: поле источника на экране одно
+    # (заявка владельца 20.09.2026), и собирать его из двух ответов было бы странно.
+    # Отдельное короткое соединение, потому что сценарий читается уже после того, как
+    # первое закрыто, а знать его размер `origin` обязан.
+    origin = {}
+    try:
+        c2 = db()
+        try:
+            origin = _project_origin(c2, pid, source)
+        finally:
+            c2.close()
+    except (HTTPException, sqlite3.Error):
+        origin = {}
     return {
         "project": {"id": p["id"], "name": p["name"] or p["id"],
                     "status": p["status"] or "", "created": p["created"],
@@ -5257,6 +5974,7 @@ def ui_project(pid: str):
                     "phase": (rel["phase"] if rel else ""),
                     "stage": stage, "applied_preset": applied_preset},
         "ready": st, "jobs": jobs, "files": groups, "paid": paid, "source": source,
+        "origin": origin,
         # Ссылки на файлы и архивы — кабинета: он отдаёт их с проверкой, что путь
         # не выводит за пределы проекта, и с миниатюрами по ?w=.
         "file_base": f"/p/{urllib.parse.quote(pid)}/file/",
@@ -5497,6 +6215,12 @@ class BatchIn(BaseModel):
 #
 # Нет ни того, ни другого — по проекту честный отказ с причиной. Подставлять чужой
 # источник нельзя: пачка тем и опасна, что одна ошибка уезжает сразу во все проекты.
+#
+# С 20.09.2026 есть и ТРЕТЬЯ запись — ссылка, которую человек сам задал на экране
+# проекта (`project_origin`, см. комментарий у таблицы). Пачка её НЕ берёт, и это
+# решение не принято, а отложено: правило «источник берёт пачка из выпуска» принимал
+# владелец, а здесь платный заказ сразу на двадцать проектов. Понадобится — вопрос
+# ставится владельцу отдельно, а не решается тихой правкой приоритета.
 
 
 # Сколько проектов берём за одно нажатие. Это не вкус: за каждый проект пульт ходит в
@@ -5955,6 +6679,11 @@ def _batch_text_plan(c, sid: str, mod, pid: str, *, where: str, repl_url: str,
     else:
         url = repl_url
         if url:
+            # Та же потеря, что была на экране проекта: ссылку из карточки пачки тоже
+            # никто не записывал, и проект после пакетного заказа не знал, из чего он
+            # сделан. Запоминаем её в `_batch_text_order` — после удачного заказа, а не
+            # здесь: сухой прогон ничего записывать не должен.
+            item["_url"] = url
             item.update(source="replacement-url", replaced=True,
                         source_note=f"ссылка карточки {_short(url)}")
         else:
@@ -6078,6 +6807,10 @@ def _batch_text_order(c, sid: str, item: dict) -> None:
         pub_calls.mark_ordered(c, one["call_id"], job_id)
     c.commit()
     _link_project_jobs(pid, "rewrite", out)
+    if item.get("_url"):
+        # Ссылка карточки — это явный выбор источника для ЭТОГО проекта, и после
+        # оплаты он обязан остаться записанным: экран проекта показывает её же.
+        _origin_link(pid, item["_url"], ordered=True)
     item.update(action="ordered", job_id=job_id, why="")
 
 
@@ -6093,9 +6826,11 @@ def ui_projects_batch_text(body: BatchTextIn, request: Request):
     `dry_run` — сухой прогон: тот же разбор, но без сети и без постановки. Им экран
     показывает «уйдёт в работу N проектов» и спрашивает подтверждение.
 
-    Режима «с нуля по теме» тут нет намеренно: тема — это не источник проекта, её в
-    проекте не записано, и брать её пачке неоткуда. Такие задачи ставятся поштучно
-    на экране текста.
+    Режима «с нуля по теме» тут по-прежнему нет. С 20.09.2026 тема у проекта
+    записывается (`project_origin`), то есть «брать неоткуда» больше не довод, — но
+    генерация требует брифа, а бриф у проектов пачки разный и в проекте не хранится.
+    Ставить пачкой по теме или нет — решение владельца, пока не принятое; поштучно это
+    делает экран текста.
     """
     sid = getattr(request.state, "sid", "")
     pids = _batch_pids(body)
@@ -6160,6 +6895,7 @@ def ui_projects_batch_text(body: BatchTextIn, request: Request):
                 item.pop("_text", None)
                 item.pop("_parts", None)
                 item.pop("_model", None)
+                item.pop("_url", None)
                 items.append(item)
     finally:
         c.close()
@@ -6593,16 +7329,69 @@ def ui_project_stage_start(pid: str, kind: str, body: StageStartIn, request: Req
 
 
 class SourceIn(BaseModel):
-    text: str = ""
+    # `None` означает «этого не присылали и трогать не надо». Пустая строка — это
+    # ЗНАЧЕНИЕ: «очистить». Разница важна, потому что одно поле экрана теперь умеет
+    # сохранять и сценарий, и ссылку, и старые вызовы (только `text`) обязаны работать
+    # как раньше.
+    text: str | None = None
+    link: str | None = None          # ссылка донора: "" — забыть её
+    file: str = ""                   # имя файла, из которого человек взял сценарий
 
 
 @app.post("/ui/projects/{pid}/source")
 def ui_project_source_save(pid: str, body: SourceIn, request: Request):
-    """Сохранить текст сценария (`source.txt`) — и «Сохранить текст», и «Взять в
-    проект» (текст рерайта, уже полученный клиентом отдельным запросом)."""
-    _cabinet_form(f"/api/projects/{pid}/source", [("source", body.text)], request,
-                 expect_json=False)
-    return {"ok": True}
+    """Сохранить источник проекта: сценарий (`source.txt`), ссылку донора или оба.
+
+    Сценарий уходит в кабинет его же ручкой — и «Сохранить текст», и «Взять в проект»
+    (текст рерайта, уже полученный клиентом отдельным запросом). Ссылка живёт у пульта
+    (`project_origin`): в настройках проекта ей не место, см. комментарий у таблицы.
+
+    Чего этот вызов НЕ делает: сохранение сценария не меняет пометку «чем пользовались
+    последним». Проект, сделанный по ссылке донора, остаётся сделанным по ней и после
+    того, как рерайт «взят в проект», — иначе ссылка пропала бы с экрана ровно в тот
+    момент, когда работа по ней удалась. Пометку двигает только явный выбор источника:
+    ссылка, тема, файл.
+    """
+    if body.text is None and body.link is None:
+        raise HTTPException(400, "нечего сохранять: ни текста, ни ссылки")
+    link = None if body.link is None else body.link.strip()
+    if link:
+        seen = detect_source(link)
+        if seen["kind"] != "link":
+            # Здесь можно отказывать строго: сохранение ничего не стоит, а молча
+            # записать текст в поле ссылки значит показать его потом как донора.
+            raise HTTPException(400, seen["problem"]
+                                or f"в поле ссылки не ссылка, а {seen['title']}")
+    c = db()
+    try:
+        _project_or_404(c, pid)
+        was = (_origin_read(c, pid).get("kind") or "").strip()
+    finally:
+        c.close()
+    known = bool(was)
+    if body.text is not None:
+        _cabinet_form(f"/api/projects/{pid}/source", [("source", body.text)], request,
+                      expect_json=False)
+        name = (body.file or "").strip()
+        if name:
+            # Файл — это выбор источника: человек показал, ОТКУДА взят сценарий.
+            # Содержимое при этом уже уехало в `source.txt`, второй копии не заводим —
+            # помним только имя, чтобы экран мог сказать, откуда текст.
+            _origin_write(pid, kind="file", file_name=_short(name, 120))
+        elif not known:
+            _origin_write(pid, kind="text")
+    if link:
+        _origin_link(pid, link)
+    elif link == "":
+        # Пустая строка пришла явно — «забыть ссылку». Заказы по ней уже стоят, и
+        # трогать их нечем: забывается запись о доноре, а не задача. Пометку источника
+        # сбрасываем только если она и была на ссылке: тему и файл чистка ссылки не
+        # касается, а пустую пометку `_project_origin` заполнит сам.
+        fields = {"donor_url": "", "video_id": "", "ordered": 0.0}
+        if was == "link":
+            fields["kind"] = ""
+        _origin_write(pid, **fields)
+    return {"ok": True, "origin": _project_origin_now(pid)}
 
 
 class PresetApplyIn(BaseModel):

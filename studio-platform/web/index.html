@@ -317,6 +317,19 @@
                cursor:pointer;transition:all .12s}
   .langs label:hover{border-color:var(--acc)}
   .langs label.on{background:var(--acc-dim);border-color:var(--acc);color:var(--acc-hi)}
+  /* Своя кнопка выбора файла (заявка владельца 20.09.2026: «а файл сделать кастомную
+     кнопку upload как в муи, а не дефолтную»). Сам <input type=file> остаётся и
+     остаётся достижимым с клавиатуры: он не display:none, а сведён в точку —
+     display:none выкинул бы его из обхода Tab, и файл нельзя было бы выбрать без
+     мыши. Рамку фокуса за невидимый input рисует видимая кнопка (:focus-within). */
+  .filepick{display:inline-flex;align-items:center;position:relative}
+  .filepick input[type=file]{position:absolute;width:1px;height:1px;opacity:0;padding:0;
+         border:0;overflow:hidden;clip:rect(0 0 0 0);clip-path:inset(50%);white-space:nowrap}
+  .filepick .pickbtn{display:inline-block;background:transparent;color:var(--ink);
+         border:1px solid var(--line-2);border-radius:8px;padding:6px 13px;font-size:13px;
+         font-weight:650;letter-spacing:-.01em;cursor:pointer;transition:background .15s}
+  .filepick:hover .pickbtn{background:var(--card-2);color:var(--ink-hi)}
+  .filepick:focus-within .pickbtn{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-dim)}
   .modes{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
   .modes button{background:transparent;color:var(--muted);border:1px solid var(--line-2)}
   .modes button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
@@ -1696,7 +1709,8 @@ async function viewQueue(){
         <td class="st"><span class="pill ${STATE_CLS[r.state]}">${STATE_TITLE[r.state]}</span>
             ${r.progress != null ? `<div class="bar"><i style="width:${
               Math.round(r.progress * 100)}%"></i></div>` : ''}
-            ${whyHtml(r)}</td>
+            ${whyHtml(r)}
+            ${jobLogBtnHtml(r.service, r.id, r.state)}</td>
         <td class="muted">${when(r.created)}</td>
         <td class="acts">${actions(r)}</td>
       </tr>`).join('')}</tbody></table></div>`);
@@ -2781,6 +2795,94 @@ function toggleJobLog(tr, btn){
   startJobLogPoll(jid, tr.nextElementSibling.querySelector('pre'));
 }
 
+/* ── Сырой лог задачи соседа: причина, а не её код ────────────────────────────────
+   Просьба владельца 20.09.2026, дословно: «можем добавить лог?». В тот день он
+   полтора часа чинил интернет, которого не ломал: заказ текста трижды падал с
+   «Ошибка: сеть недоступна (E-NET)», а настоящая причина — не найденная связка
+   сертификатов — лежала в СЫРОМ логе задачи рерайта и наружу не выходила: публичный
+   фильтр соседа заменяет текст исключения кодом. Сырой лог отдаёт
+   `GET /ui/jobs/{service}/{id}/log`, и он ТОЛЬКО ЧИТАЕТ: ничего не запускает, не
+   повторяет и не стоит денег. Поэтому кнопку можно нажимать сколько угодно — в том
+   числе у идущей задачи, — и «Обновить» в окне тоже.
+   Ручка есть только у соседей: у задач кабинета лог свой (`/ui/jobs/{id}/logs`,
+   кнопка «лог» с раскрытием строки), и подменять одно другим нельзя. */
+const JOB_LOG_SVC = {rewrite: 'Текст', cover: 'Обложки'};
+
+/* Кнопка стоит в клетке СОСТОЯНИЯ — рядом с той самой подменённой причиной («сеть
+   недоступна (E-NET)»): туда человек смотрит, когда задача упала, там же он будет
+   искать, что случилось на самом деле. У упавшей кнопка сплошная и заметная, у
+   остальных — тихая, рамкой: у идущей лог смотрят «как оно там», у упавшей он первое,
+   что нужно. */
+function jobLogBtnHtml(service, id, state){
+  if (!JOB_LOG_SVC[service] || !id) return '';
+  return `<button class="${state === 'error' ? '' : 'ghost '}small joblog"
+    data-service="${esc(service)}" data-job="${esc(id)}"
+    style="margin-top:8px">Показать лог</button>`;
+}
+
+/* Одним слушателем на весь документ, а не onclick на каждую кнопку: строки очереди и
+   списков задач дорисовываются тиком опроса (`syncJobsTable`) уже после того, как
+   экран собран, — поимённая привязка пропустила бы ровно ту строку, за которой сейчас
+   следят. */
+document.addEventListener('click', ev => {
+  const btn = ev.target.closest && ev.target.closest('button.joblog');
+  if (btn) showJobLog(btn.dataset.service, btn.dataset.job);
+});
+
+function jobLogBodyHtml(d){
+  const parts = [];
+  // Откуда лог — ПЕРВОЙ строкой и всегда. Если это не сырой файл, а публичный
+  // пересказ, говорим это громко: в нём причина снова заменена кодом, и человек,
+  // приняв код за причину, второй раз пойдёт чинить не то. Ровно от этого вся правка.
+  const raw = (d.source === 'raw');
+  parts.push(`<div class="note ${raw ? 'muted' : 'warn'}">${esc(d.why || (raw
+    ? 'сырой лог задачи с диска'
+    : 'это НЕ сырой лог задачи: настоящая причина в нём могла быть заменена кодом'))
+    }</div>`);
+  if (d.problem) parts.push(`<div class="note warn">${esc(d.problem)}</div>`);
+  if (d.error) parts.push(`<div class="note bad">Сосед о задаче: ${esc(d.error)}</div>`);
+  // Обрезку называем обрезкой: молчаливый хвост заставляет искать в логе то, чего в
+  // показанном куске нет.
+  if (d.truncated) parts.push(`<div class="note muted">Показан только конец лога — ${
+    size(d.bytes)} из ${size(d.total_bytes)}. Начало осталось в файле${
+    d.path ? ': ' + esc(d.path) : ''}.</div>`);
+  parts.push(d.text
+    ? `<pre class="mono jl-text" style="white-space:pre-wrap;max-height:52vh;overflow:auto;
+        background:var(--card-2);border-radius:8px;padding:10px;margin:8px 0 0">${
+        esc(d.text)}</pre>`
+    : '<div class="empty">Показывать нечего.</div>');
+  if (d.text && d.redacted)
+    parts.push(`<div class="note muted">Ключи и токены из лога вырезаны (${
+      esc(d.redacted)}).</div>`);
+  return parts.join('');
+}
+
+async function showJobLog(service, jobId){
+  // «Обновить» вместо «Сохранить»: окно ничего не меняет, а у идущей задачи лог
+  // дописывается — перечитать его стоит ноль.
+  const m = modal(`Лог задачи · ${JOB_LOG_SVC[service] || service} · ${jobId}`,
+    '<div class="muted">Читаем лог…</div>',
+    {ok: 'Обновить', no: 'Закрыть', onOk: () => load()});
+  const load = async () => {
+    try{
+      const d = await api(`/ui/jobs/${encodeURIComponent(service)}/${
+        encodeURIComponent(jobId)}/log`);
+      if (!m.el.isConnected) return;               // окно закрыли, пока лог ехал
+      m.body.innerHTML = jobLogBodyHtml(d);
+      // Причина всегда в конце лога — показываем конец, а не начало.
+      const pre = m.body.querySelector('.jl-text');
+      if (pre) pre.scrollTop = pre.scrollHeight;
+    }catch(e){
+      if (!m.el.isConnected) return;
+      m.body.innerHTML = `<div class="note bad">Лог не прочитался: ${esc(e.message)}</div>
+        <div class="note muted">Чтение лога бесплатно и ничего не запускает —
+          «Обновить» можно нажать ещё раз.</div>`;
+    }
+  };
+  await load();
+  return m;
+}
+
 // Строка задачи: состояние, прогресс, ошибка, «с какими настройками пошла» (снимок
 // момента постановки — правило 6 ТЗ, `j.applied`), отменить/повторить и раскрывающийся
 // лог. review-feedback-F4 цикл 1, Issue 5: старый «Обзор» умел всё это через
@@ -2950,10 +3052,18 @@ async function renderStageTab(d, tab){
 // список — по аккаунту, а не по проекту; задача, созданная тут же, — первой в списке.
 // Опрос переиспользует LOG_TIMERS/clearAllLogTimers (тот же реестр, что у раскрытого
 // лога задачи выше) — останавливается сам при уходе со страницы (смене hash).
+// Состояние вкладки переживает перерисовку экрана (viewProject вызывается после
+// каждого действия), поэтому набранное человеком тут и хранится. `any: null` — это
+// «на вкладку ещё не заходили»: в этом случае поле источника заполняется тем, что
+// записано у проекта, а дальше уже не перетирается (иначе правка пропадала бы от
+// любой перерисовки). Режимов теперь два: `auto` — одно поле на ссылку и текст,
+// `topic` — с нуля по теме, где источника нет вовсе.
 const SCEN_STATE = {};
 function scenState(pid){
-  if (!SCEN_STATE[pid]) SCEN_STATE[pid] = {mode: 'link', langs: new Set(),
-                                           model: '', preset: '', lastJob: null};
+  if (!SCEN_STATE[pid]) SCEN_STATE[pid] = {mode: 'auto', langs: new Set(),
+                                           model: '', preset: '', lastJob: null,
+                                           any: null, topic: '', fileName: '',
+                                           fileText: '', seen: null, seenFor: null};
   return SCEN_STATE[pid];
 }
 // Терминальные состояния СПИСКА задач Rewrite/Cover (не `queue_tasks` кабинета —
@@ -3001,12 +3111,16 @@ function wireProjectJobRows(root, service, colspan, paint){
 
 // Ячейка «Состояние» строки списка задач Rewrite/Cover — общая для первой отрисовки
 // таблицы и для точечного обновления тиком опроса (`syncJobsTable`), чтобы обе
-// рисовали её одинаково.
-function jobListStateCellHtml(j){
+// рисовали её одинаково. `service` — чья это задача: от него зависит кнопка лога, и
+// передаёт его ВЫЗЫВАЮЩИЙ, а не догадка по виду строки. Тик тоже обязан передать его:
+// он перерисовывает эту ячейку целиком, и без него кнопка пропадала бы с первым же
+// изменением состояния — то есть ровно в тот миг, когда задача упала.
+function jobListStateCellHtml(j, service){
   return `<span class="pill ${STATE_CLS[j.state]}">${STATE_TITLE[j.state]}</span>
     ${j.detail ? `<div class="muted" style="margin-top:4px">${esc(j.detail)}</div>` : ''}
     ${j.progress != null ? `<div class="bar"><i style="width:${
-      Math.round(j.progress * 100)}%"></i></div>` : ''}`;
+      Math.round(j.progress * 100)}%"></i></div>` : ''}
+    ${jobLogBtnHtml(service, j.id, j.state)}`;
 }
 // Тик опроса списка задач Rewrite/Cover (review-feedback-F4 цикл 3, Issue 1): не
 // перестраивает таблицу через `box.innerHTML` — это стирало бы раскрытые result-row и
@@ -3045,7 +3159,7 @@ function syncJobsTable(box, jobs, service, rowHtml, colspan, paint){
     if (tr.dataset.print === jobRowPrint(j)) return;   // ни состояние, ни прогресс, ни подпись не изменились
     const wasTerminal = JOB_LIST_TERMINAL.has(tr.dataset.state);
     const cell = tr.querySelector('.jl-state');
-    if (cell) cell.innerHTML = jobListStateCellHtml(j);
+    if (cell) cell.innerHTML = jobListStateCellHtml(j, service);
     tr.dataset.state = j.state;
     tr.dataset.print = jobRowPrint(j);
     const key = service + ':' + id;
@@ -3099,7 +3213,7 @@ function scenJobRowHtml(j){
         <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
     <td>${j.kind === 'generation' ? 'с нуля' : 'рерайт'}</td>
     <td>${(Array.isArray(j.langs) ? j.langs : [j.langs]).map(esc).join(', ') || '—'}</td>
-    <td class="jl-state">${jobListStateCellHtml(j)}</td>
+    <td class="jl-state">${jobListStateCellHtml(j, 'rewrite')}</td>
     <td class="muted">${when(j.created)}</td>
   </tr>`;
 }
@@ -3167,20 +3281,99 @@ async function renderScenarioTab(d){
   const st = scenState(p.id);
   const td = await api('/ui/text');
   if (!st.model && td.models.length) st.model = td.models[0].value;
+  // Режим «с нуля по теме» — единственный, который остаётся ОТДЕЛЬНЫМ: там нет
+  // источника вообще, есть тема и бриф. Название и пояснение берутся у сервера
+  // (TEXT_MODES), чтобы слова были одни и те же и здесь, и на #/text.
+  const topicMode = (td.modes || []).find(m => m.key === 'topic')
+                 || {title: 'С нуля по теме', note: 'текста нет, есть тема и бриф'};
 
-  // 1. Действие: «Получить текст» (три режима TEXT_MODES — та же форма, что у
-  // #/text) + список задач текста этого проекта + textarea с source.txt.
+  // 1. «Откуда взять сценарий» — ОДИН блок в начале вкладки (жалоба владельца
+  // 20.09.2026: «сверху ссылка на донора, а потом снизу висит исходный текст
+  // какой-то»). Раньше выбор источника был разорван: ссылка/тема — сверху карточки
+  // «Действие», вставленный текст — врезкой в самом её низу, и связи между ними
+  // человек не видел.
+  //
+  // Поле источника теперь одно на ссылку и на текст («желательно чтобы в строку он и
+  // текст и ссылку распознавал»), а решает, что именно вставили, СЕРВЕР —
+  // POST /ui/source/detect. Свои правила разбора в браузере рано или поздно
+  // разошлись бы с серверными, и разошлись бы на платном заказе.
+  //
+  // Смыслы при этом не свалены в кучу: «Сохранить сценарий»/«Запомнить ссылку» —
+  // бесплатно и сразу, «Получить текст» — платный заказ у рерайта. Что произойдёт по
+  // нажатию, написано рядом с каждой кнопкой ДО нажатия.
+  let origin = d.origin || {};
+  if (st.any === null){
+    // Первый заход на вкладку: поле заполняется тем, что записано у проекта — это
+    // вторая половина жалобы «ссылку на донора не сохранило».
+    st.mode = (origin.kind === 'topic') ? 'topic' : 'auto';
+    st.topic = (origin.kind === 'topic') ? (origin.value || '') : '';
+    // Сценарий (kind=text|file) в поле источника НЕ дублируется: он и так ниже,
+    // целиком и с правкой. Вторая копия того же текста — ровно та путаница, на
+    // которую жаловались.
+    st.any = (origin.kind === 'link') ? (origin.value || '') : '';
+  }
+
   const card = $(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Действие</div>
+    <div class="sec">Откуда взять сценарий</div>
     <div class="secbody">
-    <div class="note muted" style="margin-bottom:6px">Получить текст</div>
-    <div class="modes">${td.modes.map(m => `<button type="button" data-mode="${
-      esc(m.key)}" class="${m.key === st.mode ? 'on' : ''}">${esc(m.title)}</button>`
-      ).join('')}</div>
-    <div class="note muted" id="tx-note"></div>
-    <label class="k" style="display:block;margin-bottom:6px" id="tx-label"></label>
-    <input id="tx-one" style="width:100%;box-sizing:border-box">
-    <textarea id="tx-many"></textarea>
+    <div style="display:flex;gap:10px;align-items:baseline;flex-wrap:wrap">
+      <div class="note muted" id="or-now" style="margin-top:0"></div>
+      <button type="button" class="ghost small" id="or-forget" hidden>Забыть ссылку</button>
+    </div>
+    <div class="note muted" id="or-release" hidden></div>
+    <div class="modes" style="margin-top:12px">
+      <button type="button" data-mode="auto" class="${st.mode === 'topic' ? '' : 'on'}"
+        >Ссылка или готовый текст</button>
+      <button type="button" data-mode="topic" class="${st.mode === 'topic' ? 'on' : ''}"
+        >${esc(topicMode.title)}</button>
+    </div>
+
+    <div id="tx-auto">
+      <label class="k" for="tx-any" style="display:block;margin-bottom:6px">Ссылка на
+        ролик-донор или готовый текст сценария — в одно поле</label>
+      <textarea id="tx-any" rows="1" style="min-height:0"
+        placeholder="https://www.youtube.com/watch?v=… — или вставьте сюда сам текст"
+        >${esc(st.any)}</textarea>
+      <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <label class="filepick">
+          <span class="pickbtn">Выбрать файл .txt</span>
+          <input id="src-file" type="file" accept=".txt,text/plain">
+        </label>
+        <span class="muted" id="tx-fname" style="font-size:12.5px"></span>
+        <button type="button" class="ghost small" id="tx-fdrop" hidden>Убрать файл</button>
+      </div>
+      <div class="note" id="tx-seen"></div>
+    </div>
+
+    <div id="tx-topic-box" hidden>
+      <label class="k" for="tx-one" style="display:block;margin-bottom:6px">Тема</label>
+      <input id="tx-one" style="width:100%;box-sizing:border-box"
+        placeholder="О чём должен быть ролик" value="${esc(st.topic)}">
+      <div class="note muted">${esc(topicMode.note)}</div>
+    </div>
+
+    <div class="note muted" id="tx-keep-head" style="margin-top:16px;
+      border-top:1px solid var(--line);padding-top:12px">Бесплатно и сразу — сценарий
+      в самом проекте</div>
+    <div id="tx-keep-row" style="margin-top:8px;display:flex;gap:10px;align-items:center;
+      flex-wrap:wrap">
+      <button class="ghost" id="tx-keep">Сохранить сценарий</button>
+      <span class="muted" id="tx-keep-why" style="font-size:12.5px"></span>
+    </div>
+    <details id="src-box" style="margin-top:12px">
+      <summary class="muted" id="src-sum" style="cursor:pointer;font-size:12.5px"></summary>
+      <textarea id="src-text" style="margin-top:8px">${esc(d.source)}</textarea>
+      <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+        <button class="ghost" id="src-save">Сохранить текст</button>
+        <span class="muted" style="font-size:12.5px">правка уходит в сам проект
+          (source.txt) — то, что пойдёт в озвучку</span>
+      </div>
+      <div class="note muted">Edge режет текст по строкам/абзацам — короткие абзацы
+        могут потеряться при озвучке этим движком.</div>
+    </details>
+
+    <div class="note muted" style="margin-top:18px;border-top:1px solid var(--line);
+      padding-top:12px">Платно — заказать текст у рерайта</div>
     <div id="tx-preset-box" style="margin-top:10px">
       <label class="k" style="display:block;margin-bottom:6px">Бриф</label>
       <select id="tx-preset"><option value="">— выберите бриф —</option>
@@ -3198,40 +3391,289 @@ async function renderScenarioTab(d){
         data-code="${esc(l.code)}"><input type="checkbox"
         ${st.langs.has(l.code) ? 'checked' : ''}>${esc(l.title)}</label>`).join('')}</div>
     </div>
-    <div style="margin-top:12px"><button id="tx-go">Получить текст</button></div>
-    <div id="tx-jobs"></div>
-
-    <div class="note muted" style="margin-top:18px;border-top:1px solid var(--line);
-      padding-top:12px">Исходный текст</div>
-    <textarea id="src-text" style="margin-top:6px">${esc(d.source)}</textarea>
-    <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-      <button id="src-save">Сохранить текст</button>
-      <label class="muted" style="font-size:12.5px">или файлом:
-        <input id="src-file" type="file" accept=".txt,text/plain"></label>
+    <div class="note warn" id="tx-warn" hidden></div>
+    <div style="margin-top:12px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+      <button id="tx-go">Получить текст</button>
+      <span class="muted" id="tx-go-why" style="font-size:12.5px"></span>
     </div>
-    <div class="note muted">Edge режет текст по строкам/абзацам — короткие абзацы
-      могут потеряться при озвучке этим движком.</div>
+    <div id="tx-jobs"></div>
     </div></div>`);
   app.append(card);
 
+  const anyBox = card.querySelector('#tx-any');
   const one = card.querySelector('#tx-one');
-  const many = card.querySelector('#tx-many');
-  const presetBox = card.querySelector('#tx-preset-box');
-  const label = card.querySelector('#tx-label');
+  const seenNote = card.querySelector('#tx-seen');
+  const warnNote = card.querySelector('#tx-warn');
+  const keep = card.querySelector('#tx-keep');
+  const keepWhy = card.querySelector('#tx-keep-why');
+  const go = card.querySelector('#tx-go');
+  const goWhy = card.querySelector('#tx-go-why');
+  const srcBox = card.querySelector('#src-box');
   const srcText = card.querySelector('#src-text');
-  function paintMode(){
-    const m = st.mode;
-    label.textContent = m === 'link' ? 'Ссылка на ролик-донор'
-                      : m === 'text' ? 'Текст' : 'Тема';
-    one.hidden = (m === 'text');
-    many.hidden = (m !== 'text');
-    presetBox.hidden = (m !== 'topic');
-    one.placeholder = m === 'link' ? 'https://www.youtube.com/watch?v=…'
-                                   : 'О чём должен быть ролик';
-    const note = td.modes.find(x => x.key === m);
-    card.querySelector('#tx-note').textContent = note ? note.note : '';
+  const fname = card.querySelector('#tx-fname');
+  const fdrop = card.querySelector('#tx-fdrop');
+  const forget = card.querySelector('#or-forget');
+
+  // «Взять в проект» (готовый рерайт из списка задач) кладёт текст в эту же textarea.
+  // Она теперь внутри свёрнутого <details>, поэтому наружу отдаётся не она сама, а
+  // обёртка с тем же `value`: запись раскрывает блок и обновляет подпись — иначе
+  // человек не увидел бы, что текст приехал, и решил бы, что кнопка не сработала.
+  const scenarioBox = {
+    get value(){ return srcText.value; },
+    set value(v){ srcText.value = v; srcBox.open = true; paintScenario(); },
+  };
+
+  function paintScenario(){
+    const n = srcText.value.length;
+    const from = (origin.kind === 'file' && origin.file_name)
+      ? ` · из файла «${origin.file_name}»` : '';
+    card.querySelector('#src-sum').textContent = n
+      ? `Сценарий проекта — ${n} знаков${from} · показать и править`
+      : 'Сценария у проекта ещё нет · открыть и вписать вручную';
   }
-  paintMode();
+
+  // Что записано у проекта про источник — строкой над полем: откуда берётся сценарий, когда по
+  // этому источнику последний раз платили и не расходится ли он со ссылкой выпуска.
+  function paintOrigin(o){
+    if (o && typeof o === 'object' && Object.keys(o).length) origin = o;
+    const k = origin.kind || '';
+    let text;
+    if (k === 'link' && origin.donor_url) text = 'Записан донор: ' + origin.donor_url;
+    else if (k === 'topic' && origin.topic) text = 'Записана тема: ' + origin.topic;
+    else if (k === 'file') text = 'Сценарий взят из файла «'
+      + (origin.file_name || 'без имени') + '»';
+    else if (k === 'text') text = 'Сценарий вставлен текстом';
+    else text = 'Откуда берётся сценарий, у проекта пока не записано.';
+    // В одном поле `why` сервер склеивает до двух РАЗНЫХ мыслей: про источник в поле
+    // («по этой ссылке заказывали текст 20.09 19:41») и, если у выпуска канала своя
+    // ссылка, про неё («движок берёт её»). Вторую он приписывает последней, через
+    // «; », и ровно тогда, когда отдаёт непустой `release_url` (`_project_origin` в
+    // web/app.py). Печатать склейку целиком после ссылки выпуска, как было до
+    // 21.09.2026, значит приписать выпуску чужой заказ: человек читает «по ЭТОЙ ссылке
+    // заказывали», а платили по той, что в поле. Поэтому режем по последнему «; »:
+    // голова — строке источника, хвост — строке выпуска.
+    const why = origin.why || '';
+    let ownWhy = why, relWhy = '';
+    if (origin.release_url && why){
+      const cut = why.lastIndexOf('; ');
+      if (cut < 0){ ownWhy = ''; relWhy = why; }
+      else { ownWhy = why.slice(0, cut); relWhy = why.slice(cut + 2); }
+    }
+    if (ownWhy) text += ' — ' + ownWhy;
+    card.querySelector('#or-now').textContent = text;
+    // Две разные ссылки у одного проекта: кнопки этого экрана возьмут запомненную,
+    // а ночной движок — ссылку выпуска. Молчать об этом нельзя.
+    const rel = card.querySelector('#or-release');
+    rel.hidden = !origin.release_url;
+    rel.innerHTML = origin.release_url
+      ? `Ссылка выпуска канала: ${esc(origin.release_url)}`
+        + (relWhy ? `<div class="muted">${esc(relWhy)}</div>` : '')
+      : '';
+    // Забыть можно только СВОЮ запись. Ссылка выпуска живёт в плане канала: пульт её
+    // не заводил и стереть отсюда не может — кнопка там была бы обещанием впустую.
+    forget.hidden = !(origin.donor_url && origin.from !== 'release');
+    paintScenario();
+  }
+
+  // ── разбор поля: спрашиваем сервер, своих правил не заводим ──────────────────
+  let seenTimer = null;
+  const currentSeen = () => (st.seen && st.seenFor === anyBox.value) ? st.seen : null;
+
+  function paintSeen(){
+    const seen = currentSeen();
+    if (!seen){
+      seenNote.className = 'note muted';
+      seenNote.textContent = anyBox.value.trim()
+        ? 'разбираем, что это…'
+        : 'ссылка на ролик-донор или текст сценария — что именно, определит сервер';
+    }else if (!seen.mode){
+      seenNote.className = 'note bad';
+      seenNote.textContent = 'Так заказывать нельзя: ' + (seen.problem || seen.title);
+    }else{
+      seenNote.className = 'note muted';
+      seenNote.textContent = 'Распознано: ' + seen.title
+        + (seen.note ? ' — ' + seen.note : '');
+    }
+    const warn = (seen && seen.warn) ? seen.warn : '';
+    warnNote.hidden = !warn;
+    warnNote.textContent = warn;
+    paintActions();
+  }
+
+  async function askSeen(){
+    const asked = anyBox.value;
+    if (!asked.trim()){ st.seen = null; st.seenFor = null; paintSeen(); return null; }
+    try{
+      const out = await post('/ui/source/detect', {value: asked, project_id: p.id});
+      // Пока ответ шёл, человек мог допечатать: старый разбор относится к другому
+      // тексту, и показывать его — врать про то, что уедет по кнопке.
+      if (!card.isConnected || anyBox.value !== asked) return null;
+      st.seen = out; st.seenFor = asked;
+      paintSeen();
+      return out;
+    }catch(e){
+      if (!card.isConnected || anyBox.value !== asked) return null;
+      st.seen = null; st.seenFor = null;
+      seenNote.className = 'note bad';
+      seenNote.textContent = `Не удалось разобрать поле: ${e.message}. Разбор бесплатный `
+        + 'и ничего не заказывает — повторите ввод или обновите страницу.';
+      warnNote.hidden = true;
+      paintActions();
+      return null;
+    }
+  }
+
+  const ensureSeen = async () => currentSeen() || await askSeen();
+
+  function paintActions(){
+    const topic = (st.mode === 'topic');
+    const seen = currentSeen();
+    const langsOk = st.langs.size > 0;
+    const kind = seen ? seen.kind : '';
+    if (kind === 'link'){
+      keep.textContent = 'Запомнить ссылку';
+      keep.disabled = false;
+      keepWhy.textContent = 'ссылка запишется у проекта; текста это не создаёт и денег '
+                          + 'не стоит';
+    }else if (kind === 'text'){
+      keep.textContent = 'Сохранить сценарий';
+      keep.disabled = false;
+      keepWhy.textContent = `${seen.chars} знаков лягут в сценарий проекта — сразу и `
+                          + 'бесплатно, рерайт не зовём';
+    }else{
+      keep.textContent = 'Сохранить сценарий';
+      keep.disabled = true;
+      keepWhy.textContent = seen ? (seen.problem || '')
+        : (anyBox.value.trim() ? 'ждём разбор поля' : 'поле источника пустое');
+    }
+    go.disabled = topic ? !(langsOk && st.preset) : !(seen && seen.mode && langsOk);
+    let why;
+    if (topic){
+      why = !st.preset ? 'выберите бриф — без него с нуля не пишем'
+          : !langsOk ? 'выберите хотя бы один язык'
+          : 'модель напишет текст по теме и брифу — это платный вызов';
+    }else if (!seen){
+      why = anyBox.value.trim() ? 'ждём разбор поля' : 'заполните поле источника';
+    }else if (!seen.mode){
+      why = seen.problem || 'так заказывать нельзя';
+    }else if (!langsOk){
+      why = 'выберите хотя бы один язык';
+    }else{
+      why = seen.mode === 'link'
+        ? 'донор → субтитры → рерайт: создастся платная задача'
+        : 'текст уйдёт в рерайт как есть — это платный вызов';
+    }
+    goWhy.textContent = why;
+  }
+
+  // Поле по умолчанию — ОДНА строка (владелец просил дословно: «чтобы в строку он и
+  // текст и ссылку распознавал»), и растёт под содержимое: вставляют в него и ссылку
+  // в 40 знаков, и сценарий в 12 000 — одна высота не годится обоим. Отсюда `rows="1"`
+  // и `min-height:0` в разметке: без них браузер и общий стиль textarea держали бы
+  // высоту в несколько строк, что бы ни лежало в поле.
+  // Зовётся только когда поле ПОКАЗАНО: у скрытого scrollHeight равен нулю, и
+  // высота вышла бы нулевой. За показ отвечает `paintMode` — он же и меряет.
+  function grow(){
+    anyBox.style.height = 'auto';
+    anyBox.style.height = Math.min(anyBox.scrollHeight + 2, 320) + 'px';
+  }
+
+  function paintMode(){
+    const topic = (st.mode === 'topic');
+    card.querySelector('#tx-auto').hidden = topic;
+    card.querySelector('#tx-topic-box').hidden = !topic;
+    card.querySelector('#tx-preset-box').hidden = !topic;
+    card.querySelector('#tx-keep-head').hidden = topic;
+    // Не `hidden`: у строки свой inline display:flex, а он сильнее браузерного
+    // правила [hidden]{display:none} — с атрибутом строка так и осталась бы на
+    // экране. Проверено в браузере, поэтому здесь именно style.display.
+    card.querySelector('#tx-keep-row').style.display = topic ? 'none' : 'flex';
+    // Поле на экране — меряем и растим его ЗДЕСЬ, и только здесь: и при первой
+    // отрисовке, и при возврате из «с нуля по теме». Пока оно скрыто, мерить нечего
+    // (scrollHeight у скрытого ноль), а вкладка перерисовывается после каждого
+    // действия — и текст в поле переживает перерисовку, высота обязана тоже.
+    if (!topic) grow();
+    paintActions();
+  }
+
+  function paintFile(){
+    fname.textContent = st.fileName ? `файл: ${st.fileName}` : 'файл не выбран';
+    fdrop.hidden = !st.fileName;
+  }
+
+  function dropFile(silent){
+    const was = st.fileText;
+    st.fileName = ''; st.fileText = '';
+    paintFile();
+    if (silent) return;
+    if (anyBox.value === was){
+      anyBox.value = ''; st.any = ''; st.seen = null; st.seenFor = null;
+      grow();
+      paintSeen();
+      toast('Файл снят, поле очищено', 'ok');
+    }else{
+      // Текст правили руками после чтения файла — выкидывать правку молча нельзя.
+      toast('Файл снят. Текст в поле вы правили — он остался, его всё ещё можно '
+            + 'сохранить', 'ok');
+    }
+  }
+
+  anyBox.oninput = () => {
+    st.any = anyBox.value;
+    st.seen = null; st.seenFor = null;      // старый разбор — про другой текст
+    grow();
+    paintSeen();
+    clearTimeout(seenTimer);
+    seenTimer = setTimeout(askSeen, 300);   // разбор бесплатный, но дёргать на каждую букву незачем
+  };
+  one.oninput = () => { st.topic = one.value; };
+  fdrop.onclick = () => dropFile(false);
+
+  // Забыть записанную ссылку. Сервер это умеет с самого начала (пустая ссылка чистит
+  // запись), а экран такого запроса не слал — убрать записанного донора было нечем,
+  // только заменить его другим. Спрашиваем окном: другой копии ссылки у проекта нет,
+  // и «забыть» здесь значит «навсегда».
+  forget.onclick = () => confirmModal('Забыть записанную ссылку донора?',
+    'У проекта перестанет быть записан донор, и другой копии этой ссылки у него нет. '
+    + 'Уже поставленные по ней задачи останутся: забывается запись, а не задача.',
+    async () => {
+      try{
+        const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`,
+                               {link: ''});
+        paintOrigin(out.origin);
+        // Разбор поля заново НЕ спрашиваем, хотя ответ сервера теперь был бы другим:
+        // в нём висит предупреждение «по этой ссылке уже заказывали», и оно про
+        // потраченные деньги, а не про запись. Забыли мы запись — заказ остался, и
+        // снимать с человека это предупреждение было бы враньём в дорогую сторону.
+        toast('Ссылка забыта. В поле она осталась — «Запомнить ссылку» вернёт запись '
+              + 'обратно.', 'ok');
+      }catch(e){ toast(e.message); }
+    });
+
+  // Файл .txt читает БРАУЗЕР — серверу нужен текст, а не файл, и он уже едет тем же
+  // полем. TextDecoder с fatal — единственный способ отличить не-UTF-8 от кракозябр,
+  // которые иначе озвучат за деньги. Те же правила, что в карточках пакета.
+  card.querySelector('#src-file').onchange = async e => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    try{
+      const text = new TextDecoder('utf-8', {fatal: true}).decode(await file.arrayBuffer());
+      anyBox.value = text;
+      st.any = text;
+      st.fileName = file.name;
+      st.fileText = text;
+      paintFile();
+      grow();
+      paintSeen();
+      await askSeen();
+      toast(`Файл прочитан: ${text.length} знаков — проверьте и нажмите `
+            + '«Сохранить сценарий»', 'ok');
+    }catch(readErr){
+      toast(`Файл «${file.name}» не в UTF-8 — пересохраните его в этой кодировке. `
+            + 'Денег не потрачено: файл никуда не уходил.');
+    }finally{ e.target.value = ''; }
+  };
+
   card.querySelectorAll('.modes button').forEach(b => b.onclick = () => {
     st.mode = b.dataset.mode;
     card.querySelectorAll('.modes button').forEach(x => x.classList.toggle('on', x === b));
@@ -3240,57 +3682,122 @@ async function renderScenarioTab(d){
   card.querySelectorAll('#tx-langs label').forEach(l => {
     const box = l.querySelector('input');
     const sync = () => { l.classList.toggle('on', box.checked);
-      box.checked ? st.langs.add(l.dataset.code) : st.langs.delete(l.dataset.code); };
+      box.checked ? st.langs.add(l.dataset.code) : st.langs.delete(l.dataset.code);
+      paintActions(); };
     sync();
     box.onchange = sync;
   });
   card.querySelector('#tx-model').onchange = e => st.model = e.target.value;
-  card.querySelector('#tx-preset').onchange = e => st.preset = e.target.value;
+  card.querySelector('#tx-preset').onchange = e => { st.preset = e.target.value;
+    paintActions(); };
 
-  card.querySelector('#tx-go').onclick = async () => {
-    const btn = card.querySelector('#tx-go');
-    btn.disabled = true;
+  // Положить вставленный текст в сценарий проекта. Отдельной функцией, потому что
+  // зовётся из двух мест: сразу — когда затирать нечего, и из ответа «Да» на вопрос
+  // о замене.
+  async function saveScenario(text){
+    const body = {text};
+    if (st.fileName) body.file = st.fileName;   // сервер пометит источник как файл
+    const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`, body);
+    srcText.value = text;
+    // Поле освобождается: тот же текст и в поле, и в сценарии ниже — это ровно та
+    // вторая копия, из-за которой владелец не понимал, что откуда.
+    anyBox.value = ''; st.any = ''; st.seen = null; st.seenFor = null;
+    dropFile(true);
+    grow();
+    paintOrigin(out.origin);
+    paintSeen();
+    toast(`Сценарий сохранён — ${text.length} знаков. Поле свободно для нового `
+          + 'источника.', 'ok');
+  }
+
+  // Бесплатное действие: положить источник в проект. Что именно положится — ссылка
+  // или сценарий, — сказано на самой кнопке ещё до нажатия.
+  keep.onclick = async () => {
+    const seen = await ensureSeen();
+    if (!seen){ toast('Поле не разобрано — повторите ввод'); return; }
+    keep.disabled = true;
     try{
-      const out = await post('/ui/text', {
-        mode: st.mode,
-        source: (st.mode === 'text' ? many.value : one.value),
-        languages: [...st.langs], model: st.model, preset: st.preset,
-        project_id: p.id,
-      });
-      st.lastJob = out.job && out.job.job_id;
-      toast('Задача текста создана', 'ok');
-      await refreshScenarioJobs(card.querySelector('#tx-jobs'), p.id, srcText);
+      if (seen.kind === 'link'){
+        const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`,
+                               {link: seen.value});
+        paintOrigin(out.origin);
+        toast('Ссылка донора запомнена у проекта', 'ok');
+      }else if (seen.kind === 'text'){
+        const text = anyBox.value;
+        const cur = srcText.value;
+        // Сценарий у проекта уже есть, и он ДРУГОЙ. Сохранение затирает `source.txt`
+        // насовсем — второй копии у проекта нет, а рядом, на этом же экране, висит
+        // предупреждение «в проекте уже есть сценарий». Молча стереть его после такой
+        // подписи — худшее, что экран может сделать: человек прочитал, что текст цел.
+        if (cur.trim() && cur !== text){
+          confirmModal('Заменить сценарий проекта?',
+            `В проекте уже есть сценарий — ${cur.length} знаков. Он будет заменён `
+            + `вставленным (${text.length} знаков), и вернуть прежний будет неоткуда.`,
+            // Окно закрывается ДО сохранения, и его `.m-err` показать уже нечему —
+            // поэтому отказ ловим здесь и говорим тостом.
+            () => saveScenario(text).catch(e => toast(e.message)));
+          return;                      // сохранение уйдёт из ответа «Да», не отсюда
+        }
+        await saveScenario(text);
+      }else{
+        toast('Сохранять нечего: ' + (seen.problem || seen.title));
+      }
     }catch(e){ toast(e.message); }
-    finally{ btn.disabled = false; }
-  };
-  await refreshScenarioJobs(card.querySelector('#tx-jobs'), p.id, srcText);
-
-  // Файл .txt читается в браузере (18.09.2026 переехал сюда из формы заведения
-  // проекта): серверу нужен текст, а не файл, и он уже едет тем же полем.
-  // TextDecoder с fatal — единственный способ отличить не-UTF-8 от кракозябр, которые
-  // потом озвучат.
-  const srcFile = card.querySelector('#src-file');
-  if (srcFile) srcFile.onchange = async e => {
-    const file = e.target.files && e.target.files[0];
-    if (!file) return;
-    try{
-      const text = new TextDecoder('utf-8', {fatal: true}).decode(await file.arrayBuffer());
-      card.querySelector('#src-text').value = text;
-      toast('Файл прочитан — нажмите «Сохранить текст»', 'ok');
-    }catch(readErr){
-      toast(`файл «${file.name}» не в UTF-8 — пересохраните его в этой кодировке`);
-    }finally{ e.target.value = ''; }
+    finally{ keep.disabled = false; paintActions(); }
   };
 
   card.querySelector('#src-save').onclick = async () => {
     const btn = card.querySelector('#src-save');
     btn.disabled = true;
     try{
-      await post(`/ui/projects/${encodeURIComponent(p.id)}/source`, {text: srcText.value});
+      const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`,
+                             {text: srcText.value});
+      paintOrigin(out.origin);
       toast('Текст сохранён', 'ok');
     }catch(e){ toast(e.message); }
     finally{ btn.disabled = false; }
   };
+  srcText.oninput = paintScenario;
+
+  // Платное действие: заказ у рерайта. Режим больше не выбирают руками — его назвал
+  // сервер при разборе поля (`seen.mode`), и источник уезжает нормализованным
+  // (`seen.value`): голый идентификатор ролика сервер уже собрал в ссылку.
+  go.onclick = async () => {
+    const topic = (st.mode === 'topic');
+    let mode = 'topic';
+    let source = one.value;
+    if (!topic){
+      const seen = await ensureSeen();
+      if (!seen || !seen.mode){
+        toast(seen ? (seen.problem || 'так заказывать нельзя')
+                   : 'поле источника не разобрано — повторите ввод');
+        return;
+      }
+      mode = seen.mode;
+      source = seen.value;
+    }
+    go.disabled = true;
+    try{
+      const out = await post('/ui/text', {
+        mode, source, languages: [...st.langs], model: st.model,
+        preset: st.preset, project_id: p.id,
+      });
+      st.lastJob = out.job && out.job.job_id;
+      paintOrigin(out.origin);        // источник запомнен сервером — показать это сразу
+      toast('Задача текста создана', 'ok');
+      await refreshScenarioJobs(card.querySelector('#tx-jobs'), p.id, scenarioBox);
+    }catch(e){ toast(e.message); }
+    finally{ go.disabled = false; paintActions(); }
+  };
+
+  paintFile();
+  paintOrigin(null);
+  paintMode();                        // он же поставит высоту поля, если оно показано
+  paintSeen();
+  // Подставленную ссылку разбираем сразу: «по этой ссылке уже заказывали» нужно
+  // знать ДО нажатия платной кнопки, а не после списания.
+  if (anyBox.value.trim()) await askSeen();
+  await refreshScenarioJobs(card.querySelector('#tx-jobs'), p.id, scenarioBox);
 
   // 3. Результат — план сцен/промпты.
   const mine = d.files.filter(g => (TAB_FILES.scenario || []).includes(g.code));
@@ -3352,7 +3859,7 @@ function coverJobRowHtml(j){
   return `<tr data-job="${esc(j.id)}" data-state="${esc(j.state)}" data-print="${esc(jobRowPrint(j))}">
     <td><div style="font-weight:600">${esc(j.title)}</div>
         <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
-    <td class="jl-state">${jobListStateCellHtml(j)}</td>
+    <td class="jl-state">${jobListStateCellHtml(j, 'cover')}</td>
     <td class="muted">${when(j.created)}</td>
   </tr>`;
 }
