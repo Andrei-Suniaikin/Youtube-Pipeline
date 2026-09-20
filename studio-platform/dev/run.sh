@@ -14,6 +14,23 @@ set -e
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PY="$ROOT/.venv/bin/python"
 PORT="${VS_PORT:-8080}"
+# TLS (20.09.2026). Python с python.org НЕ берёт сертификаты из системной связки macOS:
+# ssl.get_default_verify_paths() отдаёт пустоту, и КАЖДЫЙ https-вызов падает с
+# CERTIFICATE_VERIFY_FAILED. Наружу это выходит как «сеть недоступна (E-NET)» — и выглядит
+# как проблема интернета, хотя curl в том же терминале отвечает 200: curl берёт связку
+# системы, а Python нет. На этом встали все заказы рерайта: три попытки по десять
+# повторов, полчаса работы и ноль текста. Берём связку certifi из .venv; заданное снаружи
+# значение не трогаем — на боевой машине связка своя.
+if [ -z "$SSL_CERT_FILE" ]; then
+  _CA="$("$PY" -c 'import certifi;print(certifi.where())' 2>/dev/null || true)"
+  if [ -n "$_CA" ] && [ -f "$_CA" ]; then
+    export SSL_CERT_FILE="$_CA"
+    export REQUESTS_CA_BUNDLE="${REQUESTS_CA_BUNDLE:-$_CA}"
+  else
+    echo "  ВНИМАНИЕ: не нашёл связку сертификатов (certifi) — https-вызовы могут падать"
+    echo "  как «сеть недоступна». Лечится: .venv/bin/pip install certifi"
+  fi
+fi
 [ -f "$ROOT/dev/vsgen.dev.db" ] || "$PY" "$ROOT/dev/make_db.py"
 # Кабинет читает воркеры по зашитому пути ~/VideoStudio/src, поэтому ему подсовывается
 # изолированный HOME внутри проекта: dev/home/VideoStudio/src → symlink на workers/.
