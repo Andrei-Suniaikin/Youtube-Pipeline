@@ -51,10 +51,10 @@ from pub_remote import (COVER_BASE, LANG_TO_RU, REWRITE_BASE,     # noqa: E402
                         donor_subs, donor_text, get_key, subs_exits_state,
                         subs_probe_async, video_id)
 from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
-                          MEDIA_STAGES, OPTIONAL_STAGES,
+                          MEDIA_STAGES, OPTIONAL_STAGES, REWRITE_BAD, REWRITE_DONE,
                           collect_paid_texts, paid_texts_waiting)
-from pub_neighbors import (cover_presets, rewrite_presets,        # noqa: E402
-                           vsgen_presets)
+from pub_neighbors import (cover_presets, rewrite_preset_config,  # noqa: E402
+                           rewrite_presets, vsgen_presets)
 from pub_tags import (DONOR_UNKNOWN_WHY, add_links, check_donor,   # noqa: E402
                       donor_facts_blank, donor_limits, donor_verdict,
                       parse_links, plan_rows)
@@ -5046,6 +5046,11 @@ BATCH_PULT_MAX = int(os.environ.get("VS_BATCH_PULT_MAX", "20") or 20)
 # превратились бы в час ожидания с выжженными выходами на сдачу.
 BATCH_SUBS_BUDGET = float(os.environ.get("VS_BATCH_SUBS_BUDGET_SEC", "150") or 150)
 BATCH_SUBS_EXITS = int(os.environ.get("VS_BATCH_SUBS_EXITS", "3") or 3)
+# Чем рерайтить, когда не сказано НИГДЕ: ни в карточке, ни в пресете проекта. То же
+# умолчание, что у одиночного экрана текста (`ui_text_rewrite`). В отпечаток платного
+# вызова оно не попадает намеренно — движок в этом случае кладёт туда пустую модель,
+# и подставить сюда своё значение значило бы развести отпечатки на ровном месте.
+TEXT_MODEL_FALLBACK = "gpt-4.1-nano"
 
 
 def _batch_calls_ready(c) -> None:
@@ -5080,20 +5085,44 @@ def _batch_pids(body) -> list:
 
 
 def _project_release(c, pid: str):
-    """Выпуск проекта: донорская ссылка, язык канала, пресет обложек.
+    """Выпуск проекта: донорская ссылка, язык канала, пресеты текста и обложки.
 
     Тот же путь, которым их читает экран проектов (`_releases`): выпуск → строка плана
     (донор) и канал (язык, пресеты). Берём последний по времени: проект в норме
     заводится под один выпуск, но переносы плана оставляют старые строки.
+
+    Пресеты пропускаем через `channel_presets` — ровно как `pub_engine.live_releases`
+    перед тем, как отдать выпуск ночному движку. Иначе это были бы РАЗНЫЕ пресеты у
+    одного и того же проекта: колонка канала — только запасной путь, а с 09.09.2026
+    текст и обложка берутся из пресета производства (и с 18.09 — из частичных пресетов
+    по ссылке). Для кнопки это вопрос денег: по пресету считается отпечаток платного
+    вызова, и разойтись с движком тут значит заплатить за один текст дважды.
+
+    Возвращает словарь (`sqlite3.Row` неизменяем, а пресеты подменяются), но читатели
+    по-прежнему обращаются по имени — для словаря это работает так же.
     """
-    return c.execute(
+    row = c.execute(
         "SELECT r.release_id, ch.lang lang, ch.preset_cover preset_cover, "
+        "       ch.preset_rewrite preset_rewrite, ch.preset_vsgen_id preset_vsgen_id, "
         "       p.donor_url donor_url "
         "FROM pub_releases r "
         "LEFT JOIN pub_channels ch ON ch.id = r.channel_id "
         "LEFT JOIN pub_plan_items p ON p.id = r.plan_item_id "
         "WHERE r.project_id=? AND r.tenant_id=? "
         "ORDER BY r.updated DESC LIMIT 1", (pid, TENANT)).fetchone()
+    if row is None:
+        return None
+    rel = dict(row)
+    try:
+        rel["preset_rewrite"], rel["preset_cover"] = channel_presets(
+            c, rel.get("preset_vsgen_id"), rel.get("preset_rewrite") or "",
+            rel.get("preset_cover") or "")
+    except sqlite3.Error:
+        # Пресет производства не прочитался. Оставляем колонки канала как есть: это
+        # запасной путь, и он честнее, чем пустота, — а пустой пресет обложек ниже
+        # всё равно становится отказом, а не тихим заказом на умолчаниях соседа.
+        pass
+    return rel
 
 
 def _project_scenario(mod, pid: str) -> str:
@@ -5117,14 +5146,138 @@ def _project_scenario(mod, pid: str) -> str:
 def _batch_open_call(c, pid: str, kind: str):
     """Заказ этого вида, судьба которого ещё не выяснена (`reserved`/`ordered`).
 
-    Это и есть ответ на «такая задача уже идёт». Спрашивать соседа про каждую задачу
-    каждого проекта — это десятки запросов на одно нажатие, и ответ всё равно был бы
-    про задачу, а не про деньги. Журнал знает именно про деньги.
+    Это и есть ответ на «такая задача уже идёт». Журнал знает именно про деньги, и
+    спрашивается он ПОСЛЕ `_batch_settle_calls`: та уже закрыла всё, что у соседа
+    кончилось, поэтому открытая строка здесь означает «работа идёт прямо сейчас», а
+    не «кнопку нажали когда-то».
     """
     return c.execute(
-        "SELECT id, unit, status, remote_order_id FROM provider_calls "
+        "SELECT id, unit, status, remote_order_id, error FROM provider_calls "
         "WHERE project_id=? AND kind=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",
         (pid, kind, pub_calls.RESERVED, pub_calls.ORDERED)).fetchone()
+
+
+def _batch_open_why(open_row, what: str) -> str:
+    """Словами: почему по этому проекту второй заказ не ставим.
+
+    Разделены два случая, которые журнал держит в одном состоянии `ordered`. Задача
+    ИДЁТ — это просто «подождите». Задача у соседа КОНЧИЛАСЬ ПЛОХО — деньги потрачены,
+    результата нет, и повтор кнопкой был бы вторым платежом за то же самое: такую
+    строку закрывает человек, а не кнопка, и он должен узнать об этом из ответа, а не
+    гадать, почему проект «вечно занят».
+    """
+    was = open_row["remote_order_id"] or ""
+    error = (open_row["error"] or "").strip()
+    if error:
+        return (f"заказ {what} у соседа кончился ничем"
+                + (f" (задача {was})" if was else "")
+                + f": {_short(error, 160)}. Деньги за него уже ушли — повтор оплатит "
+                  f"то же самое второй раз, нужен разбор")
+    return (f"у проекта уже идёт заказ {what}"
+            + (f" (задача {was})" if was else " (номер ещё не записан)")
+            + " — второй не ставлю")
+
+
+def _ask_rewrite_job(sid: str, job_id: str) -> tuple:
+    """Чем кончилась задача рерайта: ("done"|"lost"|"wait"|"unknown", причина).
+
+    Вопрос о статусе бесплатен и повторяется сколько угодно — это ровно тот вид
+    повтора, который безопасен (в отличие от повтора заказа). Словарь состояний берём
+    у движка (`REWRITE_DONE`/`REWRITE_BAD`), а не заводим второй: разойдясь с ним, мы
+    считали бы оплаченным то, что движок считает провалом.
+    """
+    code, out = _rw(f"/jobs/{urllib.parse.quote(job_id)}", sid)
+    if code == 404:
+        return "lost", "задача у рерайта не найдена"
+    if code != 200 or not isinstance(out, dict):
+        return "unknown", ""
+    state = str(out.get("status") or "").lower()
+    if state in REWRITE_BAD:
+        return "lost", "рерайт не справился: " + str(out.get("error") or state)
+    if state in REWRITE_DONE:
+        return "done", ""
+    return "wait", ""
+
+
+def _ask_cover_job(sid: str, job_id: str) -> tuple:
+    """То же самое про обложку. Завершение опознаём семейством статуса и `finished_at`,
+    как `do_cover_ready`: сосед умеет и «completed_partial», и такой ответ, не попав ни
+    в успех, ни в отказ, оставлял бы строку журнала открытой навсегда."""
+    code, out = _cover(f"/jobs/{urllib.parse.quote(job_id)}", sid)
+    if code == 404:
+        return "lost", "задача у обложек не найдена"
+    if code != 200 or not isinstance(out, dict):
+        return "unknown", ""
+    state = str(out.get("status") or "").lower()
+    if state in ("error", "failed", "cancelled"):
+        return "lost", "обложка не сделалась: " + str(out.get("error") or state)
+    if not (state.startswith(("done", "completed", "finished", "success"))
+            or out.get("finished_at")):
+        return "wait", ""
+    made = int(out.get("results_count") or 0) or len(out.get("output_files") or [])
+    if not made:
+        return "lost", ("сосед закончил, но ни одной обложки не отдал: "
+                        + str(out.get("progress_detail") or state))
+    return "done", ""
+
+
+def _batch_settle_calls(c, pid: str, kind: str, ask) -> None:
+    """Закрыть строки журнала, судьба которых у соседа уже решена.
+
+    Кто это делает и почему именно кнопка. Ночной движок закрывает свои строки по
+    ВЫПУСКУ (`pub_services._close_text_call` ищет по `release_id`), а строки кнопки
+    заведены по ПРОЕКТУ — выпуска у проекта может не быть вовсе, — и `release_id` у
+    них пуст. Движок их не увидит никогда. Значит, закрывает их тот, кто открыл:
+    кнопка, при следующем нажатии на тот же проект.
+
+    Без этого получался вечный «занят»: при `one_at_a_time` открытая строка навсегда
+    запрещала новый заказ, а журнал копил открытые строки, по которым нельзя понять,
+    что оплачено, а что ещё делается.
+
+    И ТОЛЬКО СВОИ: строки с непустым `release_id` завёл движок, и трогать их отсюда
+    запрещено. `pub_services.collect_paid_texts` ищет забытые оплаченные тексты именно
+    по ним (`provider_calls.status='ordered'` у выпуска, потерявшего свою задачу) —
+    закрыв такую строку «получено», мы вычеркнули бы оплаченный текст из экрана
+    «оплачено, но не забрано» раньше, чем его оттуда забрали. Это те самые 146
+    оплаченных и потерянных текстов из разбора 18.09, и повторять их нельзя.
+
+    Три исхода, и различать их обязательно:
+
+      done     сосед отдал результат — `delivered`, повторная оплата запрещена;
+      lost     заказ кончился ничем (отказ, пропажа, пустой результат) — деньги ушли,
+               строка ОСТАЁТСЯ открытой (`mark_failed(ordered=True)` статус не меняет),
+               но в ней появляется причина. Повтор кнопкой был бы вторым платежом;
+      wait/unknown — не трогаем ничего. Запись «не справился» по неудавшемуся вопросу
+               стоила бы оплаченного результата.
+    """
+    rows = c.execute(
+        "SELECT id, remote_order_id FROM provider_calls WHERE project_id=? AND kind=? "
+        "AND status IN (?,?) AND IFNULL(remote_order_id,'')<>'' "
+        "AND IFNULL(release_id,'')='' ORDER BY id",
+        (pid, kind, pub_calls.RESERVED, pub_calls.ORDERED)).fetchall()
+    if not rows:
+        return
+    asked, changed = {}, False
+    for row in rows:
+        job_id = row["remote_order_id"]
+        if job_id not in asked:
+            try:
+                asked[job_id] = ask(job_id)
+            except Exception as exc:                             # noqa: BLE001
+                # Спросить не вышло — это про нас, а не про задачу. Молчим.
+                asked[job_id] = ("unknown", f"{type(exc).__name__}")
+        verdict, why = asked[job_id]
+        if verdict == "done":
+            # Доказательством служит номер задачи — тем же способом закрывает оплату
+            # штатный путь движка (`_close_text_call(result=remote_job_id)`).
+            pub_calls.mark_delivered(c, row["id"], job_id)
+            changed = True
+        elif verdict == "lost":
+            pub_calls.mark_failed(c, row["id"], (why or "результата нет")[:400],
+                                  ordered=True)
+            changed = True
+    if changed:
+        c.commit()
 
 
 def _batch_langs(asked: list, rel, *, display: bool) -> tuple:
@@ -5180,13 +5333,19 @@ def _batch_langs_left(c, pid: str, kind: str, langs: list, parts: dict, item: di
     Поэтому добавленный язык уезжает, а уже оплаченный — нет, вместо «или всё, или
     ничего» на весь проект.
 
-    Отпечаток считается по тому, что влияет на результат и на цену, и теми же ключами,
-    что у движка (`pub_calls.fingerprint(text=…, lang=…, model=…)`), — чтобы дубль
-    ловился и МЕЖДУ ними: один и тот же рерайт, заказанный ночью движком и днём этой
-    кнопкой, оплачивается один раз. Совпадут они не всегда: движок кладёт в отпечаток
-    ещё и имя пресета рерайта, а этот путь пресета не знает вовсе (`/jobs/rewrite`
-    его не принимает). Это не ошибка, а граница: с пресетом у соседа получается
-    другой текст, и считать его тем же оплаченным вызовом было бы неверно.
+    Отпечаток считается ТЕМИ ЖЕ КЛЮЧАМИ, что у движка, — иначе защиты от второй оплаты
+    нет вовсе. Движок (`pub_services.do_source_ready`) кладёт в отпечаток текста
+    `text` (sha донора), `lang`, `preset` (имя пресета рерайта) и `model` (модель ИЗ
+    ПРЕСЕТА). Ровно эти четыре ключа собирает и карточка (`_batch_text_plan`). Разойтись
+    хоть одним ключом значит получить два разных отпечатка на одну и ту же работу:
+    ночью текст оплачивает движок, утром — кнопка, и человек платит дважды, не узнав
+    об этом ниоткуда.
+
+    Почему `model` берётся из пресета, а не из того, что реально уедет соседу: так
+    считает движок (и объясняет это у себя подробно — заказ с 19.09 может уйти на
+    модели, подсказанной соседом, но отпечаток остаётся на модели пресета). Отпечаток
+    отвечает на вопрос «за это уже платили?», а не «чем именно делали». Явно выбранная
+    в карточке модель отпечаток меняет — это осознанно другая работа за другие деньги.
     """
     left = []
     for lang in langs:
@@ -5283,15 +5442,19 @@ class BatchTextIn(BaseModel):
     one_at_a_time: bool = True       # не ставить второй заказ, пока идёт первый
 
 
-def _batch_text_plan(c, mod, pid: str, *, where: str, repl_url: str, repl_text: str,
-                     langs_asked: list, model: str, one_at_a_time: bool,
-                     net: bool, deadline: float) -> dict:
+def _batch_text_plan(c, sid: str, mod, pid: str, *, where: str, repl_url: str,
+                     repl_text: str, langs_asked: list, model: str,
+                     one_at_a_time: bool, net: bool, deadline: float) -> dict:
     """Что уедет по одному проекту. Ничего не заказывает и денег не тратит.
 
     Сухой прогон — это ровно этот проход с `net=False`: он читает проект, кэш
     расшифровок и журнал оплат, но в сеть за субтитрами не идёт. Поэтому про
     незнакомую кэшу ссылку он честно отвечает «повтор проверю при запуске»
     (`repeat_checked: false`), а не выдумывает ответ.
+
+    Статус уже поставленных задач спрашивается и в сухом прогоне: это бесплатный
+    вопрос, а не платный заказ, и без него предпросмотр врал бы про вчерашние задачи
+    («уже идёт заказ» там, где сосед давно закончил).
     """
     p = c.execute("SELECT id, name FROM projects WHERE id=? AND tenant_id=?",
                   (pid, TENANT)).fetchone()
@@ -5308,15 +5471,16 @@ def _batch_text_plan(c, mod, pid: str, *, where: str, repl_url: str, repl_text: 
         return item
     item["languages"] = list(langs)
 
+    # Сначала закрываем вчерашнее: задачи, которые сосед уже доделал, перестают
+    # считаться «идущими», а их строки в журнале — открытыми.
+    _batch_settle_calls(c, pid, "text", lambda jid: _ask_rewrite_job(sid, jid))
+
     # Порядок проверок выбран по цене: сначала то, что читается из базы, и только потом
     # сеть. Проект, который всё равно пропустим, не должен жечь выход субтитров.
     if one_at_a_time:
         open_row = _batch_open_call(c, pid, "text")
         if open_row is not None:
-            was = open_row["remote_order_id"] or ""
-            item["why"] = ("у проекта уже идёт заказ текста"
-                           + (f" (задача {was})" if was else " (номер ещё не записан)")
-                           + " — второй не ставлю")
+            item["why"] = _batch_open_why(open_row, "текста")
             return item
 
     text = ""
@@ -5372,10 +5536,19 @@ def _batch_text_plan(c, mod, pid: str, *, where: str, repl_url: str, repl_text: 
         item["why"] = "текста нет — рерайтить нечего"
         return item
 
+    # Пресет рерайта проекта и его модель — то же самое, из чего собирает отпечаток
+    # ночной движок. Пустое поле модели в карточке означает «как в проекте», и работает
+    # это буквально: соседу уедет модель пресета, а не наше умолчание поверх неё.
+    preset = (rel["preset_rewrite"] if rel is not None else "") or ""
+    preset_model = str((rewrite_preset_config(TENANT, preset) or {}).get("model") or "")
+    item["preset"] = preset
+    item["_model"] = model or preset_model or TEXT_MODEL_FALLBACK
     item["chars"] = len(text)
     item["_text"] = text
+    # Ключи — как у движка (`pub_services.do_source_ready`), см. `_batch_langs_left`:
+    # text + lang + preset + model. `lang` добавляет сам `_batch_langs_left`.
     item["_parts"] = {"text": hashlib.sha256(text.encode("utf-8")).hexdigest(),
-                      "model": model}
+                      "preset": preset, "model": model or preset_model}
     left = _batch_langs_left(c, pid, "text", langs, item["_parts"], item, reserve=False)
     if not left:
         item["why"] = "за эти языки уже платили — новый заказ не ставлю"
@@ -5385,14 +5558,18 @@ def _batch_text_plan(c, mod, pid: str, *, where: str, repl_url: str, repl_text: 
     return item
 
 
-def _batch_text_order(c, sid: str, item: dict, *, model: str) -> None:
+def _batch_text_order(c, sid: str, item: dict) -> None:
     """Поставить задачу текста одному проекту. Меняет `item` на месте.
 
     Порядок ровно такой: бронь в журнале → загрузка текста соседу → заказ. Строка
     журнала появляется раньше денег: обрыв между заказом и записью иначе означал бы
     вторую оплату при следующем нажатии.
+
+    Модель берётся из `item` (`_batch_text_plan`), а не из полей запроса: она своя на
+    каждый проект — пустое поле карточки означает модель ЕГО пресета.
     """
     pid = item["id"]
+    model = item["_model"]
     fresh = _batch_langs_left(c, pid, "text", item["languages"], item["_parts"], item,
                               reserve=True, provider="rewrite", model=model)
     if not fresh:
@@ -5466,13 +5643,23 @@ def ui_projects_batch_text(body: BatchTextIn, request: Request):
         raise HTTPException(400, f"неизвестный источник «{where}»")
     if repl_url and repl_text.strip():
         raise HTTPException(400, "замена источника одна: либо ссылка, либо текст")
+    # Замена сильнее выбора «откуда брать»: она проверяется первой и просто отменяет
+    # его. Молча — значит человек выбрал «сценарий проекта», получил рерайт чужой
+    # ссылки на всю пачку и узнал бы об этом только по счёту. Поэтому спор запрещаем
+    # до постановки: денег ещё не потрачено, и выбрать одно из двух ничего не стоит.
+    if (repl_url or repl_text.strip()) and where != "auto":
+        raise HTTPException(400, f"выбор источника «{where}» спорит с заменой в "
+                                 f"карточке: замена сильнее и отменила бы выбор. "
+                                 f"Уберите одно — либо замену, либо выбор")
     # Ссылку раздаём всем отмеченным — это один донор на пачку, так её и задумывали.
     # А вставленный текст (и прочитанный в браузере файл) — это ОДИН сценарий, и раздать
     # его десяти проектам значит сделать десять одинаковых роликов за десять оплат.
     if repl_text.strip() and len(pids) > 1:
         raise HTTPException(400, "вставленный текст (или файл) уходит одному проекту: "
                                  "отметьте один проект или уберите текст")
-    model = (body.model or "").strip() or "gpt-4.1-nano"
+    # Пустое поле не подменяем умолчанием здесь: «как в проекте» решается по каждому
+    # проекту отдельно (`_batch_text_plan`), потому что пресеты у них разные.
+    model = (body.model or "").strip()
 
     mod = sys.modules.get("main")
     items, c = [], db()
@@ -5485,21 +5672,30 @@ def ui_projects_batch_text(body: BatchTextIn, request: Request):
             # именно уехало. Строка проекта становится ошибкой, пачка идёт дальше.
             item = _batch_item(pid)
             try:
-                item = _batch_text_plan(c, mod, pid, where=where, repl_url=repl_url,
+                item = _batch_text_plan(c, sid, mod, pid, where=where,
+                                        repl_url=repl_url,
                                         repl_text=repl_text, langs_asked=langs_asked,
                                         model=model,
                                         one_at_a_time=bool(body.one_at_a_time),
                                         net=not body.dry_run, deadline=deadline)
                 if item["action"] == "order" and not body.dry_run:
-                    _batch_text_order(c, sid, item, model=model)
-            except HTTPException:
-                raise
+                    _batch_text_order(c, sid, item)
+            except HTTPException as exc:
+                # HTTPException изнутри цикла НЕ выпускаем наружу: она унесла бы весь
+                # ответ, включая строки проектов, за которые уже заплачено, и человек
+                # не узнал бы, за что. Отказ — это беда одного проекта, как и любая
+                # другая. Проверки, которые обязаны остановить всю пачку, стоят ДО
+                # цикла (потолок, спор источников, журнал оплат).
+                item.update(action="error",
+                            why=f"отказ по этому проекту ({exc.status_code}): "
+                                f"{_short(exc.detail, 160)}")
             except Exception as exc:                             # noqa: BLE001
                 item.update(action="error", why=f"сбой на нашей стороне: "
                                                 f"{type(exc).__name__}")
             finally:
                 item.pop("_text", None)
                 item.pop("_parts", None)
+                item.pop("_model", None)
                 items.append(item)
     finally:
         c.close()
@@ -5518,15 +5714,18 @@ class BatchCoverIn(BaseModel):
     one_at_a_time: bool = True
 
 
-def _batch_cover_plan(c, pid: str, *, repl_url: str, langs_asked: list, preset: str,
-                      provider: str, model: str, edit_preview: bool,
+def _batch_cover_plan(c, sid: str, pid: str, *, repl_url: str, langs_asked: list,
+                      preset: str, provider: str, model: str, edit_preview: bool,
                       one_at_a_time: bool) -> dict:
-    """Что уедет по обложке одного проекта. Сети не трогает вовсе.
+    """Что уедет по обложке одного проекта. Ничего не заказывает и денег не тратит.
 
     Стратегия здесь одна — «по превью донора»: это и есть источник ПРОЕКТА, и тем же
     путём заказывает обложку ночной движок (`pub_services._preorder_cover`). Заголовок
     и семя источником проекта не являются — их в проекте не записано, поэтому пачкой
     они не ставятся и остаются на одиночной карточке `/ui/covers`.
+
+    К соседу обращается ровно за одним — статусом уже поставленных задач. Это
+    бесплатный вопрос, и он закрывает строки журнала, по которым работа давно кончилась.
     """
     p = c.execute("SELECT id, name FROM projects WHERE id=? AND tenant_id=?",
                   (pid, TENANT)).fetchone()
@@ -5543,13 +5742,13 @@ def _batch_cover_plan(c, pid: str, *, repl_url: str, langs_asked: list, preset: 
         return item
     item["languages"] = list(langs)
 
+    # Сначала закрываем вчерашнее — см. `_batch_settle_calls`.
+    _batch_settle_calls(c, pid, "cover", lambda jid: _ask_cover_job(sid, jid))
+
     if one_at_a_time:
         open_row = _batch_open_call(c, pid, "cover")
         if open_row is not None:
-            was = open_row["remote_order_id"] or ""
-            item["why"] = ("у проекта уже идёт заказ обложки"
-                           + (f" (задача {was})" if was else " (номер ещё не записан)")
-                           + " — второй не ставлю")
+            item["why"] = _batch_open_why(open_row, "обложки")
             return item
 
     if repl_url:
@@ -5565,6 +5764,15 @@ def _batch_cover_plan(c, pid: str, *, repl_url: str, langs_asked: list, preset: 
         item.update(source="donor", source_note=f"превью донора {_short(url)}")
 
     item["preset"] = preset or ((rel["preset_cover"] if rel is not None else "") or "")
+    if not item["preset"]:
+        # Пустой пресет — это НЕ «на усмотрение соседа». Cover в таком заказе возьмёт
+        # свои умолчания и нарисует обложку, которой никто не просил: платно и не ту.
+        # Тот же ответ даёт ночной движок («у канала не выбран пресет обложек»,
+        # `pub_services.do_cover_ready`) — и это отказ, а не тихий заказ.
+        item["why"] = ("не выбран пресет обложек: пусто и в карточке, и у канала "
+                       "проекта. Без пресета сосед нарисует обложку на своих "
+                       "умолчаниях — платно и не ту, поэтому не заказываю")
+        return item
     item["_url"] = url
     item["_parts"] = {"url": url, "preset": item["preset"], "provider": provider,
                       "model": model, "mode": "url",
@@ -5632,7 +5840,7 @@ def ui_projects_batch_cover(body: BatchCoverIn, request: Request):
             item = _batch_item(pid)
             try:
                 item = _batch_cover_plan(
-                    c, pid, repl_url=(body.reference_url or "").strip(),
+                    c, sid, pid, repl_url=(body.reference_url or "").strip(),
                     langs_asked=langs_asked, preset=(body.preset or "").strip(),
                     provider=provider, model=model,
                     edit_preview=bool(body.edit_preview),
@@ -5640,8 +5848,12 @@ def ui_projects_batch_cover(body: BatchCoverIn, request: Request):
                 if item["action"] == "order" and not body.dry_run:
                     _batch_cover_order(c, sid, item, provider=provider, model=model,
                                        edit_preview=bool(body.edit_preview))
-            except HTTPException:
-                raise
+            except HTTPException as exc:
+                # Та же причина, что и у текста: отказ одного проекта не уносит ответ,
+                # в котором уже стоят строки оплаченных.
+                item.update(action="error",
+                            why=f"отказ по этому проекту ({exc.status_code}): "
+                                f"{_short(exc.detail, 160)}")
             except Exception as exc:                             # noqa: BLE001
                 item.update(action="error", why=f"сбой на нашей стороне: "
                                                 f"{type(exc).__name__}")
@@ -5697,7 +5909,13 @@ def ui_projects_batch_fields():
         # Порядок как в карточке кабинета: главное поле сверху, остальное — «доп.».
         fields.sort(key=lambda f: 0 if f["key"] == main_key else 1)
         out[kind] = {"title": title, "fields": fields}
-    return {"kinds": out, "pult": dict(BATCH_PULT_CARDS),
+    # Потолок пачки отдаём экрану вместе с карточками. Без него экран узнаёт о нём
+    # только отказом на нажатие — то есть после того, как человек отметил тридцать
+    # проектов и решил, что сейчас они уедут. Лежит внутри каждой карточки: потолок —
+    # свойство этой кнопки, и карточка остаётся самоописанием целиком.
+    pult = {kind: dict(card, max=BATCH_PULT_MAX)
+            for kind, card in BATCH_PULT_CARDS.items()}
+    return {"kinds": out, "pult": pult,
             "note": "пустое поле — «как в проекте»: настройки проекта не перетираются"}
 
 

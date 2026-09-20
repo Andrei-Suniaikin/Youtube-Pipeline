@@ -11,6 +11,11 @@
     и к линии заголовка `.sec`. Строчные компоненты «от края до края» по замыслу
     (таблицы, строки `.stage`, календарь) не меряются.
 
+Меряется только то, что человек ВИДИТ. Содержимое закрытых `<details>` и то, что
+укатилось за край контейнера с собственной прокруткой (`.langs`), пропускается: у
+такого содержимого прямоугольники ненулевые, но на экране его нет — см. подробный
+разбор в самом замере. Сколько пропущено, печатается рядом с числом измеренного.
+
 Требует стенд (как `tests/test_web_pult.py`) и Chrome:
 
     VS_PLATFORM_BASE=http://127.0.0.1:8082 VS_DEV_PASSWORD=… \\
@@ -47,6 +52,50 @@ MEASURE = r"""
   const LEAF = 'input:not([type=hidden]):not([type=checkbox]),select,textarea,button,label,.note,p,h2,h3,img,.modes,.pill';
   const vis = el => { const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0 && getComputedStyle(el).visibility !== 'hidden'; };
+  // ── Чего человек не видит, то и мерить нельзя ───────────────────────────────
+  // Оба правила ниже появились 20.09.2026 после 26 ложных срабатываний на
+  // #/projects. Все 26 — с ОТРИЦАТЕЛЬНЫМ зазором, то есть элемент якобы торчал за
+  // нижнюю рамку карточки наружу. Вёрстка там целая; ненадёжен был сам замер:
+  // `getBoundingClientRect()` честно отвечает и про то, что на экране не показано.
+  //
+  // 1. Закрытая «гармошка». В HeadlessChrome 153 у содержимого `<details>` при
+  //    open=false прямоугольники НЕНУЛЕВЫЕ: замер 20.09.2026 на #/projects показал
+  //    саму details высотой 18,6px (одна шапка), а textarea «Или текст — уедет
+  //    одному отмеченному» внутри неё — top 1003, bottom 1123. Мерить это значит
+  //    мерить то, чего на экране нет. Опираться на `el.checkVisibility()` (он на них
+  //    отвечает false) не будем: факт «родительская details закрыта» и есть ответ, и
+  //    он читается без знания версии Chrome. Сама шапка `<summary>` видна — и
+  //    меряется как обычно.
+  const closedUp = el => {
+    for (let d = el.closest('details'); d;
+         d = d.parentElement && d.parentElement.closest('details')){
+      if (d.open) continue;
+      const s = d.querySelector(':scope > summary');
+      if (!(s && s.contains(el))) return true;
+    }
+    return false;
+  };
+  // 2. Своя прокрутка. `.langs` — это `max-height:140px; overflow:auto`: замер нашёл
+  //    в коробке 46 чипов языков, scrollHeight 522 при clientHeight 138, и 35 из них
+  //    лежат НИЖЕ её рамки — до 373px за пределами карточки. Пока коробку не
+  //    прокрутили, этих чипов на экране нет, и «слипнуться» они ни с чем не могут.
+  //    Меряется то, что попало в окошко; уехавшее за его край — пропускается.
+  const clipped = el => {
+    const r = el.getBoundingClientRect();
+    for (let p = el.parentElement; p && p !== document.body; p = p.parentElement){
+      const cs = getComputedStyle(p);
+      const scrolls = (/auto|scroll/.test(cs.overflowY) && p.scrollHeight > p.clientHeight + 1)
+                   || (/auto|scroll/.test(cs.overflowX) && p.scrollWidth > p.clientWidth + 1);
+      if (!scrolls) continue;
+      const q = p.getBoundingClientRect();
+      if (r.bottom > q.bottom + 1 || r.top < q.top - 1 ||
+          r.right > q.right + 1 || r.left < q.left - 1) return true;
+    }
+    return false;
+  };
+  // Видно на экране = есть размер, не заперто в закрытой гармошке и не укатилось
+  // за край своей прокрутки.
+  const seen = el => vis(el) && !closedUp(el) && !clipped(el);
   const name = el => (el.tagName.toLowerCase() + (el.id ? '#' + el.id : '') +
     (el.className && typeof el.className === 'string' ? '.' + el.className.trim().split(/\s+/).join('.') : '') +
     ' «' + (el.textContent || el.placeholder || el.value || '').trim().replace(/\s+/g, ' ').slice(0, 40) + '»');
@@ -61,21 +110,24 @@ MEASURE = r"""
   };
   const run = () => {
     const app = document.getElementById('app');
-    const out = {route: location.hash, problems: [], blocks: 0, measured: 0,
+    // `hidden` — сколько элементов пропущено как невидимые. Число печатается рядом с
+    // `measured`: если правила выше однажды проглотят весь экран, это будет видно
+    // сразу, а не превратится в тихое «ничего не слиплось».
+    const out = {route: location.hash, problems: [], blocks: 0, measured: 0, hidden: 0,
                  text: app.textContent.trim().slice(0, 80)};
-    const kids = [...app.children].filter(vis);
+    const kids = [...app.children].filter(seen);
     out.blocks = kids.length;
     for (let i = 1; i < kids.length; i++){
       const a = kids[i-1].getBoundingClientRect(), b = kids[i].getBoundingClientRect();
       if (b.top >= a.bottom - 1 && b.top - a.bottom < MIN_GAP)
         out.problems.push(`блоки вплотную (${Math.round(b.top - a.bottom)}px): ${name(kids[i-1])} → ${name(kids[i])}`);
     }
-    const cards = [...app.querySelectorAll('.card')].filter(vis);
-    const cardsLists = [...app.querySelectorAll('form, div')].filter(vis);
+    const cards = [...app.querySelectorAll('.card')].filter(seen);
+    const cardsLists = [...app.querySelectorAll('form, div')].filter(seen);
     // соседние карточки внутри любых контейнеров
     for (const c of cards){
       const prev = c.previousElementSibling;
-      if (prev && vis(prev) && !prev.closest(SKIP)){
+      if (prev && seen(prev) && !prev.closest(SKIP)){
         const a = prev.getBoundingClientRect(), b = c.getBoundingClientRect();
         if (b.top >= a.bottom - 1 && b.top - a.bottom < MIN_GAP)
           out.problems.push(`карточка вплотную к блоку выше (${Math.round(b.top - a.bottom)}px): ${name(prev)} → ${name(c)}`);
@@ -83,11 +135,14 @@ MEASURE = r"""
     }
     for (const card of cards){
       const r = card.getBoundingClientRect();
-      const heads = [...card.querySelectorAll('.sec')].filter(h => vis(h) && h.closest('.card') === card)
+      const heads = [...card.querySelectorAll('.sec')].filter(h => seen(h) && h.closest('.card') === card)
         .map(h => h.getBoundingClientRect());
       for (const el of card.querySelectorAll(LEAF)){
-        if (!vis(el) || el.closest('.card') !== card || el.closest(SKIP)) continue;
+        if (el.closest('.card') !== card || el.closest(SKIP)) continue;
         if (el.parentElement && el.parentElement.closest(LEAF)) continue;
+        if (!vis(el)) continue;
+        // Размер есть, но на экране элемента нет — считаем и идём дальше.
+        if (closedUp(el) || clipped(el)){ out.hidden++; continue; }
         // У текстовых блоков меряется текст (content box): заметка с собственным
         // отступом `.secbody` не слипается, хотя её рамка и совпадает с карточкой.
         // У полей и кнопок видна их рамка — они меряются целиком.
@@ -188,8 +243,15 @@ def main() -> int:
             # Экран из одних таблиц и строк «от края до края» (каналы, очередь) мерить
             # внутри нечего — тогда проверяются только зазоры между его блоками.
             check(f"экран отрисован (блоков: {res.get('blocks', 0)}, "
-                  f"элементов в карточках: {res.get('measured', 0)})",
+                  f"элементов в карточках: {res.get('measured', 0)}, "
+                  f"пропущено невидимых: {res.get('hidden', 0)})",
                   res.get("blocks", 0) > 1, True)
+            # Пропуск невидимого — послабление, и оно обязано быть узким. Если на
+            # экране что-то спрятано, а измерено НОЛЬ, значит правила пропуска съели
+            # весь экран: тогда «ничего не слиплось» ничего не доказывает.
+            if res.get("hidden", 0):
+                check("замер не ослеп: видимое в карточках всё ещё меряется",
+                      res.get("measured", 0) > 0, True)
             check("ничего не слиплось", res.get("problems"), [])
             if shots:
                 os.makedirs(shots, exist_ok=True)
