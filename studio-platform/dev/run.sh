@@ -73,6 +73,35 @@ export VS_DEV_INSECURE_COOKIE=1
 # а не по зашитому литералу. Значения должны совпадать, иначе админ теряет права молча.
 export REWRITE_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
 export COVER_ADMIN_USER_ID="${VS_DEV_TENANT:-dev}"
+# Ключи обложкам (20.09.2026). Cover Studio с 18.09 не принимает ключ в запросе вовсе
+# («Vendor API keys больше не принимаются: используются только серверные ключи») и читает
+# СВОИ переменные COVER_*. Стенд их не задавал ни одной — и анализ превью донора молча
+# оставался без ключа, хотя тот же ключ лежал в общем файле и кабинетом использовался.
+# Берём из общего файла, чтобы ключ жил в ОДНОМ месте: две копии расходятся молча, а
+# расходятся они всегда на платном вызове. Заданное снаружи значение не трогаем.
+if [ -f "$VS_SERVER_KEYS_PATH" ]; then
+  for _pair in "COVER_OPENAI_KEY:openai" "COVER_FAST_GEN_KEY:googler" "COVER_VEO_KEY:veo"; do
+    _var="${_pair%%:*}"; _fam="${_pair##*:}"
+    if [ -z "$(eval "printf '%s' \"\$$_var\"")" ]; then
+      _val="$("$PY" - "$VS_SERVER_KEYS_PATH" "$_fam" <<'KEYS'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+value = data.get(sys.argv[2])
+if isinstance(value, list):          # у семейства бывает пул — обложкам отдаём первый
+    value = value[0] if value else ""
+if isinstance(value, dict):
+    value = value.get("value") or value.get("key") or ""
+print(value if isinstance(value, str) else "")
+KEYS
+)"
+      [ -n "$_val" ] && export "$_var=$_val"
+    fi
+  done
+  unset _pair _var _fam _val
+fi
 # ─── Пресеты рерайта: стенд не пишет в репозиторий ───────────────────────────
 # rewrite/server.py держит пресеты тенантов в REWRITE_PRESETS_DIR, а по умолчанию —
 # прямо в рабочем дереве (rewrite/presets/<тенант>/generation.json). Переменную никто

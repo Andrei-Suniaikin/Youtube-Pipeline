@@ -55,6 +55,21 @@ def main() -> int:
     # смотрит на свою переменную и ssl-умолчание не читает.
     check("requests тоже получает связку", "REQUESTS_CA_BUNDLE" in run_sh, True)
 
+    print("\nКлючи доходят до обложек")
+    # Cover Studio с 18.09 не принимает ключ в запросе вовсе («используются только
+    # серверные ключи») и читает СВОИ переменные COVER_*. Стенд не задавал ни одной, и
+    # анализ превью донора оставался без ключа, хотя тот же ключ лежал в общем файле и
+    # кабинетом использовался. Ключ должен жить в ОДНОМ месте: две копии расходятся
+    # молча и всегда на платном вызове.
+    for var, family in (("COVER_OPENAI_KEY", "openai"), ("COVER_FAST_GEN_KEY", "googler"),
+                        ("COVER_VEO_KEY", "veo")):
+        check(f"{var} берётся из общего файла ключей ({family})",
+              var in run_sh and family in run_sh, True)
+    check("заданное снаружи не перетирается",
+          'eval "printf' in run_sh or "-z" in run_sh, True)
+    check("ключ не печатается в вывод запуска",
+          "echo \"$COVER_OPENAI_KEY" not in run_sh and "echo $_val" not in run_sh, True)
+
     print("\nСвязка в .venv есть и она рабочая")
     try:
         import certifi
