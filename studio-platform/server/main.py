@@ -6586,12 +6586,40 @@ def _normalize_lumean_settings(settings):
         raise LumeanTemplateError(
             "Lumean · HeyGen: поля Voice и Template ID содержат разные UUID"
         )
+    # Карта «язык → шаблон» — такой же законный источник, как и поле «по умолчанию»
+    # (20.09.2026). Правило ТЗ §06 «язык → провайдер → идентификатор» живёт именно в ней:
+    # пресет на канал с несколькими языками держит по шаблону на язык, а верхнее поле
+    # остаётся пустым — оно запасное. Проверка смотрела ТОЛЬКО на верхнее поле, поэтому
+    # заполненная карта считалась «шаблон не указан», и пресет нельзя было сохранить:
+    # владелец вписал свой же UUID в строку языка и получил отказ.
+    #
+    # Разрешает карту в конкретный голос `pub_services.do_project_ready` по языку выпуска,
+    # то есть к моменту заказа в проекте уже стоит один идентификатор. Предохранитель
+    # «на серверном ключе только UUID шаблона» при этом никуда не девается: он стоит там,
+    # где тратятся деньги, — в сборке команды воркера (см. --required_service heygen).
+    by_lang = {}
+    try:
+        import preset_fields as _pf
+        by_lang = _pf.parse_voice_map(out.get("voice_by_lang"))
+    except Exception:                                              # noqa: BLE001
+        by_lang = {}
+    bad_lang = sorted(lang for lang, val in by_lang.items()
+                      if not _is_lumean_template_id(val))
+    if bad_lang:
+        raise LumeanTemplateError(
+            "Lumean · HeyGen требует UUID Template ID из библиотеки Lumean, а в карте "
+            "по языкам он не похож на UUID: " + ", ".join(bad_lang)
+        )
     template_id = valid_uuid or valid_voice
-    if not template_id:
+    if not template_id and not by_lang:
         raise LumeanTemplateError(
             "Lumean · HeyGen требует UUID Template ID из библиотеки Lumean; "
-            "обычный ElevenLabs/VoiceGenCore Voice ID сюда не подходит"
+            "обычный ElevenLabs/VoiceGenCore Voice ID сюда не подходит. "
+            "Укажите его в строке языка или в поле «Голос по умолчанию»"
         )
+    # Верхнее поле не выдумываем: если человек задал только карту, «по умолчанию» так и
+    # остаётся пустым — иначе шаблон одного языка молча стал бы голосом для всех
+    # остальных, и озвучка поехала бы не тем голосом, не сказав ни слова.
     out["voice"] = template_id
     out["voice_uuid"] = template_id
     # Model/voice engine live inside the validated Lumean template.  Leaving

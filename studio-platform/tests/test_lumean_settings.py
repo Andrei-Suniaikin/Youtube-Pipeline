@@ -22,8 +22,20 @@ import tempfile
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(BASE, "workers"))
+sys.path.insert(0, os.path.join(BASE, "server"))
+
+# Кабинет поднимается на ВРЕМЕННОЙ базе и временном каталоге тенантов: часть проверок
+# зовёт его функции напрямую, а общую dev-базу тест трогать не должен — иначе прогон
+# молча меняет то, на чём владелец готовится к показу.
+_TMP = tempfile.mkdtemp(prefix="lumean-settings-")
+os.environ.setdefault("VS_SERVER_DISABLE_BACKGROUND", "1")
+os.environ.setdefault("VS_SERVER_DB", os.path.join(_TMP, "t.db"))
+os.environ.setdefault("VS_DEV_DB", os.path.join(_TMP, "t.db"))
+os.environ.setdefault("VS_TENANTS_DIR", os.path.join(_TMP, "tenants"))
+os.environ.setdefault("HOME", os.path.join(BASE, "dev", "home"))
 
 import tts_worker as W                                            # noqa: E402
+import main as M                                                  # noqa: E402
 
 FAILS = []
 
@@ -123,6 +135,35 @@ def main() -> int:
         check("формат вывода остался нашим", over.get("output_settings"),
               {"audio_format": "mp3"})
         check("шаблон передан как был", body.get("template_id"), "tpl-1")
+
+        print("\nШаблон можно задать картой по языкам, а не только «по умолчанию»")
+        # Жалоба владельца 20.09.2026: вписал свой UUID шаблона в строку языка и получил
+        # «Lumean · HeyGen требует UUID Template ID» — пресет не сохранялся. Проверка
+        # смотрела только на верхнее поле «Голос по умолчанию», хотя правило ТЗ §06
+        # «язык → провайдер → идентификатор» живёт именно в карте: у канала с двумя
+        # языками там два разных шаблона, а верхнее поле пустое и запасное.
+        # Разрешает карту `pub_services.do_project_ready` по языку выпуска.
+        TID = "01a0be22-e505-7076-b88e-2615117febcb"
+        only_map = M._normalize_lumean_settings({"engine": "lumean",
+                                                 "voice_by_lang": f"ru: {TID}"})
+        check("карта по языкам принимается", only_map.get("voice_by_lang"), f"ru: {TID}")
+        check("и не подменяет собой голос по умолчанию", only_map.get("voice"), "")
+        two = M._normalize_lumean_settings(
+            {"engine": "lumean", "voice_by_lang": f"ru: {TID}, pl: {TID}"})
+        check("два языка — тоже норма", bool(two), True)
+        top = M._normalize_lumean_settings({"engine": "lumean", "voice": TID})
+        check("одно верхнее поле работает как прежде", top.get("voice"), TID)
+
+        for label, st in (("в карте голос вместо шаблона",
+                           {"engine": "lumean", "voice_by_lang": "ru: iP95p4xoKVk53GoZ742B"}),
+                          ("не задано вообще ничего", {"engine": "lumean"})):
+            try:
+                M._normalize_lumean_settings(st)
+                check(f"отказ: {label}", "принято", "LumeanTemplateError")
+            except M.LumeanTemplateError as exc:
+                check(f"отказ: {label}", "LumeanTemplateError", "LumeanTemplateError")
+                check(f"  и сказано, где чинить: {label}",
+                      "карте по языкам" in str(exc) or "строке языка" in str(exc), True)
 
         print("\nСмена настроек делает озвучку другой — оплаченный файл не подставится")
         W.TTS_CONFIG_OVERRIDE.clear()
