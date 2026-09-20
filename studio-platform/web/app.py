@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import datetime as dt
 import zoneinfo
+import hashlib
 import json
 import os
 import re
@@ -46,8 +47,9 @@ from pub_engine import revive as pub_engine_revive                # noqa: E402
 import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
 from pub_engine import channel_presets                            # noqa: E402
-from pub_remote import (COVER_BASE, REWRITE_BASE, donor_text,     # noqa: E402
-                        get_key, subs_exits_state, subs_probe_async, video_id)
+from pub_remote import (COVER_BASE, LANG_TO_RU, REWRITE_BASE,     # noqa: E402
+                        donor_subs, donor_text, get_key, subs_exits_state,
+                        subs_probe_async, video_id)
 from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
                           MEDIA_STAGES, OPTIONAL_STAGES,
                           collect_paid_texts, paid_texts_waiting)
@@ -2297,8 +2299,14 @@ def _pass_code(code: int) -> int:
     return code if (400 <= code < 500 or code == 503) else 502
 
 
-def _rw(path: str, sid: str, payload=None, method=None, raw=None, ctype=None):
-    """Запрос к Rewrite от имени вошедшего. Возвращает (код, тело)."""
+def _rw(path: str, sid: str, payload=None, method=None, raw=None, ctype=None,
+        extra=None):
+    """Запрос к Rewrite от имени вошедшего. Возвращает (код, тело).
+
+    `extra` — заголовки сверх обычных. Нужен ровно для одного: `Idempotency-Key`,
+    которым пакетная постановка защищается от потерянного ответа на POST (сосед
+    узнаёт по нему тот же заказ и не создаёт второй — rewrite/job_idempotency.py).
+    """
     data = raw
     headers = {"Cookie": f"{auth.COOKIE}={sid}"}
     if payload is not None:
@@ -2306,6 +2314,7 @@ def _rw(path: str, sid: str, payload=None, method=None, raw=None, ctype=None):
         headers["Content-Type"] = "application/json"
     elif ctype:
         headers["Content-Type"] = ctype
+    headers.update(extra or {})
     req = urllib.request.Request(REWRITE_BASE + path, data=data,
                                  method=method or ("POST" if data is not None else "GET"))
     for k, v in headers.items():
@@ -3676,6 +3685,22 @@ def _lumean_template_payload(values: dict) -> dict:
     voice = str(values.get("voice_id") or "").strip()
     if not voice:
         raise HTTPException(400, "не задан ID голоса — шаблон без голоса не работает")
+    # Формат идентификатора у сервисов РАЗНЫЙ, и перепутать их проще всего: у ElevenLabs
+    # это 20 знаков букв и цифр, у HeyGen — 32 шестнадцатеричных. Провайдер на такую
+    # путаницу отвечает «ID голоса указан в неверном формате», не говоря, чей это формат
+    # и что с ним делать. Проверяем здесь и называем вещи своими именами (20.09.2026:
+    # владелец взял голос HeyGen к сервису ElevenLabs и получил ровно этот тупик).
+    # Отказываем ТОЛЬКО когда id заведомо принадлежит ДРУГОМУ сервису. Формат «не узнали»
+    # пропускаем к провайдеру: он и есть власть над форматом, а вторым валидатором мы
+    # только начнём отвергать то, чего ещё не знаем (новый сервис, новая форма id).
+    LOOKS = {"elevenlabs": (re.compile(r"^[A-Za-z0-9]{20}$"), "ElevenLabs"),
+             "heygen": (re.compile(r"^[0-9a-f]{32}$"), "HeyGen")}
+    foreign = next((title for key, (rx, title) in LOOKS.items()
+                    if key != service and rx.match(voice)), "")
+    if foreign and service in LOOKS:
+        raise HTTPException(400, f"это идентификатор {foreign}, а сервис выбран "
+                                 f"«{LOOKS[service][1]}»: возьмите голос выбранного "
+                                 f"сервиса или смените сервис")
     voice_settings, tts = {}, {"voice_id": voice}
     for key, lo, hi in (("stability", 0.0, 1.0), ("similarity_boost", 0.0, 1.0),
                         ("style", 0.0, 1.0), ("speed", 0.5, 2.0)):
@@ -3700,8 +3725,19 @@ def _lumean_template_payload(values: dict) -> dict:
         if norm not in ("auto", "on", "off"):
             raise HTTPException(400, "нормализация текста — auto, on или off")
         tts["apply_text_normalization"] = norm
-    if voice_settings:
-        tts["voice_settings"] = voice_settings
+    # Стабильность провайдер требует ВСЕГДА («Необходимо указать параметр стабильности»),
+    # поэтому раздел настроек голоса уходит даже когда человек ничего не трогал.
+    voice_settings.setdefault("stability", 0.5)
+    tts["voice_settings"] = voice_settings
+    # Поля, которые сервис считает обязательными и у которых допустимо РОВНО ОДНО
+    # значение (проверено обращением к провайдеру 20.09.2026: mode_v2/mode_v3 и
+    # написания ElevenLabs/elevenlabs он отвергает). Спрашивать у человека нечего —
+    # подставляем сами, иначе форма отдавала бы заведомо неполный шаблон и падала на
+    # валидации у провайдера, как это и было.
+    if service == "elevenlabs":
+        tts["mode"] = "mode_v1"
+    elif service == "heygen":
+        tts["voice_engine"] = "elevenLabs"
     config = {"tts_settings": tts,
               # Формат вывода задаём сами: кабинет собирает ролик из mp3, и шаблон,
               # отдающий wav, ломает сборку молча.
@@ -4972,6 +5008,652 @@ class BatchIn(BaseModel):
     values: dict = {}
 
 
+# ───────── пакетный текст и обложка: источник берётся из проекта ─────────
+#
+# Почему это живёт в пульте, а не в кабинетном `/api/batch/{kind}`. Озвучка, картинки,
+# видео и рендер — задачи очереди КАБИНЕТА, и пакет для них стоит там же (`batch_run`).
+# Текст и обложка — СОСЕДНИЕ сервисы, к которым пульт ходит сам и кукой вошедшего
+# человека (`/ui/text` и `/ui/covers` выше). Кабинет про них не знает ничего; завести
+# для них ветку внутри его batch_run значило бы получить вторую дорогу к соседям, мимо
+# которой идёт всё остальное и которую никто не проверяет.
+#
+# ВАЖНО: обе ручки объявлены ДО `/ui/projects/batch/{kind}` — иначе catch-all перехватит
+# «text» и «cover» и ответит «нет вида» (та же причина, по которой в кабинете
+# `/api/batch/delete` объявлен выше своего catch-all, server/main.py).
+#
+# Главное правило (решение владельца 20.09.2026): ИСТОЧНИК БЕРЁТСЯ ИЗ ПРОЕКТА. Проект
+# знает про свой источник две вещи, и обе записанные, а не угаданные:
+#
+#   * донорская ссылка выпуска (`pub_releases` → `pub_plan_items.donor_url`) — то, из
+#     чего проект родился; ровно её берёт ночной движок (`pub_services.do_source_ready`
+#     для текста и `_preorder_cover` для обложки), и второй ответ на вопрос «из чего
+#     этот ролик» системе не нужен;
+#   * сценарий проекта — `source.txt` в папке проекта, тот самый текст, который
+#     показывает вкладка «Сценарий» (`/ui/projects/{pid}` → `source`).
+#
+# Нет ни того, ни другого — по проекту честный отказ с причиной. Подставлять чужой
+# источник нельзя: пачка тем и опасна, что одна ошибка уезжает сразу во все проекты.
+
+
+# Сколько проектов берём за одно нажатие. Это не вкус: за каждый проект пульт ходит в
+# сеть (расшифровка донора, загрузка файла соседу, постановка задачи), а запрос из
+# браузера обязан когда-то кончиться. Молча обрезать список нельзя — это платные
+# задачи, поэтому лишнее не «не уехало», а отказ с числом.
+BATCH_PULT_MAX = int(os.environ.get("VS_BATCH_PULT_MAX", "20") or 20)
+# Общий срок на расшифровки ВСЕЙ пачки и потолок выходов на одну ссылку. Повод тот же,
+# что у предпросмотра доноров (`pub_tags.donor_limits`): один поход за субтитрами при
+# мёртвом туннеле обходит все выходы по VS_SUBS_TIMEOUT каждый, и десять проектов
+# превратились бы в час ожидания с выжженными выходами на сдачу.
+BATCH_SUBS_BUDGET = float(os.environ.get("VS_BATCH_SUBS_BUDGET_SEC", "150") or 150)
+BATCH_SUBS_EXITS = int(os.environ.get("VS_BATCH_SUBS_EXITS", "3") or 3)
+
+
+def _batch_calls_ready(c) -> None:
+    """Журнал платных вызовов обязан быть на месте ДО первой постановки.
+
+    Без него у пачки нет единственной защиты от второй оплаты того же самого, а молча
+    поставить двадцать платных задач «как-нибудь» — худший из возможных исходов.
+    """
+    try:
+        pub_calls.ensure_calls_schema(c)
+        c.commit()
+    except sqlite3.Error as exc:
+        raise HTTPException(503, f"журнал платных вызовов недоступен "
+                                 f"({type(exc).__name__}) — пакетный запуск без него "
+                                 f"запрещён: он и есть защита от второй оплаты")
+
+
+def _batch_pids(body) -> list:
+    """Отмеченные проекты: без пустых, без повторов, не больше потолка."""
+    pids, seen = [], set()
+    for raw in (body.pids or []):
+        pid = str(raw).strip()
+        if pid and pid not in seen:
+            seen.add(pid)
+            pids.append(pid)
+    if not pids:
+        raise HTTPException(400, "не отмечен ни один проект")
+    if len(pids) > BATCH_PULT_MAX:
+        raise HTTPException(400, f"за одно нажатие берём не больше {BATCH_PULT_MAX} "
+                                 f"проектов, а отмечено {len(pids)}")
+    return pids
+
+
+def _project_release(c, pid: str):
+    """Выпуск проекта: донорская ссылка, язык канала, пресет обложек.
+
+    Тот же путь, которым их читает экран проектов (`_releases`): выпуск → строка плана
+    (донор) и канал (язык, пресеты). Берём последний по времени: проект в норме
+    заводится под один выпуск, но переносы плана оставляют старые строки.
+    """
+    return c.execute(
+        "SELECT r.release_id, ch.lang lang, ch.preset_cover preset_cover, "
+        "       p.donor_url donor_url "
+        "FROM pub_releases r "
+        "LEFT JOIN pub_channels ch ON ch.id = r.channel_id "
+        "LEFT JOIN pub_plan_items p ON p.id = r.plan_item_id "
+        "WHERE r.project_id=? AND r.tenant_id=? "
+        "ORDER BY r.updated DESC LIMIT 1", (pid, TENANT)).fetchone()
+
+
+def _project_scenario(mod, pid: str) -> str:
+    """Сценарий проекта (`source.txt`) — ровно то, что показывает вкладка «Сценарий».
+
+    Путь спрашиваем у кабинета, а при отдельном запуске пульта складываем сами: у
+    пульта тот же самый `TENANTS_DIR` (см. комментарий у переменной), и терять ручку
+    целиком из-за того, что кабинет не импортирован, незачем.
+    """
+    try:
+        if mod is not None and hasattr(mod, "_project_dir"):
+            path = os.path.join(mod._project_dir(TENANT, pid), "source.txt")
+        else:
+            path = os.path.join(TENANTS_DIR, TENANT, "projects", pid, "source.txt")
+        with open(path, encoding="utf-8") as f:
+            return f.read()
+    except (OSError, ValueError):
+        return ""
+
+
+def _batch_open_call(c, pid: str, kind: str):
+    """Заказ этого вида, судьба которого ещё не выяснена (`reserved`/`ordered`).
+
+    Это и есть ответ на «такая задача уже идёт». Спрашивать соседа про каждую задачу
+    каждого проекта — это десятки запросов на одно нажатие, и ответ всё равно был бы
+    про задачу, а не про деньги. Журнал знает именно про деньги.
+    """
+    return c.execute(
+        "SELECT id, unit, status, remote_order_id FROM provider_calls "
+        "WHERE project_id=? AND kind=? AND status IN (?,?) ORDER BY id DESC LIMIT 1",
+        (pid, kind, pub_calls.RESERVED, pub_calls.ORDERED)).fetchone()
+
+
+def _batch_langs(asked: list, rel, *, display: bool) -> tuple:
+    """Языки задачи: что выбрали в карточке, иначе язык канала этого проекта.
+
+    Пустое поле — «как в проекте», как и у соседних карточек. Для пачки это не мелочь:
+    в ней бывают проекты разных каналов, и один язык на всех был бы неверен для
+    большинства.
+
+    `display` — кому адресовано. Рерайт понимает и короткий код, и русское название
+    (`RewriteJobRequest._coerce_languages`), а Cover ждёт только русское название. И
+    переводить кодом `lang_ru` тут нельзя: по неизвестному коду он молча отвечает
+    «Русский», то есть на пачке это десять русских обложек вместо честного отказа.
+    """
+    if asked:
+        return list(asked), ""
+    code = ((rel["lang"] if rel is not None else "") or "").strip().lower()
+    if not code:
+        return [], ("не выбран язык, а у проекта нет выпуска, из которого его взять "
+                    "— выберите язык в карточке")
+    if not display:
+        return [code], ""
+    name = LANG_TO_RU.get(code, "")
+    if not name:
+        return [], (f"язык канала «{code}» обложкам неизвестен — выберите язык "
+                    f"в карточке")
+    return [name], ""
+
+
+def _short(text, n: int = 70) -> str:
+    text = str(text or "").strip()
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def _batch_item(pid: str, name: str = "") -> dict:
+    """Пустая строка отчёта по проекту.
+
+    Отчёт пофайловый по проектам: молчаливое «ок» на пачке платных задач не даёт
+    человеку увидеть, за что он заплатил, — а платит он за каждый проект отдельно.
+    """
+    return {"id": pid, "name": name or pid, "action": "skip", "why": "",
+            "source": "", "source_note": "", "replaced": False, "preset": "",
+            "languages": [], "skipped_languages": [], "job_id": "", "chars": 0,
+            "repeat_checked": True}
+
+
+def _batch_langs_left(c, pid: str, kind: str, langs: list, parts: dict, item: dict, *,
+                      reserve: bool, provider: str = "", model: str = "") -> list:
+    """Какие языки ещё не оплачены. `reserve=False` — только посмотреть (сухой прогон).
+
+    Единица оплаты — язык: и рерайт, и обложка считают деньги по языкам, и ночной
+    движок бронирует их так же (`pub_services.do_source_ready`: kind='text', unit=язык).
+    Поэтому добавленный язык уезжает, а уже оплаченный — нет, вместо «или всё, или
+    ничего» на весь проект.
+
+    Отпечаток считается по тому, что влияет на результат и на цену, и теми же ключами,
+    что у движка (`pub_calls.fingerprint(text=…, lang=…, model=…)`), — чтобы дубль
+    ловился и МЕЖДУ ними: один и тот же рерайт, заказанный ночью движком и днём этой
+    кнопкой, оплачивается один раз. Совпадут они не всегда: движок кладёт в отпечаток
+    ещё и имя пресета рерайта, а этот путь пресета не знает вовсе (`/jobs/rewrite`
+    его не принимает). Это не ошибка, а граница: с пресетом у соседа получается
+    другой текст, и считать его тем же оплаченным вызовом было бы неверно.
+    """
+    left = []
+    for lang in langs:
+        fp = pub_calls.fingerprint(lang=lang, **parts)
+        if not reserve:
+            row = c.execute(
+                "SELECT status, remote_order_id FROM provider_calls WHERE project_id=? "
+                "AND kind=? AND unit=? AND fingerprint=?", (pid, kind, lang, fp)).fetchone()
+            if row is None or row["status"] == pub_calls.FAILED:
+                left.append({"code": lang, "call_id": None})
+                continue
+            action = {pub_calls.DELIVERED: "skip"}.get(row["status"], "verify")
+            was = row["remote_order_id"] or ""
+        else:
+            decision = pub_calls.reserve(c, tenant_id=TENANT, project_id=pid, kind=kind,
+                                         unit=lang, fp=fp, provider=provider, model=model)
+            c.commit()              # строка журнала появляется раньше денег, и сразу
+            if decision["action"] == "new":
+                left.append({"code": lang, "call_id": decision["call_id"]})
+                continue
+            action = decision["action"]
+            was = decision["row"]["remote_order_id"] or ""
+        why = ("уже оплачено и получено" if action == "skip"
+               else "уже заказано" + (f", задача {was}" if was
+                                      else ", номер задачи неизвестен — нужен разбор"))
+        item["skipped_languages"].append({"code": lang, "why": why, "job_id": was})
+    return left
+
+
+def _batch_call_failed(c, fresh: list, code: int, detail) -> str:
+    """Закрыть брони после отказа соседа и сказать словами, что случилось.
+
+    Развилка тут про деньги, а не про вежливость. Отказ самого сервиса (4xx и «не
+    настроено») приходит ДО создания задачи: заказа нет, денег нет, строка уходит в
+    `failed`, и повтор безопасен. Всё остальное — обрыв, таймаут, 5xx — неоднозначно:
+    POST мог дойти и задачу создать. Такая строка остаётся `ordered`, и следующее
+    нажатие пойдёт разбираться, а не платить второй раз.
+    """
+    text = detail if isinstance(detail, str) else json.dumps(detail, ensure_ascii=False)
+    pre_order = (400 <= code < 500) or code == 503
+    for one in fresh:
+        if one["call_id"] is not None:
+            pub_calls.mark_failed(c, one["call_id"], text[:400], ordered=not pre_order)
+    c.commit()
+    if pre_order:
+        return f"сосед отказал ({code}): {_short(text, 160)}"
+    return (f"ответа нет ({code}): {_short(text, 160)}. Задача могла создаться — "
+            f"посмотрите её на экране и не нажимайте второй раз")
+
+
+def _batch_answer(items: list, dry_run: bool, service: str) -> dict:
+    """Итог пачки. Числа считаются ПО строкам отчёта, а не копятся рядом с ними:
+    разойтись они тогда не могут, а решение «платить или нет» принимается по ним."""
+    return {
+        "ok": True,
+        "dry_run": dry_run,
+        "service": service,
+        "planned": sum(1 for i in items if i["action"] == "order"),
+        "ordered": sum(1 for i in items if i["action"] == "ordered"),
+        "skipped": sum(1 for i in items if i["action"] == "skip"),
+        "failed": sum(1 for i in items if i["action"] == "error"),
+        "replaced": sum(1 for i in items if i["replaced"]),
+        "projects": items,
+        "note": ("источник взят из проекта; пустое поле карточки — «как в проекте». "
+                 "Сухой прогон ничего не заказывает и денег не тратит"),
+    }
+
+
+# Две карточки, которых на экране проектов не хватало (решение владельца 20.09.2026).
+# Отдельным ключом, а не внутри `kinds`: те четыре вида ставит кабинет и у них общая
+# форма полей из пресета, а эти две ручки — пультовые, с полями своего вида. Варианты
+# для них (языки, модели, пресеты) берутся там же, откуда их берут одиночные экраны, —
+# второго списка тех же значений в пульте быть не должно.
+BATCH_PULT_CARDS = {
+    "text": {"title": "Текст", "post": "/ui/projects/batch/text",
+             "options": "/ui/text",
+             "fields": ["languages", "model", "source_from", "source_url",
+                        "source_text", "one_at_a_time"]},
+    "cover": {"title": "Обложка", "post": "/ui/projects/batch/cover",
+              "options": "/ui/covers",
+              "fields": ["languages", "preset", "provider", "model", "reference_url",
+                         "edit_preview", "one_at_a_time"]},
+}
+
+
+class BatchTextIn(BaseModel):
+    pids: list = []
+    dry_run: bool = False            # сухой прогон: только показать, кому и что уйдёт
+    languages: list = []             # пусто — язык канала проекта («как в проекте»)
+    model: str = ""
+    source_from: str = "auto"        # auto | donor | text — что считать источником
+    source_url: str = ""             # замена: ссылка — уезжает ВСЕМ отмеченным
+    source_text: str = ""            # замена: текст (или прочитанный файл) — одному
+    one_at_a_time: bool = True       # не ставить второй заказ, пока идёт первый
+
+
+def _batch_text_plan(c, mod, pid: str, *, where: str, repl_url: str, repl_text: str,
+                     langs_asked: list, model: str, one_at_a_time: bool,
+                     net: bool, deadline: float) -> dict:
+    """Что уедет по одному проекту. Ничего не заказывает и денег не тратит.
+
+    Сухой прогон — это ровно этот проход с `net=False`: он читает проект, кэш
+    расшифровок и журнал оплат, но в сеть за субтитрами не идёт. Поэтому про
+    незнакомую кэшу ссылку он честно отвечает «повтор проверю при запуске»
+    (`repeat_checked: false`), а не выдумывает ответ.
+    """
+    p = c.execute("SELECT id, name FROM projects WHERE id=? AND tenant_id=?",
+                  (pid, TENANT)).fetchone()
+    if p is None:
+        item = _batch_item(pid)
+        item["why"] = "нет такого проекта"
+        return item
+    item = _batch_item(pid, p["name"] or pid)
+    rel = _project_release(c, pid)
+
+    langs, why = _batch_langs(langs_asked, rel, display=False)
+    if why:
+        item["why"] = why
+        return item
+    item["languages"] = list(langs)
+
+    # Порядок проверок выбран по цене: сначала то, что читается из базы, и только потом
+    # сеть. Проект, который всё равно пропустим, не должен жечь выход субтитров.
+    if one_at_a_time:
+        open_row = _batch_open_call(c, pid, "text")
+        if open_row is not None:
+            was = open_row["remote_order_id"] or ""
+            item["why"] = ("у проекта уже идёт заказ текста"
+                           + (f" (задача {was})" if was else " (номер ещё не записан)")
+                           + " — второй не ставлю")
+            return item
+
+    text = ""
+    if repl_text.strip():
+        text = repl_text
+        item.update(source="replacement-text", replaced=True,
+                    source_note=f"вставленный текст, {len(repl_text)} знаков")
+    else:
+        url = repl_url
+        if url:
+            item.update(source="replacement-url", replaced=True,
+                        source_note=f"ссылка карточки {_short(url)}")
+        else:
+            donor = ((rel["donor_url"] if rel is not None else "") or "").strip()
+            own = _project_scenario(mod, pid)
+            if where == "donor" and not donor:
+                item["why"] = "у проекта нет донорской ссылки — источник брать неоткуда"
+                return item
+            if where == "text" and not own.strip():
+                item["why"] = "в проекте нет сохранённого сценария — источник пуст"
+                return item
+            if donor and where in ("auto", "donor"):
+                item.update(source="donor", source_note=f"ссылка донора {_short(donor)}")
+                url = donor
+            elif own.strip():
+                item.update(source="text",
+                            source_note=f"сценарий проекта, {len(own)} знаков")
+                text = own
+            else:
+                item["why"] = ("у проекта нет источника: ни донорской ссылки, "
+                               "ни сохранённого сценария")
+                return item
+        if url:
+            try:
+                subs = donor_subs(url, net=net, strict=True, deadline=deadline,
+                                  max_exits=BATCH_SUBS_EXITS)
+            except Exception as exc:                             # noqa: BLE001
+                item["why"] = f"текст ролика не получен: {exc}"
+                return item
+            text = (subs or {}).get("text") or ""
+            if not text and not net:
+                # Сухой прогон, а расшифровки в кэше нет. Соврать «поставится» нельзя и
+                # промолчать нельзя: говорим прямо, что повтор проверим при запуске.
+                item["action"] = "order"
+                item["repeat_checked"] = False
+                return item
+            if not text.strip():
+                item["why"] = "расшифровка донора пустая"
+                return item
+            item["source_note"] += (f" — расшифровка {len(text)} знаков"
+                                    + (", из кэша" if (subs or {}).get("cached") else ""))
+    if not text.strip():
+        item["why"] = "текста нет — рерайтить нечего"
+        return item
+
+    item["chars"] = len(text)
+    item["_text"] = text
+    item["_parts"] = {"text": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                      "model": model}
+    left = _batch_langs_left(c, pid, "text", langs, item["_parts"], item, reserve=False)
+    if not left:
+        item["why"] = "за эти языки уже платили — новый заказ не ставлю"
+        return item
+    item["languages"] = [one["code"] for one in left]
+    item["action"] = "order"
+    return item
+
+
+def _batch_text_order(c, sid: str, item: dict, *, model: str) -> None:
+    """Поставить задачу текста одному проекту. Меняет `item` на месте.
+
+    Порядок ровно такой: бронь в журнале → загрузка текста соседу → заказ. Строка
+    журнала появляется раньше денег: обрыв между заказом и записью иначе означал бы
+    вторую оплату при следующем нажатии.
+    """
+    pid = item["id"]
+    fresh = _batch_langs_left(c, pid, "text", item["languages"], item["_parts"], item,
+                              reserve=True, provider="rewrite", model=model)
+    if not fresh:
+        item.update(action="skip", languages=[],
+                    why="за эти языки уже платили — новый заказ не ставлю")
+        return
+    langs = [one["code"] for one in fresh]
+    item["languages"] = langs
+    text = item["_text"]
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    # Имя файла своё на каждый проект и на каждое содержимое: сосед кладёт загрузку по
+    # имени и одноимённую перезаписывает, а в пачке «вставленный.txt» у всех проектов
+    # было бы одно — и все получили бы один сценарий.
+    name = f"{pid}-{digest[:8]}.txt"
+    boundary = "----studio" + secrets.token_hex(8)
+    part = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="{name}"\r\n'
+            f"Content-Type: text/plain; charset=utf-8\r\n\r\n").encode("utf-8")
+    raw = part + text.encode("utf-8") + f"\r\n--{boundary}--\r\n".encode("utf-8")
+    code, out = _rw("/upload", sid, raw=raw,
+                    ctype=f"multipart/form-data; boundary={boundary}")
+    if code >= 400:
+        item.update(action="error", why=_batch_call_failed(c, fresh, code, out))
+        return
+    stored = (out or {}).get("filename") or (out or {}).get("file") or name
+
+    order = {"files": [stored],
+             "languages": [{"code": x, "display": x} for x in langs],
+             "model": model}
+    # Ключ повтора сосед считает по паре «ключ + тело» (rewrite/job_idempotency.identity).
+    # Ключ собираем ИЗ САМОГО ТЕЛА: тогда потерянный ответ на POST вернёт ту же задачу,
+    # а другой заказ никогда не упрётся в вечный 409 «этот ключ уже был с другим телом».
+    key = "pult-batch-" + hashlib.sha256(
+        json.dumps(order, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:32]
+    code, out = _rw("/jobs/rewrite", sid, order, extra={"Idempotency-Key": key})
+    if code >= 400:
+        item.update(action="error", why=_batch_call_failed(c, fresh, code, out))
+        return
+    job_id = str((out or {}).get("job_id") or "")
+    for one in fresh:
+        pub_calls.mark_ordered(c, one["call_id"], job_id)
+    c.commit()
+    _link_project_jobs(pid, "rewrite", out)
+    item.update(action="ordered", job_id=job_id, why="")
+
+
+@app.post("/ui/projects/batch/text")
+def ui_projects_batch_text(body: BatchTextIn, request: Request):
+    """Поставить текст пачке отмеченных проектов — тем же путём, что и `/ui/text`.
+
+    Источник берётся из проекта (донорская ссылка выпуска, иначе сценарий проекта);
+    поля карточки — необязательная замена поверх. Ответ пофайловый по проектам: что
+    поставлено, что пропущено и почему. Это платные задачи сразу на пачке, и
+    молчаливое «ок» здесь означало бы «заплатили неизвестно за что».
+
+    `dry_run` — сухой прогон: тот же разбор, но без сети и без постановки. Им экран
+    показывает «уйдёт в работу N проектов» и спрашивает подтверждение.
+
+    Режима «с нуля по теме» тут нет намеренно: тема — это не источник проекта, её в
+    проекте не записано, и брать её пачке неоткуда. Такие задачи ставятся поштучно
+    на экране текста.
+    """
+    sid = getattr(request.state, "sid", "")
+    pids = _batch_pids(body)
+    langs_asked = [str(x).strip() for x in (body.languages or []) if str(x).strip()]
+    repl_url = (body.source_url or "").strip()
+    repl_text = body.source_text or ""
+    where = (body.source_from or "auto").strip().lower()
+    if where not in ("auto", "donor", "text"):
+        raise HTTPException(400, f"неизвестный источник «{where}»")
+    if repl_url and repl_text.strip():
+        raise HTTPException(400, "замена источника одна: либо ссылка, либо текст")
+    # Ссылку раздаём всем отмеченным — это один донор на пачку, так её и задумывали.
+    # А вставленный текст (и прочитанный в браузере файл) — это ОДИН сценарий, и раздать
+    # его десяти проектам значит сделать десять одинаковых роликов за десять оплат.
+    if repl_text.strip() and len(pids) > 1:
+        raise HTTPException(400, "вставленный текст (или файл) уходит одному проекту: "
+                                 "отметьте один проект или уберите текст")
+    model = (body.model or "").strip() or "gpt-4.1-nano"
+
+    mod = sys.modules.get("main")
+    items, c = [], db()
+    try:
+        _batch_calls_ready(c)
+        deadline = time.time() + BATCH_SUBS_BUDGET
+        for pid in pids:
+            # Беда одного проекта не должна уносить отчёт по остальным: часть пачки
+            # к этому моменту уже оплачена, и ответ «500» скрыл бы от человека, что
+            # именно уехало. Строка проекта становится ошибкой, пачка идёт дальше.
+            item = _batch_item(pid)
+            try:
+                item = _batch_text_plan(c, mod, pid, where=where, repl_url=repl_url,
+                                        repl_text=repl_text, langs_asked=langs_asked,
+                                        model=model,
+                                        one_at_a_time=bool(body.one_at_a_time),
+                                        net=not body.dry_run, deadline=deadline)
+                if item["action"] == "order" and not body.dry_run:
+                    _batch_text_order(c, sid, item, model=model)
+            except HTTPException:
+                raise
+            except Exception as exc:                             # noqa: BLE001
+                item.update(action="error", why=f"сбой на нашей стороне: "
+                                                f"{type(exc).__name__}")
+            finally:
+                item.pop("_text", None)
+                item.pop("_parts", None)
+                items.append(item)
+    finally:
+        c.close()
+    return _batch_answer(items, bool(body.dry_run), "rewrite")
+
+
+class BatchCoverIn(BaseModel):
+    pids: list = []
+    dry_run: bool = False
+    languages: list = []             # пусто — язык канала проекта («как в проекте»)
+    preset: str = ""                 # пусто — пресет обложек канала
+    provider: str = ""
+    model: str = ""
+    reference_url: str = ""          # замена: ссылка на референс — уезжает ВСЕМ
+    edit_preview: bool = False       # явный выбор, а не побочный эффект (ТЗ §10)
+    one_at_a_time: bool = True
+
+
+def _batch_cover_plan(c, pid: str, *, repl_url: str, langs_asked: list, preset: str,
+                      provider: str, model: str, edit_preview: bool,
+                      one_at_a_time: bool) -> dict:
+    """Что уедет по обложке одного проекта. Сети не трогает вовсе.
+
+    Стратегия здесь одна — «по превью донора»: это и есть источник ПРОЕКТА, и тем же
+    путём заказывает обложку ночной движок (`pub_services._preorder_cover`). Заголовок
+    и семя источником проекта не являются — их в проекте не записано, поэтому пачкой
+    они не ставятся и остаются на одиночной карточке `/ui/covers`.
+    """
+    p = c.execute("SELECT id, name FROM projects WHERE id=? AND tenant_id=?",
+                  (pid, TENANT)).fetchone()
+    if p is None:
+        item = _batch_item(pid)
+        item["why"] = "нет такого проекта"
+        return item
+    item = _batch_item(pid, p["name"] or pid)
+    rel = _project_release(c, pid)
+
+    langs, why = _batch_langs(langs_asked, rel, display=True)
+    if why:
+        item["why"] = why
+        return item
+    item["languages"] = list(langs)
+
+    if one_at_a_time:
+        open_row = _batch_open_call(c, pid, "cover")
+        if open_row is not None:
+            was = open_row["remote_order_id"] or ""
+            item["why"] = ("у проекта уже идёт заказ обложки"
+                           + (f" (задача {was})" if was else " (номер ещё не записан)")
+                           + " — второй не ставлю")
+            return item
+
+    if repl_url:
+        url = repl_url
+        item.update(source="replacement-url", replaced=True,
+                    source_note=f"референс карточки {_short(url)}")
+    else:
+        url = ((rel["donor_url"] if rel is not None else "") or "").strip()
+        if not url:
+            item["why"] = ("у проекта нет донорской ссылки — обложку делать не из чего; "
+                           "вставьте ссылку на референс")
+            return item
+        item.update(source="donor", source_note=f"превью донора {_short(url)}")
+
+    item["preset"] = preset or ((rel["preset_cover"] if rel is not None else "") or "")
+    item["_url"] = url
+    item["_parts"] = {"url": url, "preset": item["preset"], "provider": provider,
+                      "model": model, "mode": "url",
+                      "edit": "1" if edit_preview else ""}
+    left = _batch_langs_left(c, pid, "cover", langs, item["_parts"], item, reserve=False)
+    if not left:
+        item["why"] = "за эти языки уже платили — новый заказ не ставлю"
+        return item
+    item["languages"] = [one["code"] for one in left]
+    item["action"] = "order"
+    return item
+
+
+def _batch_cover_order(c, sid: str, item: dict, *, provider: str, model: str,
+                       edit_preview: bool) -> None:
+    """Поставить задачу обложки одному проекту. Меняет `item` на месте."""
+    pid = item["id"]
+    fresh = _batch_langs_left(c, pid, "cover", item["languages"], item["_parts"], item,
+                              reserve=True, provider=provider or "cover", model=model)
+    if not fresh:
+        item.update(action="skip", languages=[],
+                    why="за эти языки уже платили — новый заказ не ставлю")
+        return
+    langs = [one["code"] for one in fresh]
+    item["languages"] = langs
+    # Тело собирается тем же способом, что в одиночной `ui_covers_create`: соотношение
+    # сторон у обложки YouTube одно и уходит в пресет явно, а редактирование превью —
+    # отдельная галочка, а не следствие приложенного файла (ТЗ §10).
+    preset_data = {"aspect_ratio": "16:9", "simple_mode": bool(edit_preview)}
+    if provider:
+        preset_data["generation_provider"] = provider
+        preset_data["generation_model"] = model or ""
+    payload = {"languages": langs, "mode": "url", "preset_name": item["preset"],
+               "preset_data": preset_data, "urls": [item["_url"]]}
+    code, out = _cover("/jobs/cover", sid, payload)
+    if code >= 400:
+        item.update(action="error", why=_batch_call_failed(c, fresh, code, out))
+        return
+    job_id = str((out or {}).get("job_id") or "")
+    for one in fresh:
+        pub_calls.mark_ordered(c, one["call_id"], job_id)
+    c.commit()
+    _link_project_jobs(pid, "cover", out)
+    item.update(action="ordered", job_id=job_id, why="")
+
+
+@app.post("/ui/projects/batch/cover")
+def ui_projects_batch_cover(body: BatchCoverIn, request: Request):
+    """Поставить обложку пачке отмеченных проектов — тем же путём, что и `/ui/covers`.
+
+    Источник — превью донора этого проекта; ссылка на референс в карточке заменяет его
+    ВСЕМ отмеченным и помечается в ответе (`replaced`), чтобы было видно, кому уехало
+    не своё. Сухой прогон и формат ответа — как у пакетного текста.
+    """
+    sid = getattr(request.state, "sid", "")
+    pids = _batch_pids(body)
+    langs_asked = [str(x).strip() for x in (body.languages or []) if str(x).strip()]
+    provider = (body.provider or "").strip()
+    model = (body.model or "").strip()
+    items, c = [], db()
+    try:
+        _batch_calls_ready(c)
+        for pid in pids:
+            # То же, что и у текста: одна упавшая строка не уносит отчёт по пачке.
+            item = _batch_item(pid)
+            try:
+                item = _batch_cover_plan(
+                    c, pid, repl_url=(body.reference_url or "").strip(),
+                    langs_asked=langs_asked, preset=(body.preset or "").strip(),
+                    provider=provider, model=model,
+                    edit_preview=bool(body.edit_preview),
+                    one_at_a_time=bool(body.one_at_a_time))
+                if item["action"] == "order" and not body.dry_run:
+                    _batch_cover_order(c, sid, item, provider=provider, model=model,
+                                       edit_preview=bool(body.edit_preview))
+            except HTTPException:
+                raise
+            except Exception as exc:                             # noqa: BLE001
+                item.update(action="error", why=f"сбой на нашей стороне: "
+                                                f"{type(exc).__name__}")
+            finally:
+                item.pop("_url", None)
+                item.pop("_parts", None)
+                items.append(item)
+    finally:
+        c.close()
+    return _batch_answer(items, bool(body.dry_run), "cover")
+
+
 @app.post("/ui/projects/batch/{kind}")
 def ui_projects_batch(kind: str, body: BatchIn, request: Request):
     """Поставить один этап пачке проектов. Пустое поле — «как в проекте»: кабинет
@@ -5015,7 +5697,7 @@ def ui_projects_batch_fields():
         # Порядок как в карточке кабинета: главное поле сверху, остальное — «доп.».
         fields.sort(key=lambda f: 0 if f["key"] == main_key else 1)
         out[kind] = {"title": title, "fields": fields}
-    return {"kinds": out,
+    return {"kinds": out, "pult": dict(BATCH_PULT_CARDS),
             "note": "пустое поле — «как в проекте»: настройки проекта не перетираются"}
 
 

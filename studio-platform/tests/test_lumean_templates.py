@@ -73,7 +73,10 @@ def main() -> int:
                             "apply_text_normalization": "on",
                             "voice_settings": {"stability": 0.4, "similarity_boost": 0.8,
                                                "style": 0.2, "speed": 1.1,
-                                               "use_speaker_boost": True}},
+                                               "use_speaker_boost": True},
+                            # Обязателен у elevenlabs, подставляем сами — см. блок
+                            # «Обязательные поля провайдера» ниже.
+                            "mode": "mode_v1"},
            "output_settings": {"audio_format": "mp3"},
            "worker_settings": {"chunk_size": 1500},
            "pause_settings": {"enabled": True},
@@ -112,6 +115,46 @@ def main() -> int:
           (0.5, 1, "1", 2000, "0"))
     check("незаданное в шаблоне поле приходит пустым, а не выдуманным",
           vals.get("similarity_boost"), "")
+
+    print("\nОбязательные поля провайдера подставляются сами (20.09.2026)")
+    # Что провайдер требует — выяснено обращением к нему: у elevenlabs обязателен
+    # `mode` и принимает он РОВНО «mode_v1» (mode_v2/mode_v3 отвергает), у heygen
+    # вместо режима обязателен `voice_engine` и принимается ровно «elevenLabs»
+    # (написания ElevenLabs/elevenlabs отвергаются), а `voice_settings.stability`
+    # обязателен всегда. Без этого форма отдавала заведомо неполный шаблон, и
+    # создание падало на валидации — именно это и увидел владелец.
+    eleven = call("_lumean_template_payload", {"name": "Проба", "service_key": "elevenlabs",
+                                               "voice_id": "iP95p4xoKVk53GoZ742B"})
+    tts = ((eleven.get("ok") or {}).get("config") or {}).get("tts_settings") or {}
+    check("elevenlabs: режим подставлен", tts.get("mode"), "mode_v1")
+    check("elevenlabs: движок не подставлен (он там лишний)", tts.get("voice_engine"), None)
+    check("стабильность уходит даже когда её не трогали",
+          (tts.get("voice_settings") or {}).get("stability"), 0.5)
+
+    heygen = call("_lumean_template_payload", {"name": "Проба", "service_key": "heygen",
+                                               "voice_id": "c458964dc4264b70a867b2ebcf36b51e"})
+    tts2 = ((heygen.get("ok") or {}).get("config") or {}).get("tts_settings") or {}
+    check("heygen: движок подставлен ровно тем написанием, что принимает провайдер",
+          tts2.get("voice_engine"), "elevenLabs")
+    check("heygen: режима нет", tts2.get("mode"), None)
+
+    print("\nПерепутанный формат id ловится ДО провайдера и называется словами")
+    # Ловушка, в которую попал владелец: взял голос HeyGen к сервису ElevenLabs.
+    # Провайдер на это отвечает «ID голоса указан в неверном формате», не говоря,
+    # чей это формат и что делать.
+    mix = call("_lumean_template_payload", {"name": "Проба", "service_key": "elevenlabs",
+                                            "voice_id": "c458964dc4264b70a867b2ebcf36b51e"})
+    check("отказ, а не запрос к провайдеру", mix.get("code"), 400)
+    check("сказано, чей это на самом деле id", "HeyGen" in str(mix.get("err")), True)
+    check("и какой сервис выбран", "ElevenLabs" in str(mix.get("err")), True)
+    mix2 = call("_lumean_template_payload", {"name": "Проба", "service_key": "heygen",
+                                             "voice_id": "iP95p4xoKVk53GoZ742B"})
+    check("и наоборот тоже", (mix2.get("code"), "ElevenLabs" in str(mix2.get("err"))),
+          (400, True))
+    # Незнакомый формат — не наше дело: пропускаем к провайдеру, он решит сам.
+    unknown = call("_lumean_template_payload", {"name": "Проба", "service_key": "elevenlabs",
+                                                "voice_id": "voice-1"})
+    check("незнакомый формат мы не отвергаем", bool(unknown.get("ok")), True)
 
     print("\nБез ключа Lumean экран открывается и честно говорит причину")
     empty = call("_lumean_field_options", None)

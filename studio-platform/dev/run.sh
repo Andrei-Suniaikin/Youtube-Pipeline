@@ -26,6 +26,17 @@ mkdir -p "$ROOT/dev/home/VideoStudio" "$ROOT/dev/data/tenants"
 export VS_REWRITE_BASE="http://127.0.0.1:$PORT/rewrite"
 export VS_COVER_BASE="http://127.0.0.1:$PORT/cover"
 export VS_CABINET_BASE="http://127.0.0.1:$PORT"
+# Ключи провайдеров ищем ДО подмены HOME (20.09.2026). Кабинет читает их из
+# `~/video_studio_api_keys.json`, а строкой ниже HOME становится dev/home — то есть
+# стенд искал ключи в изолированном каталоге, где их нет и не будет, и молча работал
+# совсем без ключей: список моделей пуст, шаблоны Lumean «ключ не задан», статус FastGen
+# «нет данных». Диагноз при этом выглядел как «сломались ключи», а сломан был путь.
+# `dev/run-live.sh` делает то же самое и поэтому работает — здесь этого просто не было.
+export VS_SERVER_KEYS_PATH="${VS_SERVER_KEYS_PATH:-$HOME/video_studio_api_keys.json}"
+if [ ! -f "$VS_SERVER_KEYS_PATH" ]; then
+  echo "  ключей нет: $VS_SERVER_KEYS_PATH — стенд поднимется, но провайдеры будут пусты"
+  echo "  (свой путь: VS_SERVER_KEYS_PATH=/путь dev/run.sh)"
+fi
 export HOME="$ROOT/dev/home"
 # Базу можно подменить снаружи: стенды поднимаются на КОПИИ базы (правило проекта),
 # и раньше жёсткое присваивание перебивало переданный путь — стенд молча работал на

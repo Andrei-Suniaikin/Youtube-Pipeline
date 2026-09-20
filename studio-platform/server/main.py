@@ -17095,8 +17095,16 @@ def lumean_template_info(template_id: str, key: str = "") -> dict:
         data = r.json() or {}
     except Exception:                                              # noqa: BLE001
         return {"ok": False, "why": "ответ Lumean не разобран"}
+    # Провайдер заворачивает ответ в конверт {success, message, data}: сам шаблон лежит в
+    # `data`, а голос и модель ещё глубже — в `config.tts_settings` (так это уже читает
+    # `lumean_templates`). Раньше конверт принимали за шаблон, и проверка отдавала пустые
+    # имя, сервис и голос, а в «полях шаблона» показывала success/message/data — то есть
+    # ровно ничего не проверяла, хотя выглядела как проверка (20.09.2026).
+    data = data.get("data") if isinstance(data.get("data"), dict) else data
+    cfg = data.get("config") if isinstance(data.get("config"), dict) else {}
     service = data.get("service") if isinstance(data.get("service"), dict) else {}
-    tts = data.get("tts_settings") if isinstance(data.get("tts_settings"), dict) else {}
+    tts = cfg.get("tts_settings") if isinstance(cfg.get("tts_settings"), dict) else (
+        data.get("tts_settings") if isinstance(data.get("tts_settings"), dict) else {})
     return {
         "ok": True,
         "id": tid,
