@@ -4685,6 +4685,13 @@ function fieldForm(groups){
       }).join('')}</div></div>`);
     form.append(card);
     g.fields.filter(f => f.kind === 'langmap').forEach(f => wireLangMap(card, f, g, locked));
+    // Сценарий и обложка (20.09.2026, третья просьба владельца). В группах «Сценарий» и
+    // «Обложка» стоял ТОЛЬКО выбор чужого пресета по имени: сами настройки жили на
+    // экране списка пресетов, и, чтобы их поправить, надо было уйти из формы, найти
+    // нужный пресет среди чужих и вернуться. Теперь они правятся здесь же — тем самым
+    // окном, что и на списке, и форма под руками не перерисовывается.
+    g.fields.filter(f => NEIGHBOUR_PRESET_KEYS[f.key]).forEach(f =>
+      wireNeighbourPreset(card, f, locked));
   }
   // Переключатель источника группы — только когда его нарисовали (см. linkBarHtml).
   // Клик по «Свои поля» шлёт запрос на снятие ссылки, только если она реально
@@ -4746,6 +4753,43 @@ function parseVoiceMapRows(raw){
 // Собрать виджет «голоса по языкам»: строка = язык из выпадающего списка + текстовое
 // поле идентификатора + крестик. Движок и формат хранения не меняются — это только
 // удобная отрисовка одной и той же строки настроек.
+// Поле пресета кабинета → сервис соседа, у которого этот пресет живёт.
+const NEIGHBOUR_PRESET_KEYS = {preset_rewrite: 'rewrite', preset_cover: 'cover'};
+
+function wireNeighbourPreset(card, f, locked){
+  const service = NEIGHBOUR_PRESET_KEYS[f.key];
+  const sel = card.querySelector('#f-' + f.key);
+  if (!sel || locked) return;
+  const bar = $(`<div style="display:flex;gap:8px;margin-top:6px">
+    <button type="button" class="ghost small np-edit">Настроить</button>
+    <button type="button" class="ghost small np-add">Завести новый</button>
+  </div>`);
+  sel.parentElement.append(bar);
+  const edit = bar.querySelector('.np-edit');
+  const paint = () => { edit.disabled = !sel.value; };
+  sel.addEventListener('change', paint);
+  paint();
+  edit.onclick = () => {
+    if (!sel.value){ toast('Сначала выберите пресет — или заведите новый'); return; }
+    // reload:false — человек стоит в незаполненной форме пресета кабинета, и общая
+    // перерисовка стёрла бы всё, что он успел набрать.
+    neighbourPresetModal(service, sel.value, {reload: false});
+  };
+  bar.querySelector('.np-add').onclick = () => neighbourPresetModal(service, null, {
+    reload: false,
+    // Заведённый пресет сразу становится выбранным: иначе человек заводит его и тут же
+    // ищет в списке, который ещё не знает о нём.
+    onSaved: name => {
+      if (!name) return;
+      if (![...sel.options].some(o => o.value === name))
+        sel.append(new Option(name, name));
+      sel.value = name;
+      paint();
+      toast('Пресет заведён и выбран здесь же', 'ok');
+    },
+  });
+}
+
 function wireLangMap(card, f, group, locked){
   const hidden = card.querySelector('#f-' + f.key);
   const box = card.querySelector('#f-' + f.key + '-box');
@@ -5592,7 +5636,7 @@ async function channelPresetModal(id){
 
 // Окно правки пресета соседа. Поля описывает сервер (NEIGHBOUR_PRESET_FIELDS) — здесь
 // только отрисовка: второй список полей в браузере разошёлся бы с первым.
-async function neighbourPresetModal(service, name){
+async function neighbourPresetModal(service, name, opts){
   const creating = !name;
   let d;
   try{
@@ -5670,7 +5714,11 @@ async function neighbourPresetModal(service, name){
           encodeURIComponent(name)}/form`, {values});
       }
       close();
-      await render();
+      // Перерисовка нужна списку пресетов (там карточки соседей), но вредна ФОРМЕ
+      // пресета: она стёрла бы незаписанные правки. Зовущий решает сам, а имя
+      // заведённого пресета отдаём ему — чтобы подставить его в поле на месте.
+      if (opts && opts.onSaved) opts.onSaved(creating ? box.querySelector('#np-name').value.trim() : name);
+      if (!opts || opts.reload !== false) await render();
     }});
 
   // Языковые строки (у рерайта): язык + ведущий + канал.
