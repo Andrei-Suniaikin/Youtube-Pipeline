@@ -345,11 +345,20 @@ def main() -> int:
           "покинутой вкладке")
     check("исход сохраняется в STAGE_OUTCOME_STATE по ключу pid:tab",
           "const skey = p.id + ':' + tab;" in stage_tab
-          and "STAGE_OUTCOME_STATE[skey] = {text, cls};" in stage_tab, True)
+          and "STAGE_OUTCOME_STATE[skey] = {text, cls, at: Date.now()};" in stage_tab, True)
     check("исход из STAGE_OUTCOME_STATE восстанавливается при (пере)отрисовке вкладки",
           "const savedOutcome = STAGE_OUTCOME_STATE[skey];" in stage_tab, True)
     check("ошибка старта (400 и т.п.) тоже сохраняется в STAGE_OUTCOME_STATE",
-          "STAGE_OUTCOME_STATE[skey] = {text: e.message, cls: 'bad'};" in stage_tab, True)
+          "STAGE_OUTCOME_STATE[skey] = {text: e.message, cls: 'bad', at: Date.now()};"
+          in stage_tab, True)
+    # 21.09.2026: у записи появился срок. Без него отказ переживал не только ту самую
+    # перерисовку, ради которой всё делалось, но и весь сеанс: владелец видел «Уже идёт»
+    # по проекту, где мешавшие задачи давно отменены. Поведение проверяется в браузере
+    # (tests/test_stage_outcome_ttl_browser.py), здесь пришпилен сам срок.
+    check("у сохранённого исхода есть срок годности",
+          "STAGE_OUTCOME_TTL_MS" in index_html, True)
+    check("и протухший исход удаляется, а не показывается",
+          "delete STAGE_OUTCOME_STATE[skey];" in stage_tab, True)
     check("адрес на момент клика запоминается (hashAtClick) ДО похода в сеть",
           "const hashAtClick = location.hash;" in stage_tab, True)
     check("отложенный viewProject() после успешного старта сверяет location.hash с "

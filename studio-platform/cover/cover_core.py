@@ -555,6 +555,16 @@ def _acquire_cancelable(semaphore, cancel_check=None, step: float = 0.25) -> boo
 
 def _openai_client(api_key: str):
     """Клиент OpenAI с кэшированием (один клиент на ключ, потокобезопасно)."""
+    # 21.09.2026: пакета openai в окружении не было, и анализ обложки падал здесь
+    # с `NameError: name 'openai' is not defined` — сообщением, по которому нельзя
+    # понять ни что сломано, ни что делать. Флаг OPENAI_AVAILABLE при этом честно
+    # выставлялся импортом и не читался НИГДЕ. Теперь читается.
+    if not OPENAI_AVAILABLE:
+        raise RuntimeError(
+            "не установлен пакет openai — анализ и генерация обложек через OpenAI "
+            "невозможны. Деньги не потрачены, повтор не поможет. "
+            "Лечится установкой: .venv/bin/pip install openai"
+        )
     with _openai_clients_lock:
         if api_key not in _openai_clients:
             http_client = httpx.Client() if httpx is not None else None

@@ -2959,6 +2959,15 @@ const STAGE_OUTCOME_TEXT = {
 // #N» пропадало через 1,2 с, так и не будучи прочитанным. Ключ — pid:tab, живёт на
 // сессию вкладки браузера, как и остальные *_STATE этого экрана.
 const STAGE_OUTCOME_STATE = {};
+// 21.09.2026: исход переживал перерисовку БЕССРОЧНО, и отказ превращался в призрак.
+// У владельца на экране висело «Уже идёт — вторая такая же задача не ставится», хотя
+// мешавшие задачи давно отменены и сервер старт разрешал. Пока этап в очереди, экран
+// автообновляется, и старая надпись рисовалась заново снова и снова — человек видел
+// отказ, которого в этот момент уже не существовало, и не нажимал кнопку.
+// Исход отвечает на ОДНО нажатие и живёт ровно столько, сколько нужно, чтобы пережить
+// отложенное обновление экрана (1,2 с). Дальше он молчит: пусть лучше не будет надписи,
+// чем будет неправда.
+const STAGE_OUTCOME_TTL_MS = 15000;
 
 async function renderStageTab(d, tab){
   const p = d.project;
@@ -2981,7 +2990,9 @@ async function renderStageTab(d, tab){
   const outcomeBox = actCard.querySelector('#stage-outcome');
   // Показать исход предыдущего нажатия сразу же — переживает перерисовку экрана.
   const savedOutcome = STAGE_OUTCOME_STATE[skey];
-  if (savedOutcome){
+  if (savedOutcome && Date.now() - (savedOutcome.at || 0) > STAGE_OUTCOME_TTL_MS){
+    delete STAGE_OUTCOME_STATE[skey];          // протух — не показываем вчерашний ответ
+  } else if (savedOutcome){
     outcomeBox.textContent = savedOutcome.text;
     outcomeBox.classList.add(savedOutcome.cls);
   }
@@ -3003,14 +3014,14 @@ async function renderStageTab(d, tab){
         ? `Поставлено: задача #${out.job_id}`
         : (STAGE_OUTCOME_TEXT[out.outcome] || out.outcome);
       const cls = out.outcome === 'started' ? 'muted' : 'bad';
-      STAGE_OUTCOME_STATE[skey] = {text, cls};
+      STAGE_OUTCOME_STATE[skey] = {text, cls, at: Date.now()};
       outcomeBox.textContent = text;
       outcomeBox.classList.add(cls);
       if (out.outcome === 'started'){
         setTimeout(() => { if (location.hash === hashAtClick) viewProject(p.id); }, 1200);
       }
     }catch(e){
-      STAGE_OUTCOME_STATE[skey] = {text: e.message, cls: 'bad'};
+      STAGE_OUTCOME_STATE[skey] = {text: e.message, cls: 'bad', at: Date.now()};
       outcomeBox.textContent = e.message;         // текст кабинета как есть (принцип 3)
       outcomeBox.classList.add('bad');
     }finally{ btn.disabled = false; }
