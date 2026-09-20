@@ -3680,6 +3680,21 @@ def log_msg(log_queue: queue.Queue, message: str):
     )
 
 
+def _quota_exhausted(*parts) -> bool:
+    """429 про кончившиеся деньги, а не про «слишком часто» (наша правка 20.09.2026).
+
+    OpenAI отдаёт один и тот же код на оба случая, а разница для человека
+    противоположная: лимит запросов проходит сам через секунды, исчерпанная квота не
+    пройдёт никогда. Смотрим на машинные признаки ответа (`type`/`code`), а не на
+    вольный текст: тексты провайдер меняет, коды — нет.
+    """
+    blob = " ".join(str(p or "") for p in parts).lower()
+    return any(mark in blob for mark in (
+        "insufficient_quota", "insufficient quota", "billing_hard_limit_reached",
+        "exceeded your current quota", "check your plan and billing",
+    ))
+
+
 def debug_log(log_queue: Optional[queue.Queue], prefix: str, data: str):
     """Логирует данные в debug-режиме (если включён в настройках)."""
     if not log_queue or not get_keys_config().get("debug_mode", False):
@@ -6839,11 +6854,25 @@ def _call_openai_api_with_server_key(
             debug_log(log_queue, "OpenAI HTTPError:", f"code={e.code} body={error_body} error_msg={error_msg}")
             
             if e.code == 429:
+                # НАША ПРАВКА 20.09.2026 (седьмая в форке, не потерять при ребейзе).
+                # OpenAI отвечает 429 на ДВЕ разные вещи: «слишком часто» (ждать
+                # помогает) и «кончились деньги/квота» (ждать бесполезно НИКОГДА).
+                # Код считал лимитом любой 429 и уходил в откат с ростом паузы до
+                # нескольких минут: полчаса ожидания, десять повторов и отказ, а в
+                # логе — только слово «Rate limit». Настоящий текст провайдера уходил
+                # в debug_log, который по умолчанию выключен. Владелец 20.09 смотрел
+                # ровно на это и не мог понять, чего ждёт.
+                if _quota_exhausted(error_body, error_msg):
+                    log_msg(log_queue, "    ❌ На ключе кончилась квота или деньги — "
+                                       "ждать бесполезно: " + (error_msg or "")[:160])
+                    return False, ("Квота ключа исчерпана (429 insufficient_quota): "
+                                   + (error_msg or "")[:200])
                 rate_limit_attempt += 1
                 if rate_limit_attempt > max_rate_limit_retries:
                     return (
                         False,
-                        f"Rate limit after {max_rate_limit_retries} retries",
+                        f"Rate limit after {max_rate_limit_retries} retries: "
+                        + (error_msg or "")[:200],
                     )
                 # Prefer provider Retry-After, fall back to adaptive backoff.
                 wait_time = limiter.on_rate_limit()
@@ -6853,8 +6882,9 @@ def _call_openai_api_with_server_key(
                         wait_time = min(300.0, retry_after)
                 except (TypeError, ValueError):
                     pass
-                log_msg(log_queue, f"    ⏳ Rate limit{' ['+task_info+']' if task_info else ''}, жду {wait_time:.0f}с...")
-                
+                log_msg(log_queue, f"    ⏳ Rate limit{' ['+task_info+']' if task_info else ''}, "
+                                   f"жду {wait_time:.0f}с — {(error_msg or 'провайдер просит подождать')[:120]}")
+
                 # Ждём с проверкой стоп-флага
                 waited = 0
                 while waited < wait_time:
@@ -7287,6 +7317,14 @@ def call_claude_api(
 
         # 429 / rate limit
         if error_code == 429 or "rate_limit" in error_lower:
+            # НАША ПРАВКА 20.09.2026 (см. такой же разбор выше): исчерпанная квота —
+            # это не «подожди», это «денег нет». Повторять её десять раз с растущей
+            # паузой значит потратить полчаса и всё равно отказать.
+            if _quota_exhausted(error_lower, str(error_msg or "")):
+                log_msg(log_queue, "    ❌ На ключе кончилась квота или деньги — "
+                                   "ждать бесполезно: " + str(error_msg or "")[:160])
+                return False, ("Квота ключа исчерпана (429 insufficient_quota): "
+                               + str(error_msg or "")[:200])
             if retries["rate_limit"] >= max_retries["rate_limit"]:
                 return False, f"Rate limit после {max_retries['rate_limit']} попыток."
             retries["rate_limit"] += 1
