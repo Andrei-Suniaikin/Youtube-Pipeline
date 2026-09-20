@@ -143,6 +143,13 @@
   .facts{color:var(--muted);font-size:13.5px;margin-top:3px}
   .note{margin-top:4px;font-size:13px;color:var(--muted)}
   .note.bad{color:var(--bad)}
+  /* Предупреждение при успехе (рерайт отдаёт «текст короче цели»): работа сделана,
+     но смотреть на неё стоит. Красный тут соврал бы про отказ, серый — промолчал. */
+  .note.warn{color:var(--wait)}
+  /* Что происходит с задачей СЕЙЧАС — стадия и сколько уже идёт, строкой под именем.
+     Перенос по словам разрешён: фразы соседа бывают длинными («ru: старт — 1 частей»,
+     «идёт 12 мин, ждала очереди 4 мин»), а колонка очереди не резиновая. */
+  .qnow{display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;font-size:13px}
 
   .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(155px,1fr));gap:0;
         border-bottom:1px solid var(--line)}
@@ -1542,7 +1549,71 @@ function pollCollect(box, reasons){
 
 const SVC_TITLE = {vsgen:'Видео', rewrite:'Текст', cover:'Обложки', release:'Выпуск'};
 
+/* Чьи это задачи. Различие не косметическое: у соседей (Текст, Обложки) стадия и
+   причина отказа лежат в ИХ логе, за которым пульт ходит отдельным запросом и по
+   бюджету показа — там пусто значит «мы не спросили» (`reason_pending`). У задач
+   кабинета и у выпусков спрашивать некого: их этап и ошибку пишет наш же воркер в нашу
+   базу, и `web/app.py` (`_fill_neighbour_details` ходит только к соседям) признак
+   «не дочитано» им не ставит НИКОГДА. Значит, одна и та же пустота в строке значит
+   разное, и подписывать её одним словом — врать про одну из половин. */
+const OWN_SERVICE = new Set(['vsgen', 'release']);
+
 let QFILTER = {service:'', channel:'', state:'', since:''};
+
+/* Строка очереди объясняет себя сама (20.09.2026, жалоба владельца).
+   Он поставил задачу текста, увидел «просто задачу в очереди, даже без названия» и
+   решил, что всё повисло. В это время задача шла четвёртую минуту, а до неё была
+   упавшая — с причиной «сеть недоступна». Ни того, ни другого экран не показывал:
+   в строке стоял номер, а стадия и причина лежали в колонке состояния, куда взгляд
+   доходит последним. Поэтому ИМЯ, СТАДИЯ и СКОЛЬКО УЖЕ ИДЁТ стоят вместе, в одной
+   клетке: именно они отличают «идёт» от «висит».
+   Фразу времени (`age_text`) собирает сервер — здесь её не пересчитывают, иначе две
+   формулировки одного и того же начнут расходиться. */
+function taskCellHtml(r){
+  const who = [r.channel && esc(r.channel), r.lang && esc(r.lang),
+               r.user && esc(r.user)].filter(Boolean).join(' · ');
+  // Стадия пустая по двум РАЗНЫМ причинам (см. OWN_SERVICE), и обе надо назвать
+  // своими словами. «Ничего не написано» человек читает как «ничего не происходит», а
+  // это неправда в обоих случаях: у соседа мы стадию не спросили, у своей задачи воркер
+  // её ещё не записал. Раньше вторая половина показывала ровно пустоту — признак
+  // «не дочитано» своим задачам не ставят, и подписывать их им было бы враньём.
+  const stage = r.stage ? esc(r.stage)
+    : (r.reason_pending ? '<span class="muted">стадия не дочитана</span>'
+       : (OWN_SERVICE.has(r.service) && r.state === 'running'
+          ? '<span class="muted">этап не записан</span>' : ''));
+  const age = r.age_text ? `<span class="muted">${esc(r.age_text)}</span>` : '';
+  // Порядок строк в клетке — это порядок вопросов человека: что за задача, что с ней
+  // происходит сейчас, и только потом всё остальное. Объяснение имени длинное и на
+  // экране повторяется у каждой такой задачи; стоя вторым, оно отодвигало бы стадию
+  // и время на третье место — то самое, ради чего правка и делалась.
+  return `<div style="font-weight:600">${esc(r.title)}</div>
+    ${(stage || age) ? `<div class="qnow">${stage}${
+      stage && age ? '<span class="muted">·</span>' : ''}${age}</div>` : ''}
+    ${r.title_why ? `<div class="note muted" style="font-size:12px"
+      >${esc(r.title_why)}</div>` : ''}
+    <div class="muted" style="font-size:12px">${
+      who || `<span class="mono">${esc(r.id)}</span>`}</div>`;
+}
+
+/* Причина — словами и в том же месте, где состояние. Три разных ответа, которые
+   нельзя путать: причина известна, предупреждение при успехе, причину НЕ ДОЧИТАЛИ.
+   Последнее — не «причины нет»: сосед её отдаёт, это мы не стали спрашивать (бюджет
+   показа, см. `details`). Ради этой честности вся правка и делалась. */
+function whyHtml(r){
+  if (r.error) return `<div class="note bad">${esc(r.error)}</div>`;
+  if (r.warning) return `<div class="note warn">${esc(r.warning)}</div>`;
+  if (r.reason_pending)
+    return `<div class="note muted">${r.state === 'error'
+      ? 'причина не дочитана' : 'подробности не дочитаны'}</div>`;
+  // Своя задача, кончившаяся ошибкой без единого слова причины. Дочитывать тут нечего
+  // и не у кого: текст ошибки пишет наш же воркер, и пусто значит «не записал». Это
+  // третий ответ, а не четвёртый вид молчания: «не дочитали» сказать нельзя (признак
+  // своим не ставят), а промолчать — значит отдать человеку пустую клетку, которую он
+  // прочтёт как «причины нет».
+  if (OWN_SERVICE.has(r.service) && r.state === 'error')
+    return `<div class="note muted">причина не записана</div>`;
+  return '';
+}
 
 async function viewQueue(){
   const q = new URLSearchParams(Object.entries(QFILTER).filter(([,v]) => v)).toString();
@@ -1599,24 +1670,33 @@ async function viewQueue(){
     return;
   }
 
+  // Сколько строк остались без дочитанной причины (`details`). Говорим это ОДИН раз
+  // над списком, а не в каждой строке: «не дочитали» — свойство показа целиком.
+  // Счёт — только про задачи СОСЕДЕЙ, и подпись теперь так и говорит. Раньше она
+  // обещала «у остальных помечено» про весь список, а своим задачам признак
+  // «не дочитано» не ставят вовсе (см. OWN_SERVICE) — то есть подпись отвечала и за те
+  // строки, про которые не знала ничего.
+  const det = d.details || {};
+  if (det.needed > det.asked)
+    app.append($(`<div class="note muted" id="q-details" style="margin:-8px 0 14px">Подробности
+      задач Текста и Обложек дочитаны у ${det.asked} задач из ${det.needed} (за один показ
+      спрашиваем не больше ${det.budget}). У остальных стадия и причина помечены
+      «не дочитано» — это не «причины нет». У Видео и Выпусков дочитывать нечего: их этап
+      и причину пишет сам кабинет, и пустое место там значит «не записано».</div>`));
+
   const card = $(`<div class="card"><table>
     <thead><tr><th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th>
       <th class="acts"></th></tr></thead>
     <tbody>${d.rows.map(r => `
       <tr>
         <td><span class="pill s-idle">${esc(SVC_TITLE[r.service] || r.service)}</span></td>
-        <td><div style="font-weight:600">${esc(r.title)}</div>
-            <div class="muted" style="font-size:12px">${
-              [r.channel && esc(r.channel), r.lang && esc(r.lang),
-               r.user && esc(r.user)].filter(Boolean).join(' · ')
-              || `<span class="mono">${esc(r.id)}</span>`}</div></td>
+        <td>${taskCellHtml(r)}</td>
         <td>${esc(r.kind_title || r.kind || '—')}
             ${r.provider ? `<div class="muted">${esc(r.provider)}</div>` : ''}</td>
         <td class="st"><span class="pill ${STATE_CLS[r.state]}">${STATE_TITLE[r.state]}</span>
-            ${r.stage ? `<div class="muted" style="margin-top:4px">${esc(r.stage)}</div>` : ''}
             ${r.progress != null ? `<div class="bar"><i style="width:${
               Math.round(r.progress * 100)}%"></i></div>` : ''}
-            ${r.error ? `<div class="note bad">${esc(r.error)}</div>` : ''}</td>
+            ${whyHtml(r)}</td>
         <td class="muted">${when(r.created)}</td>
         <td class="acts">${actions(r)}</td>
       </tr>`).join('')}</tbody></table></div>`);
@@ -4617,6 +4697,23 @@ function linkBarHtml(g){
     ? `<div class="err" style="margin:14px 18px 0">${esc(g.link_problem)}</div>` : ''}`;
 }
 
+/* Поле формы, изменённое КОДОМ, а не человеком.
+   Браузер шлёт `input`/`change` только на набор с клавиатуры и на выбор в списке;
+   присваивание `el.value = …` проходит молча. А черновик пресета (`viewPreset`)
+   слушает ровно эти два события на форме — поэтому всё, что меняет значение мимо
+   клавиатуры, в черновик не попадало и пропадало при первой же перерисовке: человек
+   убирал язык крестиком в карте голосов, уходил на вкладку другой части, возвращался —
+   строка снова на месте, и никто ему не сказал, что правку выбросили.
+   Значит, значение поля формы меняется ТОЛЬКО через эту функцию — она же и сообщает
+   форме о правке. */
+function setFieldValue(el, value){
+  if (!el) return;
+  el.value = value;
+  // `change`, а не `input`: смысл события здесь — «значение стало другим», а не «идёт
+  // набор». `bubbles` обязателен: слушатель висит на самой форме, а не на каждом поле.
+  el.dispatchEvent(new Event('change', {bubbles: true}));
+}
+
 // Форма настроек. Одна и та же для пресета и для проекта: это один набор полей —
 // пресет лишь заготовка, проект — его копия в момент заведения. Описание приходит с
 // сервера (server/preset_fields.py), здесь только отрисовка.
@@ -4783,7 +4880,9 @@ function wireNeighbourPreset(card, f, locked){
       if (!name) return;
       if (![...sel.options].some(o => o.value === name))
         sel.append(new Option(name, name));
-      sel.value = name;
+      // Выбор сделан кодом — форме о нём надо сказать, иначе черновик пресета
+      // кабинета не увидит, что сосед здесь поменялся (см. setFieldValue).
+      setFieldValue(sel, name);
       paint();
       toast('Пресет заведён и выбран здесь же', 'ok');
     },
@@ -4852,7 +4951,11 @@ function wireLangMap(card, f, group, locked){
       const voice = r.querySelector('.lm-voice').value.trim();
       if (lang && voice) parts.push(`${lang}: ${voice}`);
     });
-    hidden.value = parts.join(', ');
+    // Через setFieldValue, а не присваиванием: карту меняют не только с клавиатуры.
+    // Крестик убирает строку, «+ строка» добавляет, «+ шаблон в Lumean» подставляет
+    // id заведённого шаблона, список шаблонов пишет выбранный — всё это клики, и без
+    // явного события черновик пресета о них не узнавал.
+    setFieldValue(hidden, parts.join(', '));
   };
 
   // Шаблоны Lumean грузятся ОДИН раз на карточку и только когда выбран Lumean: у других
@@ -4997,7 +5100,14 @@ function wireLangMap(card, f, group, locked){
 // на текущий же hash ничего не делала. Если onCancel передан, «Отмена» — кнопка,
 // которая откатывает форму на месте, а сохранение не уходит с экрана. Без onCancel
 // поведение прежнее: ссылка на `back` (страница пресета и т.п.).
-function saveBar(back, onSave, onCancel){
+// `opts.stay` — остаться на форме после записи (20.09.2026, просьба владельца про
+// целые пресеты: «каждый раз приходится настраивать»). Уход на список после каждого
+// «Сохранить» и был тем, из-за чего настройка целого пресета шла по одному полю за
+// заход: человек правил голос, сохранял, его уносило на список, он возвращался и
+// снова искал вкладку. Частичного пресета это не касается — он про одну часть, и
+// список после записи как раз то место, куда человек идёт.
+function saveBar(back, onSave, onCancel, opts){
+  const o = opts || {};
   const cancelHtml = onCancel
     ? `<button type="button" id="cancel" class="ghost">Отмена</button>`
     : `<a class="ghost" href="${back}" style="color:var(--muted)">Отмена</a>`;
@@ -5009,7 +5119,10 @@ function saveBar(back, onSave, onCancel){
     try{
       await onSave();
       toast('Сохранено', 'ok');
-      if (!onCancel) location.hash = back;
+      // Остаёмся — значит кнопка нужна снова: человек продолжает настраивать и
+      // сохранит ещё раз. Уходим — кнопку разблокировать незачем, экран сменится.
+      if (o.stay) b.disabled = false;
+      else if (!onCancel) location.hash = back;
     }catch(e){ toast(e.message); b.disabled = false; }
   };
   if (onCancel) bar.querySelector('#cancel').onclick = onCancel;
@@ -5131,6 +5244,29 @@ function presetUsersHtml(scope, users){
   </div>`;
 }
 
+/* ─────────────── незаписанные правки пресета живут в стейте ───────────────
+   Форма пресета перерисовывается не только при уходе с экрана: вкладки частей —
+   это адреса (`#/preset/12/kadry`), а переключатель «свои поля / из частичного»
+   перечитывает пресет целиком. Каждая такая перерисовка брала значения с сервера,
+   то есть молча стирала всё, что человек набрал и не сохранил, — это и есть его
+   «каждый раз приходится настраивать».
+   Черновик хранит ТОЛЬКО отличия от сохранённого и только для одного пресета: он
+   не файл настроек, а память между перерисовками одного экрана. Уходит вместе с
+   записью, с отказом от правок и со сменой пресета. */
+let PRESET_DRAFT = {id: '', name: null, values: {}};
+function presetDraft(id){
+  if (PRESET_DRAFT.id !== String(id))
+    PRESET_DRAFT = {id: String(id), name: null, values: {}};
+  return PRESET_DRAFT;
+}
+function presetDraftDrop(){ PRESET_DRAFT = {id: '', name: null, values: {}}; }
+// Пробелы внутри значения сравнение не различает: карту голосов виджет пересобирает
+// при отрисовке («ru:x» → «ru: x»), и без этого нетронутое поле числилось бы правкой,
+// а экран спрашивал бы «уйти без сохранения?» там, где ничего не меняли.
+const sameValue = (a, b) =>
+  String(a == null ? '' : a).replace(/\s+/g, ' ').trim() ===
+  String(b == null ? '' : b).replace(/\s+/g, ' ').trim();
+
 async function viewPreset(id){
   const d = await api('/ui/presets/vsgen/' + encodeURIComponent(id));
   // Группы — вкладками, а не одной простынёй: полей три десятка, и «поменять голос»
@@ -5143,14 +5279,44 @@ async function viewPreset(id){
                                      : d.groups.filter(g => g.part === d.scope);
   const tabs = groups.map(g => [slug(g.title), g.title]);
   const cur = location.hash.split('/')[3] || (tabs[0] || ['', ''])[0];
+
+  // Что реально хранится на сервере, — по всем группам, а не только по открытой
+  // вкладке: черновик копит правки со всех вкладок, и сравнивать их не с чем иным.
+  const saved = {};
+  d.groups.forEach(g => g.fields.forEach(f => { saved[f.key] = f.value; }));
+  // Поля группы, закрытой ссылкой на частичный пресет, отправлять нельзя — сервер
+  // такую попытку отвергает (`ui_preset_save`). Ссылку могли поставить уже после
+  // того, как черновик набрали, поэтому чужие ключи выбрасываем на каждом заходе,
+  // а не надеемся поймать их в момент переключения.
+  const sendable = new Set();
+  d.groups.filter(g => !g.readonly).forEach(g => g.fields.forEach(f =>
+    sendable.add(f.key)));
+  const draft = presetDraft(id);
+  Object.keys(draft.values).forEach(k => {
+    if (!sendable.has(k)) delete draft.values[k];
+  });
+  // Набранное возвращаем в поля ДО отрисовки: виджеты (карта голосов) собираются из
+  // `f.value`, и подстановка после сборки их бы не переубедила.
+  d.groups.forEach(g => g.fields.forEach(f => {
+    if (Object.prototype.hasOwnProperty.call(draft.values, f.key))
+      f.value = draft.values[f.key];
+  }));
+
   app.innerHTML = '';
-  app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
+  // Заголовок держим за ссылку: имя пресета правится полем ниже, а целый пресет после
+  // записи остаётся открытым — и переименованный стоял под прежним заголовком до
+  // перезахода. Человек видел старое имя ровно там, где ищет подтверждение, что
+  // записалось (ниже, в обработчике сохранения, заголовок обновляется).
+  const head = $(`<a class="back" href="#/presets">← ко всем пресетам</a>
     <h1>${esc(d.name)}</h1>
-    <p class="sub">${esc(d.note)}</p>`));
+    <p class="sub">${esc(d.note)}</p>`);
+  app.append(head);
+  const headTitle = head.querySelector('h1');
   const name = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Название</div>
     <div class="secbody">
-    <input id="p-name" value="${esc(d.name)}" style="width:100%;max-width:420px"></div></div>`);
+    <input id="p-name" value="${esc(draft.name != null ? draft.name : d.name)}"
+      style="width:100%;max-width:420px"></div></div>`);
   app.append(name);
   app.append($(presetUsersHtml(d.scope, d.users || {})));
   // Плашка проблем ссылок на вкладке (раздел 4: «link_problems — красной плашкой на
@@ -5189,9 +5355,67 @@ async function viewPreset(id){
   }
   const form = fieldForm(formGroups);
   app.append(form);
-  app.append(saveBar('#/presets', () => post(
-    '/ui/presets/vsgen/' + encodeURIComponent(id),
-    {name: name.querySelector('#p-name').value, values: form.read()})));
+
+  // ЛЮБОЕ изменение значения в форме — в черновик, а не только набор с клавиатуры.
+  // Не «на всякий случай»: перерисовка формы может случиться в любой момент (вкладка,
+  // ссылка на частичный пресет), и после неё в DOM уже не спросишь, что там было.
+  // Правки «мимо клавиатуры» (крестик у строки карты голосов, заведённый тут же шаблон
+  // Lumean, выбранный в окне пресет соседа) сюда доходят потому, что меняющий их код
+  // ходит через setFieldValue — он и шлёт `change`, который браузер сам бы не послал.
+  // В черновике держим только ОТЛИЧИЯ от сохранённого — одинаковое на сервер
+  // не уезжает и правкой не считается.
+  const nameInput = name.querySelector('#p-name');
+  const snap = () => {
+    const now = form.read();
+    for (const k in now){
+      if (sameValue(now[k], saved[k])) delete draft.values[k];
+      else draft.values[k] = now[k];
+    }
+    draft.name = nameInput.value;
+  };
+  form.addEventListener('input', snap);
+  form.addEventListener('change', snap);
+  nameInput.addEventListener('input', snap);
+  const dirty = () =>
+    (draft.name != null && !sameValue(draft.name, d.name)) ||
+    Object.keys(draft.values).some(k => !sameValue(draft.values[k], saved[k]));
+
+  // Уход с формы с незаписанными правками спрашивает, а не теряет молча. Сторож
+  // снимается сам: записали — спрашивать не о чем (см. ниже), ушли по своей воле —
+  // снимает роутер.
+  LEAVE_GUARD = {
+    hash: location.hash,
+    keep: h => h.startsWith('#/preset/') &&
+               decodeURIComponent(h.split('/')[2] || '') === String(id),
+    dirty, drop: presetDraftDrop,
+    what: 'Настройки пресета изменены, но не сохранены.',
+  };
+
+  // Целый пресет после записи остаётся открытым: его настраивают по многу полей за
+  // заход, и уход на список посреди настройки — ровно то, на что жаловался владелец.
+  // Частичный — про одну часть: записали и на список.
+  const full = d.scope === 'full';
+  app.append(saveBar('#/presets', async () => {
+    // Уезжает и то, что набрано на других вкладках: черновик копил правки всего
+    // пресета, и записать только открытую вкладку значило бы потерять остальные
+    // молча — та же потеря, от которой уходим.
+    const values = {};
+    Object.keys(draft.values).forEach(k => {
+      if (sendable.has(k)) values[k] = draft.values[k];
+    });
+    Object.entries(form.read()).forEach(([k, v]) => {
+      if (sendable.has(k)) values[k] = v;
+    });
+    await post('/ui/presets/vsgen/' + encodeURIComponent(id),
+               {name: nameInput.value, values});
+    // Записанное становится «тем, что хранится»: иначе сторож ухода считал бы
+    // сохранённые правки незаписанными и спрашивал бы на пустом месте.
+    Object.assign(saved, values);
+    d.name = nameInput.value;
+    if (headTitle) headTitle.textContent = d.name;
+    draft.values = {};
+    draft.name = null;
+  }, null, {stay: full}));
 }
 
 // Батч C: отдельный экран «Настройки проекта» убран — настройки этапа теперь внутри
@@ -6174,7 +6398,47 @@ const ROUTES = [
   ['channels', () => true,                        () => viewChannels()],
 ];
 
+/* Сторож незаписанных правок (20.09.2026). Экран, на котором что-то набрано и не
+   сохранено, ставит сюда `{hash, keep, dirty, drop, what}` и снимает сам, когда
+   терять уже нечего. Роутер — единственное место, где видно ВСЕ уходы: и ссылку
+   «← ко всем пресетам», и вкладку в шапке, и кнопку «назад» браузера.
+   Спрашиваем нашим <dialog>: браузерный `confirm` останавливает страницу целиком, а
+   `beforeunload` браузер показывает своими словами и не даёт объяснить, что именно
+   пропадёт. */
+let LEAVE_GUARD = null;
+// Откат адреса — это тоже смена адреса, и роутер получит её вторым событием. Второй
+// заход экран перерисовывать не должен: человек никуда не ушёл, он стоит в своей
+// форме, и перерисовка отняла бы у него фокус и место прокрутки.
+let LEAVE_BACK = false;
+
+function leaveAsk(target){
+  const g = LEAVE_GUARD;
+  modal('Правки не сохранены', `<div style="font-size:14px">${esc(g.what)}
+    Если уйти сейчас, они пропадут.</div>`, {
+      ok: 'Уйти без сохранения', no: 'Остаться',
+      onOk: async (_body, close) => {
+        close();
+        LEAVE_GUARD = null;
+        if (g.drop) g.drop();
+        location.hash = target;
+      }});
+}
+
 async function render(){
+  if (LEAVE_BACK){ LEAVE_BACK = false; return; }
+  if (LEAVE_GUARD){
+    const g = LEAVE_GUARD;
+    const to = location.hash || '#/channels';
+    if (!g.keep(to)){
+      if (g.dirty()){
+        LEAVE_BACK = true;
+        location.hash = g.hash;        // человек ещё здесь, адрес должен это отражать
+        leaveAsk(to);
+        return;
+      }
+      LEAVE_GUARD = null;              // терять нечего — уходим молча
+    }
+  }
   // Смена адреса — уход со страницы для опроса логов задач проекта (§6): останавливаем
   // все таймеры здесь одним местом, а не по одному в каждом view — иначе переключение
   // на #/text/#/covers/куда угодно из открытого лога проекта оставляло бы его дёргать

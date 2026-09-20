@@ -116,8 +116,18 @@ STATE_TITLE = {
     "blocked": "нужно действие", "idle": "не начато", "off": "не участвует",
 }
 
-TERMINAL_OK = ("done",)
+# Слова трёх разных сервисов про один и тот же исход. Соседи не говорят «done»:
+# рерайт заканчивает задачу словом `completed` (rewrite/job_queue.py JobStatus), Cover —
+# `completed` и `completed_partial` (cover/job_queue_cover.py). Пока их тут не было,
+# законченная задача текста показывалась в очереди как «в очереди»: `_state` не узнавал
+# статус и отдавал состояние по умолчанию. Это ровно та ложь экрана, из-за которой
+# 20.09 нельзя было понять, что с задачей происходит.
+TERMINAL_OK = ("done", "completed")
 TERMINAL_BAD = ("error", "cancelled", "failed")
+# `partial` у рерайта — «часть языков сделана», `interrupted` — «прервана и продолжится
+# с места обрыва»: оба отдают файлы (DOWNLOADABLE_STATUSES в rewrite/api.py), оба — не
+# отказ. `completed_partial` — то же самое у Cover.
+TERMINAL_PART = ("partial", "completed_partial", "interrupted")
 
 app = FastAPI(title="Studio Platform — оболочка разработки", docs_url="/docs")
 
@@ -215,13 +225,15 @@ def _state(status) -> str:
     s = (status or "").lower()
     if s in TERMINAL_OK:
         return "done"
-    if s == "partial":
+    if s in TERMINAL_PART:
         return "partial"        # рерайт умеет «сделал часть языков» — это не ошибка
     if s == "cancelled":
         return "cancelled"      # остановлено человеком — тоже не ошибка
     if s in TERMINAL_BAD:
         return "error"
-    if s in ("running", "claimed", "in_progress"):
+    # `resetting` у рерайта — подготовка к повтору: работа уже идёт, и показывать её
+    # как «в очереди» значит обещать человеку, что задача ещё не начиналась.
+    if s in ("running", "claimed", "in_progress", "resetting"):
         return "running"
     return "queued" if s else "idle"
 
@@ -686,15 +698,197 @@ def _calendar(c, ch, history_days: int) -> list:
 
 # ─────────────────────────── сквозная очередь ───────────────────────────
 
-# Оба соседа отдают одинаковую форму: {items, total, limit, offset}, элемент —
-# ApiJobListItem(id, status, created_at, progress_percent, results_count).
+# Формы ответа у соседей РАЗНЫЕ, и это стоило владельцу вечера 20.09: строка задачи
+# текста приходила в очередь без номера, без названия и без стадии — «просто висит
+# задача, даже без названия». Причина в одной букве. Списочный элемент отдаёт:
+#   cover:   id, status, created_at, progress_percent, results_count
+#            (cover/api_cover.py ApiJobListItem)
+#   rewrite: job_id, status, progress_percent, progress_detail, model, files_count,
+#            languages_count, created_at, started_at, finished_at
+#            (rewrite/api.py _job_to_summary — поля `id` у него нет вовсе)
+# Старый код читал `it["id"]` у обоих, и у рерайта получал пусто: пустой номер, пустое
+# название, пустая ссылка на задачу. Ни `results_count`, ни `error` рерайт в списке не
+# отдаёт тоже.
 # Ключевая авторизация у обоих живёт под /api/v1 (см. pub_remote.RewriteClient._url).
 NEIGHBOURS = (("rewrite", "Текст", REWRITE_BASE), ("cover", "Обложки", COVER_BASE))
 NEIGHBOUR_TIMEOUT = 6
 
+# Как называется работа соседа по-русски. ТЗ §13: внутренние слова наружу не показываем,
+# а «rewrite» в строке очереди — внутреннее слово.
+NEIGHBOUR_KIND = {"rewrite": ("text", "текст"), "cover": ("cover", "обложка")}
+
+# Сколько раз за ОДИН показ очереди можно дочитать подробности у соседей — на всех, а
+# не на каждого.
+#
+# Зачем вообще дочитывать. Стадию идущей задачи и причину отказа сосед держит в логе
+# задачи, а лог отдаётся только поштучно: `GET /api/v1/jobs/{id}?include_log=true`.
+# В списке их нет — у рерайта `progress_detail` идущей задачи пуст (проверено на задаче
+# владельца 0a6c6716dbd1: log «ru: старт — 1 частей», progress_detail ''), а `error` в
+# списке не отдаётся вовсе.
+#
+# Почему бюджет, а не «дочитать всё». Сорок строк — это сорок запросов по сети на каждое
+# открытие экрана, и очередь из инструмента наблюдения превращается в нагрузку на тот
+# самый сервис, за которым наблюдает. Бюджет тратится на строки, где ответ ВИДЕН
+# человеку: идущие (нужна стадия) и кончившиеся плохо (нужна причина), и только на те,
+# что пережили фильтры экрана (см. `ui_queue`: дочитывание идёт ПОСЛЕ отбора).
+# Остальным подробности не нужны — по статусу и так всё понятно. Кому не хватило бюджета, тот
+# честно помечен `reason_pending`: «не дочитали» и «причины нет» — разное.
+QUEUE_DETAIL_BUDGET = 12
+DETAIL_TTL_LIVE = 5.0          # задача идёт: лог меняется, держим недолго
+DETAIL_TTL_DONE = 600.0        # задача кончилась: лог больше не изменится
+DETAIL_CACHE_MAX = 500
+_DETAIL_CACHE: dict = {}
+
+
+def _span_ru(sec) -> str:
+    """Длительность словами: «40 с», «12 мин», «2 ч 10 мин»."""
+    sec = int(max(0.0, float(sec or 0)))
+    if sec < 90:
+        return f"{sec} с"
+    minutes = sec // 60
+    if minutes < 90:
+        return f"{minutes} мин"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours} ч" if not minutes else f"{hours} ч {minutes} мин"
+
+
+def _job_age(created, started, finished, state="", now=None,
+             times_known=True) -> dict:
+    """Сколько задача ждала очереди и сколько уже работает — двумя числами.
+
+    Владелец 20.09 смотрел на строку и не мог отличить «висит» от «идёт давно»: в
+    строке стояло одно время создания. Рерайт расшифровки — это минуты, и это
+    нормально; ненормально не знать, взяли задачу в работу вообще или нет. У задачи
+    владельца между «создана» (18:44) и «взята» (18:48) прошло четыре минуты, и
+    именно эти четыре минуты человек читал как «ничего не происходит».
+
+    Состояние нужно ради одного случая, который без него читается ложью: задача,
+    которую отменили или похоронили ДО того, как её взяли в работу. Времени начала у
+    неё нет, и по одним числам выходит «в очереди 1 ч 48 мин» — про задачу, которой
+    в очереди давно нет. Проверено на боевых строках 17 и 18 стенда 20.09.
+
+    `times_known` отделяет «не бралась» от «не знаем». Бывает, что времён работы нет
+    не потому, что работы не было, а потому, что источник их не передаёт: списочная
+    ручка Cover отдаёт только `id/status/created_at/progress_percent/results_count`
+    (cover/api_cover.py `ApiJobListItem`) — ни `started_at`, ни `finished_at`. По
+    одним числам законченная обложка читалась как «в работу не бралась», а идущая —
+    как «в очереди 13 мин»: оба раза уверенное враньё о чужой работе. Незнание
+    называем незнанием; в числах его тоже не подменяем — `waiting` там пуст, потому
+    что ожидание очереди без времени начала не считается, а возраст строки — это не
+    ожидание.
+    """
+    now = time.time() if now is None else float(now)
+
+    def _at(value):
+        return float(value) if isinstance(value, (int, float)) and value else None
+
+    created, started, finished = _at(created), _at(started), _at(finished)
+    over = state in ("done", "error", "cancelled", "partial")
+    # Источник молчит о временах, а статус говорит, что работа шла или уже кончилась:
+    # единственный честный ответ — «не знаем». Если же работа ещё в очереди, времени
+    # начала нет по существу, и «в очереди N» остаётся верным даже от молчуна.
+    silent = not times_known and started is None and (over or state == "running")
+    waiting = working = None
+    if created is not None and not silent:
+        waiting = max(0.0, (started if started is not None else now) - created)
+    if started is not None:
+        working = max(0.0, (finished if finished is not None else now) - started)
+
+    if silent:
+        text = "сосед не сообщает, когда взял в работу"
+    elif over and started is None:
+        text = "в работу не бралась"
+    elif finished is not None and working is not None:
+        text = f"заняла {_span_ru(working)}"
+    elif working is not None and over:
+        # Кончилась, а время окончания не записано: сказать «идёт» было бы обещанием
+        # работы, которой уже нет.
+        text = f"работала {_span_ru(working)}"
+    elif working is not None:
+        text = f"идёт {_span_ru(working)}"
+        # Ожидание в очереди упоминаем, только когда оно заметное: приписка «ждала 3 с»
+        # к каждой строке — шум, который учит не читать строку целиком.
+        if waiting and waiting >= 60:
+            text += f", ждала очереди {_span_ru(waiting)}"
+    elif waiting is not None:
+        text = f"в очереди {_span_ru(waiting)}"
+    else:
+        text = ""
+    return {"started": started, "finished": finished,
+            "waiting": (round(waiting) if waiting is not None else None),
+            "working": (round(working) if working is not None else None),
+            "age_text": text}
+
+
+# Отметка времени в начале строки лога соседа: «[18:50:52] » или «[2026-09-20 18:48:24] ».
+# Только цифры и разделители — иначе под правило попадает «[migrate 001] …», а это уже
+# содержание строки, а не её время.
+_LOG_TIME = re.compile(r"^\s*\[[\d\s:.\-]{4,24}\]\s*")
+_LOG_GLUE = re.compile(r"(?=\[\d{2}:\d{2}:\d{2}\])")
+_LOG_BAD = re.compile(r"(ошибк|не удалось|не завершен|отказ|E-[A-Z]{2,8})", re.I)
+# «задача не завершена (E-FAIL)» — это ИТОГ работы, а не её причина. Человеку в очереди
+# нужна причина: из-за чего именно не завершена.
+_LOG_OUTCOME = re.compile(r"\(E-FAIL\)", re.I)
+
+
+def _log_lines(log: str) -> list:
+    """Лог соседа строками, без отметок времени и без пустот."""
+    out = []
+    for raw in str(log or "").splitlines():
+        # Рерайт дописывает служебную пометку без перевода строки, и две записи
+        # слипаются в одну: «…продолжит с места обрыва[18:48:24] Задача принята».
+        # Читать такую склейку как одну строку — значит показать человеку мусор.
+        for piece in _LOG_GLUE.split(raw):
+            line = _LOG_TIME.sub("", piece).strip()
+            if line:
+                out.append(line)
+    return out
+
+
+def _stage_from_log(log: str, skip_errors: bool = False) -> str:
+    """Последняя осмысленная строка лога — она же стадия задачи для очереди.
+
+    Сосед пишет их по-русски и для человека («Подготовка», «Обработка…», «ru: старт —
+    1 частей»), сочинять свои слова поверх незачем: разойдясь с ними, экран начнёт
+    рассказывать не то, что сосед на самом деле делает.
+
+    `skip_errors` — для упавшей задачи. У неё последняя строка лога это сама ошибка, и
+    без пропуска в строке очереди дважды стоит одно и то же: «этап: задача не завершена»
+    и рядом «причина: задача не завершена». Человеку нужно другое — ГДЕ она встала.
+    """
+    lines = _log_lines(log)
+    if skip_errors:
+        lines = [ln for ln in lines if not _LOG_BAD.search(ln)]
+    return _short(lines[-1], 160) if lines else ""
+
+
+def _reason_from_log(log: str) -> str:
+    """Причина отказа словами: та строка лога, из-за которой всё встало."""
+    bad = [ln for ln in _log_lines(log) if _LOG_BAD.search(ln)]
+    if not bad:
+        return ""
+    cause = [ln for ln in bad if not _LOG_OUTCOME.search(ln)]
+    # «Ошибка: сеть недоступна (E-NET)» точнее, чем «ru: не удалось завершить (E-PART)»:
+    # второе — следствие первого, и повторять человеку следствие бессмысленно.
+    named = [ln for ln in cause if ln.lower().startswith("ошибка")]
+    return _short((named or cause or bad)[-1], 200)
+
+
+def _join_reason(cause: str, said: str) -> str:
+    """Причина и итог в одной строке, без повторов одного и того же."""
+    cause, said = (cause or "").strip(), (said or "").strip()
+    if cause and said and said not in cause and cause not in said:
+        return _short(f"{cause} · {said}", 300)
+    return _short(cause or said, 300)
+
 
 def _neighbour_jobs(name: str, base: str, key: str) -> tuple:
-    """Задачи соседа. Возвращает (строки, ошибка). Недоступный сосед не роняет экран."""
+    """Задачи соседа. Возвращает (строки, ошибка). Недоступный сосед не роняет экран.
+
+    Строка приводится к тому же виду, что и своя (`queue_tasks`), включая поля канала
+    и проекта: иначе фильтр «по каналу» молча выбрасывал задачи соседей — у них
+    `channel_id` не было вовсе, а `None` не равен номеру канала никогда.
+    """
     if not key:
         return [], "ключ доступа не сохранён"
     req = urllib.request.Request(f"{base}/api/v1/jobs?limit=50")
@@ -708,24 +902,235 @@ def _neighbour_jobs(name: str, base: str, key: str) -> tuple:
         return [], f"не отвечает: {type(exc).__name__}"
 
     items = body.get("items", body) if isinstance(body, dict) else body
+    kind, kind_title = NEIGHBOUR_KIND.get(name, (name, name))
     rows = []
     for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict):
+            continue
         pct = it.get("progress_percent")
-        rows.append({
+        status = str(it.get("status") or "")
+        # `job_id` — рерайт, `id` — Cover. Оба спрашиваем всегда: гадать, кто перед
+        # нами, по имени сервиса значит сломаться от первой же смены формы у одного.
+        job_id = str(it.get("id") or it.get("job_id") or "")
+        stage = str(it.get("progress_detail") or "").strip()
+        if not stage and it.get("results_count"):
+            stage = f'готово {it["results_count"]}'
+        row = {
             "service": name,
-            "id": str(it.get("id") or ""),
-            "title": str(it.get("id") or ""),
-            "kind": "",
-            "status": str(it.get("status") or ""),
-            "state": _state(it.get("status")),
+            "id": job_id,
+            "title": "", "title_why": "",
+            "channel": "", "channel_id": None, "lang": "",
+            "release_id": "", "project_id": "", "user": "",
+            "kind": kind, "kind_title": kind_title,
+            "status": status,
+            "state": _state(status),
             "progress": (float(pct) / 100 if isinstance(pct, (int, float)) else None),
-            "stage": (f'готово {it["results_count"]}'
-                      if it.get("results_count") else ""),
+            "stage": _short(stage, 160),
             "provider": "",
             "created": it.get("created_at"),
-            "error": "",
-        })
+            "error": "", "warning": "",
+            # Подробности ещё не спрашивали. Строке, которой они нужны, это поле
+            # переставит `_fill_neighbour_details` — в True, если бюджет кончился.
+            "reason_pending": False,
+            # Сообщает ли сосед времена работы ВООБЩЕ. Решаем по наличию поля, а не
+            # его значения: у рерайта `started_at` есть всегда и ноль в нём означает
+            # «не бралась», у Cover поля нет вовсе и означать оно не может ничего.
+            # Разбирать по имени сервиса нельзя — сменит форму один, соврут оба.
+            "times_known": ("started_at" in it) or ("finished_at" in it),
+        }
+        row.update(_job_age(it.get("created_at"), it.get("started_at"),
+                            it.get("finished_at"), row["state"],
+                            times_known=row["times_known"]))
+        rows.append(row)
     return rows, ""
+
+
+def _name_neighbour_rows(c, service: str, rows: list) -> None:
+    """Имя задачи соседа — название ролика, как требует ТЗ, а не hex-номер.
+
+    Сосед про наш проект и наш канал не знает ничего: у него есть номер задачи и файл.
+    Связь держим мы, в двух местах и по двум разным поводам:
+      * `project_service_jobs` — задачу поставил человек с экрана проекта (пульт
+        записывает связь сразу после того, как сосед задачу принял, `_link_project_jobs`);
+      * `pub_release_jobs` — задачу поставил ночной движок по выпуску канала, и там же
+        лежит путь к `pub_plan_items.donor_title`, то есть к настоящему названию ролика.
+    Оба — ОДНИМ запросом на сервис: очередь на сотню строк не должна превращаться в
+    сотню обращений за именем.
+
+    Чего в этой цепочке нет. Названия ролика для задачи, заказанной ссылкой прямо с
+    экрана проекта: ссылку кабинет нигде не сохраняет (`ui_text_create` превращает её
+    в текст и забывает), а спросить название у YouTube отсюда нельзя — `donor_title`
+    ходит в сеть и стоит до 48 с на ссылку (замер 19.09). В таком случае в строке
+    стоит имя проекта, а `title_why` говорит, почему имя именно такое. «Без названия»
+    не годится: человек должен понимать, что это за задача.
+    """
+    ids = [r["id"] for r in rows if r.get("id")]
+    if not ids:
+        return
+    marks = ",".join("?" * len(ids))
+    found: dict = {}
+
+    def _put(row) -> None:
+        cur = found.setdefault(row["job_id"], {})
+        for field in ("project_id", "project_name", "release_id", "donor_title",
+                      "donor_url", "ch_id", "ch_name", "lang"):
+            value = row[field] if field in row.keys() else None
+            if value and not cur.get(field):
+                cur[field] = value
+
+    try:
+        # Задача, поставленная человеком с экрана проекта.
+        for q in c.execute(
+                "SELECT j.job_id, j.project_id, p.name project_name, "
+                "       r.release_id, i.donor_title, i.donor_url, "
+                "       ch.id ch_id, ch.name ch_name, ch.lang lang "
+                "FROM project_service_jobs j "
+                "LEFT JOIN projects p ON p.id=j.project_id AND p.tenant_id=j.tenant_id "
+                "LEFT JOIN pub_releases r ON r.project_id=j.project_id "
+                "     AND r.tenant_id=j.tenant_id "
+                "LEFT JOIN pub_plan_items i ON i.id=r.plan_item_id "
+                "LEFT JOIN pub_channels ch ON ch.id=r.channel_id "
+                f"WHERE j.tenant_id=? AND j.service=? AND j.job_id IN ({marks}) "
+                "ORDER BY r.updated", (TENANT, service, *ids)):
+            _put(q)
+        # Задача, поставленная движком по выпуску: у неё есть строка плана, а значит и
+        # настоящее название ролика.
+        for q in c.execute(
+                "SELECT j.remote_job_id job_id, j.release_id, r.project_id, "
+                "       i.donor_title, i.donor_url, "
+                "       ch.id ch_id, ch.name ch_name, ch.lang lang "
+                "FROM pub_release_jobs j "
+                "JOIN pub_releases r ON r.release_id=j.release_id "
+                "LEFT JOIN pub_plan_items i ON i.id=r.plan_item_id "
+                "LEFT JOIN pub_channels ch ON ch.id=r.channel_id "
+                f"WHERE r.tenant_id=? AND j.service=? AND j.remote_job_id IN ({marks}) "
+                "ORDER BY j.updated", (TENANT, service, *ids)):
+            _put(q)
+    except sqlite3.Error:
+        # Имя — это удобство. Потерять из-за него всю очередь нельзя: строка без
+        # названия хуже названной, но лучше пустого экрана.
+        found = {}
+
+    for row in rows:
+        info = found.get(row["id"]) or {}
+        row["project_id"] = info.get("project_id") or ""
+        row["release_id"] = info.get("release_id") or ""
+        row["channel"] = info.get("ch_name") or ""
+        row["channel_id"] = info.get("ch_id")
+        row["lang"] = (info.get("lang") or "").upper()
+        title, why = (info.get("donor_title") or "").strip(), ""
+        if not title:
+            link = (info.get("donor_url") or "").strip()
+            project = (info.get("project_name") or "").strip()
+            if link:
+                title = link
+                why = "названия ролика у нас нет — показываем ссылку донора"
+            elif project:
+                title = project
+                why = ("название ролика не сохранено: задачу поставили ссылкой с "
+                       "экрана проекта — в строке имя проекта")
+            elif row["id"]:
+                title = f"задача {row['id']}"
+                why = ("задача заведена не из кабинета: ни проекта, ни выпуска за ней "
+                       "не записано, названия ролика взять негде")
+            else:
+                title = "задача без номера"
+                why = "сосед не назвал номер задачи — спросить его не о чем"
+        row["title"] = _short(title, 200)
+        row["title_why"] = why
+
+
+def _neighbour_detail(name: str, base: str, key: str, job_id: str, status: str) -> dict:
+    """Подробности одной задачи соседа, с коротким кэшем.
+
+    Кэш — ускорение, а не хранилище: кончившаяся задача свой лог больше не меняет,
+    поэтому её держим долго, а идущую — секунды, иначе экран начнёт показывать
+    вчерашнюю стадию. Ключ включает статус: сменился статус — ответ устарел заведомо.
+    """
+    now = time.time()
+    hit = _DETAIL_CACHE.get((name, job_id))
+    if hit is not None and hit[0] > now and hit[1] == status:
+        return hit[2]
+    path = f"/api/v1/jobs/{urllib.parse.quote(job_id)}"
+    if name == "rewrite":
+        path += "?include_log=true"   # стадия и причина у рерайта живут только в логе
+    body, _err = _neighbour_get(base, path, key)
+    out = body if isinstance(body, dict) else {}
+    if not out:
+        # Неудачу не запоминаем. Иначе одна сорвавшаяся сетевая попытка прячет причину
+        # отказа на десять минут — ровно у той строки, ради которой человек и пришёл
+        # в очередь. Пустой кэш стоит одного лишнего запроса, пустой экран — вечера.
+        return out
+    ttl = DETAIL_TTL_LIVE if _state(status) in ("running", "queued") else DETAIL_TTL_DONE
+    if len(_DETAIL_CACHE) > DETAIL_CACHE_MAX:
+        _DETAIL_CACHE.clear()
+    _DETAIL_CACHE[(name, job_id)] = (now + ttl, status, out)
+    return out
+
+
+def _apply_detail(row: dict, detail: dict) -> None:
+    """Положить в строку то, ради чего подробности и спрашивали."""
+    if not detail:
+        row["reason_pending"] = True      # спросили и не узнали — так и говорим
+        return
+    log = str(detail.get("log_tail") or "")
+    over = row["state"] in ("error", "partial", "cancelled")
+    stage = (_stage_from_log(log, skip_errors=over)
+             or str(detail.get("progress_detail") or "").strip())
+    if stage:
+        row["stage"] = _short(stage, 160)
+    said = str(detail.get("error") or "").strip()
+    if over:
+        row["error"] = _join_reason(_reason_from_log(log), said) or row["error"]
+    elif said and not row["error"]:
+        row["error"] = _short(said, 300)
+    warning = str(detail.get("warning") or "").strip()
+    if warning and not row["warning"]:
+        row["warning"] = _short(warning, 200)
+    # Поштучная ручка Cover времена отдаёт (`ApiJobResponse`), в отличие от списка:
+    # раз дочитали — строка перестаёт быть строкой молчуна.
+    if "started_at" in detail or "finished_at" in detail:
+        row["times_known"] = True
+    row.update(_job_age(row.get("created"),
+                        detail.get("started_at") or row.get("started"),
+                        detail.get("finished_at") or row.get("finished"),
+                        row["state"], times_known=row.get("times_known", True)))
+    row["reason_pending"] = False
+
+
+def _detail_needed(row: dict) -> bool:
+    """Нужны ли этой строке подробности. Спрашиваем только там, где это видно."""
+    if not row.get("id"):
+        return False
+    if row["state"] == "running":
+        return not row["stage"]                       # чем занята прямо сейчас
+    if row["state"] in ("error", "partial", "cancelled"):
+        return not row["error"]                       # почему кончилась так
+    return False
+
+
+def _fill_neighbour_details(parcels: list, budget: int = QUEUE_DETAIL_BUDGET) -> dict:
+    """Дочитать стадию и причину тем строкам, без которых строка бессмысленна.
+
+    `parcels` — по одной записи на сервис: (имя, база, ключ, строки).
+    """
+    need = []
+    for name, base, key, rows in parcels:
+        if not key:
+            continue
+        need.extend((row.get("created") or 0, name, base, key, row)
+                    for row in rows if _detail_needed(row))
+    # Свежие первыми: если бюджета на всех не хватит, человек смотрит на то, что
+    # происходит сейчас, а не на позавчерашний отказ.
+    need.sort(key=lambda item: -item[0])
+    asked = 0
+    for _created, name, base, key, row in need:
+        if asked >= budget:
+            row["reason_pending"] = True
+            continue
+        asked += 1
+        _apply_detail(row, _neighbour_detail(name, base, key, row["id"], row["status"]))
+    return {"asked": asked, "needed": len(need), "budget": budget}
 
 
 @app.get("/ui/queue")
@@ -746,21 +1151,39 @@ def ui_queue(service: str | None = None, channel: int | None = None,
         # превращаться в сотню обращений за именем ролика.
         rows = []
         for q in c.execute(
-                "SELECT q.job_id, q.kind, q.status, q.created, q.progress, q.stage, "
+                "SELECT q.job_id, q.kind, q.status, q.created, q.started, q.finished, "
+                "       q.progress, q.stage, "
                 "       q.provider, q.error, q.project_id, q.uid, "
                 "       r.release_id, ch.id ch_id, ch.name ch_name, ch.lang lang, "
-                "       p.donor_title, p.donor_url, u.name user_name "
+                "       p.donor_title, p.donor_url, pr.name project_name, "
+                "       u.name user_name "
                 "FROM queue_tasks q "
                 "LEFT JOIN pub_releases r ON r.project_id = q.project_id "
                 "LEFT JOIN pub_channels ch ON ch.id = r.channel_id "
                 "LEFT JOIN pub_plan_items p ON p.id = r.plan_item_id "
+                "LEFT JOIN projects pr ON pr.id = q.project_id "
                 "LEFT JOIN users u ON u.id = q.uid "
                 "WHERE q.tenant_id=? ORDER BY q.job_id DESC LIMIT 100",
                 (TENANT,)):
-            rows.append({
+            # Имя проекта раньше в этой цепочке не участвовало, и строка своей задачи
+            # без выпуска подписывалась идентификатором `p_a66a80ca50`. Человеку он не
+            # говорит ничего — а имя проекта он сам и задал.
+            title, why = (q["donor_title"] or "").strip(), ""
+            if not title:
+                if (q["donor_url"] or "").strip():
+                    title = q["donor_url"].strip()
+                    why = "названия ролика у нас нет — показываем ссылку донора"
+                elif (q["project_name"] or "").strip():
+                    title = q["project_name"].strip()
+                    why = ("название ролика не сохранено: у задачи нет выпуска — "
+                           "в строке имя проекта")
+                else:
+                    title = q["project_id"] or f'задача {q["job_id"]}'
+                    why = ("название ролика не сохранено: у этой задачи нет ни "
+                           "выпуска, ни названного проекта")
+            row = {
                 "service": "vsgen", "id": str(q["job_id"]),
-                "title": (q["donor_title"] or q["donor_url"] or q["project_id"]
-                          or str(q["job_id"])),
+                "title": _short(title, 200), "title_why": why,
                 "channel": q["ch_name"] or "", "channel_id": q["ch_id"],
                 "lang": (q["lang"] or "").upper(),
                 "release_id": q["release_id"] or "",
@@ -774,8 +1197,15 @@ def ui_queue(service: str | None = None, channel: int | None = None,
                 "stage": q["stage"] or "",
                 "provider": q["provider"] or "",
                 "created": q["created"],
-                "error": q["error"] or "",
-            })
+                "error": q["error"] or "", "warning": "",
+                "reason_pending": False,
+                # Своя очередь: `started`/`finished` лежат в той же строке таблицы,
+                # спрашивать не у кого и молчать некому.
+                "times_known": True,
+            }
+            row.update(_job_age(q["created"], q["started"], q["finished"],
+                                row["state"]))
+            rows.append(row)
         services = [{"key": "vsgen", "title": "Видео", "ok": True, "error": "",
                      "count": len(rows)}]
         # Выпуск канала, который ещё не дошёл до задач (или ждёт между этапами), в
@@ -786,8 +1216,12 @@ def ui_queue(service: str | None = None, channel: int | None = None,
         rows.extend(releases)
         services.append({"key": "release", "title": "Выпуски", "ok": True, "error": "",
                          "count": len(releases)})
+        parcels = []
         for name, title, base in NEIGHBOURS:
-            got, err = _neighbour_jobs(name, base, get_key(c, name))
+            key = get_key(c, name)
+            got, err = _neighbour_jobs(name, base, key)
+            _name_neighbour_rows(c, name, got)
+            parcels.append((name, base, key, got))
             rows.extend(got)
             services.append({"key": name, "title": title, "ok": not err,
                              "error": err, "count": len(got)})
@@ -811,6 +1245,21 @@ def ui_queue(service: str | None = None, channel: int | None = None,
         except KeyError:
             pass
 
+    # Дочитывание — ПОСЛЕ фильтров, и порядок здесь содержательный, а не косметика.
+    # Каждое дочитывание — отдельный запрос по сети к соседу, а бюджет на весь показ
+    # один. Потратив его выше, на строки, которые фильтр тут же выбрасывает, экран
+    # отнимал сеть ровно у тех строк, ради которых фильтр и поставлен: при выбранном
+    # «Обложки» весь бюджет уходил на задачи рерайта, а обложки оставались без стадии
+    # с пометкой «не дочитали». Теперь бюджет уходит только на видимое.
+    # Переставлять безопасно: фильтры смотрят на сервис, канал, состояние и время
+    # создания, а подробности меняют стадию, причину и время работы — пересечений нет.
+    # База уже закрыта, и это тоже нарочно: дочитывание — чистая сеть, держать под неё
+    # открытое соединение к SQLite незачем.
+    visible = {id(r) for r in rows}
+    details = _fill_neighbour_details([(name, base, key,
+                                        [r for r in got if id(r) in visible])
+                                       for name, base, key, got in parcels])
+
     rows.sort(key=lambda r: (r["created"] or 0), reverse=True)
     return {
         "rows": rows, "services": services, "channels": channels,
@@ -819,6 +1268,10 @@ def ui_queue(service: str | None = None, channel: int | None = None,
         "periods": [{"key": "1h", "title": "за час"},
                     {"key": "24h", "title": "за сутки"},
                     {"key": "7d", "title": "за неделю"}],
+        # Сколько строк пришлось дочитывать у соседей и скольким не хватило бюджета.
+        # Наружу это не украшение: строка с `reason_pending` объясняется именно этим
+        # числом, и без него «причина не показана» выглядело бы как «причины нет».
+        "details": details,
         # Канал и язык есть только у задач, рождённых выпуском. Ручная задача их не
         # имеет, и это не пробел данных, а другое происхождение — так и показываем.
         "note": "канал и язык видны у задач, созданных выпуском",
@@ -4596,6 +5049,8 @@ def _live_release_rows(c) -> list:
         out.append({
             "service": "release", "id": r["release_id"],
             "title": r["donor_title"] or r["donor_url"] or r["release_id"],
+            "title_why": ("" if r["donor_title"] else
+                          "название ролика не добыто — показываем ссылку донора"),
             "channel": r["ch_name"] or "", "channel_id": r["ch_id"],
             "lang": (r["lang"] or "").upper(),
             "release_id": r["release_id"], "project_id": r["project_id"] or "",
@@ -4605,6 +5060,15 @@ def _live_release_rows(c) -> list:
             "status": r["status"] or "", "state": _state(r["status"]),
             "progress": None, "stage": PHASE_TITLE.get(ph, ph), "provider": "",
             "created": r["updated"], "error": r["blocked_reason"] or "",
+            "warning": "", "reason_pending": False,
+            # У выпуска нет «взят в работу»: он не задача, а цепочка задач, и его
+            # время — это время последнего движения. Поэтому «ждёт с …», а не «идёт»:
+            # обещать работу там, где её может не быть, экран не должен.
+            "started": None, "finished": None, "working": None,
+            "waiting": (round(max(0.0, time.time() - float(r["updated"] or 0)))
+                        if r["updated"] else None),
+            "age_text": (f'в этой фазе {_span_ru(time.time() - float(r["updated"]))}'
+                         if r["updated"] else ""),
         })
     return out
 
