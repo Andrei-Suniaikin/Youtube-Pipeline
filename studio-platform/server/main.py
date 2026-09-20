@@ -3970,6 +3970,18 @@ _CANCEL_SPEC = {
 }
 
 
+def _without_deferred(settings):
+    """Настройки БЕЗ служебных deferred-флагов — для любого копирования настроек.
+
+    Отложенный авто-запуск — это состояние КОНКРЕТНОГО проекта («этому обещали видео и
+    рендер, когда дозреют материалы»), а не настройка, которую можно унаследовать.
+    Вотчер `_deferred_render_tick` ищет работу запросом `settings LIKE '%deferred_%'`,
+    то есть скопированный флаг он подхватит у нового проекта и сам поставит платное
+    видео (кредиты veo/recrafter) и рендер, которых человек не заказывал.
+    """
+    return {k: v for k, v in (settings or {}).items() if k not in _DEFERRED_KEYS}
+
+
 def _active_task(tid, pid, kind, done_too=False):
     """Есть ли по проекту задача вида kind в очереди/работе (done_too — учитывать и завершённые)."""
     sts = ("queued", "running", "done") if done_too else ("queued", "running")
@@ -4629,6 +4641,14 @@ b.addEventListener('click',function(e){
 });})(bs[i]);})();
 </script>"""
 
+# Что делает «Сделать всё» — и чего оно не делает. Один текст на кнопку, подсказку и
+# ответ ручки: расходиться им нельзя, иначе экран обещает одно, а ответ говорит другое.
+# Кабинет умеет ровно четыре этапа; сценарий живёт в Rewrite, обложка — в Cover, и
+# дорога к обоим одна — пульт (см. комментарий в /api/batch/{kind} и web/app.py).
+_PIPELINE_STAGES = ("tts", "images", "video", "render")
+_PIPELINE_NOTE = ("Сценарий и обложка сюда не входят: их делают соседние сервисы — "
+                  "текст заказывается кнопкой «Текст», обложка — кнопкой «Обложка».")
+
 _ICON_UP = '<svg viewBox="0 0 24 24" width=26 height=26 fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0 4 4m-4-4-4 4M5 20h14"/></svg>'
 # иконки галереи картинок (выбор / перегенерация / удаление)
 _GI_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'
@@ -4819,7 +4839,8 @@ def dashboard(request: Request):
     <button type=button class="btn btn-ghost btn-sm" data-cancel="рендер" formaction=/api/batch/cancel/render style="width:100%;justify-content:center;margin-top:9px" title="Остановить рендер у отмеченных проектов и снять отложенный авто-рендер"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-stop"/></svg> Отменить</button>
   </div>
 </div>
-<button class="btn btn-primary" formaction=/api/batch/pipeline style="width:100%;justify-content:center;margin:-6px 0 7px" title="Озвучка и картинки стартуют сразу; видео и рендер поставятся автоматически, когда дозреют материалы"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-rocket"/></svg> Сделать всё (озвучка → картинки → видео → рендер)</button>
+<button class="btn btn-primary" formaction=/api/batch/pipeline style="width:100%;justify-content:center;margin:-6px 0 7px" title="Озвучка и картинки стартуют сразу; видео и рендер поставятся автоматически, когда дозреют материалы. {_PIPELINE_NOTE}"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-rocket"/></svg> Сделать всё видео (озвучка → картинки → видео → рендер)</button>
+<p class=hint style="margin:-3px 0 7px">{_PIPELINE_NOTE} <a href="{html.escape(_NEIGHBOUR_LINKS["cover"])}">Обложки →</a></p>
 <button type=button class="btn btn-ghost btn-sm" data-cancel="ВСЕ задачи (озвучка, картинки, видео, рендер)" formaction=/api/batch/cancel/all style="width:100%;justify-content:center;margin:0 0 18px" title="Остановить все активные задачи отмеченных проектов и снять все отложенные авто-запуски. Готовые файлы не удаляются."><svg class="ic" viewBox="0 0 24 24"><use href="#ic-stop"/></svg> Отменить всё у выбранных</button>
 </form>
 
@@ -4839,9 +4860,14 @@ def _create_project(tid, name, source_text="", settings=None):
     now = datetime.datetime.now().timestamp()
     c = db()
     # наследование настроек: явные settings → иначе последний проект тенанта с настройками (как add_project в десктопе)
+    # Отложенные авто-запуски НЕ наследуются и не переносятся пресетом (_without_deferred):
+    # иначе свежесозданный проект получал бы чужое обещание «поставить видео и рендер,
+    # когда дозреют материалы» и сам тратил бы деньги. Пресеты чистятся уже на записи
+    # (_preset_project_payload), но путь наследования от последнего проекта тенанта
+    # копировал settings живого проекта ЦЕЛИКОМ — вместе с его флагами.
     if isinstance(settings, dict):
         initial = _normalize_lumean_settings(_canonical_preset_settings(settings))
-        sj = json.dumps(initial, ensure_ascii=False)
+        sj = json.dumps(_without_deferred(initial), ensure_ascii=False)
     else:
         rr = c.execute("SELECT settings FROM projects WHERE tenant_id=? AND settings IS NOT NULL AND settings!='' "
                        "ORDER BY created DESC LIMIT 1", (tid,)).fetchone()
@@ -4851,7 +4877,7 @@ def _create_project(tid, name, source_text="", settings=None):
             except Exception:
                 inherited = {}
             inherited = _normalize_lumean_settings(_canonical_preset_settings(inherited))
-            sj = json.dumps(inherited, ensure_ascii=False)
+            sj = json.dumps(_without_deferred(inherited), ensure_ascii=False)
         else:
             sj = None
     c.execute("INSERT INTO projects(id,tenant_id,name,dir_path,status,created,updated,settings) VALUES(?,?,?,?,?,?,?,?)",
@@ -5171,6 +5197,15 @@ async def batch_run(kind: str, request: Request):
             # Её канал тоже должен быть чем-то авторизован (в одиночной постановке
             # это проверялось, в батче — нет: 20 проектов вставали и падали разом).
             _block_kinds = _block_kinds + ("prompts",)
+        # Проект без сценария пропускаем ЗДЕСЬ, по тому же набору этапов, что и проверка
+        # провайдера: платить за раскадровку и озвучку пустоты нельзя (см. _NO_SOURCE_HINT).
+        # Причина уходит в тот же счётчик blocked и в тот же тост — молчаливого «кнопка не
+        # сработала» быть не должно.
+        _src_reason = _source_block_reason(tid, pid, _block_kinds, merged)
+        if _src_reason:
+            blocked += 1
+            block_reason = block_reason or _src_reason
+            continue
         _reason = next((r for r in (_provider_block_reason(
                                         u, bk, merged, project_id=pid)
                                     for bk in _block_kinds) if r), "")
@@ -5226,8 +5261,19 @@ async def batch_run(kind: str, request: Request):
     if blocked and not enq and not dfr:
         raise HTTPException(400, block_reason)
     if request.headers.get("x-requested-with") == "fetch":
-        return JSONResponse({"ok": True, "enqueued": enq, "deferred": dfr, "skipped": skipped,
-                             "blocked": blocked, "block_reason": block_reason, "kind": kind})
+        out = {"ok": True, "enqueued": enq, "deferred": dfr, "skipped": skipped,
+               "blocked": blocked, "block_reason": block_reason, "kind": kind}
+        if kind == "pipeline":
+            # Чем «Сделать всё» НЕ является, сказано в самом ответе, а не только на
+            # кнопке: 20.09.2026 владелец ждал от неё сценарий и обложку и не увидел
+            # ни того, ни другого. Кабинет физически не умеет ни то, ни другое —
+            # сценарий пишет Rewrite, обложку рисует Cover, и ходит к ним только пульт
+            # (web/app.py, «пакетный текст и обложка»). Заводить здесь вторую дорогу к
+            # соседям нельзя: у кабинета нет ни их ключей, ни их очереди, зато появился
+            # бы второй, никем не проверяемый путь к платным вызовам.
+            out["stages"] = list(_PIPELINE_STAGES)
+            out["note"] = _PIPELINE_NOTE
+        return JSONResponse(out)
     return RedirectResponse("/queue", 302)
 
 
@@ -6886,6 +6932,88 @@ def _provider_block_reason(u, kind, params, project_id=None):
 def _assert_provider_available(u, kind, params, project_id=None):
     """Loud-fail ПРИ ПОСТАНОВКЕ: иначе задача висела бы в очереди и падала в воркере."""
     reason = _provider_block_reason(u, kind, params, project_id=project_id)
+    if reason:
+        raise HTTPException(400, reason)
+
+
+# ═══════════ «нет сценария — не платим» (20.09.2026) ═══════════
+#
+# Повод. Владелец нажал «Сделать всё» на проекте p_bc85c4bc85, у которого не было ни
+# строки сценария: `source.txt` в папке проекта отсутствовал вовсе. В очередь встали
+# платные `prompts` и `tts` — модель раскадровывала пустоту, озвучка озвучивала
+# пустоту, и на экране это выглядело как «конвейер пошёл». Проверки текста при
+# постановке не было ни в батче, ни у одиночных кнопок: обе дороги спрашивали про
+# ключи провайдера и про готовность кадров, но не про то, есть ли что озвучивать.
+#
+# Правило одно на все входы человека: этап, который ЧИТАЕТ сценарий, без сценария не
+# ставится, а человек получает причину словами. Это тот же жанр, что и
+# `_provider_block_reason` рядом, поэтому и живёт здесь же.
+#
+# Почему «пусто», а не минимальная длина. Короткий сценарий — законный (шортс,
+# вставка, тестовый ролик), и назначать за владельца минимальный размер ролика мы не
+# вправе (правило «не додумывать», docs/14). Пустой же файл — факт, а не оценка.
+_NO_SOURCE_HINT = ("нет сценария: вкладка «Сценарий» у проекта пустая — вставьте текст "
+                   "или закажите его кнопкой «Текст», и запускайте снова")
+
+
+def _has_source_text(tid, pid):
+    """Есть ли у проекта непустой `source.txt`.
+
+    Читаем файл целиком, а не первые байты: «пусто» обязано значить пусто, иначе
+    сценарий, начинающийся с шапки из пробелов и переводов строк, получил бы ложный
+    отказ. Файла нет, папки нет, прав нет — это тоже «текста нет»: платить за такой
+    проект нельзя ровно так же, как за пустой.
+    """
+    try:
+        with open(os.path.join(_project_dir(tid, pid), "source.txt"),
+                  encoding="utf-8", errors="replace") as f:
+            return bool(f.read().strip())
+    except OSError:
+        return False
+
+
+def _stage_reads_source(kind, params):
+    """Читает ли этап сценарий проекта. Источник правды — `_build_cmd`, не догадки.
+
+    * `tts` и `prompts` — всегда: воркер получает `--source_file`/сам текст.
+    * `images` — только на пути плана сцен. Свои промпты (`custom_prompts`) и Bing с
+      тегами текста не касаются вовсе, и запрещать их проекту без сценария было бы
+      выдумкой: это законный способ собрать ролик из готовых кадров.
+    * видео, рендер, главы, карточка — сценарий не читают: у них свои проверки
+      готовности (`_video_ready`, `_render_inputs_ready`, транскрипт с ноды,
+      `card_jobs.narration_bytes`).
+    """
+    if kind in ("tts", "prompts"):
+        return True
+    if kind != "images":
+        return False
+    try:
+        p = _canonical_image_params(params or {})
+    except ImageModeContractError:
+        # Параметры не разобрались — считаем, что текст нужен: отказ дешевле
+        # оплаченной задачи, а настоящую причину назовёт контрактный гейт рядом.
+        return True
+    if p["image_mode"] == _IMAGE_MODE_BING:
+        return not str(p.get("tags") or "").strip()
+    return not str(p.get("custom_prompts") or "").strip()
+
+
+def _source_block_reason(tid, pid, kinds, params):
+    """Почему эти этапы нельзя ставить проекту без сценария ('' — можно).
+
+    `kinds` — тот же набор, по которому проверяются провайдеры: у «Сделать всё» это
+    озвучка, картинки и (когда плана ещё нет) промпты.
+    """
+    if not any(_stage_reads_source(k, params) for k in kinds):
+        return ""
+    if _has_source_text(tid, pid):
+        return ""
+    return _NO_SOURCE_HINT
+
+
+def _assert_source_text(tid, pid, kinds, params):
+    """Loud-fail при одиночной постановке — по образцу `_assert_provider_available`."""
+    reason = _source_block_reason(tid, pid, kinds, params)
     if reason:
         raise HTTPException(400, reason)
 
@@ -14805,6 +14933,14 @@ async def gen_submit(pid: str, kind: str, request: Request):
             dd = _normalize_lumean_settings(dd)
         except LumeanTemplateError as exc:
             raise HTTPException(400, str(exc)) from exc
+    # Проект без сценария отклоняем ДО всего остального: это та же дыра, что закрыта в
+    # батче (см. _NO_SOURCE_HINT), и через одиночные кнопки «Озвучить»/«Сделать картинки»
+    # она была открыта ровно так же. Раньше ключей — потому что пустой сценарий человек
+    # чинит сам и сразу, а разговор про ключи на пустом проекте бессмыслен. Отказ здесь
+    # ещё и не успевает записать настройки задачи в проект (_save_project_settings ниже).
+    _assert_source_text(
+        tid, pid, (kind,), image_effective if image_effective is not None else dd,
+    )
     # Провайдера без серверного ключа и без своего отклоняем СРАЗУ: иначе задача висит
     # в очереди и падает в воркере «нет ключа» уже после ожидания.
     _assert_provider_available(
@@ -15843,6 +15979,14 @@ async def job_retry(jid: int, request: Request):
     except Exception:
         params = {}
     reference_bundle_id = params.pop(_REFERENCE_BUNDLE_PARAM, _REFERENCE_BUNDLE_UNSET)
+    # Проект без сценария: «Повторить» — ТРЕТИЙ человеческий вход к платной постановке
+    # (после батча и одиночных кнопок), и правило «нет сценария — не платим» обязано
+    # стоять и здесь. Строка очереди хранит параметры момента падения, а сценарий с тех
+    # пор могли стереть или проект пересоздать — тогда повтор молча оплатил бы
+    # раскадровку и озвучку пустоты. Раньше проверки ключей и раньше отложенного
+    # рендера — по той же причине, что и в gen_submit: пустой сценарий человек чинит
+    # сам и сразу, а разговор про ключи на пустом проекте бессмыслен.
+    _assert_source_text(tid, t["project_id"], (t["kind"],), params)
     _is_fetch = request.headers.get("X-Requested-With") == "fetch"
     if t["kind"] == "render" and not _render_inputs_ready(tid, t["project_id"]):
         _save_project_settings(tid, t["project_id"], {"deferred_pending": t["uid"] or u["id"]})
@@ -19018,6 +19162,15 @@ def _adm_act_retry_job(u, p):
     except Exception:
         params = {}
     reference_bundle_id = params.pop(_REFERENCE_BUNDLE_PARAM, _REFERENCE_BUNDLE_UNSET)
+    # ЧЕТВЁРТЫЙ вход того же правила. Повтор из админ-панели ставит задачу в очередь
+    # ВЛАДЕЛЬЦА и тратит его деньги ровно так же, как кнопка в кабинете, поэтому и
+    # проверка та же. Она нужна здесь даже больше: админ видит строку очереди, но не
+    # видит, что у проекта успели стереть сценарий.
+    _src_reason = _source_block_reason(
+        t["tenant_id"], t["project_id"], (t["kind"],), params
+    )
+    if _src_reason:
+        raise HTTPException(400, _src_reason)
     task_failover = _prompt_failover_from_row(t)
     prompt_snapshot = _PROMPT_FAILOVER_UNSET
     if t["kind"] == "prompts" and task_failover == _PROMPT_FAILOVER_DISABLED:

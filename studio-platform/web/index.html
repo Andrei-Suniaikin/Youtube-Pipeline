@@ -62,7 +62,15 @@
   nav a.tab.on{color:var(--ink-hi);border-bottom-color:var(--acc)}
   nav span.soon{padding:15px 13px;color:#5a5470;cursor:not-allowed;white-space:nowrap}
   nav span.soon::after{content:" скоро";font-size:11px;opacity:.8}
-  nav .who{padding:15px 0 15px 16px;color:var(--muted);font-size:13px;white-space:nowrap}
+  /* Имя человека — вход в профиль (20.09.2026), отдельной вкладки «Профиль» больше нет:
+     поэтому `margin-left:auto` переехал сюда с неё. Вертикальные отступы сняты со span и
+     остались у вкладки внутри — иначе они сложились бы и шапка стала бы вдвое выше. */
+  nav .who{margin-left:auto;display:flex;align-items:center;gap:12px;
+           color:var(--muted);white-space:nowrap}
+  /* Размер имени — как у остальных вкладок (15px, из body): оно теперь такая же
+     вкладка. Мелким остаётся только «выйти» — это не раздел, а действие. */
+  nav .who a.out{color:var(--muted);text-decoration:none;font-size:13px}
+  nav .who a.out:hover{color:var(--ink)}
 
   main{max-width:1180px;margin:0 auto;padding:26px 20px 70px}
   h1{font-size:26px;margin:0 0 5px;font-weight:750;letter-spacing:-.02em;color:var(--ink-hi)}
@@ -186,6 +194,23 @@
               padding:4px 8px;background:var(--card-2);border:1px solid var(--line-2);
               border-radius:8px;font-size:13px}
   .inline-ask .ask-in{width:210px}
+  /* Значок вместо слова в колонке действий (жалоба владельца 20.09.2026: «в очереди
+     огромные кнопки повторить и убрать, экран съезжает»). Слово задавало колонке свою
+     ширину, и таблица ехала вбок на каждой строке, где действие вообще было. У значка
+     ширина постоянная; смысл слова остаётся в `title` и `aria-label`. */
+  .iconbtn{display:inline-grid;place-items:center;width:30px;height:30px;padding:0;
+           background:transparent;border:1px solid var(--line-2);border-radius:8px;
+           color:var(--muted);cursor:pointer;line-height:0;vertical-align:middle}
+  .iconbtn + .iconbtn{margin-left:6px}
+  .iconbtn svg{width:16px;height:16px;display:block}
+  .iconbtn:hover{background:var(--card-2);color:var(--ink-hi)}
+  /* Необратимое — красным на наведении: «убрать» и «отменить» не переигрываются. */
+  .iconbtn.bad:hover{color:var(--bad);border-color:rgba(248,113,113,.45)}
+  .iconbtn:disabled{opacity:.45;cursor:default}
+  /* Колонка действий одной ширины во всех строках: иначе «в работе» (есть кнопка) и
+     «готово» (кнопки нет) двигали бы таблицу друг относительно друга при каждом
+     обновлении очереди. */
+  th.acts,td.acts{width:104px;white-space:nowrap;text-align:right}
   .subtabs{display:flex;gap:4px;margin:0 0 16px;border-bottom:1px solid var(--line)}
   .subtabs a{padding:8px 14px;color:var(--muted);text-decoration:none;font-weight:550;
              font-size:13px;border-bottom:2px solid transparent;margin-bottom:-1px}
@@ -262,6 +287,9 @@
           animation:toast-in .18s ease-out}
   #toasts .toast.bad{border-left-color:var(--bad);color:var(--bad)}
   #toasts .toast.ok{border-left-color:var(--ok)}
+  /* Пачка ушла, но не вся: зелёное «готово» здесь врёт, красное «не сработало» — тоже.
+     Янтарный — «часть требует внимания», числа и причина в самом тексте. */
+  #toasts .toast.warn{border-left-color:var(--wait)}
   #toasts .toast.out{opacity:0;transform:translateX(12px);transition:opacity .2s,transform .2s}
   @keyframes toast-in{from{opacity:0;transform:translateX(12px)}to{opacity:1;transform:none}}
 
@@ -300,7 +328,8 @@
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
     <a class="tab" href="#/presets" id="tab-presets">Пресеты</a>
-    <a class="tab" href="#/profile" id="tab-profile" style="margin-left:auto">Профиль</a>
+    <!-- Вкладки «Профиль» здесь нет намеренно: в профиль ведёт имя человека справа —
+         его рисует showWho(). Два входа в одно место — лишний выбор без разницы. -->
     <span class="who" id="who"></span>
   </nav>
 </header>
@@ -322,6 +351,33 @@ const STATE_CLS = {done:'s-done', running:'s-running', queued:'s-queued',
                    error:'s-error', idle:'s-idle', off:'s-off'};
 const DOT = {done:'✓', running:'◐', queued:'·', partial:'◑', cancelled:'–',
              blocked:'!', error:'!', idle:'', off:'–'};
+
+/* Значки действий в строках таблиц — одним набором здесь, а не по месту: их четыре,
+   и они обязаны выглядеть одинаково в очереди, в выпуске, в текстах и в обложках.
+   `currentColor` — цвет берётся от кнопки, поэтому значок светлеет вместе с рамкой на
+   наведении и гаснет вместе с ней у `disabled`. Значок без подписи понятен не всем,
+   поэтому рисуется он только вместе с `title` (см. `actions()`). */
+const ICON = {
+  // перечёркнутый круг — «отменить то, что сейчас идёт»
+  cancel: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"'
+        + ' aria-hidden="true"><circle cx="8" cy="8" r="5.6"/>'
+        + '<path d="M4.1 11.9 11.9 4.1" stroke-linecap="round"/></svg>',
+  // стрелка по кругу — «повторить то, что упало»
+  retry: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"'
+       + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+       + '<path d="M13.2 8a5.2 5.2 0 1 1-1.52-3.68"/><path d="M13.4 2.4v3.3h-3.3"/></svg>',
+  // корзина — «убрать из очереди»
+  remove: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"'
+        + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+        + '<path d="M3 4.4h10M6.4 4.4V3.1h3.2v1.3M4.4 4.4l.6 8.2h6l.6-8.2"/>'
+        + '<path d="M6.7 7v3.3M9.3 7v3.3"/></svg>',
+  // стрелка из рамки — «открыть отдельным экраном»
+  open: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"'
+      + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+      + '<path d="M9.4 2.8h3.8v3.8"/><path d="M13.2 2.8 7.7 8.3"/>'
+      + '<path d="M12.2 9.8v2.9a.9.9 0 0 1-.9.9H3.7a.9.9 0 0 1-.9-.9V5.1a.9.9 0'
+      + ' 0 1 .9-.9h2.9"/></svg>',
+};
 
 function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -607,12 +663,50 @@ function rewriteRowHtml(rw){
     «OpenAI · текст (Rewrite Studio)».</div></div>`;
 }
 
+/* Карточка своих ключей. Одна и та же на экране ключей и в профиле (20.09.2026):
+   владелец — «чтобы ключ добавить, нужно куда-то переходить». Теперь не нужно, а второй
+   копии разметки, которая разойдётся с первой на первой же правке, не завелось.
+   `opts.title` — своё название в профиле, `opts.note` — строка под заголовком,
+   `opts.more` — ссылка на полный экран ключей: очередь провайдеров, отдыхающие ключи и
+   FastGen остались там, они только читают и в профиле были бы простынёй. */
+function ownKeysCard(d, opts){
+  const o = opts || {};
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">${esc(o.title || 'Свои ключи пользователей')}${o.more
+      ? '<a class="mklink" href="#/keys">очередь и отдых ключей →</a>' : ''}</div>
+    ${o.note ? `<div class="secbody"><div class="note muted">${esc(o.note)}</div></div>` : ''}
+    ${d.own_keys.length ? `<table><thead><tr>
+        <th>Пользователь</th><th>Провайдер</th><th>Ключей</th><th>Раздача</th>
+      </tr></thead><tbody>${d.own_keys.map(o2 => `<tr>
+        <td>${esc(o2.user)}</td><td>${esc(o2.family)}</td>
+        <td>${(o2.items || []).map(i => `<span class="mono"
+          style="margin-right:8px">${esc(i.mask)}${o2.mine ? ` <a href="#"
+          class="dropkey" data-f="${esc(o2.family)}" data-i="${i.index}"
+          title="снять этот ключ">×</a>` : ''}</span>`).join('') || o2.count}</td>
+        <td>${o2.pooled
+          ? '<span class="pill s-done">по кругу между ключами</span>'
+          : '<span class="pill s-idle">ключ один</span>'}</td>
+      </tr>`).join('')}</tbody></table>
+      <div class="sec" style="border-bottom:0;font-weight:400" class="muted">
+        Значение ключа нигде не показывается — только его хвост.
+      </div>`
+      : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
+    ${rewriteRowHtml(d.rewrite || {})}
+    <div class="secbody" style="padding-top:0">
+      <button class="ghost" id="addkey">Добавить ключ</button>
+    </div>
+  </div>`);
+  wireKeys(card, d);
+  return card;
+}
+
 async function viewKeys(){
   // Ключи живут в профиле: это про человека, а не про производство. Вкладки в топбаре
   // у них больше нет — обратный путь должен быть виден со страницы.
   const d = await api('/ui/keys');
   app.innerHTML = '';
-  app.append($(`<h1>Ключи</h1>
+  app.append($(`<a class="back" href="#/profile">← в профиль</a>
+    <h1>Ключи</h1>
     <p class="sub">Кто ждёт, сколько ждёт и когда снова заработает.</p>`));
 
   app.append($(`<div class="card" style="margin-bottom:16px">
@@ -677,31 +771,7 @@ async function viewKeys(){
       : '<div class="empty">Данных пока нет.</div>'}
   </div>`));
 
-  const ownCard = $(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Свои ключи пользователей</div>
-    ${d.own_keys.length ? `<table><thead><tr>
-        <th>Пользователь</th><th>Провайдер</th><th>Ключей</th><th>Раздача</th>
-      </tr></thead><tbody>${d.own_keys.map(o => `<tr>
-        <td>${esc(o.user)}</td><td>${esc(o.family)}</td>
-        <td>${(o.items || []).map(i => `<span class="mono"
-          style="margin-right:8px">${esc(i.mask)}${o.mine ? ` <a href="#"
-          class="dropkey" data-f="${esc(o.family)}" data-i="${i.index}"
-          title="снять этот ключ">×</a>` : ''}</span>`).join('') || o.count}</td>
-        <td>${o.pooled
-          ? '<span class="pill s-done">по кругу между ключами</span>'
-          : '<span class="pill s-idle">ключ один</span>'}</td>
-      </tr>`).join('')}</tbody></table>
-      <div class="sec" style="border-bottom:0;font-weight:400" class="muted">
-        Значение ключа нигде не показывается — только его хвост.
-      </div>`
-      : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
-    ${rewriteRowHtml(d.rewrite || {})}
-    <div class="secbody" style="padding-top:0">
-      <button class="ghost" id="addkey">Добавить ключ</button>
-    </div>
-  </div>`);
-  app.append(ownCard);
-  wireKeys(ownCard, d);
+  app.append(ownKeysCard(d));
 
   if (d.unavailable && d.unavailable.length){
     app.append($(`<div class="card">
@@ -1531,7 +1601,7 @@ async function viewQueue(){
 
   const card = $(`<div class="card"><table>
     <thead><tr><th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th>
-      <th></th></tr></thead>
+      <th class="acts"></th></tr></thead>
     <tbody>${d.rows.map(r => `
       <tr>
         <td><span class="pill s-idle">${esc(SVC_TITLE[r.service] || r.service)}</span></td>
@@ -1542,13 +1612,13 @@ async function viewQueue(){
               || `<span class="mono">${esc(r.id)}</span>`}</div></td>
         <td>${esc(r.kind_title || r.kind || '—')}
             ${r.provider ? `<div class="muted">${esc(r.provider)}</div>` : ''}</td>
-        <td><span class="pill ${STATE_CLS[r.state]}">${STATE_TITLE[r.state]}</span>
+        <td class="st"><span class="pill ${STATE_CLS[r.state]}">${STATE_TITLE[r.state]}</span>
             ${r.stage ? `<div class="muted" style="margin-top:4px">${esc(r.stage)}</div>` : ''}
             ${r.progress != null ? `<div class="bar"><i style="width:${
               Math.round(r.progress * 100)}%"></i></div>` : ''}
             ${r.error ? `<div class="note bad">${esc(r.error)}</div>` : ''}</td>
         <td class="muted">${when(r.created)}</td>
-        <td style="white-space:nowrap">${actions(r)}</td>
+        <td class="acts">${actions(r)}</td>
       </tr>`).join('')}</tbody></table></div>`);
   app.append(card);
   wireActions(card);
@@ -1559,20 +1629,24 @@ async function viewQueue(){
    ещё идёт, повторить — то, что уже упало. Кнопка, которая всегда есть и через раз
    отвечает «нельзя», обучает не нажимать её вовсе. */
 function actions(r){
-  const btn = (act, title) =>
-    `<button class="ghost act" data-service="${esc(r.service)}" data-id="${esc(r.id)}"
-             data-act="${act}">${title}</button>`;
+  // Слово живёт в `title`: значок молча — это ребус, а подпись рядом со значком снова
+  // раздувает колонку. `aria-label` — то же слово для чтения вслух.
+  const btn = (act, icon, title, danger) =>
+    `<button class="iconbtn act${danger ? ' bad' : ''}" title="${esc(title)}"
+             aria-label="${esc(title)}" data-service="${esc(r.service)}"
+             data-id="${esc(r.id)}" data-act="${act}">${ICON[icon]}</button>`;
   // Выпуск — не задача сервиса: отменять и повторять у него нечего, его ведёт движок.
   // Что с ним можно сделать руками — убрать из очереди целиком (18.09.2026).
   if (r.service === 'release'){
-    return `<a class="ghost" href="#/release/${encodeURIComponent(r.release_id)}"
-              style="padding:3px 10px;border:1px solid var(--line);border-radius:6px;
-                     text-decoration:none;font-size:12px">Открыть</a>
-            ${r.plan_item_id ? `<button class="ghost small rel-del"
-              data-plan="${r.plan_item_id}" style="margin-left:6px">Убрать</button>` : ''}`;
+    return `<a class="iconbtn" title="Открыть" aria-label="Открыть"
+              href="#/release/${encodeURIComponent(r.release_id)}">${ICON.open}</a>
+            ${r.plan_item_id ? `<button class="iconbtn bad rel-del" title="Убрать"
+              aria-label="Убрать" data-plan="${r.plan_item_id}">${ICON.remove}</button>` : ''}`;
   }
-  if (r.state === 'running' || r.state === 'queued') return btn('cancel', 'Отменить');
-  if (r.state === 'error' || r.status === 'cancelled') return btn('retry', 'Повторить');
+  if (r.state === 'running' || r.state === 'queued')
+    return btn('cancel', 'cancel', 'Отменить', true);
+  if (r.state === 'error' || r.status === 'cancelled')
+    return btn('retry', 'retry', 'Повторить');
   return '';
 }
 
@@ -1581,20 +1655,26 @@ function wireActions(root){
     b.onclick = async () => {
       const {service, id, act} = b.dataset;
       b.disabled = true;
-      const was = b.textContent;
-      b.textContent = '…';
+      // Внутри кнопки значок, а не слово, поэтому сохраняем и возвращаем разметку:
+      // `textContent` стёр бы <svg> и вернул пустую кнопку.
+      const was = b.innerHTML;
+      b.innerHTML = '…';
       try{
         await post(`/ui/actions/${encodeURIComponent(service)}/${encodeURIComponent(id)}/${act}`);
         await render();
       }catch(e){
         b.disabled = false;
-        b.textContent = was;
+        b.innerHTML = was;
         // Отказ сервиса — это ответ, а не сбой экрана: показываем его словами рядом
-        // с той строкой, к которой он относится.
+        // с той строкой, к которой он относится. Место — колонка состояния: колонка
+        // значков узкая и постоянной ширины, длинная фраза в ней переносилась бы по
+        // одному слову и растягивала строку — ровно то, от чего уходили.
+        const row = b.closest('tr');
+        const cell = (row && row.querySelector('td.st')) || b.parentElement;
         const box = document.createElement('div');
         box.className = 'note bad';
         box.textContent = e.message;
-        b.parentElement.appendChild(box);
+        cell.appendChild(box);
       }
     };
   });
@@ -1716,10 +1796,16 @@ function viewLogin(why){
     box.querySelector('#' + id).onkeydown = e => { if (e.key === 'Enter') go(); };
 }
 
+/* Имя в шапке — это и есть вход в профиль (владелец 20.09.2026: «профиль перенести при
+   нажатии на логин в топбаре»). Оно же носит id вкладки `tab-profile`: подсветку раздела
+   ставит render() по той же таблице ROUTES, что и остальным вкладкам, — второй механизм
+   подсветки заводить не нужно. */
 function showWho(){
   const el = document.getElementById('who');
   el.innerHTML = ME
-    ? `${esc(ME.name)} · <a href="#" id="out">выйти</a>` : '';
+    ? `<a class="tab" href="#/profile" id="tab-profile"
+          title="Профиль: ключи, люди, система">${esc(ME.name)}</a>
+       <a href="#" class="out" id="out">выйти</a>` : '';
   const out = document.getElementById('out');
   if (out) out.onclick = async e => {
     e.preventDefault();
@@ -1805,7 +1891,8 @@ function wireReleaseDrop(root){
     ev.stopPropagation();
     const plan = b.dataset.plan || (b.closest('[data-plan]') || {dataset: {}}).dataset.plan;
     if (!plan){ toast('У этого выпуска не нашлось строки плана'); return; }
-    confirmInline(b, 'Убрать выпуск из очереди? Материалы проекта останутся.', async () => {
+    confirmModal('Убрать выпуск из очереди?',
+      'Выпуск уйдёт из плана канала. Материалы проекта останутся на диске.', async () => {
       b.disabled = true;
       try{ await post(`/ui/plan/${plan}/cancel`); await render(); }
       catch(e){ b.disabled = false; toast(e.message); }
@@ -2015,6 +2102,49 @@ function fieldSelectHtml(kind, f){
             placeholder="${esc(f.label)}: как в проекте" style="width:100%;margin-top:6px">`;
 }
 
+/* Что кабинет принял по «Сделать всё» — окном, а не молчанием.
+
+   Жалоба владельца 20.09.2026: «нажал сделать всё, но не вижу чтобы начался делаться
+   сценарий и обложка». Кабинет их и не делает: «всё» — это четыре этапа ЕГО очереди
+   (поле `stages` ответа), а сценарий пишет Rewrite и обложку рисует Cover, каждый
+   своей кнопкой (поле `note`). Оба поля ответ отдаёт, но на экране их не было нигде —
+   человек ждал того, чего не заказывал, и не получал ни строчки объяснения.
+
+   Слова берём из ответа, а не пересказываем своими: на кнопке, в подсказке кабинета и
+   здесь должен стоять один текст, иначе экран однажды пообещает не то, что сделано.
+
+   Окно, а не тост: тост живёт пять секунд и перекрывается следующим, а экран через
+   1,2 с перерисовывается — врезка внутри карточки исчезла бы вместе с ним. <dialog>
+   висит на <body> и перерисовку переживает. */
+// Подписи этапов — ровно те же слова, что стоят на карточках пакетного запуска рядом
+// («Озвучка», «Картинки», «Видео», «Рендер»): человек должен сопоставить сказанное с
+// кнопками, а не догадываться, что «кадры» и «картинки» — одно и то же.
+const PIPELINE_STAGE_TITLES = {tts: 'озвучка', images: 'картинки', video: 'видео',
+                               render: 'рендер', prompts: 'промпты',
+                               chapters: 'главы'};
+function pipelineReport(out, n, where){
+  const enq = out.enqueued || 0, def = out.deferred || 0;
+  const blocked = out.blocked || 0, busy = out.skipped || 0;
+  const stages = (out.stages || []).map(s => PIPELINE_STAGE_TITLES[s] || s).join(' → ');
+  const nums = [`отмечено проектов: <b>${n}</b>`, `поставлено задач: <b>${enq}</b>`];
+  if (def) nums.push(`отложено: <b>${def}</b>`);
+  if (blocked) nums.push(`пропущено: <b>${blocked}</b>`);
+  if (busy) nums.push(`уже шло: <b>${busy}</b>`);
+  modal('Сделать всё: что поставлено',
+    `<div style="font-size:14px">${nums.join(' · ')}</div>
+     ${blocked ? `<div class="note bad">Пропущено проектов: ${blocked} — ${
+        esc(out.block_reason || 'причину кабинет не назвал')}. Денег на них не
+        потрачено: задача не ставилась. Остальные уехали — всю пачку повторять не
+        нужно, поправьте причину и нажмите только для пропущенных.</div>` : ''}
+     ${def ? `<div class="note muted">Отложенное стартует само, когда дозреют
+        материалы: видео ждёт картинки, рендер — озвучку и картинки.</div>` : ''}
+     ${stages ? `<div class="note muted">В «сделать всё» входит: ${esc(stages)}.</div>`
+       : ''}
+     ${out.note ? `<div class="note muted">${esc(out.note)}${
+        where ? ' ' + esc(where) : ''}</div>` : ''}`,
+    {ok: 'Понятно', no: 'Закрыть', onOk: (body, close) => close()});
+}
+
 async function viewProjects(){
   const d = await api('/ui/projects');
   app.innerHTML = '';
@@ -2169,12 +2299,25 @@ async function viewProjects(){
     });
     return out;
   };
+  // Итог пачки. Причину пропуска называем ВСЕГДА, когда кто-то пропущен.
+  //
+  // Было: причина показывалась только при `!enq && !def` — то есть когда не поставлено
+  // ничего. Такого ответа не бывает: если не уехал ни один проект, кабинет отвечает
+  // отказом 400 с той же причиной, и она уходит в `catch` ниже. Условие было мёртвым,
+  // а живой случай — смешанная пачка (часть уехала, часть отвалилась) — оставался без
+  // единого слова: ни числа пропущенных, ни почему. Ровно на это жаловался владелец
+  // 20.09.2026. Пропущенные (`blocked`) и «уже идёт» (`skipped`) считаются отдельно:
+  // первое — повод что-то поправить, второе — нормальная защита от дубля.
   const batchToast = (out, n) => {
-    const enq = out.enqueued || 0, def = out.deferred || 0, skip = out.skipped || 0;
-    toast(`проектов: ${n} — поставлено задач: ${enq}${def ? `, отложено: ${def}` : ''}${
-      skip ? `, пропущено: ${skip}` : ''}${
-      out.block_reason && !enq && !def ? ' — ' + out.block_reason : ''}`,
-      (enq || def) ? 'ok' : 'bad');
+    const enq = out.enqueued || 0, def = out.deferred || 0;
+    const blocked = out.blocked || 0, busy = out.skipped || 0;
+    const parts = [`проектов: ${n}`, `поставлено задач: ${enq}`];
+    if (def) parts.push(`отложено: ${def}`);
+    if (blocked) parts.push(`пропущено: ${blocked}`);
+    if (busy) parts.push(`уже идёт: ${busy}`);
+    toast(parts.join(' · ')
+          + (blocked ? ` — ${out.block_reason || 'причину кабинет не назвал'}` : ''),
+          (enq || def) ? (blocked ? 'warn' : 'ok') : 'bad');
   };
   batch.querySelectorAll('button.bgo').forEach(b => b.onclick = async () => {
     const ids = picks();
@@ -2354,7 +2497,13 @@ async function viewProjects(){
     // двадцать отмеченных означали двадцать последовательных походов в кабинет.
     try{
       const out = await post('/ui/projects/batch/pipeline', {pids: ids});
-      batchToast(out, ids.length);
+      // Здесь окно вместо тоста: у «Сделать всё» объяснять надо не только числа, но и
+      // границу — чего эта кнопка не делает и какой кнопкой это заказывают.
+      // На карточки соседей показываем, только если они на экране есть: на старом
+      // сервере (`/ui/projects/batch/fields` без `pult`) их не рисуют, и посылать
+      // человека к несуществующей кнопке хуже, чем не посылать никуда.
+      pipelineReport(out, ids.length, PULT_ORDER.length
+        ? 'Карточки «Текст» и «Обложка» — в этой же панели, над кнопкой.' : '');
     }catch(e){
       // Сессия истекла посреди пакета — это не «причина отказа» проекта, а «войдите
       // снова»: тот же уход на экран входа, что и в render() при обычной навигации.
@@ -3327,6 +3476,24 @@ async function renderCoverTab(d){
   app.append(jobsLogCard(d, 'cover'));
 }
 
+/* Вкладки ВНУТРИ одного экрана не копят историю браузера. Жалоба владельца 20.09.2026:
+   «захожу в проекты, тыкаю на проект, жму назад — показывает, что я на вкладке каналов».
+   Каждый клик по вкладке был отдельным шагом истории, «назад» отыгрывал их по одному и
+   доходил до адреса без хеша — а это умолчание ROUTES, то есть «Каналы». Адрес вкладки
+   остаётся честной ссылкой (её можно скопировать, открыть в новой вкладке, прислать),
+   но обычный клик ЗАМЕНЯЕТ текущий шаг, и «назад» возвращает туда, откуда пришли. */
+function tabsNoHistory(box){
+  box.querySelectorAll('a[href^="#/"]').forEach(a => a.onclick = ev => {
+    // Ctrl/Cmd/Shift/Alt и средняя кнопка — просьба открыть отдельно; не перехватываем.
+    if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.altKey || ev.button) return;
+    ev.preventDefault();
+    // `location.replace`, а не `history.replaceState`: он сам шлёт `hashchange`, и экран
+    // перерисовывает тот же роутер, что и при обычном переходе, — второй точки входа в
+    // отрисовку не появляется.
+    location.replace(a.getAttribute('href'));
+  });
+}
+
 /* ───────────────────────── экран проекта целиком ───────────────────────── */
 async function viewProject(id){
   clearAllLogTimers();
@@ -3338,7 +3505,7 @@ async function viewProject(id){
   const wantTab = location.hash.split('/')[3] || '';
   const tab = PROJECT_TABS.some(([k]) => k === wantTab) ? wantTab : 'scenario';
   app.innerHTML = '';
-  app.append($(`<a class="back" href="#/projects">‹ Все проекты</a>
+  app.append($(`<a class="back" href="#/projects">← ко всем проектам</a>
     <div class="head">
       <div><h1 id="pname" title="Нажмите, чтобы переименовать"
              style="cursor:text">${esc(p.name)}</h1>
@@ -3382,7 +3549,6 @@ async function viewProject(id){
   const runBox = $(`<div class="card" style="margin-bottom:16px;display:none">
     <div class="sec">Сделать всё</div>
     <div class="secbody">
-    <div id="rerr"></div>
     <div style="display:flex;gap:12px;flex-wrap:wrap">
       <div><label class="k" style="display:block;margin-bottom:4px">Предложений на кадр</label>
         <input id="r-spp" placeholder="как в проекте" style="width:110px"></div>
@@ -3402,20 +3568,20 @@ async function viewProject(id){
   app.querySelector('#runall').onclick = () => {
     runBox.style.display = (runBox.style.display === 'none') ? '' : 'none';
   };
-  const rerr = runBox.querySelector('#rerr');
   runBox.querySelector('#rgo').onclick = async () => {
     const btn = runBox.querySelector('#rgo');
-    rerr.innerHTML = ''; btn.disabled = true;
+    btn.disabled = true;
     try{
       const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/run`, {
         sentences_per_prompt: runBox.querySelector('#r-spp').value,
         model: runBox.querySelector('#r-model').value,
         engine: runBox.querySelector('#r-engine').value,
         quality: runBox.querySelector('#r-quality').value});
-      rerr.innerHTML = `<div class="note ${out.enqueued ? 'muted' : 'bad'}">поставлено: ${
-        out.enqueued}${out.deferred ? `, отложено: ${out.deferred}` : ''}${
-        out.skipped ? `, пропущено (уже идёт): ${out.skipped}` : ''}${
-        out.block_reason ? ' — ' + esc(out.block_reason) : ''}</div>`;
+      // Тот же отчёт, что и у пакетной кнопки: ответ один и тот же, и объяснять его
+      // двумя разными способами значит однажды разойтись. Врезки под формой здесь
+      // быть не может — через 1,2 с экран перерисовывается и уносит её с собой.
+      pipelineReport(out, 1,
+                     'На экране проекта это вкладки «Сценарий» и «Обложка».');
       setTimeout(() => viewProject(p.id), 1200);
     }catch(e){ toast(e.message); }
     finally{ btn.disabled = false; }
@@ -3447,13 +3613,15 @@ async function viewProject(id){
   }
 
   // Вкладки — адрес вида #/project/{pid}/{tab}, никакой отдельной «Настройки».
-  app.append($(`<div class="subtabs">${PROJECT_TABS.map(([k, title]) => {
+  const tabsBox = $(`<div class="subtabs">${PROJECT_TABS.map(([k, title]) => {
     const codes = TAB_FILES[k] || [];
     const n = d.files.filter(g => codes.includes(g.code)).reduce((a, g) => a + g.count, 0);
     return `<a href="#/project/${encodeURIComponent(id)}/${k}"
       class="${tab === k ? 'on' : ''}">${esc(title)}${
         n ? ` <span class="muted">${n}</span>` : ''}</a>`;
-  }).join('')}</div>`));
+  }).join('')}</div>`);
+  app.append(tabsBox);
+  tabsNoHistory(tabsBox);
 
   if (tab === 'scenario') await renderScenarioTab(d);
   else if (tab === 'cover') await renderCoverTab(d);
@@ -4273,7 +4441,7 @@ function modal(title, bodyHtml, opts){
     <div class="sec">${esc(title)}<button class="x" title="Закрыть">×</button></div>
     <div class="mbody">${bodyHtml}</div>
     <div class="mfoot"><button class="m-ok">${esc(o.ok || 'Сохранить')}</button>
-      <button class="ghost m-no">Отмена</button>
+      <button class="ghost m-no">${esc(o.no || 'Отмена')}</button>
       <span class="note bad m-err" style="margin:0"></span></div>
   </dialog>`).firstElementChild;
   document.body.append(dlg);
@@ -4299,6 +4467,25 @@ function modal(title, bodyHtml, opts){
   return {el: dlg, body: dlg.querySelector('.mbody'), close};
 }
 
+/* Вопрос про необратимое — окном, а не врезкой в строке. `confirmInline` раздвигает ту
+   строку, в которой нажали: в таблице очереди от этого уезжала вся таблица (жалоба
+   владельца 20.09.2026). Окно ничего не двигает, закрывается Esc и кликом по фону.
+   Это по-прежнему НЕ браузерный `confirm` — тот останавливает страницу целиком. */
+function confirmModal(title, question, onOk){
+  const m = modal(title, `<div style="font-size:14px">${esc(question)}</div>`,
+    {ok: 'Да', no: 'Нет', onOk: async (_body, close) => {
+      // Закрываем ДО действия: ответ «да» уже получен, а ход работы показывает тот
+      // экран, к которому она относится, — строка, тост, перерисовка списка.
+      close();
+      await onOk();
+    }});
+  // Полей в вопросе нет, поэтому фокус сам уходит на крестик закрытия — и Enter
+  // попадает по нему вслепую. Ставим фокус на «Нет»: у необратимого действия по
+  // умолчанию должен быть выбран безопасный ответ.
+  m.el.querySelector('.m-no').focus();
+  return m;
+}
+
 function confirmInline(btn, text, onOk){
   const box = inlineBox(btn);
   box.innerHTML = `<span class="muted">${esc(text)}</span>
@@ -4319,22 +4506,37 @@ async function viewProfile(){
   app.append($(`<h1>Профиль</h1>
     <p class="sub">${esc(me.name || '')}${me.role ? ' · ' + esc(me.role) : ''}</p>`));
 
-  app.append($(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Ключи провайдеров
-      <a class="mklink" href="#/keys">открыть →</a></div>
-    <div class="note muted secbody">Ключи принадлежат человеку, а не системе: свой ключ
-      тратит свои деньги, серверный — деньги владельца.</div></div>`));
-
-  app.append($(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Система</div>
-    <div class="note muted secbody">
-      <a href="#/admin">Состояние: тревоги, диск, публикации</a> ·
-      <a href="#/limits">Серверные лимиты</a></div></div>`));
+  // Ключи работают ЗДЕСЬ, а не «где-то ещё» (владелец 20.09.2026): та же карточка, что
+  // на #/keys, с той же кнопкой «Добавить ключ». Сам экран #/keys остался живым адресом
+  // — на нём очередь провайдеров, отдыхающие ключи и FastGen; туда ведёт ссылка в
+  // заголовке карточки, и чужие закладки не ломаются.
+  try{
+    app.append(ownKeysCard(await api('/ui/keys'), {
+      title: 'Ключи провайдеров', more: true,
+      note: 'Ключи принадлежат человеку, а не системе: свой ключ тратит свои деньги, '
+          + 'серверный — деньги владельца.'}));
+  }catch(e){
+    // Истёкшая сессия — дело роутера, он покажет вход; всё остальное не повод терять
+    // весь профиль: люди и система человеку всё равно нужны, а про ключи скажем прямо.
+    if (e instanceof NeedLogin) throw e;
+    app.append($(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">Ключи провайдеров<a class="mklink" href="#/keys">открыть →</a></div>
+      <div class="secbody"><div class="note bad">Состояние ключей прочитать не удалось:
+        ${esc(e.message)}. Денег это не стоило — карточка только читает.</div></div></div>`));
+  }
 
   // Раздел людей появляется только у администратора: проверка стоит на сервере,
   // а не на прятании кнопки — запрос может прислать кто угодно.
   const people = await accountsCard();
   if (people) app.append(people);
+
+  // «Система» — только ссылки: тревоги, диск и лимиты не место для действий. Внизу,
+  // потому что это переход в другой экран, а не работа на этом.
+  app.append($(`<div class="card" style="margin-top:16px">
+    <div class="sec">Система</div>
+    <div class="note muted secbody">
+      <a href="#/admin">Состояние: тревоги, диск, публикации</a> ·
+      <a href="#/limits">Серверные лимиты</a></div></div>`));
 }
 
 /* ─────────────────────────── серверные лимиты ─────────────────────────── */
@@ -4342,7 +4544,8 @@ async function viewProfile(){
 async function viewLimits(){
   const d = await api('/ui/limits');
   app.innerHTML = '';
-  app.append($(`<h1>Серверные лимиты</h1><p class="sub">${esc(d.note)}</p>`));
+  app.append($(`<a class="back" href="#/profile">← в профиль</a>
+    <h1>Серверные лимиты</h1><p class="sub">${esc(d.note)}</p>`));
   if (!d.rows.length){
     app.append($(`<div class="card"><div class="empty">Лимиты не заданы —
       действуют значения из кода.</div></div>`));
@@ -5556,22 +5759,13 @@ async function accountsCard(){
       </td>
     </tr>`).join('')}</tbody></table>
 
-    <div class="sec" style="border-bottom:0">Завести человека</div>
     <div class="secbody">
     <div id="uerr"></div>
-    <div class="fldrow"><label>Логин</label>
-      <input id="n-login" style="width:200px" autocomplete="off">
-      <label style="min-width:auto">Пароль</label>
-      <input id="n-pw" type="password" style="width:200px" autocomplete="new-password">
-    </div>
-    <div class="fldrow"><label>Роль и квота</label>
-      <select id="n-role">${d.roles.map(r =>
-        `<option value="${esc(r.key)}">${esc(r.title)}</option>`).join('')}</select>
-      <input id="n-quota" placeholder="без лимита" style="width:120px">
-      <button id="n-go">Завести</button>
-    </div>
     <div class="note muted">${esc(d.note)}. Заводить его в Rewrite и Cover не нужно —
       они узнают человека по этому же входу.</div>
+    </div>
+    <div class="secbody" style="padding-top:0">
+      <button class="ghost" id="n-go">Завести человека</button>
     </div>
   </div>`);
 
@@ -5582,11 +5776,31 @@ async function accountsCard(){
     catch(e){ err.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
   };
 
-  card.querySelector('#n-go').onclick = () => act(() => post('/ui/accounts', {
-    login: card.querySelector('#n-login').value,
-    password: card.querySelector('#n-pw').value,
-    role: card.querySelector('#n-role').value,
-    quota: card.querySelector('#n-quota').value}));
+  // Форма нового человека — в окне, как форма ключа (18.09.2026). Теперь оба раздела
+  // профиля устроены одинаково: список, одна кнопка, окно с формой — это и есть
+  // «более нативно» из жалобы владельца 20.09.2026. Заодно экран не растёт в простыню:
+  // постоянно раскрытой формы на нём больше нет.
+  card.querySelector('#n-go').onclick = () => modal('Завести человека', `
+    <div class="fldrow"><label>Логин</label>
+      <input id="n-login" style="width:200px" autocomplete="off"></div>
+    <div class="fldrow"><label>Пароль</label>
+      <input id="n-pw" type="password" style="width:200px" autocomplete="new-password"></div>
+    <div class="fldrow"><label>Роль и квота</label>
+      <select id="n-role">${d.roles.map(r =>
+        `<option value="${esc(r.key)}">${esc(r.title)}</option>`).join('')}</select>
+      <input id="n-quota" placeholder="без лимита" style="width:120px"></div>`,
+    // Отказ сервера (занятый логин, слабый пароль) показывает само окно: `modal` ловит
+    // исключение из onOk и пишет его в подвал, а окно остаётся открытым. Введённое не
+    // пропадает, и поправить можно там же, где ошиблись.
+    {ok: 'Завести', onOk: async (box, close) => {
+      await post('/ui/accounts', {
+        login: box.querySelector('#n-login').value,
+        password: box.querySelector('#n-pw').value,
+        role: box.querySelector('#n-role').value,
+        quota: box.querySelector('#n-quota').value});
+      close();
+      await render();
+    }});
 
   card.querySelectorAll('button.ublock').forEach(b => b.onclick = () => {
     const off = b.dataset.to === '1';
@@ -5711,7 +5925,8 @@ async function viewAdmin(){
                                             api('/ui/subs-exits').catch(
                                               e => ({read_error: e.message}))]);
   app.innerHTML = '';
-  app.append($(`<h1>Админ</h1>
+  app.append($(`<a class="back" href="#/profile">← в профиль</a>
+    <h1>Админ</h1>
     <p class="sub">Состояние системы: что мешает работе и сколько осталось места.
       <a href="#/limits" style="margin-left:8px">Серверные лимиты →</a></p>`));
 
@@ -5927,8 +6142,13 @@ async function render(){
   const hit = ROUTES.find(r => r[1](h));
   // Экранов больше, чем вкладок: «Выпуски», «Текст», «Обложки» и «Админ» живут внутри
   // каналов, проектов и профиля. Подсвечиваем ту вкладку, в чей раздел попал маршрут.
-  for (const id of ['channels', 'projects', 'queue', 'presets', 'profile'])
-    document.getElementById('tab-' + id).classList.toggle('on', hit[0] === id);
+  // «Профиль» среди них — это имя человека справа: отдельной вкладки у него больше
+  // нет, id висит на ссылке, которую рисует showWho(). На экране входа имени нет, и
+  // слепое обращение к нему уронило бы весь роутер — поэтому проверяем.
+  for (const id of ['channels', 'projects', 'queue', 'presets', 'profile']){
+    const tab = document.getElementById('tab-' + id);
+    if (tab) tab.classList.toggle('on', hit[0] === id);
+  }
   try{ await hit[2](h); }
   catch(e){
     // Сессия могла истечь посреди работы: это не ошибка экрана, а «войдите снова».
