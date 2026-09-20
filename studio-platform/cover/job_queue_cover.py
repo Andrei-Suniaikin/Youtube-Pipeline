@@ -9,6 +9,7 @@ import json
 import uuid
 import time
 import sqlite3
+from contextlib import closing
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, asdict, fields as dc_fields
@@ -143,7 +144,7 @@ class JobQueue:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             # v1.3.0: WAL + busy_timeout — иначе под нагрузкой (много юзеров + 20 sub-потоков)
             # ловим 'database is locked'. WAL персистентен на файле, busy_timeout — на коннект.
             try:
@@ -363,7 +364,7 @@ class JobQueue:
         return job.id
 
     def get_pending_providers(self) -> List[str]:
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             rows = conn.execute(
                 """
                 SELECT provider, MIN(created_at) AS oldest
@@ -383,7 +384,7 @@ class JobQueue:
         намеренно НЕ читается (чтение JSON превращает индексный скан в row lookup).
         Покрывается idx_jobs_provider_sched.
         """
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             rows = conn.execute(
                 """
                 SELECT status, COALESCE(user_id, ''), COALESCE(cancel_requested, 0)
@@ -417,7 +418,7 @@ class JobQueue:
                 + ")"
             )
             params.extend(provider_list)
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             rows = conn.execute(
                 f"""
                 SELECT user_id, MIN(created_at) AS oldest
@@ -435,7 +436,7 @@ class JobQueue:
         return self.count_pending_for_user(user_id) > 0
 
     def count_pending_for_user(self, user_id: str) -> int:
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             row = conn.execute(
                 """
                 SELECT COUNT(*) FROM jobs
@@ -447,7 +448,7 @@ class JobQueue:
 
     def count_reserved_for_user(self, user_id: str) -> int:
         """Pending + resetting jobs that already own a queue slot."""
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             return self._reserved_count(conn, user_id)
 
     def claim_next_for_user(
@@ -628,12 +629,12 @@ class JobQueue:
             conn.close()
 
     def get_job(self, job_id: str) -> Optional[Job]:
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             row = conn.execute("SELECT data FROM jobs WHERE id = ?", (job_id,)).fetchone()
         return _job_from_data(json.loads(row[0])) if row else None
 
     def get_all_jobs(self) -> List[Job]:
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             rows = conn.execute("SELECT data FROM jobs ORDER BY created_at DESC").fetchall()
         return [_job_from_data(json.loads(r[0])) for r in rows]
 
@@ -693,7 +694,7 @@ class JobQueue:
 
     def is_cancelled(self, job_id: str) -> bool:
         """Persistent cancel-check: переживает restart процесса."""
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             row = conn.execute(
                 "SELECT cancel_requested, status FROM jobs WHERE id = ?",
                 (job_id,),
@@ -708,7 +709,7 @@ class JobQueue:
 
     def should_stop_run(self, job_id: str, run_token: str) -> bool:
         """Cancel-aware lease check for waits and provider polling."""
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             row = conn.execute(
                 """
                 SELECT status, cancel_requested, run_token
@@ -813,7 +814,7 @@ class JobQueue:
 
     def delete_job(self, job_id: str):
         """Удалить задание из очереди (любой статус)."""
-        with sqlite3.connect(self.db_path, timeout=30) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as conn, conn:
             conn.execute("DELETE FROM jobs WHERE id = ?", (job_id,))
 
 

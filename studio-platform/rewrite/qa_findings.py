@@ -16,6 +16,7 @@ import json
 import os
 import re
 import sqlite3
+from contextlib import closing
 import sys
 import time
 from typing import Dict, List, Optional
@@ -58,7 +59,7 @@ def record(job_id: str, source: str, ftype: str, severity: str = "info",
     if ftype not in _QUOTELESS_OK and not (quote or "").strip():
         return False
     try:
-        with _conn(db_path) as c:
+        with closing(_conn(db_path)) as c, c:
             c.execute(
                 "INSERT INTO qa_findings (job_id, created_at, source, ftype, severity,"
                 " quote, pos_pct, data) VALUES (?,?,?,?,?,?,?,?)",
@@ -193,7 +194,7 @@ def aggregate(days: float = 7.0, db_path: Optional[str] = None) -> str:
     since = time.time() - days * 86400
     lines = [f"=== QA-агрегат за {days:g} дн. ==="]
     try:
-        with _conn(db_path) as c:
+        with closing(_conn(db_path)) as c, c:
             jobs = c.execute("SELECT COUNT(DISTINCT job_id) FROM qa_findings WHERE created_at>?",
                              (since,)).fetchone()[0]
             lines.append(f"джоб с находками: {jobs}")

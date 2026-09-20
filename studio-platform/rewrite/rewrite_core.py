@@ -30,7 +30,7 @@ import random
 import unicodedata
 import urllib.request
 import urllib.error
-from contextlib import contextmanager, nullcontext
+from contextlib import closing, contextmanager, nullcontext
 from functools import wraps
 
 try:
@@ -1897,7 +1897,7 @@ def _prime_byok_from_db(db_path: str) -> bool:
     удалось (тогда повторять не нужно).
     """
     try:
-        with sqlite3.connect(db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(db_path, timeout=5.0)) as conn, conn:
             has_codex = _user_keys_has_column(conn, "codex_auth")
             columns = "user_id, anthropic_api_key, openai_api_key, oauth_tokens"
             if has_codex:
@@ -1985,7 +1985,7 @@ def get_keys_config(user_id: str = "", strict: bool = False) -> Dict:
     }
     store_readable = False
     try:
-        with sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0) as conn:
+        with closing(sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0)) as conn, conn:
             row = conn.execute(
                 """
                 SELECT anthropic_api_key, openai_api_key, oauth_tokens,
@@ -2046,7 +2046,7 @@ def get_keys_config(user_id: str = "", strict: bool = False) -> Dict:
     # все остальные BYOK-ключи молча превратились бы в дефолты (=перестали бы
     # работать). Здесь же отсутствие колонки просто даёт "".
     try:
-        with sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0) as conn:
+        with closing(sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0)) as conn, conn:
             if _user_keys_has_column(conn, "credential_mode"):
                 mode = conn.execute("SELECT credential_mode FROM user_keys WHERE user_id=?", (uid,)).fetchone()
                 if mode:
@@ -2206,7 +2206,7 @@ def save_keys_config(
       if gen_settings_presets is not None:
         data["gen_settings_presets"] = gen_settings_presets if isinstance(gen_settings_presets, dict) else {}
       try:
-        with sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0) as conn:
+        with closing(sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0)) as conn, conn:
             # FIX-2026-07-30 (P0-review добор): колонка проверяется ДО основного
             # UPSERT. Раньше `return False` при провале ALTER стоял ПОСЛЕ него и
             # внутри `with sqlite3.connect(...)`: выход из контекста коммитил
@@ -8813,7 +8813,7 @@ def _persist_refreshed_codex_auth(leased_codex_home: str, source_path: str) -> N
                 saved_payload = json.dumps(docs[match], ensure_ascii=False, sort_keys=True)
             else:
                 updated = saved_payload = refreshed
-            with sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0) as conn:
+            with closing(sqlite3.connect(SESSIONS_DB_PATH, timeout=5.0)) as conn, conn:
                 cur = conn.execute("UPDATE user_keys SET codex_auth=?,updated_at=? WHERE user_id=? AND codex_auth=?",
                                    (updated, time.time(), owner, current_raw))
                 if cur.rowcount != 1:

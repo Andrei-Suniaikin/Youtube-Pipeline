@@ -10,6 +10,7 @@ import json
 import time
 import uuid
 import sqlite3
+from contextlib import closing
 import hashlib
 import hmac
 import threading
@@ -46,7 +47,7 @@ class LicenseManager:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
             # M4 PATCH-2026-06-25-secfix: WAL — sessions.db пишется из auth (на каждый запрос)
             # + воркер-потоков; без WAL/busy_timeout под конкуренцией ловили 'database is locked'.
             conn.execute("PRAGMA journal_mode=WAL")
@@ -101,7 +102,7 @@ class LicenseManager:
             self._last_cleanup = now
         cutoff = now - SESSION_TIMEOUT
         try:
-            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+            with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
                 conn.execute("DELETE FROM sessions WHERE last_ping < ?", (cutoff,))
         except sqlite3.OperationalError as exc:
             # Уборка служебная: занятая база (locked/busy) не должна ронять запрос пользователя.
@@ -112,7 +113,7 @@ class LicenseManager:
         НЕ берёт self._lock (зовётся под ним). Лимита сессий нет — у каждого свой логин."""
         session_id = str(uuid.uuid4())
         now = time.time()
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
             conn.execute(
                 "INSERT INTO sessions (session_id, license_key, user_name, ip, created_at, last_ping, user_id) "
                 "VALUES (?, '', ?, ?, ?, ?, ?)",
@@ -144,7 +145,7 @@ class LicenseManager:
 
     def has_users(self) -> bool:
         """Есть ли хоть один аккаунт (для gating setup-экрана первичной настройки)."""
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
             return conn.execute("SELECT 1 FROM users LIMIT 1").fetchone() is not None
 
     def _insert_user(self, conn, username: str, password: str, user_id: str, user_name: str):
@@ -168,7 +169,7 @@ class LicenseManager:
             if self.has_users():
                 return (False, "Первичная настройка уже выполнена", "")
             user_name = "Админ"
-            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+            with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
                 self._insert_user(conn, username, password, ADMIN_USER_ID, user_name)
             return (True, self._create_session(ADMIN_USER_ID, user_name, ip), user_name)
 
@@ -179,7 +180,7 @@ class LicenseManager:
             return (False, err)
         display = (user_name or "").strip() or username
         with self._lock:
-            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+            with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
                 if conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone():
                     return (False, "Логин уже занят")
                 new_uid = os.urandom(6).hex()  # 12 hex — свой тенант (чистый профиль)
@@ -187,7 +188,7 @@ class LicenseManager:
         return (True, "")
 
     def list_accounts(self) -> list:
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
             rows = conn.execute(
                 "SELECT username, user_name, user_id, created_at, status, disabled_at "
                 "FROM users ORDER BY created_at"
@@ -198,7 +199,7 @@ class LicenseManager:
 
     def is_user_active(self, user_id: str) -> bool:
         """Cheap worker-side recheck immediately before provider execution."""
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
             return (
                 conn.execute(
                     "SELECT 1 FROM users WHERE user_id=? AND status='active'",
@@ -418,7 +419,7 @@ class LicenseManager:
         self, jobs_db_path: Optional[str] = None
     ) -> int:
         """Resume fenced offboarding transactions after an interrupted startup."""
-        with sqlite3.connect(self.db_path, timeout=15.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=15.0)) as conn, conn:
             usernames = [
                 row[0]
                 for row in conn.execute(
@@ -445,7 +446,7 @@ class LicenseManager:
         if not username or not password:
             return (False, "Введите логин и пароль", "")
         with self._lock:
-            with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+            with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
                 row = conn.execute(
                     "SELECT password_hash, salt, user_id, user_name, status "
                     "FROM users WHERE username = ?",
@@ -463,7 +464,7 @@ class LicenseManager:
 
     def ping(self, session_id: str) -> bool:
         now = time.time()
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
             result = conn.execute(
                 "UPDATE sessions SET last_ping = ? "
                 "WHERE session_id = ? AND EXISTS ("
@@ -474,7 +475,7 @@ class LicenseManager:
             return result.rowcount > 0
 
     def logout(self, session_id: str):
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
 
     def validate(self, session_id: str) -> Optional[Dict]:
@@ -485,7 +486,7 @@ class LicenseManager:
         вкладках) → активный юзер вылетал через 10 мин."""
         self._cleanup_expired()
         now = time.time()
-        with sqlite3.connect(self.db_path, timeout=5.0) as conn:
+        with closing(sqlite3.connect(self.db_path, timeout=5.0)) as conn, conn:
             # FIX-2026-09-13: уборка теперь редкая — просроченную сессию отсекаем здесь же,
             # иначе до ближайшей уборки она бы проходила и «оживала» через last_ping.
             row = conn.execute(

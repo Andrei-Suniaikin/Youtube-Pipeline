@@ -11,6 +11,7 @@ Plain key format: rws_live_<32 url-safe random chars>  (≈190 bits entropy)
 import hashlib
 import secrets
 import sqlite3
+from contextlib import closing
 import threading
 import time
 from typing import Dict, List, Optional, Tuple
@@ -64,7 +65,7 @@ def create_api_key(sessions_db: str, user_id: str, license_key: str, name: str) 
         raise HTTPException(status_code=422, detail="name is required")
     name = name.strip()[:64]
 
-    with sqlite3.connect(sessions_db) as conn:
+    with closing(sqlite3.connect(sessions_db)) as conn, conn:
         active_user = conn.execute(
             "SELECT 1 FROM users WHERE user_id=? AND status='active'",
             (user_id,),
@@ -113,7 +114,7 @@ def create_api_key(sessions_db: str, user_id: str, license_key: str, name: str) 
 
 def list_api_keys(sessions_db: str, user_id: str) -> List[Dict]:
     """Список ВСЕХ (active + revoked) ключей user'а. Plain key НЕ возвращается."""
-    with sqlite3.connect(sessions_db) as conn:
+    with closing(sqlite3.connect(sessions_db)) as conn, conn:
         rows = conn.execute(
             "SELECT key_id, name, prefix, created_at, last_used_at, status "
             "FROM api_keys WHERE user_id=? ORDER BY created_at DESC",
@@ -134,7 +135,7 @@ def list_api_keys(sessions_db: str, user_id: str) -> List[Dict]:
 
 def revoke_api_key(sessions_db: str, key_id: str, user_id: str) -> bool:
     """Помечает ключ status='revoked' (НЕ DELETE, для аудита). Returns True если был active."""
-    with sqlite3.connect(sessions_db) as conn:
+    with closing(sqlite3.connect(sessions_db)) as conn, conn:
         cur = conn.execute(
             "UPDATE api_keys SET status='revoked' WHERE key_id=? AND user_id=? AND status='active'",
             (key_id, user_id)
@@ -197,7 +198,7 @@ def get_api_user(
     if raw:
         key_hash = _sha256(raw)
         now = time.time()
-        with sqlite3.connect(_ApiAuthState.sessions_db, timeout=SESSIONS_DB_TIMEOUT_SEC) as conn:
+        with closing(sqlite3.connect(_ApiAuthState.sessions_db, timeout=SESSIONS_DB_TIMEOUT_SEC)) as conn, conn:
             row = conn.execute(
                 "SELECT k.key_id, k.user_id, k.license_key, k.status, k.name, "
                 "       COALESCE(u.status, 'disabled') "

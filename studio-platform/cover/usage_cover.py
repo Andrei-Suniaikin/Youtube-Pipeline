@@ -15,6 +15,7 @@ usage_cover.py — учёт расхода обложек per-user (v1.2.0, Фа
 
 import time
 import sqlite3
+from contextlib import closing
 import threading
 from typing import Optional
 
@@ -26,7 +27,7 @@ class UsageTracker:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path, timeout=30) as c:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as c, c:
             c.execute("""
                 CREATE TABLE IF NOT EXISTS usage (
                     user_id    TEXT NOT NULL,
@@ -46,7 +47,7 @@ class UsageTracker:
         return time.strftime("%Y-%m-%d", time.gmtime())
 
     def used_today(self, user_id: str, key_source: str = "server") -> int:
-        with sqlite3.connect(self.db_path, timeout=30) as c:
+        with closing(sqlite3.connect(self.db_path, timeout=30)) as c, c:
             row = c.execute(
                 "SELECT covers FROM usage WHERE user_id=? AND day=? AND key_source=?",
                 (user_id, self._today(), key_source),
@@ -58,7 +59,7 @@ class UsageTracker:
         if covers <= 0 and credits <= 0:
             return
         with self._lock:
-            with sqlite3.connect(self.db_path, timeout=30) as c:
+            with closing(sqlite3.connect(self.db_path, timeout=30)) as c, c:
                 c.execute("""
                     INSERT INTO usage (user_id, day, key_source, covers, credits, updated_at)
                     VALUES (?, ?, ?, ?, ?, ?)
