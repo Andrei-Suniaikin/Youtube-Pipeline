@@ -284,6 +284,43 @@ R["refresh_pool_only_snapshot"] = json.loads(row9[0]) if row9 else None
 R["refresh_pool_only_header"] = network_calls[0][1] if network_calls else None
 c.close()
 
+# §11 (21.09.2026) — провайдер ОТВЕТИЛ и ключ не принял. До этой правки 401 и обрыв
+# связи обрабатывались одинаково: снимок просто не обновлялся, и мёртвый ключ выглядел
+# ровно как отсутствие интернета. Отличает их наличие `response` у исключения.
+class FakeHTTPError(Exception):
+    def __init__(self, code):
+        super().__init__(f"HTTP {code}")
+        self.response = type("Resp", (), {"status_code": code})()
+
+
+def fake_get_401(url, headers=None, timeout=None):
+    network_calls.append((url, dict(headers or {})))
+    raise FakeHTTPError(401)
+
+
+write_keys({"googler": "fg_live_test_key"})
+A_dev.requests.get = fake_get_401
+c = main.db()
+c.execute("DELETE FROM admin_state WHERE k IN ('fastgen_usage','fastgen_key_refused')")
+c.commit()
+A_dev.refresh_fastgen_usage(c, NOW1 + 900)
+row10 = c.execute("SELECT v FROM admin_state WHERE k='fastgen_key_refused'").fetchone()
+R["refused_after_one"] = json.loads(row10[0]) if row10 else None
+A_dev.refresh_fastgen_usage(c, NOW1 + 960)
+row11 = c.execute("SELECT v FROM admin_state WHERE k='fastgen_key_refused'").fetchone()
+R["refused_after_two"] = json.loads(row11[0]) if row11 else None
+# Обрыв связи заявку не заводит и не трогает: ответа провайдера не было вовсе.
+A_dev.requests.get = fake_get_fail
+A_dev.refresh_fastgen_usage(c, NOW1 + 1020)
+row12 = c.execute("SELECT v FROM admin_state WHERE k='fastgen_key_refused'").fetchone()
+R["refused_after_outage"] = json.loads(row12[0]) if row12 else None
+# Принятый запрос — единственное доказательство того, что ключ заменили.
+A_dev.requests.get = fake_get_ok
+A_dev.refresh_fastgen_usage(c, NOW1 + 1080)
+row13 = c.execute("SELECT v FROM admin_state WHERE k='fastgen_key_refused'").fetchone()
+R["refused_after_success"] = json.loads(row13[0]) if row13 else None
+c.close()
+
 print(json.dumps(R, ensure_ascii=False))
 """
 
@@ -422,19 +459,34 @@ def main() -> int:
     check("и заголовок ушёл с ключом из пула",
           r["refresh_pool_only_header"].get("X-API-Key"), "fg_pool_only_key")
 
+    print("\n  §11 — отказ провайдера отличается от обрыва связи (21.09.2026)")
+    check("первый 401 записан заявкой",
+          ((r["refused_after_one"] or {}).get("googler") or {}).get("seen"), 1)
+    check("второй отказ подряд — подтверждение, вот теперь это повод",
+          ((r["refused_after_two"] or {}).get("googler") or {}).get("seen"), 2)
+    check("код ответа сохранён — в тревоге будет видно, что сказал провайдер",
+          ((r["refused_after_two"] or {}).get("googler") or {}).get("code"), 401)
+    check("в заявке маска, а не значение ключа",
+          "fg_live_test_key" in json.dumps(r["refused_after_two"], ensure_ascii=False),
+          False)
+    check("обрыв связи заявку не трогает — ответа провайдера не было",
+          ((r["refused_after_outage"] or {}).get("googler") or {}).get("seen"), 2)
+    check("провайдер принял ключ — заявка снята, тревога погаснет",
+          r["refused_after_success"], {})
+
     print("\nШапка модуля и строка «ни один из N поводов» обновлены (пункт §3.2)")
     pub_alerts_src = open(os.path.join(BASE, "server", "pub_alerts.py"), encoding="utf-8").read()
-    check("докстрока pub_alerts.py говорит про десять поводов",
-          "десять поводов" in pub_alerts_src, True)
+    check("докстрока pub_alerts.py говорит про одиннадцать поводов",
+          "одиннадцать поводов" in pub_alerts_src, True)
     dev_alerts_src = open(os.path.join(BASE, "dev", "alerts.py"), encoding="utf-8").read()
-    check("dev/alerts.py:show() считает десять поводов",
-          "ни один из десяти поводов" in dev_alerts_src, True)
+    check("dev/alerts.py:show() считает одиннадцать поводов",
+          "ни один из одиннадцати поводов" in dev_alerts_src, True)
     index_html_src = open(os.path.join(BASE, "web", "index.html"), encoding="utf-8").read()
-    check("web/index.html:viewAdmin() тоже про десять поводов",
-          "Ни один из десяти поводов не выполнен." in index_html_src, True)
+    check("web/index.html:viewAdmin() тоже про одиннадцать поводов",
+          "Ни один из одиннадцати поводов не выполнен." in index_html_src, True)
     test_alerts_src = open(os.path.join(BASE, "tests", "test_alerts.py"), encoding="utf-8").read()
     check("докстрока tests/test_alerts.py тоже обновлена",
-          "десять поводов" in test_alerts_src, True)
+          "одиннадцать поводов" in test_alerts_src, True)
 
     print("\nReview issue 2 — экран ключей не подставляет 0 вместо неизвестного расхода")
     check("images_used больше не подставляет 0 по умолчанию",

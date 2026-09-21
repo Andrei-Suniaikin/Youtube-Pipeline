@@ -58,6 +58,11 @@ def refresh_fastgen_usage(c, now) -> None:
     никто не заходит. Сбой сети не роняет проход: снимок просто не обновится, а
     правило «устаревший снимок не повод» не даст соврать по старым цифрам.
 
+    Здесь же — единственное место, где слышно ОТКАЗ провайдера по ключу: §11
+    (`pub_alerts.check_key_dead`) сам в сеть не ходит и читает то, что запишет
+    `note_key_refused`. Запрос бесплатный (чтение статистики, 0 кредитов): проверять
+    ключ генерацией нельзя — один кадр FastGen стоит денег.
+
     Ключ читается через `main.keys()` + `main._first_credential(..., "googler")` —
     ТОЧНО тот же разбор, что и в кабинете (скаляр, список, `googler_pool`; путь —
     `main.KEYS_PATH`, тот же `VS_SERVER_KEYS_PATH`). До review issue 3 здесь был свой
@@ -82,8 +87,21 @@ def refresh_fastgen_usage(c, now) -> None:
         r = requests.get(_FG_USAGE_URL, headers={"X-API-Key": key}, timeout=15)
         r.raise_for_status()
         usage = r.json()
-    except Exception:
-        return          # сеть недоступна — снимок просто не обновится
+    except Exception as exc:
+        # Ответ провайдера и отсутствие ответа — разные события, а до 21.09.2026 они
+        # обрабатывались одинаково: и «401, ключ не принят», и «нет интернета» просто
+        # не обновляли снимок, и мёртвый ключ выглядел как обрыв связи. Отличает их
+        # ровно один признак: у HTTPError есть `response` с кодом, у обрыва — нет.
+        code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+        if code in A.KEY_REFUSED_CODES:
+            # Ещё не тревога: §11 ждёт второго отказа подряд. Кладём маску, чтобы в
+            # сообщении было видно, о каком ключе речь; значение ключа не сохраняется.
+            A.note_key_refused(c, A.FASTGEN_FAMILY, code, now, mask(key))
+        return
+    # Ключ принят — снимаем заявку на отказ, если она была. Принятый запрос и есть
+    # единственное доказательство того, что ключ заменили: по нему §11 гаснет и уходит
+    # «ПОЧИНИЛОСЬ», а по таймеру «само рассосётся» мы бы обещали то, чего не знаем.
+    A.note_key_accepted(c, A.FASTGEN_FAMILY, now)
     try:
         vsgen.save_fastgen_usage(c, usage, now)
     except Exception:
@@ -106,7 +124,7 @@ def show(c, now):
           f"ожидание {A.OLDEST_SEC // 3600} ч · диск {A.DISK_MIN_GB:.0f} ГБ · "
           f"повтор раз в {A.REPEAT_SEC // 60} мин")
     if not found:
-        print("\nвсё спокойно: ни один из десяти поводов не выполнен")
+        print("\nвсё спокойно: ни один из одиннадцати поводов не выполнен")
     for key, a in sorted(found.items()):
         st = state.get(key) or {}
         said = ("сказано " + time.strftime("%H:%M", time.localtime(st["sent"]))
