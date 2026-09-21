@@ -109,6 +109,48 @@ KEYS
   done
   unset _pair _var _fam _val
 fi
+
+# ─── Чем писать промпты к кадрам (21.09.2026) ────────────────────────────────
+# У счёта OpenAI ноль: провайдер отвечает 429 insufficient_quota / «You have no credits
+# remaining». Повтор при этом не помогает никогда, и весь конвейер встаёт на промптах.
+#
+# Оказалось, что у FastGen — того самого провайдера, за которого уже заплачено и который
+# рисует нам кадры, — есть полноценный OpenAI-совместимый /v1/chat/completions: 28 моделей
+# (GPT-5.x/4.x/o-серия, Grok, Gemini), наш заголовок Authorization: Bearer принимается,
+# ответ приходит штатной chat.completion. Проверено живым вызовом с подставным словом в
+# запросе: модель вернула именно его, то есть это настоящая генерация, а не заглушка.
+# Расход идёт из ОТДЕЛЬНОЙ квоты prompt.tokens.hour (200 000 токенов/час) — кредиты картинок
+# она не трогает.
+#
+# Подключается это существующим каналом altclaude, без единой правки движка. Две тонкости,
+# каждая проверена, а не выведена из названий:
+#   * база ОБЯЗАНА включать /v1: адрес склеивается как base + "/chat/completions" без
+#     нормализации, и без префикса получается 404, который считается фатальным;
+#   * модель ОБЯЗАНА быть в стиле OpenRouter (openai/...). Дефолт канала — claude-sonnet-5,
+#     а моделей Anthropic на этом эндпоинте нет вовсе: любой запрос вернул бы 400.
+# Ключ тот же, что у картинок (семейство googler) — второй копии секрета не заводим.
+# Заданное снаружи не трогаем: VS_PROMPT_PROVIDER=openai вернёт прежнее поведение.
+if [ -f "$VS_SERVER_KEYS_PATH" ] && [ -z "$VS_ALT_LLM_KEY" ]; then
+  _altkey="$("$PY" - "$VS_SERVER_KEYS_PATH" <<'ALTK'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+v = data.get("alt_llm") or data.get("googler") or ""
+if isinstance(v, list):
+    v = v[0] if v else ""
+print(v if isinstance(v, str) else "")
+ALTK
+)"
+  if [ -n "$_altkey" ]; then
+    export VS_ALT_LLM_KEY="$_altkey"
+    export VS_ALT_LLM_BASE="${VS_ALT_LLM_BASE:-https://api.fast-gen.ai/v1}"
+    export VS_ALT_LLM_MODEL="${VS_ALT_LLM_MODEL:-openai/gpt-4.1-mini}"
+    export VS_PROMPT_PROVIDER="${VS_PROMPT_PROVIDER:-altclaude}"
+  fi
+  unset _altkey
+fi
 # ─── Пресеты рерайта: стенд не пишет в репозиторий ───────────────────────────
 # rewrite/server.py держит пресеты тенантов в REWRITE_PRESETS_DIR, а по умолчанию —
 # прямо в рабочем дереве (rewrite/presets/<тенант>/generation.json). Переменную никто

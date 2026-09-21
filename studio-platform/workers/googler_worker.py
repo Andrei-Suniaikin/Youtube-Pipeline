@@ -2447,6 +2447,14 @@ _PLANNING_ARTIFACT_CACHE_VERSION = "v2"  # v2: complete story analysis, no trunc
 # соединений + TLS-хендшейк на каждый вызов (кэш-промахи, медленно). Сессия с
 # pool_maxsize по числу потоков = keep-alive + реальная параллельность.
 GPT_CHAT_TIMEOUT = (5, 60)  # (connect, read) сек для ЧАТ-вызовов GPT — НЕ 200с image-пути
+# 21.09.2026. Альтернативный OpenAI-совместимый канал ходит не в сам OpenAI, а в провайдера
+# поверх сохранённых веб-аккаунтов: даже однословный ответ там идёт ~10-12 с, а план сцен в
+# наши 60 с на чтение не укладывается вовсе — проверено живым вызовом (ReadTimeout).
+# Это ровно та болезнь, из-за которой 03.09 подняли таймауты картинок: наш собственный
+# таймер снимает вызов, который провайдер ЕЩЁ ВЫПОЛНЯЕТ, и оплаченный ответ выбрасывается.
+# Поднимаем ТОЛЬКО для этого канала и только вверх: у openai/codex/claude свои сроки, и
+# заданный вызывающим больший таймаут не урезается.
+ALT_CHAT_READ_TIMEOUT = int(os.environ.get("VS_ALT_CHAT_READ_TIMEOUT") or 240)
 try:
     from requests.adapters import HTTPAdapter as _HTTPAdapter
     _GPT_SESSION = requests.Session()
@@ -2551,6 +2559,13 @@ class _AltResponse:
             raise requests.HTTPError(f"HTTP {self.status_code}")
 
 
+def _alt_timeout(timeout):
+    """Срок чтения для альт-канала: не короче ALT_CHAT_READ_TIMEOUT, но и не короче заданного."""
+    t = timeout or GPT_CHAT_TIMEOUT
+    conn, read = t if isinstance(t, tuple) else (5, t)
+    return (conn, max(read, ALT_CHAT_READ_TIMEOUT))
+
+
 def _llm_post_ungated(url, headers=None, json=None, timeout=None, **kwargs):
     """Транспорт ЧАТ-вызовов (написание промптов). Сигнатура = requests.post, чтобы места вызова
     не переписывались: меняется только канал доставки, payload и разбор ответа те же.
@@ -2602,7 +2617,7 @@ def _llm_post_ungated(url, headers=None, json=None, timeout=None, **kwargs):
             headers={"Authorization": "Bearer " + prompt_llm.alt_key(),
                      "Content-Type": "application/json"},
             json=body,
-            timeout=(timeout or GPT_CHAT_TIMEOUT),
+            timeout=_alt_timeout(timeout),
         )
         return _alt_shape_json(resp) if rf else resp
 
