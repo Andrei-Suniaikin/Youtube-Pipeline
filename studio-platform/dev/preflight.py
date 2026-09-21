@@ -75,12 +75,44 @@ def _get(url, headers=None, timeout=15):
 
 
 def check_certs() -> None:
-    import ssl                                                     # noqa: PLC0415
-    if os.environ.get("SSL_CERT_FILE") or ssl.get_default_verify_paths().cafile:
-        row("сертификаты", OK)
+    """Сможет ли СТЕНД проверять сертификаты — а не эта оболочка.
+
+    Python с python.org не берёт корни из системной связки macOS:
+    `ssl.get_default_verify_paths().cafile` пуст, и голый `urllib` падает с
+    CERTIFICATE_VERIFY_FAILED. Рерайт ходит именно так (`ssl.create_default_context()`,
+    rewrite_core.py:6817), поэтому его вызовы держатся на переменной SSL_CERT_FILE,
+    которую выставляет dev/run.sh из certifi.
+
+    Первая версия этой проверки смотрела на ТЕКУЩЕЕ окружение и, запущенная из обычной
+    оболочки, кричала «НЕ ПОЙДЁТ» сразу после того, как сама успешно сходила по https к
+    трём провайдерам (requests носит certifi с собой и переменной не требует). Проверка,
+    которая пугает на исправной системе, хуже отсутствующей: её перестают читать.
+
+    Поэтому решает наличие связки и экспорта в пускаче, а состояние этой оболочки —
+    лишь примечание.
+    """
+    try:
+        import certifi                                             # noqa: PLC0415
+        bundle = certifi.where()
+        have = os.path.isfile(bundle)
+    except Exception:                                              # noqa: BLE001
+        have = False
+    if not have:
+        row("сертификаты", BAD, "нет связки certifi — стенду будет нечем проверять")
+        return
+    try:
+        exports = "SSL_CERT_FILE" in open(
+            os.path.join(ROOT, "dev", "run.sh"), encoding="utf-8").read()
+    except Exception:                                              # noqa: BLE001
+        exports = False
+    if not exports:
+        row("сертификаты", BAD, "пускач не выставляет SSL_CERT_FILE")
+    elif os.environ.get("SSL_CERT_FILE"):
+        row("сертификаты", OK, "связка задана в этом окружении")
     else:
-        # Без связки КАЖДЫЙ https-вызов падает и выглядит как «сеть недоступна».
-        row("сертификаты", BAD, "нет связки: поднимайте стенд через dev/run.sh")
+        row("сертификаты", OK,
+            "связка есть, стенд выставит её сам (в этой оболочке переменной нет — "
+            "это нормально)")
 
 
 def check_fastgen(k: dict) -> None:
@@ -193,13 +225,74 @@ def check_cover_preset() -> None:
         f"{total} шт." if total else "пока нет — «Default RU» засеется при первом запуске")
 
 
-def check_scheduler() -> None:
-    off = (os.environ.get("VS_SERVER_DISABLE_BACKGROUND") or "").strip().lower()
+def _stand_env() -> tuple[str, dict]:
+    """Окружение РАБОТАЮЩЕГО стенда, а не этой оболочки.
+
+    Мерить свои переменные бессмысленно: стенд поднимается своим пускачом, и все
+    интересные значения живут в нём. 21.09 это стоило дня — у стенда был неправильный
+    ключ, а любая проверка «у меня в оболочке» показывала бы полный порядок.
+    """
+    try:
+        pid = subprocess.run(["pgrep", "-f", "uvicorn web.platform:app"],
+                             capture_output=True, text=True, timeout=10).stdout.split()
+        if not pid:
+            return "", {}
+        raw = subprocess.run(["ps", "eww", pid[0]], capture_output=True, text=True,
+                             timeout=10).stdout
+    except Exception:                                              # noqa: BLE001
+        return "", {}
+    env = {}
+    for part in raw.split():
+        if "=" in part:
+            k, v = part.split("=", 1)
+            if k.isupper():
+                env[k] = v
+    return pid[0], env
+
+
+def check_scheduler(stand: dict, pid: str) -> None:
+    if not pid:
+        row("Исполнитель задач", WARN, "стенд не запущен — проверять нечего")
+        return
+    off = (stand.get("VS_SERVER_DISABLE_BACKGROUND") or "").strip().lower()
     if off in ("1", "true", "yes"):
         row("Исполнитель задач", BAD,
-            "выключен: поднимайте через dev/run-live.sh, иначе задачи просто стоят")
+            f"выключен у стенда (pid {pid}): поднимайте через dev/run-live.sh, "
+            "иначе задачи просто стоят в очереди")
     else:
-        row("Исполнитель задач", OK, "включён (проверяется в окружении ЭТОГО процесса)")
+        row("Исполнитель задач", OK, f"включён у стенда (pid {pid})")
+
+
+def check_key_routes(k: dict, stand: dict, pid: str) -> None:
+    """Ключ каждого маршрута обязан принадлежать хосту этого маршрута.
+
+    21.09: на адрес FastGen уехал ключ другого провайдера, потому что в пускаче стояло
+    «alt_llm или googler», и появление alt_llm молча переставило чужой. Наружу это вышло
+    как «Неверный API ключ» — то есть как сломанный аккаунт. Сверка занимает миллисекунду
+    и снимает целый класс расследований; значения ключей при этом не печатаются.
+    """
+    if not pid:
+        row("Ключ ↔ адрес", WARN, "стенд не запущен — сверять нечего")
+        return
+    fam = {}
+    for name in ("googler", "alt_llm"):
+        if isinstance(k.get(name), str) and k[name]:
+            fam[k[name]] = name
+    pairs = (("REWRITE_GPT_CHAT_KEY", "REWRITE_GPT_CHAT_URL", "googler"),
+             ("VS_ALT_LLM_KEY", "VS_ALT_LLM_BASE", "googler"),
+             ("COVER_ALT_API_KEY", "COVER_ALT_BASE_URL", "alt_llm"))
+    wrong = []
+    for key_var, url_var, want in pairs:
+        val, url = stand.get(key_var), stand.get(url_var)
+        if not val or not url:
+            continue
+        got = fam.get(val, "неизвестный")
+        if got != want:
+            wrong.append(f"{key_var}: {got} вместо {want}")
+    if wrong:
+        row("Ключ ↔ адрес", BAD, "; ".join(wrong) + " — будет «Неверный API ключ»")
+    else:
+        row("Ключ ↔ адрес", OK, "каждый маршрут со своим ключом")
 
 
 def check_subs() -> None:
@@ -217,8 +310,10 @@ def check_subs() -> None:
 def main() -> int:
     live_subs = "--subs" in sys.argv
     k = keys()
+    pid, stand = _stand_env()
     check_certs()
-    check_scheduler()
+    check_scheduler(stand, pid)
+    check_key_routes(k, stand, pid)
     check_fastgen(k)
     check_alt(k)
     check_openai(k)
