@@ -95,6 +95,29 @@ def test_stand_wires_it() -> None:
           "/chat/completions" in _rw_line, True)
     check("ключ рерайта задан вместе с адресом",
           bool(re.search(r"REWRITE_GPT_CHAT_KEY=", sh)), True)
+
+    # ── Ключ принадлежит хосту ────────────────────────────────────────────────
+    # 21.09 это стрельнуло: ключ для FastGen брался как `alt_llm or googler`. Пока
+    # alt_llm в файле не было, подставлялся googler и всё работало. Как только alt_llm
+    # появился (он нужен обложкам, у которых ДРУГОЙ хост), он молча победил — и на
+    # FastGen поехал ключ чужого провайдера. Наружу это вышло как «Неверный API ключ»,
+    # то есть как сломанный аккаунт, хотя сломалось сопоставление ключа и адреса.
+    # Проверяем по блокам: у каждого маршрута своё семейство и никаких «или».
+    # Граница — присваивание _coverkey: блок ключа обложки начинается именно там и
+    # стоит ВЫШЕ строки COVER_ALT_BASE_URL (резать по ней значило бы отдать этот блок
+    # чужой половине — на этом тест и споткнулся, когда писался).
+    _cover_at = sh.find("_coverkey=")
+    check("блок ключа обложки найден", _cover_at > 0, True)
+    _fastgen_block = sh[:_cover_at]
+    _cover_block = sh[_cover_at:]
+    check("маршруты FastGen берут ключ googler",
+          'data.get("googler")' in _fastgen_block, True)
+    check("...и НЕ берут ключ чужого провайдера",
+          'data.get("alt_llm")' in _fastgen_block, False)
+    check("маршрут обложки берёт свой ключ alt_llm",
+          'data.get("alt_llm")' in _cover_block, True)
+    check("...и не подставляет им ключ FastGen",
+          'data.get("googler")' in _cover_block, False)
     check("модель в стиле OpenRouter",
           bool(re.search(r"VS_ALT_LLM_MODEL=.*openai/", sh)), True)
     check("...а не дефолтная claude-sonnet-5, которой там нет",

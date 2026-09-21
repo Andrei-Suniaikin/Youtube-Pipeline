@@ -88,7 +88,7 @@ def main() -> int:
         ok, msg = _call()
         check("отказано", ok, False)
         check("в сеть не ходили", "url" in SENT, False)
-        check("названа причина", "без REWRITE_GPT_CHAT_KEY" in msg, True)
+        check("названа причина", "REWRITE_GPT_CHAT_KEY" in msg, True)
         check("сказано, что денег не стоило", "Денег это не стоило" in msg, True)
         check("ключ OpenAI в сообщение не попал", "КЛЮЧ-OPENAI" in msg, False)
 
@@ -99,10 +99,16 @@ def main() -> int:
         check("адрес чужой", SENT.get("url"), "https://чужой.example/v1/chat/completions")
         check("ключ тоже чужой, а не OpenAI", SENT.get("auth"), "Bearer КЛЮЧ-ПРОВАЙДЕРА")
 
-        print("\nТолько ключ, без адреса — по-прежнему OpenAI")
+        print("\nТолько ключ, без адреса — тоже отказ")
+        # Раньше тут проверялся только адрес, и дыра прошла мимо: ключ чужого провайдера
+        # уезжал в api.openai.com. Внешне это «Неверный API ключ» — выглядит как сломанный
+        # аккаунт, а на деле секрет уже отдан третьей стороне.
         os.environ.pop("REWRITE_GPT_CHAT_URL")
-        ok, _ = _call()
-        check("адрес прежний", SENT.get("url"), "https://api.openai.com/v1/chat/completions")
+        ok, msg = _call()
+        check("отказано", ok, False)
+        check("в сеть не ходили", "url" in SENT, False)
+        check("названо, чего не хватает", "REWRITE_GPT_CHAT_URL" in msg, True)
+        check("чужой ключ в OpenAI не уехал", SENT.get("auth"), None)
     finally:
         rc.urllib.request.urlopen = was
         for v in ("REWRITE_GPT_CHAT_URL", "REWRITE_GPT_CHAT_KEY"):

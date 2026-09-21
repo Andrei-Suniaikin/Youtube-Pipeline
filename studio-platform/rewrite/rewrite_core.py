@@ -6766,12 +6766,16 @@ def _call_openai_api_with_server_key(
     # отправить его туда — значит засветить секрет на стороне, которой он не предназначен.
     _chat_url = _alt_setting("REWRITE_GPT_CHAT_URL")
     _chat_key = _alt_setting("REWRITE_GPT_CHAT_KEY")
-    if _chat_url and not _chat_key:
-        # Отказ, а не тихий откат на OpenAI: молча отправить ключ OpenAI на чужой адрес —
-        # значит засветить секрет там, где он не предназначен, и узнать об этом никогда.
-        return (False, "REWRITE_GPT_CHAT_URL задан без REWRITE_GPT_CHAT_KEY: ключ OpenAI "
-                       "чужому провайдеру не отправляется. Денег это не стоило. "
-                       "Задайте ключ этого провайдера или уберите адрес.")
+    # Адрес и ключ — ПАРА, и отсутствие любой половины опасно по-своему.
+    # Адрес без ключа отправил бы ключ OpenAI чужому провайдеру. Ключ без адреса —
+    # наоборот, отправил бы чужой ключ в OpenAI: тоже утечка секрета третьей стороне,
+    # и внешне это выглядит как «Неверный API ключ», то есть как сломанный аккаунт.
+    # Оба случая — отказ, а не тихий откат: молчание здесь стоит секрета.
+    if bool(_chat_url) != bool(_chat_key):
+        missing = "REWRITE_GPT_CHAT_KEY" if _chat_url else "REWRITE_GPT_CHAT_URL"
+        return (False, f"задана только половина маршрута чат-вызова: не хватает {missing}. "
+                       "Ключ и адрес обязаны меняться вместе — иначе секрет уедет не тому "
+                       "провайдеру. Денег это не стоило, повтор не поможет.")
     if _chat_key:
         _register_server_secret_tree({"rewrite_chat_key": _chat_key})   # чтобы не попал в логи
     url = _chat_url or "https://api.openai.com/v1/chat/completions"

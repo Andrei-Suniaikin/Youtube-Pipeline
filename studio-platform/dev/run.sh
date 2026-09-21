@@ -131,13 +131,21 @@ fi
 # Ключ тот же, что у картинок (семейство googler) — второй копии секрета не заводим.
 # Заданное снаружи не трогаем: VS_PROMPT_PROVIDER=openai вернёт прежнее поведение.
 if [ -f "$VS_SERVER_KEYS_PATH" ] && [ -z "$VS_ALT_LLM_KEY" ]; then
+  # КЛЮЧ ПРИНАДЛЕЖИТ ХОСТУ. Здесь берётся ключ FastGen (семейство googler) — и только он,
+  # потому что ниже адресом стоит именно FastGen. Раньше тут было `alt_llm or googler`, и
+  # пока alt_llm в файле не было, подставлялся googler и всё сходилось. 21.09 alt_llm
+  # появился (он нужен обложкам, у которых ДРУГОЙ хост) — и молча победил: на FastGen
+  # поехал ключ чужого провайдера, а рерайт отвечал «Неверный API ключ», то есть 401,
+  # который читается как «сломался аккаунт», хотя сломалось сопоставление ключа и адреса.
+  # Никаких «или»: у каждого маршрута своё семейство, иначе добавление любого нового
+  # ключа снова тихо переставит чужой.
   _altkey="$("$PY" - "$VS_SERVER_KEYS_PATH" <<'ALTK'
 import json, sys
 try:
     data = json.load(open(sys.argv[1]))
 except Exception:
     raise SystemExit
-v = data.get("alt_llm") or data.get("googler") or ""
+v = data.get("googler") or ""
 if isinstance(v, list):
     v = v[0] if v else ""
 print(v if isinstance(v, str) else "")
