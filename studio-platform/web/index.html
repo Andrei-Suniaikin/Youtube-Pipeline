@@ -5188,6 +5188,22 @@ function inlineBox(btn){
 }
 
 // Вместо prompt(): поле рядом с кнопкой. Enter — принять, Esc — отменить.
+function menuInline(btn, items){
+  // Выбор из нескольких действий у одной кнопки. Отдельное окно тут было бы тяжелее
+  // самого выбора, а три кнопки в шапке — это ровно та перегруженность, на которую
+  // жаловался владелец 21.09.
+  const box = inlineBox(btn);
+  box.style.flexDirection = 'column';
+  box.style.alignItems = 'stretch';
+  box.innerHTML = items.map((it, n) => `<button class="ghost small mi" data-n="${n}"
+      style="text-align:left;font-weight:500">${esc(it.title)}${it.hint
+      ? `<div class="note muted" style="margin:2px 0 0">${esc(it.hint)}</div>` : ''}</button>`).join('');
+  box.querySelectorAll('.mi').forEach(b => b.onclick = () => {
+    box.remove();
+    items[Number(b.dataset.n)].run();
+  });
+}
+
 function askInline(btn, opts, onOk){
   const box = inlineBox(btn);
   box.innerHTML = `<input class="ask-in" placeholder="${esc(opts.placeholder || '')}"
@@ -5856,8 +5872,12 @@ const PART_TITLES = [['voice', 'Озвучка'], ['images', 'Картинки']
                      ['render', 'Сборка'], ['text', 'Сценарий'], ['cover', 'Обложка']];
 
 // Фильтр списка пресетов: живёт между заходами на экран, у каждого зрителя свой.
+// 21.09.2026: пресеты каналов и шаблоны Lumean висели внизу страницы всегда, мимо
+// фильтра — страница получалась перегруженной, а найти их было негде. Теперь они
+// такие же виды, как остальные: фильтр их и показывает, и прячет.
+const PRESET_SIDE_TYPES = [['channel', 'Каналы'], ['lumean', 'Озвучка Lumean']];
 const PRESET_FILTER_TYPES = [['all', 'Все'], ['full', 'Целые'], ['partial', 'Частичные'],
-                             ...PART_TITLES];
+                             ...PART_TITLES, ...PRESET_SIDE_TYPES];
 const presetFilter = (() => {
   const dflt = {q: '', type: 'all'};
   try{
@@ -6142,10 +6162,22 @@ async function viewPresets(){
   const head = $(`<div class="head">
       <div><h1>Пресеты</h1>
         <p class="sub">Настройки, которыми делаются ролики.</p></div>
-      <button id="newpr" class="small">Новый пресет</button>
+      <button id="newpr" class="small">Создать</button>
     </div>`);
   app.append(head);
-  head.querySelector('#newpr').onclick = () => { location.hash = '#/preset/new'; };
+  // Раньше кнопка вела ровно в один вид, а пресет канала и шаблон Lumean заводились
+  // своими кнопками внизу страницы — то есть найти их можно было, только долистав.
+  head.querySelector('#newpr').onclick = ev => menuInline(ev.currentTarget, [
+    {title: 'Пресет производства',
+     hint: 'чем делается ролик: текст, озвучка, кадры, сборка',
+     run: () => { location.hash = '#/preset/new'; }},
+    {title: 'Пресет канала',
+     hint: 'как живёт канал: расписание, машина заливки, ниша',
+     run: () => channelPresetModal(null)},
+    {title: 'Шаблон озвучки Lumean',
+     hint: 'голос и настройки на стороне Lumean',
+     run: () => lumeanTemplateModal(null, (lum && lum.fields) || null)},
+  ]);
 
   if (d.broken.length){
     app.append($(`<div class="card" style="margin-bottom:16px">
@@ -6214,8 +6246,11 @@ async function viewPresets(){
   // выборе типа их карточки скрываются, а не показываются «не подходящими».
   const F = presetFilter;
   const nameOk = i => !F.q || String(i.name || '').toLowerCase().includes(F.q.toLowerCase());
-  const typeOk = i => F.type === 'all' || (F.type === 'full' ? i.scope === 'full'
-    : F.type === 'partial' ? i.scope !== 'full' : i.scope === F.type);
+  // Виды «Каналы» и «Озвучка Lumean» — не про пресеты производства вовсе: при их
+  // выборе список производства пустеет целиком, и на экране остаётся только нужное.
+  const sideType = PRESET_SIDE_TYPES.some(([c]) => c === F.type);
+  const typeOk = i => !sideType && (F.type === 'all' || (F.type === 'full' ? i.scope === 'full'
+    : F.type === 'partial' ? i.scope !== 'full' : i.scope === F.type));
 
   const vsgenBodyHtml = items => {
     items = items.filter(i => nameOk(i) && typeOk(i));
@@ -6262,10 +6297,22 @@ async function viewPresets(){
   const list = document.createElement('div');
   app.append(list);
 
+  // Боковые карточки («Пресеты каналов», «Шаблоны Lumean») создаются ниже, а прятать их
+  // надо на каждую смену фильтра. Поэтому ссылки объявлены здесь, а `paint` только
+  // переключает видимость — перерисовывать их незачем, данные от фильтра не зависят.
+  let lumCard = null, chpCard = null;
+
   const paint = () => {
+    const side = PRESET_SIDE_TYPES.some(([c]) => c === F.type);
+    if (lumCard) lumCard.style.display = (F.type === 'all' || F.type === 'lumean') ? '' : 'none';
+    if (chpCard) chpCard.style.display = (F.type === 'all' || F.type === 'channel') ? '' : 'none';
     list.innerHTML = '';
     let shown = 0;
     for (const g of d.groups){
+      // Виды «Каналы» и «Озвучка Lumean» не про эти списки вовсе: карточка производства
+      // при них рисовала саму себя с надписью «под фильтр ничего не подошло» — рядом с
+      // секцией, которую человек как раз и просил показать. Это читается как поломка.
+      if (side) continue;
       if (g.service !== 'vsgen' && F.type !== 'all') continue;
       const items = g.service === 'vsgen' ? g.items : g.items.filter(nameOk);
       if (g.service !== 'vsgen' && F.q && !items.length && !g.error) continue;
@@ -6288,8 +6335,8 @@ async function viewPresets(){
       list.append(card);
       wirePresets(card);
     }
-    if (!shown) list.append($(`<div class="card"><div class="empty">Под фильтр ничего не
-      подошло.</div></div>`));
+    if (!shown && !side) list.append($(`<div class="card"><div class="empty">Под фильтр
+      ничего не подошло.</div></div>`));
   };
   const save = () => { try{ localStorage.setItem('presetFilter', JSON.stringify(F)); }catch(e){} };
   bar.querySelector('#pf-q').oninput = e => { F.q = e.target.value; save(); paint(); };
@@ -6303,7 +6350,7 @@ async function viewPresets(){
   // в ответе на создание — его сразу видно и можно вставить в карту голосов пресета.
   let lum = {ok: false, templates: [], fields: []};
   try{ lum = await api('/ui/lumean/templates'); }catch(e){ lum = {ok: false, why: e.message}; }
-  const lumCard = $(`<div class="card">
+  lumCard = $(`<div class="card">
     <div class="sec">Шаблоны озвучки Lumean
       ${lum.ok ? `<button class="ghost small" id="lum-new"
         style="float:right;font-weight:400;text-transform:none;letter-spacing:0"
@@ -6347,7 +6394,7 @@ async function viewPresets(){
       }));
 
   // Каналы на пресете видно сразу: правка меняет их поведение со следующего прохода.
-  const chpCard = $(`<div class="card">
+  chpCard = $(`<div class="card">
     <div class="sec">Пресеты каналов
       <button class="ghost small" id="chp-new"
         style="float:right;font-weight:400;text-transform:none;letter-spacing:0"
@@ -6373,6 +6420,8 @@ async function viewPresets(){
     <div class="secbody"><div class="note muted">${esc(chp.note || '')}</div></div>
   </div>`);
   app.append(chpCard);
+  // Обе карточки уже на месте — теперь фильтр может ими управлять.
+  paint();
   chpCard.querySelector('#chp-new').onclick = () => channelPresetModal(null);
   chpCard.querySelectorAll('.chp-edit').forEach(b => b.onclick =
     () => channelPresetModal(Number(b.dataset.id)));
