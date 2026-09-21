@@ -135,6 +135,10 @@ SCENARIO = r"""
   out.карточка_обложки = !!cc;
   out.соседи_на_месте = !!document.querySelector('[data-kind="tts"]');
   out.кнопка_выключена_без_галочек = tc.querySelector('button.pgo').disabled;
+  // Без отметок панель — одна строка: раскрытая, она занимала 900 px над списком.
+  const тело = document.querySelector('#batchbody');
+  out.панель_свёрнута_без_галочек = !!тело && тело.getClientRects().length === 0;
+  out.подсказка_без_галочек = flat(document.querySelector('#batchn'));
   out.отмены_у_текста_нет = !tc.querySelector('button.bcancel');
   out.про_источник = flat(tc.querySelector('.note'));
   out.языки_текста = [...tc.querySelectorAll('[data-pf="languages"] label')]
@@ -153,6 +157,8 @@ SCENARIO = r"""
   const picks = [...document.querySelectorAll('input.pick')];
   picks[0].checked = true; picks[0].dispatchEvent(new Event('change'));
   out.кнопка_включилась = !tc.querySelector('button.pgo').disabled;
+  out.панель_раскрылась = тело.getClientRects().length > 0;
+  out.счётчик_после_галочки = flat(document.querySelector('#batchn'));
   out.подпись_про_один_проект = flat(tc.querySelector('.pult-one'));
 
   const pl = [...tc.querySelectorAll('[data-pf="languages"] label')]
@@ -286,6 +292,9 @@ def main() -> int:
     check("карточка «Обложка»", res.get("карточка_обложки"), True)
     check("кабинетные карточки остались", res.get("соседи_на_месте"), True)
     check("без галочек «Сделать» выключено", res.get("кнопка_выключена_без_галочек"), True)
+    check("без галочек панель свёрнута в строку", res.get("панель_свёрнута_без_галочек"), True)
+    check("и подсказывает, что делать", res.get("подсказка_без_галочек"),
+          "отметьте проекты в списке")
     check("«Отменить» у соседних сервисов нет", res.get("отмены_у_текста_нет"), True)
     has("сказано, откуда берётся источник", res.get("про_источник"),
         "ссылка донора выпуска, а если донора нет — сценарий проекта")
@@ -308,6 +317,8 @@ def main() -> int:
 
     print("\nСначала сухой прогон, деньги — только после подтверждения")
     check("галочка включила кнопку", res.get("кнопка_включилась"), True)
+    check("и раскрыла панель", res.get("панель_раскрылась"), True)
+    check("счётчик называет число", res.get("счётчик_после_галочки"), "отмечено: 1")
     first = res.get("первый_запрос") or {}
     check("первый запрос — в пультовую ручку текста",
           first.get("path"), "/ui/projects/batch/text")

@@ -380,6 +380,18 @@
   .head{display:flex;align-items:flex-start;justify-content:space-between;gap:16px}
   .head h1{margin-bottom:5px}
   .head > button{margin-top:3px;flex:0 0 auto}   /* по верхней строке заголовка */
+  .head-acts{display:flex;gap:8px;flex:0 0 auto;margin-top:3px;flex-wrap:wrap;
+             justify-content:flex-end}
+  .head-acts .bad{color:var(--bad);border-color:var(--bad)}
+  /* Строка пресета: название и факты в одну строку, факты гаснут многоточием, а не
+     переносятся — длинный список моделей не должен раздувать каждую строку. */
+  .pitem .pline{display:flex;gap:10px;align-items:baseline;min-width:0}
+  .pitem .pline .name{flex:0 0 auto}
+  .pitem .pline .facts{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+                       white-space:nowrap;margin:0}
+  .pitem .body{min-width:0}
+  .pitem .pacts{white-space:nowrap;align-self:center;display:flex;gap:6px}
+  #paidline{margin-top:6px}
 
   /* Тосты: ошибка действия видна там, где смотрит глаз, и не перекрывает работу.
      Раньше это был alert() — он останавливает страницу и требует нажать «ОК». */
@@ -426,6 +438,15 @@
                cursor:pointer;transition:all .12s}
   .langs label:hover{border-color:var(--acc)}
   .langs label.on{background:var(--acc-dim);border-color:var(--acc);color:var(--acc-hi)}
+  /* Выбор языков одной строкой: кнопка с итогом, список с поиском — по нажатию. */
+  .lpick{margin-top:6px}
+  .lpick-btn{max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .lpick-btn::after{content:" ▾";opacity:.7}
+  .lpick-btn[aria-expanded="true"]::after{content:" ▴"}
+  .lpick-pop{margin-top:8px}
+  .lpick-pop[hidden]{display:none}
+  .lpick-q{width:min(260px,100%)}
+  .lpick-pop .langs{max-height:240px}
   /* Своя кнопка выбора файла (заявка владельца 20.09.2026: «а файл сделать кастомную
      кнопку upload как в муи, а не дефолтную»). Сам <input type=file> остаётся и
      остаётся достижимым с клавиатуры: он не display:none, а сведён в точку —
@@ -1482,14 +1503,20 @@ function schedulerCard(sch){
   // иначе человек чинит то, что не сломано.
   sch = sch || {};
   if (!sch.known || sch.on) return null;     // всё работает — молчим, экран про работу
-  return $(`<div class="card">
-    <div class="sec">Задачи никто не выполняет</div>
+  // Одной строкой заголовка, без отдельной полосы «шапки» карточки: предупреждение
+  // стоит на каждом экране проекта и очереди и не должно отодвигать работу вниз.
+  // Успокаивающая фраза — только если причина сама её не говорит: сервер пишет
+  // «поставленное никуда не денется», и второй раз то же самое — шум.
+  const calm = /не денется|не потеряется/.test(sch.why || '') ? ''
+    : `<div class="note muted">Поставленное не потеряется: оно стоит в очереди и
+          начнётся само, как только появится исполнитель.</div>`;
+  return $(`<div class="card" style="margin-bottom:16px">
     <div class="stage">
       <div class="dot s-queued">⏸</div>
       <div class="body">
+        <div class="name">Задачи никто не выполняет</div>
         <div class="facts">${esc(sch.why)}</div>
-        <div class="note muted">Поставленное не потеряется: оно стоит в очереди и
-          начнётся само, как только появится исполнитель.</div>
+        ${calm}
       </div>
     </div></div>`);
 }
@@ -1745,13 +1772,18 @@ function taskCellHtml(r){
   // происходит сейчас, и только потом всё остальное. Объяснение имени длинное и на
   // экране повторяется у каждой такой задачи; стоя вторым, оно отодвигало бы стадию
   // и время на третье место — то самое, ради чего правка и делалась.
+  // Почему имя не из ролика — короткой пометкой в строке «кто», а объяснение под знаком
+  // вопроса. Целой фразой оно стояло в КАЖДОЙ такой строке, и в очереди из полусотни
+  // задач одна и та же фраза занимала больше места, чем сами задачи (жалоба владельца
+  // 21.09.2026 «перегружен»). Во всех трёх случаях сервера — ссылка донора, имя
+  // проекта, номер задачи — показано не название ролика; это пометка и говорит.
   return `<div style="font-weight:600">${esc(r.title)}</div>
     ${(stage || age) ? `<div class="qnow">${stage}${
       stage && age ? '<span class="muted">·</span>' : ''}${age}</div>` : ''}
-    ${r.title_why ? `<div class="note muted" style="font-size:12px"
-      >${esc(r.title_why)}</div>` : ''}
     <div class="muted" style="font-size:12px">${
-      who || `<span class="mono">${esc(r.id)}</span>`}</div>`;
+      who || `<span class="mono">${esc(r.id)}</span>`}${r.title_why
+      ? ` · <span class="tsrc">это не название ролика</span>${hintDot(r.title_why)}`
+      : ''}</div>`;
 }
 
 /* Причина — словами и в том же месте, где состояние. Три разных ответа, которые
@@ -2372,6 +2404,7 @@ async function pultBatchFill(batch){
       const cb = l.querySelector('input');
       cb.onchange = () => l.classList.toggle('on', cb.checked);
     });
+    langPicker(box);
   };
   const fill = (sel, list) => {
     if (!sel || !list.length) return;
@@ -2529,11 +2562,15 @@ async function viewProjects(){
   }catch(e){ toast(e.message); }
   const BATCH_ORDER = ['tts', 'images', 'video', 'render'];
   const PULT_ORDER = ['text', 'cover'].filter(k => batchPult[k] && batchPult[k].post);
+  // Панель пакетного запуска нужна, только когда что-то отмечено. Раскрытая всегда, она
+  // занимала 900 px над списком проектов — на экране, который открывают ради списка
+  // (жалоба владельца 21.09.2026 «интерфейс перегружен»). Без отметок от неё остаётся
+  // одна строка с подсказкой, первая галочка раскрывает её целиком.
   const batch = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Запуск для отмеченных
       <span class="muted" id="batchn" style="float:right;font-weight:400;
-        text-transform:none;letter-spacing:0">отмечено: 0</span></div>
-    <div class="secbody">
+        text-transform:none;letter-spacing:0">отметьте проекты в списке</span></div>
+    <div class="secbody" id="batchbody" hidden>
       <div style="display:flex;gap:14px;flex-wrap:wrap;align-items:stretch">
         ${BATCH_ORDER.map(kind => {
           const k = batchFields[kind] || {title: kind, fields: []};
@@ -2621,7 +2658,8 @@ async function viewProjects(){
   let pultNote = () => {};
   const refreshCount = () => {
     const n = picks().length;
-    countEl.textContent = `отмечено: ${n}`;
+    countEl.textContent = n ? `отмечено: ${n}` : 'отметьте проекты в списке';
+    batch.querySelector('#batchbody').hidden = n === 0;
     batch.querySelectorAll('button.bgo, button.bcancel, button.pgo, #batchgo')
       .forEach(b => b.disabled = n === 0);
     pultNote();
@@ -2882,13 +2920,59 @@ const PROJECT_TABS = [
 // измерения не нужна.
 const PART_TABS = new Set(['tts', 'video']);
 
-function partsWord(n){
-  // Склонение руками: «2 части/ей» — не по-русски, а неряшливый текст в интерфейсе
-  // читается как неряшливая работа под ним.
+// Склонение руками: «2 части/ей» — не по-русски, а неряшливый текст в интерфейсе
+// читается как неряшливая работа под ним.
+function plural(n, one, few, many){
   const t = n % 10, h = n % 100;
-  if (t === 1 && h !== 11) return 'часть';
-  if (t >= 2 && t <= 4 && (h < 12 || h > 14)) return 'части';
-  return 'частей';
+  if (t === 1 && h !== 11) return one;
+  if (t >= 2 && t <= 4 && (h < 12 || h > 14)) return few;
+  return many;
+}
+function partsWord(n){ return plural(n, 'часть', 'части', 'частей'); }
+
+// Выбор языков одной строкой (жалоба владельца 21.09.2026 «перегружен»): сорок с лишним
+// языков висели стеной галочек на каждой вкладке заказа, и сам заказ уезжал под неё.
+// Теперь — кнопка с итогом выбора, а список с поиском раскрывается по нажатию. Сами
+// галочки и их обработчики не меняются: список переезжает внутрь целиком, как есть.
+function langPicker(box){
+  if (!box || box.closest('.lpick')) return null;
+  const wrap = document.createElement('div');
+  wrap.className = 'lpick';
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'ghost small lpick-btn';
+  btn.setAttribute('aria-expanded', 'false');
+  const pop = document.createElement('div');
+  pop.className = 'lpick-pop';
+  pop.hidden = true;
+  const q = document.createElement('input');
+  q.className = 'lpick-q';
+  q.placeholder = 'найти язык';
+  box.replaceWith(wrap);
+  pop.append(q, box);
+  wrap.append(btn, pop);
+  const paint = () => {
+    const on = [...box.querySelectorAll('label')]
+      .filter(l => { const i = l.querySelector('input'); return i && i.checked; })
+      .map(l => l.textContent.trim());
+    btn.textContent = !on.length ? 'выбрать языки'
+      : on.length <= 3 ? on.join(', ') : `${on.slice(0, 3).join(', ')} +${on.length - 3}`;
+  };
+  box.addEventListener('change', paint);
+  btn.onclick = () => {
+    pop.hidden = !pop.hidden;
+    btn.setAttribute('aria-expanded', String(!pop.hidden));
+    if (!pop.hidden) q.focus();
+  };
+  // Скрываем стилем, а не атрибутом: у чипа свой display, и он сильнее [hidden].
+  q.oninput = () => {
+    const v = q.value.trim().toLowerCase();
+    box.querySelectorAll('label').forEach(l => {
+      l.style.display = (!v || l.textContent.toLowerCase().includes(v)) ? '' : 'none';
+    });
+  };
+  paint();
+  return wrap;
 }
 
 const TAB_FILES = {scenario: ['scenes'], tts: ['audio'], images: ['images'],
@@ -2902,6 +2986,9 @@ const TAB_KINDS = {scenario: ['prompts'], tts: ['tts'], images: ['images', 'rege
 // группы «Сценарий» и «Обложка» в проект не идут).
 const TAB_SETTINGS_GROUP = {tts: 'Озвучка', images: 'Картинки', video: 'Клипы',
                             render: 'Сборка'};
+// Виды оплаченных вызовов (`provider_calls.kind`) — словами экрана, а не кодом.
+const PAID_KIND = {images: 'кадры', clip: 'клипы', video: 'клипы', tts: 'озвучка',
+                   cover: 'обложка', text: 'текст'};
 
 /* ─────────────────── статус проекта по этапам ─────────────────── */
 // `project_stage_status` (Ф1, server/main.py) отдаёт tone/state кабинетными именами
@@ -4294,6 +4381,7 @@ async function renderScenarioTab(d){
     card.querySelectorAll('.modes button').forEach(x => x.classList.toggle('on', x === b));
     paintMode();
   });
+  langPicker(card.querySelector('#tx-langs'));
   card.querySelectorAll('#tx-langs label').forEach(l => {
     const box = l.querySelector('input');
     const sync = () => { l.classList.toggle('on', box.checked);
@@ -4655,6 +4743,7 @@ async function renderCoverTab(d){
     noteBox.textContent = note ? note.note : '';
     paintFields();
   });
+  langPicker(card.querySelector('#cv-langs'));
   card.querySelectorAll('#cv-langs label').forEach(l => {
     const box = l.querySelector('input');
     const sync = () => { l.classList.toggle('on', box.checked);
@@ -4737,6 +4826,19 @@ async function viewProject(id){
   const p = d.project;
   const wantTab = location.hash.split('/')[3] || '';
   const tab = PROJECT_TABS.some(([k]) => k === wantTab) ? wantTab : 'scenario';
+  // «Во что обошёлся» (`d.paid`) — один раз на экране, строкой в шапке, видна на любой
+  // вкладке (review-feedback-F4 цикл 1, Issue 5). Отдельной карточкой она стояла до
+  // вкладок вместе с «Пресетом», и до самой работы надо было листать 700 px (жалоба
+  // владельца 21.09.2026 «интерфейс перегружен»). Пояснение — под знаком вопроса.
+  const paidLine = d.paid.length
+    ? `<div class="note" id="paidline">Во что обошёлся: ${d.paid.map(x =>
+        `${esc(PAID_KIND[x.kind] || x.kind)} — ${x.delivered} ${
+          plural(x.delivered, 'оплаченный вызов', 'оплаченных вызова', 'оплаченных вызовов')}${
+          x.cost ? ` на ${x.cost.toFixed(0)} кр.` : ''}`).join('; ')} ${hintDot(
+        'Это то, что будет выброшено, если проект убрать с диска.')}</div>`
+    : '';
+  const ap = p.applied_preset;
+  const ppLabel = !ap ? 'Пресет' : ap.missing ? 'Пресет удалён' : `Пресет: ${ap.name}`;
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/projects">← ко всем проектам</a>
     <div class="head">
@@ -4747,8 +4849,13 @@ async function viewProject(id){
             encodeURIComponent(p.release_id)}">${esc(p.release_id)}</a> · фаза ${
             esc(p.phase)}` : ''}</p>
         ${stageStripHtml(p.stage)}
+        ${paidLine}
       </div>
-      <button id="runall" class="small ghost">Сделать всё</button>
+      <div class="head-acts">
+        <button id="ppopen" class="small ghost${ap && ap.missing ? ' bad' : ''}"
+          aria-expanded="false">${esc(ppLabel)}</button>
+        <button id="runall" class="small ghost">Сделать всё</button>
+      </div>
     </div>`));
 
   // Предупреждение стоит до вкладок: нажимать «Начать» при выключенном исполнителе
@@ -4784,6 +4891,9 @@ async function viewProject(id){
 
   // «Сделать всё» — ровно одна кнопка на экране (ФР §4 п.8), видна на любой вкладке,
   // сама форма сворачиваема, чтобы не занимать место на каждый день.
+  // `$()` отдаёт ОБЁРТКУ, а скрыта карточка внутри неё: переключение `display` у
+  // обёртки не открывало панель никогда — «Сделать всё» не делало ничего видимого
+  // (жалоба владельца 21.09.2026; прошлая правка лечила место панели, а не это).
   const runBox = $(`<div class="card" style="margin-bottom:16px;display:none">
     <div class="sec">Сделать всё</div>
     <div class="secbody">
@@ -4801,7 +4911,7 @@ async function viewProject(id){
       пойдут параллельно, сборка дождётся материалов сама.</div>
     <div class="note muted">Сборку делает отдельная машина. Если рендер-нода не
       запущена, проект дойдёт до сборки и остановится.</div>
-    <div style="margin-top:12px"><button id="rgo">Запустить</button></div></div></div>`);
+    <div style="margin-top:12px"><button id="rgo">Запустить</button></div></div></div>`).firstElementChild;
   // Панель ставится ПОД шапкой, а не в конец страницы. Раньше она добавлялась после
   // вкладок, настроек, результатов и лога — то есть далеко за пределами видимого
   // экрана. Кнопка вверху, панель внизу: владелец нажимал «Сделать всё» и не видел
@@ -4847,26 +4957,20 @@ async function viewProject(id){
   const vsgenGroup = (presetsData.groups || []).find(g => g.service === 'vsgen');
   const wholePresets = ((vsgenGroup && vsgenGroup.items) || [])
     .filter(i => i.scope === 'full').map(i => ({key: i.key, name: i.name}));
+  // Панель пресета нужна изредка — применить или снять снимок, — а стояла до вкладок
+  // на каждом заходе. Теперь её открывает кнопка «Пресет» в шапке, тем же приёмом, что
+  // и «Сделать всё»; что применено, сказано на самой кнопке.
   const ppCard = $(presetPanelHtml(p.applied_preset, wholePresets));
-  app.append(ppCard);
+  ppCard.style.display = 'none';
+  (runBox.isConnected ? runBox : (runHead || app.lastElementChild)).after(ppCard);
   wirePresetPanel(ppCard, p.id);
-
-  // «Во что обошёлся» (`d.paid`) — один раз на экране, здесь в шапке, видна на любой
-  // вкладке (review-feedback-F4 цикл 1, Issue 5: карточка была на старом «Обзоре» и
-  // молча пропала при переезде на вкладки). `.stage`/`.dot`/`.body`/`.name` — те же
-  // классы, что и раньше здесь же, строки от края до края по замыслу (правило батча A
-  // — строчные компоненты сами себе отступ); хвостовая подпись — в `.secbody`, чтобы
-  // не касаться рамки (Issue 6).
-  if (d.paid.length){
-    app.append($(`<div class="card" style="margin-bottom:16px">
-      <div class="sec">Во что обошёлся</div>
-      ${d.paid.map(x => `<div class="stage"><div class="dot s-done">✓</div>
-        <div class="body"><div class="name">${esc(x.kind)}: ${x.delivered} оплаченных
-          вызовов${x.cost ? ` · ${x.cost.toFixed(0)} кр.` : ''}</div></div></div>`).join('')}
-      <div class="secbody">
-      <div class="note muted">Это то, что будет выброшено, если проект убрать с диска.</div>
-      </div></div>`));
-  }
+  const ppOpen = app.querySelector('#ppopen');
+  ppOpen.onclick = () => {
+    const hidden = ppCard.style.display === 'none';
+    ppCard.style.display = hidden ? '' : 'none';
+    ppOpen.setAttribute('aria-expanded', String(hidden));
+    if (hidden) ppCard.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+  };
 
   // Вкладки — адрес вида #/project/{pid}/{tab}, никакой отдельной «Настройки».
   const tabsBox = $(`<div class="subtabs">${PROJECT_TABS.map(([k, title]) => {
@@ -6944,28 +7048,40 @@ async function viewPresets(){
     // реально разрешились бы (см. фазу 1).
     const viaPresets = i.scope !== 'full' && i.users ? i.users.presets : 0;
     const inUse = i.channels.length > 0 || viaPresets > 0;
-    return `<div class="stage">
+    // Строка пресета — две строки текста, а не четыре (жалоба владельца 21.09.2026
+    // «перегружен»): название и чем он делает — рядом, кто им пользуется — ниже. Счёт
+    // «каналы: 0, проекты: 0» рядом с «ни один канал им не пользуется» говорил одно и
+    // то же дважды, поэтому нули не печатаются; прочерк на месте пустых фактов — тоже.
+    // Каналы названы ссылками — их число рядом не нужно; через целые пресеты — число
+    // уже в самой фразе. Остаются проекты, и только когда они есть.
+    const whoShown = i.users ? [
+      ...(!i.channels.length && !viaPresets && i.users.channels
+        ? [`каналы: ${i.users.channels}`] : []),
+      ...(i.users.projects ? [`проекты: ${i.users.projects}`] : []),
+    ].join(', ') : '';
+    const facts = i.facts.map(f => esc(f)).join(' · ');
+    return `<div class="stage pitem">
       <div class="dot ${inUse ? 's-done' : 's-idle'}">${inUse ? '✓' : '·'}</div>
       <div class="body">
-        <div class="name">${esc(i.name)}</div>
-        <div class="facts">${i.facts.map(f => esc(f)).join(' · ') || '—'}</div>
-        ${who ? `<div class="note muted">${esc(who)}</div>` : ''}
+        <div class="pline"><span class="name">${esc(i.name)}</span>${
+          facts ? `<span class="facts">${facts}</span>` : ''}</div>
         <div class="note ${inUse ? 'muted' : ''}">${
           i.channels.length
             ? 'каналы: ' + i.channels.map(ch =>
                 `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')
             : viaPresets > 0
               ? `напрямую каналы не ссылаются — используется через целые пресеты (${viaPresets})`
-              : 'ни один канал им не пользуется'}</div>
+              : 'ни один канал им не пользуется'}${
+          whoShown ? `<span class="muted"> · ${esc(whoShown)}</span>` : ''}</div>
       </div>
-      <div style="white-space:nowrap;align-self:center">
+      <div class="pacts">
         ${g.service === 'vsgen'
-          ? `<button class="ghost pedit" data-key="${esc(i.key)}">Править</button>`
-          : `<button class="ghost pform" data-svc="${esc(g.service)}"
+          ? `<button class="ghost small pedit" data-key="${esc(i.key)}">Править</button>`
+          : `<button class="ghost small pform" data-svc="${esc(g.service)}"
                data-name="${esc(i.name)}">Править</button>`}
-        <button class="ghost pcopy" data-svc="${esc(g.service)}"
+        <button class="ghost small pcopy" data-svc="${esc(g.service)}"
           data-name="${esc(i.name)}">Копия</button>
-        <button class="ghost pdel" data-svc="${esc(g.service)}"
+        <button class="ghost small pdel" data-svc="${esc(g.service)}"
           data-name="${esc(i.name)}">Удалить</button>
       </div></div>`;
   };
