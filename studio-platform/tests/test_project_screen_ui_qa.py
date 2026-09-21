@@ -200,15 +200,67 @@ def main() -> int:
     check("шапка содержит «← ко всем проектам» → #/projects",
           'href="#/projects">← ко всем проектам</a>' in view_project, True)
 
-    print("\nПорядок блоков production-вкладки (tts/images/video/render): Действие → "
-          "Настройки этапа → Результат → Лог задач (ФР §4 п.3)")
-    order_markers = ["<div class=\"sec\">Действие</div>", "app.append(settingsForm)",
-                      "// 3. Результат", "// 4. Лог задач"]
+    print("\nПорядок блоков production-вкладки (tts/images/video/render): Настройки "
+          "этапа с «Начать» в заголовке → Результат → Лог задач")
+    # 21.09.2026: отдельной карточки «Действие» больше нет. Заголовок «Действие» не
+    # сообщал ничего — на вкладке «Озвучка» единственное действие и так озвучить, — а
+    # рамка на одну кнопку и пустую строку исхода отодвигала настройки вниз на ~130 px
+    # (жалоба владельца: «места много, смысла в рамке нет»). Это наше решение о
+    # раскладке, а не контракт кабинета, поэтому маркер порядка правится вместе с кодом.
+    check("отдельной карточки «Действие» в файле нет",
+          '<div class="sec">Действие</div>' in index_html, False)
+    # У вкладки «Обложка» карточка осталась — в ней настоящая форма платного заказа,
+    # а не одна кнопка; там сменился только заголовок: он называет действие, а не
+    # повторяет слово «Действие» над подписью «Сделать обложку».
+    check("карточка обложки названа своим действием",
+          '<div class="sec">Сделать обложку</div>' in cover_tab, True)
+    check("«Начать» и строка исхода стоят в заголовке карточки настроек этапа",
+          "sec.append(titleSpan, outcomeBox, goBtn);" in stage_tab, True)
+    check("идентификаторы кнопки и строки исхода не переименованы "
+          "(на них висит tests/test_stage_outcome_ttl_browser.py)",
+          ("goBtn.id = 'stage-go';" in stage_tab,
+           "outcomeBox.id = 'stage-outcome';" in stage_tab), (True, True))
+    order_markers = ["app.append(box);", "// 3. Результат", "// 4. Лог задач"]
     positions = [stage_tab.find(m) for m in order_markers]
-    check("все четыре маркера порядка найдены в renderStageTab", [p_ >= 0 for p_ in positions],
+    check("все три маркера порядка найдены в renderStageTab", [p_ >= 0 for p_ in positions],
           [True] * len(positions))
     check("маркеры идут строго по возрастанию позиции (порядок блоков не перепутан)",
           positions == sorted(positions), True)
+
+    print("\nНастройки этапа сохраняются сами — и только они (сохранение тут ничего не "
+          "запускает и ни за что не платит)")
+    check("кнопки «Сохранить» на вкладке этапа нет (saveBar не зовётся)",
+          "saveBar(" in stage_tab, False)
+    check("saveBar остаётся ровно у одного вызывающего — редактора пресета",
+          index_html.count("app.append(saveBar("), 1)
+    check("автозапись уходит в ту же ручку настроек, что была у кнопки",
+          "/settings`, {values})" in stage_tab, True)
+    # Форма не должна уметь ходить по платному адресу сама: от сохранения запрос
+    # отличается ТОЛЬКО адресом, а кабинет по нему и настройки пишет, и ставит задачу.
+    check("из автосохранения нет обращения к /stage/ (оно только в обработчике «Начать»)",
+          stage_tab.count("/stage/${tab}`"), 1)
+    check("пауза набора вынесена константой и лежит в 600–800 мс",
+          600 <= int(re.search(r"const STAGE_SAVE_MS = (\d+);", index_html).group(1)) <= 800,
+          True)
+    check("правки слушаются на самой форме: набор, готовое значение и уход с поля",
+          [f"settingsForm.addEventListener('{e}'" in stage_tab
+           for e in ("input", "change", "focusout")], [True, True, True])
+    check("Lumean-поля строгого формата ждут ухода с поля, а не паузы в наборе",
+          "const STAGE_SAVE_ON_BLUR = new Set(['voice', 'voice_uuid']);" in index_html, True)
+    check("уезжают только отличия от сохранённого (пустое тело ручка отвергает)",
+          "const values = diff(saved);" in stage_tab, True)
+    check("один запрос в полёте, следующий — очередью из последнего состояния",
+          "if (inFlight){ again = true; return; }" in stage_tab, True)
+    check("отказ не откатывает набранное и ставит сторож ухода",
+          ("LEAVE_GUARD = {stageTab: skey" in stage_tab,
+           "dirty: () => failReason != null" in stage_tab), (True, True))
+    check("на серию отказов — один тост, а не по тосту на букву",
+          "if (firstOfSeries) toast(e.message);" in stage_tab, True)
+    # «Вернуть как было» при автосохранении обязано ПИСАТЬ: набранное уже на сервере, и
+    # откат одной формы показывал бы человеку не то, что хранится.
+    check("откат отправляет значения на момент входа на вкладку, а не только чистит форму",
+          "Object.keys(diff(entry)).forEach(k => { values[k] = entry[k]; });"
+          in stage_tab, True)
 
     print("\nГруппа настроек этапа (TAB_SETTINGS_GROUP) — те же 4 названия групп, что и "
           "у server/preset_fields.GROUPS (иначе fieldForm() тихо не найдёт группу — "

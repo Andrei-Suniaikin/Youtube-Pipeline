@@ -75,6 +75,9 @@
   main{max-width:1180px;margin:0 auto;padding:26px 20px 70px}
   h1{font-size:26px;margin:0 0 5px;font-weight:750;letter-spacing:-.02em;color:var(--ink-hi)}
   .sub{color:var(--muted);margin:0 0 22px;font-size:14px}
+  /* Заголовок, у которого подзаголовок уехал под знак вопроса, сам держит отступ до
+     первой карточки: иначе экран начинался вплотную к ней. */
+  h1:last-child{margin-bottom:17px}
   .card{background:var(--card);border:1px solid var(--line);border-radius:var(--r)}
   .toolbar{display:flex;gap:9px;flex-wrap:wrap;align-items:center;margin-bottom:16px}
 
@@ -233,10 +236,48 @@
   .upsteps{display:flex;align-items:center;gap:5px;margin:5px 0 3px}
   .upstep{width:26px;height:3px;border-radius:2px;background:var(--line-2)}
   .upstep.on{background:var(--acc)}
-  .inline-ask{display:inline-flex;gap:6px;align-items:center;margin-left:8px;
+  /* Врезка-вопрос висит НАД содержимым, а не стоит в потоке рядом с кнопкой. В потоке
+     она была ещё одним элементом flex-шапки: от одного нажатия «Создать» заголовок
+     сужался, кнопка уезжала влево, а страница вырастала на полторы сотни пикселей
+     (жалоба владельца 21.09.2026 «всё съезжает»). Координаты ставит `inlineBox` от
+     самой кнопки — иначе врезка открывалась бы в углу карточки, далеко от нажатого.
+     Тень обязательна: поверх чужого текста одной рамки мало, чтобы отделить врезку
+     от того, что под ней.
+     Ширина — по содержимому, а предел — от экрана, не от контейнера: абсолютный блок
+     браузер иначе ужимает до ширины родителя, и в ячейке «×» шириной 64 px вопрос
+     складывался в столбик по одному слову. */
+  .inline-ask{position:absolute;z-index:30;display:inline-flex;gap:6px;align-items:center;
+              flex-wrap:wrap;white-space:normal;width:max-content;
+              max-width:min(440px,calc(100vw - 32px));
               padding:4px 8px;background:var(--card-2);border:1px solid var(--line-2);
-              border-radius:8px;font-size:13px}
+              border-radius:8px;font-size:13px;
+              box-shadow:0 16px 40px -14px rgba(0,0,0,.7)}
   .inline-ask .ask-in{width:210px}
+  /* Подпись поля и её знак вопроса — соседи, а не матрёшка: кнопка внутри <label>
+     недопустима по HTML и дописывает весь текст подсказки к имени поля — читалка
+     объявляла бы «Тема, вопрос, <абзац руководства>» на каждом заходе в поле. */
+  .lh{display:inline-flex;align-items:center;gap:6px}
+  div.lh>label,span.lh>label{margin:0}
+  .fldrow>.lh:first-child{min-width:175px}
+  .fldrow>.lh:first-child>label{color:var(--muted);font-size:12.5px;font-weight:550}
+  /* Знак вопроса у подписи. Руководство «за что отвечает это поле» раскрывается по нему,
+     а не стоит под каждым полем постоянной строкой: сплошной текст под формой человек
+     перестаёт читать целиком, и вместе с ним перестаёт видеть предупреждения про деньги
+     и необратимое. Те остаются открытым текстом и под знак вопроса не убираются. */
+  .q{display:inline-flex;align-items:center;justify-content:center;
+     width:16px;height:16px;padding:0;margin-left:6px;vertical-align:1px;
+     background:transparent;border:1px solid var(--line-2);border-radius:50%;
+     color:var(--muted);font-size:11px;font-weight:700;line-height:1;cursor:help;
+     transition:color .12s,border-color .12s,background .12s}
+  .q:hover,.q:focus-visible{background:var(--acc-dim);border-color:var(--acc);
+                            color:var(--ink-hi);outline:0}
+  /* Сама подсказка лежит в <body>, а не рядом со знаком: у карточек есть рамки и
+     собственная прокрутка, и внутри них подсказка обрезалась бы по краю карточки.
+     Координаты считает `hintShow` — от кнопки, как у врезок `inlineBox`. */
+  .qbox{position:absolute;z-index:40;max-width:min(330px,calc(100vw - 16px));
+        padding:9px 12px;background:var(--card-2);border:1px solid var(--line-2);
+        border-radius:9px;font-size:13px;line-height:1.5;color:var(--ink);
+        box-shadow:0 16px 40px -14px rgba(0,0,0,.7)}
   /* Значок вместо слова в колонке действий (жалоба владельца 20.09.2026: «в очереди
      огромные кнопки повторить и убрать, экран съезжает»). Слово задавало колонке свою
      ширину, и таблица ехала вбок на каждой строке, где действие вообще было. У значка
@@ -259,6 +300,18 @@
              font-size:13px;border-bottom:2px solid transparent;margin-bottom:-1px}
   .subtabs a:hover{color:var(--ink)}
   .subtabs a.on{color:var(--ink-hi);border-bottom-color:var(--acc)}
+  /* Число у вкладки — это КОЛИЧЕСТВО файлов, а не номер запуска. Владелец 21.09 прочёл
+     «Озвучка 2» как «вторая озвучка» и пошёл искать первую: цифра, стоящая рядом со
+     словом, читается порядковым номером. Цифра в кружке так не читается — кружок-счётчик
+     везде означает «сколько», и номера в него не пишут. Что именно сосчитано, говорит
+     подпись значка и сама вкладка, когда на неё зайти. */
+  .subtabs .cnt{display:inline-flex;align-items:center;justify-content:center;
+                min-width:19px;height:19px;margin-left:7px;padding:0 6px;
+                border:1px solid var(--line-2);border-radius:999px;
+                background:var(--card-2);color:var(--muted);
+                font-size:11px;font-weight:700;line-height:1;
+                font-variant-numeric:tabular-nums;vertical-align:1px}
+  .subtabs a.on .cnt{background:var(--acc-dim);border-color:var(--acc);color:var(--ink-hi)}
 
   /* Месяцы рядом, а не в столбик: канал с расписанием на квартал должен читаться
      одним взглядом, без прокрутки. */
@@ -301,6 +354,26 @@
   .sec .mklink{float:right;font-weight:500;font-size:12px;text-transform:none;
                letter-spacing:0;color:var(--acc-hi);text-decoration:none}
   .sec .mklink:hover{text-decoration:underline}
+  /* Заголовок карточки настроек этапа — он же строка действия: «Начать» стоит там, где
+     человек только что правил поля. Отдельной карточки «Действие» на одну кнопку больше
+     нет — рамка и заголовок занимали ~130 px над настройками и не сообщали ничего. */
+  .sec.stage-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:10px 18px}
+  .sec.stage-head .grow{flex:1 1 auto}
+  .sec.stage-head .note{margin:0;font-weight:500;letter-spacing:0}
+  /* Подвал той же карточки: как прошла запись и чем её откатить. Появляется, только
+     когда есть что сказать, — иначе это была бы пустая строка с линией над ней. */
+  .stage-foot{display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+              padding:11px 18px;border-top:1px solid var(--line)}
+  /* Свой display сильнее браузерного [hidden]{display:none} — без этой строки подвал
+     с атрибутом `hidden` так и остался бы на экране пустой полосой (та же ловушка,
+     что у #tx-keep-row на вкладке «Сценарий»). */
+  .stage-foot[hidden]{display:none}
+  /* Свёрнутые настройки этапа: остаётся строка заголовка с «Начать». Правилом по
+     детям карточки, а не `hidden` на каждом: у полосы пресета свой display, и он
+     сильнее атрибута (см. выше). Подвал записи НЕ сворачивается: «не сохранено» и
+     «Повторить» обязаны оставаться на виду, а пустой подвал прячет себя сам. */
+  .card.folded>:not(.sec):not(.stage-foot){display:none}
+  .stage-foot .note{margin:0}
   .back{display:inline-block;margin-bottom:13px;color:var(--muted);text-decoration:none}
   .back:hover{color:var(--ink-hi)}
   button.small{padding:6px 13px;border-radius:8px;font-size:13px}
@@ -369,6 +442,25 @@
   .modes{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
   .modes button{background:transparent;color:var(--muted);border:1px solid var(--line-2)}
   .modes button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+
+  /* Виды пресетов — один раскрывающийся список вместо одиннадцати кнопок в строке.
+     Строкой они занимали всю ширину шапки и читались как одиннадцать действий, хотя
+     это один выбор; выбранное теперь написано на самой кнопке. Список висит поверх
+     страницы по тому же правилу, что и `.inline-ask`: раскрытие фильтра не должно
+     двигать список, ради которого его и открыли. */
+  .pf-pick{position:relative}
+  .pf-menu{position:absolute;z-index:30;top:calc(100% + 6px);left:0;min-width:212px;
+           padding:6px;background:var(--card-2);border:1px solid var(--line-2);
+           border-radius:10px;box-shadow:0 16px 40px -14px rgba(0,0,0,.7)}
+  .pf-menu[hidden]{display:none}
+  .pf-item{display:block;width:100%;text-align:left;font-weight:500;
+           background:transparent;color:var(--muted);border:1px solid transparent}
+  .pf-item:hover{color:var(--ink-hi);background:var(--card)}
+  .pf-item.on{color:var(--ink-hi);background:var(--acc-dim);border-color:var(--acc)}
+  /* Черта отделяет виды пресетов производства от «Каналов» и «Озвучки Lumean»: это
+     не части одного ролика, а другие сущности, и выбор их сразу убирает производство
+     с экрана. Без черты набор читается как один плоский список равного. */
+  .pf-sep{height:1px;background:var(--line);margin:5px 6px}
   .fldrow{display:flex;gap:9px;align-items:center;margin-top:10px;flex-wrap:wrap}
   .fldrow>label:first-child{min-width:175px;color:var(--muted);font-size:12.5px;font-weight:550}
 
@@ -521,8 +613,8 @@ async function viewReleases(){
   ]);
 
   app.innerHTML = '';
-  app.append($(`<h1>Выпуски</h1>
-    <p class="sub">Путь ролика от донорской ссылки до подтверждённой публикации.</p>`));
+  app.append($(`<h1>Выпуски ${hintDot(
+    'Путь ролика от донорской ссылки до подтверждённой публикации.')}</h1>`));
 
   const bar = $(`<div class="toolbar">
     <select id="f-ch"><option value="">все каналы</option>${
@@ -714,9 +806,9 @@ function rewriteRowHtml(rw){
       ? '<span class="pill s-idle">серверный ключ владельца</span>'
       : '<span class="pill s-error">ключа нет — текст делать нечем</span>';
   return `<div class="secbody"><div class="note muted">Текст (Rewrite Studio): ${state}${
-    rw.own_openai ? ' <a href="#" id="rw-drop">снять свой</a>' : ''}
-    <br>Ключ для текста добавляется той же кнопкой ниже — провайдер
-    «OpenAI · текст (Rewrite Studio)».</div></div>`;
+    rw.own_openai ? ' <a href="#" id="rw-drop">снять свой</a>' : ''}${hintDot(
+    'Ключ для текста добавляется той же кнопкой ниже — провайдер '
+    + '«OpenAI · текст (Rewrite Studio)».')}</div></div>`;
 }
 
 /* Карточка своих ключей. Одна и та же на экране ключей и в профиле (20.09.2026):
@@ -732,7 +824,9 @@ function ownKeysCard(d, opts){
       ? '<a class="mklink" href="#/keys">очередь и отдых ключей →</a>' : ''}</div>
     ${o.note ? `<div class="secbody"><div class="note muted">${esc(o.note)}</div></div>` : ''}
     ${d.own_keys.length ? `<table><thead><tr>
-        <th>Пользователь</th><th>Провайдер</th><th>Ключей</th><th>Раздача</th>
+        <th>Пользователь</th><th>Провайдер</th>
+        <th>Ключей ${hintDot('Значение ключа нигде не показывается — только его хвост.')}</th>
+        <th>Раздача</th>
       </tr></thead><tbody>${d.own_keys.map(o2 => `<tr>
         <td>${esc(o2.user)}</td><td>${esc(o2.family)}</td>
         <td>${(o2.items || []).map(i => `<span class="mono"
@@ -743,9 +837,7 @@ function ownKeysCard(d, opts){
           ? '<span class="pill s-done">по кругу между ключами</span>'
           : '<span class="pill s-idle">ключ один</span>'}</td>
       </tr>`).join('')}</tbody></table>
-      <div class="sec" style="border-bottom:0;font-weight:400" class="muted">
-        Значение ключа нигде не показывается — только его хвост.
-      </div>`
+`
       : '<div class="empty">Свои ключи не заданы — всё идёт на серверные.</div>'}
     ${rewriteRowHtml(d.rewrite || {})}
     <div class="secbody" style="padding-top:0">
@@ -762,8 +854,7 @@ async function viewKeys(){
   const d = await api('/ui/keys');
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/profile">← в профиль</a>
-    <h1>Ключи</h1>
-    <p class="sub">Кто ждёт, сколько ждёт и когда снова заработает.</p>`));
+    <h1>Ключи ${hintDot('Кто ждёт, сколько ждёт и когда снова заработает.')}</h1>`));
 
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Занято прямо сейчас</div>
@@ -851,8 +942,8 @@ const CAL_CLS   = {done:'s-done', running:'s-running', blocked:'s-error',
 async function viewChannels(){
   const d = await api('/ui/channels');
   app.innerHTML = '';
-  app.append($(`<h1>Каналы</h1>
-    <p class="sub">Расписание выходов, план и история. Цвет карточки — состояние канала.</p>`));
+  app.append($(`<h1>Каналы ${hintDot(
+    'Расписание выходов, план и история. Цвет карточки — состояние канала.')}</h1>`));
 
   const bar = $(`<div class="toolbar"><span style="flex:1"></span>
     <button class="ghost" id="impch">Перенести списком</button>
@@ -1029,7 +1120,8 @@ async function channelReleases(id, d){
   const waiting = d.waiting_items || [];
   if (waiting.length){
     const card = $(`<div class="card">
-      <div class="sec">Ждут даты</div>
+      <div class="sec">Ждут даты ${hintDot('Дата назначится сама, как только у канала '
+        + 'появится расписание: очередь раскладывает ссылки по свободным выходам.')}</div>
       <table><thead><tr><th>Ролик</th><th>Поставлен</th><th style="width:90px"></th>
         </tr></thead><tbody>${waiting.map(w => `<tr data-id="${w.id}">
         <td><div style="font-weight:600">${esc(w.title || 'название неизвестно')}</div>
@@ -1039,9 +1131,7 @@ async function channelReleases(id, d){
         <td class="muted">${when(w.created)}</td>
         <td><button class="ghost small pl-del">Убрать</button></td></tr>`).join('')}
       </tbody></table>
-      <div class="secbody"><div class="note muted">Дата назначится сама, как только у
-        канала появится расписание: очередь раскладывает ссылки по свободным
-        выходам.</div></div></div>`);
+      </div>`);
     app.append(card);
     card.querySelectorAll('button.pl-del').forEach(b => b.onclick = () => {
       const id = b.closest('tr').dataset.id;
@@ -1268,7 +1358,9 @@ function donorsHtml(out){
 // заливщик. Экран показывает состояние, а не предлагает недопустимое действие.
 function uploadsCard(rows){
   return $(`<div class="card" style="margin-top:16px">
-    <div class="sec">Заливка на YouTube</div>
+    <div class="sec">Заливка на YouTube ${hintDot('Вердикт читается из состояния строки '
+      + 'в YouTube Studio, а не из текста на странице: для запланированного ролика '
+      + 'Studio пишет «Video published».')}</div>
     ${rows.map(u => `<div class="stage">
       <div class="dot ${u.verdict === 'scheduled' || u.verdict === 'published' ? 's-done'
                       : u.error ? 's-error'
@@ -1292,8 +1384,6 @@ function uploadsCard(rows){
           повторная заливка запрещена, только продолжение начатого</div>` : ''}
         ${u.error ? `<div class="note bad">${esc(u.error)}</div>` : ''}
       </div></div>`).join('')}
-    <div class="note muted">Вердикт читается из состояния строки в YouTube Studio, а не
-      из текста на странице: для запланированного ролика Studio пишет «Video published».</div>
   </div>`);
 }
 
@@ -1414,6 +1504,9 @@ function pauseCard(p){
         Обновите страницу.</div></div></div>`);
   if (!p.paused) return null;          // пауза не стоит — молчим, экран и так про работу
 
+  // Хвост про то, что правило пришло из прежней боевой системы, с экрана снят: откуда
+  // правило взялось — история разработки, а у паузы человеку нужен только факт, что
+  // чужой профиль тоже встал.
   const card = $(`<div class="card">
     <div class="sec">Выдача новых задач остановлена</div>
     <div class="stage">
@@ -1421,8 +1514,7 @@ function pauseCard(p){
       <div class="body">
         ${(p.lines || []).map(l => `<div class="facts">${esc(l)}</div>`).join('')}
         ${p.blocks_my_texts ? `<div class="note">Пока на паузе хоть один канал
-          промптов, новые тексты не заказываются ни в одном профиле — правило
-          унаследовано из боя.</div>` : ''}
+          промптов, новые тексты не заказываются ни в одном профиле.</div>` : ''}
       </div>
     </div>
     <div class="secbody">
@@ -1469,17 +1561,15 @@ async function viewPaidTexts(){
   const d = await api('/ui/paid-texts');
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/queue">← к очереди</a>
-    <h1>Оплачено, но не забрано</h1>
-    <p class="sub">Выпуски, за текст которых рерайту уже заплачено, а текста у нас
-      нет.</p>`));
+    <h1>Оплачено, но не забрано ${hintDot(
+      'Выпуски, за текст которых рерайту уже заплачено, а текста у нас нет.')}</h1>`));
 
   const run = $(`<div class="card">
-    <div class="sec">Забрать готовое</div>
+    <div class="sec">Забрать готовое ${hintDot('За одно нажатие опрашивается до '
+      + d.batch + ' задач; на неотвечающей задаче ответ ждём до 30 секунд, поэтому '
+      + 'проход идёт в фоне и показывает, сколько уже опрошено.')}</div>
     <div class="secbody">
       <div class="note">${esc(d.free || '')}</div>
-      <div class="note muted">За одно нажатие опрашивается до ${d.batch} задач; на
-        неотвечающей задаче ответ ждём до 30 секунд, поэтому проход идёт в фоне и
-        показывает, сколько уже опрошено.</div>
       <div style="margin-top:12px">
         <button id="pt-go">Забрать оплаченное (денег не тратит)</button></div>
       <div id="pt-state"></div>
@@ -1694,9 +1784,8 @@ async function viewQueue(){
   ]);
 
   app.innerHTML = '';
-  app.append($(`<h1>Очередь</h1>
-    <p class="sub">Всё, что сейчас делается, в одном списке.
-      <a href="#/paid-texts" style="margin-left:8px">Оплачено, но не забрано →</a></p>`));
+  app.append($(`<h1>Очередь ${hintDot('Всё, что сейчас делается, в одном списке.')}</h1>
+    <p class="sub"><a href="#/paid-texts">Оплачено, но не забрано →</a></p>`));
 
   // Порядок намеренный: «некому брать» важнее «выдача приостановлена» — при
   // выключенном исполнителе пауза вообще ни на что не влияет.
@@ -1749,6 +1838,9 @@ async function viewQueue(){
   // обещала «у остальных помечено» про весь список, а своим задачам признак
   // «не дочитано» не ставят вовсе (см. OWN_SERVICE) — то есть подпись отвечала и за те
   // строки, про которые не знала ничего.
+  // Последняя фраза подписи — не про отсутствие пометки, а про смысл пустой клетки:
+  // у Видео и Выпусков пусто значит «кабинет не записал», у соседей — «не дочитали».
+  // Без неё два разных пустых места на одном экране читались бы одинаково.
   const det = d.details || {};
   if (det.needed > det.asked)
     app.append($(`<div class="note muted" id="q-details" style="margin:-8px 0 14px">Подробности
@@ -1841,9 +1933,9 @@ async function viewNew(){
 
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/releases">← ко всем выпускам</a>
-    <h1>Новый выпуск по ссылке</h1>
-    <p class="sub">Ссылки раскладываются по свободным выходам канала.
-      Что не влезло в горизонт — сохранится без даты и займёт выход, как только он освободится.</p>`));
+    <h1>Новый выпуск по ссылке ${hintDot('Ссылки раскладываются по свободным выходам '
+      + 'канала. Что не влезло в горизонт — сохранится без даты и займёт выход, как '
+      + 'только он освободится.')}</h1>`));
 
   const form = $(`<div class="card" style="padding:16px">
     <div id="err"></div>
@@ -2399,8 +2491,8 @@ async function viewProjects(){
   const d = await api('/ui/projects');
   app.innerHTML = '';
   const bar = $(`<div class="head">
-      <div><h1>Проекты</h1>
-        <p class="sub">Материалы роликов: кадры, озвучка, готовые файлы.</p></div>
+      <div><h1>Проекты ${hintDot(
+        'Материалы роликов: кадры, озвучка, готовые файлы.')}</h1></div>
       <button id="newp" class="small">Новый проект</button>
     </div>`);
   app.append(bar);
@@ -3140,25 +3232,103 @@ const STAGE_OUTCOME_STATE = {};
 // чем будет неправда.
 const STAGE_OUTCOME_TTL_MS = 15000;
 
+// Пауза в наборе, после которой настройки этапа уезжают сами. 600–800 мс: короче —
+// и каждое слово в поле «Стиль» становится отдельной записью, длиннее — человек
+// успевает уйти с вкладки раньше своей правки.
+const STAGE_SAVE_MS = 700;
+// Поля, значение которых ДОНАБИРАЮТ и недобранное кабинет законно отвергает: у Lumean
+// голос и template_id — UUID (server/main.py:_normalize_lumean). Пауза в наборе для них
+// не значит «готово», поэтому они уезжают по уходу с поля, а не по таймеру. Иначе
+// экран показывал бы отказ на полуслове, хотя сервер прав.
+const STAGE_SAVE_ON_BLUR = new Set(['voice', 'voice_uuid']);
+// Тот же образец, что `_LUMEAN_TEMPLATE_ID_RE` в кабинете (server/main.py).
+const LUMEAN_TEMPLATE_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const LUMEAN_HOLD = 'Lumean запишется вместе с шаблоном — впишите его UUID в строку '
+  + 'языка или в «Голос по умолчанию».';
+// Досылает набранное на открытой вкладке этапа и ждёт ответа кабинета. Возвращает
+// причину, по которой записать не вышло, или null. Нужна платным кнопкам шапки
+// проекта: они видны, пока человек набирает, и без неё ушли бы со значениями ДО правки.
+let STAGE_FLUSH = null;
+// Какие свёрнутые настройки человек раскрыл сам, по `pid:tab`. Экран проекта
+// перерисовывается сам (после «Начать», при возврате на вкладку) — без этой памяти
+// раскрытое сворачивалось бы обратно у него на глазах.
+const STAGE_FOLD_OPEN = {};
+// Подписи состояния, при котором настройки свёрнуты.
+const STAGE_FOLD_WHY = {running: 'идёт', queued: 'в очереди',
+                        planned: 'в плане — стартует сам, когда дозреют материалы'};
+
 async function renderStageTab(d, tab){
   const p = d.project;
   const skey = p.id + ':' + tab;
   const groupTitle = TAB_SETTINGS_GROUP[tab];
   const settingsData = await api(`/ui/projects/${encodeURIComponent(p.id)}/settings`);
   const group = settingsData.groups.find(g => g.title === groupTitle);
-  let settingsForm = group ? fieldForm([group]) : null;
+  const settingsForm = group ? fieldForm([group]) : null;
+  // Сторож ухода от прошлой отрисовки этой же вкладки снимается здесь: экран сам
+  // перерисовывается через 1,2 с после удачного «Начать», и старое замыкание
+  // продолжало бы отвечать «не сохранено» за форму, которой уже нет на странице.
+  if (LEAVE_GUARD && LEAVE_GUARD.stageTab) LEAVE_GUARD = null;
 
-  // 1. Действие — «Начать» шлёт ТЕКУЩИЕ значения формы настроек этой вкладки
-  // (fieldForm(...).read()), чтобы старт не сбросил их на «как по умолчанию»
-  // (поправка оркестратора к §5.4).
-  const actCard = $(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Действие</div>
-    <div class="secbody">
-    <button id="stage-go">Начать</button>
-    <div id="stage-outcome" class="note"></div>
-    </div></div>`);
-  app.append(actCard);
-  const outcomeBox = actCard.querySelector('#stage-outcome');
+  // 1. Настройки этапа и действие — ОДНА карточка. Отдельная карточка «Действие» на
+  // одну кнопку убрана (жалоба владельца 21.09.2026: «места много, смысла в рамке
+  // нет»). Заголовок «Действие» не сообщал ничего — на вкладке «Озвучка» единственное
+  // действие и так озвучить, — а рамка с заголовком отодвигала настройки вниз на
+  // ~130 px, и до них надо было прокручивать. Теперь «Начать» стоит в заголовке той
+  // самой карточки, поля которой он и отправляет.
+  // Идентификаторы `stage-go` и `stage-outcome` — дословно прежние: на них держится
+  // проверка «призрачного отказа» (tests/test_stage_outcome_ttl_browser.py).
+  const goBtn = document.createElement('button');
+  goBtn.id = 'stage-go';
+  goBtn.textContent = 'Начать';
+  const outcomeBox = document.createElement('span');
+  outcomeBox.id = 'stage-outcome';
+  outcomeBox.className = 'note';
+  // Группы настроек у вкладки может и не быть — тогда от карточки остаётся одна строка
+  // действия: кнопке и её исходу пропадать не из-за чего.
+  const box = settingsForm || $(`<div class="card"><div class="sec"></div></div>`);
+  const sec = box.querySelector('.sec');
+  const headTitle = (sec.textContent || '').trim()
+    || (PROJECT_TABS.find(([k]) => k === tab) || ['', tab])[1];
+  const titleSpan = document.createElement('span');
+  titleSpan.className = 'grow';
+  titleSpan.textContent = headTitle;
+  sec.textContent = '';
+  sec.className = 'sec stage-head';
+  sec.append(titleSpan, outcomeBox, goBtn);
+  app.append(box);
+
+  // Этап идёт, ждёт в очереди или поставлен «Сделать всё» в план — настройки
+  // сворачиваются в одну строку (просьба владельца 21.09.2026: «они много места
+  // занимают»). Сворачивание — ради места, не запрет: у идущего и стоящего в очереди
+  // правка уже не изменит поставленное, а этап «в плане» стартует позже с ТЕКУЩИМИ
+  // настройками проекта — поэтому их можно развернуть и поправить. Раскрытое
+  // запоминается до конца работы этапа.
+  const segNow = ((p.stage && p.stage.segments) || []).find(x => x.stage === tab);
+  const foldState = (segNow && (segNow.state === 'running' || segNow.state === 'queued'))
+    ? segNow.state : ((p.planned || []).includes(tab) ? 'planned' : '');
+  const foldCard = settingsForm ? box.querySelector('.card') : null;
+  if (!foldState) delete STAGE_FOLD_OPEN[skey];
+  if (foldCard && foldState){
+    const why = document.createElement('span');
+    why.id = 'stage-fold-why';
+    why.className = 'note muted';
+    why.textContent = STAGE_FOLD_WHY[foldState];
+    const foldBtn = document.createElement('button');
+    foldBtn.type = 'button';
+    foldBtn.id = 'stage-fold';
+    foldBtn.className = 'ghost small';
+    const paintFold = () => {
+      const open = !!STAGE_FOLD_OPEN[skey];
+      foldCard.classList.toggle('folded', !open);
+      foldBtn.textContent = open ? 'Свернуть настройки' : 'Настройки';
+      foldBtn.setAttribute('aria-expanded', String(open));
+    };
+    foldBtn.onclick = () => { STAGE_FOLD_OPEN[skey] = !STAGE_FOLD_OPEN[skey]; paintFold(); };
+    titleSpan.after(why);
+    goBtn.before(foldBtn);
+    paintFold();
+  }
+
   // Показать исход предыдущего нажатия сразу же — переживает перерисовку экрана.
   const savedOutcome = STAGE_OUTCOME_STATE[skey];
   if (savedOutcome && Date.now() - (savedOutcome.at || 0) > STAGE_OUTCOME_TTL_MS){
@@ -3167,9 +3337,12 @@ async function renderStageTab(d, tab){
     outcomeBox.textContent = savedOutcome.text;
     outcomeBox.classList.add(savedOutcome.cls);
   }
-  actCard.querySelector('#stage-go').onclick = async () => {
-    const btn = actCard.querySelector('#stage-go');
-    btn.disabled = true;
+  // «Начать» шлёт ТЕКУЩИЕ значения формы настроек этой вкладки (fieldForm(...).read()),
+  // чтобы старт не сбросил их на «как по умолчанию» (поправка оркестратора к §5.4).
+  // Автосохранение ниже этого не отменяет: пустое тело кабинет трактует как
+  // `engine="edge"` и молча увёл бы проект с Lumean (web/app.py:7322-7352).
+  goBtn.onclick = async () => {
+    goBtn.disabled = true;
     outcomeBox.className = 'note';
     outcomeBox.textContent = 'запускаю…';
     // Адрес на момент нажатия — чтобы отложенное обновление ниже не сработало,
@@ -3195,25 +3368,229 @@ async function renderStageTab(d, tab){
       STAGE_OUTCOME_STATE[skey] = {text: e.message, cls: 'bad', at: Date.now()};
       outcomeBox.textContent = e.message;         // текст кабинета как есть (принцип 3)
       outcomeBox.classList.add('bad');
-    }finally{ btn.disabled = false; }
+    }finally{ goBtn.disabled = false; }
   };
 
-  // 2. Настройки этапа — та же fieldForm/группа, что и в общих настройках проекта,
-  // сохранение — той же ручкой (§3: путь переиспользуется без изменений).
+  // 2. Настройки этапа сохраняются САМИ — кнопки «Сохранить» здесь больше нет.
+  // Ручка та же, что была у неё: POST /ui/projects/{pid}/settings. Кабинет по ней
+  // только СЛИВАЕТ присланные ключи в projects.settings (_mutate_project_settings,
+  // BEGIN IMMEDIATE, слиянием) — ни задачи, ни списания. Поэтому запись по паузе в
+  // наборе ничего не запускает и ни за что не платит.
+  // Автосохранение стоит ТОЛЬКО здесь. Ни «Начать» (/stage/{kind} ставит платную
+  // задачу), ни «Сделать всё» (/run — весь конвейер), ни вкладка «Обложка» (платный
+  // заказ), ни источник сценария (/source затирает source.txt без второй копии)
+  // сами не отправляются: там «сохранить» означает работу и деньги.
   if (settingsForm){
-    app.append(settingsForm);
-    // «Отмена» тут не адрес — вкладка сама и есть текущий экран, у неё нет отдельной
-    // страницы «назад» (Issue 8: ссылка на тот же hash не делала ничего). Вместо
-    // перехода — построить форму заново из тех же данных, что пришли с сервера,
-    // отбросив несохранённые правки на месте.
-    app.append(saveBar(location.hash,
-      () => post(`/ui/projects/${encodeURIComponent(p.id)}/settings`,
-                 {values: settingsForm.read()}),
-      () => {
-        const fresh = fieldForm([group]);
-        settingsForm.replaceWith(fresh);
-        settingsForm = fresh;
-      }));
+    const foot = $(`<div class="stage-foot" hidden>
+      <span id="stage-save" class="note"></span>
+      <button type="button" id="stage-retry" class="ghost small" hidden>Повторить</button>
+      <button type="button" id="stage-undo" class="ghost small" hidden
+              style="margin-left:auto"
+              title="вернёт значения, какими они были при открытии вкладки, и запишет их"
+        >Вернуть как было</button>
+      </div>`).firstElementChild;
+    box.querySelector('.card').append(foot);
+    const status = foot.querySelector('#stage-save');
+    const retryBtn = foot.querySelector('#stage-retry');
+    const undoBtn = foot.querySelector('#stage-undo');
+
+    const entry = settingsForm.read();       // что лежало на сервере при входе на вкладку
+    const saved = Object.assign({}, entry);  // что лежит там сейчас
+    let timer = null, inFlight = false, again = false, failReason = null, held = null;
+
+    // Слияние на сервере позволяет слать ТОЛЬКО отличия; пустое тело ручка отвергает
+    // (web/app.py:7306), и это правильно — сохранять нечего.
+    const diff = from => {
+      const now = settingsForm.read(), out = {};
+      for (const k in now) if (!sameValue(now[k], from[k])) out[k] = now[k];
+      return out;
+    };
+    const paint = () => {
+      undoBtn.hidden = !Object.keys(diff(entry)).length;
+      retryBtn.hidden = !failReason;
+      foot.hidden = undoBtn.hidden && retryBtn.hidden && !status.textContent;
+      // Откатывать стало нечего, пока висел вопрос, — вопрос снимается, а кнопка
+      // возвращается в строй. Иначе он прятался вместе с подвалом и всплывал потом
+      // устаревшим, а кнопка оставалась выключенной до перерисовки экрана.
+      if (undoBtn.hidden){
+        const ask = foot.querySelector('.inline-ask');
+        if (ask) ask.remove();
+        undoBtn.disabled = false;
+      }
+    };
+    const say = (text, cls) => {
+      status.className = 'note' + (cls ? ' ' + cls : '');
+      status.textContent = text;
+      paint();
+    };
+    const myHash = location.hash;
+    const guardOff = () => {
+      if (LEAVE_GUARD && LEAVE_GUARD.stageTab === skey) LEAVE_GUARD = null;
+    };
+    // Сторож один на оба случая: запись отвергнута или придержана. Текст читается в
+    // момент ухода, а не в момент постановки — к тому времени причина могла смениться.
+    const guardOn = () => {
+      if (!settingsForm.isConnected) return;
+      LEAVE_GUARD = {stageTab: skey, hash: myHash, keep: h => h === myHash,
+                     dirty: () => failReason != null || held != null,
+                     get what(){
+                       return failReason != null
+                         ? `Настройки «${headTitle}» не сохранены: ${failReason}.`
+                         : `Движок Lumean в «${headTitle}» не записан: ему нужен шаблон.`;
+                     }};
+    };
+    // Выбор «Lumean» в «Движке» — первый шаг настройки, а не готовое значение: кабинет
+    // законно отвергает Lumean без UUID шаблона (`_normalize_lumean_settings`), а поле
+    // шаблона человек заполнит только следующим шагом. Отправь мы движок сразу — первый
+    // же клик давал бы красное «не сохранено», тост и сторож ухода. Поэтому движок
+    // придерживается, пока шаблона нет нигде: ни в «Голосе по умолчанию», ни в
+    // template_id, ни в строке карты языков. Остальные правки уходят как обычно.
+    // Неверный UUID в строке языка НЕ придерживается: его человек уже вписал, и отказ
+    // кабинета с объяснением — ровно то, что ему нужно увидеть.
+    const holdLumean = values => {
+      if (!('engine' in values)) return null;
+      const now = settingsForm.read();
+      if (String(now.engine || '').trim().toLowerCase() !== 'lumean') return null;
+      const uuid = v => LUMEAN_TEMPLATE_RE.test(String(v || '').trim());
+      const rows = String(now.voice_by_lang || '').split(/[,\n]/).filter(c => {
+        const i = c.indexOf(':');
+        return i > 0 && c.slice(0, i).trim() && c.slice(i + 1).trim();
+      });
+      if (uuid(now.voice) || uuid(now.voice_uuid) || rows.length) return null;
+      delete values.engine;
+      return LUMEAN_HOLD;
+    };
+
+    const send = async () => {
+      clearTimeout(timer); timer = null;
+      // Один запрос в полёте: _mutate_project_settings берёт BEGIN IMMEDIATE на одну
+      // строку, а пульт ждёт кабинет синхронно до 18 с. Набор в поле иначе породил бы
+      // хвост параллельных записей; следующая уходит одна, из последнего состояния.
+      if (inFlight){ again = true; return; }
+      const values = diff(saved);
+      const wasHeld = held;
+      held = holdLumean(values);
+      if (held) guardOn();
+      else if (wasHeld && failReason == null) guardOff();
+      if (!Object.keys(values).length){
+        // Форма снова совпадает с сервером — прежний отказ больше ни о чём. Без этого
+        // «не сохранено» висело бы вечно, «Повторить» слал бы пустоту, сторож ухода
+        // пугал потерей, которой нет, а «Сделать всё» отказывалось бы запускать.
+        const hadFail = failReason != null;
+        if (hadFail){ failReason = null; if (!held) guardOff(); }
+        if (held) say(held, 'warn');
+        else if (wasHeld || hadFail) say('');
+        return;
+      }
+      inFlight = true;
+      say('сохраняю…');
+      try{
+        await post(`/ui/projects/${encodeURIComponent(p.id)}/settings`, {values});
+        Object.assign(saved, values);
+        failReason = null;
+        if (held) say(held, 'warn');
+        else { guardOff(); say('сохранено ' + new Date().toTimeString().slice(0, 5)); }
+      }catch(e){
+        // Набранное НЕ откатываем и снимок несохранённого держим: «Lumean требует UUID
+        // Template ID» — законный ответ на недобранное поле, а не сбой, и дописать его
+        // человек может только в своём же значении. Следующая правка отправит
+        // непрошедшее вместе с новым.
+        const firstOfSeries = failReason == null;
+        failReason = e.message;
+        // Кнопки «Сохранить» больше нет — значит, и защиты от потери нет. Её место
+        // занимает сторож ухода, и только на «не сохранено»: пока запись проходит,
+        // спрашивать не о чем, правка уже на сервере.
+        // Если отказ пришёл, когда вкладку уже покинули (запись уходит и по уходу с
+        // поля), сторожу нечего стеречь: формы с набранным на странице нет, и
+        // «остаться» ничего не вернёт. Тогда остаётся сказать словами — тостом ниже.
+        guardOn();
+        say('не сохранено: ' + e.message, 'bad');
+        if (firstOfSeries) toast(e.message);   // один тост на серию, а не на букву
+      }finally{
+        inFlight = false;
+        if (again){ again = false; send(); }
+      }
+    };
+    const arm = () => { clearTimeout(timer); timer = setTimeout(send, STAGE_SAVE_MS); };
+
+    // Карта голосов шлёт `change` со скрытого поля на КАЖДУЮ букву в строке id
+    // (wireLangMap.sync через setFieldValue) — при Lumean это недобранный UUID.
+    // Такие поля ждут ухода с поля; всё остальное — селекты, переключатели, выбор
+    // шаблона, пресет соседа — приходит готовым значением и уезжает сразу.
+    const slow = el => !!(el && el.closest && (el.closest('.langmap')
+      || STAGE_SAVE_ON_BLUR.has((el.dataset || {}).key)));
+    const stillTyping = () => {
+      const a = document.activeElement;
+      return !!(a && a.classList && a.classList.contains('lm-voice'));
+    };
+    settingsForm.addEventListener('input', ev => {
+      paint();
+      if (!slow(ev.target)) arm();
+    });
+    settingsForm.addEventListener('change', ev => {
+      paint();
+      if (slow(ev.target) && stillTyping()) return;
+      send();
+    });
+    settingsForm.addEventListener('focusout', () => { paint(); send(); });
+    retryBtn.onclick = () => send();
+
+    STAGE_FLUSH = async () => {
+      if (!settingsForm.isConnected) return null;
+      for (let i = 0; i < 400; i++){
+        if (!inFlight){
+          await send();                      // нечего слать — вернётся сразу
+          if (failReason != null) return failReason;
+          if (held) return held;
+          if (!inFlight && !Object.keys(diff(saved)).length) return null;
+        }
+        await new Promise(r => setTimeout(r, 50));
+      }
+      return 'кабинет не ответил на запись настроек';
+    };
+
+    // Откат при автосохранении — это ЗАПИСЬ: набранное уже лежит на сервере, и вернуть
+    // одну форму значило бы показывать человеку не то, что хранится. Поэтому «Вернуть
+    // как было» отправляет значения на момент открытия вкладки и перерисовывает экран —
+    // форма собирается из ответа сервера, а не из нашей памяти о нём.
+    undoBtn.onclick = async () => {
+      // Нажатие мышью сперва снимает фокус с поля, а `focusout` зовёт `send()`. Без
+      // ожидания получались ДВА одновременных запроса в одну строку настроек:
+      // набранное и возвращаемое. Порядок прихода не определён, и если набранное
+      // ложилось последним, на сервере оставалось оно, а экран показывал возвращённое.
+      // Поэтому откат ждёт, пока текущая запись закончится, и запрещает следующую.
+      clearTimeout(timer);
+      again = false;
+      undoBtn.disabled = true;
+      let spins = 0;
+      while (inFlight && spins++ < 200) await new Promise(r => setTimeout(r, 50));
+
+      const count = Object.keys(diff(entry)).length;
+      if (!count){ undoBtn.disabled = false; return; }
+      // Откат ПИШЕТ на сервер и возвращает всё, что изменилось с открытия вкладки, —
+      // в том числе правки, сохранённые давно. Это самое сильное действие на экране,
+      // и спрашивать о нём обязательно: в проекте подтверждают куда меньшее.
+      confirmInline(undoBtn,
+        `Вернуть ${count} настр. к значениям на момент открытия `
+        + `вкладки? Это запишется на сервер.`,
+        async () => {
+          // Что откатывать — считаем в момент ответа, а не вопроса: пока он висел,
+          // человек мог поправить форму ещё раз.
+          const values = {};
+          Object.keys(diff(entry)).forEach(k => { values[k] = entry[k]; });
+          if (!Object.keys(values).length){ undoBtn.disabled = false; return; }
+          try{
+            inFlight = true;
+            await post(`/ui/projects/${encodeURIComponent(p.id)}/settings`, {values});
+            failReason = null;
+            guardOff();
+            await viewProject(p.id);
+          }catch(e){ toast(e.message); undoBtn.disabled = false; }
+          finally{ inFlight = false; }
+        },
+        () => { undoBtn.disabled = false; });
+    };
+    paint();
   }
 
   // 3. Результат
@@ -3423,11 +3800,11 @@ async function refreshScenarioJobs(box, pid, srcTextEl){
     if (i > 0){ const [j] = jobs.splice(i, 1); jobs.unshift(j); }
   }
   box.innerHTML = `<div class="note muted" style="margin:14px 0 8px">Задачи текста этого
-    проекта — поставленные из этой вкладки, новые сверху.</div>
+    проекта ${hintDot('Здесь поставленные из этой вкладки, новые сверху. '
+      + 'Нажмите на строку — покажется результат.')}</div>
     ${jobs.length ? `<table><thead><tr>
       <th>Задача</th><th>Вид</th><th>Языки</th><th>Состояние</th><th>Создана</th></tr></thead>
-      <tbody>${jobs.map(scenJobRowHtml).join('')}</tbody></table>
-      <div class="note muted">Нажмите на строку — покажется результат.</div>`
+      <tbody>${jobs.map(scenJobRowHtml).join('')}</tbody></table>`
       : '<div class="empty">У проекта задач текста пока нет.</div>'}`;
   wireProjectJobRows(box, 'rewrite', 5, (jid, host) => paintTextTake(jid, host, pid, srcTextEl));
 
@@ -3480,9 +3857,10 @@ async function renderScenarioTab(d){
   // POST /ui/source/detect. Свои правила разбора в браузере рано или поздно
   // разошлись бы с серверными, и разошлись бы на платном заказе.
   //
-  // Смыслы при этом не свалены в кучу: «Сохранить сценарий»/«Запомнить ссылку» —
-  // бесплатно и сразу, «Получить текст» — платный заказ у рерайта. Что произойдёт по
-  // нажатию, написано рядом с каждой кнопкой ДО нажатия.
+  // Смыслы при этом не свалены в кучу: «Сохранить сценарий» — бесплатно и сразу,
+  // «Получить текст» — платный заказ у рерайта. Что произойдёт по нажатию, написано
+  // рядом с каждой кнопкой ДО нажатия. Ссылку донора кнопкой больше не запоминают —
+  // она запоминается сама, как только сервер её распознал (см. `rememberLink`).
   let origin = d.origin || {};
   if (st.any === null){
     // Первый заход на вкладку: поле заполняется тем, что записано у проекта — это
@@ -3511,8 +3889,10 @@ async function renderScenarioTab(d){
     </div>
 
     <div id="tx-auto">
-      <label class="k" for="tx-any" style="display:block;margin-bottom:6px">Ссылка на
-        ролик-донор или готовый текст сценария — в одно поле</label>
+      <div class="lh" style="display:flex;margin-bottom:6px"><label class="k"
+        for="tx-any">Ссылка на ролик-донор или готовый текст сценария</label>${
+        hintDot('И то и другое вставляется в одно и то же поле — сервер сам разбирает, '
+        + 'что ему дали.')}</div>
       <textarea id="tx-any" rows="1" style="min-height:0"
         placeholder="https://www.youtube.com/watch?v=… — или вставьте сюда сам текст"
         >${esc(st.any)}</textarea>
@@ -3528,10 +3908,10 @@ async function renderScenarioTab(d){
     </div>
 
     <div id="tx-topic-box" hidden>
-      <label class="k" for="tx-one" style="display:block;margin-bottom:6px">Тема</label>
+      <div class="lh" style="display:flex;margin-bottom:6px"><label class="k"
+        for="tx-one">Тема</label>${hintDot(topicMode.note)}</div>
       <input id="tx-one" style="width:100%;box-sizing:border-box"
         placeholder="О чём должен быть ролик" value="${esc(st.topic)}">
-      <div class="note muted">${esc(topicMode.note)}</div>
     </div>
 
     <div class="note muted" id="tx-keep-head" style="margin-top:16px;
@@ -3692,6 +4072,7 @@ async function renderScenarioTab(d){
       if (!card.isConnected || anyBox.value !== asked) return null;
       st.seen = out; st.seenFor = asked;
       paintSeen();
+      await rememberLink(out);
       return out;
     }catch(e){
       if (!card.isConnected || anyBox.value !== asked) return null;
@@ -3707,16 +4088,64 @@ async function renderScenarioTab(d){
 
   const ensureSeen = async () => currentSeen() || await askSeen();
 
+  // Та же ли это ссылка, что записана у проекта. По идентификатору ролика, а не по
+  // строке: голый id сервер собирает в полную ссылку, и `youtu.be/X` с
+  // `watch?v=X` — один донор. Переписывать запись из-за формы адреса незачем.
+  const sameVideo = (seen, o) => !!(seen && o && (
+    (seen.video_id && seen.video_id === o.video_id) || seen.value === o.donor_url));
+
+  // Ссылка донора запоминается сама, как только сервер её распознал (просьба
+  // владельца 21.09.2026: «блок с запомнить ссылку убираем, ссылка запоминается
+  // сама»). Это ровно та запись, что делала кнопка, — бесплатная, без заказа и без
+  // `source.txt`, — поэтому спрашивать о ней незачем.
+  // Не пишет то, что уже записано, и не возвращает ссылку, которую человек только что
+  // велел забыть: она осталась в поле, а состояние вкладки переживает перерисовку
+  // экрана, и без этой пометки забытая ссылка записалась бы обратно при следующем
+  // же открытии вкладки. Пометку снимает только правка поля.
+  async function rememberLink(seen){
+    if (!seen || seen.kind !== 'link' || !seen.value) return;
+    if (sameVideo(seen, origin) || st.forgot === seen.value) return;
+    try{
+      const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`,
+                             {link: seen.value});
+      st.linkFail = null;
+      if (!card.isConnected) return;
+      paintOrigin(out.origin);
+      paintActions();
+      // Разбор спрошен ДО записи, и его предупреждение («у проекта записана другая
+      // ссылка — заказ по новой её заменит») после записи уже неправда. Спрашиваем
+      // заново: разбор бесплатный, а предупреждение о повторе — про деньги и должно
+      // быть свежим. Повторной записи не будет: ссылка теперь та же, что записана.
+      if (st.seenFor != null && st.seenFor === anyBox.value) await askSeen();
+    }catch(e){
+      st.linkFail = {value: seen.value, message: e.message};
+      if (!card.isConnected) return;
+      paintActions();
+    }
+  }
+
   function paintActions(){
     const topic = (st.mode === 'topic');
     const seen = currentSeen();
     const langsOk = st.langs.size > 0;
     const kind = seen ? seen.kind : '';
-    if (kind === 'link'){
-      keep.textContent = 'Запомнить ссылку';
+    // Запись ссылки не прошла — это держится на экране, пока ссылка та же, и кнопка
+    // возвращается как повтор. Без этого любая следующая перерисовка (галочка языка,
+    // выбор брифа) писала поверх отказа «ссылка запоминается сама», и человек верил,
+    // что обложка её подхватит.
+    const linkFail = (kind === 'link' && st.linkFail && st.linkFail.value === seen.value)
+      ? st.linkFail : null;
+    keep.hidden = (kind === 'link') && !linkFail;
+    if (linkFail){
+      keep.textContent = 'Запомнить ссылку ещё раз';
       keep.disabled = false;
-      keepWhy.textContent = 'ссылка запишется у проекта; текста это не создаёт и денег '
-                          + 'не стоит';
+      keepWhy.textContent = 'ссылку запомнить не удалось: ' + linkFail.message;
+    }else if (kind === 'link'){
+      keepWhy.textContent = sameVideo(seen, origin)
+        ? 'ссылка запомнена у проекта — вкладка «Обложка» подставит её сама'
+        : (st.forgot === seen.value
+           ? 'эту ссылку велели забыть — поправьте поле, и она запомнится снова'
+           : 'ссылка запоминается у проекта сама — денег это не стоит');
     }else if (kind === 'text'){
       keep.textContent = 'Сохранить сценарий';
       keep.disabled = false;
@@ -3802,6 +4231,7 @@ async function renderScenarioTab(d){
 
   anyBox.oninput = () => {
     st.any = anyBox.value;
+    st.forgot = null;                       // поле правили — воля «забыть» исчерпана
     st.seen = null; st.seenFor = null;      // старый разбор — про другой текст
     grow();
     paintSeen();
@@ -3820,15 +4250,18 @@ async function renderScenarioTab(d){
     + 'Уже поставленные по ней задачи останутся: забывается запись, а не задача.',
     async () => {
       try{
+        const was = currentSeen();
         const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`,
                                {link: ''});
+        st.forgot = (was && was.kind === 'link') ? was.value : (origin.donor_url || null);
         paintOrigin(out.origin);
         // Разбор поля заново НЕ спрашиваем, хотя ответ сервера теперь был бы другим:
         // в нём висит предупреждение «по этой ссылке уже заказывали», и оно про
         // потраченные деньги, а не про запись. Забыли мы запись — заказ остался, и
         // снимать с человека это предупреждение было бы враньём в дорогую сторону.
-        toast('Ссылка забыта. В поле она осталась — «Запомнить ссылку» вернёт запись '
-              + 'обратно.', 'ok');
+        toast('Ссылка забыта. В поле она осталась, но сама больше не запомнится — '
+              + 'поправьте поле, если передумаете.', 'ok');
+        paintActions();
       }catch(e){ toast(e.message); }
     });
 
@@ -3900,10 +4333,7 @@ async function renderScenarioTab(d){
     keep.disabled = true;
     try{
       if (seen.kind === 'link'){
-        const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`,
-                               {link: seen.value});
-        paintOrigin(out.origin);
-        toast('Ссылка донора запомнена у проекта', 'ok');
+        await rememberLink(seen);          // кнопка у ссылки скрыта; сюда — только гонкой
       }else if (seen.kind === 'text'){
         const text = anyBox.value;
         const cur = srcText.value;
@@ -4001,7 +4431,8 @@ async function renderScenarioTab(d){
 const COVER_STATE = {};
 function coverState(pid){
   if (!COVER_STATE[pid]) COVER_STATE[pid] = {mode: 'url', langs: new Set(), preset: '',
-                                             option: 0, edit: false, n: 3, lastJob: null};
+                                             option: 0, edit: false, n: 3, lastJob: null,
+                                             urls: '', urlsOffered: ''};
   return COVER_STATE[pid];
 }
 
@@ -4061,11 +4492,11 @@ async function refreshCoverJobs(box, pid){
     if (i > 0){ const [j] = jobs.splice(i, 1); jobs.unshift(j); }
   }
   box.innerHTML = `<div class="note muted" style="margin:14px 0 8px">Задачи обложек этого
-    проекта — поставленные из этой вкладки, новые сверху.</div>
+    проекта ${hintDot('Здесь поставленные из этой вкладки, новые сверху. '
+      + 'Нажмите на строку — покажутся готовые обложки.')}</div>
     ${jobs.length ? `<table><thead><tr>
       <th>Задача</th><th>Состояние</th><th>Создана</th></tr></thead>
-      <tbody>${jobs.map(coverJobRowHtml).join('')}</tbody></table>
-      <div class="note muted">Нажмите на строку — покажутся готовые обложки.</div>`
+      <tbody>${jobs.map(coverJobRowHtml).join('')}</tbody></table>`
       : '<div class="empty">У проекта задач обложек пока нет.</div>'}`;
   wireProjectJobRows(box, 'cover', 3, (jid, host) => paintCoverTake(jid, host, pid));
 
@@ -4101,10 +4532,12 @@ async function renderCoverTab(d){
   const st = coverState(p.id);
   const cd = await api('/ui/covers');
 
+  // Заголовок называет само действие, а не слово «Действие»: под ним стояла ещё и
+  // подпись «Сделать обложку» — то есть карточка объясняла себя дважды и ни разу
+  // в заголовке (жалоба владельца 21.09.2026 про пустые рамки на вкладках этапов).
   const card = $(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Действие</div>
+    <div class="sec">Сделать обложку</div>
     <div class="secbody">
-    <div class="note muted" style="margin-bottom:6px">Сделать обложку</div>
     <div class="modes">${cd.modes.map(m => `<button type="button" data-mode="${
       esc(m.key)}" class="${m.key === st.mode ? 'on' : ''}">${esc(m.title)}</button>`
       ).join('')}</div>
@@ -4130,8 +4563,7 @@ async function renderCoverTab(d){
     </div>
     <div id="cv-edit-box" style="margin-top:10px"></div>
     <div class="note muted" style="margin-top:12px">Соотношение сторон —
-      <b>${esc(cd.aspect)}</b>, всегда. У обложки YouTube оно одно, поэтому его здесь
-      не спрашивают и не дают выбрать; в задачу оно уходит явно, а не «по умолчанию».</div>
+      <b>${esc(cd.aspect)}</b>, всегда. У обложки YouTube оно одно.</div>
     <div style="margin-top:12px"><button id="cv-go">Запустить</button></div>
     <div id="cv-jobs"></div>
     </div></div>`);
@@ -4148,9 +4580,41 @@ async function renderCoverTab(d){
     // заголовка без полной перерисовки вкладки.
     const langs = [...st.langs];
     if (m === 'url'){
+      // Ссылка, запомненная на вкладке «Сценарий», подставляется сама (просьба
+      // владельца 21.09.2026) — но только в ПУСТОЕ поле и только один раз: стёртую
+      // человеком обратно не возвращаем. Запуск по-прежнему за кнопкой, а откуда
+      // взялась ссылка, сказано под полем — подстановка не должна выглядеть как
+      // чужая правка.
+      const known = (d.origin && (d.origin.donor_url || d.origin.release_url)) || '';
+      // Подставленное нами и не тронутое человеком следует за запомненной ссылкой:
+      // сменили или забыли её на «Сценарии» — меняется и здесь. Иначе в поле тихо
+      // оставался прежний донор, подпись «подставлена» пропадала (он уже не совпадал
+      // с запомненным), и платная обложка уходила по ролику, от которого отказались.
+      if (st.urlsOffered && st.urls === st.urlsOffered && known !== st.urlsOffered){
+        st.urls = '';
+        st.urlsOffered = '';
+      }
+      if (known && st.urlsOffered !== known && !String(st.urls || '').trim()){
+        st.urls = known;
+        st.urlsOffered = known;
+      }
+      const offered = !!known && st.urls === known;
       fields.innerHTML = `<label class="k" style="display:block;margin-bottom:6px"
         >Ссылки на доноров, по одной в строке</label>
-        <textarea id="cv-urls" placeholder="https://www.youtube.com/watch?v=…"></textarea>`;
+        <textarea id="cv-urls" placeholder="https://www.youtube.com/watch?v=…"
+          >${esc(st.urls)}</textarea>
+        <div class="note muted" id="cv-urls-from"${offered ? '' : ' hidden'}>${
+          // Своей ссылки нет — сервер кладёт в `donor_url` ссылку выпуска и помечает
+          // это `from: 'release'`. Называть её «запомненной на Сценарии» — неправда:
+          // там её никто не запоминал.
+          (d.origin && (d.origin.from === 'release' || !d.origin.donor_url))
+            ? 'подставлена ссылка выпуска канала'
+            : 'подставлена ссылка, запомненная на вкладке «Сценарий»'}</div>`;
+      const ta = fields.querySelector('#cv-urls');
+      ta.oninput = () => {
+        st.urls = ta.value;
+        fields.querySelector('#cv-urls-from').hidden = !(known && ta.value === known);
+      };
     } else if (m === 'title'){
       fields.innerHTML = langs.length
         ? `<label class="k" style="display:block;margin-bottom:6px">Заголовок на
@@ -4359,6 +4823,11 @@ async function viewProject(id){
     const btn = runBox.querySelector('#rgo');
     btn.disabled = true;
     try{
+      // Правка на вкладке этапа ждёт паузы в наборе; запуск, попавший в эту паузу,
+      // оплатил бы конвейер по значениям ДО правки. Сначала досылаем, и если записать
+      // не вышло — не запускаем: экран показывает одно, а платить пришлось бы за другое.
+      const why = STAGE_FLUSH ? await STAGE_FLUSH() : null;
+      if (why){ toast('Не запускаю — настройки этапа не записаны: ' + why); return; }
       const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/run`, {
         sentences_per_prompt: runBox.querySelector('#r-spp').value,
         model: runBox.querySelector('#r-model').value,
@@ -4403,15 +4872,16 @@ async function viewProject(id){
   const tabsBox = $(`<div class="subtabs">${PROJECT_TABS.map(([k, title]) => {
     const codes = TAB_FILES[k] || [];
     const n = d.files.filter(g => codes.includes(g.code)).reduce((a, g) => a + g.count, 0);
-    // Голая цифра рядом с названием этапа читается как ПОРЯДКОВЫЙ НОМЕР запуска —
-    // владелец 21.09 так её и прочёл: «запускаю озвучку, она записывается как озвучка 1,
-    // потом озвучка 2, не понимаю почему». На деле это число ФАЙЛОВ: EdgeTTS не берёт
-    // больше 4000 знаков за раз, и один запуск режет текст на куски. Поэтому у звука
-    // и видео единица измерения пишется словом, а не подразумевается.
-    const unit = PART_TABS.has(k) ? ' ' + partsWord(n) : '';
+    // Что считает цифра: у звука и видео это куски ОДНОГО результата (EdgeTTS не берёт
+    // больше 4000 знаков за раз, видео режется по сценам), у остальных — просто файлы.
+    // Словом единица измерения больше не пишется: она удлиняла полосу вкладок вдвое, а
+    // от чтения цифры номером спасает не слово, а форма значка (см. `.subtabs .cnt`).
+    const what = `файлов: ${n}` + (PART_TABS.has(k)
+      ? ` (${partsWord(n)} одного результата)` : '');
     return `<a href="#/project/${encodeURIComponent(id)}/${k}"
-      class="${tab === k ? 'on' : ''}">${esc(title)}${
-        n ? ` <span class="muted">${n}${unit}</span>` : ''}</a>`;
+      class="${tab === k ? 'on' : ''}">${esc(title)}${n
+        ? ` <span class="cnt" title="${esc(what)}" aria-label="${esc(what)}">${n}</span>`
+        : ''}</a>`;
   }).join('')}</div>`);
   app.append(tabsBox);
   tabsNoHistory(tabsBox);
@@ -4590,15 +5060,16 @@ async function wireKeys(root, d){
     // читать сам список. Провайдеры спрашиваем у кабинета, как и раньше.
     const ref = await api('/ui/keys/families');
     modal('Добавить ключ', `
-      <div class="fldrow"><label>Провайдер</label>
+      <div class="fldrow"><span class="lh"><label for="kfam">Провайдер</label>${
+        hintDot((ref.note || '')
+        + ' Ключ для текста хранит Rewrite Studio, остальные — кабинет.'
+        + ' Значение нигде не показывается: в списке видно только хвост.')}</span>
         <select id="kfam">${ref.families.map(f =>
           `<option value="${esc(f.key)}">${esc(f.title)}</option>`).join('')}
           <option value="__rewrite">OpenAI · текст (Rewrite Studio)</option></select></div>
       <div class="fldrow"><label>Ключ</label>
         <input id="kval" type="password" autocomplete="off" style="flex:1;min-width:0"></div>
-      <div class="note muted">${esc(ref.note)}</div>
-      <div class="note muted">Ключ для текста хранит Rewrite Studio, остальные — кабинет.
-        Значение нигде не показывается: в списке видно только хвост.</div>`,
+`,
       {ok: 'Сохранить', onOk: async (box, close) => {
         const val = box.querySelector('#kval').value.trim();
         if (!val) throw new Error('Ключ пустой.');
@@ -4731,10 +5202,11 @@ async function wireChannelEdit(root, c, chp){
             c.host_id, 'Машина заливки', 'host_id')}
       ${sel('f-pv', ref.presets.vsgen.map(p => ({value: p.id, title: p.name})),
             c.preset_vsgen_id, 'Пресет', 'preset_vsgen_id')}
-      <div class="note muted">Текст и обложка берутся из него же — группы
-        «Сценарий» и «Обложка» внутри пресета. Сейчас: рерайт
+      <div class="note muted">Сейчас: рерайт
         «${esc(c.presets.rewrite || 'не задан')}», обложка
-        «${esc(c.presets.cover || 'не задана')}».${c.preset_vsgen_id
+        «${esc(c.presets.cover || 'не задана')}» ${hintDot('Текст и обложка берутся из '
+          + 'того же пресета — это группы «Сценарий» и «Обложка» внутри него.')}${
+          c.preset_vsgen_id
           ? ` <a href="#/preset/${c.preset_vsgen_id}">Открыть пресет →</a>` : ''}</div>
       <div class="fldrow"><label>Заметка</label>
         <input id="f-note" value="${esc(c.note || '')}" style="width:100%"></div>
@@ -4879,8 +5351,8 @@ let TEXT_FORM = {mode:'link', langs:new Set(), model:'', preset:''};
 async function viewText(){
   const d = await api('/ui/text');
   app.innerHTML = '';
-  app.append($(`<h1>Текст</h1>
-    <p class="sub">Рерайт по ссылке, рерайт своего текста и генерация с нуля.</p>`));
+  app.append($(`<h1>Текст ${hintDot(
+    'Рерайт по ссылке, рерайт своего текста и генерация с нуля.')}</h1>`));
 
   if (!TEXT_FORM.model && d.models.length) TEXT_FORM.model = d.models[0].value;
   const mode = () => d.modes.find(m => m.key === TEXT_FORM.mode) || d.modes[0];
@@ -4987,7 +5459,8 @@ async function viewText(){
   };
 
   const list = $(`<div class="card">
-    <div class="sec">Задачи текста</div>
+    <div class="sec">Задачи текста ${hintDot(
+      'Нажмите на строку — покажется результат.')}</div>
     ${d.jobs.length ? `<table><thead><tr>
       <th>Задача</th><th>Вид</th><th>Языки</th><th>Состояние</th><th>Создана</th><th></th>
       </tr></thead><tbody>${d.jobs.map(j => `<tr data-job="${esc(j.id)}">
@@ -5004,7 +5477,6 @@ async function viewText(){
                                                   state:j.state, status:j.status})}</td>
       </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Задач текста пока нет.</div>'}
-    ${d.jobs.length ? '<div class="note muted">Нажмите на строку — покажется результат.</div>' : ''}
   </div>`);
   app.append(list);
   wireActions(list);
@@ -5021,8 +5493,7 @@ let COVER_FORM = {mode:'url', langs:new Set(), preset:'', option:0,
 async function viewCovers(){
   const d = await api('/ui/covers');
   app.innerHTML = '';
-  app.append($(`<h1>Обложки</h1>
-    <p class="sub">Сначала выберите, как делаем обложку.</p>`));
+  app.append($(`<h1>Обложки ${hintDot('Сначала выберите, как делаем обложку.')}</h1>`));
 
   const mode = () => d.modes.find(m => m.key === COVER_FORM.mode) || d.modes[0];
   const langs = [...COVER_FORM.langs];
@@ -5062,8 +5533,7 @@ async function viewCovers(){
     <div id="edit-box" style="margin-top:12px"></div>
 
     <div class="note muted" style="margin-top:12px">Соотношение сторон —
-      <b>${esc(d.aspect)}</b>, всегда. У обложки YouTube оно одно, поэтому его здесь
-      не спрашивают и не дают выбрать; в задачу оно уходит явно, а не «по умолчанию».</div>
+      <b>${esc(d.aspect)}</b>, всегда. У обложки YouTube оно одно.</div>
 
     <div style="margin-top:14px"><button id="go">Запустить</button></div>
     <div id="res"></div>
@@ -5170,7 +5640,8 @@ async function viewCovers(){
   };
 
   const list = $(`<div class="card">
-    <div class="sec">Задачи обложек</div>
+    <div class="sec">Задачи обложек ${hintDot(
+      'Нажмите на строку — покажутся готовые обложки.')}</div>
     ${d.jobs.length ? `<table><thead><tr>
       <th>Задача</th><th>Состояние</th><th>Готово</th><th>Создана</th><th></th>
       </tr></thead><tbody>${d.jobs.map(j => `<tr data-job="${esc(j.id)}">
@@ -5186,12 +5657,123 @@ async function viewCovers(){
                                                   state:j.state, status:j.status})}</td>
       </tr>`).join('')}</tbody></table>`
       : '<div class="empty">Задач обложек пока нет.</div>'}
-    ${d.jobs.length ? '<div class="note muted">Нажмите на строку — покажутся готовые обложки.</div>' : ''}
   </div>`);
   app.append(list);
   wireActions(list);
   wireResults(list, 'cover');
 }
+
+/* ───────────────── подсказка у знака вопроса ───────────────── */
+// Руководство («за что отвечает поле», «что этот экран показывает») снято с экрана под
+// знак вопроса. Граница, по которой решалось, что убрать: останавливает ли текст руку ДО
+// необратимого. Всё про деньги, дубли, «изменится у всех каналов» и «задать можно один
+// раз» осталось открытым текстом — предупреждение, которое надо раскрыть кликом, уже не
+// предупреждение.
+// Раскрывается наведением, кликом и фокусом с клавиатуры сразу: hover'а нет на
+// тач-экране, а у клавиатуры нет ни hover'а, ни клика мышью.
+
+let HINT = null;                        // {btn, box, pinned} — открыта всегда одна
+
+function hintDot(text){
+  // Переносы строк приходят из шаблонных строк вёрстки; в атрибуте они бы остались
+  // пробелами по три десятка знаков.
+  const t = String(text ?? '').replace(/\s+/g, ' ').trim();
+  if (!t) return '';                    // пустая подсказка — знака вопроса тоже нет
+  // Текст лежит и в aria-label: читалка озвучит его по самой кнопке, не дожидаясь
+  // появления всплывающего блока (тот помечен aria-hidden, чтобы не повторяться).
+  return `<button type="button" class="q" data-hint="${esc(t)}"
+    aria-label="${esc(t)}">?</button>`;
+}
+
+function hintHide(){
+  if (!HINT) return;
+  HINT.box.remove();
+  HINT = null;
+}
+
+function hintShow(btn, pinned){
+  if (HINT && HINT.btn === btn){ HINT.pinned = HINT.pinned || pinned; return; }
+  hintHide();
+  const box = document.createElement('div');
+  box.className = 'qbox';
+  box.setAttribute('aria-hidden', 'true');
+  box.textContent = btn.dataset.hint || '';
+  document.body.append(box);
+  // Размер меряем уже наполненным: пустую коробку мерить нечего, а от её ширины зависит,
+  // с какой стороны она поместится (та же причина, что у `inlineBox`).
+  const r = btn.getBoundingClientRect();
+  const w = box.offsetWidth, bh = box.offsetHeight;
+  const vw = document.documentElement.clientWidth;
+  const vh = document.documentElement.clientHeight;
+  // За край экрана не выпускаем: знаки вопроса стоят и у правой колонки формы, и у
+  // заголовков карточек — оттуда подсказка шириной в треть экрана уезжала бы под обрез.
+  const left = Math.max(8, Math.min(r.left + r.width / 2 - w / 2, vw - w - 8));
+  // Снизу, если снизу есть место; иначе над знаком. Если не помещается нигде — всё равно
+  // снизу: обрезанный низ виден прокруткой, обрезанный верх — нет.
+  const below = r.bottom + 8 + bh <= vh || r.top - 8 - bh < 0;
+  const top = below ? r.bottom + 8 : Math.max(8, r.top - 8 - bh);
+  box.style.left = (left + window.scrollX) + 'px';
+  box.style.top = (top + window.scrollY) + 'px';
+  HINT = {btn, box, pinned: !!pinned, at: Date.now()};
+}
+
+const hintAt = ev => (ev.target instanceof Element)
+  ? ev.target.closest('.q[data-hint]') : null;
+
+document.addEventListener('mouseover', ev => {
+  const b = hintAt(ev);
+  if (b) hintShow(b, false);
+});
+document.addEventListener('mouseout', ev => {
+  const b = hintAt(ev);
+  // Открытую кликом подсказку уход курсора не закрывает: её закрывают повторным кликом,
+  // Esc или кликом мимо. Иначе прочитать длинный текст было бы нельзя — он исчезал бы,
+  // как только курсор двинулся к нему.
+  if (b && HINT && HINT.btn === b && !HINT.pinned) hintHide();
+});
+// Клик ловим на погружении: знак вопроса стоит и внутри <label>, и внутри кликабельной
+// строки таблицы. На всплытии обработчик строки уже успел бы открыть задачу, а <label> —
+// переключить галочку.
+document.addEventListener('click', ev => {
+  const b = hintAt(ev);
+  if (!b){ hintHide(); return; }
+  ev.preventDefault();
+  ev.stopPropagation();
+  // Закрывать по клику можно только ту подсказку, которую человек САМ открыл кликом
+  // раньше. Chrome даёт кнопке фокус на mousedown, то есть `focusin` успевает
+  // приколотить подсказку ДО `click` — и обычное нажатие мышью её тут же закрывало.
+  // На тач-экране, где hover'а нет вовсе, подсказка не открывалась ни разу: ровно тот
+  // случай, ради которого клик и добавляли. Поэтому считаем «своим» только клик,
+  // пришедший позже открытия, а не тот, что его и вызвал.
+  const mine = HINT && HINT.btn === b && HINT.pinned
+               && (Date.now() - (HINT.at || 0)) > 250;
+  if (mine) hintHide(); else hintShow(b, true);
+}, true);
+document.addEventListener('focusin', ev => {
+  const b = hintAt(ev);
+  // Фокус от мыши подсказку не открывает — это сделает клик следом. Открываем только
+  // при переходе клавиатурой, иначе mousedown и click спорят друг с другом.
+  if (b && !HINT_POINTER) hintShow(b, true);
+  else if (!b) hintHide();
+});
+// Отличить клавиатуру от мыши иначе нечем: `focusin` одинаков в обоих случаях.
+let HINT_POINTER = false;
+document.addEventListener('mousedown', () => { HINT_POINTER = true; }, true);
+document.addEventListener('touchstart', () => { HINT_POINTER = true; }, true);
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Tab') HINT_POINTER = false;
+}, true);
+// Уход фокуса закрывает свою подсказку сам: `focusin` на новом месте бывает не всегда —
+// после Tab в адресную строку или blur() фокус уходит в никуда, и подсказка осталась бы
+// висеть поверх экрана, к которому уже не относится.
+document.addEventListener('focusout', ev => {
+  const b = hintAt(ev);
+  if (b && HINT && HINT.btn === b) hintHide();
+});
+document.addEventListener('keydown', ev => { if (ev.key === 'Escape') hintHide(); }, true);
+// Экран перерисовывается целиком (`app.innerHTML`), кнопка со знаком вопроса при этом
+// исчезает — а подсказка лежит в <body> и осталась бы висеть поверх нового экрана.
+window.addEventListener('hashchange', hintHide);
 
 /* ─────────────────────────────── пресеты ─────────────────────────────── */
 
@@ -5199,12 +5781,37 @@ async function viewCovers(){
 // Браузерные prompt() и confirm() останавливают страницу целиком, выглядят чужими и на
 // части браузеров блокируются вместе с попапами. Спрашиваем там же, где нажали.
 
-function inlineBox(btn){
-  let box = btn.parentElement.querySelector('.inline-ask');
+// `fill` наполняет врезку ДО того, как ей ищут место: пустую мерить нечего, а место
+// зависит от её ширины. Отдельным шагом после возврата это делать нельзя — ширину
+// пришлось бы досчитывать в следующем кадре, а в безголовом браузере (им прогоняются
+// браузерные тесты) до следующего кадра дело может и не дойти.
+function inlineBox(btn, fill){
+  const host = btn.parentElement;
+  let box = host.querySelector('.inline-ask');
   if (box) box.remove();
   box = document.createElement('div');
   box.className = 'inline-ask';
-  btn.parentElement.insertBefore(box, btn.nextSibling);
+  host.insertBefore(box, btn.nextSibling);
+  // Врезка вынута из потока (CSS `.inline-ask`), поэтому место отмеряем сами — от
+  // кнопки, а не от края карточки. Точкой отсчёта для absolute служит ближайший
+  // позиционированный предок, а у наших контейнеров позиции обычно нет вовсе:
+  // без этой строки врезка улетела бы к краю экрана.
+  if (getComputedStyle(host).position === 'static') host.style.position = 'relative';
+  fill(box);
+  // Ширину меряем, прижав врезку к левому краю контейнера: у правого края ей остаётся
+  // несколько десятков пикселей, и браузер сложил бы её в узкий столбик ещё до того,
+  // как мы её оттуда сдвинем. Потом ставим под кнопку, но не дальше правого края —
+  // «Создать» и «Удалить» стоят справа, и оттуда врезка вылезала бы за карточку.
+  box.style.left = '0px';
+  const w = box.offsetWidth;
+  let left = Math.max(0, Math.min(btn.offsetLeft, host.clientWidth - w));
+  // Контейнер уже врезки (узкая ячейка) — тогда держим её в пределах экрана: слева
+  // от ячейки место есть, а за правым краем экрана её не увидят.
+  const hostLeft = host.getBoundingClientRect().left;
+  const vw = document.documentElement.clientWidth;
+  left = Math.max(8 - hostLeft, Math.min(left, vw - 8 - hostLeft - w));
+  box.style.left = left + 'px';
+  box.style.top = (btn.offsetTop + btn.offsetHeight + 6) + 'px';
   return box;
 }
 
@@ -5213,24 +5820,46 @@ function menuInline(btn, items){
   // Выбор из нескольких действий у одной кнопки. Отдельное окно тут было бы тяжелее
   // самого выбора, а три кнопки в шапке — это ровно та перегруженность, на которую
   // жаловался владелец 21.09.
-  const box = inlineBox(btn);
-  box.style.flexDirection = 'column';
-  box.style.alignItems = 'stretch';
-  box.innerHTML = items.map((it, n) => `<button class="ghost small mi" data-n="${n}"
+  const box = inlineBox(btn, b => {
+    b.style.flexDirection = 'column';
+    b.style.alignItems = 'stretch';
+    // Пункты с пояснениями сами по себе узкие не бывают, а без нижней границы у
+    // правого края экрана меню сложилось бы в столбик по одному слову.
+    b.style.minWidth = '212px';
+    b.innerHTML = items.map((it, n) => `<button class="ghost small mi" data-n="${n}"
       style="text-align:left;font-weight:500">${esc(it.title)}${it.hint
       ? `<div class="note muted" style="margin:2px 0 0">${esc(it.hint)}</div>` : ''}</button>`).join('');
-  box.querySelectorAll('.mi').forEach(b => b.onclick = () => {
+  });
+  // Меню висит поверх страницы, а не раздвигает её (см. `inlineBox`). Значит, закрыть
+  // его должно что-то помимо выбора пункта: в потоке передумавший нажимал мимо и меню
+  // просто оставалось стоять ниже, а поверх текста забытое меню закрывает содержимое.
+  // Слушатели снимаются вместе с меню — иначе они копились бы на каждое открытие.
+  const close = () => {
     box.remove();
+    document.removeEventListener('mousedown', outside, true);
+    document.removeEventListener('keydown', onEsc, true);
+  };
+  const outside = ev => { if (!box.contains(ev.target) && ev.target !== btn) close(); };
+  const onEsc = ev => { if (ev.key === 'Escape') close(); };
+  // Через такт: этот же клик ещё не закончился, и слушатель поймал бы его сам —
+  // меню закрывалось бы ровно в момент открытия.
+  setTimeout(() => {
+    document.addEventListener('mousedown', outside, true);
+    document.addEventListener('keydown', onEsc, true);
+  }, 0);
+  box.querySelectorAll('.mi').forEach(b => b.onclick = () => {
+    close();
     items[Number(b.dataset.n)].run();
   });
 }
 
 function askInline(btn, opts, onOk){
-  const box = inlineBox(btn);
-  box.innerHTML = `<input class="ask-in" placeholder="${esc(opts.placeholder || '')}"
+  const box = inlineBox(btn, b => {
+    b.innerHTML = `<input class="ask-in" placeholder="${esc(opts.placeholder || '')}"
       value="${esc(opts.value || '')}">
     <button class="small ask-ok">${esc(opts.ok || 'Готово')}</button>
     <button class="ghost small ask-no">Отмена</button>`;
+  });
   const input = box.querySelector('.ask-in');
   input.focus();
   input.select();
@@ -5304,12 +5933,15 @@ function confirmModal(title, question, onOk){
   return m;
 }
 
-function confirmInline(btn, text, onOk){
-  const box = inlineBox(btn);
-  box.innerHTML = `<span class="muted">${esc(text)}</span>
+function confirmInline(btn, text, onOk, onNo){
+  const box = inlineBox(btn, b => {
+    b.innerHTML = `<span class="muted">${esc(text)}</span>
     <button class="small ask-ok">Да</button>
     <button class="ghost small ask-no">Нет</button>`;
-  box.querySelector('.ask-no').onclick = () => box.remove();
+  });
+  // `onNo` нужен там, где кнопку на время вопроса выключили: без него отказ оставлял бы
+  // её мёртвой навсегда, и человек решил бы, что сломалось.
+  box.querySelector('.ask-no').onclick = () => { box.remove(); if (onNo) onNo(); };
   box.querySelector('.ask-ok').onclick = async () => { box.remove(); await onOk(); };
 }
 
@@ -5369,6 +6001,9 @@ async function viewLimits(){
       действуют значения из кода.</div></div>`));
     return;
   }
+  // Формы правки здесь нет и не будет: значения обрезаются границами при чтении, и поле,
+  // показывающее 64 там, где применится 12, врало бы человеку. Причина живёт в коде, а не
+  // на экране — читателю таблицы нужен только адрес, где правка настоящая.
   app.append($(`<div class="card"><table>
     <thead><tr><th>Провайдер</th><th>Настройки</th></tr></thead>
     <tbody>${d.rows.map(r => `<tr>
@@ -5377,9 +6012,7 @@ async function viewLimits(){
         `${esc(k)}: <b>${esc(String(v))}</b>${
           d.bounds[k] ? ` <span class="muted">(${d.bounds[k][0]}–${d.bounds[k][1]})</span>` : ''}`
       ).join(' · ') || '—'}</td></tr>`).join('')}</tbody></table>
-    <div class="note muted">Правка — в файле ключей, блок «_concurrency». Форму сюда
-      не переносим: значения обрезаются на чтении, и поле, показывающее 64 там, где
-      применится 12, врало бы ровно так, как ТЗ запрещает.</div></div>`));
+    <div class="note muted">Правка — в файле ключей, блок «_concurrency».</div></div>`));
 }
 
 /* ─────────────────────────── редактор пресета ─────────────────────────── */
@@ -5603,11 +6236,22 @@ function wireNeighbourPreset(card, f, locked){
   // Жалоба 21.09: «создаю частичный пресет для обложки, а мне зачем-то предлагают
   // выбрать ещё какой-то пресет». Поле не лишнее — оно и ЕСТЬ всё содержимое такой
   // части: настройки обложки и текста живут в соседних сервисах, а здесь хранится
-  // ссылка на них. Но понять это по одной подписи нельзя, поэтому говорим прямо.
-  const why = $(`<div class="note muted" style="margin-top:6px">Сами настройки
-    ${service === 'cover' ? 'обложки' : 'текста'} живут в соседнем сервисе — здесь
-    выбирается, каким из тамошних пресетов пользоваться.</div>`);
-  bar.after(why);
+  // ссылка на них. Понять это по одной подписи нельзя — поэтому знак вопроса у самой
+  // подписи, а не третья строка текста под полем: в форме пресета таких полей много.
+  // Знак — соседом подписи, а не внутри неё: кнопка внутри подписи дописала бы весь текст
+  // подсказки к имени поля для читалки (см. `.lh`).
+  const lab = sel.parentElement.querySelector('label');
+  if (lab && !lab.parentElement.classList.contains('lh')){
+    const row = document.createElement('div');
+    row.className = 'lh';
+    row.style.cssText = 'display:flex;margin-bottom:7px';
+    lab.replaceWith(row);
+    row.append(lab);
+    row.insertAdjacentHTML('beforeend', hintDot('Сами настройки '
+      + (service === 'cover' ? 'обложки' : 'текста')
+      + ' живут в соседнем сервисе — здесь выбирается, каким из тамошних пресетов'
+      + ' пользоваться.'));
+  }
   const edit = bar.querySelector('.np-edit');
   const paint = () => { edit.disabled = !sel.value; };
   sel.addEventListener('change', paint);
@@ -5874,14 +6518,23 @@ function saveBar(back, onSave, onCancel, opts){
       // сохранит ещё раз. Уходим — кнопку разблокировать незачем, экран сменится.
       if (o.stay) b.disabled = false;
       else if (!onCancel) location.hash = back;
-    }catch(e){ toast(e.message); b.disabled = false; }
+    }catch(e){
+      // `e.inplace` — отказ, который форма уже показала у самого поля (пустое имя
+      // пресета). Тост поверх него повторил бы ту же фразу вторым голосом и увёл
+      // взгляд от места, куда надо смотреть.
+      if (!e.inplace) toast(e.message);
+      b.disabled = false;
+    }
   };
   if (onCancel) bar.querySelector('#cancel').onclick = onCancel;
   return bar;
 }
 
-// Заведение пресета — своя страница, а не браузерный попап: имя видно рядом с тем,
-// куда попадёшь, и опечатку можно исправить, не начиная заново.
+// Отдельного экрана заведения (название + тип, потом «Завести») больше нет: он
+// требовал имя до того, как человек что-нибудь настроил, и держал настройки за двумя
+// переходами — жалоба владельца 21.09.2026 «имя — как будто уже настройка пресета».
+// Теперь `#/preset/new` открывает тот же редактор, только пресета за ним ещё нет:
+// строку заводит первое «Сохранить» (см. `viewPreset`).
 const PRESET_SLUG = {'Озвучка': 'ozvuchka', 'Картинки': 'kadry', 'Клипы': 'klipy',
                      'Сборка': 'sborka', 'Сценарий': 'stsenariy', 'Обложка': 'oblozhka'};
 
@@ -5899,70 +6552,25 @@ const PART_TITLES = [['voice', 'Озвучка'], ['images', 'Картинки']
 const PRESET_SIDE_TYPES = [['channel', 'Каналы'], ['lumean', 'Озвучка Lumean']];
 const PRESET_FILTER_TYPES = [['all', 'Все'], ['full', 'Целые'], ['partial', 'Частичные'],
                              ...PART_TITLES, ...PRESET_SIDE_TYPES];
+// «Все» — не вид, а пустой набор видов, поэтому в карте подписей его нет: она отвечает
+// на вопрос «как называется выбранный код», а выбрать «все» значит не выбрать ничего.
+const PRESET_TYPE_TITLE = new Map(PRESET_FILTER_TYPES.filter(([c]) => c !== 'all'));
+// 21.09.2026 форма состояния сменилась с `{q, type}` на `{q, types: []}`: видов стало
+// одиннадцать, строка кнопок свёрнута в один список, и выбирать можно несколько.
+// Старую форму читаем, а не выбрасываем: иначе у всех, кто уже заходил на экран,
+// фильтр молча слетел бы в «Все». Сверка со списком кодов остаётся — в ключе зрителя
+// может лежать что угодно, в том числе вид, которого больше нет.
 const presetFilter = (() => {
-  const dflt = {q: '', type: 'all'};
+  const dflt = {q: '', types: []};
   try{
     const v = JSON.parse(localStorage.getItem('presetFilter') || 'null');
-    if (v && typeof v.q === 'string' && PRESET_FILTER_TYPES.some(([c]) => c === v.type)) return v;
+    if (!v || typeof v.q !== 'string') return dflt;
+    const raw = Array.isArray(v.types) ? v.types
+              : (typeof v.type === 'string' ? [v.type] : []);
+    return {q: v.q, types: raw.filter(c => PRESET_TYPE_TITLE.has(c))};
   }catch(e){}
   return dflt;
 })();
-
-async function viewPresetNew(){
-  app.innerHTML = '';
-  app.append($(`<a class="back" href="#/presets">← ко всем пресетам</a>
-    <h1>Новый пресет</h1>
-    <p class="sub">Настройки, которыми делаются ролики этого канала: озвучка, кадры,
-      клипы, сборка, текст и обложка.</p>`));
-
-  // Целый или частичный (батч «Пресеты целые и частичные», решение владельца) —
-  // кнопки-группа, а не выпадающий список: вариантов шесть, и их надо видеть сразу,
-  // а не разворачивать список ради каждого выбора.
-  let scope = 'full';
-  const scopeCard = $(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Тип пресета</div>
-    <div class="secbody">
-    <div class="modes" id="scope-modes">
-      <button type="button" data-scope="full" class="on">Целый</button>
-      ${PART_TITLES.map(([code, title]) =>
-        `<button type="button" data-scope="${code}">Только ${esc(title.toLowerCase())}</button>`
-      ).join('')}
-    </div>
-    <div class="note muted">Частичный пресет закрывает одну часть ролика — его можно
-      подключить как ссылку в любом целом пресете этой же части.</div></div></div>`);
-  app.append(scopeCard);
-  scopeCard.querySelectorAll('#scope-modes button').forEach(b => b.onclick = () => {
-    scope = b.dataset.scope;
-    scopeCard.querySelectorAll('#scope-modes button').forEach(x =>
-      x.classList.toggle('on', x === b));
-  });
-
-  const card = $(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Название</div>
-    <div class="secbody">
-    <input id="p-name" placeholder="например: длинные ролики, польский"
-      style="width:100%;max-width:420px">
-    <div class="note muted">Дальше откроется редактор полей. Пустое поле означает
-      «как по умолчанию» — заполнять всё сразу не нужно.</div></div></div>`);
-  app.append(card);
-  const bar = $(`<div style="display:flex;gap:10px;align-items:center">
-    <button id="go">Завести</button>
-    <a class="ghost" href="#/presets" style="color:var(--muted)">Отмена</a></div>`);
-  app.append(bar);
-  const create = async () => {
-    const b = bar.querySelector('#go');
-    b.disabled = true;
-    try{
-      const out = await post('/ui/presets/vsgen',
-                             {name: card.querySelector('#p-name').value, scope});
-      location.hash = '#/preset/' + out.id;
-    }catch(e){ toast(e.message); b.disabled = false; }
-  };
-  bar.querySelector('#go').onclick = create;
-  const input = card.querySelector('#p-name');
-  input.focus();
-  input.onkeydown = e => { if (e.key === 'Enter'){ e.preventDefault(); create(); } };
-}
 
 // «Кто бежит» (батч «Пресеты целые и частичные»): каналы и проекты — всегда,
 // у частичного ещё целые пресеты, которые на него ссылаются, и каналы через них
@@ -6008,13 +6616,16 @@ function presetUsersHtml(scope, users){
    Черновик хранит ТОЛЬКО отличия от сохранённого и только для одного пресета: он
    не файл настроек, а память между перерисовками одного экрана. Уходит вместе с
    записью, с отказом от правок и со сменой пресета. */
-let PRESET_DRAFT = {id: '', name: null, values: {}};
+// `scope` в черновике нужен только ещё не заведённому пресету (`#/preset/new`): у
+// заведённого тип хранит сервер, а у этого его негде держать, кроме как здесь — а
+// пережить перерисовку он обязан, потому что от него считается набор вкладок.
+let PRESET_DRAFT = {id: '', name: null, values: {}, scope: ''};
 function presetDraft(id){
   if (PRESET_DRAFT.id !== String(id))
-    PRESET_DRAFT = {id: String(id), name: null, values: {}};
+    PRESET_DRAFT = {id: String(id), name: null, values: {}, scope: ''};
   return PRESET_DRAFT;
 }
-function presetDraftDrop(){ PRESET_DRAFT = {id: '', name: null, values: {}}; }
+function presetDraftDrop(){ PRESET_DRAFT = {id: '', name: null, values: {}, scope: ''}; }
 // Пробелы внутри значения сравнение не различает: карту голосов виджет пересобирает
 // при отрисовке («ru:x» → «ru: x»), и без этого нетронутое поле числилось бы правкой,
 // а экран спрашивал бы «уйти без сохранения?» там, где ничего не меняли.
@@ -6023,7 +6634,16 @@ const sameValue = (a, b) =>
   String(b == null ? '' : b).replace(/\s+/g, ' ').trim();
 
 async function viewPreset(id){
-  const d = await api('/ui/presets/vsgen/' + encodeURIComponent(id));
+  // `#/preset/new` — тот же редактор, но за ним ещё нет строки в кабинете: настройки
+  // видны сразу, а заводится пресет первым «Сохранить». Имя требуется только в этот
+  // момент — дальше его никто не проверяет и затереть пустым нельзя, так что держать
+  // из-за него отдельный экран было незачем.
+  const creating = String(id) === 'new';
+  const draft = presetDraft(id);
+  if (creating && !draft.scope) draft.scope = 'full';
+  const d = await api(creating
+    ? '/ui/presets/vsgen/new/form?scope=' + encodeURIComponent(draft.scope)
+    : '/ui/presets/vsgen/' + encodeURIComponent(id));
   // Группы — вкладками, а не одной простынёй: полей три десятка, и «поменять голос»
   // не должно означать прокрутку мимо сборки и обложки. У частичного пресета вкладка
   // ровно одна — своя часть (раздел 4 спецификации: «Редактор частичного. Только
@@ -6044,9 +6664,11 @@ async function viewPreset(id){
   // того, как черновик набрали, поэтому чужие ключи выбрасываем на каждом заходе,
   // а не надеемся поймать их в момент переключения.
   const sendable = new Set();
-  d.groups.filter(g => !g.readonly).forEach(g => g.fields.forEach(f =>
-    sendable.add(f.key)));
-  const draft = presetDraft(id);
+  // У ещё не заведённого пресета набор полей считаем от ВЫБРАННОГО типа, а не от всех
+  // групп: тип тут переключается на месте, и набранное для «Картинок» уехало бы в
+  // пресет «Только озвучка» настройкой, которой в нём не видно и которую не поправить.
+  (creating ? groups : d.groups).filter(g => !g.readonly).forEach(g =>
+    g.fields.forEach(f => sendable.add(f.key)));
   Object.keys(draft.values).forEach(k => {
     if (!sendable.has(k)) delete draft.values[k];
   });
@@ -6063,17 +6685,51 @@ async function viewPreset(id){
   // перезахода. Человек видел старое имя ровно там, где ищет подтверждение, что
   // записалось (ниже, в обработчике сохранения, заголовок обновляется).
   const head = $(`<a class="back" href="#/presets">← ко всем пресетам</a>
-    <h1>${esc(d.name)}</h1>
+    <h1>${esc(creating ? 'Новый пресет' : d.name)}</h1>
     <p class="sub">${esc(d.note)}</p>`);
   app.append(head);
   const headTitle = head.querySelector('h1');
   const name = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Название</div>
     <div class="secbody">
-    <input id="p-name" value="${esc(draft.name != null ? draft.name : d.name)}"
-      style="width:100%;max-width:420px"></div></div>`);
+    <input id="p-name" placeholder="например: длинные ролики, польский"
+      value="${esc(draft.name != null ? draft.name : d.name)}"
+      style="width:100%;max-width:420px">
+    <div class="note bad" id="p-name-err" hidden></div></div></div>`);
   app.append(name);
-  app.append($(presetUsersHtml(d.scope, d.users || {})));
+
+  // Тип пресета — здесь же, в форме, а не на экране до неё (жалоба владельца 21.09).
+  // Кнопки-группа, а не выпадающий список: вариантов семь, и прежнее решение
+  // владельца — видеть их сразу. Переключается только пока пресета нет: после
+  // заведения тип лежит в `_scope`, ручки сменить его у сервера нет, а молча
+  // переписать тип пресета, на который уже ссылаются каналы, нельзя.
+  if (creating){
+    const scopeCard = $(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">Тип пресета ${hintDot('Частичный пресет закрывает одну часть '
+        + 'ролика — его можно подключить как ссылку в любом целом пресете этой же '
+        + 'части.')}</div>
+      <div class="secbody">
+      <div class="modes" id="scope-modes">
+        <button type="button" data-scope="full"
+          class="${draft.scope === 'full' ? 'on' : ''}">Целый</button>
+        ${PART_TITLES.map(([code, title]) =>
+          `<button type="button" data-scope="${code}"
+            class="${draft.scope === code ? 'on' : ''}"
+            >Только ${esc(title.toLowerCase())}</button>`).join('')}
+      </div>
+      </div></div>`);
+    app.append(scopeCard);
+    scopeCard.querySelectorAll('#scope-modes button').forEach(b => b.onclick = async () => {
+      if (draft.scope === b.dataset.scope) return;
+      draft.scope = b.dataset.scope;
+      // Набор вкладок считается от типа, а открытая вкладка — часть адреса. Смена типа
+      // обязана вернуть адрес к первой вкладке, иначе остался бы адрес части, которой
+      // у нового типа нет, и форма открылась бы «ни на чём».
+      if (location.hash !== '#/preset/new'){ location.hash = '#/preset/new'; return; }
+      await render();
+    });
+  }
+  if (!creating) app.append($(presetUsersHtml(d.scope, d.users || {})));
   // Плашка проблем ссылок на вкладке (раздел 4: «link_problems — красной плашкой на
   // вкладке группы с причиной») — предупреждающий значок на самой вкладке, чтобы
   // проблему было видно, не открывая её, и красный блок внутри вкладки (см. ниже,
@@ -6090,7 +6746,10 @@ async function viewPreset(id){
   // у частичного своих ссылок не бывает (правило 4), поэтому колбэк вешаем на массив
   // групп только когда `d.scope === 'full'` — без него `fieldForm()` переключатель
   // не рисует (см. комментарий у самой функции про буквальную сигнатуру).
-  if (d.scope === 'full'){
+  // У ещё не заведённого пресета переключателя ссылок нет: писать ссылку некуда —
+  // ручка `/links` адресуется номером, которого пока не существует. Поэтому про это
+  // сказано в карточке типа, а не оставлено кнопкой, которая молча не сработает.
+  if (d.scope === 'full' && !creating){
     formGroups.onLinkChange = async (part, presetId) => {
       // `ownBtn`/`linkBtn` в fieldForm переключают вид сразу по клику, до ответа
       // сервера (иначе список частичных не успевал бы открыться до записи). Если
@@ -6120,6 +6779,7 @@ async function viewPreset(id){
   // В черновике держим только ОТЛИЧИЯ от сохранённого — одинаковое на сервер
   // не уезжает и правкой не считается.
   const nameInput = name.querySelector('#p-name');
+  const nameErr = name.querySelector('#p-name-err');
   const snap = () => {
     const now = form.read();
     for (const k in now){
@@ -6143,7 +6803,8 @@ async function viewPreset(id){
     keep: h => h.startsWith('#/preset/') &&
                decodeURIComponent(h.split('/')[2] || '') === String(id),
     dirty, drop: presetDraftDrop,
-    what: 'Настройки пресета изменены, но не сохранены.',
+    what: creating ? 'Новый пресет ещё не заведён — набранное нигде не записано.'
+                   : 'Настройки пресета изменены, но не сохранены.',
   };
 
   // Целый пресет после записи остаётся открытым: его настраивают по многу полей за
@@ -6161,6 +6822,37 @@ async function viewPreset(id){
     Object.entries(form.read()).forEach(([k, v]) => {
       if (sendable.has(k)) values[k] = v;
     });
+    if (creating){
+      // Имя спрашиваем ровно здесь: сервер отвергает пустое только при заведении
+      // (`ui_preset_create`), а набирать настройки оно не мешало. Говорим у самого
+      // поля — не тостом поверх экрана, который не показывает, где поправить.
+      const nm = nameInput.value.trim();
+      if (!nm){
+        nameErr.textContent = 'Дайте пресету имя — по нему его ищут в списках и '
+          + 'привязывают к каналу. Настройки уже набраны, они никуда не денутся.';
+        nameErr.hidden = false;
+        nameInput.focus();
+        const why = new Error('у пресета должно быть имя');
+        why.inplace = true;                       // уже сказано у поля, тост не нужен
+        throw why;
+      }
+      nameErr.hidden = true;
+      const out = await post('/ui/presets/vsgen', {name: nm, scope: draft.scope});
+      // Черновик переносим на заведённый номер ДО записи значений: пресет уже есть, и
+      // второй раз его не завести — имя занято им же (409). Если запись полей упадёт
+      // (сосед не ответил, поле не прошло контракт), человек окажется в редакторе
+      // нового пресета со всем набранным на месте, а не перед пустой формой.
+      PRESET_DRAFT = {id: String(out.id), name: null, values: {...values}, scope: ''};
+      LEAVE_GUARD = null;
+      try{
+        if (Object.keys(values).length)
+          await post('/ui/presets/vsgen/' + out.id, {name: nm, values});
+        presetDraftDrop();
+      }finally{
+        location.hash = '#/preset/' + out.id;
+      }
+      return;
+    }
     await post('/ui/presets/vsgen/' + encodeURIComponent(id),
                {name: nameInput.value, values});
     // Записанное становится «тем, что хранится»: иначе сторож ухода считал бы
@@ -6170,7 +6862,9 @@ async function viewPreset(id){
     if (headTitle) headTitle.textContent = d.name;
     draft.values = {};
     draft.name = null;
-  }, null, {stay: full}));
+    // Отказ у поля имени снимаем: он про пустое имя, а имя только что уехало.
+    nameErr.hidden = true;
+  }, null, {stay: creating || full}));
 }
 
 // Батч C: отдельный экран «Настройки проекта» убран — настройки этапа теперь внутри
@@ -6181,17 +6875,34 @@ async function viewPresets(){
   const d = await api('/ui/presets');
   app.innerHTML = '';
   const head = $(`<div class="head">
-      <div><h1>Пресеты</h1>
-        <p class="sub">Настройки, которыми делаются ролики.</p></div>
+      <div><h1>Пресеты ${hintDot('Настройки, которыми делаются ролики. Быстрее всего '
+        + 'новый пресет получается копией похожего: «Копия» рядом с ним, потом правка '
+        + 'полей. Завести с нуля и править настройки — в том сервисе, которому пресет '
+        + 'принадлежит: ссылки в заголовках карточек.')}</h1></div>
       <button id="newpr" class="small">Создать</button>
     </div>`);
   app.append(head);
   // Раньше кнопка вела ровно в один вид, а пресет канала и шаблон Lumean заводились
   // своими кнопками внизу страницы — то есть найти их можно было, только долистав.
+  // 21.09.2026: сюда же пресеты обложки и рерайта. До этого завести пресет обложки
+  // значило сперва завести пресет производства «Только обложка» — обёртку, у которой
+  // всё содержимое — одна ссылка на пресет Cover Studio (`preset_fields`: часть
+  // «Обложка» — единственное поле `preset_cover`), и лишь потом, из его редактора,
+  // завести сам пресет обложки. Два заведения на одно намерение; теперь второе
+  // доступно напрямую, а обёртка остаётся тем, кому она правда нужна.
   head.querySelector('#newpr').onclick = ev => menuInline(ev.currentTarget, [
     {title: 'Пресет производства',
      hint: 'чем делается ролик: текст, озвучка, кадры, сборка',
-     run: () => { location.hash = '#/preset/new'; }},
+     // Черновик незаведённого живёт под ключом «new» и помнит выбранный тип. Если его
+     // не сбросить, «Создать» во второй раз открывало бы форму с типом от прошлого
+     // захода — состояние, которого человек не задавал и которому неоткуда взяться.
+     run: () => { presetDraftDrop(); location.hash = '#/preset/new'; }},
+    {title: 'Пресет обложки',
+     hint: 'настройки обложки — в Cover Studio, заводится отсюда',
+     run: () => neighbourPresetModal('cover', null)},
+    {title: 'Пресет рерайта',
+     hint: 'как Rewrite Studio делает текст',
+     run: () => neighbourPresetModal('rewrite', null)},
     {title: 'Пресет канала',
      hint: 'как живёт канал: расписание, машина заливки, ниша',
      run: () => channelPresetModal(null)},
@@ -6209,8 +6920,8 @@ async function viewPresets(){
           <div class="name">${esc(b.why)}</div>
           <div class="facts">на него ссылаются: ${b.channels.map(ch =>
             `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')}</div>
-          <div class="note muted">Сегодня такой канал узнаёт об этом в момент
-            генерации — то есть после того, как встал.</div>
+          <div class="note muted">Такой канал узнаёт об этом в момент генерации —
+            то есть после того, как встал.</div>
         </div></div>`).join('')}
     </div>`));
   }
@@ -6267,17 +6978,24 @@ async function viewPresets(){
   // выборе типа их карточки скрываются, а не показываются «не подходящими».
   const F = presetFilter;
   const nameOk = i => !F.q || String(i.name || '').toLowerCase().includes(F.q.toLowerCase());
-  // Виды «Каналы» и «Озвучка Lumean» — не про пресеты производства вовсе: при их
-  // выборе список производства пустеет целиком, и на экране остаётся только нужное.
-  const sideType = PRESET_SIDE_TYPES.some(([c]) => c === F.type);
-  const typeOk = i => !sideType && (F.type === 'all' || (F.type === 'full' ? i.scope === 'full'
-    : F.type === 'partial' ? i.scope !== 'full' : i.scope === F.type));
+  const SIDE_CODES = new Set(PRESET_SIDE_TYPES.map(([c]) => c));
+  // Виды «Каналы» и «Озвучка Lumean» — не про пресеты производства вовсе. Пока выбраны
+  // ТОЛЬКО они, список производства пустеет целиком и на экране остаётся одно нужное;
+  // вместе с «Целыми» — показываются и те и другие, потому что выбор нескольких видов
+  // читается как «покажи вот это», а не «покажи то, что одновременно и то и другое».
+  const onlySides = () => F.types.length > 0 && F.types.every(c => SIDE_CODES.has(c));
+  const typeOk = i => {
+    if (!F.types.length) return true;             // «Все виды» — это пустой набор
+    return (F.types.includes('full') && i.scope === 'full')
+        || (F.types.includes('partial') && i.scope !== 'full')
+        || F.types.includes(i.scope);
+  };
 
   const vsgenBodyHtml = items => {
     items = items.filter(i => nameOk(i) && typeOk(i));
     const whole = items.filter(i => i.scope === 'full');
     const partial = items.filter(i => i.scope !== 'full');
-    const filtered = F.q || F.type !== 'all';
+    const filtered = F.q || F.types.length > 0;
     let html = '';
     if (!filtered || whole.length){
       html += '<div class="sec">Целые</div>';
@@ -6306,13 +7024,29 @@ async function viewPresets(){
   let chp = {presets: [], note: ''};
   try{ chp = await api('/ui/channel-presets'); }catch(e){ toast(e.message); }
 
+  // Подпись кнопки — то, что сейчас выбрано, и это единственное, что про фильтр видно
+  // не раскрывая его. Больше двух видов в строку не пишем: подпись кнопки перестала бы
+  // быть подписью и стала бы тем же списком, только без рамок.
+  const typeLabel = () => {
+    const t = F.types.map(c => PRESET_TYPE_TITLE.get(c)).filter(Boolean);
+    if (!t.length) return 'Все виды';
+    return t.length <= 2 ? t.join(', ') : `${t[0]}, ${t[1]} +${t.length - 2}`;
+  };
   const bar = $(`<div class="card" style="padding:16px 18px">
     <div style="display:flex;gap:12px;flex-wrap:wrap;align-items:center">
       <input id="pf-q" type="search" placeholder="Поиск по названию"
              style="flex:1 1 240px;min-width:0;max-width:360px" value="${esc(F.q)}">
-      <div class="modes" style="margin:0">${PRESET_FILTER_TYPES.map(([code, title]) =>
-        `<button type="button" data-type="${code}" class="small${F.type === code ? ' on' : ''}"
-         >${esc(title)}</button>`).join('')}</div>
+      <div class="pf-pick">
+        <button type="button" id="pf-open" class="ghost small" aria-haspopup="true"
+          aria-expanded="false">${esc(typeLabel())}</button>
+        <div class="pf-menu" id="pf-types" hidden>${PRESET_FILTER_TYPES.map(
+          ([code, title], n) => `${SIDE_CODES.has(code)
+            && !SIDE_CODES.has((PRESET_FILTER_TYPES[n - 1] || [])[0])
+              ? '<div class="pf-sep"></div>' : ''}<button type="button" class="pf-item small${
+            (code === 'all' ? !F.types.length : F.types.includes(code)) ? ' on' : ''
+          }" data-type="${code}">${esc(title)}</button>`
+        ).join('')}</div>
+      </div>
     </div></div>`);
   app.append(bar);
   const list = document.createElement('div');
@@ -6324,9 +7058,10 @@ async function viewPresets(){
   let lumCard = null, chpCard = null;
 
   const paint = () => {
-    const side = PRESET_SIDE_TYPES.some(([c]) => c === F.type);
-    if (lumCard) lumCard.style.display = (F.type === 'all' || F.type === 'lumean') ? '' : 'none';
-    if (chpCard) chpCard.style.display = (F.type === 'all' || F.type === 'channel') ? '' : 'none';
+    const any = !F.types.length;
+    const side = onlySides();
+    if (lumCard) lumCard.style.display = (any || F.types.includes('lumean')) ? '' : 'none';
+    if (chpCard) chpCard.style.display = (any || F.types.includes('channel')) ? '' : 'none';
     list.innerHTML = '';
     let shown = 0;
     for (const g of d.groups){
@@ -6334,7 +7069,9 @@ async function viewPresets(){
       // при них рисовала саму себя с надписью «под фильтр ничего не подошло» — рядом с
       // секцией, которую человек как раз и просил показать. Это читается как поломка.
       if (side) continue;
-      if (g.service !== 'vsgen' && F.type !== 'all') continue;
+      // У пресетов рерайта и обложек типа нет вовсе, поэтому любой выбранный вид их
+      // карточки скрывает: показывать их «не подошедшими» было бы неправдой.
+      if (g.service !== 'vsgen' && !any) continue;
       const items = g.service === 'vsgen' ? g.items : g.items.filter(nameOk);
       if (g.service !== 'vsgen' && F.q && !items.length && !g.error) continue;
       shown++;
@@ -6361,9 +7098,41 @@ async function viewPresets(){
   };
   const save = () => { try{ localStorage.setItem('presetFilter', JSON.stringify(F)); }catch(e){} };
   bar.querySelector('#pf-q').oninput = e => { F.q = e.target.value; save(); paint(); };
+
+  const typeMenu = bar.querySelector('#pf-types');
+  const typeOpen = bar.querySelector('#pf-open');
+  const typeShut = () => {
+    if (typeMenu.hidden) return;
+    typeMenu.hidden = true;
+    typeOpen.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('mousedown', typeOutside, true);
+    document.removeEventListener('keydown', typeEsc, true);
+  };
+  const typeOutside = ev => {
+    if (!typeOpen.parentElement.contains(ev.target)) typeShut();
+  };
+  const typeEsc = ev => { if (ev.key === 'Escape') typeShut(); };
+  typeOpen.onclick = () => {
+    if (!typeMenu.hidden) return typeShut();
+    typeMenu.hidden = false;
+    typeOpen.setAttribute('aria-expanded', 'true');
+    // Через такт — иначе слушатель поймал бы тот же клик, которым список открыли.
+    setTimeout(() => {
+      document.addEventListener('mousedown', typeOutside, true);
+      document.addEventListener('keydown', typeEsc, true);
+    }, 0);
+  };
   bar.querySelectorAll('[data-type]').forEach(b => b.onclick = () => {
-    F.type = b.dataset.type;
-    bar.querySelectorAll('[data-type]').forEach(x => x.classList.toggle('on', x === b));
+    const code = b.dataset.type;
+    // «Все» — не вид, а сброс набора. Остальные переключаются по одному, и список
+    // остаётся открытым: выбирают их обычно не по одному, и закрытие после каждого
+    // означало бы открывать его заново столько раз, сколько видов нужно.
+    if (code === 'all') F.types = [];
+    else if (F.types.includes(code)) F.types = F.types.filter(x => x !== code);
+    else F.types = [...F.types, code];
+    bar.querySelectorAll('[data-type]').forEach(x => x.classList.toggle('on',
+      x.dataset.type === 'all' ? !F.types.length : F.types.includes(x.dataset.type)));
+    typeOpen.textContent = typeLabel();
     save(); paint();
   });
   paint();
@@ -6452,11 +7221,6 @@ async function viewPresets(){
       catch(e){ toast(e.message); }
     }));
 
-  app.append($(`<div class="note muted">Быстрее всего новый пресет получается копией
-    похожего: «Копия» рядом с ним, потом правка полей. Завести с нуля и править
-    настройки — в том сервисе, которому пресет принадлежит: ссылки в заголовках выше.
-    Здесь их формы не повторяются намеренно — у обложек полей больше двадцати, и вторая
-    копия формы разошлась бы с первой.</div>`));
 }
 
 function wirePresets(root){
@@ -6694,11 +7458,16 @@ async function neighbourPresetModal(service, name, opts){
   };
 
   const nameHtml = creating
-    ? `<div class="fld" style="grid-column:1/-1"><label for="np-name">Название</label>
+    // Первая фраза нужна всегда: имя живёт в соседнем сервисе, и на главном пути
+    // («Создать» на странице пресетов) это единственное место, где об этом сказано.
+    // Вторая — только когда есть «пресет здесь», чьё имя подставлено в поле.
+    ? `<div class="fld" style="grid-column:1/-1"><div class="lh"
+         style="display:flex;margin-bottom:7px"><label for="np-name">Название</label>${
+         hintDot('Это пресет в соседнем сервисе — у него своё имя.'
+           + (opts && opts.suggestName
+              ? ' Можно оставить такое же, как у пресета здесь.' : ''))}</div>
          <input id="np-name" placeholder="как называть пресет"
-           value="${esc((opts && opts.suggestName) || '')}">
-         <div class="note muted">Это пресет в соседнем сервисе — у него своё имя. Можно
-           оставить такое же, как у пресета здесь.</div></div>`
+           value="${esc((opts && opts.suggestName) || '')}"></div>`
     : '';
   const m = modal(creating ? 'Новый пресет' : `Пресет «${name}»`,
     `<div class="fields" style="padding:0">${nameHtml}${d.fields.map(fieldHtml).join('')}</div>`,
@@ -6720,6 +7489,17 @@ async function neighbourPresetModal(service, name, opts){
         const nm = box.querySelector('#np-name').value.trim();
         if (!nm) throw new Error('Название пустое.');
         await post(`/ui/presets/${encodeURIComponent(service)}/new`, {name: nm, values});
+        // Образец стиля уходит тем же нажатием, сразу за заведением. Cover Studio
+        // принимает файл только по имени УЖЕ существующего пресета — из-за этого
+        // поле при заведении было заперто, и чтобы приложить картинку, окно надо
+        // было открывать второй раз. Неудача с файлом не отменяет заведённый пресет:
+        // он уже есть у соседа, и «откатить» его тут значило бы удалить чужое.
+        const refIn = box.querySelector('#np-ref');
+        const picked = refIn && refIn.files && refIn.files[0];
+        if (picked){
+          try{ await uploadPresetReference(service, nm, picked); }
+          catch(e){ toast('Пресет заведён, образец стиля не ушёл: ' + e.message); }
+        }
       }else{
         await post(`/ui/presets/${encodeURIComponent(service)}/${
           encodeURIComponent(name)}/form`, {values});
@@ -6759,28 +7539,34 @@ async function neighbourPresetModal(service, name, opts){
     host.querySelector('.np-add').onclick = () => addRow(null);
   }
 
-  // Картинка-образец уходит сразу: файл хранит Cover Studio, а не форма.
+  // У заведённого пресета картинка-образец уходит сразу по выбору файла: править —
+  // значит менять то, что уже есть. У заводимого файл ждёт нажатия «Завести» (см.
+  // `onOk` выше): раньше сосед её принять не мог, и поле стояло запертым.
   const ref = m.body.querySelector('#np-ref');
-  if (ref && creating){
-    ref.disabled = true;
-    ref.title = 'Образец стиля прикрепляется после заведения пресета';
-  }
   if (ref && !creating) ref.onchange = async () => {
     const file = ref.files && ref.files[0];
     if (!file) return;
-    const fd = new FormData();
-    fd.append('file', file);
     ref.disabled = true;
     try{
-      const r = await fetch(API + `/ui/presets/${encodeURIComponent(service)}/${
-        encodeURIComponent(name)}/reference`, {method: 'POST', body: fd});
-      const out = await r.json().catch(() => ({}));
-      if (!r.ok) throw new Error(out.detail || ('HTTP ' + r.status));
+      const out = await uploadPresetReference(service, name, file);
       m.body.querySelector('.np-refname').textContent = out.filename || out.file_id;
       toast('Образец стиля прикреплён', 'ok');
     }catch(e){ toast(e.message); }
     finally{ ref.disabled = false; ref.value = ''; }
   };
+}
+
+// Картинку-образец хранит Cover Studio, а не форма: пульт её только передаёт. Вынесено
+// из окна пресета соседа, потому что зовётся из двух мест — при правке (сразу по
+// выбору файла) и при заведении (следом за созданием пресета, когда имя уже занято им).
+async function uploadPresetReference(service, presetName, file){
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch(API + `/ui/presets/${encodeURIComponent(service)}/${
+    encodeURIComponent(presetName)}/reference`, {method: 'POST', body: fd});
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(out.detail || ('HTTP ' + r.status));
+  return out;
 }
 
 /* ─────────────────────────── учётные записи ─────────────────────────── */
@@ -6793,7 +7579,9 @@ async function accountsCard(){
   catch(e){ return null; }        // не администратор — раздела просто нет
 
   const card = $(`<div class="card" style="margin-top:16px">
-    <div class="sec">Люди</div>
+    <div class="sec">Люди ${hintDot((d.note ? d.note + '. ' : '')
+      + 'Заводить человека в Rewrite и Cover не нужно — они узнают его по этому же '
+      + 'входу.')}</div>
     <table><thead><tr>
       <th>Логин</th><th>Роль</th><th>Тенант</th><th>Квота</th><th>Состояние</th><th></th>
     </tr></thead><tbody>${d.users.map(u => `<tr>
@@ -6818,13 +7606,9 @@ async function accountsCard(){
       </td>
     </tr>`).join('')}</tbody></table>
 
-    <div class="secbody">
-    <div id="uerr"></div>
-    <div class="note muted">${esc(d.note)}. Заводить его в Rewrite и Cover не нужно —
-      они узнают человека по этому же входу.</div>
-    </div>
     <div class="secbody" style="padding-top:0">
       <button class="ghost" id="n-go">Завести человека</button>
+      <div id="uerr"></div>
     </div>
   </div>`);
 
@@ -6915,7 +7699,9 @@ function subsExitsCard(s){
         страницу; если не помогло, кабинет не отвечает.</div></div></div>`);
 
   const card = $(`<div class="card">
-    <div class="sec">Выходы субтитров</div>
+    <div class="sec">Выходы субтитров ${hintDot((s.rest_vs_dead || '')
+      + ' Мёртвый выход убирать из настроек не нужно: он вернётся в работу сам, как '
+      + 'только снова ответит.')}</div>
     <div class="stage">
       <div class="dot ${EXIT_KIND_CLS[s.kind] || 's-idle'}">${EXIT_KIND_DOT[s.kind] || '?'}</div>
       <div class="body">
@@ -6953,9 +7739,6 @@ function subsExitsCard(s){
         несколько выходов: ${Object.entries(s.shared_ip).map(([ip, names]) =>
           esc(ip + ' — ' + names.join(', '))).join('; ')}.
         ${esc(s.shared_ip_note || '')}</div>` : ''}
-      <div class="note muted">${esc(s.rest_vs_dead || '')}</div>
-      <div class="note muted">Мёртвый выход убирать из настроек не нужно: он вернётся
-        в работу сам, как только снова ответит.</div>
       <div style="margin-top:12px"><button class="ghost small" id="se-probe"
         >Проверить сейчас</button></div>
     </div></div>`);
@@ -6985,18 +7768,21 @@ async function viewAdmin(){
                                               e => ({read_error: e.message}))]);
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/profile">← в профиль</a>
-    <h1>Админ</h1>
-    <p class="sub">Состояние системы: что мешает работе и сколько осталось места.
-      <a href="#/limits" style="margin-left:8px">Серверные лимиты →</a></p>`));
+    <h1>Админ ${hintDot(
+      'Состояние системы: что мешает работе и сколько осталось места.')}</h1>
+    <p class="sub"><a href="#/limits">Серверные лимиты →</a></p>`));
 
   /* ── тревоги ── */
   const t = a.transport;
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Тревоги в телеграм</div>
     <div class="stage">
-      <div class="dot ${t.configured ? 's-done' : 's-error'}">${t.configured ? '✓' : '!'}</div>
+      <div class="dot ${t.configured && !t.loop_off ? 's-done' : 's-error'}">${
+        t.configured && !t.loop_off ? '✓' : '!'}</div>
       <div class="body">
-        <div class="name">${t.configured
+        <div class="name">${t.loop_off
+          ? 'Тревоги на этом стенде выключены (VS_ALERTS=0) — никуда не уходят'
+          : t.configured
           ? 'Телеграм настроен' : 'Телеграм не настроен — тревоги никуда не уходят'}</div>
         <div class="facts">${t.configured
           ? `токен <span class="mono">${esc(t.token)}</span> · чат
@@ -7113,7 +7899,7 @@ async function viewAdmin(){
 
   /* ── вышел ли ролик на самом деле ── */
   app.append($(`<div class="card" style="margin-top:16px">
-    <div class="sec">Выход в свет</div>
+    <div class="sec">Выход в свет ${hintDot(pb.how)}</div>
     <div class="stage">
       <div class="dot ${pb.key_set ? 's-done' : 's-idle'}">${pb.key_set ? '✓' : '?'}</div>
       <div class="body">
@@ -7122,7 +7908,6 @@ async function viewAdmin(){
           : 'Ключа YouTube Data API нет — выход подтвердить нечем'}</div>
         <div class="facts">подтверждённо вышли: ${pb.confirmed} ·
           стоят в расписании: ${pb.scheduled}</div>
-        <div class="note muted">${esc(pb.how)}</div>
       </div>
     </div>
     ${pb.due.length ? `<div class="sec" style="border-bottom:0">Пора спросить</div>
@@ -7174,7 +7959,9 @@ const ROUTES = [
                                                           decodeURIComponent(h.split('/')[2]))],
   ['profile',  h => h === '#/limits',             () => viewLimits()],
   ['presets',  h => h === '#/presets',            () => viewPresets()],
-  ['presets',  h => h === '#/preset/new',          () => viewPresetNew()],
+  // `#/preset/new` — тоже редактор, просто пресета за ним ещё нет: отдельного экрана
+  // заведения больше нет, и отдельного маршрута ему не нужно. Номер пресета — всегда
+  // число, поэтому «new» ни с чьим адресом не столкнётся.
   ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(
                                                           decodeURIComponent(h.split('/')[2]))],
   ['profile',  h => h === '#/admin',              () => viewAdmin()],

@@ -58,6 +58,11 @@ SCENARIO = r"""
   document.getElementById('app').append(card);
   out.кнопка_настроить = !!card.querySelector('.np-edit');
   out.кнопка_завести = !!card.querySelector('.np-add');
+  // Знак вопроса у подписи вставляется уже в живой разметке — проверяем её, а не
+  // исходник: вставка во время выполнения статической проверке не видна.
+  out.знак_есть = !!card.querySelector('.fld .q');
+  out.знаков_в_подписи = card.querySelectorAll('label .q').length;
+  out.подпись_поля = (card.querySelector('label[for="f-preset_cover"]') || {}).textContent;
 
   card.querySelector('.np-edit').click();
   await new Promise(r => setTimeout(r, 400));
@@ -101,6 +106,10 @@ def main() -> int:
     check("падений нет", (res.get("упало"), res.get("errs")), (None, []))
     check("кнопка «Настроить» рядом с полем", res.get("кнопка_настроить"), True)
     check("кнопка «Завести новый» рядом с ней", res.get("кнопка_завести"), True)
+    check("у подписи есть знак вопроса", res.get("знак_есть"), True)
+    check("и он рядом с подписью, а не внутри <label>", res.get("знаков_в_подписи"), 0)
+    check("подпись поля — только её слова", (res.get("подпись_поля") or "").strip(),
+          "Пресет обложки")
 
     print("\nНастройки соседа открываются на месте")
     check("окно правки открылось", res.get("окно_правки"), True)

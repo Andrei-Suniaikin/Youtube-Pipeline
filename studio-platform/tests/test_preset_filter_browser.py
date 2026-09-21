@@ -48,20 +48,33 @@ api = async (path) => {
   const out = {};
   try {
     try { localStorage.removeItem('presetFilter'); } catch (e) {}
-    presetFilter.q = ''; presetFilter.type = 'all';
+    presetFilter.q = ''; presetFilter.types = [];
     await viewPresets();
     const names = () => [...app.querySelectorAll('.stage .name')].map(x => x.textContent.trim());
     const click = code => app.querySelector(`[data-type="${code}"]`).click();
+    // Выбор стал множественным, поэтому «показать ровно этот вид» — это сброс («Все»)
+    // и один клик. Так же поступает и человек: «Все» стоит первым пунктом списка.
+    const only = code => { click('all'); click(code); };
+    const label = () => app.querySelector('#pf-open').textContent.trim();
     const type = q => { const i = app.querySelector('#pf-q'); i.value = q; i.dispatchEvent(new Event('input')); };
     out.all = names();
+    out.labelAll = label();
     out.buttons = [...app.querySelectorAll('[data-type]')].map(b => b.textContent.trim());
-    click('full');    out.full = names();
+    out.menuHidden = app.querySelector('#pf-types').hidden;
+    only('full');    out.full = names();
     out.fullOn = app.querySelector('[data-type="full"]').classList.contains('on');
-    click('partial'); out.partial = names();
-    click('images');  out.images = names();
-    click('clips');   out.clipsEmpty = app.textContent.includes('Под фильтр ничего не подошло');
+    out.labelFull = label();
+    // Множественный выбор: «Целые» + «Картинки» показывают и то и другое, а подпись
+    // кнопки перечисляет выбранное.
+    click('images'); out.twoKinds = names(); out.labelTwo = label();
+    click('voice'); click('clips'); out.labelMany = label();
+    only('partial'); out.partial = names();
+    only('images');  out.images = names();
+    only('clips');   out.clipsEmpty = app.textContent.includes('Под фильтр ничего не подошло');
     click('all');     type('польск'); out.search = names();
     click('full');    out.searchFull = names();
+    // Повторный клик по выбранному виду снимает его — иначе из набора не выйти.
+    click('full');   out.offAgain = names();
     type('нет такого'); click('all'); out.noneEmpty = app.textContent.includes('Под фильтр ничего не подошло');
     let saved = null; try { saved = JSON.parse(localStorage.getItem('presetFilter')); } catch (e) {}
     out.saved = saved;
@@ -91,12 +104,28 @@ def main() -> int:
     check("«Частичные» — все частичные, по частям", res.get("partial"),
           ["Голос Анна", "Кадры польские", "Сборка быстрая"])
     check("«Картинки» — только частичные картинки", res.get("images"), ["Кадры польские"])
+    check("повторный клик снимает вид — набор пустеет обратно во «все»",
+          sorted(res.get("offAgain") or []),
+          sorted(["Польский длинный", "Кадры польские", "Польский рерайт"]))
     check("пустой результат подписан, а не пустое место", res.get("clipsEmpty"), True)
     check("поиск по названию без учёта регистра, во всех сервисах", res.get("search"),
           ["Польский длинный", "Кадры польские", "Польский рерайт"])
     check("поиск и тип вместе", res.get("searchFull"), ["Польский длинный"])
     check("ничего не найдено — подпись", res.get("noneEmpty"), True)
-    check("фильтр запоминается у зрителя", res.get("saved"), {"q": "нет такого", "type": "all"})
+    check("фильтр запоминается у зрителя", res.get("saved"),
+          {"q": "нет такого", "types": []})
+
+    print("\nОдиннадцать кнопок свёрнуты в один список (жалоба владельца 21.09.2026)")
+    check("список закрыт, пока его не открыли", res.get("menuHidden"), True)
+    check("подпись кнопки без выбора — «Все виды»", res.get("labelAll"), "Все виды")
+    check("подпись кнопки называет выбранное", res.get("labelFull"), "Целые")
+
+    print("\nВыбор множественный")
+    check("«Целые» + «Картинки» показывают и то и другое", res.get("twoKinds"),
+          ["Польский длинный", "Английский короткий", "Кадры польские"])
+    check("подпись перечисляет оба", res.get("labelTwo"), "Целые, Картинки")
+    check("длинный набор подписан коротко, а не списком",
+          res.get("labelMany"), "Целые, Картинки +2")
 
     print()
     if FAILS:

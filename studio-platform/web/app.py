@@ -2020,6 +2020,9 @@ def ui_alerts():
         "owed_recovered": owed,
         "transport": {"configured": tg.enabled, "token": mask(tg.token),
                       "chat": tg.chat or "",
+                      # Стенд запущен с VS_ALERTS=0 (dev/run.sh): цикл тревог не заведён,
+                      # и «Телеграм настроен ✓» обещало бы доставку, которой не будет.
+                      "loop_off": os.environ.get("VS_ALERTS", "").strip() == "0",
                       "how": "нужны токен бота и адрес чата — их выдаёт @BotFather; "
                              "порядок описан в инструкции к системе"},
         "thresholds": [
@@ -3025,8 +3028,25 @@ def _origin_link(pid: str, url: str, *, ordered: bool = False) -> None:
     fields = {"kind": "link", "donor_url": url, "video_id": vid}
     if ordered:
         fields["ordered"] = time.time()
+        _order_remember(pid, vid, url, fields["ordered"])
     elif not _origin_same_link(row, url, vid):
-        fields["ordered"] = 0.0
+        # Прежняя пометка уходит из строки источника — но не из памяти: заказ по
+        # прежнему ролику был, и вернись человек к нему, предупредить о повторе надо.
+        # Проекты, чьи заказы сделаны до появления истории, попадают в неё здесь.
+        old = float(row.get("ordered") or 0)
+        if old and (row.get("video_id") or ""):
+            _order_remember(pid, row["video_id"], row.get("donor_url") or "", old)
+        before = 0.0
+        try:
+            c = db()
+        except HTTPException:
+            c = None
+        if c is not None:
+            try:
+                before = _ordered_before(c, pid, vid)
+            finally:
+                c.close()
+        fields["ordered"] = before
     _origin_write(pid, **fields)
 
 
@@ -3059,6 +3079,66 @@ def _origin_same_link(row: dict, url: str, vid: str = None) -> bool:
     if vid and (row.get("video_id") or ""):
         return vid == row["video_id"]
     return bool(url) and url == (row.get("donor_url") or "")
+
+
+# ─────────────── какие ролики проекта уже оплачены ───────────────
+# Пометка `project_origin.ordered` одна на проект и живёт, пока запомнена ТА ЖЕ ссылка:
+# смена ссылки её обнуляет. Пока ссылку меняли только кнопкой, этого хватало. С
+# 21.09.2026 ссылка запоминается сама, как только её вставили в поле, — и достаточно
+# было вставить по ошибке другую, а потом вернуть прежнюю, чтобы пометка «по этой
+# ссылке уже заказывали» пропала и второй платный рерайт ушёл без предупреждения
+# (найдено ревью 21.09.2026, воспроизведено на копии базы).
+#
+# Поэтому оплаченные ролики проекта записываются отдельно, по одному на ролик, и
+# предупреждение о повторе смотрит сюда, а не на то, какая ссылка запомнена сейчас.
+# Деньги — факт истории заказов, а не состояние поля.
+
+
+def _orders_schema(c) -> None:
+    c.execute("CREATE TABLE IF NOT EXISTS project_origin_orders("
+              "tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, "
+              "video_id TEXT NOT NULL, donor_url TEXT NOT NULL DEFAULT '', "
+              "ordered REAL NOT NULL DEFAULT 0, "
+              "PRIMARY KEY(tenant_id, project_id, video_id))")
+
+
+def _order_remember(pid: str, vid: str, url: str, ts: float) -> None:
+    """Записать, что по ролику `vid` для проекта заказывали текст в момент `ts`.
+
+    Как и `_origin_write`, сбой записи не превращаем в ошибку: к этому моменту заказ уже
+    может быть оплачен, и отказ заставил бы нажать ещё раз."""
+    if not pid or not vid or not ts:
+        return
+    try:
+        c = db()
+    except HTTPException:
+        return
+    try:
+        _orders_schema(c)
+        c.execute("INSERT INTO project_origin_orders(tenant_id, project_id, video_id, "
+                  "donor_url, ordered) VALUES (?,?,?,?,?) "
+                  "ON CONFLICT(tenant_id, project_id, video_id) DO UPDATE SET "
+                  "donor_url=excluded.donor_url, "
+                  "ordered=MAX(ordered, excluded.ordered)",
+                  (TENANT, pid, vid, url or "", float(ts)))
+        c.commit()
+    except sqlite3.Error:
+        pass
+    finally:
+        c.close()
+
+
+def _ordered_before(c, pid: str, vid: str) -> float:
+    """Когда по этому ролику для проекта последний раз заказывали текст; 0 — не
+    заказывали. Только чтение: таблицы нет — значит, и заказов не было."""
+    if not pid or not vid:
+        return 0.0
+    try:
+        r = c.execute("SELECT ordered FROM project_origin_orders WHERE tenant_id=? "
+                      "AND project_id=? AND video_id=?", (TENANT, pid, vid)).fetchone()
+    except sqlite3.Error:
+        return 0.0
+    return float(r["ordered"] or 0) if r else 0.0
 
 
 def _release_donor(c, pid: str) -> str:
@@ -3491,14 +3571,23 @@ def ui_source_detect(body: DetectIn):
     finally:
         c.close()
     same = out["kind"] == "link" and _origin_same_link(row, out["url"], out["video_id"])
-    ordered = float(row.get("ordered") or 0)
+    ordered = float(row.get("ordered") or 0) if same else 0.0
+    if out["kind"] == "link" and not ordered:
+        # Не запомненная сейчас ссылка ещё не значит «не заказанная»: история заказов
+        # проекта знает все оплаченные ролики (см. `project_origin_orders`).
+        c = db()
+        try:
+            ordered = _ordered_before(c, pid, out["video_id"])
+        finally:
+            c.close()
     warn = ""
-    if same and ordered:
+    if ordered:
         warn = (f"по этой ссылке текст для проекта уже заказывали {_when(ordered)} — "
                 f"повтор создаст вторую задачу и второй платный рерайт")
-    elif out["kind"] == "link" and (row.get("donor_url") or "") and not same:
-        warn = (f"у проекта записана другая ссылка ({_short(row['donor_url'])}) — "
-                f"заказ по новой её заменит")
+    if out["kind"] == "link" and (row.get("donor_url") or "") and not same:
+        warn = ((warn + ". ") if warn else "") + (
+            f"у проекта записана другая ссылка ({_short(row['donor_url'])}) — "
+            f"заказ по новой её заменит")
     if out["mode"] and scenario.strip():
         # Вторая половина путаницы, на которую жаловался владелец: сверху ссылка, снизу
         # «исходный текст какой-то». Сценарий заказом не перезаписывается — это делает
@@ -4273,6 +4362,50 @@ def _partial_options_by_part(c) -> dict:
             continue
         out[scope].append({"id": row["id"], "name": row["name"] or f"пресет {row['id']}"})
     return out
+
+
+# Стоит ВЫШЕ общей `/ui/presets/{service}/new/form` намеренно: FastAPI берёт первый
+# подошедший маршрут, и без этого порядка «новый пресет производства» уехал бы в ручку
+# соседей и ответил бы 404 «у сервиса vsgen своих пресетов нет».
+@app.get("/ui/presets/vsgen/new/form")
+def ui_preset_new_form(scope: str = preset_links.FULL):
+    """Пустая форма ещё НЕ заведённого пресета производства.
+
+    Раньше настройки открывались только по номеру (`/ui/presets/vsgen/{prid}`), то есть
+    строку в кабинете приходилось заводить до того, как человек что-нибудь настроил, —
+    ради этого и стоял отдельный экран «название + тип». Имя при этом требовалось
+    заранее, хотя нужно оно только записи: дальше его никто не проверяет
+    (`ui_preset_save`), а кабинет пустым именем и затереть-то не может
+    (`COALESCE(NULLIF(?,''),name)`).
+
+    Теперь форма открывается без записи, а строка заводится первым «Сохранить». Поля —
+    те же самые (`preset_fields.describe`), значения умолчательные. Ссылок на частичные
+    здесь нет и быть не может: писать их некуда, пока пресета нет, — поэтому
+    `link_options` пуст, и переключатель «свои поля / из частичного» пульт не рисует.
+    """
+    scope = (scope or preset_links.FULL).strip().lower() or preset_links.FULL
+    if scope != preset_links.FULL and scope not in preset_links.PARTS:
+        raise HTTPException(400, f"нет такой части: «{scope}»")
+    settings = {} if scope == preset_links.FULL else {"_scope": scope}
+    mod = sys.modules.get("main")
+    groups = preset_fields.describe(mod, settings, _neighbour_preset_names())
+    for g in groups:
+        part = _TITLE_TO_PART.get(g["title"])
+        g["part"] = part
+        if part is None:
+            continue
+        g["source"] = "own"
+        g["readonly"] = False
+        g["link_id"] = None
+        g["link_name"] = None
+        g["link_problem"] = ""
+        g["link_options"] = []
+    return {"id": None, "name": "", "scope": scope,
+            "links": {}, "link_problems": [], "users": {},
+            "groups": groups,
+            "note": ("Пустое поле означает «как по умолчанию» — заполнять всё сразу "
+                     "не нужно. Имя спросим при сохранении: по нему пресет ищут в "
+                     "списках и привязывают к каналу.")}
 
 
 @app.get("/ui/presets/vsgen/{prid:int}")
@@ -6014,6 +6147,15 @@ def ui_project(pid: str):
         applied_preset = _applied_preset_info(c, settings)
     finally:
         c.close()
+    # Этапы, поставленные «Сделать всё» в план: задачи в очереди у них ещё нет, они
+    # стартуют сами, когда дозреют материалы, — с ТЕКУЩИМИ настройками проекта.
+    # Соответствие флагов этапам — то же, что у кабинетного списка проектов
+    # (server/main.py, `_defer`). Экрану это нужно, чтобы свернуть настройки такого
+    # этапа ради места (просьба владельца 21.09.2026) и сказать, что он в плане.
+    planned = [name for key, name in (("deferred_images_pending", "images"),
+                                      ("deferred_video_pending", "video"),
+                                      ("deferred_pending", "render"))
+               if settings.get(key)]
 
     st = {}
     if mod is not None and hasattr(mod, "_project_status"):
@@ -6067,7 +6209,8 @@ def ui_project(pid: str):
                     "updated": p["updated"],
                     "release_id": (rel["release_id"] if rel else ""),
                     "phase": (rel["phase"] if rel else ""),
-                    "stage": stage, "applied_preset": applied_preset},
+                    "stage": stage, "applied_preset": applied_preset,
+                    "planned": planned},
         "ready": st, "jobs": jobs, "files": groups, "paid": paid, "source": source,
         "origin": origin,
         # Ссылки на файлы и архивы — кабинета: он отдаёт их с проверкой, что путь
@@ -7461,7 +7604,8 @@ def ui_project_source_save(pid: str, body: SourceIn, request: Request):
     c = db()
     try:
         _project_or_404(c, pid)
-        was = (_origin_read(c, pid).get("kind") or "").strip()
+        was_row = _origin_read(c, pid)
+        was = (was_row.get("kind") or "").strip()
     finally:
         c.close()
     known = bool(was)
@@ -7486,6 +7630,11 @@ def ui_project_source_save(pid: str, body: SourceIn, request: Request):
         fields = {"donor_url": "", "video_id": "", "ordered": 0.0}
         if was == "link":
             fields["kind"] = ""
+        # Забывается запись о доноре, а не заказ: пометку о деньгах уносим в историю
+        # заказов, иначе вставленная обратно ссылка не предупредила бы о повторе.
+        old = float(was_row.get("ordered") or 0)
+        if old and (was_row.get("video_id") or ""):
+            _order_remember(pid, was_row["video_id"], was_row.get("donor_url") or "", old)
         _origin_write(pid, **fields)
     return {"ok": True, "origin": _project_origin_now(pid)}
 

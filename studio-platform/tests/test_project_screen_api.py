@@ -269,6 +269,11 @@ def main() -> int:
         code, body = me.go(f"/ui/projects/{pid}/stage/render", {})
         check("рендер без готовых материалов — render_deferred",
               (body or {}).get("outcome"), "render_deferred")
+        # Отложенный рендер — этап «в плане»: задачи в очереди нет, а экран обязан
+        # свернуть его настройки так же, как у идущего (владелец 21.09.2026).
+        code, body = me.go(f"/ui/projects/{pid}")
+        check("отложенный рендер назван в project.planned",
+              ((body or {}).get("project") or {}).get("planned"), ["render"])
 
         busy_jid = 9010001
         insert_queue_task(busy_jid, pid, "regen", "running")

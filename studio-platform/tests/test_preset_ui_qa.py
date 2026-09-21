@@ -11,7 +11,8 @@
 
 Покрывает то, чего не покрывают другие тесты фазы 3:
 - список пресетов разбит на «Целые»/«Частичные» (по частям), у каждого — «кто бежит»;
-- «Новый пресет»: тип — кнопки-группа на шесть вариантов, а не выпадающий список;
+- заведение идёт внутри формы (`#/preset/new`), отдельного экрана «название + тип»
+  нет, а сам тип — кнопки-группа на семь вариантов, а не выпадающий список;
 - редактор частичного показывает только вкладку своей части;
 - редактор целого: переключатель «Свои поля / Из частичного пресета», подпись
   «из пресета «X»» со ссылкой «править его →», поля связанной группы — `disabled`
@@ -114,35 +115,54 @@ def main() -> int:
           "viaPresets > 0" in preset_item
           and "ни один канал им не пользуется" in preset_item, True)
 
-    print("\n«Новый пресет» (viewPresetNew): тип — кнопки-группа на шесть вариантов, "
-          "а не выпадающий список (вариантов шесть, спецификация требует видеть их сразу)")
-    view_new = function_body(index_html, "async function viewPresetNew(){")
-    check("viewPresetNew() найдена", bool(view_new), True)
-    check("группа переключателей #scope-modes есть", 'id="scope-modes"' in view_new, True)
+    # 21.09.2026: отдельного экрана заведения (viewPresetNew) больше нет — он требовал
+    # имя и тип ДО того, как человек что-нибудь настроил, то есть держал настройки за
+    # двумя переходами (жалоба владельца «имя — как будто уже настройка пресета»).
+    # Выбор типа при этом никуда не делся и остался кнопками-группой: прежнее решение
+    # владельца — «вариантов шесть, их надо видеть сразу» — в силе, просто он переехал
+    # в саму форму, на `#/preset/new`.
+    print("\nЗаведение — внутри формы (viewPreset при id === 'new'): тип кнопками-"
+          "группой, отдельного экрана «название + тип» нет")
+    view_preset = function_body(index_html, "async function viewPreset(id){")
+    check("отдельного экрана заведения не осталось",
+          "async function viewPresetNew(" in index_html, False)
+    check("адреса `#/preset/new` в роутере отдельной строкой нет — это тот же редактор",
+          "() => viewPresetNew()" in index_html, False)
+    check("редактор знает про ещё не заведённый пресет",
+          "const creating = String(id) === 'new';" in view_preset, True)
+    check("форма для незаведённого берётся своей ручкой, а не по номеру",
+          "'/ui/presets/vsgen/new/form?scope='" in view_preset, True)
+    check("группа переключателей #scope-modes есть", 'id="scope-modes"' in view_preset, True)
     check("класс .modes (тот же виджет кнопок-группы, что и везде в пульте, "
-          "не select/dropdown)", 'class="modes" id="scope-modes"' in view_new, True)
+          "не select/dropdown)", 'class="modes" id="scope-modes"' in view_preset, True)
     check("внутри блока типа пресета нет <select (это не выпадающий список)",
-          "<select" not in view_new.split('id="scope-modes"')[1].split("</div>")[0]
-          if 'id="scope-modes"' in view_new else True, True)
-    check("кнопка «Целый» — включена по умолчанию (class on)",
-          'data-scope="full" class="on"' in view_new, True)
-    check("пять кнопок «Только <часть>» строятся из PART_TITLES (та же карта частей, "
-          "что и сервер)", "PART_TITLES.map(([code, title])" in view_new, True)
+          "<select" not in view_preset.split('id="scope-modes"')[1].split("</div>")[0]
+          if 'id="scope-modes"' in view_preset else True, True)
+    check("кнопки типа показываются только пока пресета нет",
+          "if (creating){" in view_preset, True)
+    check("шесть кнопок «Только <часть>» строятся из PART_TITLES (та же карта частей, "
+          "что и сервер)", "PART_TITLES.map(([code, title])" in view_preset, True)
     check("подпись кнопки — «Только <часть в нижнем регистре>»",
-          "Только ${esc(title.toLowerCase())}" in view_new, True)
-    check("создание пресета отправляет выбранный scope на сервер",
-          "{name: card.querySelector('#p-name').value, scope}" in view_new, True)
+          "Только ${esc(title.toLowerCase())}" in view_preset, True)
+    check("заведение отправляет выбранный тип на сервер",
+          "post('/ui/presets/vsgen', {name: nm, scope: draft.scope})" in view_preset, True)
+    # Главное в жалобе: настройки открываются сразу, а имя спрашивают в момент записи и
+    # говорят об этом у самого поля. Тост поверх экрана не показывает, где поправить.
+    check("пустое имя останавливает только запись, и отказ показан у поля",
+          "nameErr.hidden = false;" in view_preset
+          and "why.inplace = true;" in view_preset, True)
 
     print("\nРедактор частичного (viewPreset): показана только вкладка своей части "
           "(раздел 4: «Только вкладка своей части»)")
-    view_preset = function_body(index_html, "async function viewPreset(id){")
     check("viewPreset() найдена", bool(view_preset), True)
     check("группы частичного отфильтрованы по d.scope === g.part",
           "d.scope === 'full' ? d.groups\n"
           "                                     : d.groups.filter(g => g.part === d.scope)"
           in view_preset, True)
-    check("переключатель ссылок вешается только у целого (d.scope === 'full')",
-          "if (d.scope === 'full'){" in view_preset, True)
+    # Ссылку на частичный некуда писать, пока пресета нет: ручка `/links` адресуется
+    # номером. Поэтому у ещё не заведённого переключателя быть не должно.
+    check("переключатель ссылок вешается только у целого и только у заведённого",
+          "if (d.scope === 'full' && !creating){" in view_preset, True)
     # Ревью цикла 1 фазы 3, Issue 2: клик по переключателю меняет вид сразу (до ответа
     # сервера), поэтому при неудачной записи ссылки экран обязан перерисоваться по
     # факту (render()) и вне try, а не только при успехе — иначе переключатель после
@@ -208,6 +228,24 @@ def main() -> int:
           and "Целые пресеты, ссылающиеся на этот" in users_html, True)
     check("блок «Каналы через них» — тоже только у частичного",
           "Каналы через них" in users_html, True)
+
+    # 21.09.2026, свёртка фильтра в один список с множественным выбором: форма
+    # запомненного состояния сменилась с `{q, type}` на `{q, types: []}`. Старую форму
+    # сторож обязан читать — иначе у каждого, кто уже пользовался экраном, фильтр молча
+    # слетел бы в «Все»; и обязан сверять коды со списком — иначе внутрь проехал бы
+    # мусор из ключа зрителя (в том числе вид, которого больше нет).
+    print("\nФильтр: смена формы ключа в localStorage не теряет прежний выбор")
+    reader = index_html.split("const presetFilter = (() => {")[1].split("})();")[0] \
+        if "const presetFilter = (() => {" in index_html else ""
+    check("сторож фильтра найден", bool(reader), True)
+    check("старая форма {q, type} читается как набор из одного вида",
+          "typeof v.type === 'string' ? [v.type]" in reader, True)
+    check("новая форма {q, types} читается как есть",
+          "Array.isArray(v.types) ? v.types" in reader, True)
+    check("коды сверяются со списком видов",
+          "raw.filter(c => PRESET_TYPE_TITLE.has(c))" in reader, True)
+    check("«Все» в карту подписей не попадает — это пустой набор, а не вид",
+          "PRESET_FILTER_TYPES.filter(([c]) => c !== 'all')" in index_html, True)
 
     print("\nПроблемы ссылок: предупреждающий значок на вкладке (viewPreset)")
     check("вкладка с link_problem получает значок ⚠",
