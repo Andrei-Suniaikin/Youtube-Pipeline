@@ -176,7 +176,14 @@ ALTK
     #
     # Проверено НАСТОЯЩИМИ вызовами, а не пробой с пустым телом: пустое тело валидируется
     # раньше разбора модели и на nano отвечало 422 «принято», то есть врало.
-    export REWRITE_ALLOWED_OPENAI_MODELS="${REWRITE_ALLOWED_OPENAI_MODELS:-gpt-4.1-mini,gpt-4o-mini}"
+    # Сужение привязано к ТОМУ, КУДА реально направлен рерайт, а не к наличию ключа.
+    # Иначе после перехода на настоящий OpenAI (где nano есть) она осталась бы скрытой
+    # без видимой причины — ловушка, которую пришлось бы разгадывать заново.
+    case "$REWRITE_GPT_CHAT_URL" in
+      *fast-gen.ai*)
+        export REWRITE_ALLOWED_OPENAI_MODELS="${REWRITE_ALLOWED_OPENAI_MODELS:-gpt-4.1-mini,gpt-4o-mini}"
+        ;;
+    esac
   fi
   # Анализ обложки. В этом форке он ходит ТОЛЬКО в OpenAI: Gemini-SDK удалён в v1.0.3,
   # provider="google" молча падает обратно на OpenAI. Без денег на счету обложка «новой
