@@ -7584,10 +7584,20 @@ def _autotake_cover(pid: str, rows: list, sid: str) -> str:
         if not done:
             return ""
         job = done[0]
-        files = [f for f in (job.get("output_files") or []) if isinstance(f, str) and f]
-        if len(files) != 1:
+        jid = str(job.get("id") or "")
+        if not jid:
             return ""
-        url = (f"{COVER_BASE}/jobs/{urllib.parse.quote(str(job.get('id') or ''))}"
+        # Имена файлов в СТРОКЕ задачи не приходят — там только `results` числом. Их
+        # отдаёт отдельный запрос, и именно им пользуется ручная кнопка «Поставить
+        # обложкой проекта». Первая версия этой функции читала поле `output_files`,
+        # которого в ответе нет вовсе, и молча не срабатывала никогда: владелец так и
+        # сказал — «не показывается, что обложка уже готова».
+        code, listed = _proxy_get(COVER_BASE, f"/jobs/{urllib.parse.quote(jid)}/files", sid)
+        files = [f for f in (listed if isinstance(listed, list) else [])
+                 if isinstance(f, str) and f]
+        if code != 200 or len(files) != 1:
+            return ""
+        url = (f"{COVER_BASE}/jobs/{urllib.parse.quote(jid)}"
                f"/files/{urllib.parse.quote(files[0])}")
         req = urllib.request.Request(url)
         req.add_header("Cookie", f"{auth.COOKIE}={sid}")

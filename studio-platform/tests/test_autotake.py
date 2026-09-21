@@ -63,14 +63,20 @@ def test_cover(tmp) -> None:
     was_mod = sys.modules.get("main")
     sys.modules["main"] = _Mod()
     was_open = app.urllib.request.urlopen
+    was_proxy = app._proxy_get
 
     class _R:
         def __enter__(self): return self
         def __exit__(self, *a): return False
         def read(self): return b"JPEGDATA"
     app.urllib.request.urlopen = lambda *a, **k: _R()
+    # Имена файлов приходят ОТДЕЛЬНЫМ запросом: в строке задачи их нет, там только
+    # число результатов. На этом первая версия и споткнулась — читала поле, которого
+    # в ответе не существует, и молча не срабатывала никогда.
+    names = ["a/cover.jpg"]
+    app._proxy_get = lambda base, path, sid: (200, list(names))
     try:
-        one = [{"id": "j1", "status": "completed", "output_files": ["a/cover.jpg"]}]
+        one = [{"id": "j1", "status": "completed"}]
         check("один готовый вариант — взяли", app._autotake_cover("p", one, "sid"),
               "a/cover.jpg")
         check("файл лежит в проекте",
@@ -80,15 +86,17 @@ def test_cover(tmp) -> None:
         check("второй раз не трогаем", app._autotake_cover("p", one, "sid"), "")
 
         os.remove(os.path.join(pdir, "cover.jpg"))
-        two = [{"id": "j1", "status": "completed", "output_files": ["a.jpg", "b.jpg"]}]
-        check("два варианта — выбирает человек", app._autotake_cover("p", two, "sid"), "")
-        running = [{"id": "j1", "status": "running", "output_files": ["a.jpg"]}]
+        names[:] = ["a.jpg", "b.jpg"]
+        check("два варианта — выбирает человек", app._autotake_cover("p", one, "sid"), "")
+        names[:] = ["a.jpg"]
+        running = [{"id": "j1", "status": "running"}]
         check("задача не готова — брать нечего",
               app._autotake_cover("p", running, "sid"), "")
         check("после отказов файла так и нет",
               os.path.exists(os.path.join(pdir, "cover.jpg")), False)
     finally:
         app.urllib.request.urlopen = was_open
+        app._proxy_get = was_proxy
         if was_mod is None:
             sys.modules.pop("main", None)
         else:

@@ -124,9 +124,37 @@
   .segs i.off{background:transparent;border:1px dashed var(--line-2)}
   /* Переделать один кадр — ТЗ §14. Кнопка появляется на самой миниатюре: искать
      номер сцены в отдельном поле человек не станет, он смотрит на картинку. */
+  /* Просмотр картинки на месте. Раньше миниатюра вела <a target="_blank"> — то есть
+     смотреть кадры означало открыть двадцать вкладок и потерять, где ты был. */
+  dialog.lb{border:0;background:transparent;padding:0;max-width:96vw;max-height:96vh}
+  dialog.lb::backdrop{background:rgba(0,0,0,.86)}
+  dialog.lb img{max-width:96vw;max-height:86vh;display:block;border-radius:8px;
+                margin:0 auto;object-fit:contain}
+  dialog.lb .lbbar{display:flex;align-items:center;gap:14px;justify-content:center;
+                   padding:10px 4px 0;color:#cfc9da;font-size:13px}
+  dialog.lb .lbbar button{background:rgba(255,255,255,.08);color:#fff;border:0;
+                   border-radius:7px;padding:6px 13px;cursor:pointer;font-size:14px}
+  dialog.lb .lbbar button:hover{background:rgba(255,255,255,.16)}
+  dialog.lb .lbname{max-width:46vw;overflow:hidden;text-overflow:ellipsis;
+                    white-space:nowrap;opacity:.8}
+  /* Плеер: у встроенного в браузер вид чужой и разный в каждом браузере. */
+  .pl{display:flex;align-items:center;gap:11px;padding:9px 12px;margin-top:6px;
+      border:1px solid var(--line);border-radius:9px;background:var(--card-2,rgba(255,255,255,.03))}
+  .pl button{flex:0 0 auto;width:32px;height:32px;border-radius:50%;border:0;cursor:pointer;
+             background:var(--acc,#8b7bf0);color:#fff;font-size:13px;line-height:1}
+  .pl .bar{flex:1;height:5px;border-radius:3px;background:rgba(255,255,255,.13);
+           position:relative;cursor:pointer}
+  .pl .bar i{position:absolute;left:0;top:0;bottom:0;border-radius:3px;
+             background:var(--acc,#8b7bf0);width:0}
+  .pl .t{flex:0 0 auto;font-variant-numeric:tabular-nums;font-size:12px;opacity:.75}
   .thumb{position:relative;display:inline-block;line-height:0}
   .thumb img{display:block;border-radius:5px;border:1px solid var(--line)}
+  /* 21.09.2026: у вертикального формата 9:16 миниатюра уже кнопки, и «переделать»
+     вылезала за левый край карточки на два десятка пикселей. Ширину ограничиваем
+     самой миниатюрой; длинная подпись обрезается многоточием, а не ломает вёрстку. */
   .thumb .again{position:absolute;right:3px;bottom:3px;opacity:0;transition:opacity .12s;
+                max-width:calc(100% - 6px);overflow:hidden;text-overflow:ellipsis;
+                white-space:nowrap;
                 background:rgba(13,11,18,.82);color:#fff;border:0;border-radius:5px;
                 padding:2px 7px;font-size:11px;font-weight:650;cursor:pointer;line-height:1.5}
   .thumb:hover .again{opacity:1}
@@ -1940,10 +1968,106 @@ function showWho(){
 /* Миниатюра с кнопкой «переделать». Один кадр вместо всего этапа: повтор этапа
    целиком переделывает и то, что получилось, а это уже оплаченная работа. */
 function thumb(src, full, name, height, pid){
+  // href и target остаются: обычный клик перехватит просмотрщик (wireLightbox), а
+  // ctrl-клик и «открыть в новой вкладке» продолжат работать как у всякой ссылки.
   return `<span class="thumb"><a href="${full}" target="_blank" title="${esc(name)}"
+    data-full="${full}" data-name="${esc(name)}"
     ><img src="${src}" loading="lazy" style="height:${height}px"></a>${pid
     ? `<button class="again" data-regen="image" data-pid="${esc(pid)}"
          data-name="${esc(name)}">переделать</button>` : ''}</span>`;
+}
+
+function lightbox(items, start){
+  // Смотреть кадры вкладками — значит потерять место, где ты был. Здесь тот же <dialog>,
+  // что у остальных окон: Esc и клик по фону закрывают его сами, без нашего кода.
+  let i = Math.max(0, Math.min(start | 0, items.length - 1));
+  const dlg = $(`<dialog class="lb">
+    <img alt="">
+    <div class="lbbar">
+      <button class="lb-prev" title="Предыдущая (←)">‹</button>
+      <span class="lb-num"></span>
+      <span class="lbname"></span>
+      <button class="lb-next" title="Следующая (→)">›</button>
+      <a class="lb-dl" download style="color:inherit;text-decoration:underline">скачать</a>
+      <button class="lb-x" title="Закрыть (Esc)">×</button>
+    </div></dialog>`).firstElementChild;
+  document.body.append(dlg);
+  const img = dlg.querySelector('img');
+  const paint = () => {
+    const it = items[i];
+    img.src = it.full; img.alt = it.name;
+    dlg.querySelector('.lb-num').textContent = `${i + 1} / ${items.length}`;
+    dlg.querySelector('.lbname').textContent = it.name;
+    const dl = dlg.querySelector('.lb-dl');
+    dl.href = it.full; dl.setAttribute('download', it.name.split('/').pop());
+    const many = items.length > 1;
+    dlg.querySelector('.lb-prev').style.visibility = many ? '' : 'hidden';
+    dlg.querySelector('.lb-next').style.visibility = many ? '' : 'hidden';
+  };
+  const step = d => { i = (i + d + items.length) % items.length; paint(); };
+  const close = () => { dlg.close(); dlg.remove(); };
+  dlg.querySelector('.lb-prev').onclick = () => step(-1);
+  dlg.querySelector('.lb-next').onclick = () => step(1);
+  dlg.querySelector('.lb-x').onclick = close;
+  dlg.onclick = ev => { if (ev.target === dlg) close(); };
+  dlg.addEventListener('cancel', ev => { ev.preventDefault(); close(); });
+  dlg.addEventListener('keydown', ev => {
+    if (ev.key === 'ArrowLeft') { ev.preventDefault(); step(-1); }
+    if (ev.key === 'ArrowRight') { ev.preventDefault(); step(1); }
+  });
+  paint();
+  dlg.showModal();
+}
+
+function wireLightbox(root){
+  root.querySelectorAll('.thumbs').forEach(box => {
+    const links = [...box.querySelectorAll('a[data-full]')];
+    const items = links.map(a => ({full: a.dataset.full, name: a.dataset.name || ''}));
+    links.forEach((a, n) => a.onclick = ev => {
+      // Ctrl/Cmd/средняя кнопка — пусть работает как обычная ссылка: человек
+      // осознанно просит новую вкладку, и отнимать это нельзя.
+      if (ev.metaKey || ev.ctrlKey || ev.shiftKey || ev.button) return;
+      ev.preventDefault();
+      lightbox(items, n);
+    });
+  });
+}
+
+function player(src){
+  // Встроенный плеер браузера выглядит по-своему в каждом и не попадает в оформление.
+  // Звук остаётся тем же <audio>, меняется только оболочка.
+  const wrap = $(`<div class="pl">
+    <button type="button" class="pl-go" title="Слушать">▶</button>
+    <div class="bar"><i></i></div>
+    <span class="t">0:00</span>
+    <audio preload="none" src="${src}"></audio></div>`).firstElementChild;
+  const a = wrap.querySelector('audio');
+  const go = wrap.querySelector('.pl-go');
+  const bar = wrap.querySelector('.bar');
+  const fill = wrap.querySelector('.bar i');
+  const t = wrap.querySelector('.t');
+  const mmss = v => (isFinite(v) ? `${Math.floor(v / 60)}:${String(Math.floor(v % 60)).padStart(2, '0')}` : '0:00');
+  go.onclick = () => { a.paused ? a.play() : a.pause(); };
+  a.onplay = () => { go.textContent = '❚❚'; go.title = 'Пауза'; };
+  a.onpause = () => { go.textContent = '▶'; go.title = 'Слушать'; };
+  a.onended = () => { go.textContent = '▶'; fill.style.width = '0'; };
+  a.ontimeupdate = () => {
+    const d = a.duration || 0;
+    fill.style.width = d ? `${(a.currentTime / d) * 100}%` : '0';
+    t.textContent = `${mmss(a.currentTime)} / ${mmss(d)}`;
+  };
+  a.onloadedmetadata = () => { t.textContent = `0:00 / ${mmss(a.duration)}`; };
+  bar.onclick = ev => {
+    const r = bar.getBoundingClientRect();
+    if (a.duration) a.currentTime = ((ev.clientX - r.left) / r.width) * a.duration;
+  };
+  return wrap;
+}
+
+function wirePlayers(root){
+  root.querySelectorAll('[data-audio]').forEach(box => {
+    box.replaceWith(player(box.dataset.audio));
+  });
 }
 
 function wireRegen(root){
@@ -4296,8 +4420,7 @@ function fileCard(d, g){
         : g.kind === 'audio'
         ? g.names.map((n, i) => `<div class="note muted" style="margin-top:8px">${
               g.names.length > 1 ? `часть ${i + 1} из ${g.names.length}` : 'дорожка'
-            }</div><audio controls preload="none" src="${url(n)}"
-            style="width:100%"></audio>`).join('')
+            }</div><div data-audio="${url(n)}"></div>`).join('')
           // Почему кусков несколько — объясняем прямо здесь, а не оставляем догадываться:
           // имя файла «1.mp3» человеку ничего не говорит, а число рядом с названием этапа
           // владелец 21.09 прочёл как номер запуска.
@@ -4323,7 +4446,7 @@ function fileCard(d, g){
              всего ${g.count} — остальные в архиве</div>` : ''}
       </div>
     </div>`);
-  wireRegen(card);
+  wireRegen(card); wireLightbox(card); wirePlayers(card);
   if (g.kind === 'image') wireThumbScroll(card, d, g);
   return card;
 }
@@ -4374,7 +4497,7 @@ function wireThumbScroll(card, d, g){
     if (!names.length){ stop(); note(''); return; }
     box.insertAdjacentHTML('beforeend', names.map(n =>
       thumb(url(n) + '?w=160', url(n), n, 78, p.id)).join(''));
-    wireRegen(card);
+    wireRegen(card); wireLightbox(card); wirePlayers(card);
     loaded += names.length;
     note();
     if (loaded >= total) stop();
@@ -5440,6 +5563,14 @@ function wireNeighbourPreset(card, f, locked){
     <button type="button" class="ghost small np-add">Завести новый</button>
   </div>`);
   sel.parentElement.append(bar);
+  // Жалоба 21.09: «создаю частичный пресет для обложки, а мне зачем-то предлагают
+  // выбрать ещё какой-то пресет». Поле не лишнее — оно и ЕСТЬ всё содержимое такой
+  // части: настройки обложки и текста живут в соседних сервисах, а здесь хранится
+  // ссылка на них. Но понять это по одной подписи нельзя, поэтому говорим прямо.
+  const why = $(`<div class="note muted" style="margin-top:6px">Сами настройки
+    ${service === 'cover' ? 'обложки' : 'текста'} живут в соседнем сервисе — здесь
+    выбирается, каким из тамошних пресетов пользоваться.</div>`);
+  bar.after(why);
   const edit = bar.querySelector('.np-edit');
   const paint = () => { edit.disabled = !sel.value; };
   sel.addEventListener('change', paint);
@@ -5452,6 +5583,11 @@ function wireNeighbourPreset(card, f, locked){
   };
   bar.querySelector('.np-add').onclick = () => neighbourPresetModal(service, null, {
     reload: false,
+    // Жалоба 21.09: «в попапе предлагается ввести имя, хотя я его уже ввёл, когда
+    // создавал пресет». Это РАЗНЫЕ объекты — пресет кабинета и пресет соседа, — но
+    // заставлять человека придумывать второе имя незачем: подставляем то же самое,
+    // а он поменяет, если захочет.
+    suggestName: (document.querySelector('#p-name') || {}).value || '',
     // Заведённый пресет сразу становится выбранным: иначе человек заводит его и тут же
     // ищет в списке, который ещё не знает о нём.
     onSaved: name => {
@@ -6489,7 +6625,10 @@ async function neighbourPresetModal(service, name, opts){
 
   const nameHtml = creating
     ? `<div class="fld" style="grid-column:1/-1"><label for="np-name">Название</label>
-         <input id="np-name" placeholder="как называть пресет"></div>`
+         <input id="np-name" placeholder="как называть пресет"
+           value="${esc((opts && opts.suggestName) || '')}">
+         <div class="note muted">Это пресет в соседнем сервисе — у него своё имя. Можно
+           оставить такое же, как у пресета здесь.</div></div>`
     : '';
   const m = modal(creating ? 'Новый пресет' : `Пресет «${name}»`,
     `<div class="fields" style="padding:0">${nameHtml}${d.fields.map(fieldHtml).join('')}</div>`,
