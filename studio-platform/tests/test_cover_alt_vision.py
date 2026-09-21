@@ -62,7 +62,9 @@ class _Client:
         self.completions = self
         self._key, self._base = key, base
 
-    def create(self, model=None, messages=None, max_tokens=None):
+    def create(self, model=None, messages=None, max_tokens=None, **kw):
+        # **kw — потому что разные вызовы шлют разный набор (temperature и т.п.);
+        # заглушка не должна падать на том, что ей неинтересно.
         SENT.update(key=self._key, base=self._base, model=model)
 
         class _M:
@@ -81,6 +83,42 @@ def _call():
     SENT.clear()
     return cc._call_openai_vision(Image.new("RGB", (8, 8)), "промпт",
                                   "КЛЮЧ-OPENAI", "gpt-4.1-mini")
+
+
+def test_all_call_sites() -> None:
+    """Маршрут обязан действовать на ВСЕ вызовы модели у обложек, а не только на зрение.
+
+    21.09: имя `_alt_vision_route` увело в ловушку — маршрут применили к зрению, а
+    `adapt_text` и `generate_scene_from_title` остались ходить в OpenAI напрямую.
+    Анализ обложки проходил, а следующий шаг падал с 429, и задача завершалась
+    частично, без файла. Починка одного места не чинила остальные.
+    """
+    print("\nМаршрут действует на все вызовы, а не только на зрение")
+    was_client = cc._openai_client
+    cc._openai_client = _fake_client
+    os.environ["COVER_ALT_BASE_URL"] = "https://чужой.example/v1"
+    os.environ["COVER_ALT_API_KEY"] = "КЛЮЧ-ПРОКСИ"
+    os.environ["COVER_ALT_MODEL"] = "модель-провайдера"
+    try:
+        SENT.clear()
+        cc.adapt_text("текст", "Английский", "КЛЮЧ-OPENAI")
+        check("адаптация текста идёт к провайдеру", SENT.get("base"),
+              "https://чужой.example/v1")
+        check("...его ключом", SENT.get("key"), "КЛЮЧ-ПРОКСИ")
+        check("...и его моделью", SENT.get("model"), "модель-провайдера")
+
+        SENT.clear()
+        try:
+            cc.generate_scene_from_title("Название", "", "КЛЮЧ-OPENAI")
+        except Exception:
+            pass                       # разбор ответа заглушки нас тут не интересует
+        check("сцена по названию — туда же", SENT.get("base"),
+              "https://чужой.example/v1")
+        check("...его ключом", SENT.get("key"), "КЛЮЧ-ПРОКСИ")
+    finally:
+        cc._openai_client = was_client
+        for v in ("COVER_ALT_BASE_URL", "COVER_ALT_API_KEY", "COVER_ALT_MODEL"):
+            os.environ.pop(v, None)
 
 
 def main() -> int:
@@ -144,6 +182,8 @@ def main() -> int:
         if was_openai is not None:
             cc.openai = was_openai
         cc._openai_clients.clear()
+
+    test_all_call_sites()
 
     print()
     if FAILS:

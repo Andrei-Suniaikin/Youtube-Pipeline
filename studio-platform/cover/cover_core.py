@@ -553,6 +553,21 @@ def _acquire_cancelable(semaphore, cancel_check=None, step: float = 0.25) -> boo
             return True
 
 
+def _chat_route(api_key: str, model: str):
+    """Клиент, модель и фактический ключ для вызова модели у обложек.
+
+    Одна точка на все три места (зрение, адаптация текста, сцена по названию): разойдясь,
+    они молча дают разный маршрут, и починка одного не чинит остальные — ровно это и
+    случилось 21.09.
+    """
+    base, alt_key, alt_model = _alt_chat_route()
+    if base:
+        # Модель берётся ЕГО: у стороннего провайдера свой список, и модели OpenAI там
+        # может не быть вовсе — тогда каждый вызов вернул бы 400.
+        return _openai_client(alt_key, base), (alt_model or model), alt_key
+    return _openai_client(api_key), model, api_key
+
+
 def _openai_client(api_key: str, base_url: str = ""):
     """Клиент OpenAI с кэшированием (один клиент на пару ключ+адрес, потокобезопасно)."""
     # 21.09.2026: пакета openai в окружении не было, и анализ обложки падал здесь
@@ -576,8 +591,14 @@ def _openai_client(api_key: str, base_url: str = ""):
         return _openai_clients[ck]
 
 
-def _alt_vision_route():
-    """Куда слать анализ обложки, если не в OpenAI: (адрес, ключ, модель) либо пусто.
+def _alt_chat_route():
+    """Куда слать ЛЮБОЙ вызов модели у обложек: (адрес, ключ, модель) либо пусто.
+
+    Имя сперва было `_alt_vision_route`, и это оказалось ловушкой: маршрут применили
+    только к зрению, а `adapt_text` и `generate_scene_from_title` остались ходить в
+    OpenAI напрямую. 21.09 это стоило владельцу готовой обложки — анализ прошёл через
+    прокси, распознал текст и стиль, а следующий же шаг «Адаптация текста» упал с
+    429 «You have no credits remaining», и задача завершилась частично, без файла.
 
     21.09.2026: у счёта OpenAI ноль, а весь анализ обложки в этом форке ходит ТОЛЬКО
     в OpenAI — Gemini-SDK удалён в v1.0.3, и provider="google" молча падает обратно
@@ -613,15 +634,8 @@ def _call_openai_vision(image, prompt: str, api_key: str, model: str) -> str:
     for im in images:
         b64 = image_to_base64(im, "PNG")
         content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
-    alt_base, alt_key, alt_model = _alt_vision_route()
-    if alt_base:
-        # Модель OpenAI на чужом провайдере может не существовать вовсе: там свой
-        # список. Берём его модель, а не нашу — иначе каждый вызов вернёт 400.
-        api_key, base_url, model = alt_key, alt_base, (alt_model or model)
-    else:
-        base_url = ""
-    client = _openai_client(api_key, base_url)
-    with _provider_semaphore_for_key("openai", api_key):
+    client, model, used_key = _chat_route(api_key, model)
+    with _provider_semaphore_for_key("openai", used_key):
         resp = client.chat.completions.create(
             model=model or DEFAULT_ANALYSIS_MODEL_OPENAI,
             messages=[{"role": "user", "content": content}],
@@ -771,8 +785,8 @@ def generate_scene_from_title(
     )
     user = f"Title: {title.strip()}\n\nExtra details: {(extra_prompt or '').strip() or '(none)'}"
 
-    client = _openai_client(openai_api_key)
-    with _provider_semaphore_for_key("openai", openai_api_key):
+    client, model_name, used_key = _chat_route(openai_api_key, model_name)
+    with _provider_semaphore_for_key("openai", used_key):
         resp = client.chat.completions.create(
             model=model_name,
             messages=[
@@ -807,10 +821,10 @@ def adapt_text(original_text: str, target_language: str, api_key: str, video_tit
     system_template = _active_prompts().get("adapt_text_system_template") or get_default_prompt("adapt_text_system_template")
     video_title_val = (video_title or "").strip() or "(not provided)"
     system_content = system_template.replace("{video_title}", video_title_val).replace("{target_language}", target_language)
-    client = _openai_client(api_key)
-    with _provider_semaphore_for_key("openai", api_key):
+    client, _model, used_key = _chat_route(api_key, GPT_MODEL)
+    with _provider_semaphore_for_key("openai", used_key):
         resp = client.chat.completions.create(
-            model=GPT_MODEL,
+            model=_model,
             messages=[
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": original_text}

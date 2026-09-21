@@ -140,8 +140,16 @@
   /* Плеер: у встроенного в браузер вид чужой и разный в каждом браузере. */
   .pl{display:flex;align-items:center;gap:11px;padding:9px 12px;margin-top:6px;
       border:1px solid var(--line);border-radius:9px;background:var(--card-2,rgba(255,255,255,.03))}
+  /* Глиф ▶ внутри круга смотрится съехавшим: у него своя внутренняя пустота слева.
+     Поэтому кнопка — flex-контейнер, а сам знак рисуется рамками, без шрифта. */
   .pl button{flex:0 0 auto;width:32px;height:32px;border-radius:50%;border:0;cursor:pointer;
-             background:var(--acc,#8b7bf0);color:#fff;font-size:13px;line-height:1}
+             background:var(--acc,#8b7bf0);display:flex;align-items:center;
+             justify-content:center;padding:0}
+  .pl button i{display:block;width:0;height:0;border-style:solid;
+               border-width:6px 0 6px 10px;border-color:transparent transparent
+               transparent #fff;margin-left:2px}
+  .pl button.on i{width:10px;height:11px;border:0;margin:0;
+                  background:linear-gradient(to right,#fff 0 3px,transparent 3px 7px,#fff 7px 10px)}
   .pl .bar{flex:1;height:5px;border-radius:3px;background:rgba(255,255,255,.13);
            position:relative;cursor:pointer}
   .pl .bar i{position:absolute;left:0;top:0;bottom:0;border-radius:3px;
@@ -2037,7 +2045,7 @@ function player(src){
   // Встроенный плеер браузера выглядит по-своему в каждом и не попадает в оформление.
   // Звук остаётся тем же <audio>, меняется только оболочка.
   const wrap = $(`<div class="pl">
-    <button type="button" class="pl-go" title="Слушать">▶</button>
+    <button type="button" class="pl-go" title="Слушать"><i></i></button>
     <div class="bar"><i></i></div>
     <span class="t">0:00</span>
     <audio preload="none" src="${src}"></audio></div>`).firstElementChild;
@@ -2048,9 +2056,9 @@ function player(src){
   const t = wrap.querySelector('.t');
   const mmss = v => (isFinite(v) ? `${Math.floor(v / 60)}:${String(Math.floor(v % 60)).padStart(2, '0')}` : '0:00');
   go.onclick = () => { a.paused ? a.play() : a.pause(); };
-  a.onplay = () => { go.textContent = '❚❚'; go.title = 'Пауза'; };
-  a.onpause = () => { go.textContent = '▶'; go.title = 'Слушать'; };
-  a.onended = () => { go.textContent = '▶'; fill.style.width = '0'; };
+  a.onplay = () => { go.classList.add('on'); go.title = 'Пауза'; };
+  a.onpause = () => { go.classList.remove('on'); go.title = 'Слушать'; };
+  a.onended = () => { go.classList.remove('on'); fill.style.width = '0'; };
   a.ontimeupdate = () => {
     const d = a.duration || 0;
     fill.style.width = d ? `${(a.currentTime / d) * 100}%` : '0';
@@ -4330,9 +4338,22 @@ async function viewProject(id){
     <div class="note muted">Сборку делает отдельная машина. Если рендер-нода не
       запущена, проект дойдёт до сборки и остановится.</div>
     <div style="margin-top:12px"><button id="rgo">Запустить</button></div></div></div>`);
-  app.append(runBox);
+  // Панель ставится ПОД шапкой, а не в конец страницы. Раньше она добавлялась после
+  // вкладок, настроек, результатов и лога — то есть далеко за пределами видимого
+  // экрана. Кнопка вверху, панель внизу: владелец нажимал «Сделать всё» и не видел
+  // ничего, отчего и решил, что кнопка не работает.
+  //
+  // Якорь берём по самой кнопке, а не по переменной шапки: в этом экране шапка
+  // добавляется анонимно, и обращение к несуществующему `head` роняло отрисовку
+  // целиком — экран проекта переставал открываться вовсе.
+  const runAnchor = app.querySelector('#runall');
+  const runHead = runAnchor ? runAnchor.closest('.head') : null;
+  if (runHead) runHead.after(runBox); else app.append(runBox);
   app.querySelector('#runall').onclick = () => {
-    runBox.style.display = (runBox.style.display === 'none') ? '' : 'none';
+    const hidden = runBox.style.display === 'none';
+    runBox.style.display = hidden ? '' : 'none';
+    // Даже стоя под кнопкой, панель может оказаться за краем на коротком экране.
+    if (hidden) runBox.scrollIntoView({block: 'nearest', behavior: 'smooth'});
   };
   runBox.querySelector('#rgo').onclick = async () => {
     const btn = runBox.querySelector('#rgo');
