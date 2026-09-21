@@ -648,8 +648,34 @@ def _last_gen_error() -> str:
 _GEN_PROVIDER_REFUSAL = threading.local()
 
 
+# Отказы, которые провайдер объясняет машинно, а человеку — никак. Сырой JSON в карточке
+# задачи не отвечает ни на один из трёх вопросов («что упало, потрачены ли деньги, какую
+# кнопку жать»), поэтому знакомые причины переводим на человеческий вместе с лекарством.
+#
+# 21.09.2026, повод: владелец выбрал метод клипов «Flow» и получил
+# «HTTP 403 {"error": "Video generation not allowed for this license", "code":
+# "auth.forbidden"}». Это правда: у лицензии FastGen `video.generate = false`, а квоты
+# video.* нулевые — проверяется бесплатно через /api/v6/usage. Но по такому сообщению
+# нельзя догадаться, что рядом есть рабочий метод на ДРУГОМ провайдере и другом ключе.
+_KNOWN_REFUSALS = (
+    (("video generation not allowed", "auth.forbidden"),
+     "лицензия FastGen не включает генерацию видео — этим методом клипы сделать нельзя. "
+     "Выберите метод «Veo 3.1 — по умолчанию»: он идёт через VeoNonStop и отдельный ключ. "
+     "Денег это не стоило, повтор не поможет."),
+)
+
+
+def _humanize_refusal(msg: str) -> str:
+    """Знакомый отказ провайдера → что это значит и что делать. Незнакомый — как есть."""
+    low = str(msg or "").lower()
+    for needles, human in _KNOWN_REFUSALS:
+        if all(n in low for n in needles):
+            return human
+    return str(msg or "")
+
+
 def _set_provider_refusal(msg) -> None:
-    _GEN_PROVIDER_REFUSAL.msg = " ".join(str(msg or "").split())[:300]
+    _GEN_PROVIDER_REFUSAL.msg = " ".join(_humanize_refusal(msg).split())[:300]
 
 
 def _provider_refusal() -> str:
@@ -7698,7 +7724,8 @@ def googler_v6_generate(v6_model: str, prompt: str, aspect_ratio: Optional[str] 
         # («HTTP 401: invalid api key»). Дальше она терялась: наверх уходила обёртка
         # «v6 генерация не удалась», и в карточке с журналом оставалось «rc=3».
         _set_provider_refusal(str(resp["_error"]))
-        print_user(f"❌ [{index}] v6 generation отклонён: {str(resp['_error'])[:220]}", "ERROR")
+        print_user(f"❌ [{index}] v6 generation отклонён: "
+                   f"{_humanize_refusal(str(resp['_error']))[:300]}", "ERROR")
         return None
     gid = resp.get("id")
     if not gid:
