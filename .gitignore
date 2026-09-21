@@ -26,6 +26,9 @@ studio-platform/dev/home/
 studio-platform/dev/data/
 # выхлоп стенда рерайта (загрузки/результаты прогонов), а не код
 studio-platform/rewrite/outputs/
+# 21.09.2026: обложки писались СЮДА ЖЕ, в исходники. У рерайта строка была, у
+# обложек парной не завели — и готовый файл появлялся в `git status` как мусор.
+studio-platform/cover/outputs/
 studio-platform/rewrite/uploads/
 studio-platform/rewrite/job_logs/
 # состояние миграции личности: журнал переносов и бэкапы баз — не код

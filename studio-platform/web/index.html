@@ -2652,6 +2652,21 @@ const PROJECT_TABS = [
 // Коды групп файлов (`_FILE_GROUPS` пульта) и виды задач (`queue_tasks.kind`),
 // которые относятся к каждой вкладке — те же коды, что были в PROJ_TABS/PROJ_KINDS
 // до этого батча, просто под новыми ключами вкладок.
+// Вкладки, где число файлов — это ЧАСТИ ОДНОГО результата, а не сколько раз запускали.
+// Озвучка режется лимитом провайдера, видео — по сценам; и то и другое склеивается в
+// один ролик. Для кадров число файлов означает именно количество кадров, там единица
+// измерения не нужна.
+const PART_TABS = new Set(['tts', 'video']);
+
+function partsWord(n){
+  // Склонение руками: «2 части/ей» — не по-русски, а неряшливый текст в интерфейсе
+  // читается как неряшливая работа под ним.
+  const t = n % 10, h = n % 100;
+  if (t === 1 && h !== 11) return 'часть';
+  if (t >= 2 && t <= 4 && (h < 12 || h > 14)) return 'части';
+  return 'частей';
+}
+
 const TAB_FILES = {scenario: ['scenes'], tts: ['audio'], images: ['images'],
                    video: ['clips'], render: ['renders', 'subs', 'chapters'],
                    cover: ['covers']};
@@ -4243,9 +4258,15 @@ async function viewProject(id){
   const tabsBox = $(`<div class="subtabs">${PROJECT_TABS.map(([k, title]) => {
     const codes = TAB_FILES[k] || [];
     const n = d.files.filter(g => codes.includes(g.code)).reduce((a, g) => a + g.count, 0);
+    // Голая цифра рядом с названием этапа читается как ПОРЯДКОВЫЙ НОМЕР запуска —
+    // владелец 21.09 так её и прочёл: «запускаю озвучку, она записывается как озвучка 1,
+    // потом озвучка 2, не понимаю почему». На деле это число ФАЙЛОВ: EdgeTTS не берёт
+    // больше 4000 знаков за раз, и один запуск режет текст на куски. Поэтому у звука
+    // и видео единица измерения пишется словом, а не подразумевается.
+    const unit = PART_TABS.has(k) ? ' ' + partsWord(n) : '';
     return `<a href="#/project/${encodeURIComponent(id)}/${k}"
       class="${tab === k ? 'on' : ''}">${esc(title)}${
-        n ? ` <span class="muted">${n}</span>` : ''}</a>`;
+        n ? ` <span class="muted">${n}${unit}</span>` : ''}</a>`;
   }).join('')}</div>`);
   app.append(tabsBox);
   tabsNoHistory(tabsBox);
@@ -4273,8 +4294,18 @@ function fileCard(d, g){
             thumb(url(n) + '?w=160', url(n), n, 78, p.id)).join('')}</div>
            <div class="more-mark"></div>`
         : g.kind === 'audio'
-        ? g.names.map(n => `<audio controls preload="none" src="${url(n)}"
-            style="width:100%;margin-top:6px"></audio>`).join('')
+        ? g.names.map((n, i) => `<div class="note muted" style="margin-top:8px">${
+              g.names.length > 1 ? `часть ${i + 1} из ${g.names.length}` : 'дорожка'
+            }</div><audio controls preload="none" src="${url(n)}"
+            style="width:100%"></audio>`).join('')
+          // Почему кусков несколько — объясняем прямо здесь, а не оставляем догадываться:
+          // имя файла «1.mp3» человеку ничего не говорит, а число рядом с названием этапа
+          // владелец 21.09 прочёл как номер запуска.
+          + (g.names.length > 1
+             ? `<div class="note muted" style="margin-top:8px">Движок озвучки не берёт
+                больше 4000 знаков за раз, поэтому текст озвучен кусками. В ролик они
+                склеиваются подряд — это одна дорожка, а не несколько записей.</div>`
+             : '')
         : g.kind === 'video'
         ? g.names.slice(0, 4).map(n => `<div class="thumb" style="margin:6px 6px 0 0"
             ><video controls preload="none" src="${url(n)}"

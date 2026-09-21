@@ -3326,6 +3326,55 @@ def _project_job_rows(pid: str, service: str, listed: list, fetch_one) -> list:
     return out
 
 
+def _autotake_text(pid: str, rows: list, sid: str, request) -> str:
+    """Положить готовый текст в проект самому — но только там, где выбора нет.
+
+    Жалоба владельца 21.09: «чтобы сценарий присвоился, нужно тыкать ещё кнопку, и нет
+    такого, что он автоматически присваивается». Так и было: заказ записывал связь
+    «проект → задача», а перенести текст умела единственная кнопка «Взять в проект»,
+    спрятанная внутри свёрнутой строки результата. От «Готово» до текста в проекте было
+    два клика, и первый ничем не подписан как обязательный.
+
+    Автоматика здесь ограничена ровно тем, о чём владелец уже просил 20.09 отдельно:
+      * сценарий в проекте ПУСТ. Непустой не перезаписывается — правило записано в
+        `ui_text_create` дословно («не заменит, пока вы не нажмёте „Взять в проект"»),
+        и замена спрашивает подтверждение. Молча затереть чужой труд нельзя;
+      * файл РОВНО ОДИН. Одна задача рерайта отдаёт по файлу на язык и на исходник;
+        выбор между ними — решение человека, а не платформы.
+
+    Возвращает имя взятого файла или пустую строку. Ошибки съедаются: это удобство,
+    а не обязанность, и падать из-за него экран не вправе.
+    """
+    try:
+        if _project_scenario(sys.modules.get("main"), pid).strip():
+            return ""
+        done = [j for j in rows if isinstance(j, dict)
+                and _state(j.get("status")) == "done"]
+        if not done:
+            return ""
+        jid = str(done[0].get("id") or "")
+        if not jid:
+            return ""
+        code, body = _proxy_get(RESULT_BASES["rewrite"],
+                                f"/jobs/{urllib.parse.quote(jid)}/files", sid)
+        names = [str(x) for x in body] if code == 200 and isinstance(body, list) else []
+        if len(names) != 1:
+            return ""
+        # `_proxy_get` отдаёт уже разобранный текст (JSON — объектом, прочее — строкой);
+        # файл сценария это .txt, то есть придёт строкой.
+        code2, body2 = _proxy_get(RESULT_BASES["rewrite"],
+                                  f"/jobs/{urllib.parse.quote(jid)}/files/"
+                                  f"{urllib.parse.quote(names[0])}", sid)
+        text = body2 if isinstance(body2, str) else ""
+        if code2 != 200 or not text.strip():
+            return ""
+        _cabinet_form(f"/api/projects/{pid}/source", [("source", text)], request,
+                      expect_json=False)
+        return names[0]
+    except Exception:                                              # noqa: BLE001
+        return ""
+
+
 @app.get("/ui/text")
 def ui_text(request: Request, project_id: str = ""):
     """Экран текста: что уже сделано и чем можно сделать ещё.
@@ -3370,6 +3419,7 @@ def ui_text(request: Request, project_id: str = ""):
                     "status": j1.get("status"), "progress": j1.get("progress_percent"),
                     "detail": j1.get("progress_detail"), "created_at": j1.get("created_at")}
         listed = _project_job_rows(project_id, "rewrite", listed, _one)
+        _autotake_text(project_id, listed, sid, request)
     rows = []
     for j in listed:
         pct = j.get("progress")
@@ -3698,6 +3748,7 @@ def ui_covers(request: Request, project_id: str = ""):
             j1.pop("log", None)          # в строке списка лога нет, и тащить его незачем
             return j1
         items = _project_job_rows(project_id, "cover", items, _one)
+        _autotake_cover(project_id, items, sid)
     rows = []
     for j in items:
         pct = j.get("progress") or j.get("progress_percent")
@@ -7481,6 +7532,75 @@ class CoverPickIn(BaseModel):
     name: str
 
 
+def _write_project_cover(pdir: str, data: bytes) -> None:
+    """Атомарная запись `cover.jpg` проекта. Одна на все пути — ручной и автоматический.
+
+    Временный файл РЯДОМ (та же файловая система — иначе `os.replace` не атомарен),
+    затем `os.replace`. Читатель `cover.jpg` никогда не увидит половину файла, а читает
+    его не только экран: отсюда же берёт обложку publication plane перед заливкой.
+    """
+    target = os.path.join(pdir, "cover.jpg")
+    tmp = os.path.join(pdir, f".cover.jpg.tmp-{secrets.token_hex(8)}")
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, target)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+
+def _autotake_cover(pid: str, rows: list, sid: str) -> str:
+    """Положить готовую обложку в проект самому — но только там, где выбора нет.
+
+    Жалоба владельца 21.09: «код сделал обложку, но записал в корень проекта и нельзя её
+    выкачать с сайта», и следом «обложка со статусом сделано, а ползунок в шапке не
+    загорелся». Причина у обеих одна: Cover Studio держит результат в СВОЁМ хранилище, а
+    и экран, и полоса этапов, и заливка смотрят на `<проект>/cover.jpg`. Перенести файл
+    умела единственная кнопка, спрятанная внутри свёрнутой строки задачи, — то есть
+    готовый оплаченный результат существовал, но проекта не достигал.
+
+    Условий три, и каждое отказывает в пользу человека:
+      * задача завершена успешно — иначе класть нечего;
+      * вариант РОВНО ОДИН. Когда их несколько, выбор между оплаченными картинками
+        принадлежит владельцу, а не платформе;
+      * `cover.jpg` в проекте ещё нет. Тот же файл читает publication plane, и молча
+        переписать обложку, уже уехавшую в релиз, хуже, чем не положить новую.
+
+    Возвращает имя взятого файла или пустую строку. Ошибки съедаются: это удобство,
+    а не обязанность, и падать из-за него экран проекта не вправе.
+    """
+    mod = sys.modules.get("main")
+    if mod is None or not hasattr(mod, "_project_dir"):
+        return ""
+    try:
+        pdir = mod._project_dir(TENANT, pid)
+        if os.path.exists(os.path.join(pdir, "cover.jpg")):
+            return ""
+        done = [j for j in rows if isinstance(j, dict)
+                and _state(j.get("status")) == "done"]
+        if not done:
+            return ""
+        job = done[0]
+        files = [f for f in (job.get("output_files") or []) if isinstance(f, str) and f]
+        if len(files) != 1:
+            return ""
+        url = (f"{COVER_BASE}/jobs/{urllib.parse.quote(str(job.get('id') or ''))}"
+               f"/files/{urllib.parse.quote(files[0])}")
+        req = urllib.request.Request(url)
+        req.add_header("Cookie", f"{auth.COOKIE}={sid}")
+        with urllib.request.urlopen(req, timeout=NEIGHBOUR_TIMEOUT * 5) as resp:
+            data = resp.read()
+        if not data:
+            return ""
+        _write_project_cover(pdir, data)
+        return files[0]
+    except Exception:                                              # noqa: BLE001
+        return ""
+
+
 @app.post("/ui/projects/{pid}/cover")
 def ui_project_cover_pick(pid: str, body: CoverPickIn, request: Request):
     """«Поставить обложкой проекта» — скопировать готовый вариант из задачи Cover в
@@ -7517,22 +7637,7 @@ def ui_project_cover_pick(pid: str, body: CoverPickIn, request: Request):
         raise HTTPException(502, f"cover не отвечает: {type(exc).__name__}")
     if mod is None or not hasattr(mod, "_project_dir"):
         raise HTTPException(503, "кабинет не поднят — обложку положить некуда")
-    pdir = mod._project_dir(TENANT, pid)
-    target = os.path.join(pdir, "cover.jpg")
-    # Атомарная запись (§6, шаг 5): временный файл РЯДОМ (та же файловая система —
-    # иначе `os.replace` не атомарен), затем `os.replace`. Читатель `cover.jpg`
-    # никогда не увидит частично записанный файл. Место — то же самое, куда
-    # конвейер кладёт обложку (`server/pub_services.py` ≈609), без перекодирования.
-    tmp = os.path.join(pdir, f".cover.jpg.tmp-{secrets.token_hex(8)}")
-    try:
-        with open(tmp, "wb") as f:
-            f.write(data)
-        os.replace(tmp, target)
-    finally:
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+    _write_project_cover(mod._project_dir(TENANT, pid), data)
     return {"ok": True, "bytes": len(data)}
 
 
