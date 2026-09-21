@@ -6754,11 +6754,32 @@ def _call_openai_api_with_server_key(
     no_cache = caps.get("no_cache", False)
     no_temperature = caps.get("no_temperature", False)
 
-    url = "https://api.openai.com/v1/chat/completions"
+    # 21.09.2026: адрес и ключ чат-вызова выносятся в переменные. Повод — у счёта OpenAI
+    # ноль (429 insufficient_quota), и весь текст встаёт, хотя рядом лежит оплаченный
+    # провайдер с OpenAI-совместимым /v1/chat/completions. Форма запроса та же, имена
+    # моделей он принимает и беспрефиксные (`gpt-4.1-mini` — проверено), неизвестные поля
+    # молча игнорирует, а 240 с на чтение ниже хватает его медленному бэкенду.
+    #
+    # По умолчанию НИЧЕГО не меняется: пустые переменные — прежний OpenAI и прежний ключ.
+    # Адрес задаётся ЦЕЛИКОМ, а не базой: склейка с /v1 — известный способ получить 404.
+    # Ключ обязан ехать вместе с адресом: у чужого провайдера ключ OpenAI бессмыслен, и
+    # отправить его туда — значит засветить секрет на стороне, которой он не предназначен.
+    _chat_url = _alt_setting("REWRITE_GPT_CHAT_URL")
+    _chat_key = _alt_setting("REWRITE_GPT_CHAT_KEY")
+    if _chat_url and not _chat_key:
+        # Отказ, а не тихий откат на OpenAI: молча отправить ключ OpenAI на чужой адрес —
+        # значит засветить секрет там, где он не предназначен, и узнать об этом никогда.
+        return (False, "REWRITE_GPT_CHAT_URL задан без REWRITE_GPT_CHAT_KEY: ключ OpenAI "
+                       "чужому провайдеру не отправляется. Денег это не стоило. "
+                       "Задайте ключ этого провайдера или уберите адрес.")
+    if _chat_key:
+        _register_server_secret_tree({"rewrite_chat_key": _chat_key})   # чтобы не попал в логи
+    url = _chat_url or "https://api.openai.com/v1/chat/completions"
+    _chat_key = _chat_key or server_key
 
     headers = {
         "Content-Type": "application/json",
-        "Authorization": f"Bearer {server_key}"
+        "Authorization": f"Bearer {_chat_key}"
     }
 
     # gpt-5*, o*, o1*, o3*, o4* используют max_completion_tokens вместо max_tokens

@@ -148,6 +148,13 @@ ALTK
     export VS_ALT_LLM_BASE="${VS_ALT_LLM_BASE:-https://api.fast-gen.ai/v1}"
     export VS_ALT_LLM_MODEL="${VS_ALT_LLM_MODEL:-openai/gpt-4.1-mini}"
     export VS_PROMPT_PROVIDER="${VS_PROMPT_PROVIDER:-altclaude}"
+    # Тот же провайдер пишет и ТЕКСТ. Рерайт ходит в чат одним местом, адрес и ключ у него
+    # теперь настраиваются; адрес задаётся целиком — склейка с /v1 даёт 404. Имена моделей
+    # рерайта (gpt-4.1-mini и т.п.) провайдер принимает и без префикса — проверено.
+    # Ключ ставится ВМЕСТЕ с адресом: без него рерайт откажется работать, чтобы не
+    # отправить ключ OpenAI чужому провайдеру.
+    export REWRITE_GPT_CHAT_URL="${REWRITE_GPT_CHAT_URL:-https://api.fast-gen.ai/v1/chat/completions}"
+    export REWRITE_GPT_CHAT_KEY="${REWRITE_GPT_CHAT_KEY:-$_altkey}"
   fi
   unset _altkey
 fi

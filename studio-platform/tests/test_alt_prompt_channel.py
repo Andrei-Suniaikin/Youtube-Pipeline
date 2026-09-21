@@ -82,8 +82,19 @@ def test_stand_wires_it() -> None:
     check("канал включается", "VS_PROMPT_PROVIDER" in sh and "altclaude" in sh, True)
     check("база задана с версионным префиксом /v1",
           bool(re.search(r"VS_ALT_LLM_BASE=.*https://api\.fast-gen\.ai/v1", sh)), True)
-    check("...и без лишнего /chat/completions в адресе",
-          "fast-gen.ai/v1/chat" in sh, False)
+    # Две переменные рядом устроены ПО-РАЗНОМУ, и перепутать их — прямой путь к 404:
+    #   VS_ALT_LLM_BASE      — БАЗА, движок сам добавляет "/chat/completions";
+    #   REWRITE_GPT_CHAT_URL — ПОЛНЫЙ адрес, к нему не добавляется ничего.
+    # Поэтому запрет на "/chat/completions" относится только к первой, и проверять его
+    # надо в её строке, а не подстрокой по всему файлу.
+    _base_line = next((l for l in sh.splitlines() if "VS_ALT_LLM_BASE=" in l), "")
+    check("у базы канала промптов нет лишнего /chat/completions",
+          "/chat/completions" in _base_line, False)
+    _rw_line = next((l for l in sh.splitlines() if "REWRITE_GPT_CHAT_URL=" in l), "")
+    check("а у адреса рерайта он, наоборот, есть",
+          "/chat/completions" in _rw_line, True)
+    check("ключ рерайта задан вместе с адресом",
+          bool(re.search(r"REWRITE_GPT_CHAT_KEY=", sh)), True)
     check("модель в стиле OpenRouter",
           bool(re.search(r"VS_ALT_LLM_MODEL=.*openai/", sh)), True)
     check("...а не дефолтная claude-sonnet-5, которой там нет",
