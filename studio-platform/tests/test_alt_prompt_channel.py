@@ -101,6 +101,15 @@ def test_stand_wires_it() -> None:
     check("ключ рерайта задан вместе с адресом",
           bool(re.search(r"REWRITE_GPT_CHAT_KEY=", sh)), True)
 
+    # Список моделей обязан совпадать с тем, что у провайдера есть. `gpt-4.1-nano` в
+    # умолчании рерайта присутствует, а у FastGen её нет — живой вызов отвечает 400.
+    # Владелец выбрал именно её и получил задачу, которая не могла завершиться.
+    _models = next((l for l in sh.splitlines()
+                    if "REWRITE_ALLOWED_OPENAI_MODELS=" in l), "")
+    check("список моделей рерайта задан", bool(_models), True)
+    check("...и в нём нет модели, которой у провайдера нет", "nano" in _models, False)
+    check("...а рабочая есть", "gpt-4.1-mini" in _models, True)
+
     # ── Ключ принадлежит хосту ────────────────────────────────────────────────
     # 21.09 это стрельнуло: ключ для FastGen брался как `alt_llm or googler`. Пока
     # alt_llm в файле не было, подставлялся googler и всё работало. Как только alt_llm

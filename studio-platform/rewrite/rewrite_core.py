@@ -6856,17 +6856,36 @@ def _call_openai_api_with_server_key(
                 method='POST'
             )
             
-            with urllib.request.urlopen(req, timeout=240, context=ssl_context) as response:
-                result = json.loads(response.read().decode('utf-8'))
-                content = result['choices'][0]['message']['content']
-                limiter.on_success()
-                if log_queue and caching:
-                    usage = result.get("usage", {})
-                    pt_details = usage.get("prompt_tokens_details", {})
-                    cached = pt_details.get("cached_tokens", 0)
-                    if cached > 0:
-                        log_msg(log_queue, f"  💾 GPT cache hit: {cached} токенов")
-                return (True, content)
+            # 21.09.2026: пока провайдер думает, лог молчит — и «долго» неотличимо от
+            # «умерло». Владелец увидел одну строку «Analyzing text structure...» и
+            # через шесть минут спросил, не сломалось ли. Не сломалось: связь с
+            # провайдером была установлена всё это время, просто альтернативный канал
+            # работает поверх сохранённых веб-аккаунтов и на длинном тексте отвечает
+            # минутами. Раз в полминуты говорим, что ждём и сколько уже.
+            _beat_stop = threading.Event()
+
+            def _beat(started=time.time()):
+                while not _beat_stop.wait(30):
+                    log_msg(log_queue, f"    ⏳ жду ответа провайдера… "
+                                       f"{int(time.time() - started)} с"
+                                       + (f" [{task_info}]" if task_info else ""))
+            threading.Thread(target=_beat, daemon=True).start()
+            try:
+                with urllib.request.urlopen(req, timeout=240,
+                                            context=ssl_context) as response:
+                    _raw = response.read().decode('utf-8')
+            finally:
+                _beat_stop.set()
+            result = json.loads(_raw)
+            content = result['choices'][0]['message']['content']
+            limiter.on_success()
+            if log_queue and caching:
+                usage = result.get("usage", {})
+                pt_details = usage.get("prompt_tokens_details", {})
+                cached = pt_details.get("cached_tokens", 0)
+                if cached > 0:
+                    log_msg(log_queue, f"  💾 GPT cache hit: {cached} токенов")
+            return (True, content)
                 
         except urllib.error.HTTPError as e:
             error_body = ""

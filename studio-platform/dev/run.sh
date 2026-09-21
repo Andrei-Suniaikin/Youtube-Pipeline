@@ -168,6 +168,15 @@ ALTK
     # отправить ключ OpenAI чужому провайдеру.
     export REWRITE_GPT_CHAT_URL="${REWRITE_GPT_CHAT_URL:-https://api.fast-gen.ai/v1/chat/completions}"
     export REWRITE_GPT_CHAT_KEY="${REWRITE_GPT_CHAT_KEY:-$_altkey}"   # _altkey = googler
+    # Список моделей обязан совпадать с тем, что у провайдера ЕСТЬ. Умолчание рерайта —
+    # «gpt-4.1-nano,gpt-4.1-mini,gpt-4o-mini», но nano у FastGen не существует: живой
+    # вызов отвечает 400 «No supported model found». Владелец выбрал именно её и получил
+    # задачу, которая не могла завершиться. Список, предлагающий неработающее, — это та
+    # же ложь интерфейса, что и всё остальное сегодня.
+    #
+    # Проверено НАСТОЯЩИМИ вызовами, а не пробой с пустым телом: пустое тело валидируется
+    # раньше разбора модели и на nano отвечало 422 «принято», то есть врало.
+    export REWRITE_ALLOWED_OPENAI_MODELS="${REWRITE_ALLOWED_OPENAI_MODELS:-gpt-4.1-mini,gpt-4o-mini}"
   fi
   # Анализ обложки. В этом форке он ходит ТОЛЬКО в OpenAI: Gemini-SDK удалён в v1.0.3,
   # provider="google" молча падает обратно на OpenAI. Без денег на счету обложка «новой
