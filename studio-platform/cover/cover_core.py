@@ -1812,7 +1812,25 @@ def check_simple_result(
     читаемый и без артефактов. Возвращает (passed, details)."""
     template = _active_prompts().get("simple_check_prompt_template") or get_default_prompt("simple_check_prompt_template")
     prompt = template.replace("{language}", language or "")
-    raw = _call_vision([original, generated], prompt, provider, model, "", openai_api_key)
+    try:
+        raw = _call_vision([original, generated], prompt, provider, model, "", openai_api_key)
+    except Exception as exc:                                       # noqa: BLE001
+        # 21.09.2026: проверка НЕ СМОГЛА состояться — это не провал проверки.
+        # Картинка к этому моменту уже сгенерирована и оплачена (FastGen), а контролёр
+        # ходит в OpenAI. Когда у OpenAI кончились кредиты, исключение улетало наверх и
+        # уносило с собой оплаченный результат — ровно то, против чего ниже в
+        # `_generate_simple_edit` стоит подпись «анти cost-drain».
+        #
+        # Ниже по коду уже принято правило «QC не распарсился → не блокируем сохранение:
+        # retry дороже, чем один неидеальный текст». Здесь тот же случай, только причина
+        # другая, и ответ обязан быть тем же. Повтор тут бессмыслен вдвойне: от второй
+        # попытки контролёр не починится, а каждая попытка — новая оплаченная генерация.
+        #
+        # `checked: False` отличает «проверили и всё хорошо» от «проверить не смогли» —
+        # вызывающий обязан сказать человеку правду, а не нарисовать зелёную галочку.
+        return True, {"overall_pass": True, "checked": False,
+                      "issues": f"проверка текста не выполнена: {type(exc).__name__}: "
+                                f"{exc}"[:300]}
     result = _parse_json_response(raw)
     if not result:
         # QC не распарсился — не блокируем сохранение (retry дороже, чем один неидеальный текст)
@@ -2059,7 +2077,15 @@ def _generate_simple_edit(
         )
         result.check_result = details
         if passed:
-            log("   ✅ Проверка пройдена")
+            if details.get("checked") is False:
+                # Зелёная галочка тут была бы враньём: картинку отдаём, но человек
+                # должен знать, что текст на ней автоматически никто не сверял.
+                log(f"   ⚠ {details.get('issues') or 'проверка текста не выполнена'}")
+                log("   Картинка сохранена: она уже оплачена, и выбрасывать её "
+                    "из-за неработающего контролёра нельзя.")
+                result.used_fallback = True
+            else:
+                log("   ✅ Проверка пройдена")
             result.image = generated
             result.success = True
             return result
