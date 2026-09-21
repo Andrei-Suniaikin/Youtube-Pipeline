@@ -80,8 +80,13 @@ def test_stand_wires_it() -> None:
     sh = open(os.path.join(BASE, "dev", "run.sh"), encoding="utf-8").read()
 
     check("канал включается", "VS_PROMPT_PROVIDER" in sh and "altclaude" in sh, True)
-    check("база задана с версионным префиксом /v1",
-          bool(re.search(r"VS_ALT_LLM_BASE=.*https://api\.fast-gen\.ai/v1", sh)), True)
+    # 21.09, вторая итерация: адрес и модель альт-канала пускач больше НЕ задаёт.
+    # Их источник — файл ключей (alt_llm_base/alt_llm_model), откуда кабинет собирает
+    # окружение подпроцесса. Два источника расходились молча: ключ доезжал отсюда, а
+    # адрес — оттуда, и они указывали на разных провайдеров.
+    check("пускач не задаёт адрес альт-канала — его источник один",
+          "VS_ALT_LLM_BASE=" in sh, False)
+    check("и не задаёт модель",  "VS_ALT_LLM_MODEL=" in sh, False)
     # Две переменные рядом устроены ПО-РАЗНОМУ, и перепутать их — прямой путь к 404:
     #   VS_ALT_LLM_BASE      — БАЗА, движок сам добавляет "/chat/completions";
     #   REWRITE_GPT_CHAT_URL — ПОЛНЫЙ адрес, к нему не добавляется ничего.
@@ -110,7 +115,7 @@ def test_stand_wires_it() -> None:
     check("блок ключа обложки найден", _cover_at > 0, True)
     _fastgen_block = sh[:_cover_at]
     _cover_block = sh[_cover_at:]
-    check("маршруты FastGen берут ключ googler",
+    check("маршрут текста берёт ключ googler",
           'data.get("googler")' in _fastgen_block, True)
     check("...и НЕ берут ключ чужого провайдера",
           'data.get("alt_llm")' in _fastgen_block, False)
@@ -118,16 +123,13 @@ def test_stand_wires_it() -> None:
           'data.get("alt_llm")' in _cover_block, True)
     check("...и не подставляет им ключ FastGen",
           'data.get("googler")' in _cover_block, False)
-    check("модель в стиле OpenRouter",
-          bool(re.search(r"VS_ALT_LLM_MODEL=.*openai/", sh)), True)
-    check("...а не дефолтная claude-sonnet-5, которой там нет",
-          "VS_ALT_LLM_MODEL:-claude-sonnet-5" in sh, False)
+
     check("ключ берётся из общего файла, а не вписан в скрипт",
           "alt_llm" in sh and "googler" in sh, True)
 
     # Все четыре — через ${VAR:-...}: заданное снаружи значение обязано побеждать,
     # иначе нельзя ни вернуть openai, ни подставить другого провайдера.
-    for var in ("VS_ALT_LLM_BASE", "VS_ALT_LLM_MODEL", "VS_PROMPT_PROVIDER"):
+    for var in ("REWRITE_GPT_CHAT_URL", "COVER_ALT_BASE_URL", "COVER_ALT_MODEL"):
         check(f"{var} не перетирает заданное снаружи",
               bool(re.search(rf'{var}="\$\{{{var}:-', sh)), True)
     check("VS_ALT_LLM_KEY ставится только когда пуст",

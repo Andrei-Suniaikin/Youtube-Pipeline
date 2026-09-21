@@ -75,9 +75,12 @@ def test_certs() -> None:
 def test_key_routes() -> None:
     print("\nКлюч сверяется с адресом своего маршрута")
     k = {"googler": "КЛЮЧ-FASTGEN", "alt_llm": "КЛЮЧ-ПРОКСИ"}
+    # Распределение после 21.09: текст рерайта идёт в FastGen, промпты и анализ обложки —
+    # на сторонний прокси. Адрес промптам задаёт кабинет из файла ключей, поэтому
+    # VS_ALT_LLM_BASE в окружении стенда может отсутствовать — ключ проверяется всё равно.
     good = {"REWRITE_GPT_CHAT_KEY": "КЛЮЧ-FASTGEN",
             "REWRITE_GPT_CHAT_URL": "https://api.fast-gen.ai/v1/chat/completions",
-            "VS_ALT_LLM_KEY": "КЛЮЧ-FASTGEN", "VS_ALT_LLM_BASE": "https://api.fast-gen.ai/v1",
+            "VS_ALT_LLM_KEY": "КЛЮЧ-ПРОКСИ",
             "COVER_ALT_API_KEY": "КЛЮЧ-ПРОКСИ", "COVER_ALT_BASE_URL": "https://proxy/v1"}
 
     pf.ROWS.clear(); pf.check_key_routes(k, good, "123")
@@ -94,6 +97,11 @@ def test_key_routes() -> None:
           "Неверный API ключ" in note, True)
     check("значение ключа не напечатано",
           "КЛЮЧ-ПРОКСИ" in note or "КЛЮЧ-FASTGEN" in note, False)
+
+    # Ровно то, что стояло у владельца: ключ FastGen на канале промптов, который ходит
+    # на прокси. Симптом тот же — 401 и «Неверный API ключ».
+    pf.ROWS.clear(); pf.check_key_routes(k, dict(good, VS_ALT_LLM_KEY="КЛЮЧ-FASTGEN"), "1")
+    check("ключ FastGen на канале промптов — отказ", last("Ключ ↔ адрес")[0], pf.BAD)
 
     # Незнакомый ключ — тоже повод сказать: молчать про «не знаю чей» опаснее.
     pf.ROWS.clear(); pf.check_key_routes(k, dict(good, VS_ALT_LLM_KEY="ЧУЖОЙ"), "123")

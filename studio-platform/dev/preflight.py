@@ -233,12 +233,31 @@ def _stand_env() -> tuple[str, dict]:
     ключ, а любая проверка «у меня в оболочке» показывала бы полный порядок.
     """
     try:
-        pid = subprocess.run(["pgrep", "-f", "uvicorn web.platform:app"],
-                             capture_output=True, text=True, timeout=10).stdout.split()
-        if not pid:
+        pids = subprocess.run(["pgrep", "-f", "uvicorn web.platform:app"],
+                              capture_output=True, text=True, timeout=10).stdout.split()
+        if not pids:
             return "", {}
-        raw = subprocess.run(["ps", "eww", pid[0]], capture_output=True, text=True,
+        # Стендов может быть несколько (свой на 8080, проверочный на другом порту), и
+        # «первый попавшийся» — худший выбор: проверка уверенно расскажет про чужой
+        # процесс. Берём тот, что слушает нужный порт, и называем его вслух.
+        want = str(os.environ.get("VS_PORT") or "8080")
+        chosen, raw = "", ""
+        for pid in pids:
+            cmd = subprocess.run(["ps", "-o", "command=", "-p", pid],
+                                 capture_output=True, text=True, timeout=10).stdout
+            if f"--port {want}" in cmd:
+                chosen = pid
+                break
+        if not chosen:
+            row("Стенд", WARN,
+                f"ни один из {len(pids)} запущенных не слушает порт {want} — "
+                f"проверяю первый (pid {pids[0]})")
+            chosen = pids[0]
+        elif len(pids) > 1:
+            row("Стенд", WARN, f"запущено {len(pids)}; проверяю тот, что на порту {want}")
+        raw = subprocess.run(["ps", "eww", chosen], capture_output=True, text=True,
                              timeout=10).stdout
+        pid = [chosen]
     except Exception:                                              # noqa: BLE001
         return "", {}
     env = {}
@@ -278,13 +297,17 @@ def check_key_routes(k: dict, stand: dict, pid: str) -> None:
     for name in ("googler", "alt_llm"):
         if isinstance(k.get(name), str) and k[name]:
             fam[k[name]] = name
+    # Кому какой ключ принадлежит: текст идёт в FastGen (googler), промпты и анализ
+    # обложки — на сторонний прокси (alt_llm). Адрес промптам задаёт кабинет из файла
+    # ключей, поэтому в окружении стенда VS_ALT_LLM_BASE может и не быть — ключ всё
+    # равно обязан быть проксиным, иначе получим 401 уже в прогоне.
     pairs = (("REWRITE_GPT_CHAT_KEY", "REWRITE_GPT_CHAT_URL", "googler"),
-             ("VS_ALT_LLM_KEY", "VS_ALT_LLM_BASE", "googler"),
+             ("VS_ALT_LLM_KEY", "", "alt_llm"),
              ("COVER_ALT_API_KEY", "COVER_ALT_BASE_URL", "alt_llm"))
     wrong = []
     for key_var, url_var, want in pairs:
-        val, url = stand.get(key_var), stand.get(url_var)
-        if not val or not url:
+        val = stand.get(key_var)
+        if not val or (url_var and not stand.get(url_var)):
             continue
         got = fam.get(val, "неизвестный")
         if got != want:

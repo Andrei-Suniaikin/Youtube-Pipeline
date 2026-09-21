@@ -152,17 +152,22 @@ print(v if isinstance(v, str) else "")
 ALTK
 )"
   if [ -n "$_altkey" ]; then
-    export VS_ALT_LLM_KEY="$_altkey"
-    export VS_ALT_LLM_BASE="${VS_ALT_LLM_BASE:-https://api.fast-gen.ai/v1}"
-    export VS_ALT_LLM_MODEL="${VS_ALT_LLM_MODEL:-openai/gpt-4.1-mini}"
-    export VS_PROMPT_PROVIDER="${VS_PROMPT_PROVIDER:-altclaude}"
+    # 21.09, вторая итерация. Канал промптов выбирает НЕ эта переменная, а `_prompt_policy`
+    # из файла ключей: кабинет собирает окружение подпроцесса сам (server/main.py ≈1560)
+    # и для altclaude подставляет свои VS_ALT_LLM_BASE/MODEL из того же файла. То есть
+    # адрес отсюда до решения не доживал, а ключ — доживал, и они расходились.
+    #
+    # Поэтому здесь адрес и модель больше не задаются: их источник один — файл ключей,
+    # рядом с ключом, которому они принадлежат. Ключ altclaude — это `alt_llm`, ключ
+    # стороннего прокси; им же ходит анализ обложки. FastGen остаётся у текста рерайта,
+    # где своя пара переменных и свой ключ (googler).
     # Тот же провайдер пишет и ТЕКСТ. Рерайт ходит в чат одним местом, адрес и ключ у него
     # теперь настраиваются; адрес задаётся целиком — склейка с /v1 даёт 404. Имена моделей
     # рерайта (gpt-4.1-mini и т.п.) провайдер принимает и без префикса — проверено.
     # Ключ ставится ВМЕСТЕ с адресом: без него рерайт откажется работать, чтобы не
     # отправить ключ OpenAI чужому провайдеру.
     export REWRITE_GPT_CHAT_URL="${REWRITE_GPT_CHAT_URL:-https://api.fast-gen.ai/v1/chat/completions}"
-    export REWRITE_GPT_CHAT_KEY="${REWRITE_GPT_CHAT_KEY:-$_altkey}"
+    export REWRITE_GPT_CHAT_KEY="${REWRITE_GPT_CHAT_KEY:-$_altkey}"   # _altkey = googler
   fi
   # Анализ обложки. В этом форке он ходит ТОЛЬКО в OpenAI: Gemini-SDK удалён в v1.0.3,
   # provider="google" молча падает обратно на OpenAI. Без денег на счету обложка «новой
@@ -181,10 +186,16 @@ v = data.get("alt_llm") or ""
 print(v if isinstance(v, str) else "")
 CALT
 )"
-  if [ -n "$_coverkey" ] && [ -z "$COVER_ALT_API_KEY" ]; then
-    export COVER_ALT_API_KEY="$_coverkey"
+  if [ -n "$_coverkey" ]; then
+    [ -z "$COVER_ALT_API_KEY" ] && export COVER_ALT_API_KEY="$_coverkey"
     export COVER_ALT_BASE_URL="${COVER_ALT_BASE_URL:-https://triklz27.ru/v1}"
     export COVER_ALT_MODEL="${COVER_ALT_MODEL:-gpt-5.6-terra}"
+    # Тем же ключом и тем же адресом ходит канал промптов altclaude — это ОДИН
+    # провайдер на две задачи, и держать для него два разных ключа значило бы
+    # завести себе тот самый рассинхрон «ключ от одного хоста на адресе другого».
+    # Адрес и модель промптам задаёт кабинет из файла ключей (alt_llm_base/model),
+    # здесь только ключ: подпроцесс наследует его от нас.
+    export VS_ALT_LLM_KEY="${VS_ALT_LLM_KEY:-$_coverkey}"
   fi
   unset _coverkey
   unset _altkey
