@@ -553,8 +553,8 @@ def _acquire_cancelable(semaphore, cancel_check=None, step: float = 0.25) -> boo
             return True
 
 
-def _openai_client(api_key: str):
-    """Клиент OpenAI с кэшированием (один клиент на ключ, потокобезопасно)."""
+def _openai_client(api_key: str, base_url: str = ""):
+    """Клиент OpenAI с кэшированием (один клиент на пару ключ+адрес, потокобезопасно)."""
     # 21.09.2026: пакета openai в окружении не было, и анализ обложки падал здесь
     # с `NameError: name 'openai' is not defined` — сообщением, по которому нельзя
     # понять ни что сломано, ни что делать. Флаг OPENAI_AVAILABLE при этом честно
@@ -566,10 +566,43 @@ def _openai_client(api_key: str):
             "Лечится установкой: .venv/bin/pip install openai"
         )
     with _openai_clients_lock:
-        if api_key not in _openai_clients:
+        ck = (api_key, base_url or "")
+        if ck not in _openai_clients:
             http_client = httpx.Client() if httpx is not None else None
-            _openai_clients[api_key] = openai.OpenAI(api_key=api_key, http_client=http_client)
-        return _openai_clients[api_key]
+            kw = {"api_key": api_key, "http_client": http_client}
+            if base_url:
+                kw["base_url"] = base_url
+            _openai_clients[ck] = openai.OpenAI(**kw)
+        return _openai_clients[ck]
+
+
+def _alt_vision_route():
+    """Куда слать анализ обложки, если не в OpenAI: (адрес, ключ, модель) либо пусто.
+
+    21.09.2026: у счёта OpenAI ноль, а весь анализ обложки в этом форке ходит ТОЛЬКО
+    в OpenAI — Gemini-SDK удалён в v1.0.3, и provider="google" молча падает обратно
+    на него. То есть без денег обложка «новой сценой» невозможна в принципе.
+
+    В бою эта развилка уже решена теми же тремя переменными (COVER_ALT_*): анализ
+    уходит на сторонний OpenAI-совместимый прокси, который умеет зрение. Берём тот же
+    путь, а не изобретаем свой.
+
+    Ключ обязан ехать вместе с адресом. Задать чужой адрес и оставить ключ OpenAI —
+    значит отправить секрет туда, где он не предназначен, и никогда об этом не узнать,
+    поэтому адрес без ключа игнорируется целиком, а вызывающий об этом кричит.
+    """
+    base = (os.environ.get("COVER_ALT_BASE_URL") or "").strip().rstrip("/")
+    key = (os.environ.get("COVER_ALT_API_KEY") or "").strip()
+    model = (os.environ.get("COVER_ALT_MODEL") or "").strip()
+    if not base:
+        return ("", "", "")
+    if not key:
+        raise RuntimeError(
+            "COVER_ALT_BASE_URL задан без COVER_ALT_API_KEY: ключ OpenAI чужому "
+            "провайдеру не отправляется. Денег это не стоило, повтор не поможет. "
+            "Задайте ключ этого провайдера или уберите адрес."
+        )
+    return (base, key, model)
 
 
 def _call_openai_vision(image, prompt: str, api_key: str, model: str) -> str:
@@ -580,7 +613,14 @@ def _call_openai_vision(image, prompt: str, api_key: str, model: str) -> str:
     for im in images:
         b64 = image_to_base64(im, "PNG")
         content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
-    client = _openai_client(api_key)
+    alt_base, alt_key, alt_model = _alt_vision_route()
+    if alt_base:
+        # Модель OpenAI на чужом провайдере может не существовать вовсе: там свой
+        # список. Берём его модель, а не нашу — иначе каждый вызов вернёт 400.
+        api_key, base_url, model = alt_key, alt_base, (alt_model or model)
+    else:
+        base_url = ""
+    client = _openai_client(api_key, base_url)
     with _provider_semaphore_for_key("openai", api_key):
         resp = client.chat.completions.create(
             model=model or DEFAULT_ANALYSIS_MODEL_OPENAI,

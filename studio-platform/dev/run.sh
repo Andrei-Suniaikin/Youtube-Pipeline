@@ -156,6 +156,29 @@ ALTK
     export REWRITE_GPT_CHAT_URL="${REWRITE_GPT_CHAT_URL:-https://api.fast-gen.ai/v1/chat/completions}"
     export REWRITE_GPT_CHAT_KEY="${REWRITE_GPT_CHAT_KEY:-$_altkey}"
   fi
+  # Анализ обложки. В этом форке он ходит ТОЛЬКО в OpenAI: Gemini-SDK удалён в v1.0.3,
+  # provider="google" молча падает обратно на OpenAI. Без денег на счету обложка «новой
+  # сценой» невозможна в принципе. Бой решает это теми же COVER_ALT_* — сторонним
+  # OpenAI-совместимым прокси, который умеет зрение (проверено живым вызовом: прочитал
+  # текст с картинки). Модель берётся ЕГО, потому что моделей OpenAI у него нет.
+  # Ключ ставится вместе с адресом: без него анализ откажется работать, чтобы не
+  # отправить ключ OpenAI чужому провайдеру. Канал узкий — в бою COVER_ALT_INFLIGHT=1.
+  _coverkey="$("$PY" - "$VS_SERVER_KEYS_PATH" <<'CALT'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+v = data.get("alt_llm") or ""
+print(v if isinstance(v, str) else "")
+CALT
+)"
+  if [ -n "$_coverkey" ] && [ -z "$COVER_ALT_API_KEY" ]; then
+    export COVER_ALT_API_KEY="$_coverkey"
+    export COVER_ALT_BASE_URL="${COVER_ALT_BASE_URL:-https://triklz27.ru/v1}"
+    export COVER_ALT_MODEL="${COVER_ALT_MODEL:-gpt-5.6-terra}"
+  fi
+  unset _coverkey
   unset _altkey
 fi
 # ─── Пресеты рерайта: стенд не пишет в репозиторий ───────────────────────────
