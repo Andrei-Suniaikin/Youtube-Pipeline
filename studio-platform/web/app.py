@@ -22,6 +22,7 @@ import re
 import secrets
 import sqlite3
 import sys
+from typing import Optional
 import threading
 import time
 import urllib.error
@@ -1743,6 +1744,126 @@ def ui_keys_rewrite(body: RewriteKeyIn, request: Request):
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
     return {"ok": True, "set": bool(body.openai_api_key.strip())}
+
+
+# ─────────────────── подписки для текста: Codex и Claude (22.09.2026) ───────────────────
+#
+# Раньше сменить подписку, которой пишется текст, можно было только по SSH: `codex login`,
+# правка /etc/rewrite.env и перезапуск сервиса. Теперь это делает администратор здесь.
+# Хранит подписки модуль рерайта (`rewrite/subscriptions.py`) — второго места хранения
+# секрета не заводим, пульт только передаёт. Значение наружу не уходит никогда: в ответе
+# имя, хвост и состояние.
+
+def _text_subs():
+    rw = os.path.join(BASE, "rewrite")
+    if rw not in sys.path:
+        sys.path.append(rw)
+    import subscriptions                                           # noqa: E402
+    return subscriptions
+
+
+def _require_subs_admin(request) -> dict:
+    """Серверные подписки общие на всех — менять их может только администратор.
+    Свои подписки человека живут в «Моих ключах» и сюда не относятся."""
+    user = getattr(request.state, "user", None)
+    role = (user["role"] if user is not None and "role" in user.keys() else "") or ""
+    if role != "admin":
+        raise HTTPException(403, "серверные подписки меняет только администратор")
+    return {"id": user["id"], "name": user["name"]}
+
+
+def _subs_env_part() -> dict:
+    """Подписки, заданные на сервере файлом окружения: их видно, но менять их здесь
+    нельзя — они живут в /etc/rewrite.env. Рерайт не поднят — честно «неизвестно»."""
+    core = sys.modules.get("rewrite_core")
+    if core is None:
+        return {"known": False, "codex": [], "claude": []}
+    subs = _text_subs()
+    try:
+        managed_homes = set(subs.codex_homes())
+        managed_tokens = set(subs.claude_tokens())
+        homes = [h for h in core.get_server_codex_homes() if h not in managed_homes]
+        tokens = [t for t in core.get_server_claude_oauth_tokens()
+                  if t not in managed_tokens]
+    except Exception:                                              # noqa: BLE001
+        return {"known": False, "codex": [], "claude": []}
+    return {"known": True,
+            # Путь каталога — не секрет, а человеку нужен ответ «какой это вход».
+            "codex": [{"tail": os.path.basename(h.rstrip("/")) or h} for h in homes],
+            "claude": [{"tail": f"…{t[-4:]}"} for t in tokens]}
+
+
+def _subs_pool() -> dict:
+    """Сколько вызовов текста идёт прямо сейчас — из самого пула, а не выдуманное."""
+    core = sys.modules.get("rewrite_core")
+    out = {}
+    for provider in ("codex", "claude"):
+        try:
+            out[provider] = core.get_server_credential_pool(provider).stats() if core else None
+        except Exception:                                          # noqa: BLE001
+            out[provider] = None
+    return out
+
+
+@app.get("/ui/subscriptions")
+def ui_subscriptions(request: Request):
+    _require_subs_admin(request)
+    return {"items": _text_subs().listing(), "env": _subs_env_part(),
+            "pool": _subs_pool(), "now": time.time()}
+
+
+class SubscriptionIn(BaseModel):
+    provider: str = ""
+    secret: str = ""
+    label: str = ""
+
+
+class SubscriptionEditIn(BaseModel):
+    label: Optional[str] = None
+    paused: Optional[bool] = None
+    secret: str = ""               # не пусто — новый вход в ту же запись («Заменить»)
+
+
+def _subs_call(fn, *args):
+    subs = _text_subs()
+    try:
+        return fn(*args)
+    except subs.SubscriptionError as exc:
+        raise HTTPException(400, str(exc))
+    except KeyError:
+        raise HTTPException(404, "такой подписки нет — возможно, её уже удалили")
+
+
+@app.post("/ui/subscriptions")
+def ui_subscription_add(body: SubscriptionIn, request: Request):
+    who = _require_subs_admin(request)
+    subs = _text_subs()
+    item = _subs_call(subs.add, body.provider, body.secret, body.label, who["name"])
+    return {"ok": True, "item": item}
+
+
+@app.post("/ui/subscriptions/{sid}")
+def ui_subscription_edit(sid: str, body: SubscriptionEditIn, request: Request):
+    who = _require_subs_admin(request)
+    subs = _text_subs()
+    item = None
+    if body.secret.strip():
+        item = _subs_call(subs.replace, sid, body.secret, who["name"])
+    if body.label is not None:
+        item = _subs_call(subs.rename, sid, body.label)
+    if body.paused is not None:
+        item = _subs_call(subs.set_paused, sid, body.paused)
+    if item is None:
+        raise HTTPException(400, "нечего менять")
+    return {"ok": True, "item": item}
+
+
+@app.delete("/ui/subscriptions/{sid}")
+def ui_subscription_remove(sid: str, request: Request):
+    _require_subs_admin(request)
+    subs = _text_subs()
+    _subs_call(subs.remove, sid)
+    return {"ok": True}
 
 
 def _pool_load() -> list:

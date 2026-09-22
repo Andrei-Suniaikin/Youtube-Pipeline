@@ -60,6 +60,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import os
 import shutil
 import time
@@ -140,7 +141,7 @@ class Alert:
         return f"<Alert {self.key}>"
 
 
-# ──────────────────────────── одиннадцать поводов ─────────────────────────────
+# ──────────────────────────── двенадцать поводов ─────────────────────────────
 
 # Слова, по которым отказ провайдера означает «ключ кончился», а не «слишком часто».
 # Список закрытый и совпадает с тем, по которому воркер останавливает прогон
@@ -646,7 +647,7 @@ def check_key_dead(c, now, tenant=None) -> list:
     out = {}
     raw = _state_row(c, KEY_REFUSED_KEY)
     # Запись читаем защищаясь: `detect` зовут и тик, и экран «Админ», и упасть на
-    # испорченном JSON значило бы погасить разом все одиннадцать поводов.
+    # испорченном JSON значило бы погасить разом все поводы.
     raw = raw if isinstance(raw, dict) else {}
     for family, rec in sorted(raw.items()):
         if not isinstance(rec, dict) or _f(rec.get("seen")) < KEY_REFUSE_HITS:
@@ -686,10 +687,65 @@ def check_key_dead(c, now, tenant=None) -> list:
     return list(out.values())
 
 
+def _text_subscriptions():
+    """Модуль подписок рерайта. Процесс тревог живёт с `server/` на пути, рерайт — рядом."""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "rewrite")
+    if path not in sys.path:
+        sys.path.append(path)
+    try:
+        import subscriptions
+    except ImportError:
+        return None
+    return subscriptions
+
+
+def check_text_subscription_dead(c, now, tenant=None) -> list:
+    """§12. Подписка для текста разлогинилась. Добавлено 22.09.2026 вместе с экраном
+    подписок: раньше протухший вход Codex или Claude было видно только по тому, что
+    задачи текста падали одна за другой.
+
+    Факт берётся из состояния, которое пишет сам рерайт по итогам настоящих вызовов
+    (`subscriptions.note`): два отказа входа подряд. Проверок «на пробу» нет. Повод —
+    состояние: «починилось» уходит, когда подписку заменили, вернули или удалили.
+    """
+    subs = _text_subscriptions()
+    if subs is None:
+        return []
+    try:
+        items = subs.listing(now)
+    except Exception:                                  # noqa: BLE001
+        return []
+    out = []
+    for item in items:
+        if item["state"] != "dead":
+            continue
+        name = "Codex (ChatGPT)" if item["provider"] == "codex" else "Claude"
+        alive = sum(1 for i in items if i["provider"] == item["provider"]
+                    and i["state"] in ("new", "ok", "limit"))
+        how = ("войти командой `codex login` на своём компьютере и вставить файл "
+               "~/.codex/auth.json" if item["provider"] == "codex" else
+               "получить новый токен командой `claude setup-token` и вставить его")
+        out.append(Alert(
+            f"text_sub_dead:{item['id']}",
+            f"Подписка для текста «{item['label']}» разлогинилась",
+            f"{name}, вход {item['tail'] or '—'}: провайдер дважды подряд не принял "
+            f"вход. Подписка вынута из раздачи.\n"
+            + (f"Текст пишут остальные подписки {name}: рабочих — {alive}.\n" if alive
+               else f"Других рабочих подписок {name} нет — задачи текста этим "
+                    f"провайдером встанут.\n")
+            + f"Что сделать: «Ключи» → «Подписки для текста» → «Заменить»: {how}.",
+            since_hint=item.get("since"),
+            money="Отказ входа денег не стоит: вызов не состоялся, а подписка — "
+                  "фиксированная плата. Задачи текста, упавшие на ней, после замены "
+                  "поднять кнопкой «Повторить»."))
+    return out
+
+
 CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
           check_missed_slots, check_disk, check_oldest_task, check_failed_tasks,
           check_key_exhausted, check_key_expiring, check_usage_near_limit,
-          check_key_dead)
+          check_key_dead, check_text_subscription_dead)
 
 # Сколько повод должен продержаться, прежде чем о нём говорят. Там, где длительность
 # и есть суть повода (§2), она проверяется здесь; остальные поводы уже содержат свой

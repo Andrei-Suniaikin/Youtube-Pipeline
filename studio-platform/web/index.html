@@ -404,6 +404,17 @@
   .pitem .body{min-width:0}
   .pitem .pacts{white-space:nowrap;align-self:center;display:flex;gap:2px}
   #paidline{margin-top:6px}
+  /* Подписки для текста (22.09.2026): форма добавления встаёт в саму карточку, под
+     полосой заголовка, — отдельного экрана на одно поле не нужно. */
+  .subform{border-bottom:1px solid var(--line);display:grid;gap:10px}
+  .subform[hidden]{display:none}
+  .subform ol{margin:0;padding-left:20px;line-height:1.55}
+  .subform code{font-family:var(--mono);font-size:12px;background:var(--well);
+                padding:1px 5px;border-radius:var(--r-xs)}
+  .subform textarea{width:100%;font-size:12px;min-height:110px}
+  .subform .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .subform input.secret{width:min(460px,100%);font-family:var(--mono);font-size:12px}
+  .subrow .ptag{font-size:11px;padding:1px 7px;font-weight:500}
 
   /* Тосты: ошибка действия видна там, где смотрит глаз, и не перекрывает работу.
      Раньше это был alert() — он останавливает страницу и требует нажать «ОК». */
@@ -861,6 +872,14 @@ const ICON = {
   expand: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
       + '<path d="M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z"/></svg>',
   // звенья — «скопировать идентификатор» (не путать с копией пресета)
+  // ключ — «заменить вход» подписки
+  key: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M12.65 10A5.99 5.99 0 0 0 7 6c-3.31 0-6 2.69-6 6s2.69 6 6 6a5.99 5.99 0 0 0 5.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>',
+  // две черты — «на паузу», треугольник — «вернуть в работу»
+  pause: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>',
+  play: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M8 5v14l11-7z"/></svg>',
   link: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
       + '<path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>',
 };
@@ -1195,6 +1214,209 @@ function ownKeysCard(d, opts){
   return card;
 }
 
+/* ─────────────── подписки для текста: Codex и Claude (22.09.2026) ───────────────
+   Владелец: «сделаем, чтобы мы могли пользоваться подпиской кодекса или клода для
+   написания текста». Раньше подписку меняли только по SSH: `codex login` на сервере,
+   правка /etc/rewrite.env и перезапуск. Теперь — здесь, администратором.
+   Значение входа сюда обратно не приходит никогда: только имя, хвост и состояние. */
+const SUB_PROVIDER = {codex: 'Codex', claude: 'Claude'};
+const SUB_DOT = {ok: ['s-done', '✓'], new: ['s-idle', '·'], limit: ['s-queued', '⏳'],
+                 dead: ['s-error', '!'], paused: ['s-idle', '‖']};
+
+function subStateText(it){
+  const t = ts => new Date(ts * 1000).toLocaleTimeString('ru-RU',
+    {hour: '2-digit', minute: '2-digit'});
+  switch (it.state){
+    case 'ok': return `работает${it.last_ok ? ' · последний вызов ' + when(it.last_ok) : ''}`;
+    case 'limit': return it.until
+      ? `упёрлась в лимит подписки — проснётся в ${t(it.until)}`
+      // Codex времени сброса не называет — выдумывать час не будем.
+      : 'упёрлась в лимит подписки — ждёт сброса окна; Codex не говорит, когда';
+    case 'dead': return `вход протух ${when(it.since)} — вынута из раздачи, `
+      + 'текст её не берёт. Замените вход';
+    case 'paused': return 'на паузе — задачи текста её не берут';
+    default: return 'добавлена, ещё не работала';
+  }
+}
+
+function subFormHtml(provider, forLabel){
+  const codex = provider === 'codex';
+  return `
+    ${forLabel ? '' : `<div class="fld"><label>Название</label>
+      <input id="sf-label" maxlength="60" style="width:min(340px,100%)"
+        placeholder="${codex ? 'Например: ChatGPT Pro, основной' : 'Например: Claude Max, резерв'}"></div>`}
+    ${codex ? `<ol class="note">
+        <li>На своём компьютере войдите в <b>отдельную папку</b>:
+          <code>CODEX_HOME=~/codex-studio codex login</code> — аккаунтом ChatGPT с подпиской.</li>
+        <li>Вставьте сюда файл <code>~/codex-studio/auth.json</code> целиком или выберите его.</li>
+      </ol>
+      <div class="note muted">Почему отдельная папка: Codex сам обновляет вход, и старый
+        при этом перестаёт действовать. Один и тот же вход на сервере и на вашем
+        компьютере выбивал бы друг друга.</div>
+      <textarea id="sf-secret" rows="6" spellcheck="false" autocomplete="off"
+        placeholder='{"auth_mode": "chatgpt", "tokens": { … } }'></textarea>
+      <div class="row"><label class="filepick"><span class="pickbtn">Выбрать auth.json</span>
+        <input id="sf-file" type="file" accept=".json,application/json"></label>
+        <span class="muted" id="sf-fname" style="font-size:12.5px"></span></div>`
+    : `<ol class="note">
+        <li>На своём компьютере выполните <code>claude setup-token</code> и войдите
+          аккаунтом Claude с подпиской.</li>
+        <li>Вставьте напечатанный токен — он начинается с <code>sk-ant-oat</code>.</li>
+      </ol>
+      <input id="sf-secret" class="secret" type="password" autocomplete="off"
+        spellcheck="false" placeholder="sk-ant-oat01-…">`}
+    <div class="note muted">Вход хранится на сервере закрыто. Показать его обратно
+      нельзя — только заменить или удалить.</div>
+    <div class="row"><button id="sf-ok">${forLabel ? 'Заменить вход' : 'Добавить'}</button>
+      <button class="ghost" id="sf-no">Отмена</button>
+      <span class="note bad" id="sf-err" style="margin:0"></span></div>`;
+}
+
+async function textSubsCard(){
+  const card = $(`<div class="card" id="subs-card" style="margin-bottom:16px"></div>`)
+    .firstElementChild;
+  const draw = async () => {
+    let d;
+    try{ d = await api('/ui/subscriptions'); }
+    catch(e){
+      if (e instanceof NeedLogin) throw e;
+      card.innerHTML = `<div class="sec">Подписки для текста</div><div class="secbody">
+        <div class="note bad">Список подписок прочитать не удалось: ${esc(e.message)}</div></div>`;
+      return;
+    }
+    // Неполный ответ не должен ронять весь экран ключей: блок рисуется из того, что есть.
+    d.items = Array.isArray(d.items) ? d.items : [];
+    const env = d.env || {};
+    const envParts = ['codex', 'claude'].filter(p => (env[p] || []).length).map(p =>
+      `${SUB_PROVIDER[p]} — ${env[p].length} (${env[p].map(x => esc(x.tail)).join(', ')})`);
+    const pool = d.pool || {};
+    const busy = ['codex', 'claude'].filter(p => pool[p] && pool[p].credentials).map(p =>
+      `${SUB_PROVIDER[p]} ${pool[p].in_use} из ${pool[p].capacity}`);
+    card.innerHTML = `
+      <div class="sec stage-head"><span class="grow">Подписки для текста ${hintDot(
+        'Подписки ChatGPT (Codex) и Claude, которыми студия пишет сценарии. Добавленная '
+        + 'здесь начинает работать со следующей задачи — без перезапуска. Задачи '
+        + 'раздаются по кругу; подписка с протухшим входом вынимается сама.')}</span>
+        <button class="ghost small" id="sub-add-codex">Добавить Codex</button>
+        <button class="ghost small" id="sub-add-claude">Добавить Claude</button></div>
+      <div class="secbody subform" id="sub-form" hidden></div>
+      ${d.items.length ? d.items.map(it => {
+        const [cls, mark] = SUB_DOT[it.state] || SUB_DOT.new;
+        const paused = it.state === 'paused', dead = it.state === 'dead';
+        return `<div class="stage pitem subrow" data-sub="${esc(it.id)}"
+            data-provider="${esc(it.provider)}" data-state="${esc(it.state)}">
+          <div class="dot ${cls}">${mark}</div>
+          <div class="body">
+            <div class="pline"><span class="name">${esc(it.label)}</span>
+              <span class="pill ptag">${esc(SUB_PROVIDER[it.provider])}</span>
+              <span class="facts mono">${esc(it.tail)}</span></div>
+            <div class="note ${dead ? 'bad' : it.state === 'limit' ? 'warn' : 'muted'}">${
+              esc(subStateText(it))}</div>
+            ${dead && it.note ? `<div class="note muted">${esc(it.note)}</div>` : ''}
+          </div>
+          <div class="pacts">
+            ${iconBtn('sub-replace', 'key', 'Заменить вход', it.label)}
+            ${paused || dead
+              ? iconBtn('sub-resume', 'play', dead ? 'Вернуть в работу без замены'
+                                                   : 'Вернуть в работу', it.label)
+              : iconBtn('sub-pause', 'pause', 'Поставить на паузу', it.label)}
+            ${iconBtn('sub-rename', 'edit', 'Переименовать', it.label)}
+            ${iconBtn('sub-drop', 'remove', 'Удалить', it.label)}
+          </div></div>`;
+      }).join('') : `<div class="empty">Своих подписок студии пока нет${
+        envParts.length ? ' — текст пишут подписки из настроек сервера' : ''}.</div>`}
+      ${envParts.length || busy.length || env.known === false ? `<div class="secbody"
+          style="padding-top:8px">
+        ${envParts.length ? `<div class="note muted">Из файла настроек сервера:
+          ${envParts.join(' · ')}. Их меняют на сервере, здесь только видно.</div>` : ''}
+        ${busy.length ? `<div class="note muted">Пишут текст прямо сейчас: ${
+          busy.join(' · ')}.</div>` : ''}
+        ${env.known === false ? `<div class="note muted">Подписки из настроек сервера
+          отсюда не видно: сервис текста не поднят в этом процессе.</div>` : ''}
+      </div>` : ''}`;
+
+    const form = card.querySelector('#sub-form');
+    const openForm = (provider, item) => {
+      form.hidden = false;
+      form.innerHTML = `<div class="name" style="font-weight:600">${item
+        ? `Новый вход для «${esc(item.label)}»` : `Новая подписка ${SUB_PROVIDER[provider]}`}</div>`
+        + subFormHtml(provider, item ? item.label : '');
+      const secret = form.querySelector('#sf-secret');
+      const err = form.querySelector('#sf-err');
+      const file = form.querySelector('#sf-file');
+      if (file) file.onchange = async () => {
+        const f = file.files[0];
+        if (!f) return;
+        secret.value = await f.text();
+        form.querySelector('#sf-fname').textContent = f.name;
+        file.value = '';
+      };
+      form.querySelector('#sf-no').onclick = () => { form.hidden = true; form.innerHTML = ''; };
+      const ok = form.querySelector('#sf-ok');
+      ok.onclick = async () => {
+        err.textContent = '';
+        if (!secret.value.trim()){
+          err.textContent = provider === 'codex' ? 'вставьте содержимое auth.json'
+                                                : 'вставьте токен';
+          return secret.focus();
+        }
+        ok.disabled = true;
+        try{
+          if (item) await post(`/ui/subscriptions/${item.id}`, {secret: secret.value});
+          else await post('/ui/subscriptions', {provider, secret: secret.value,
+            label: form.querySelector('#sf-label').value});
+          // Секрет не держим в странице ни мгновения дольше нужного.
+          secret.value = '';
+          toast(item ? `Вход «${item.label}» заменён` : 'Подписка добавлена — работает '
+                + 'со следующей задачи текста', 'ok');
+          await draw();
+        }catch(e){ err.textContent = e.message; }
+        finally{ ok.disabled = false; }
+      };
+      (form.querySelector('#sf-label') || secret).focus();
+    };
+    card.querySelector('#sub-add-codex').onclick = () => openForm('codex');
+    card.querySelector('#sub-add-claude').onclick = () => openForm('claude');
+
+    const byId = id => d.items.find(i => i.id === id);
+    const rowItem = b => byId(b.closest('.subrow').dataset.sub);
+    card.querySelectorAll('.sub-replace').forEach(b => b.onclick = () => {
+      const it = rowItem(b); openForm(it.provider, it);
+    });
+    const act = async (b, payload, done) => {
+      b.disabled = true;
+      try{ await post(`/ui/subscriptions/${rowItem(b).id}`, payload); if (done) toast(done, 'ok');
+           await draw(); }
+      catch(e){ toast(e.message); b.disabled = false; }
+    };
+    card.querySelectorAll('.sub-pause').forEach(b => b.onclick = () =>
+      act(b, {paused: true}));
+    card.querySelectorAll('.sub-resume').forEach(b => b.onclick = () =>
+      act(b, {paused: false}));
+    card.querySelectorAll('.sub-rename').forEach(b => b.onclick = () => {
+      const it = rowItem(b);
+      const m = modal('Переименовать подписку', `<div class="fld"><label>Название</label>
+        <input id="rn" maxlength="60" value="${esc(it.label)}"></div>`,
+        {onOk: async (body, close) => {
+          await post(`/ui/subscriptions/${it.id}`, {label: body.querySelector('#rn').value});
+          close(); await draw();
+        }});
+      m.body.querySelector('#rn').select();
+    });
+    card.querySelectorAll('.sub-drop').forEach(b => b.onclick = () => {
+      const it = rowItem(b);
+      confirmModal('Удалить подписку', `Удалить «${it.label}»? Задачи текста перестанут `
+        + 'её брать, а вход будет стёрт с сервера. Вернуть можно только добавив заново.',
+        async () => {
+          try{ await api(`/ui/subscriptions/${it.id}`, {method: 'DELETE'}); await draw(); }
+          catch(e){ toast(e.message); }
+        });
+    });
+  };
+  await draw();
+  return card;
+}
+
 async function viewKeys(){
   // Ключи живут в профиле: это про человека, а не про производство. Вкладки в топбаре
   // у них больше нет — обратный путь должен быть виден со страницы.
@@ -1216,6 +1438,10 @@ async function viewKeys(){
         </div></div>`).join('')
       : '<div class="empty">Сейчас никто не работает — все потоки свободны.</div>'}
   </div>`));
+
+  // Серверные подписки общие на всех — блок видит и меняет только администратор
+  // (проверка на сервере; здесь — лишь чтобы не показывать пустой отказ).
+  if (ME && ME.role === 'admin') app.append(await textSubsCard());
 
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Очередь по провайдерам</div>
@@ -6555,6 +6781,8 @@ async function viewProfile(){
       <div class="secbody"><div class="note bad">Состояние ключей прочитать не удалось:
         ${esc(e.message)}. Денег это не стоило — карточка только читает.</div></div></div>`));
   }
+  // Подписки для текста — рядом с ключами: заказчик меняет их отсюда, а не по SSH.
+  if (me.role === 'admin') app.append(await textSubsCard());
 
   // Раздел людей появляется только у администратора: проверка стоит на сервере,
   // а не на прятании кнопки — запрос может прислать кто угодно.
@@ -7552,7 +7780,7 @@ async function viewPresets(){
      run: () => channelPresetModal(null)},
     {title: 'Шаблон озвучки Lumean',
      hint: 'голос и настройки на стороне Lumean',
-     run: () => lumeanTemplateModal(null, (lum && lum.fields) || null)},
+     run: () => { location.hash = '#/lumean/new'; }},
   ]);
 
   if (d.broken.length){
@@ -7847,9 +8075,10 @@ async function viewPresets(){
   </div>`);
   app.append(lumCard);
   const lumNew = lumCard.querySelector('#lum-new');
-  if (lumNew) lumNew.onclick = () => lumeanTemplateModal(null, lum.fields);
+  // Заводится и правится шаблон своей страницей, как обычный пресет (22.09.2026).
+  if (lumNew) lumNew.onclick = () => { location.hash = '#/lumean/new'; };
   lumCard.querySelectorAll('.lum-edit').forEach(b => b.onclick =
-    () => lumeanTemplateModal(b.dataset.id, null));
+    () => { location.hash = '#/lumean/' + encodeURIComponent(b.dataset.id); });
   lumCard.querySelectorAll('.lum-copy').forEach(b => b.onclick = async () => {
     try{ await navigator.clipboard.writeText(b.dataset.id); toast('id скопирован', 'ok'); }
     catch(e){ toast('Скопировать не вышло — id виден в строке шаблона'); }
@@ -7936,13 +8165,9 @@ function wirePresets(root){
 // Окно шаблона озвучки Lumean. Поля описывает сервер (те же имена, что у провайдера),
 // здесь только отрисовка. Создание возвращает id — показываем его и предлагаем
 // скопировать: именно он вписывается в карту «язык → шаблон» пресета.
-async function lumeanTemplateModal(id, fields, opts){
-  const creating = !id;
-  let d = {fields: fields || [], used_by: []};
-  if (!creating){
-    try{ d = await api(`/ui/lumean/templates/${encodeURIComponent(id)}/form`); }
-    catch(e){ toast(e.message); return; }
-  }
+// Форма шаблона озвучки — одна на окно и на страницу: поля описывает сервер, здесь
+// только отрисовка.
+function lumeanFormHtml(d){
   const fieldHtml = f => {
     const fid = 'lt-' + f.key;
     if (f.kind === 'switch')
@@ -7973,14 +8198,32 @@ async function lumeanTemplateModal(id, fields, opts){
     ? `<div class="note muted">На него ссылаются: ${d.used_by.map(esc).join(', ')}.
        Правка изменит их озвучку со следующего запуска.</div>`
     : '';
-  modal(creating ? 'Новый шаблон озвучки' : 'Шаблон озвучки Lumean',
-    `<div class="fields" style="padding:0">${(d.fields || []).map(fieldHtml).join('')}</div>
+  return `<div class="fields" style="padding:0">${(d.fields || []).map(fieldHtml).join('')}</div>
      <div class="note muted">Шаблон живёт в аккаунте Lumean: заведённый здесь виден и
        на сайте Lumean, удаление удаляет его там же. Формат вывода задаём мы — студия
-       собирает ролик из mp3.</div>${used}`,
+       собирает ролик из mp3.</div>${used}`;
+}
+
+function lumeanValues(box){
+  const values = {};
+  box.querySelectorAll('[data-lt]').forEach(el => { values[el.dataset.lt] = el.value; });
+  return values;
+}
+
+// Окно шаблона осталось ровно в одном месте — в форме пресета, у карты голосов
+// («Завести шаблон» и сразу подставить его id). Там уход на отдельную страницу стёр
+// бы всё, что человек успел набрать в пресете. Со списка пресетов шаблон заводится и
+// правится страницей `#/lumean/…` — как обычный пресет (владелец 22.09.2026).
+async function lumeanTemplateModal(id, fields, opts){
+  const creating = !id;
+  let d = {fields: fields || [], used_by: []};
+  if (!creating){
+    try{ d = await api(`/ui/lumean/templates/${encodeURIComponent(id)}/form`); }
+    catch(e){ toast(e.message); return; }
+  }
+  modal(creating ? 'Новый шаблон озвучки' : 'Шаблон озвучки Lumean', lumeanFormHtml(d),
     {ok: creating ? 'Завести' : 'Сохранить', onOk: async (box, close) => {
-      const values = {};
-      box.querySelectorAll('[data-lt]').forEach(el => { values[el.dataset.lt] = el.value; });
+      const values = lumeanValues(box);
       if (creating){
         const out = await post('/ui/lumean/templates', {values});
         close();
@@ -8001,6 +8244,74 @@ async function lumeanTemplateModal(id, fields, opts){
       // пресета: она стёрла бы незаписанные правки. Зовущий решает сам.
       if (!opts || opts.reload !== false) await render();
     }});
+}
+
+// Страница шаблона озвучки Lumean (22.09.2026). Владелец: «когда хочешь создать пресет
+// для Lumean — попап, а для обычного пресета нас на страницу перекидывает; давай и для
+// Lumean сделаем отдельной страничкой, просто перенесём попап». Форма та же, что была
+// в окне, — `lumeanFormHtml`; меняется только место.
+async function viewLumeanTemplate(id){
+  const creating = id === 'new';
+  let d;
+  if (creating){
+    const lum = await api('/ui/lumean/templates');
+    d = lum.ok ? {fields: lum.fields || [], used_by: []} : {why: lum.why || 'Lumean не ответил'};
+  }else{
+    d = await api(`/ui/lumean/templates/${encodeURIComponent(id)}/form`);
+  }
+  const nameField = (d.fields || []).find(f => f.key === 'name');
+  const title = creating ? 'Новый шаблон озвучки Lumean'
+                         : ((nameField && nameField.value) || id);
+  app.innerHTML = '';
+  const head = $(`<a class="back" href="#/presets">← ко всем пресетам</a>
+    <h1>${esc(title)}</h1>
+    <p class="sub">${creating ? 'Голос и настройки на стороне Lumean. Заведённый шаблон '
+      + 'выбирается в пресете, в карте голосов.' : `Шаблон озвучки Lumean · id
+      <span class="mono">${esc(id)}</span> ${iconBtn('lum-copy', 'link', 'Копировать id',
+      title, `data-id="${esc(id)}"`)}`}</p>`);
+  app.append(head);
+  const copy = head.querySelector('.lum-copy');
+  if (copy) copy.onclick = async () => {
+    try{ await navigator.clipboard.writeText(id); toast('id скопирован', 'ok'); }
+    catch(e){ toast('Скопировать не вышло — id виден в строке выше'); }
+  };
+  if (d.why){
+    app.append($(`<div class="card"><div class="secbody">
+      <div class="note bad">${esc(d.why)}</div>
+      <div class="note muted">Шаблоны заводятся ключом Lumean из профиля: без него
+        завести шаблон нечем.</div></div></div>`));
+    return;
+  }
+  // Сторож набранного — как у формы пресета: уход по ссылке, вкладке или «назад»
+  // спрашивает, прежде чем стереть незаписанное.
+  let touched = false;
+  const guardHash = location.hash;
+  const panel = inlinePanel(app, 'Настройки шаблона', lumeanFormHtml(d), {
+    ok: creating ? 'Завести' : 'Сохранить',
+    onOk: async box => {
+      const values = lumeanValues(box);
+      if (creating){
+        const out = await post('/ui/lumean/templates', {values});
+        touched = false; LEAVE_GUARD = null;
+        // id нужен человеку сразу: именно он идёт в карту голосов пресета. Страница
+        // заведённого показывает его с кнопкой копирования.
+        toast(`Шаблон заведён, id: ${out.id}`, 'ok');
+        try{ navigator.clipboard.writeText(out.id).catch(() => {}); }catch(e){}
+        location.hash = '#/lumean/' + encodeURIComponent(out.id);
+      }else{
+        await post(`/ui/lumean/templates/${encodeURIComponent(id)}`, {values});
+        touched = false; LEAVE_GUARD = null;
+        toast('Шаблон обновлён у провайдера', 'ok');
+        await render();
+      }
+    }});
+  panel.el.addEventListener('input', () => {
+    touched = true;
+    LEAVE_GUARD = {hash: guardHash, keep: h => h === guardHash,
+                   dirty: () => touched && panel.el.isConnected,
+                   what: creating ? 'Шаблон ещё не заведён — набранное нигде не записано.'
+                                  : 'Правка шаблона не сохранена.'};
+  });
 }
 
 // Окно пресета канала: те же настройки, что у канала, кроме языка. Пустое поле — «в
@@ -8487,7 +8798,7 @@ async function viewAdmin(){
             ? `сказано ${when(x.said_at)}${x.times > 1 ? `, раз: ${x.times}` : ''}`
             : 'ещё не сказано'}</div>
         </div></div>`).join('')
-      : '<div class="empty">Ни один из одиннадцати поводов не выполнен.</div>'}
+      : '<div class="empty">Ни один из двенадцати поводов не выполнен.</div>'}
     ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
        ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
     <div class="sec" style="border-bottom:0">Пороги</div>
@@ -8650,6 +8961,9 @@ const ROUTES = [
   // заведения больше нет, и отдельного маршрута ему не нужно. Номер пресета — всегда
   // число, поэтому «new» ни с чьим адресом не столкнётся.
   ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(
+                                                          decodeURIComponent(h.split('/')[2]))],
+  // Шаблон озвучки Lumean — своя страница, как у пресета (22.09.2026).
+  ['presets',  h => h.startsWith('#/lumean/'),     h  => viewLumeanTemplate(
                                                           decodeURIComponent(h.split('/')[2]))],
   ['profile',  h => h === '#/admin',              () => viewAdmin()],
   ['channels', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
