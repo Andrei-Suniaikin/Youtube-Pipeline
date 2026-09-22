@@ -36,7 +36,9 @@
     --bad:#ff9483;  --bad-bg:rgba(255,148,131,.15);  --bad-clip:#e8604d;
     --off:#a9abb2;  --off-bg:rgba(169,171,178,.12);
     --surface:var(--card); --border:var(--line);
-    --r:4px;
+    --r:10px;                /* панели, всплывающее */
+    --r-sm:7px;              /* кнопки, поля, сегменты */
+    --r-xs:5px;              /* теги, клипы, чипы */
     --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
   }
   *{box-sizing:border-box}
@@ -381,6 +383,7 @@
      сильнее атрибута (см. выше). Подвал записи НЕ сворачивается: «не сохранено» и
      «Повторить» обязаны оставаться на виду, а пустой подвал прячет себя сам. */
   .card.folded>:not(.sec):not(.stage-foot){display:none}
+  .card.folded>.sec{border-radius:var(--r)}
   .stage-foot .note{margin:0}
   .back{display:inline-block;margin-bottom:13px;color:var(--muted);text-decoration:none}
   .back:hover{color:var(--ink-hi)}
@@ -395,6 +398,7 @@
      переносятся — длинный список моделей не должен раздувать каждую строку. */
   .pitem .pline{display:flex;gap:10px;align-items:baseline;min-width:0}
   .pitem .pline .name{flex:0 0 auto}
+  .pitem .ptag{font-size:11px;padding:1px 7px;font-weight:500}
   .pitem .pline .facts{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
                        white-space:nowrap;margin:0}
   .pitem .body{min-width:0}
@@ -541,7 +545,7 @@
   td.st + td.muted{white-space:nowrap}      /* время создания в очереди — одной строкой */
 
   /* кнопки: действие — кость, остальное — контур */
-  button{border-radius:var(--r);padding:7px 14px;font-weight:600;font-size:13.5px;letter-spacing:0}
+  button{border-radius:var(--r-sm);padding:7px 14px;font-weight:600;font-size:13.5px;letter-spacing:0}
   button:hover{background:var(--acc-hi)}
   button:disabled{opacity:1;background:transparent;color:#7d7f86;
                   box-shadow:inset 0 0 0 1px var(--line-2);cursor:not-allowed}
@@ -549,9 +553,9 @@
                box-shadow:inset 0 0 0 1px var(--line-2)}
   button.ghost:hover{background:var(--card-2);color:var(--ink-hi)}
   button.ghost:disabled{color:#7d7f86;box-shadow:none;background:transparent}
-  button.small{padding:5px 11px;font-size:12.5px;border-radius:var(--r)}
+  button.small{padding:5px 11px;font-size:12.5px;border-radius:var(--r-sm)}
   input[type=checkbox],input[type=radio]{accent-color:var(--acc)}
-  select,input,textarea{background:var(--well);border:1px solid var(--line);border-radius:3px;
+  select,input,textarea{background:var(--well);border:1px solid var(--line);border-radius:var(--r-sm);
                         padding:7px 10px;font-size:13.5px}
   select:focus,input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-dim)}
   .fld label{font-size:12px}
@@ -569,7 +573,7 @@
   .iconbtn:disabled{background:transparent;box-shadow:none;opacity:.4}
 
   /* теги состояния: прямоугольник с тоном, слово внутри */
-  .pill{border-radius:3px;padding:2px 8px;font-size:12px;font-weight:600;letter-spacing:0}
+  .pill{border-radius:var(--r-xs);padding:2px 8px;font-size:12px;font-weight:600;letter-spacing:0}
   .s-done{background:var(--ok-bg);color:var(--ok)}
   .s-running{background:var(--run-bg);color:var(--run)}
   .s-queued{background:var(--wait-bg);color:var(--wait)}
@@ -586,7 +590,7 @@
   tr.row td:nth-child(3){white-space:nowrap}
   tr.row td:nth-child(3) .note{white-space:normal}
   tr.row td:nth-child(3) .pill{min-width:112px;margin:0 1px 2px 0;padding:3px 8px;
-        border-radius:2px;font-weight:550;text-align:left;vertical-align:top}
+        border-radius:var(--r-xs);font-weight:550;text-align:left;vertical-align:top}
   tr.row td:nth-child(3) .pill.s-done::before{content:"✓ ";font-weight:700}
   tr.row td:nth-child(3) .pill.s-idle{background:transparent;color:var(--muted);
         box-shadow:inset 0 0 0 1px var(--line-2)}
@@ -602,7 +606,7 @@
 
   /* Тонкая полоса этапов (выпуски, строки очереди) — та же азбука. */
   .segs{gap:2px}
-  .segs i{height:7px;border-radius:1px;background:transparent;box-shadow:inset 0 0 0 1px var(--line-2)}
+  .segs i{height:7px;border-radius:3px;background:transparent;box-shadow:inset 0 0 0 1px var(--line-2)}
   .segs i.done{background:rgba(141,219,166,.5);box-shadow:none}
   .segs i.running{background:var(--run);box-shadow:none;
         background-image:repeating-linear-gradient(135deg,rgba(0,0,0,.28) 0 3px,transparent 3px 6px);
@@ -621,7 +625,7 @@
         padding-top:9px;
         background:repeating-linear-gradient(90deg,var(--line-2) 0 1px,transparent 1px 10px) 0 0/100% 4px no-repeat,
                    repeating-linear-gradient(90deg,#65676e 0 1px,transparent 1px 50px) 0 0/100% 7px no-repeat}
-  .head .segs i{height:26px;position:relative;overflow:visible;border-radius:2px;
+  .head .segs i{height:26px;position:relative;overflow:visible;border-radius:var(--r-xs);
         font-style:normal;font-size:12px;line-height:26px;font-weight:550;padding:0 9px;
         color:#8e9097;white-space:nowrap;text-overflow:ellipsis;margin-top:0}
   .head .segs i::after{content:attr(title);display:block;overflow:hidden;text-overflow:ellipsis}
@@ -643,7 +647,7 @@
 
   /* строки-этапы и точки: квадратная метка вместо круга */
   .stage{padding:9px 14px;border-bottom:1px solid rgba(255,255,255,.045);gap:12px}
-  .stage .dot,.cal .dot{border-radius:3px;flex-basis:20px;height:20px;font-size:11px}
+  .stage .dot,.cal .dot{border-radius:6px;flex-basis:20px;height:20px;font-size:11px}
   .stage .name{font-weight:600}
   .stage .note,.stage .facts{margin-top:1px;line-height:1.4}
   .facts{font-size:13px}
@@ -661,32 +665,32 @@
   /* вкладки проекта: переключатель страниц, как внизу монтажки */
   .subtabs{border-bottom:0;background:#232428;border-radius:var(--r);padding:3px;gap:2px;
            margin-bottom:12px;display:inline-flex;flex-wrap:wrap}
-  .subtabs a{border:0;margin:0;padding:6px 13px;border-radius:3px;font-size:13px;font-weight:500;
+  .subtabs a{border:0;margin:0;padding:6px 13px;border-radius:var(--r-sm);font-size:13px;font-weight:500;
              text-decoration:none;display:inline-flex;align-items:center}
   .subtabs a:hover{background:#2c2d32}
   .subtabs a.on{background:var(--card-2);color:var(--ink-hi);box-shadow:inset 0 -2px 0 var(--acc)}
   .subtabs .cnt{border:0;background:rgba(255,255,255,.06);color:var(--muted);min-width:18px;
-                padding:0 5px;margin-left:7px;height:17px;border-radius:2px;font-weight:500;
+                padding:0 5px;margin-left:7px;height:17px;border-radius:var(--r-xs);font-weight:500;
                 font-size:11.5px;vertical-align:baseline}
   .subtabs a.on .cnt{background:rgba(255,255,255,.1);border:0;color:var(--ink)}
 
   /* Выбор режима — сегмент, а не кнопки: выбранный пункт светлее соседей, но НЕ цвета
      «кости». Кость — цвет платного действия («Начать», «Получить текст»), и режим,
      закрашенный ею, выглядел бы как уже нажатый заказ. */
-  .modes{gap:0;background:var(--well);border-radius:var(--r);padding:3px;display:inline-flex}
+  .modes{gap:0;background:var(--well);border-radius:9px;padding:3px;display:inline-flex}
   .modes button{border:0;background:transparent;color:var(--muted);padding:6px 14px;font-size:13px;
                 box-shadow:none}
   .modes button:hover{background:var(--card-2);color:var(--ink)}
   .modes button.on{background:var(--card-2);color:var(--ink-hi);border:0;
                    box-shadow:inset 0 0 0 1px var(--line-2),inset 0 -2px 0 var(--ink)}
   .langs{border:0;background:var(--well);border-radius:var(--r);padding:8px;gap:4px}
-  .langs label{border:0;border-radius:3px;padding:3px 9px 3px 6px;font-size:12.5px;
+  .langs label{border:0;border-radius:var(--r-xs);padding:3px 9px 3px 6px;font-size:12.5px;
                background:rgba(255,255,255,.04)}
   .langs label:hover{background:rgba(255,255,255,.08)}
   .langs label.on{background:var(--acc-dim);color:var(--ink-hi);box-shadow:inset 0 0 0 1px var(--acc)}
 
   /* пакетный запуск: у каждого этапа своя колонка, без рамки */
-  .bcard{border:0 !important;border-radius:3px !important;background:#2a2b30;padding:10px 12px !important}
+  .bcard{border:0 !important;border-radius:var(--r-sm) !important;background:#2a2b30;padding:10px 12px !important}
 
   /* Нативные части (галочки, списки, плеер, подсказка поля) — тёмные: без этого
      браузер рисовал белую пустую галочку почти как отмеченную «кость». */
@@ -709,6 +713,28 @@
   /* Кнопка в полосе заголовка панели: полоса держит её в себе (плавающая кнопка
      вылезала в первую строку и сбивала её значки) и ставит по центру высоты. */
   .card > .sec{display:flow-root}
+  .card > .sec.stage-head{display:flex}
+  .iconbtn.fold svg{transition:transform .15s}
+  .iconbtn.fold[aria-expanded="true"] svg{transform:rotate(180deg)}
+  @media (prefers-reduced-motion:reduce){ .iconbtn.fold svg{transition:none} }
+  /* «Сценарий»: режим и выбор файла — одной строкой; готовый текст — превью в колодце
+     с затуханием, целиком — в читалке. */
+  .srcrow{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px}
+  .srcrow .modes{margin:0}
+  .srcfile{display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .srcfile[hidden]{display:none}
+  .scn-preview{white-space:pre-line;max-height:11.5em;overflow:hidden;position:relative;
+               background:var(--well);border-radius:var(--r-sm);padding:12px 14px;
+               font-size:14px;line-height:1.65;color:var(--ink)}
+  .scn-preview:not(.empty)::after{content:"";position:absolute;left:0;right:0;bottom:0;height:3.2em;
+               background:linear-gradient(transparent,var(--well));pointer-events:none}
+  .scn-preview.empty{color:var(--muted);max-height:none}
+  .scn #src-box > summary{display:none}
+  .scn #src-box[open]{margin-top:12px}
+  .scn #src-text{min-height:260px}
+  dialog.modal.reading{width:min(860px,94vw)}
+  .reader{white-space:pre-line;max-width:68ch;max-height:68vh;overflow:auto;font-size:15px;
+          line-height:1.75;color:var(--ink);padding-right:6px}
   .sec > [style*="float:right"]{margin:-4px 0}
   .sec.grp{background:transparent;color:var(--muted);padding-top:12px;border-radius:0}
   .thumb:focus-within .again,.thumb .again:focus-visible{opacity:1}
@@ -735,7 +761,7 @@
   .q:hover,.q:focus-visible{background:var(--acc-dim);border-color:var(--acc)}
   .pf-item.on{color:var(--ink-hi);background:var(--acc-dim);border-color:var(--acc)}
   .err{border-radius:var(--r);border:0;box-shadow:inset 3px 0 0 var(--bad)}
-  .bar{background:var(--well);border-radius:1px;height:4px}
+  .bar{background:var(--well);border-radius:3px;height:4px}
   .bar i{background:#8a8c93}
   .pl{border:0;border-radius:var(--r);background:var(--well)}
   .pl button{background:var(--ink)}
@@ -744,8 +770,8 @@
   .pl button.on i{background:linear-gradient(to right,var(--on-acc) 0 3px,transparent 3px 7px,var(--on-acc) 7px 10px)}
   .pl .bar{background:rgba(255,255,255,.1)}
   .pl .bar i{background:var(--ink)}
-  .thumb img{border-radius:2px}
-  .thumb .again{background:rgba(30,31,34,.88);border-radius:2px}
+  .thumb img{border-radius:var(--r-xs)}
+  .thumb .again{background:rgba(30,31,34,.88);border-radius:var(--r-xs)}
   .thumb .again:hover{background:var(--acc);color:var(--on-acc)}
   .chcard{border:0;border-left:3px solid var(--off);border-radius:var(--r)}
   .chcard:hover{background:#33353a}
@@ -831,6 +857,9 @@ const ICON = {
   // два листа — «сделать копию»
   copy: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
       + '<path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>',
+  // стрелка вниз — «развернуть» (повёрнутая — «свернуть»)
+  expand: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z"/></svg>',
   // звенья — «скопировать идентификатор» (не путать с копией пресета)
   link: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
       + '<path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>',
@@ -1123,10 +1152,10 @@ function rewriteRowHtml(rw){
     : (rw.server_openai || rw.server_claude)
       ? '<span class="pill s-idle">серверный ключ владельца</span>'
       : '<span class="pill s-error">ключа нет — текст делать нечем</span>';
-  return `<div class="secbody"><div class="note muted">Текст (Rewrite Studio): ${state}${
+  return `<div class="secbody"><div class="note muted">Текст: ${state}${
     rw.own_openai ? ' <a href="#" id="rw-drop">снять свой</a>' : ''}${hintDot(
     'Ключ для текста добавляется той же кнопкой ниже — провайдер '
-    + '«OpenAI · текст (Rewrite Studio)».')}</div></div>`;
+    + '«OpenAI · текст».')}</div></div>`;
 }
 
 /* Карточка своих ключей. Одна и та же на экране ключей и в профиле (20.09.2026):
@@ -1209,7 +1238,7 @@ async function viewKeys(){
         <div class="body">
           <div class="name">${esc(r.family)} · <span class="mono">${esc(r.mask)}</span></div>
           <div class="facts">проснётся через ${dur(r.left_sec)}${
-            r.noticed_by_neighbour ? ' · лимит заметил соседний сервис' : ''}</div>
+            r.noticed_by_neighbour ? ' · лимит заметили при заказе текста или обложки' : ''}</div>
           <div class="note muted">${esc(r.why)}</div>
         </div></div>`).join('')
       : '<div class="empty">Все ключи в строю.</div>'}
@@ -1265,12 +1294,14 @@ const CAL_CLS   = {done:'s-done', running:'s-running', blocked:'s-error',
 async function viewChannels(){
   const d = await api('/ui/channels');
   app.innerHTML = '';
-  app.append($(`<h1>Каналы ${hintDot(
-    'Расписание выходов, план и история. Цвет карточки — состояние канала.')}</h1>`));
-
-  const bar = $(`<div class="toolbar"><span style="flex:1"></span>
-    <button class="ghost" id="impch">Перенести списком</button>
-    <button id="newch">Новый канал</button></div>`);
+  // Кнопки — в строке заголовка, как на «Проектах» и «Пресетах» (владелец 22.09.2026:
+  // «перенести в один ряд с тайтлом и сэкономить место на красивые отступы»).
+  // Формы переноса и заведения по-прежнему открываются под этой строкой.
+  const bar = $(`<div class="head"><div><h1>Каналы ${hintDot(
+    'Расписание выходов, план и история. Цвет карточки — состояние канала.')}</h1></div>
+    <div class="head-acts">
+      <button class="ghost small" id="impch">Перенести списком</button>
+      <button class="small" id="newch">Новый канал</button></div></div>`);
   app.append(bar);
 
   bar.querySelector('#impch').onclick = () => {
@@ -1961,7 +1992,7 @@ async function viewPaidTexts(){
       <td class="muted">${esc(ago(Math.round(r.waiting_sec || 0)))}</td>
     </tr>`).join('')}</tbody></table>
     <div class="secbody"><div class="note muted">${esc(d.how || '')}</div>
-      <div class="note muted">Выпуск, у которого задача пропала у соседа, из этого
+      <div class="note muted">Выпуск, у которого пропала задача текста, из этого
         списка уходит: забирать нечего, и повтор заказа — это вторые деньги, решает
         человек. Искать такие надо среди выпусков на фазе «заведён»:
         <a href="#/releases">все выпуски →</a></div></div>
@@ -2198,7 +2229,7 @@ async function viewQueue(){
       задач Текста и Обложек дочитаны у ${det.asked} задач из ${det.needed} (за один показ
       спрашиваем не больше ${det.budget}). У остальных стадия и причина помечены
       «не дочитано» — это не «причины нет». У Видео и Выпусков дочитывать нечего: их этап
-      и причину пишет сам кабинет, и пустое место там значит «не записано».</div>`));
+      и причину пишет сама студия, и пустое место там значит «не записано».</div>`));
 
   const card = $(`<div class="card"><table>
     <thead><tr><th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th>
@@ -2319,11 +2350,11 @@ async function viewNew(){
       const p = await post('/ui/links/preview', payload());
       const mark = x => x.exists === false
         ? '<span class="pill s-error">не найден</span>'
-        : x.exists === null ? '<span class="pill s-idle">сервис не ответил</span>' : '';
+        : x.exists === null ? '<span class="pill s-idle">не удалось проверить</span>' : '';
       resBox.innerHTML = `<div class="res">
         <h3>Чем будет сделано</h3>
         <ul>${p.presets.map(x => `<li>${esc(x.what)}: <b>${esc(x.name)}</b>
-          <span class="muted">(${esc(x.where)})</span> ${mark(x)}</li>`).join('')}
+          ${mark(x)}</li>`).join('')}
           <li>язык канала: <b>${esc(p.channel.lang || '—')}</b>,
               часовой пояс ${esc(p.channel.tz)}</li></ul>
         ${p.placed.length ? `<h3>Встанет на выходы</h3><ul>${
@@ -2827,7 +2858,7 @@ function pipelineReport(out, n, where){
   modal('Сделать всё: что поставлено',
     `<div style="font-size:14px">${nums.join(' · ')}</div>
      ${blocked ? `<div class="note bad">Пропущено проектов: ${blocked} — ${
-        esc(out.block_reason || 'причину кабинет не назвал')}. Денег на них не
+        esc(out.block_reason || 'причина не названа')}. Денег на них не
         потрачено: задача не ставилась. Остальные уехали — всю пачку повторять не
         нужно, поправьте причину и нажмите только для пропущенных.</div>` : ''}
      ${def ? `<div class="note muted">Отложенное стартует само, когда дозреют
@@ -2918,9 +2949,9 @@ async function viewProjects(){
         настройки проекта не перетираются. Видео и рендер у неготовых проектов ставятся
         отложенно — стартуют сами, когда материалы дозреют. «Отменить» снимает и уже
         идущие задачи, и отложенный авто-запуск; готовые файлы не удаляются.${
-        PULT_ORDER.length ? ` Текст и обложку делают соседние сервисы: у них своя
-        очередь, поэтому «Отменить» для них здесь нет — начатый заказ виден на
-        экранах «Текст» и «Обложки».` : ''}</div>
+        PULT_ORDER.length ? ` У текста и обложки своя очередь заказов, поэтому
+        «Отменить» для них здесь нет — начатый заказ виден на экранах «Текст» и
+        «Обложки».` : ''}</div>
       <div id="pultres" style="margin-top:12px"></div>
     </div></div>`);
   app.append(batch);
@@ -3015,7 +3046,7 @@ async function viewProjects(){
     if (blocked) parts.push(`пропущено: ${blocked}`);
     if (busy) parts.push(`уже идёт: ${busy}`);
     toast(parts.join(' · ')
-          + (blocked ? ` — ${out.block_reason || 'причину кабинет не назвал'}` : ''),
+          + (blocked ? ` — ${out.block_reason || 'причина не названа'}` : ''),
           (enq || def) ? (blocked ? 'warn' : 'ok') : 'bad');
   };
   batch.querySelectorAll('button.bgo').forEach(b => b.onclick = async () => {
@@ -3318,8 +3349,11 @@ const PAID_KIND = {images: 'кадры', clip: 'клипы', video: 'клипы'
 // язык, а не вторая полоска с нуля.
 const STAGE_TONE_VAR = {running: '--run', error: '--bad', queued: '--wait',
                         done: '--ok', muted: '--muted', dim: '--off'};
+// «Ещё не начат» — пустой контур (`idle`), а не `off`: `off` в полосах выпусков значит
+// «этап не участвует» и рисуется средней чертой — в шапке проекта это перечёркивало
+// этапы, которые просто ещё впереди.
 const STAGE_SEG_CLS = {done: 'done', running: 'running', queued: 'queued',
-                       error: 'error', pending: 'off'};
+                       error: 'error', pending: 'idle'};
 // Подписи этапов: до 18.09.2026 в подсказке стоял внутренний код («tts», «cover»),
 // а плиток было пять при шести вкладках — шестую (обложку) добавили в
 // `project_stage_status`, здесь её надо ещё и назвать по-человечески.
@@ -3328,7 +3362,7 @@ const STAGE_SEG_TITLE = {text: 'сценарий', tts: 'озвучка', images
 function stageStripHtml(stage){
   if (!stage || !(stage.segments || []).length) return '';
   const bar = stage.segments.map(s =>
-    `<i class="${STAGE_SEG_CLS[s.state] || 'off'}" title="${
+    `<i class="${STAGE_SEG_CLS[s.state] || 'idle'}" title="${
       esc(STAGE_SEG_TITLE[s.stage] || s.stage)}"></i>`).join('');
   return `<div class="segs" style="max-width:320px;margin-top:9px">${bar}</div>
     <div class="note" style="color:var(${STAGE_TONE_VAR[stage.tone] || '--muted'})"
@@ -3509,7 +3543,7 @@ function jobLogBodyHtml(d){
     : 'это НЕ сырой лог задачи: настоящая причина в нём могла быть заменена кодом'))
     }</div>`);
   if (d.problem) parts.push(`<div class="note warn">${esc(d.problem)}</div>`);
-  if (d.error) parts.push(`<div class="note bad">Сосед о задаче: ${esc(d.error)}</div>`);
+  if (d.error) parts.push(`<div class="note bad">О задаче: ${esc(d.error)}</div>`);
   // Обрезку называем обрезкой: молчаливый хвост заставляет искать в логе то, чего в
   // показанном куске нет.
   if (d.truncated) parts.push(`<div class="note muted">Показан только конец лога — ${
@@ -3655,13 +3689,19 @@ const LUMEAN_HOLD = 'Lumean запишется вместе с шаблоном 
 // причину, по которой записать не вышло, или null. Нужна платным кнопкам шапки
 // проекта: они видны, пока человек набирает, и без неё ушли бы со значениями ДО правки.
 let STAGE_FLUSH = null;
+// Правка сценария, не записанная в проект: «Сделать всё» с ней не запускается — иначе
+// озвучился бы прежний `source.txt`, а на экране стоял бы новый текст.
+let SCENARIO_DIRTY = null;
+// Форма части «Сценарий» / «Обложка» на экране заведения: набрано ли в ней что-то.
+let PRESET_PART_DIRTY = null;
 // Какие свёрнутые настройки человек раскрыл сам, по `pid:tab`. Экран проекта
 // перерисовывается сам (после «Начать», при возврате на вкладку) — без этой памяти
 // раскрытое сворачивалось бы обратно у него на глазах.
 const STAGE_FOLD_OPEN = {};
 // Подписи состояния, при котором настройки свёрнуты.
 const STAGE_FOLD_WHY = {running: 'идёт', queued: 'в очереди',
-                        planned: 'в плане — стартует сам, когда дозреют материалы'};
+                        planned: 'в плане — стартует сам, когда дозреют материалы',
+                        done: 'готово'};
 
 async function renderStageTab(d, tab){
   const p = d.project;
@@ -3709,11 +3749,18 @@ async function renderStageTab(d, tab){
   // правка уже не изменит поставленное, а этап «в плане» стартует позже с ТЕКУЩИМИ
   // настройками проекта — поэтому их можно развернуть и поправить. Раскрытое
   // запоминается до конца работы этапа.
+  // Готовый этап — тоже свёрнут (владелец 22.09.2026: «когда этап уже готов, настройки
+  // удобно скрывать, а развернуть — стрелочкой на уровне кнопки „Начать“»).
   const segNow = ((p.stage && p.stage.segments) || []).find(x => x.stage === tab);
-  const foldState = (segNow && (segNow.state === 'running' || segNow.state === 'queued'))
-    ? segNow.state : ((p.planned || []).includes(tab) ? 'planned' : '');
+  // «В плане» важнее «готово»: «Сделать всё» ставит видео и сборку в план и у
+  // проекта, где они уже есть, — и стартуют они с ТЕКУЩИМИ настройками.
+  const foldState = (segNow && ['running', 'queued'].includes(segNow.state)) ? segNow.state
+    : (p.planned || []).includes(tab) ? 'planned'
+    : (segNow && segNow.state === 'done') ? 'done' : '';
   const foldCard = settingsForm ? box.querySelector('.card') : null;
-  if (!foldState) delete STAGE_FOLD_OPEN[skey];
+  // Раскрытое помнится только в том же состоянии этапа: ушёл в работу, закончился —
+  // снова свёрнуто по умолчанию, а не «как раскрыли вчера в другом состоянии».
+  if (STAGE_FOLD_OPEN[skey] && STAGE_FOLD_OPEN[skey] !== foldState) delete STAGE_FOLD_OPEN[skey];
   if (foldCard && foldState){
     const why = document.createElement('span');
     why.id = 'stage-fold-why';
@@ -3722,14 +3769,21 @@ async function renderStageTab(d, tab){
     const foldBtn = document.createElement('button');
     foldBtn.type = 'button';
     foldBtn.id = 'stage-fold';
-    foldBtn.className = 'ghost small';
+    foldBtn.className = 'iconbtn fold';
+    foldBtn.innerHTML = ICON.expand;
     const paintFold = () => {
-      const open = !!STAGE_FOLD_OPEN[skey];
+      const open = STAGE_FOLD_OPEN[skey] === foldState;
       foldCard.classList.toggle('folded', !open);
-      foldBtn.textContent = open ? 'Свернуть настройки' : 'Настройки';
+      const word = open ? 'Свернуть настройки' : 'Развернуть настройки';
+      foldBtn.title = word;
+      foldBtn.setAttribute('aria-label', word);
       foldBtn.setAttribute('aria-expanded', String(open));
     };
-    foldBtn.onclick = () => { STAGE_FOLD_OPEN[skey] = !STAGE_FOLD_OPEN[skey]; paintFold(); };
+    foldBtn.onclick = () => {
+      if (STAGE_FOLD_OPEN[skey] === foldState) delete STAGE_FOLD_OPEN[skey];
+      else STAGE_FOLD_OPEN[skey] = foldState;
+      paintFold();
+    };
     titleSpan.after(why);
     goBtn.before(foldBtn);
     paintFold();
@@ -3952,7 +4006,7 @@ async function renderStageTab(d, tab){
         }
         await new Promise(r => setTimeout(r, 50));
       }
-      return 'кабинет не ответил на запись настроек';
+      return 'сервер не ответил на запись настроек';
     };
 
     // Откат при автосохранении — это ЗАПИСЬ: набранное уже лежит на сервере, и вернуть
@@ -4287,11 +4341,21 @@ async function renderScenarioTab(d){
       <button type="button" class="ghost small" id="or-forget" hidden>Забыть ссылку</button>
     </div>
     <div class="note muted" id="or-release" hidden></div>
-    <div class="modes" style="margin-top:12px">
-      <button type="button" data-mode="auto" class="${st.mode === 'topic' ? '' : 'on'}"
-        >Ссылка или готовый текст</button>
-      <button type="button" data-mode="topic" class="${st.mode === 'topic' ? 'on' : ''}"
-        >${esc(topicMode.title)}</button>
+    <div class="srcrow">
+      <div class="modes">
+        <button type="button" data-mode="auto" class="${st.mode === 'topic' ? '' : 'on'}"
+          >Ссылка или готовый текст</button>
+        <button type="button" data-mode="topic" class="${st.mode === 'topic' ? 'on' : ''}"
+          >${esc(topicMode.title)}</button>
+      </div>
+      <span id="tx-filebox" class="srcfile">
+        <label class="filepick">
+          <span class="pickbtn">Выбрать файл .txt</span>
+          <input id="src-file" type="file" accept=".txt,text/plain">
+        </label>
+        <span class="muted" id="tx-fname" style="font-size:12.5px"></span>
+        <button type="button" class="ghost small" id="tx-fdrop" hidden>Убрать файл</button>
+      </span>
     </div>
 
     <div id="tx-auto">
@@ -4302,14 +4366,6 @@ async function renderScenarioTab(d){
       <textarea id="tx-any" rows="1" style="min-height:0"
         placeholder="https://www.youtube.com/watch?v=… — или вставьте сюда сам текст"
         >${esc(st.any)}</textarea>
-      <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <label class="filepick">
-          <span class="pickbtn">Выбрать файл .txt</span>
-          <input id="src-file" type="file" accept=".txt,text/plain">
-        </label>
-        <span class="muted" id="tx-fname" style="font-size:12.5px"></span>
-        <button type="button" class="ghost small" id="tx-fdrop" hidden>Убрать файл</button>
-      </div>
       <div class="note" id="tx-seen"></div>
     </div>
 
@@ -4328,17 +4384,6 @@ async function renderScenarioTab(d){
       <button class="ghost" id="tx-keep">Сохранить сценарий</button>
       <span class="muted" id="tx-keep-why" style="font-size:12.5px"></span>
     </div>
-    <details id="src-box" style="margin-top:12px">
-      <summary class="muted" id="src-sum" style="cursor:pointer;font-size:12.5px"></summary>
-      <textarea id="src-text" style="margin-top:8px">${esc(d.source)}</textarea>
-      <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
-        <button class="ghost" id="src-save">Сохранить текст</button>
-        <span class="muted" style="font-size:12.5px">правка уходит в сам проект
-          (source.txt) — то, что пойдёт в озвучку</span>
-      </div>
-      <div class="note muted">Edge режет текст по строкам/абзацам — короткие абзацы
-        могут потеряться при озвучке этим движком.</div>
-    </details>
 
     <div class="note muted" style="margin-top:18px;border-top:1px solid var(--line);
       padding-top:12px">Платно — заказать текст у рерайта</div>
@@ -4366,6 +4411,31 @@ async function renderScenarioTab(d){
     </div>
     <div id="tx-jobs"></div>
     </div></div>`);
+  // Готовый сценарий — первым блоком и сразу на виду (владелец 22.09.2026: «не особо
+  // понятно, где готовый текст; сделать так, чтобы он лежал сразу, плюс возможность
+  // просмотреть»). Раньше он прятался в свёрнутом блоке посреди «Откуда взять», между
+  // бесплатным и платным действиями. Правка — там же, по «Править».
+  const scnCard = $(`<div class="card scn" style="margin-bottom:16px">
+    <div class="sec stage-head"><span class="grow">Сценарий проекта</span>
+      <span class="note muted" id="src-sum" style="margin:0"></span>
+      <button type="button" class="ghost small" id="src-read">Читать целиком</button>
+      <button type="button" class="ghost small" id="src-edit"
+        aria-expanded="false">Править</button></div>
+    <div class="secbody">
+      <div class="scn-preview" id="src-preview"></div>
+      <details id="src-box">
+        <summary>Править</summary>
+        <textarea id="src-text">${esc(d.source)}</textarea>
+        <div style="margin-top:8px;display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button class="ghost" id="src-save">Сохранить текст</button>
+          <span class="muted" style="font-size:12.5px">правка уходит в сам проект
+            (source.txt) — то, что пойдёт в озвучку</span>
+        </div>
+        <div class="note muted">Edge режет текст по строкам/абзацам — короткие абзацы
+          могут потеряться при озвучке этим движком.</div>
+      </details>
+    </div></div>`);
+  app.append(scnCard);
   app.append(card);
 
   const anyBox = card.querySelector('#tx-any');
@@ -4376,8 +4446,11 @@ async function renderScenarioTab(d){
   const keepWhy = card.querySelector('#tx-keep-why');
   const go = card.querySelector('#tx-go');
   const goWhy = card.querySelector('#tx-go-why');
-  const srcBox = card.querySelector('#src-box');
-  const srcText = card.querySelector('#src-text');
+  const srcBox = scnCard.querySelector('#src-box');
+  const srcText = scnCard.querySelector('#src-text');
+  const srcPreview = scnCard.querySelector('#src-preview');
+  const srcEdit = scnCard.querySelector('#src-edit');
+  const srcRead = scnCard.querySelector('#src-read');
   const fname = card.querySelector('#tx-fname');
   const fdrop = card.querySelector('#tx-fdrop');
   const forget = card.querySelector('#or-forget');
@@ -4386,19 +4459,60 @@ async function renderScenarioTab(d){
   // Она теперь внутри свёрнутого <details>, поэтому наружу отдаётся не она сама, а
   // обёртка с тем же `value`: запись раскрывает блок и обновляет подпись — иначе
   // человек не увидел бы, что текст приехал, и решил бы, что кнопка не сработала.
+  // Что лежит в проекте (`source.txt`) — отдельно от поля правки. Превью, число знаков
+  // и «Читать целиком» показывают ЗАПИСАННОЕ: именно оно уйдёт в озвучку. Иначе
+  // несохранённая правка выглядела бы текстом проекта, «Сделать всё» озвучило бы
+  // прежний текст, а правка пропала бы молча (ревью 22.09.2026, отмечено как деньги).
+  let savedText = d.source || '';
+  const scnDirty = () => srcText.isConnected && srcText.value !== savedText;
+  const myScnHash = location.hash;
+  const scnGuard = () => {
+    if (scnDirty()){
+      LEAVE_GUARD = {scenario: true, hash: myScnHash, keep: h => h === myScnHash,
+                     dirty: scnDirty, what: 'Правка сценария не сохранена.',
+                     drop: () => { srcText.value = savedText; }};
+    }else if (LEAVE_GUARD && LEAVE_GUARD.scenario){
+      LEAVE_GUARD = null;
+    }
+  };
+  const markSaved = text => { savedText = text; paintScenario(); scnGuard(); };
+  SCENARIO_DIRTY = () => scnDirty() ? 'правка сценария не сохранена — «Сохранить текст» '
+    + 'на вкладке «Сценарий»' : null;
+  if (LEAVE_GUARD && LEAVE_GUARD.scenario) LEAVE_GUARD = null;   // от прошлой отрисовки
   const scenarioBox = {
     get value(){ return srcText.value; },
-    set value(v){ srcText.value = v; srcBox.open = true; paintScenario(); },
+    // «Взять в проект» записывает текст на сервер и только потом кладёт его сюда.
+    set value(v){ srcText.value = v; markSaved(v); },
   };
 
   function paintScenario(){
-    const n = srcText.value.length;
+    const text = savedText;
+    const n = text.length;
     const from = (origin.kind === 'file' && origin.file_name)
       ? ` · из файла «${origin.file_name}»` : '';
-    card.querySelector('#src-sum').textContent = n
-      ? `Сценарий проекта — ${n} знаков${from} · показать и править`
-      : 'Сценария у проекта ещё нет · открыть и вписать вручную';
+    const sum = scnCard.querySelector('#src-sum');
+    const dirty = scnDirty();
+    sum.textContent = (n ? `${n} ${plural(n, 'знак', 'знака', 'знаков')}${from}` : 'пусто')
+      + (dirty ? ' · правка не сохранена' : '');
+    sum.className = 'note ' + (dirty ? 'warn' : 'muted');
+    // Превью — начало текста абзацами; целиком — по «Читать целиком». Пустой сценарий
+    // говорит, откуда его взять, а не показывает пустую рамку.
+    srcPreview.classList.toggle('empty', !n);
+    srcPreview.textContent = n ? text.slice(0, 900)
+      : 'Сценария пока нет — возьмите его ниже: по ссылке на ролик, из готового текста '
+        + 'или по теме. Или впишите вручную.';
+    srcRead.hidden = !n;
+    srcEdit.textContent = srcBox.open ? 'Свернуть правку' : (n ? 'Править' : 'Вписать вручную');
+    srcEdit.setAttribute('aria-expanded', String(srcBox.open));
   }
+  srcEdit.onclick = () => {
+    srcBox.open = !srcBox.open;
+    paintScenario();
+    if (srcBox.open) srcText.focus();
+  };
+  srcBox.addEventListener('toggle', paintScenario);
+  srcRead.onclick = () => readerModal('Сценарий проекта', savedText,
+                                      scnCard.querySelector('#src-sum').textContent);
 
   // Что записано у проекта про источник — строкой над полем: откуда берётся сценарий, когда по
   // этому источнику последний раз платили и не расходится ли он со ссылкой выпуска.
@@ -4598,6 +4712,7 @@ async function renderScenarioTab(d){
   function paintMode(){
     const topic = (st.mode === 'topic');
     card.querySelector('#tx-auto').hidden = topic;
+    card.querySelector('#tx-filebox').hidden = topic;
     card.querySelector('#tx-topic-box').hidden = !topic;
     card.querySelector('#tx-preset-box').hidden = !topic;
     card.querySelector('#tx-keep-head').hidden = topic;
@@ -4721,6 +4836,7 @@ async function renderScenarioTab(d){
     if (st.fileName) body.file = st.fileName;   // сервер пометит источник как файл
     const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`, body);
     srcText.value = text;
+    markSaved(text);
     // Поле освобождается: тот же текст и в поле, и в сценарии ниже — это ровно та
     // вторая копия, из-за которой владелец не понимал, что откуда.
     anyBox.value = ''; st.any = ''; st.seen = null; st.seenFor = null;
@@ -4765,18 +4881,19 @@ async function renderScenarioTab(d){
     finally{ keep.disabled = false; paintActions(); }
   };
 
-  card.querySelector('#src-save').onclick = async () => {
-    const btn = card.querySelector('#src-save');
+  scnCard.querySelector('#src-save').onclick = async () => {
+    const btn = scnCard.querySelector('#src-save');
     btn.disabled = true;
     try{
-      const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`,
-                             {text: srcText.value});
+      const text = srcText.value;
+      const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/source`, {text});
+      markSaved(text);
       paintOrigin(out.origin);
       toast('Текст сохранён', 'ok');
     }catch(e){ toast(e.message); }
     finally{ btn.disabled = false; }
   };
-  srcText.oninput = paintScenario;
+  srcText.oninput = () => { paintScenario(); scnGuard(); };
 
   // Платное действие: заказ у рерайта. Режим больше не выбирают руками — его назвал
   // сервер при разборе поля (`seen.mode`), и источник уезжает нормализованным
@@ -5255,7 +5372,8 @@ async function viewProject(id){
       // Правка на вкладке этапа ждёт паузы в наборе; запуск, попавший в эту паузу,
       // оплатил бы конвейер по значениям ДО правки. Сначала досылаем, и если записать
       // не вышло — не запускаем: экран показывает одно, а платить пришлось бы за другое.
-      const why = STAGE_FLUSH ? await STAGE_FLUSH() : null;
+      const why = (STAGE_FLUSH ? await STAGE_FLUSH() : null)
+        || (SCENARIO_DIRTY ? SCENARIO_DIRTY() : null);
       if (why){ toast('Не запускаю — настройки этапа не записаны: ' + why); return; }
       const out = await post(`/ui/projects/${encodeURIComponent(p.id)}/run`, {
         sentences_per_prompt: runBox.querySelector('#r-spp').value,
@@ -5485,11 +5603,10 @@ async function wireKeys(root, d){
     modal('Добавить ключ', `
       <div class="fldrow"><span class="lh"><label for="kfam">Провайдер</label>${
         hintDot((ref.note || '')
-        + ' Ключ для текста хранит Rewrite Studio, остальные — кабинет.'
         + ' Значение нигде не показывается: в списке видно только хвост.')}</span>
         <select id="kfam">${ref.families.map(f =>
           `<option value="${esc(f.key)}">${esc(f.title)}</option>`).join('')}
-          <option value="__rewrite">OpenAI · текст (Rewrite Studio)</option></select></div>
+          <option value="__rewrite">OpenAI · текст</option></select></div>
       <div class="fldrow"><label>Ключ</label>
         <input id="kval" type="password" autocomplete="off" style="flex:1;min-width:0"></div>
 `,
@@ -5803,7 +5920,8 @@ async function viewText(){
         ${d.presets.generation.map(p => `<option>${esc(p)}</option>`).join('')}
       </select>
       ${d.presets.generation.length ? '' :
-        '<div class="note muted">Брифов нет. Создать их можно в разделе Rewrite.</div>'}
+        '<div class="note muted">Брифов нет. Завести: «Пресеты» → «Создать» → «Пресет» → '
+        + '«Только сценарий» → «Бриф для текста с нуля».</div>'}
     </div>
 
     <div style="margin-top:12px">
@@ -6340,6 +6458,43 @@ function modal(title, bodyHtml, opts){
   return {el: dlg, body: dlg.querySelector('.mbody'), close};
 }
 
+// То же, что `modal`, но на самой странице: форма встаёт в указанное место. Нужна
+// заведению частей «Сценарий» и «Обложка» на общем экране пресета — отдельное окно
+// поверх него было бы вторым экраном на одно намерение. «Отмены» нет: закрывать нечего.
+function inlinePanel(host, title, bodyHtml, opts){
+  const o = opts || {};
+  const el = $(`<div class="card inpanel" style="margin-bottom:16px">
+    <div class="sec">${esc(title)}</div>
+    <div class="mbody secbody">${bodyHtml}</div>
+    <div class="mfoot secbody" style="display:flex;gap:10px;align-items:center;padding-top:0">
+      <button class="m-ok">${esc(o.ok || 'Сохранить')}</button>
+      <span class="note bad m-err" style="margin:0"></span></div></div>`).firstElementChild;
+  host.append(el);
+  const err = el.querySelector('.m-err');
+  const ok = el.querySelector('.m-ok');
+  ok.onclick = async () => {
+    err.textContent = '';
+    ok.disabled = true;
+    try{ await o.onOk(el.querySelector('.mbody'), () => {}); }
+    catch(e){ err.textContent = e.message; }
+    finally{ ok.disabled = false; }
+  };
+  const first = el.querySelector('.mbody input,.mbody textarea,.mbody select');
+  if (first) first.focus();
+  return {el, body: el.querySelector('.mbody'), close: () => {}};
+}
+
+// Прочитать длинный текст целиком: окном поверх экрана, удобной мерой строки и без
+// поля ввода — чтобы прочитать, не рискуя случайно поправить.
+function readerModal(title, text, meta){
+  const m = modal(title, `${meta ? `<div class="note muted" style="margin:0 0 10px">${
+      esc(meta)}</div>` : ''}<div class="reader">${esc(text)}</div>`,
+    {ok: 'Закрыть', onOk: async (_b, close) => close()});
+  m.el.classList.add('reading');
+  m.el.querySelector('.m-no').hidden = true;
+  return m;
+}
+
 /* Вопрос про необратимое — окном, а не врезкой в строке. `confirmInline` раздвигает ту
    строку, в которой нажали: в таблице очереди от этого уезжала вся таблица (жалоба
    владельца 20.09.2026). Окно ничего не двигает, закрывается Esc и кликом по фону.
@@ -6526,7 +6681,14 @@ function fieldForm(groups){
   const form = $(`<form></form>`);
   for (const g of groups){
     const locked = !!g.readonly;
-    const linkBar = (g.part && onLinkChange) ? linkBarHtml(g) : '';
+    // Сценарий и обложку целый пресет выбирает по названию — полем самой группы. С
+    // 22.09.2026 их пресеты — части хранилища текстов и обложек, а не частичные
+    // пресеты производства, и «подключить частичный» для них нечего: переключатель
+    // звал бы «сначала завести один», которого заведение больше не создаёт. Старую
+    // ссылку (если она есть) видно по-прежнему — чтобы её можно было снять.
+    const nameLinked = (g.part === 'text' || g.part === 'cover') && g.link_id == null
+      && !g.readonly;
+    const linkBar = (g.part && onLinkChange && !nameLinked) ? linkBarHtml(g) : '';
     const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)}</div>
       ${linkBar}
@@ -6674,10 +6836,9 @@ function wireNeighbourPreset(card, f, locked){
     row.style.cssText = 'display:flex;margin-bottom:7px';
     lab.replaceWith(row);
     row.append(lab);
-    row.insertAdjacentHTML('beforeend', hintDot('Сами настройки '
+    row.insertAdjacentHTML('beforeend', hintDot('Какой пресет '
       + (service === 'cover' ? 'обложки' : 'текста')
-      + ' живут в соседнем сервисе — здесь выбирается, каким из тамошних пресетов'
-      + ' пользоваться.'));
+      + ' взять. Его настройки правятся по «Настроить», новый — «Завести новый».'));
   }
   const edit = bar.querySelector('.np-edit');
   const paint = () => { edit.disabled = !sel.value; };
@@ -7133,8 +7294,8 @@ async function viewPreset(id){
   if (creating){
     const scopeCard = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">Тип пресета ${hintDot('Частичный пресет закрывает одну часть '
-        + 'ролика — его можно подключить как ссылку в любом целом пресете этой же '
-        + 'части.')}</div>
+        + 'ролика. Озвучку, картинки, клипы и сборку можно подключить ссылкой в целом '
+        + 'пресете; сценарий и обложку целый пресет выбирает по названию.')}</div>
       <div class="secbody">
       <div class="modes" id="scope-modes">
         <button type="button" data-scope="full"
@@ -7148,6 +7309,11 @@ async function viewPreset(id){
     app.append(scopeCard);
     scopeCard.querySelectorAll('#scope-modes button').forEach(b => b.onclick = async () => {
       if (draft.scope === b.dataset.scope) return;
+      if (PRESET_PART_DIRTY && PRESET_PART_DIRTY()){
+        confirmModal('Сменить тип пресета?', 'Набранное в форме не заведено и пропадёт.',
+          () => { PRESET_PART_DIRTY = null; LEAVE_GUARD = null; b.click(); });
+        return;
+      }
       draft.scope = b.dataset.scope;
       // Набор вкладок считается от типа, а открытая вкладка — часть адреса. Смена типа
       // обязана вернуть адрес к первой вкладке, иначе остался бы адрес части, которой
@@ -7155,6 +7321,60 @@ async function viewPreset(id){
       if (location.hash !== '#/preset/new'){ location.hash = '#/preset/new'; return; }
       await render();
     });
+  }
+  // Сценарий и обложка — такие же части, как картинки и сборка (владелец 22.09.2026).
+  // Их настройки хранятся в хранилище текстов и обложек, поэтому и поля у них свои —
+  // но на этом же экране, сразу под выбором типа, а не отдельным окном.
+  if (creating && (draft.scope === 'text' || draft.scope === 'cover')){
+    name.remove();                              // у формы части своё поле названия
+    // Сторож от формы «Целый» (она рисовалась до смены типа) здесь ни о чём: его
+    // черновик — другой. Оставленный, он после заведения кричал бы «не заведён».
+    LEAVE_GUARD = null;
+    PRESET_PART_DIRTY = null;
+    let svc = 'cover';
+    const host = document.createElement('div');
+    // Набранное в форме части — не в черновике пресета, поэтому и сторож свой: уход,
+    // смена типа и «по ссылке / с нуля» спрашивают, прежде чем стереть набранное.
+    let touched = false;
+    const partDirty = () => touched && host.isConnected;
+    PRESET_PART_DIRTY = partDirty;
+    const guardHash = location.hash;
+    const guard = () => {
+      touched = true;
+      LEAVE_GUARD = {hash: guardHash, keep: h => h === guardHash, dirty: partDirty,
+                     what: 'Новый пресет ещё не заведён — набранное нигде не записано.'};
+    };
+    host.addEventListener('input', guard);
+    if (draft.scope === 'text'){
+      svc = draft.textKind === 'gen' ? 'rewrite_gen' : 'rewrite';
+      const kinds = $(`<div class="modes" id="text-kind" style="margin-bottom:12px">
+        <button type="button" data-k="link" class="${svc === 'rewrite' ? 'on' : ''}"
+          >Рерайт по ссылке</button>
+        <button type="button" data-k="gen" class="${svc === 'rewrite_gen' ? 'on' : ''}"
+          >Бриф для текста с нуля</button></div>`);
+      app.append(kinds);
+      kinds.querySelectorAll('button').forEach(b => b.onclick = () => {
+        if (b.classList.contains('on')) return;
+        const go = async () => { touched = false; LEAVE_GUARD = null;
+                                 draft.textKind = b.dataset.k; await render(); };
+        if (partDirty()) confirmModal('Сменить вид сценария?',
+          'Набранное в форме не заведено и пропадёт.', go);
+        else go();
+      });
+    }
+    app.append(host);
+    // Имя, набранное до выбора типа, переезжает в форму — и уже есть что терять.
+    if ((draft.name || '').trim()) guard();
+    await neighbourPresetModal(svc, null, {host, reload: false, prefillName: draft.name || '',
+      onSaved: nm => {
+        touched = false;
+        LEAVE_GUARD = null;
+        PRESET_PART_DIRTY = null;
+        presetDraftDrop();
+        toast(`Пресет «${nm}» заведён`, 'ok');
+        location.hash = '#/presets';
+      }});
+    return;
   }
   if (!creating) app.append($(presetUsersHtml(d.scope, d.users || {})));
   // Плашка проблем ссылок на вкладке (раздел 4: «link_problems — красной плашкой на
@@ -7302,10 +7522,9 @@ async function viewPresets(){
   const d = await api('/ui/presets');
   app.innerHTML = '';
   const head = $(`<div class="head">
-      <div><h1>Пресеты ${hintDot('Настройки, которыми делаются ролики. Быстрее всего '
-        + 'новый пресет получается копией похожего: «Копия» рядом с ним, потом правка '
-        + 'полей. Завести с нуля и править настройки — в том сервисе, которому пресет '
-        + 'принадлежит: ссылки в заголовках карточек.')}</h1></div>
+      <div><h1>Пресеты ${hintDot('Настройки, которыми делаются ролики. Целый пресет '
+        + 'задаёт всё сразу, частичный — одну часть: текст, озвучку, картинки, клипы, '
+        + 'сборку или обложку. Быстрее всего новый получается копией похожего.')}</h1></div>
       <button id="newpr" class="small">Создать</button>
     </div>`);
   app.append(head);
@@ -7317,19 +7536,17 @@ async function viewPresets(){
   // «Обложка» — единственное поле `preset_cover`), и лишь потом, из его редактора,
   // завести сам пресет обложки. Два заведения на одно намерение; теперь второе
   // доступно напрямую, а обёртка остаётся тем, кому она правда нужна.
+  // 22.09.2026 владелец: «нет больше отдельных студий — одна студия; пресеты текста и
+  // обложки — такие же обычные, как картинки и монтаж». Отдельных пунктов «Пресет
+  // обложки» / «Пресет рерайта» больше нет: это части пресета, их выбирают там же,
+  // где «Только картинки» и «Только сборку».
   head.querySelector('#newpr').onclick = ev => menuInline(ev.currentTarget, [
-    {title: 'Пресет производства',
-     hint: 'чем делается ролик: текст, озвучка, кадры, сборка',
+    {title: 'Пресет',
+     hint: 'целый или одна часть: текст, озвучка, картинки, клипы, сборка, обложка',
      // Черновик незаведённого живёт под ключом «new» и помнит выбранный тип. Если его
      // не сбросить, «Создать» во второй раз открывало бы форму с типом от прошлого
      // захода — состояние, которого человек не задавал и которому неоткуда взяться.
      run: () => { presetDraftDrop(); location.hash = '#/preset/new'; }},
-    {title: 'Пресет обложки',
-     hint: 'настройки обложки — в Cover Studio, заводится отсюда',
-     run: () => neighbourPresetModal('cover', null)},
-    {title: 'Пресет рерайта',
-     hint: 'как Rewrite Studio делает текст',
-     run: () => neighbourPresetModal('rewrite', null)},
     {title: 'Пресет канала',
      hint: 'как живёт канал: расписание, машина заливки, ниша',
      run: () => channelPresetModal(null)},
@@ -7382,12 +7599,21 @@ async function viewPresets(){
         ? [`каналы: ${i.users.channels}`] : []),
       ...(i.users.projects ? [`проекты: ${i.users.projects}`] : []),
     ].join(', ') : '';
-    const facts = i.facts.map(f => esc(f)).join(' · ');
+    // Настройки в карточке не выписываются (владелец 22.09.2026: «очень мешает»):
+    // строка из движка, голосов и качества читалась хуже самого названия, а увидеть
+    // их целиком можно по «Править».
+    // Старый частичный «Сценарий»/«Обложка» производства — это ссылка на пресет текста или
+    // обложки и стоит в той же карточке, часто под тем же именем. Пометка отличает.
+    const wrapper = g.service === 'vsgen' && (i.scope === 'text' || i.scope === 'cover');
+    const tag = wrapper ? 'ссылка' : PRESET_KIND_TAG[g.service];
+    const kind = wrapper ? `ссылку на пресет ${i.scope === 'text' ? 'текста' : 'обложки'}`
+      : (PRESET_KIND_WORD[g.service] || (i.scope === 'full' ? 'целый пресет'
+                                                             : 'частичный пресет'));
     return `<div class="stage pitem">
       <div class="dot ${inUse ? 's-done' : 's-idle'}">${inUse ? '✓' : '·'}</div>
       <div class="body">
         <div class="pline"><span class="name">${esc(i.name)}</span>${
-          facts ? `<span class="facts">${facts}</span>` : ''}</div>
+          tag ? `<span class="pill s-idle ptag">${esc(tag)}</span>` : ''}</div>
         <div class="note ${inUse ? 'muted' : ''}">${
           i.channels.length
             ? 'каналы: ' + i.channels.map(ch =>
@@ -7405,7 +7631,8 @@ async function viewPresets(){
         ${iconBtn('pcopy', 'copy', 'Копия', i.name,
                   `data-svc="${esc(g.service)}" data-name="${esc(i.name)}"`)}
         ${iconBtn('bad pdel', 'remove', 'Удалить', i.name,
-                  `data-svc="${esc(g.service)}" data-name="${esc(i.name)}"`)}
+                  `data-svc="${esc(g.service)}" data-name="${esc(i.name)}"
+                   data-kind="${esc(kind)}"`)}
       </div></div>`;
   };
 
@@ -7430,32 +7657,44 @@ async function viewPresets(){
         || F.types.includes(i.scope);
   };
 
-  const vsgenBodyHtml = items => {
-    items = items.filter(i => nameOk(i) && typeOk(i));
-    const whole = items.filter(i => i.scope === 'full');
-    const partial = items.filter(i => i.scope !== 'full');
+  // Пресеты из хранилищ текстов и обложек — такие же части, как картинки и сборка
+  // (владелец 22.09.2026: «одна студия»). Каждому — часть, куда он встаёт в списке.
+  // Сервис остаётся на элементе: по нему «Править», «Копия» и «Удалить» знают, куда
+  // писать.
+  const NB_PART = {rewrite: 'text', rewrite_gen: 'text', cover: 'cover'};
+  const nbItems = d.groups.filter(g => NB_PART[g.service]).flatMap(g =>
+    (g.items || []).map(i => Object.assign({}, i, {scope: NB_PART[g.service],
+      service: g.service, users: null})));
+  const nbErrors = d.groups.filter(g => NB_PART[g.service] && g.error);
+  // Каждый вид — своей карточкой, как «Шаблоны озвучки Lumean» (владелец 22.09.2026:
+  // «картинки, монтаж и все эти типы сейчас склеены в одно — несуразно; отдельными
+  // карточками мозг будет отделять их друг от друга»). Раньше это был один лист с
+  // подзаголовками «Целые / Частичные / Озвучка / …», и границу вида глаз не находил.
+  // «Целые» видны всегда — это главный вид; пустая часть карточки не получает.
+  const vsgenCardsHtml = vsItems => {
+    const items = [...vsItems.map(i => Object.assign({service: 'vsgen'}, i)), ...nbItems]
+      .filter(i => nameOk(i) && typeOk(i));
     const filtered = F.q || F.types.length > 0;
-    let html = '';
+    const cards = [];
+    const whole = items.filter(i => i.scope === 'full');
     if (!filtered || whole.length){
-      html += '<div class="sec grp">Целые</div>';
-      html += whole.length ? whole.map(i => presetItemHtml({service: 'vsgen'}, i)).join('')
-                           : '<div class="empty">Целых пресетов нет.</div>';
+      cards.push({title: 'Целые пресеты', html: whole.length
+        ? whole.map(i => presetItemHtml({service: i.service}, i)).join('')
+        : '<div class="empty">Целых пресетов нет.</div>'});
     }
-    if (!filtered || partial.length){
-      html += '<div class="sec grp">Частичные</div>';
-      if (!partial.length){
-        html += '<div class="empty">Частичных пресетов нет.</div>';
-      } else {
-        for (const [code, title] of PART_TITLES){
-          const arr = partial.filter(i => i.scope === code);
-          if (!arr.length) continue;
-          html += `<div class="sec part" style="border-top:1px solid var(--line);
-            font-size:12px;color:var(--muted)">${esc(title)}</div>`;
-          html += arr.map(i => presetItemHtml({service: 'vsgen'}, i)).join('');
-        }
-      }
+    for (const [code, title] of PART_TITLES){
+      const arr = items.filter(i => i.scope === code);
+      const errs = nbErrors.filter(g => NB_PART[g.service] === code)
+        .filter(() => !F.types.length || F.types.includes(code) || F.types.includes('partial'));
+      if (!arr.length && !errs.length) continue;
+      cards.push({title, html: arr.map(i => presetItemHtml({service: i.service}, i)).join('')
+        + errs.map(g => `<div class="stage"><div class="dot s-error">!</div><div class="body">
+            <div class="name">${esc(NEIGHBOUR_PART[g.service] || g.title)}: список не получен —
+              ${esc(g.error)}</div>
+            <div class="note muted">Пусто здесь означает «не спросили», а не «пресетов нет».
+            </div></div></div>`).join('')});
     }
-    return html || '<div class="empty">Под фильтр ничего не подошло.</div>';
+    return cards;
   };
 
   // Пресеты канала (18.09.2026) — отдельная сущность: это не «чем делается ролик», а
@@ -7508,32 +7747,34 @@ async function viewPresets(){
       // при них рисовала саму себя с надписью «под фильтр ничего не подошло» — рядом с
       // секцией, которую человек как раз и просил показать. Это читается как поломка.
       if (side) continue;
+      // Пресеты текстов и обложек стоят частями внутри общего списка — отдельной
+      // карточкой со своим заголовком хранилища их больше нет.
+      if (NB_PART[g.service]) continue;
       // У пресетов рерайта и обложек типа нет вовсе, поэтому любой выбранный вид их
       // карточки скрывает: показывать их «не подошедшими» было бы неправдой.
       if (g.service !== 'vsgen' && !any) continue;
       const items = g.service === 'vsgen' ? g.items : g.items.filter(nameOk);
       if (g.service !== 'vsgen' && F.q && !items.length && !g.error) continue;
-      shown++;
-      const card = $(`<div class="card" style="margin-bottom:16px">
-      <div class="sec">${esc(g.title)}${g.service !== 'vsgen'
-        ? ` <button class="ghost small pnew" data-svc="${esc(g.service)}"
-              style="float:right;font-weight:400;text-transform:none;letter-spacing:0"
-              >Завести</button>` : ''}</div>
-      ${g.error
-        ? `<div class="stage"><div class="dot s-error">!</div><div class="body">
-             <div class="name">Список не получен — ${esc(g.error)}</div>
+      const blocks = g.service === 'vsgen'
+        ? (g.error ? [{title: 'Пресеты', html: `<div class="stage"><div class="dot s-error">!</div>
+             <div class="body"><div class="name">Список не получен — ${esc(g.error)}</div>
              <div class="note muted">Пусто здесь означает «не спросили», а не
-               «пресетов нет».</div></div></div>`
-        : (g.service === 'vsgen' ? vsgenBodyHtml(g.items)
-           : (items.length ? items.map(i => presetItemHtml(g, i)).join('')
-              : '<div class="empty">Пресетов нет.</div>'))}
-      ${g.note ? `<div class="secbody"><div class="note muted">${esc(g.note)}</div></div>` : ''}
-    </div>`);
-      list.append(card);
-      wirePresets(card);
+               «пресетов нет».</div></div></div>`}] : vsgenCardsHtml(g.items))
+        : [{title: g.title, html: g.error
+            ? `<div class="stage"><div class="dot s-error">!</div><div class="body">
+                 <div class="name">Список не получен — ${esc(g.error)}</div></div></div>`
+            : (items.length ? items.map(i => presetItemHtml(g, i)).join('')
+               : '<div class="empty">Пресетов нет.</div>')}];
+      for (const b of blocks){
+        shown++;
+        const card = $(`<div class="card ptype" style="margin-bottom:16px">
+          <div class="sec">${esc(b.title)}</div>${b.html}</div>`);
+        list.append(card);
+        wirePresets(card);
+      }
     }
-    if (!shown && !side) list.append($(`<div class="card"><div class="empty">Под фильтр
-      ничего не подошло.</div></div>`));
+    if (!shown && !side) list.append($(
+      '<div class="card"><div class="empty">Под фильтр ничего не подошло.</div></div>'));
   };
   const save = () => { try{ localStorage.setItem('presetFilter', JSON.stringify(F)); }catch(e){} };
   bar.querySelector('#pf-q').oninput = e => { F.q = e.target.value; save(); paint(); };
@@ -7589,8 +7830,6 @@ async function viewPresets(){
           <div class="dot s-done">♪</div>
           <div class="body">
             <div class="name">${esc(t.name || t.id)}</div>
-            <div class="facts">${esc(t.service || '')}${t.model ? ' · ' + esc(t.model) : ''}${
-              t.voice_id ? ' · голос ' + esc(t.voice_id) : ''}</div>
             <div class="note muted mono" style="font-size:11px">${esc(t.id)}</div>
           </div>
           <div class="pacts">
@@ -7634,8 +7873,6 @@ async function viewPresets(){
         >${p.channels.length ? '✓' : '·'}</div>
       <div class="body">
         <div class="name">${esc(p.name)}</div>
-        <div class="facts">${p.given.length ? 'задано: ' + p.given.map(esc).join(', ')
-          : 'ничего не задано — каналы работают по своим настройкам'}</div>
         <div class="note ${p.channels.length ? 'muted' : ''}">${p.channels.length
           ? 'каналы: ' + p.channels.map(ch =>
               `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')
@@ -7682,17 +7919,15 @@ function wirePresets(root){
   // интерфейс: до 18.09.2026 их можно было только скопировать или удалить.
   root.querySelectorAll('button.pform').forEach(b => b.onclick =
     () => neighbourPresetModal(b.dataset.svc, b.dataset.name));
-  // Завести пресет обложек, рерайта или бриф — тем же окном, что и правка (18.09.2026).
-  // Раньше из пульта их можно было только скопировать: заведение жило в чужом сервисе.
-  root.querySelectorAll('button.pnew').forEach(b => b.onclick =
-    () => neighbourPresetModal(b.dataset.svc, null));
   root.querySelectorAll('button.pcopy').forEach(b => b.onclick = () => {
     askInline(b, {value: b.dataset.name + ' — копия', ok: 'Скопировать'}, to =>
       ask(b, () => post(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/copy`,
                         {from: b.dataset.name, to})));
   });
   root.querySelectorAll('button.pdel').forEach(b => b.onclick = () => {
-    confirmInline(b, `Удалить «${b.dataset.name}»?`, () =>
+    // В одном списке теперь бывают одноимённые строки (ссылка из производства и сам
+    // пресет обложки), поэтому вопрос называет, ЧТО удаляется.
+    confirmInline(b, `Удалить ${b.dataset.kind || 'пресет'} «${b.dataset.name}»?`, () =>
       ask(b, () => api(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/${
         encodeURIComponent(b.dataset.name)}`, {method: 'DELETE'})));
   });
@@ -7741,7 +7976,7 @@ async function lumeanTemplateModal(id, fields, opts){
   modal(creating ? 'Новый шаблон озвучки' : 'Шаблон озвучки Lumean',
     `<div class="fields" style="padding:0">${(d.fields || []).map(fieldHtml).join('')}</div>
      <div class="note muted">Шаблон живёт в аккаунте Lumean: заведённый здесь виден и
-       в их кабинете, удаление удаляет его там же. Формат вывода задаём мы — кабинет
+       на сайте Lumean, удаление удаляет его там же. Формат вывода задаём мы — студия
        собирает ролик из mp3.</div>${used}`,
     {ok: creating ? 'Завести' : 'Сохранить', onOk: async (box, close) => {
       const values = {};
@@ -7849,6 +8084,15 @@ async function channelPresetModal(id){
 
 // Окно правки пресета соседа. Поля описывает сервер (NEIGHBOUR_PRESET_FIELDS) — здесь
 // только отрисовка: второй список полей в браузере разошёлся бы с первым.
+// Хранилище пресета части → как часть называется на экране.
+// Пометка у пресета части «Сценарий»: их там два рода, и по названию не отличить.
+const PRESET_KIND_TAG = {rewrite: 'по ссылке', rewrite_gen: 'с нуля по теме'};
+// Как назвать пресет в вопросе об удалении.
+const PRESET_KIND_WORD = {rewrite: 'пресет текста', rewrite_gen: 'бриф', cover: 'пресет обложки'};
+const NEIGHBOUR_PART = {rewrite: 'Сценарий — рерайт по ссылке',
+                        rewrite_gen: 'Сценарий — бриф для текста с нуля',
+                        cover: 'Обложка'};
+
 async function neighbourPresetModal(service, name, opts){
   const creating = !name;
   let d;
@@ -7899,18 +8143,21 @@ async function neighbourPresetModal(service, name, opts){
   };
 
   const nameHtml = creating
-    // Первая фраза нужна всегда: имя живёт в соседнем сервисе, и на главном пути
-    // («Создать» на странице пресетов) это единственное место, где об этом сказано.
-    // Вторая — только когда есть «пресет здесь», чьё имя подставлено в поле.
+    // По имени пресет части выбирают в целых пресетах и в каналах — об этом и
+    // подсказка. Вторая фраза — когда имя подставлено из целого пресета.
     ? `<div class="fld" style="grid-column:1/-1"><div class="lh"
          style="display:flex;margin-bottom:7px"><label for="np-name">Название</label>${
-         hintDot('Это пресет в соседнем сервисе — у него своё имя.'
+         hintDot((service === 'rewrite_gen'
+             ? 'По названию бриф выбирают на вкладке «Сценарий» в режиме «С нуля по теме».'
+             : 'По названию этот пресет выбирают в целых пресетах и в каналах.')
            + (opts && opts.suggestName
-              ? ' Можно оставить такое же, как у пресета здесь.' : ''))}</div>
+              ? ' Можно оставить такое же, как у пресета, из которого вы пришли.' : ''))}</div>
          <input id="np-name" placeholder="как называть пресет"
-           value="${esc((opts && opts.suggestName) || '')}"></div>`
+           value="${esc((opts && (opts.suggestName || opts.prefillName)) || '')}"></div>`
     : '';
-  const m = modal(creating ? 'Новый пресет' : `Пресет «${name}»`,
+  const panelTitle = opts && opts.host
+    ? (NEIGHBOUR_PART[service] || 'Настройки') : (creating ? 'Новый пресет' : `Пресет «${name}»`);
+  const m = (opts && opts.host ? inlinePanel.bind(null, opts.host) : modal)(panelTitle,
     `<div class="fields" style="padding:0">${nameHtml}${d.fields.map(fieldHtml).join('')}</div>`,
     {ok: creating ? 'Завести' : 'Сохранить', onOk: async (box, close) => {
       const values = {};
@@ -8021,8 +8268,7 @@ async function accountsCard(){
 
   const card = $(`<div class="card" style="margin-top:16px">
     <div class="sec">Люди ${hintDot((d.note ? d.note + '. ' : '')
-      + 'Заводить человека в Rewrite и Cover не нужно — они узнают его по этому же '
-      + 'входу.')}</div>
+      + 'Вход у человека один на всю студию: тексты и обложки узнают его по нему же.')}</div>
     <table><thead><tr>
       <th>Логин</th><th>Роль</th><th>Тенант</th><th>Квота</th><th>Состояние</th><th></th>
     </tr></thead><tbody>${d.users.map(u => `<tr>
@@ -8137,7 +8383,7 @@ function subsExitsCard(s){
     return $(`<div class="card"><div class="sec">Выходы субтитров</div>
       <div class="secbody"><div class="note bad">Состояние выходов прочитать не удалось:
         ${esc(s.read_error)}. Денег это не стоило — плитка только читает. Обновите
-        страницу; если не помогло, кабинет не отвечает.</div></div></div>`);
+        страницу; если не помогло, сервер не отвечает.</div></div></div>`);
 
   const card = $(`<div class="card">
     <div class="sec">Выходы субтитров ${hintDot((s.rest_vs_dead || '')

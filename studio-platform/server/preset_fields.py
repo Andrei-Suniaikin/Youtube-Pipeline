@@ -506,11 +506,11 @@ GROUPS = (
 GROUPS = GROUPS + (
     ("Сценарий", (
         Field("preset_rewrite", "Пресет рерайта", "select",
-              hint="каким пресетом Rewrite Studio делает текст"),
+              hint="каким пресетом делается текст"),
     )),
     ("Обложка", (
         Field("preset_cover", "Пресет обложки", "select",
-              hint="каким пресетом Cover Studio делает обложку"),
+              hint="каким пресетом делается обложка"),
     )),
 )
 

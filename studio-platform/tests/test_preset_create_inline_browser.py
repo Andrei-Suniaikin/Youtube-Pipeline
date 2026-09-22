@@ -69,9 +69,9 @@ SCENARIO = r"""
               note: 'подсказка'};
     }
     if (p === '/ui/presets/vsgen/7')
-      return {id: 7, name: 'Обложечный', scope: 'cover', links: {}, link_problems: [],
+      return {id: 7, name: 'Кадровый', scope: 'images', links: {}, link_problems: [],
               users: {channels: [], projects: []},
-              groups: ALL.filter(g => g.part === 'cover'), note: 'подсказка'};
+              groups: ALL.filter(g => g.part === 'images'), note: 'подсказка'};
     return {};
   };
   window.post = async (p, body) => {
@@ -103,21 +103,22 @@ SCENARIO = r"""
       (document.querySelector('#p-name-err').textContent || '').includes('имя');
   out.набранное_на_месте = document.querySelector('.fields [data-key]').value;
 
-  // 3. Тип переключается в самой форме, вкладки следуют за ним.
+  // 3. Тип переключается в самой форме, вкладки следуют за ним. (До 22.09.2026 здесь
+  //    была «Обложка»; теперь у неё своя форма — см. test_preset_cover_one_confirm.)
   out.кнопок_типа = document.querySelectorAll('#scope-modes button').length;
   [...document.querySelectorAll('#scope-modes button')]
-      .find(b => b.dataset.scope === 'cover').click();
+      .find(b => b.dataset.scope === 'images').click();
   await tick(500);
   out.вкладок_у_частичного = document.querySelectorAll('.subtabs a').length;
-  out.тип_подсвечен = document.querySelector('[data-scope="cover"]').classList
+  out.тип_подсвечен = document.querySelector('[data-scope="images"]').classList
       .contains('on');
-  // Набранное для «Картинок» в пресет «Только обложка» уехать не должно: этого поля
+  // Набранное для «Озвучки» в пресет «Только картинки» уехать не должно: этого поля
   // у него нет и поправить его негде.
   const nm = document.querySelector('#p-name');
-  nm.value = 'Обложечный';
+  nm.value = 'Кадровый';
   nm.dispatchEvent(new Event('input', {bubbles: true}));
   const own = document.querySelector('.fields [data-key]');
-  own.value = 'свой пресет обложки';
+  own.value = 'свой стиль';
   own.dispatchEvent(new Event('input', {bubbles: true}));
 
   // 4. Первое «Сохранить» заводит пресет и уводит в его редактор.
@@ -182,14 +183,14 @@ def main() -> int:
     check("сначала заведение, потом запись полей", res.get("posts_после"),
           ["/ui/presets/vsgen", "/ui/presets/vsgen/7"])
     check("заведение унесло имя и выбранный тип", res.get("создание_тело"),
-          {"name": "Обложечный", "scope": "cover"})
+          {"name": "Кадровый", "scope": "images"})
     # Набранное для «Картинок» осталось в прошлом типе: у пресета «Только обложка»
     # такого поля нет, и уехать оно туда не должно.
     check("уехали поля выбранного типа, и только они",
-          res.get("записанные_поля"), {"preset_cover": "свой пресет обложки"})
+          res.get("записанные_поля"), {"style": "свой стиль"})
     check("человек оказался в редакторе заведённого", res.get("адрес_после"),
           "#/preset/7")
-    check("и видит его имя в заголовке", res.get("заголовок_после"), "Обложечный")
+    check("и видит его имя в заголовке", res.get("заголовок_после"), "Кадровый")
     check("кнопок типа у заведённого больше нет — тип выбирают один раз",
           res.get("кнопок_типа_после"), 0)
 

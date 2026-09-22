@@ -51,7 +51,10 @@ SCENARIO = r"""
     const cardText = () => {
       const c = [...document.querySelectorAll('.card')]
         .find(x => /Свои ключи пользователей/.test(x.textContent));
-      return c ? c.textContent.replace(/\s+/g, ' ') : '';
+      // Подсказки «?» — тоже текст для человека: имя провайдера живёт в ней.
+      const hints = c ? [...c.querySelectorAll('.q')].map(q => q.getAttribute('data-hint'))
+                         .join(' ') : '';
+      return c ? (c.textContent + ' ' + hints).replace(/\s+/g, ' ') : '';
     };
 
     await viewKeys();
@@ -97,9 +100,11 @@ def main() -> int:
     check("сценарий выполнен без ошибок", res.get("error"), None)
     check("без ключа так и написано — текст делать нечем",
           "ключа нет — текст делать нечем" in (res.get("noKey") or ""), True)
+    # С 22.09.2026 — одна студия: провайдер называется «OpenAI · текст», без имени
+    # отдельного сервиса.
     check("сказано, какой кнопкой вписать",
           "Добавить ключ" in (res.get("noKey") or "")
-          and "Rewrite Studio" in (res.get("noKey") or ""), True)
+          and "«OpenAI · текст»" in (res.get("noKey") or ""), True)
     check("в списке провайдеров есть пункт рерайта",
           "__rewrite" in (res.get("opts") or []), True)
     check("форма ключа открывается окном, а не строкой в карточке",

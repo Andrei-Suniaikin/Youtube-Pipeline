@@ -122,6 +122,8 @@ SCENARIO = r"""
   // Создание: одна кнопка в шапке должна предлагать все пять видов.
   document.querySelector('#newpr').click();
   await tick(150);
+  out.заголовки_меню = [...document.querySelectorAll('.mi')].map(
+      b => b.firstChild.textContent.trim());
   out.пунктов_меню = [...document.querySelectorAll('.mi')].map(
       b => b.textContent.split('\n')[0].trim().slice(0, 24));
 
@@ -164,12 +166,13 @@ def main() -> int:
     # значило сперва завести обёртку — частичный пресет производства «Только обложка»,
     # у которого всё содержимое — одна ссылка на пресет Cover Studio, — и только из его
     # редактора добраться до настоящего заведения. Два заведения на одно намерение.
-    print("\nСоздание: все пять видов из шапки, а не три из пяти")
+    # 22.09.2026 владелец: одна студия — пресеты текста и обложки стали частями общего
+    # пресета, отдельных пунктов у них в «Создать» больше нет.
+    print("\nСоздание: пресет, пресет канала, шаблон Lumean — всё из шапки")
     items = res.get("пунктов_меню") or []
-    check("пунктов пять", len(items), 5)
-    check("есть производство", any("производ" in x.lower() for x in items), True)
-    check("есть обложка", any("обложк" in x.lower() for x in items), True)
-    check("есть рерайт", any("рерайт" in x.lower() for x in items), True)
+    check("пунктов три", len(items), 3)
+    titles = res.get("заголовки_меню") or []
+    check("заголовки пунктов", titles, ["Пресет", "Пресет канала", "Шаблон озвучки Lumean"])
     check("есть канал", any("канал" in x.lower() for x in items), True)
     check("есть Lumean", any("lumean" in x.lower() for x in items), True)
 

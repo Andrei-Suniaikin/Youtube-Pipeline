@@ -89,6 +89,27 @@ SCENARIO = r"""
   out.подсказка_поля = getComputedStyle(inp.querySelector('#t-in'), '::placeholder').color;
   out.недоступное = cs(inp.querySelector('#t-dis'), 'border-top-style');
 
+  // Шапка проекта: этап, который ещё впереди, — пустой контур, а не зачёркнутый.
+  const strip = add(`<div class="head"><div>${stageStripHtml({segments: [
+    {stage: 'tts', state: 'done'}, {stage: 'video', state: 'pending'}], caption: 'x',
+    tone: 'dim'})}</div></div>`);
+  const pend = strip.querySelectorAll('.segs i')[1];
+  out.впереди = {cls: pend.className, фон: cs(pend, 'background-image')};
+
+  // Скругления (владелец 22.09.2026: «немного квадратненько»).
+  const card = add('<div class="card"><div class="sec">x</div></div>').firstElementChild;
+  out.радиусы = {панель: cs(card, 'border-top-left-radius'),
+                 кнопка: cs(btn, 'border-top-left-radius'),
+                 поле: cs(inp.querySelector('#t-in'), 'border-top-left-radius')};
+
+  // Каналы: кнопки — в строке заголовка.
+  window.api = async p => p === '/ui/channels' ? {channels: []} : {};
+  await viewChannels();
+  const h = document.querySelector('#app .head');
+  out.каналы_шапка = h ? [!!h.querySelector('h1'), !!h.querySelector('#impch'),
+                          !!h.querySelector('#newch')] : null;
+  document.getElementById('app').innerHTML = '';
+
   // Статус канала: текущий виден, переходы — глаголами.
   const root = add('<div class="sec"><span id="statusbtns"></span></div><div id="editbox"></div>');
   window.api = async () => ({statuses: [{key: 'active', title: 'работает'},
@@ -133,6 +154,12 @@ def main() -> int:
     check("у галочки видно кольцо фокуса", res.get("фокус_галочки"), "solid")
     check("подсказка поля читается (5.4:1)", res.get("подсказка_поля"), "rgb(148, 150, 157)")
     check("недоступное поле — пунктиром", res.get("недоступное"), "dashed")
+    check("этап впереди — контур, не зачёркнут", res.get("впереди"),
+          {"cls": "idle", "фон": "none"})
+    check("скругления: панель 10, кнопка и поле 7", res.get("радиусы"),
+          {"панель": "10px", "кнопка": "7px", "поле": "7px"})
+    check("каналы: заголовок и обе кнопки — одной строкой", res.get("каналы_шапка"),
+          [True, True, True])
     check("статус канала виден, переходы — глаголами", res.get("статус_канала"),
           ["работает", "Поставить на паузу", "Убрать в архив"])
     print()

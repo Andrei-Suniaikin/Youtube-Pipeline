@@ -529,7 +529,7 @@ class PubServices:
                 # умолчания хуже жалобы.
                 log_line(c, rel["release_id"], "ролик",
                          f"настройки пресета {rel['preset_vsgen_id']} не прочитались — "
-                         "проект уйдёт на умолчаниях кабинета", level="warn")
+                         "проект уйдёт на настройках по умолчанию", level="warn")
                 settings = {}
             settings["_applied_preset"] = rel["preset_vsgen_id"]
             # Голос по языку канала — правило ТЗ §06 «язык → провайдер → идентификатор».
@@ -613,7 +613,7 @@ class PubServices:
             if known is None:
                 uid = self._uid(c, rel["tenant_id"])
                 if not uid:
-                    raise ResourceDown("кабинет", "не найден владелец кабинета для постановки")
+                    raise ResourceDown("студия", "не найден владелец проекта для постановки")
                 c.commit()      # постановка задачи откроет своё соединение — замок отпустить
                 job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], kind,
                                       self._preset_params(c, rel))
@@ -1114,9 +1114,9 @@ COLLECT_BATCH = int(os.environ.get("VS_COLLECT_BATCH", "25"))
 # Что случилось с каждым выпуском — кодом для машины и словами для экрана.
 COLLECT_REASONS = {
     "taken": "текст забран, фаза двинута",
-    "waiting": "у соседа ещё не готово",
-    "missing": "задача пропала у соседа — нужен разбор, повтор оплачивается заново",
-    "failed": "сосед сообщил об отказе по задаче",
+    "waiting": "текст ещё не готов",
+    "missing": "задача текста пропала — нужен разбор, повтор оплачивается заново",
+    "failed": "заказ текста вернулся отказом",
     "rejected": "текст пришёл, но не прошёл приёмку",
     "ask_failed": "статус задачи спросить не удалось",
     "cancelled": "выпуск отменён, пока шёл проход",
@@ -1291,7 +1291,7 @@ def _take_paid_text(c, svc, client, item: dict, now: float) -> tuple:
         c.commit()
         return ("failed", reason[:200], 0)
     if state not in REWRITE_DONE:
-        return ("waiting", f"у соседа «{state or 'без статуса'}»", 0)
+        return ("waiting", f"текст: «{state or 'без статуса'}»", 0)
 
     donor_chars = PubServices._donor_chars(item)
     try:

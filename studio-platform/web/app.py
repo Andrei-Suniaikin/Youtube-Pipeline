@@ -182,7 +182,7 @@ def ui_login(body: LoginIn, response: Response):
     if user is None:
         # Кабинет выдал сессию, а мы её не видим — значит смотрим в разные базы.
         # Сказать об этом прямо дешевле, чем оставить «неверный пароль» при верном.
-        raise HTTPException(500, "кабинет выдал сессию, но её нет в базе пульта — "
+        raise HTTPException(500, "сессия выдана, но её нет в базе студии — "
                                  "проверьте, что VS_SERVER_DB и VS_DEV_DB это один файл")
     response.set_cookie(auth.COOKIE, sid, httponly=True, samesite="lax",
                         secure=not auth.INSECURE, max_age=30 * 86400)
@@ -795,7 +795,7 @@ def _job_age(created, started, finished, state="", now=None,
         working = max(0.0, (finished if finished is not None else now) - started)
 
     if silent:
-        text = "сосед не сообщает, когда взял в работу"
+        text = "время взятия в работу не записано"
     elif over and started is None:
         text = "в работу не бралась"
     elif finished is not None and working is not None:
@@ -1049,11 +1049,11 @@ def _name_neighbour_rows(c, service: str, rows: list) -> None:
                        "экрана проекта — в строке имя проекта")
             elif row["id"]:
                 title = f"задача {row['id']}"
-                why = ("задача заведена не из кабинета: ни проекта, ни выпуска за ней "
+                why = ("задача заведена не из студии: ни проекта, ни выпуска за ней "
                        "не записано, названия ролика взять негде")
             else:
                 title = "задача без номера"
-                why = "сосед не назвал номер задачи — спросить его не о чем"
+                why = "у задачи нет номера — спросить о ней не о чем"
         row["title"] = _short(title, 200)
         row["title_why"] = why
 
@@ -1396,7 +1396,8 @@ def ui_queue_pause(request: Request):
     if story.get("mine_prompt"):
         targets.append({"key": "prompt_mine", "title": "возобновить тексты моего профиля"})
     story["targets"] = targets
-    story["where_to_resume"] = ("Снимают паузу в админ-панели кабинета: у рубильника "
+    story["where_to_resume"] = ("Снимают паузу в служебной админ-панели сервера "
+                                "(адрес /admin): у рубильника "
                                 "одна точка записи, и вторая кнопка означала бы два "
                                 "места, откуда конвейер отпускают вслепую.")
     return story
@@ -2248,7 +2249,7 @@ def ui_presets():
     # заводить вторую правду о том, из чего состоит пресет. Но и тупик оставлять
     # нельзя: раньше экран говорил «правка — в разделе того сервиса» и не говорил,
     # где этот раздел.
-    groups = [{"service": "vsgen", "title": "Производство (кабинет)", "items": vsgen,
+    groups = [{"service": "vsgen", "title": "Пресеты", "items": vsgen,
                "error": "", "note": "ключ пресета — число, а не имя"}]
 
     body, err = _neighbour_get(REWRITE_BASE, "/api/v1/presets", keys["rewrite"])
@@ -2256,7 +2257,6 @@ def ui_presets():
     groups.append({
         "service": "rewrite", "title": "Рерайт по ссылке", "error": err,
         "note": "канал ссылается именно на этот набор, а не на брифы генерации",
-        "home": REWRITE_BASE, "home_title": "Rewrite Studio",
         "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
                   for name, cfg in sorted(rew.items(), key=lambda kv: kv[0].lower())]})
     gen = (body or {}).get("generation") or {}
@@ -2264,7 +2264,6 @@ def ui_presets():
         groups.append({
             "service": "rewrite_gen", "title": "Брифы генерации с нуля", "error": "",
             "note": "к рерайту по ссылке отношения не имеют — отдельное хранилище",
-            "home": REWRITE_BASE, "home_title": "Rewrite Studio",
             "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
                       for name, cfg in sorted(gen.items(), key=lambda kv: kv[0].lower())]})
 
@@ -2272,7 +2271,6 @@ def ui_presets():
     cov = body if isinstance(body, dict) else {}
     groups.append({
         "service": "cover", "title": "Обложки", "error": err, "note": "",
-        "home": COVER_BASE, "home_title": "Cover Studio",
         "items": [{"key": name, "name": name, "facts": _preset_facts(cfg)}
                   for name, cfg in sorted(cov.items(), key=lambda kv: kv[0].lower())]})
 
@@ -2463,9 +2461,9 @@ def _cabinet_form(path: str, fields, request, timeout: float = 0.0,
             detail = (json.loads(raw or "{}") or {}).get("detail") or raw[:200]
         except ValueError:
             detail = raw[:200]
-        raise HTTPException(_pass_code(exc.code), detail or f"кабинет ответил {exc.code}")
+        raise HTTPException(_pass_code(exc.code), detail or f"сервер ответил {exc.code}")
     except Exception as exc:                                     # noqa: BLE001
-        raise HTTPException(502, f"кабинет не отвечает: {type(exc).__name__}")
+        raise HTTPException(502, f"сервер не отвечает: {type(exc).__name__}")
 
 
 @app.post("/ui/actions/{service}/{job_id}/{action}")
@@ -2784,7 +2782,7 @@ def _channel_presets(c, ch) -> list:
         if ch["preset_vsgen_id"] else None
     out.append({"what": "производство", "name": (row["name"] if row else
                                                  str(ch["preset_vsgen_id"] or "—")),
-                "exists": bool(row), "where": "кабинет"})
+                "exists": bool(row), "where": "vsgen"})
     keys = {n: get_key(c, n) for n in ("rewrite", "cover")}
     body, _err = _neighbour_get(REWRITE_BASE, "/api/v1/presets", keys["rewrite"])
     have_rew = set((body or {}).get("rewrite") or {})
@@ -4185,7 +4183,7 @@ def ui_job_log(service: str, job_id: str, request: Request, tail: int = 0):
             text, out["truncated"] = text[-limit:], True
         out.update(source=("service" if service == "cover" else "public"),
                    text=text, total_bytes=whole)
-        out["why"] = ("лог задачи, как его отдаёт Cover: у него он один и не фильтруется"
+        out["why"] = ("лог задачи обложки: он у неё один и не фильтруется"
                       if service == "cover" else
                       "ПУБЛИЧНЫЙ лог: настоящая причина заменена кодом (E-NET, E-TIMEOUT "
                       "и т. п.). Сырой лежит файлом на машине рерайта — "
@@ -4262,7 +4260,7 @@ def ui_preset_create(body: PresetNew, request: Request):
         r = c.execute("SELECT id FROM presets WHERE tenant_id=? AND name=? "
                       "ORDER BY id DESC LIMIT 1", (TENANT, name)).fetchone()
         if not r:
-            raise HTTPException(502, "кабинет не завёл пресет")
+            raise HTTPException(502, "пресет не заведён")
         prid = r["id"]
     finally:
         c.close()
@@ -4485,7 +4483,7 @@ def ui_preset_get(prid: int):
             "users": users,
             "groups": groups,
             "note": ("Пустое поле означает «как по умолчанию». Проверку значений делает "
-                     "кабинет при сохранении — теми же контрактами, что и всегда. "
+                     "студия при сохранении — теми же правилами, что и всегда. "
                      "Уже поставленные задачи правка не меняет — их настройки заморожены "
                      "в момент запуска. Изменится со следующего запуска.")}
 
@@ -4925,7 +4923,7 @@ async def ui_cover_preset_reference(name: str, request: Request,
     finally:
         c.close()
     if not key:
-        raise HTTPException(503, "ключ доступа к Cover Studio не сохранён")
+        raise HTTPException(503, "ключ доступа к обложкам не сохранён")
     boundary = "----studio" + secrets.token_hex(8)
     head = (f"--{boundary}\r\n"
             f'Content-Disposition: form-data; name="file"; '
@@ -4950,7 +4948,7 @@ async def ui_cover_preset_reference(name: str, request: Request,
         raise HTTPException(502, f"обложки не отвечают: {type(exc).__name__}")
     file_id = str(out.get("file_id") or "")
     if not file_id:
-        raise HTTPException(502, "Cover Studio не вернула идентификатор файла")
+        raise HTTPException(502, "для обложки не вернулся идентификатор файла")
     sid = getattr(request.state, "sid", "")
     store, put = _preset_store("cover", sid, request)
     cfg = dict(store.get(name) or {})
@@ -5002,7 +5000,7 @@ LUMEAN_SERVICES = (("elevenlabs", "ElevenLabs TTS"), ("heygen", "HeyGen"), ("sfx
 LUMEAN_TEMPLATE_FIELDS = (
     {"key": "name", "kind": "text", "label": "Название"},
     {"key": "service_key", "kind": "select", "label": "Сервис",
-     "hint": "чем озвучивать; маршрут кабинета «Lumean · только HeyGen» ждёт heygen"},
+     "hint": "чем озвучивать; маршрут «Lumean · только HeyGen» ждёт heygen"},
     {"key": "voice_id", "kind": "text", "label": "ID голоса",
      "hint": "голос из библиотеки Lumean — обязателен"},
     {"key": "model_id", "kind": "select", "label": "Модель"},
@@ -5182,7 +5180,7 @@ def _lumean_users(template_id: str) -> list:
 def _lumean_mod():
     mod = sys.modules.get("main")
     if mod is None or not hasattr(mod, "lumean_templates"):
-        raise HTTPException(503, "кабинет не поднят")
+        raise HTTPException(503, "сервер студии не поднят")
     return mod
 
 
@@ -5264,7 +5262,7 @@ def ui_lumean_template(id: str = ""):
     """
     mod = sys.modules.get("main")
     if mod is None or not hasattr(mod, "lumean_template_info"):
-        raise HTTPException(503, "кабинет не поднят")
+        raise HTTPException(503, "сервер студии не поднят")
     return mod.lumean_template_info(id)
 
 
@@ -5909,7 +5907,7 @@ def ui_keys_save(body: KeysIn, request: Request):
         raise HTTPException(_pass_code(exc.code),
                             exc.read().decode("utf-8", "replace")[:200])
     except Exception as exc:                                     # noqa: BLE001
-        raise HTTPException(502, f"кабинет не отвечает: {type(exc).__name__}")
+        raise HTTPException(502, f"сервер не отвечает: {type(exc).__name__}")
     if out.get("bad_codex_auth"):
         raise HTTPException(400, "путь к codex-auth не похож на файл авторизации — "
                                  "ключ не сохранён")
@@ -6336,7 +6334,7 @@ def ui_project_files_page(pid: str, code: str, request: Request,
         c.close()
     mod = sys.modules.get("main")
     if mod is None or not hasattr(mod, "_dl_items"):
-        raise HTTPException(503, "кабинет не поднят")
+        raise HTTPException(503, "сервер студии не поднят")
     try:
         items = mod._dl_items(mod._project_dir(TENANT, pid), code)
     except Exception:                                              # noqa: BLE001
@@ -6366,7 +6364,7 @@ def ui_project_new(body: ProjectNew, request: Request):
     """
     mod = sys.modules.get("main")
     if mod is None or not hasattr(mod, "_create_project"):
-        raise HTTPException(503, "кабинет не поднят — заводить проект нечем")
+        raise HTTPException(503, "сервер студии не поднят — заводить проект нечем")
     text = (body.text or "").strip()
     # Текст больше не обязателен (18.09.2026): раньше его спрашивала форма заведения, а
     # потом ровно то же самое спрашивала вкладка «Сценарий» — два ввода одного и того же.
@@ -6603,7 +6601,7 @@ def _batch_open_why(open_row, what: str) -> str:
     was = open_row["remote_order_id"] or ""
     error = (open_row["error"] or "").strip()
     if error:
-        return (f"заказ {what} у соседа кончился ничем"
+        return (f"заказ {what} кончился ничем"
                 + (f" (задача {was})" if was else "")
                 + f": {_short(error, 160)}. Деньги за него уже ушли — повтор оплатит "
                   f"то же самое второй раз, нужен разбор")
@@ -6650,7 +6648,7 @@ def _ask_cover_job(sid: str, job_id: str) -> tuple:
         return "wait", ""
     made = int(out.get("results_count") or 0) or len(out.get("output_files") or [])
     if not made:
-        return "lost", ("сосед закончил, но ни одной обложки не отдал: "
+        return "lost", ("заказ закончился, но ни одной обложки нет: "
                         + str(out.get("progress_detail") or state))
     return "done", ""
 
@@ -6825,7 +6823,7 @@ def _batch_call_failed(c, fresh: list, code: int, detail) -> str:
             pub_calls.mark_failed(c, one["call_id"], text[:400], ordered=not pre_order)
     c.commit()
     if pre_order:
-        return f"сосед отказал ({code}): {_short(text, 160)}"
+        return f"отказ ({code}): {_short(text, 160)}"
     return (f"ответа нет ({code}): {_short(text, 160)}. Задача могла создаться — "
             f"посмотрите её на экране и не нажимайте второй раз")
 
@@ -7216,8 +7214,8 @@ def _batch_cover_plan(c, sid: str, pid: str, *, repl_url: str, langs_asked: list
         # Тот же ответ даёт ночной движок («у канала не выбран пресет обложек»,
         # `pub_services.do_cover_ready`) — и это отказ, а не тихий заказ.
         item["why"] = ("не выбран пресет обложек: пусто и в карточке, и у канала "
-                       "проекта. Без пресета сосед нарисует обложку на своих "
-                       "умолчаниях — платно и не ту, поэтому не заказываю")
+                       "проекта. Без пресета обложка нарисуется на настройках по "
+                       "умолчанию — платно и не та, поэтому не заказываю")
         return item
     item["_url"] = url
     item["_parts"] = {"url": url, "preset": item["preset"], "provider": provider,
@@ -7393,7 +7391,7 @@ def ui_limits(request: Request):
     _require_admin(request)
     mod = sys.modules.get("main")
     if mod is None or not hasattr(mod, "_concurrency_cfg"):
-        raise HTTPException(503, "кабинет не поднят — лимиты читать неоткуда")
+        raise HTTPException(503, "сервер студии не поднят — лимиты читать неоткуда")
     try:
         cfg = mod._concurrency_cfg() or {}
     except Exception as exc:                                       # noqa: BLE001
@@ -7571,7 +7569,7 @@ def ui_project_stage_start(pid: str, kind: str, body: StageStartIn, request: Req
         return {"outcome": "render_deferred"}
     if "dv" in q:
         return {"outcome": "video_deferred"}
-    raise HTTPException(502, "кабинет ответил на старт этапа непонятным адресом")
+    raise HTTPException(502, "сервер ответил на старт этапа непонятным адресом")
 
 
 class SourceIn(BaseModel):
@@ -7800,9 +7798,9 @@ def ui_project_cover_pick(pid: str, body: CoverPickIn, request: Request):
         raise HTTPException(_pass_code(exc.code),
                             exc.read().decode("utf-8", "replace")[:200])
     except Exception as exc:                                       # noqa: BLE001
-        raise HTTPException(502, f"cover не отвечает: {type(exc).__name__}")
+        raise HTTPException(502, f"обложки не отвечают: {type(exc).__name__}")
     if mod is None or not hasattr(mod, "_project_dir"):
-        raise HTTPException(503, "кабинет не поднят — обложку положить некуда")
+        raise HTTPException(503, "сервер студии не поднят — обложку положить некуда")
     _write_project_cover(mod._project_dir(TENANT, pid), data)
     return {"ok": True, "bytes": len(data)}
 
@@ -7926,7 +7924,7 @@ def _require_admin(request) -> dict:
 def _hash_password():
     mod = sys.modules.get("main")
     if mod is None or not hasattr(mod, "hash_password"):
-        raise HTTPException(503, "кабинет не поднят — задать пароль нечем")
+        raise HTTPException(503, "сервер студии не поднят — задать пароль нечем")
     return mod.hash_password
 
 
@@ -7947,7 +7945,7 @@ def ui_accounts(request: Request):
         "admins": admins,
         "roles": [{"key": "admin", "title": "администратор"},
                   {"key": "user", "title": "пользователь"}],
-        "note": "вход у человека один на всю платформу: кабинет, пульт, тексты и обложки",
+        "note": "вход у человека один на всю студию",
     }
 
 

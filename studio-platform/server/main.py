@@ -12305,7 +12305,7 @@ def _queue_pause_words(state, names=None):
     if any(p.startswith("prompt_") for p in st["providers"]):
         out.append("следствие: пока на паузе хотя бы один канал текстов (prompt_*), "
                    "новые тексты не заказываются ни в одном профиле — правило "
-                   "унаследовано из боевого кабинета")
+                   "унаследовано из боевой системы")
     return out
 
 

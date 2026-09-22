@@ -338,7 +338,7 @@ def main() -> int:
     check("источник — сам сервис", cover["source"], "service")
     check_in("лог отдан целиком", "KeyError('api_key')", cover["text"])
     check("пути к файлу у Cover нет", cover["path"], "")
-    check_in("и сказано, почему так", "у него он один и не фильтруется", cover["why"])
+    check_in("и сказано, почему так", "он у неё один и не фильтруется", cover["why"])
 
     print("\nПустой лог — это ответ")
     check("и он не притворяется логом", got["empty"]["text"], "")

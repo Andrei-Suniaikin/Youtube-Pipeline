@@ -58,6 +58,9 @@ api = async (path) => {
     const label = () => app.querySelector('#pf-open').textContent.trim();
     const type = q => { const i = app.querySelector('#pf-q'); i.value = q; i.dispatchEvent(new Event('input')); };
     out.all = names();
+    // Каждый вид — своей карточкой со своим заголовком (владелец 22.09.2026).
+    out.карточки = [...app.querySelectorAll('.card.ptype')].map(
+      c => [...c.querySelectorAll(':scope > .sec')].map(x => x.textContent.trim()).join(' | '));
     out.labelAll = label();
     out.buttons = [...app.querySelectorAll('[data-type]')].map(b => b.textContent.trim());
     out.menuHidden = app.querySelector('#pf-types').hidden;
@@ -95,14 +98,17 @@ def main() -> int:
     check("кнопки типа — все варианты сразу", res.get("buttons"),
           ["Все", "Целые", "Частичные", "Озвучка", "Картинки", "Клипы", "Сборка",
            "Сценарий", "Обложка", "Каналы", "Озвучка Lumean"])
+    check("каждый вид — отдельной карточкой", res.get("карточки"),
+          ["Целые пресеты", "Озвучка", "Картинки", "Сборка", "Сценарий"])
     check("без фильтра видно всё", sorted(res.get("all") or []),
           sorted(["Польский длинный", "Английский короткий", "Голос Анна", "Кадры польские",
                   "Сборка быстрая", "Польский рерайт"]))
     check("«Целые» — только целые пресеты производства", res.get("full"),
           ["Польский длинный", "Английский короткий"])
     check("выбранная кнопка подсвечена", res.get("fullOn"), True)
-    check("«Частичные» — все частичные, по частям", res.get("partial"),
-          ["Голос Анна", "Кадры польские", "Сборка быстрая"])
+    # С 22.09.2026 пресеты текста — часть «Сценарий» общего списка (одна студия).
+    check("«Частичные» — все частичные, по частям, включая сценарий", res.get("partial"),
+          ["Голос Анна", "Кадры польские", "Сборка быстрая", "Польский рерайт"])
     check("«Картинки» — только частичные картинки", res.get("images"), ["Кадры польские"])
     check("повторный клик снимает вид — набор пустеет обратно во «все»",
           sorted(res.get("offAgain") or []),

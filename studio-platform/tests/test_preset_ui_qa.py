@@ -82,16 +82,14 @@ def main() -> int:
     check("PART_TITLES — пять частей, порядок и подписи как в preset_fields.PARTS",
           ui_parts, list(PF.PARTS))
 
-    print("\nСписок пресетов (viewPresets): «Целые»/«Частичные», частичные — по частям")
-    vsgen_body = function_body(index_html, "  const vsgenBodyHtml = items => {")
-    check("vsgenBodyHtml() найдена", bool(vsgen_body), True)
-    # Класс роли (`sec grp`, облик 22.09.2026) допустим: проверяется, что заголовок есть.
-    check("заголовок «Целые»",
-          re.search(r'<div class="sec[^"]*">Целые</div>', vsgen_body) is not None, True)
-    check("заголовок «Частичные»",
-          re.search(r'<div class="sec[^"]*">Частичные</div>', vsgen_body) is not None, True)
-    check("частичные разбиваются подзаголовками по PART_TITLES (не одним общим списком)",
-          "for (const [code, title] of PART_TITLES)" in vsgen_body, True)
+    # 22.09.2026 владелец: каждый вид — отдельной карточкой, как шаблоны Lumean.
+    print("\nСписок пресетов (viewPresets): целые и каждая часть — своей карточкой")
+    vsgen_body = function_body(index_html, "  const vsgenCardsHtml = vsItems => {")
+    check("vsgenCardsHtml() найдена", bool(vsgen_body), True)
+    check("карточка «Целые пресеты»", "title: 'Целые пресеты'" in vsgen_body, True)
+    check("каждая часть по PART_TITLES — своя карточка (не подзаголовок одного листа)",
+          "for (const [code, title] of PART_TITLES)" in vsgen_body
+          and "cards.push({title," in vsgen_body, True)
     check("деление идёт по полю scope (whole = full, остальное — частичные)",
           "i.scope === 'full'" in vsgen_body, True)
 
@@ -198,7 +196,11 @@ def main() -> int:
     check("fieldForm() найдена", bool(field_form), True)
     check("linkBar рисуется только у групп с частью и активным колбэком (не у формы "
           "проекта и не у частичного пресета — там onLinkChange не передают)",
-          "(g.part && onLinkChange) ? linkBarHtml(g) : ''" in field_form, True)
+          "(g.part && onLinkChange && !nameLinked) ? linkBarHtml(g) : ''" in field_form, True)
+    # С 22.09.2026 сценарий и обложку целый пресет выбирает по названию — у них ссылки
+    # на частичный нет, если она не осталась от прежнего (tests/test_preset_parts_by_name).
+    check("у сценария и обложки без старой ссылки — выбор по названию, без linkBar",
+          "(g.part === 'text' || g.part === 'cover') && g.link_id == null" in field_form, True)
     check("поля заблокированной группы получают disabled (select)",
           "(f.off || locked) ? ' disabled' : ''" in field_form, True)
     check("текстовые поля заблокированной группы тоже disabled",
