@@ -40,6 +40,10 @@ P_ERR_NET = "Ошибка: сеть недоступна (E-NET)"
 P_ERR_SAVE = "Ошибка: результат не сохранён (E-SAVE)"
 P_ERR_INTERNAL = "Ошибка: сбой обработки (E-INTERNAL)"
 P_ERR_FAILED = "Ошибка: задача не завершена (E-FAIL)"
+P_ERR_MODEL = (
+    "Ошибка: модель недоступна у провайдера — выберите другую модель "
+    "и запустите заново (E-MODEL)"
+)
 
 HEARTBEAT_SEC = 120
 
@@ -97,6 +101,14 @@ RE_LANG_DONE_ALT = re.compile(
 RE_LANG_PARTIAL = re.compile(r"^⚠️ (?P<lang>.+?): готово с \d+ ошибками")
 # «⚠️ {lang}: N чанков провалились — файл НЕ сохранён …»
 RE_LANG_FAILED = re.compile(r"^⚠️ (?P<lang>.+?): \d+ чанков провалились")
+# FIX-2026-09-13-length: жёлтые предупреждения о длине — задача успешна, текст короче.
+# Наружу — язык (по тем же правилам) и два числа слов; имя файла не выносим.
+# «⚠️ {lang}: текст короче исходника: N из M слов → file.txt»
+RE_LANG_SHORT = re.compile(
+    r"^⚠️ (?P<lang>.+?): текст короче исходника: (?P<n>\d+) из (?P<m>\d+) слов(?: →.*)?$"
+)
+# «⚠️ Текст короче цели: N из ~M слов» — генерация
+RE_GEN_SHORT = re.compile(r"^⚠️ Текст короче цели: (?P<n>\d+) из ~(?P<m>\d+) слов$")
 RE_GEN_DONE = re.compile(r"^🎬 Done:")
 RE_STOPPED = re.compile(r"^(?:⏹️|⛔)")
 RE_TASK_RETRY = re.compile(r"^🔁")
@@ -122,6 +134,8 @@ RE_SAVE_FAIL = re.compile(r"^❌ Не сохранён финальный скр
 KW_LIMIT = ("rate limit", "usage limit", "на лимите", "лимит", "429", "quota")
 KW_TIMEOUT = ("timeout", "таймаут", "stall", "истекло")
 KW_NET = ("disconnect", "connection", "сетевая ошибка", "network", "сеть")
+# FIX-2026-09-13-models: метка rewrite_core — провайдер не даёт саму модель.
+RE_MODEL_UNAVAILABLE = re.compile(r"\bCODEX_MODEL_UNAVAILABLE\b")
 
 
 def _classify_error(text: str) -> Optional[str]:
@@ -136,6 +150,9 @@ def _classify_error(text: str) -> Optional[str]:
       увидит, где именно пайплайн спотыкается.
     """
     low = text.lower()
+    # Раньше ключевых слов: в хвосте строки бывает кусок промпта со словом «лимит».
+    if RE_FAIL_MARKER.match(text) and RE_MODEL_UNAVAILABLE.search(text):
+        return P_ERR_MODEL
     if any(k in low for k in KW_LIMIT):
         return P_WAIT_LIMIT
     if RE_WAIT_MARKER.match(text):
@@ -236,6 +253,22 @@ class PublicLogFilter:
             lang = self._lang_or_empty(m.group("lang"))
             tail = "не удалось завершить (E-PART)"
             return f"{lang}: {tail}" if lang else f"Ошибка: {tail}"
+
+        m = RE_LANG_SHORT.match(text)
+        if m:
+            n, total = _num(m.group("n")), _num(m.group("m"))
+            if n is None or total is None:
+                return None
+            lang = self._lang_or_empty(m.group("lang"))
+            tail = f"текст короче исходника: {n} из {total} слов"
+            return f"{lang}: {tail}" if lang else f"Т{tail[1:]}"
+
+        m = RE_GEN_SHORT.match(text)
+        if m:
+            n, total = _num(m.group("n")), _num(m.group("m"))
+            if n is None or total is None:
+                return None
+            return f"Текст короче цели: {n} из ~{total} слов"
 
         if RE_GEN_DONE.match(text):
             return P_DONE

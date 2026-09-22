@@ -22,7 +22,8 @@
     Rewrite  sessions.db   users.user_id, sessions.user_id, api_keys.user_id,
                            user_keys.user_id
              job_queue.db  jobs.user_id, fair_queue_users.user_id,
-                           fair_queue_state.last_user_id
+                           fair_queue_state.last_user_id,
+                           create_intents.user_id
              файлы         presets/<uid>/, outputs/<uid>/, uploads/<uid>/
     Cover    cover_sessions.db    users.user_id, sessions.user_id
              cover_job_queue.db   jobs.user_id, api_keys.user_id
@@ -76,9 +77,17 @@ def services(base: str) -> list:
         Service("rewrite", os.path.join(base, "rewrite"),
                 dbs={"sessions.db": [("users", "user_id"), ("sessions", "user_id"),
                                      ("api_keys", "user_id"), ("user_keys", "user_id")],
+                     # create_intents приехала с ребейзом рерайта на боевой 18.09.
+                     # Это ключи повтора создания задачи: (user_id, scope, key_hash)
+                     # → job_id. Если не переписать здесь user_id, перенос сменит
+                     # владельца у задач, но не у ключей, `lookup_create` под новым id
+                     # ничего не найдёт — и тот же Idempotency-Key создаст ВТОРУЮ
+                     # ОПЛАЧЕННУЮ задачу. Молча: снаружи это выглядит как обычный
+                     # повтор. Ровно от этого идемпотентность и защищает.
                      "job_queue.db": [("jobs", "user_id"),
                                       ("fair_queue_users", "user_id"),
-                                      ("fair_queue_state", "last_user_id")]},
+                                      ("fair_queue_state", "last_user_id"),
+                                      ("create_intents", "user_id")]},
                 dirs=["presets", "outputs", "uploads"],
                 json_tables=[("job_queue.db", "jobs", "data")]),
         Service("cover", os.path.join(base, "cover"),

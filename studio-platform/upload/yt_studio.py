@@ -267,11 +267,18 @@ def open_account_menu(driver, wait=8):
         return !!av;
     """, SEL_ACCOUNTS["avatar_btn"])
     time.sleep(2)
+    # ИСПРАВЛЕНО 19.09.2026 (правка production от 14.09, срез live_2026-09-18):
+    # `arguments` внутри вложенной функции — это аргументы САМОЙ вложенной функции, а не
+    # скрипта. Сравнение `e.tagName === arguments[0]` брало первый аргумент колбэка
+    # (элемент), поэтому пункт «Switch account» не находился никогда: переключение
+    # канала и возврат вышедшего аккаунта молча не работали. Параметры скрипта теперь
+    # сохраняются в переменные сразу — это правило гайда «обязан сохранить».
     _js(driver, """
+        var menuTag = arguments[0], switchIcon = arguments[1];
         var sw = deepAll(document).filter(function(e){
           try {
-            return (e.tagName||'').toLowerCase() === arguments[0] &&
-                   e.data && e.data.icon && e.data.icon.iconType === arguments[1];
+            return (e.tagName||'').toLowerCase() === menuTag &&
+                   e.data && e.data.icon && e.data.icon.iconType === switchIcon;
           } catch(err) { return false; }
         })[0];
         if(sw) realClick(sw);

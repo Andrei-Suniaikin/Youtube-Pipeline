@@ -15,13 +15,15 @@ import json
 import os
 import sqlite3
 import sys
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(BASE, "server"))
 
 import preset_fields as PF                                        # noqa: E402
-from pub_engine import channel_presets, preset_settings           # noqa: E402
+import preset_links as PL                                         # noqa: E402
+from pub_engine import channel_presets                            # noqa: E402
 
 FAILS = []
 
@@ -35,9 +37,12 @@ def check(label, got, want):
 
 
 def fresh(settings=None) -> sqlite3.Connection:
+    # tenant_id — колонка настоящей таблицы `presets` (batch «Пресеты целые и
+    # частичные», фаза 1): `channel_presets` теперь идёт через `preset_links.resolve`,
+    # а её `_load_row` читает `tenant_id` вместе с настройками.
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
-    c.execute("CREATE TABLE presets(id INTEGER PRIMARY KEY, settings TEXT)")
+    c.execute("CREATE TABLE presets(id INTEGER PRIMARY KEY, tenant_id TEXT, settings TEXT)")
     if settings is not None:
         c.execute("INSERT INTO presets(id, settings) VALUES(1, ?)",
                   (json.dumps(settings, ensure_ascii=False),))
@@ -70,7 +75,12 @@ def main() -> int:
 
     c = fresh()
     c.execute("INSERT INTO presets(id, settings) VALUES(2, 'не json')")
-    check("битые настройки не роняют разбор", preset_settings(c, 2), {})
+    # `pub_engine.preset_settings` удалён (Minor 3 ревью цикла 2, обход `resolve`) —
+    # разбор пресета теперь только через `preset_links.resolve`; служебные `_`-ключи
+    # снимаем так же, как это уже делает `pub_services.PubServices.do_project_ready`.
+    resolved = PL.resolve(c, 2)
+    real = {k: v for k, v in resolved.items() if not str(k).startswith("_")}
+    check("битые настройки не роняют разбор", real, {})
 
     print("\nГолос по языку — правило «язык → провайдер → идентификатор»")
     check("запятыми", PF.parse_voice_map("ru: aaa, en: bbb"), {"ru": "aaa", "en": "bbb"})
@@ -95,12 +105,19 @@ def main() -> int:
         """Заглушка кабинета: описанию нужны только списки вариантов."""
         TTS_ENGINES = {"edge": ("Edge", "бесплатно"), "voicegencore": ("VGC", "ключ"),
                        "voicer": ("Voicer", "ключ"), "lumean": ("Lumean", "ключ")}
-        IMAGE_MODELS = {"OPENAI": ("OpenAI", "1 кр", "r"), "NARWHAL": ("NB2", "4 кр", "r")}
-        VIDEO_METHODS = {"veo": ("Veo", "", "v")}
+        # GROK/GROK_SPEED и grok — как в реальном main.py: остаются ключами движка,
+        # батч 16.09.2026 убирает их только из списка для человека (ниже).
+        IMAGE_MODELS = {"OPENAI": ("OpenAI", "1 кр", "r"), "NARWHAL": ("NB2", "4 кр", "r"),
+                        "GROK": ("Grok", "3 кр", "recrafter"),
+                        "GROK_SPEED": ("Grok Speed", "1 кр", "recrafter")}
+        VIDEO_METHODS = {"veo": ("Veo 3.1 — по умолчанию", "", "veo"),
+                         "flower": ("Flower · Veo 3.1", "1 кр", "recrafter"),
+                         "grok": ("Grok", "2–4 кр", "recrafter")}
         _QUALITY_OK = ("720p", "1080p")
         _MATERIAL_ORDERS = {"video_first", "images_first", "alternate"}
         _SUB_LANG_OK = {"Russian"}
         IMAGE_MODELS_WITH_SEED = {"NARWHAL"}
+        _LANG_NAMES = {"ru": "Русский", "en": "English", "pl": "Polski"}
 
     def voice_fields(engine):
         g = PF.describe(Cabinet, {"engine": engine})
@@ -137,6 +154,198 @@ def main() -> int:
     keys = PF.keys()
     for k in ("preset_rewrite", "preset_cover", "voice_by_lang", "voice"):
         check(f"поле {k} есть", k in keys, True)
+
+    print("\nБатч 16.09.2026: убрать из выбора не значит убрать из движка")
+
+    model_field = build_field("model", {"model": "GROK"})
+    model_values = [o["value"] for o in model_field["options"]]
+    check("GROK нет в списке моделей", "GROK" in model_values, False)
+    check("GROK_SPEED нет в списке моделей",
+          any(o["value"] == "GROK_SPEED" for o in model_field["options"]), False)
+    check("сохранённый GROK не потерялся описанием (value)",
+          model_field["value"], "GROK")
+
+    method_field = build_field("video_method", {"video_method": "grok"})
+    method_values = [o["value"] for o in method_field["options"]]
+    check("grok нет в списке методов клипов", "grok" in method_values, False)
+    method_titles = {o["value"]: o["title"] for o in method_field["options"]}
+    check("veo подписан провайдером NonStop", "NonStop" in method_titles["veo"], True)
+    check("flower подписан провайдером FastGen", "FastGen" in method_titles["flower"], True)
+    check("сохранённый grok не потерялся описанием (value)", method_field["value"], "grok")
+
+    aspect_field = build_field("aspect_ratio", {})
+    check("aspect_ratio — выпадающий список", aspect_field["kind"], "select")
+    check("aspect_ratio приходит с непустым списком вариантов",
+          len(aspect_field["options"]) > 0, True)
+    check("подписи ровно как в кабинете (main.py:4124)",
+          {o["value"]: o["title"] for o in aspect_field["options"]},
+          {"landscape": "Горизонтальное 16:9", "portrait": "Вертикальное 9:16",
+           "square": "Квадрат"})
+
+    check("custom_prompts убран из формы", "custom_prompts" in keys, False)
+    check("custom_prompts не встречается ни в одной группе",
+          any(f["key"] == "custom_prompts"
+              for g in PF.describe(Cabinet, {}) for f in g["fields"]), False)
+
+    voice_field = build_field("voice_by_lang", {"engine": "edge"})
+    check("voice_by_lang — карта по языкам", voice_field["kind"], "langmap")
+    check("языки берутся из _LANG_NAMES кабинета",
+          {o["value"] for o in voice_field["options"]}, {"ru", "en", "pl"})
+    # Решение владельца 17.09.2026: названия языков — полный список Rewrite Studio.
+    import types
+    fake_core = types.ModuleType("rewrite_core")
+    fake_core.LANGUAGES = {"Русский": "Russian", "Армянский": "Armenian",
+                           "Португальский": "Portuguese", "Клингонский": "Klingon"}
+    sys.modules["rewrite_core"] = fake_core
+    try:
+        rw_opts = build_field("voice_by_lang", {"engine": "edge"})["options"]
+    finally:
+        del sys.modules["rewrite_core"]
+    check("при загруженном Rewrite языки — его списком, в его порядке, с ISO-кодом",
+          [(o["value"], o["title"]) for o in rw_opts],
+          [("ru", "Русский (ru)"), ("hy", "Армянский (hy)"), ("pt", "Португальский (pt)")])
+    check("все языки настоящего Rewrite имеют ISO-код без коллизий",
+          len(set(PF.REWRITE_LANG_ISO.values())) == len(PF.REWRITE_LANG_ISO) == 46, True)
+    check("подсказка для обычного движка — про язык→провайдер→идентификатор",
+          "идентификатор" in voice_field["hint"], True)
+    lumean_hint = build_field("voice_by_lang", {"engine": "lumean"})["hint"]
+    check("подсказка для Lumean говорит про template_id, а не голос",
+          "template_id" in lumean_hint, True)
+    # Подпись поля обязана меняться вместе с подсказкой — иначе человек с Lumean
+    # по-прежнему читает в заголовке слово «голоса».
+    check("подпись поля для обычного движка — «Голоса по языкам»",
+          build_field("voice_by_lang", {"engine": "edge"})["label"], "Голоса по языкам")
+    check("подпись поля для Lumean — про пресеты, а не про голоса",
+          build_field("voice_by_lang", {"engine": "lumean"})["label"],
+          "Пресеты Lumean по языкам")
+
+    # Решение владельца 17.09.2026: подпись переключается сразу при смене движка —
+    # сервер отдаёт оба варианта, форма берёт нужный без сохранения.
+    both = build_field("voice_by_lang", {"engine": "edge"}).get("by_engine") or {}
+    check("оба варианта подписи отданы форме",
+          (both.get("lumean", {}).get("label"), both.get("other", {}).get("label")),
+          ("Пресеты Lumean по языкам", "Голоса по языкам"))
+    check("варианты не зависят от текущего движка",
+          build_field("voice_by_lang", {"engine": "lumean"}).get("by_engine"), both)
+    check("подсказка Lumean в варианте — про template_id",
+          "template_id" in both.get("lumean", {}).get("hint", ""), True)
+
+    # Язык, введённый в строку карты до появления этого выпадающего списка (или код,
+    # которого больше нет в _LANG_NAMES), не должен теряться на sync()/сохранении
+    # формы. Проверка со стороны описания — value поля
+    # остаётся сырой строкой без разбора и фильтрации по известным языкам: фильтрует
+    # список выбора JS (langOptionsHtml — стрей-пункт), а не describe().
+    stray_raw = "ru: id-1, pt-br: id-2"
+    stray_field = build_field("voice_by_lang", {"engine": "edge", "voice_by_lang": stray_raw})
+    check("значение с языком вне _LANG_NAMES не фильтруется описанием",
+          stray_field["value"], stray_raw)
+    check("parse_voice_map принимает код языка вне _LANG_NAMES как есть",
+          PF.parse_voice_map(stray_raw), {"ru": "id-1", "pt-br": "id-2"})
+
+    # Второй случай: если вариантов языка вообще нет
+    # (кабинет не поднят / _LANG_NAMES не прочитался), поле не должно рисоваться с
+    # пустым списком — иначе открытие и сохранение формы вычистило бы карту целиком.
+    # Защита та же, что уже стоит у kind == "select" (см. describe()).
+    class CabinetNoLangs(Cabinet):
+        _LANG_NAMES = {}
+
+    check("без вариантов языка поле langmap не рисуется (не вычищает карту при сохранении)",
+          "voice_by_lang" in {f["key"] for g in PF.describe(
+              CabinetNoLangs, {"voice_by_lang": stray_raw}) for f in g["fields"]},
+          False)
+
+    # Браузер собирает те же строки, что и раньше: два ряда виджета «язык + id» → та же
+    # строка "ru: id-1, en: id-2", которую как всегда разбирает parse_voice_map.
+    assembled = ", ".join(f"{lang}: {vid}" for lang, vid in
+                          (("ru", "id-1"), ("en", "id-2")))
+    check("карта голосов по-прежнему разбирается parse_voice_map после сборки браузером",
+          PF.parse_voice_map(assembled), {"ru": "id-1", "en": "id-2"})
+
+    print("\nСтатус моделей FastGen и провайдер в подписи (пункт 2.1 ТЗ; 18.09.2026 —"
+          " статус из снимка, провайдер у всех моделей)")
+
+    def image_options(cab):
+        for g in PF.describe(cab, {}):
+            for f in g["fields"]:
+                if f["key"] == "model":
+                    return {o["value"]: o["title"] for o in f["options"]}
+        return {}
+
+    class CabinetWithStatus(Cabinet):
+        # Провайдеры — как в настоящем main.py: recrafter получает статус, openai — нет.
+        IMAGE_MODELS = {"OPENAI": ("OpenAI", "1 кр", "recrafter"),
+                        "NARWHAL": ("Nano Banana 2 · Flow", "4 кр", "recrafter"),
+                        "GPT_IMAGE2": ("GPT Image 2.5", "платно · $", "openai")}
+
+        @staticmethod
+        def keys():
+            return {"googler": "fg_live_test"}
+
+        @staticmethod
+        def _first_credential(cfg, family):
+            return cfg.get(family, "")
+
+        @staticmethod
+        def fastgen_models_snapshot():
+            return {"checked": time.time(), "models": {"NARWHAL": "работает"}}
+
+    opts = image_options(CabinetWithStatus)
+    check("статус из снимка дописан у модели FastGen",
+          opts["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · FastGen · работает")
+    check("модель FastGen, которой нет в снимке, — «статуса нет», а не выдуманное «работает»",
+          opts["OPENAI"], "OpenAI · 1 кр · FastGen · статуса нет")
+    check("у GPT Image health-API нет — статус не дописан, но виден провайдер",
+          opts["GPT_IMAGE2"], "GPT Image 2.5 · платно · $ · OpenAI")
+
+    print("\n  форма открывается и когда снимка нет, и когда провайдер молчит")
+
+    class CabinetNoSnap(CabinetWithStatus):
+        @staticmethod
+        def fastgen_models_snapshot():
+            return {}
+
+        @staticmethod
+        def fastgen_status(key):
+            raise RuntimeError("сеть недоступна")
+
+    check("снимка нет и сеть молчит — форма открывается и не врёт",
+          image_options(CabinetNoSnap)["NARWHAL"],
+          "Nano Banana 2 · Flow · 4 кр · FastGen · статуса нет")
+
+    class CabinetNoKey(CabinetNoSnap):
+        @staticmethod
+        def keys():
+            return {}
+
+    check("ключа нет — то же самое, без исключений",
+          image_options(CabinetNoKey)["NARWHAL"],
+          "Nano Banana 2 · Flow · 4 кр · FastGen · статуса нет")
+
+    check("у кабинета без снимка и без fastgen_status форма всё равно собирается",
+          bool(image_options(Cabinet)), True)
+
+    print("\n  зависший провайдер не задерживает форму (жалоба владельца 18.09: раньше"
+          " живой опрос не укладывался в бюджет и статус не показывался никогда)")
+
+    class CabinetStatusHang(CabinetNoSnap):
+        @staticmethod
+        def fastgen_status(key):
+            time.sleep(30)                     # имитация зависшего провайдера
+            return {"models": [{"id": "NARWHAL", "txt": "работает"}]}
+
+    t0 = time.monotonic()
+    opts_hang = image_options(CabinetStatusHang)
+    elapsed = time.monotonic() - t0
+    check("статус честный, пока снимок не обновился",
+          opts_hang["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · FastGen · статуса нет")
+    check("форма собралась мгновенно, а не ждала провайдера", elapsed < 1.0, True)
+
+    # Старое поведение (ждать ответ прямо в форме) не должно вернуться: живой опрос
+    # занимает ~3.4с, и любое ожидание внутри describe() снова спрячет статус.
+    src = open(os.path.join(BASE, "server", "preset_fields.py"), encoding="utf-8").read()
+    body = src[src.index("def _fg_status_map(m):"):src.index("def _fg_refresh_async(m)")]
+    check("в пути формы нет ожидания ответа провайдера",
+          "wait(" in body or "join(" in body, False)
 
     print()
     if FAILS:

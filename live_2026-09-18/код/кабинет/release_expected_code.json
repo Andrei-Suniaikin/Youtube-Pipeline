@@ -1,0 +1,41 @@
+{
+  "vps": {
+    "/root/VideoStudio/server/main.py": "16bde6728ea9549825dd69c6359eafc9bafac271d8559a3ec24d479770e029b1",
+    "/root/VideoStudio/src/googler_worker.py": "b1cc68c6b0aa9029d9feb7cadaca112f2adf03e427df79cd57d03ab8888e1516",
+    "/root/VideoStudio/src/remote_generation_journal.py": "880da957eb770a3c4fd4563f767d2655b3f05359b11db225d5fe0d89bc7799d3",
+    "/root/VideoStudio/src/voicegencore_worker.py": "6595e76d2132aa02d73782b1d59e3eeec392275452eec021a5df2bfbdecf6ea0",
+    "/root/VideoStudio/src/remote_journal_vgc.py": "0b3b102902fffbaabe74328c9b799e2b234c8b5708e7ccf12cc6de13ff4fc3ac",
+    "/root/cover_tool/api_cover.py": "b472f7c8e6d3f534b5582333d59ab3ef588073ae0d7f7ea4a7f1105664e7ca98",
+    "/root/cover_tool/api_cover_helpers.py": "b6ab4e34fc5057311a0634963794ae8dff23df0b462055d4c95d2bb2ed2c5279",
+    "/root/cover_tool/cover_server.py": "57f0ea0be0819ef8b43d2a0798c5315173b6afd327b908629f5acdc86c7afd96",
+    "/root/cover_tool/cover_core.py": "8ec5aca8213069521024bc46d381d4325586352f39174be832876110bdadafad",
+    "/root/cover_tool/job_queue_cover.py": "58128c34c0ddcb9afe9f22d06383c460b0c5489263b3defaf6899cd5b35a88d4",
+    "/root/cover_tool/static/index.html": "37b9a56e8cc1a6cb9f55707bcfccd23858719070f36fefbeed9e968852052467",
+    "/root/cover_tool/cover_recovery.py": "8d8104dc730d1e5cefa87317bdc5fed0c8019269698201d6165328a3fbe759d7",
+    "/root/VideoStudio/server/auto_sound.py": "07edcffeba5f2b8fdd47efa67b21aff45c8b846b45c5ebc072b1bd9f44acdb50",
+    "/root/VideoStudio/server/render_narration.py": "dfcbe0a056eeb1b87b14e4276bbedd82ee54a9d2f526bd4ef1a7a52d840a1bf9",
+    "/root/VideoStudio/server/storage_admission.py": "22ceddd9eb8dc441f5edd90663e115e6c71d5f4f877e34cd3b2dc266422be5bb",
+    "/root/VideoStudio/server/pub_remote.py": "f9da6d95569ade0b6ba7f1f32b53aa527d4f9cbd777f1d0424818d22af82dacb",
+    "/root/VideoStudio/server/pub_services.py": "9300051321093e407fab61d7e1899c7deca0994ab69f6cbb99953313b454dca5",
+    "/root/VideoStudio/src/remote_cache_storage.py": "e69ff4116209f329c3538f1ace48c404b3bef59a1def05e49af1fc8375d641c1",
+    "/opt/video-studio-shared/credential_budget.py": "72a3dbf84a6ec5c9813de8f6103fc4c83025a1154208cc412ed3f4eba787fc61",
+    "/root/rewrite-server/api.py": "e1ec849f47c7d9c89a29d2d7f770c7d722a9243f55ff04eef40f93d8f1a3dd77",
+    "/root/rewrite-server/server.py": "3455c27fa359f3b35681d2f9690273992349819dc5e93359c7263657ad214433",
+    "/root/rewrite-server/job_queue.py": "1b9e90c839e7bb0332692f7471abda66ab6616448b6e4b3ebb7413e1f036fae9",
+    "/root/rewrite-server/job_idempotency.py": "f27ded14fb4c9c047722aeb4086e86a948384b8a0792e7eb45f994c0e77d6e23",
+    "/root/rewrite-server/rewrite_core.py": "08239982e796f37536ee2f6f897cfc9455182be61f83ee1ad58e7ae5429fd812",
+    "/root/rewrite-server/static/index.html": "751066cd0fdb236a2472476609257effee7747002f1cfc31a4603f3f26e8a2e1",
+    "/root/VideoStudio/server/source_retention.py": "3fd84d5a56541aeffe97e65e97d90d2e2549a8438c62ace35ca0961497e57714",
+    "/opt/video-studio-ops/storage_service.py": "280b506e9b74967c48cc3b6a18c1c0cd5264cfcbbd58a53eace3fae6252646ab",
+    "/opt/video-studio-ops/delivery_evidence.py": "4806ce1708966626332c6471be5fd96202708c1f3980f2ba64463d2295ef764f",
+    "/opt/video-ops-watchdog/watchdog.py": "31b3112f73248cef51cb9c079e76b9c7569cc2d612c9e517d2e16c7a41429da9",
+    "/opt/video-ops-watchdog/service_health.py": "414f496ae1e9d600ae1d89087c7cb9e89b3765fc49cba09c7ed077e7b428a227",
+    "/opt/video-studio-ops/backup_service.py": "dfeadfad5097125d0a387ce1704972d189eb5e7d19f761ecd725de9728efac1f"
+  },
+  "minsk": {
+    "/opt/video_agent/render_worker.py": "aac593ab9271273991ffd9f8e675f6f432476fa57b5c4f195406ab2db97534be",
+    "/opt/video_agent/render_puller.py": "c120b3857a9f6e42c0b091a28d72c18f11807c73f8784ec30a23a01559de509f",
+    "/opt/video_agent/render_delivery.py": "2ff34f096dfa7936e3b32d72427f9829c5a7e2b4b1a0a1e298f57448a25aa8ce",
+    "/opt/video_agent/render_narration.py": "dfcbe0a056eeb1b87b14e4276bbedd82ee54a9d2f526bd4ef1a7a52d840a1bf9"
+  }
+}

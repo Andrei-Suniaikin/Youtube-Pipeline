@@ -133,21 +133,34 @@ def many(form: dict, key: str) -> list:
 
 # ─────────────────────────── проверки ───────────────────────────
 
-def clean_uc(value: str) -> str:
+def clean_uc(value: str):
+    """Пустое значение — законный случай (пункт 6.1 ТЗ): канал иногда заводят раньше,
+    чем узнают его настоящий ID на YouTube. Пусто → None, а не "" — несколько пустых
+    строк в UNIQUE-колонке SQLite считает дублями, а несколько NULL — нет."""
     uc = (value or "").strip()
+    if not uc:
+        return None
     if not UC_RE.match(uc):
         raise ChannelError("ID канала должен быть вида UC и ещё 22 символа, например "
-                           "UCK8sQmJBp8GCxrOtXWBpyEA. Получено: " + (uc or "пусто"))
+                           "UCK8sQmJBp8GCxrOtXWBpyEA. Получено: " + uc)
     return uc
 
 
 def clean_schedule(times_raw: str, days: list) -> str:
     times = [t for t in re.split(r"[,\s]+", times_raw or "") if t]
+    picked_raw = [d for d in days if d in DAY_KEYS]
     if not times:
+        # Дни без времени — расписания не выходит: слот задаётся временем, и до
+        # 18.09.2026 такая форма молча сохранялась как «расписания нет» (владелец
+        # отметил дни, нажал «Сохранить» и увидел, что они не сохранились). Пустая
+        # форма целиком по-прежнему законна: так расписание и снимают.
+        if picked_raw:
+            raise ScheduleError("выбраны дни, но не задано время выходов — "
+                                "укажите время или снимите дни")
         return "{}"
     for t in times:
         parse_time(t)
-    picked = [d for d in days if d in DAY_KEYS]
+    picked = picked_raw
     schedule = {"*": times} if (not picked or len(picked) == 7) else {d: times for d in picked}
     normalize_schedule(schedule)
     return json.dumps(schedule, ensure_ascii=False)
@@ -268,7 +281,12 @@ def create_channel(c, tenant_id: str, uc: str, name: str, lang: str = "",
 
 
 def update_channel(c, tenant_id: str, cid: int, data: dict, now: float = None) -> None:
-    """Сохранить настройки канала. `data` — то, что вернул `read_channel_form`."""
+    """Сохранить настройки канала. `data` — то, что вернул `read_channel_form`.
+
+    UC сюда намеренно не входит: он «не меняется после создания» (см. комментарий в
+    `pub_schema.py`). Дописать пустой ID можно — но отдельной функцией `set_channel_uc`
+    ниже, а не через эту: та ничего не проверяет, кроме «поле раньше было пусто», а
+    все остальные поля формы настроек проверяет `read_channel_form`."""
     import time as _t
     now = _t.time() if now is None else now
     c.execute(
@@ -283,6 +301,44 @@ def update_channel(c, tenant_id: str, cid: int, data: dict, now: float = None) -
          data["preset_cover"], data["collaborator"], data["note"], now, cid, tenant_id))
 
 
+def set_channel_uc(c, tenant_id: str, cid: int, uc: str, now: float = None) -> None:
+    """Вписать ID YouTube каналу, у которого его ещё нет (дополнение 16.09, вопрос 1,
+    вариант «а»). Зовёт только пульт (`web/app.py`) со страницы канала, вкладка
+    «Настройки» — кабинет (`server/pub_ui.py` формы настроек, `register_pub_routes`)
+    эту возможность не получает по прямому указанию владельца: он работает с ID
+    исключительно в пульте.
+
+    Уже заданный UC — read-only навсегда: он определяет, куда льётся видео, и смена
+    задним числом означает ролик на чужом канале (прецедент, из-за которого и введено
+    правило «UC не меняется после создания», см. `pub_schema.py`). Поэтому запрет — на
+    сервере, а не только в интерфейсе: попытка поменять или стереть уже заданный ID
+    отклоняется здесь, а не молчаливо принимается, если фронт вдруг пришлёт поле.
+
+    Доработка ревьюера (code review, итерация 2, Issue 2): раньше проверка «ID ещё
+    пуст» и сама запись были двумя отдельными запросами — SELECT, потом UPDATE без
+    условия на uc. Два одновременных запроса (двойной клик, две вкладки) оба видели
+    uc IS NULL и оба писали, второй поверх первого. Решает сам UPDATE: он затрагивает
+    строку, только если uc там всё ещё NULL, — это атомарно в пределах одной операции
+    SQLite. Предварительный SELECT оставлен ради понятного «канал не найден».
+    """
+    import time as _t
+    now = _t.time() if now is None else now
+    row = c.execute("SELECT id FROM pub_channels WHERE id=? AND tenant_id=?",
+                    (cid, tenant_id)).fetchone()
+    if row is None:
+        raise ChannelError("канал не найден")
+    new_uc = clean_uc(uc)
+    if not new_uc:
+        raise ChannelError("ID канала должен быть вида UC и ещё 22 символа, например "
+                           "UCK8sQmJBp8GCxrOtXWBpyEA")
+    cur = c.execute(
+        "UPDATE pub_channels SET uc=?, updated=? WHERE id=? AND tenant_id=? AND uc IS NULL",
+        (new_uc, now, cid, tenant_id))
+    if cur.rowcount == 0:
+        raise ChannelError("у канала уже задан ID — его нельзя изменить или стереть")
+    c.commit()
+
+
 def set_channel_status(c, tenant_id: str, cid: int, status: str, now: float = None) -> None:
     if status not in STATUS_TITLES:
         raise ChannelError("неизвестный статус канала")
@@ -295,8 +351,21 @@ IMPORT_FIELDS = ("name", "handle", "lang", "niche", "profile_id", "host_id", "tz
 
 
 def read_import_row(item: dict) -> tuple:
-    """Строка переноса → (uc, только реально присланные поля)."""
-    uc = clean_uc(str(item.get("uc") or ""))
+    """Строка переноса → (uc, только реально присланные поля).
+
+    Дополнение 16.09, вопрос 2: канал без ID заводится ТОЛЬКО формой пульта
+    (`create_channel`), перенос списком такие строки отклоняет — как было до пункта
+    6.1. Причина: у `import_channels` сопоставление старой и новой строки идёт по
+    `uc` (`WHERE uc=?`), а SQL `NULL` никогда не равен `NULL` — при пустом ID перенос
+    не смог бы отличить повторную загрузку той же строки от новой и плодил бы
+    дубликаты канала при каждом повторе импорта.
+    """
+    uc_raw = str(item.get("uc") or "").strip()
+    if not uc_raw:
+        raise ChannelError("в строке переноса не задан ID канала — заведите канал без "
+                           "ID через форму в пульте, перенос списком таких строк не "
+                           "принимает")
+    uc = clean_uc(uc_raw)
     got = {k: str(item[k]).strip() for k in IMPORT_FIELDS
            if item.get(k) is not None and str(item[k]).strip() != ""}
     out = {}
@@ -496,6 +565,10 @@ text-align:left;background:none;border:0;color:var(--text);font-size:13px;paddin
 border-radius:7px;cursor:pointer;text-decoration:none;font-family:inherit}
 .pub-menu-body button:hover,.pub-menu-body a:hover{background:var(--surface2)}
 .pub-menu-sep{height:1px;background:var(--border);margin:4px 2px}
+/* Карточка «конвейер остановлен»: жёлтая, а не красная — это не поломка, а чьё-то
+   решение, и читать её надо целиком, поэтому текст, а не значок. */
+.pub-pause{border-color:#e0a33e}
+.pub-pause b{color:#e0a33e}
 </style>"""
 
 PUB_JS = """<script>
@@ -531,6 +604,34 @@ document.addEventListener('click',function(e){
   });
 });
 </script>"""
+
+
+def pause_card(story) -> str:
+    """Пауза конвейера — словами, на экране кабинета.
+
+    Раньше кабинет о ней молчал: выпуски просто стояли «ждём», и 187 штук простояли
+    так с 31.08 до 18.09. Карточка отвечает сразу на четыре вопроса: что именно
+    остановлено, с какого времени, кем и что держится этим прямо сейчас. Ничем не
+    управляет: снимают паузу в админ-панели и только после сухого прогона — иначе
+    экран кабинета стал бы вторым местом, откуда конвейер можно отпустить вслепую.
+    """
+    if not isinstance(story, dict) or not story.get("paused"):
+        return ""
+    held = story.get("holding") or {}
+    # Чужая персональная пауза текстов этому кабинету ничего не говорит. Показываем
+    # только то, что реально касается его работы, иначе карточку перестанут читать.
+    touches = bool(story.get("all") or story.get("providers")
+                   or story.get("blocks_my_texts")
+                   or (held.get("releases_mine") or 0))
+    if not touches:
+        return ""
+    lines = "".join(f'<div style="margin-top:6px">{e(line)}</div>'
+                    for line in (story.get("lines") or []))
+    return ('<div class="card pub-pause" style="margin-bottom:12px">'
+            '<b>Конвейер остановлен</b>' + lines
+            + '<div class=hint style="margin-top:8px">Снять паузу можно только в '
+              'админ-панели, и она сначала покажет сухим прогоном, сколько задач и '
+              'выпусков уйдёт в работу немедленно.</div></div>')
 
 
 def tile_menu(row, back: str) -> str:
@@ -610,6 +711,20 @@ def register_pub_routes(app, ctx):
     _now = ctx["_now"]
     web_user = ctx["web_user"]
     require_web_user = ctx["require_web_user"]
+    # Состояние рубильника живёт в main.py — оттуда и берём его описание словами.
+    # Ключа может не быть (старый вызов, тест со своим ctx): тогда карточки просто
+    # нет, но каналы показать это не мешает.
+    queue_pause_story = ctx.get("queue_pause_story")
+
+    def pause_block(u, tid: str) -> str:
+        if queue_pause_story is None:
+            return ""
+        try:
+            return pause_card(queue_pause_story(u["id"], tid))
+        except Exception:
+            # Объяснение паузы — важное, но не главное на экране: сбой в нём не
+            # должен прятать от владельца сами каналы.
+            return ""
 
     def _err_page(u, text, back="/channels"):
         body = _header(u, "channels") + f"""<div class=wrap>
@@ -663,7 +778,7 @@ def register_pub_routes(app, ctx):
             args += [needle] * 4
 
         c = db()
-        rows = c.execute(f"SELECT * FROM pub_channels WHERE {where}"
+        rows = c.execute(f"SELECT * FROM pub_channels_live WHERE {where}"
                          " ORDER BY lang, name COLLATE NOCASE", args).fetchall()
         now = _now()
         taken = plan_by_channel(c, tid, now - 86400, now + 92 * 86400)
@@ -673,7 +788,7 @@ def register_pub_routes(app, ctx):
             "SELECT lang, COUNT(*) n FROM pub_channels WHERE tenant_id=? AND status!='archived'"
             " AND lang IS NOT NULL AND lang!='' GROUP BY lang ORDER BY n DESC", (tid,)).fetchall()
         niches = c.execute(
-            "SELECT niche, COUNT(*) n FROM pub_channels WHERE tenant_id=? AND status!='archived'"
+            "SELECT niche, COUNT(*) n FROM pub_channels_live WHERE tenant_id=? AND status!='archived'"
             " AND niche IS NOT NULL AND niche!='' GROUP BY niche ORDER BY n DESC LIMIT 12",
             (tid,)).fetchall()
         own = all_tags(c, tid)
@@ -721,6 +836,7 @@ def register_pub_routes(app, ctx):
         opened = " open" if (tag or picked != ["active"]) else ""
         body = _header(u, "channels") + PUB_CSS + f"""<div class=wrap>
 <h1>Каналы <span class=muted style="font-size:14px;font-weight:400">{len(rows)}</span></h1>
+{pause_block(u, tid)}
 <div class=card>
   <form method=get action="/channels" style="display:flex;gap:8px;align-items:center;margin:0;flex-wrap:wrap">
     <input name=q value="{e(q)}" placeholder="название, ниша или ID канала" style="min-width:280px">
@@ -788,6 +904,12 @@ def register_pub_routes(app, ctx):
             if item:
                 rel_row = rels.get(item["id"])
                 text, color = release_look(rel_row, item["status"])
+                if rel_row is None and not row["uc"]:
+                    # Движок (pub_engine.materialize) намеренно не заводит выпуск на
+                    # канале без ID — «ждёт очереди» тут вводило бы в заблуждение,
+                    # выпуск и не начнёт заводиться, пока ID не появится. Цвет — из
+                    # уже существующего набора (см. `dot` ниже): это не сбой движка.
+                    text, color = "нет ID канала — выпуск не заводится", "muted"
                 dot = {"ok": "#5fa463", "err": "#c25a4e", "work": "var(--accent)",
                        "muted": "var(--muted)"}[color]
                 # Название донорского ролика, а не длинная ссылка. Клик ведёт в проект,
@@ -847,6 +969,7 @@ def register_pub_routes(app, ctx):
 <span class=muted style="font-size:13px">{e(lang_title(row['lang']))}{' · ' + e(row['niche']) if row['niche'] else ''}</span>
 <span style="flex:1"></span><a class="btn btn-ghost btn-sm" href="/channels">К списку</a></div>
 {err}
+{pause_block(u, tid)}
 <div class=panel style="margin-top:10px">
 <div class=panel-title>Ролики канала</div>
 <table class=pub-tab>
@@ -918,7 +1041,8 @@ placeholder="по одной ссылке в строке — разложу п�
 <form method=post action="/api/channels/create">
 <div class=panel>
 <div class=fld><label class=cap>ID канала</label>
-  <input name=uc placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" required style="width:320px;flex:none"></div>
+  <input name=uc placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" style="width:320px;flex:none">
+  <span class=hint>необязательно — можно завести канал раньше, чем узнаете его ID</span></div>
 <div class=fld><label class=cap>Название</label><input name=name required style="width:320px;flex:none"></div>
 <div class=fld><label class=cap>Язык / ниша</label>
   <input name=lang placeholder="pl" style="width:60px;flex:none">
@@ -948,7 +1072,7 @@ placeholder='[{"uc":"UC...","name":"Канал","lang":"pl","times":"10:00, 18:0
 
     def _load(u, cid):
         c = db()
-        row = c.execute("SELECT * FROM pub_channels WHERE id=? AND tenant_id=?",
+        row = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
                         (cid, _tid(u))).fetchone()
         c.close()
         return row
@@ -986,11 +1110,22 @@ placeholder='[{"uc":"UC...","name":"Канал","lang":"pl","times":"10:00, 18:0
         c.close()
 
         colors = {"error": "#c25a4e", "warn": "#e0a33e", "info": "var(--muted)"}
+        # Повтор одной и той же строки не заводит новую запись (pub_log.add): движок
+        # проверяет «ждём: …» каждые полминуты, и раньше эти повторы вытесняли из
+        # журнала всё остальное. Вместо стены — счётчик и время последнего раза.
+        def _repeat(r):
+            n = (r["repeats"] if "repeats" in r.keys() else 1) or 1
+            if n <= 1:
+                return ""
+            last = dt.datetime.fromtimestamp(r["last_ts"]).strftime("%d.%m %H:%M:%S")
+            return (f' <span class=muted style="font-size:12px">· повторилось {n} раз(а), '
+                    f'последний раз {last}</span>')
+
         rows = "".join(
             f'<tr><td style="width:120px;white-space:nowrap;color:var(--muted)">'
             f'{dt.datetime.fromtimestamp(r["ts"]).strftime("%d.%m %H:%M:%S")}</td>'
             f'<td style="width:110px;color:{colors.get(r["level"], "var(--muted)")}">'
-            f'{e(r["step"])}</td><td>{e(r["message"])}</td></tr>'
+            f'{e(r["step"])}</td><td>{e(r["message"])}{_repeat(r)}</td></tr>'
             for r in lines) or ('<tr><td colspan=3><span class=muted>записей пока нет</span>'
                                 '</td></tr>')
 

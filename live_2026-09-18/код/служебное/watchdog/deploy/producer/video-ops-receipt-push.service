@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry VideoStudio exact upload receipts to VPS
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+UMask=0077
+WorkingDirectory=%h/VideoStudio
+ExecStart=/usr/bin/env python3 %h/VideoStudio/tools/video_ops_watchdog/receipt_io.py push --outbox %h/.local/state/video-ops-receipts/outbox --target video-ops-receipts-vps
+TimeoutStartSec=3min
+

@@ -142,7 +142,7 @@ GENERATION_OPTIONS = [
     ("Nano Banana Pro (VeoNonStop)", "veo", "GEM_PIX_2"),
     ("Nano Banana 2 (VeoNonStop)", "veo", "NARWHAL"),
     ("Nano Banana 2 Lite (VeoNonStop)", "veo", "HARBOR_SEAL"),
-    ("GPT-Image-2 low (OpenAI)", "gpt_image2", ""),
+    ("GPT Image 2.5 low (OpenAI)", "gpt_image2", ""),
 ]
 THUMBNAIL_URLS = [
     "https://img.youtube.com/vi/{vid}/maxresdefault.jpg",
@@ -553,13 +553,77 @@ def _acquire_cancelable(semaphore, cancel_check=None, step: float = 0.25) -> boo
             return True
 
 
-def _openai_client(api_key: str):
-    """Клиент OpenAI с кэшированием (один клиент на ключ, потокобезопасно)."""
+def _chat_route(api_key: str, model: str):
+    """Клиент, модель и фактический ключ для вызова модели у обложек.
+
+    Одна точка на все три места (зрение, адаптация текста, сцена по названию): разойдясь,
+    они молча дают разный маршрут, и починка одного не чинит остальные — ровно это и
+    случилось 21.09.
+    """
+    base, alt_key, alt_model = _alt_chat_route()
+    if base:
+        # Модель берётся ЕГО: у стороннего провайдера свой список, и модели OpenAI там
+        # может не быть вовсе — тогда каждый вызов вернул бы 400.
+        return _openai_client(alt_key, base), (alt_model or model), alt_key
+    return _openai_client(api_key), model, api_key
+
+
+def _openai_client(api_key: str, base_url: str = ""):
+    """Клиент OpenAI с кэшированием (один клиент на пару ключ+адрес, потокобезопасно)."""
+    # 21.09.2026: пакета openai в окружении не было, и анализ обложки падал здесь
+    # с `NameError: name 'openai' is not defined` — сообщением, по которому нельзя
+    # понять ни что сломано, ни что делать. Флаг OPENAI_AVAILABLE при этом честно
+    # выставлялся импортом и не читался НИГДЕ. Теперь читается.
+    if not OPENAI_AVAILABLE:
+        raise RuntimeError(
+            "не установлен пакет openai — анализ и генерация обложек через OpenAI "
+            "невозможны. Деньги не потрачены, повтор не поможет. "
+            "Лечится установкой: .venv/bin/pip install openai"
+        )
     with _openai_clients_lock:
-        if api_key not in _openai_clients:
+        ck = (api_key, base_url or "")
+        if ck not in _openai_clients:
             http_client = httpx.Client() if httpx is not None else None
-            _openai_clients[api_key] = openai.OpenAI(api_key=api_key, http_client=http_client)
-        return _openai_clients[api_key]
+            kw = {"api_key": api_key, "http_client": http_client}
+            if base_url:
+                kw["base_url"] = base_url
+            _openai_clients[ck] = openai.OpenAI(**kw)
+        return _openai_clients[ck]
+
+
+def _alt_chat_route():
+    """Куда слать ЛЮБОЙ вызов модели у обложек: (адрес, ключ, модель) либо пусто.
+
+    Имя сперва было `_alt_vision_route`, и это оказалось ловушкой: маршрут применили
+    только к зрению, а `adapt_text` и `generate_scene_from_title` остались ходить в
+    OpenAI напрямую. 21.09 это стоило владельцу готовой обложки — анализ прошёл через
+    прокси, распознал текст и стиль, а следующий же шаг «Адаптация текста» упал с
+    429 «You have no credits remaining», и задача завершилась частично, без файла.
+
+    21.09.2026: у счёта OpenAI ноль, а весь анализ обложки в этом форке ходит ТОЛЬКО
+    в OpenAI — Gemini-SDK удалён в v1.0.3, и provider="google" молча падает обратно
+    на него. То есть без денег обложка «новой сценой» невозможна в принципе.
+
+    В бою эта развилка уже решена теми же тремя переменными (COVER_ALT_*): анализ
+    уходит на сторонний OpenAI-совместимый прокси, который умеет зрение. Берём тот же
+    путь, а не изобретаем свой.
+
+    Ключ обязан ехать вместе с адресом. Задать чужой адрес и оставить ключ OpenAI —
+    значит отправить секрет туда, где он не предназначен, и никогда об этом не узнать,
+    поэтому адрес без ключа игнорируется целиком, а вызывающий об этом кричит.
+    """
+    base = (os.environ.get("COVER_ALT_BASE_URL") or "").strip().rstrip("/")
+    key = (os.environ.get("COVER_ALT_API_KEY") or "").strip()
+    model = (os.environ.get("COVER_ALT_MODEL") or "").strip()
+    if not base:
+        return ("", "", "")
+    if not key:
+        raise RuntimeError(
+            "COVER_ALT_BASE_URL задан без COVER_ALT_API_KEY: ключ OpenAI чужому "
+            "провайдеру не отправляется. Денег это не стоило, повтор не поможет. "
+            "Задайте ключ этого провайдера или уберите адрес."
+        )
+    return (base, key, model)
 
 
 def _call_openai_vision(image, prompt: str, api_key: str, model: str) -> str:
@@ -570,8 +634,8 @@ def _call_openai_vision(image, prompt: str, api_key: str, model: str) -> str:
     for im in images:
         b64 = image_to_base64(im, "PNG")
         content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
-    client = _openai_client(api_key)
-    with _provider_semaphore_for_key("openai", api_key):
+    client, model, used_key = _chat_route(api_key, model)
+    with _provider_semaphore_for_key("openai", used_key):
         resp = client.chat.completions.create(
             model=model or DEFAULT_ANALYSIS_MODEL_OPENAI,
             messages=[{"role": "user", "content": content}],
@@ -721,8 +785,8 @@ def generate_scene_from_title(
     )
     user = f"Title: {title.strip()}\n\nExtra details: {(extra_prompt or '').strip() or '(none)'}"
 
-    client = _openai_client(openai_api_key)
-    with _provider_semaphore_for_key("openai", openai_api_key):
+    client, model_name, used_key = _chat_route(openai_api_key, model_name)
+    with _provider_semaphore_for_key("openai", used_key):
         resp = client.chat.completions.create(
             model=model_name,
             messages=[
@@ -757,10 +821,10 @@ def adapt_text(original_text: str, target_language: str, api_key: str, video_tit
     system_template = _active_prompts().get("adapt_text_system_template") or get_default_prompt("adapt_text_system_template")
     video_title_val = (video_title or "").strip() or "(not provided)"
     system_content = system_template.replace("{video_title}", video_title_val).replace("{target_language}", target_language)
-    client = _openai_client(api_key)
-    with _provider_semaphore_for_key("openai", api_key):
+    client, _model, used_key = _chat_route(api_key, GPT_MODEL)
+    with _provider_semaphore_for_key("openai", used_key):
         resp = client.chat.completions.create(
-            model=GPT_MODEL,
+            model=_model,
             messages=[
                 {"role": "system", "content": system_content},
                 {"role": "user", "content": original_text}
@@ -1133,6 +1197,12 @@ VEO_BASE_URL = os.environ.get("VEO_BASE_URL", "https://veononstop.org/api/v1")  
 VEO_BANANA_TIMEOUT = int(os.environ.get("VEO_BANANA_TIMEOUT", "600"))  # СИНХРОННЫЙ endpoint: POST держит соединение до готовности
 VEO_RETRY_DELAY = 3            # плоская пауза между попытками (капча у провайдера не лечится backoff'ом)
 GPT_IMAGE2_TIMEOUT = 180
+# 17.09.2026: модель та же, что у кадров VideoStudio (`workers/googler_worker.py`,
+# GPT_IMAGE_MODEL): "gpt-image-2.5" без суффикса у OpenAI нет, владелец выбрал sunburst.
+# Внутренний id провайдера `gpt_image2` не меняется — он лежит в пресетах и задачах.
+# Размеры 1536x1024 / 1024x1536 сняты под gpt-image-2 и под 2.5 не перепроверены.
+GPT_IMAGE_MODEL = (os.environ.get("COVER_GPT_IMAGE_MODEL")
+                   or os.environ.get("VS_GPT_IMAGE_MODEL") or "gpt-image-2.5-sunburst")
 
 # xAI напрямую (официальный API Grok). Ключ xai-..., отдельный от Fast Gen.
 XAI_BASE_URL = "https://api.x.ai/v1"
@@ -1208,14 +1278,14 @@ def _generate_via_gpt_image2(
     max_retries: int = None, log_fn=None,
     reference_images: Optional[List[str]] = None, cancel_check=None,
 ) -> Optional[Image.Image]:
-    """OpenAI gpt-image-2 НАПРЯМУЮ (платно ~$0.006/шт, quality=low фиксирован).
+    """OpenAI GPT_IMAGE_MODEL НАПРЯМУЮ (платно, quality=low фиксирован; цена не перепроверена под 2.5).
     generate-only: референсы не поддерживаются — предупреждаем и генерим без них."""
     log = log_fn or (lambda m: None)
     if reference_images:
-        log("[gpt-image-2] референсы не поддерживаются (generate-only) — генерирую без референса")
+        log(f"[{GPT_IMAGE_MODEL}] референсы не поддерживаются (generate-only) — генерирую без референса")
     ar = _v6_aspect(aspect_ratio)
     size = {"16:9": "1536x1024", "9:16": "1024x1536"}.get(ar, "1024x1024")
-    body = {"model": "gpt-image-2", "prompt": prompt, "size": size,
+    body = {"model": GPT_IMAGE_MODEL, "prompt": prompt, "size": size,
             "quality": "low", "n": 1, "output_format": "jpeg"}
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     attempts = max(1, max_retries or 3)
@@ -1232,27 +1302,27 @@ def _generate_via_gpt_image2(
             finally:
                 openai_semaphore.release()
             if r.status_code in (401, 403):
-                log(f"[gpt-image-2] auth {r.status_code}: OpenAI ключ неверный/без доступа — ретраи бессмысленны")
+                log(f"[{GPT_IMAGE_MODEL}] auth {r.status_code}: OpenAI ключ неверный/без доступа — ретраи бессмысленны")
                 return None
             if r.status_code == 200:
                 data = (r.json() or {}).get("data") or []
                 b64 = data[0].get("b64_json") if data else None
                 if b64:
                     return Image.open(BytesIO(base64.b64decode(b64))).convert("RGB")
-                log(f"[gpt-image-2] попытка {attempt}/{attempts}: пустой ответ")
+                log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: пустой ответ")
                 return None
             if r.status_code != 429:
                 # 4xx/5xx мог прийти после принятия платной операции; без
                 # idempotency key не создаём возможный дубль.
-                log(f"[gpt-image-2] попытка {attempt}/{attempts}: HTTP {r.status_code}: {r.text[:200]}")
+                log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: HTTP {r.status_code}: {r.text[:200]}")
                 return None
             else:
-                log(f"[gpt-image-2] попытка {attempt}/{attempts}: HTTP {r.status_code}: {r.text[:200]}")
+                log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: HTTP {r.status_code}: {r.text[:200]}")
         except requests.exceptions.Timeout:
-            log(f"[gpt-image-2] попытка {attempt}/{attempts}: таймаут {GPT_IMAGE2_TIMEOUT}с")
+            log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: таймаут {GPT_IMAGE2_TIMEOUT}с")
             return None
         except Exception as e:
-            log(f"[gpt-image-2] попытка {attempt}/{attempts}: {e}")
+            log(f"[{GPT_IMAGE_MODEL}] попытка {attempt}/{attempts}: {e}")
             return None
         if attempt < attempts and _interruptible_sleep(3, cancel_check):
             return None
@@ -1595,7 +1665,7 @@ def _generate_via_fast_gen_inner(
 # оплачивал обложку второй раз. Порядок обязателен: reserve() до провайдера →
 # ordered() как только известен id заказа → delivered() когда файл записан.
 #
-# Синхронные провайдеры (veononstop, gpt-image-2, xai) id заказа не выдают: у них
+# Синхронные провайдеры (veononstop, gpt_image2, xai) id заказа не выдают: у них
 # шаг ordered() пропускается, а «заказ создан» выводится из самого факта запроса.
 
 # Единственный dispatch с id заказа и опросом статуса — Fast Gen v6. Всё остальное
@@ -1684,7 +1754,7 @@ def _journaled_generate(
     except Exception:                                                 # noqa: BLE001
         dispatch = ""
     # Соотношение сторон обязано быть в отпечатке: 16:9 и 9:16 — разные картинки и разная
-    # цена. Известный дефект gpt-image-2 (16:9 → 1536x1024, то есть 3:2) здесь НЕ чиним —
+    # цена. Известный дефект gpt_image2 (16:9 → 1536x1024, то есть 3:2) здесь НЕ чиним —
     # пишем то соотношение, которое реально ушло в вызов.
     fingerprint = journal.fingerprint(
         provider=provider, model=model, prompt=prompt, lang=lang,
@@ -1796,7 +1866,25 @@ def check_simple_result(
     читаемый и без артефактов. Возвращает (passed, details)."""
     template = _active_prompts().get("simple_check_prompt_template") or get_default_prompt("simple_check_prompt_template")
     prompt = template.replace("{language}", language or "")
-    raw = _call_vision([original, generated], prompt, provider, model, "", openai_api_key)
+    try:
+        raw = _call_vision([original, generated], prompt, provider, model, "", openai_api_key)
+    except Exception as exc:                                       # noqa: BLE001
+        # 21.09.2026: проверка НЕ СМОГЛА состояться — это не провал проверки.
+        # Картинка к этому моменту уже сгенерирована и оплачена (FastGen), а контролёр
+        # ходит в OpenAI. Когда у OpenAI кончились кредиты, исключение улетало наверх и
+        # уносило с собой оплаченный результат — ровно то, против чего ниже в
+        # `_generate_simple_edit` стоит подпись «анти cost-drain».
+        #
+        # Ниже по коду уже принято правило «QC не распарсился → не блокируем сохранение:
+        # retry дороже, чем один неидеальный текст». Здесь тот же случай, только причина
+        # другая, и ответ обязан быть тем же. Повтор тут бессмыслен вдвойне: от второй
+        # попытки контролёр не починится, а каждая попытка — новая оплаченная генерация.
+        #
+        # `checked: False` отличает «проверили и всё хорошо» от «проверить не смогли» —
+        # вызывающий обязан сказать человеку правду, а не нарисовать зелёную галочку.
+        return True, {"overall_pass": True, "checked": False,
+                      "issues": f"проверка текста не выполнена: {type(exc).__name__}: "
+                                f"{exc}"[:300]}
     result = _parse_json_response(raw)
     if not result:
         # QC не распарсился — не блокируем сохранение (retry дороже, чем один неидеальный текст)
@@ -2043,7 +2131,15 @@ def _generate_simple_edit(
         )
         result.check_result = details
         if passed:
-            log("   ✅ Проверка пройдена")
+            if details.get("checked") is False:
+                # Зелёная галочка тут была бы враньём: картинку отдаём, но человек
+                # должен знать, что текст на ней автоматически никто не сверял.
+                log(f"   ⚠ {details.get('issues') or 'проверка текста не выполнена'}")
+                log("   Картинка сохранена: она уже оплачена, и выбрасывать её "
+                    "из-за неработающего контролёра нельзя.")
+                result.used_fallback = True
+            else:
+                log("   ✅ Проверка пройдена")
             result.image = generated
             result.success = True
             return result

@@ -1,0 +1,176 @@
+[
+  {
+    "profile": "21",
+    "port": 33939,
+    "checked_at_utc": "2026-09-13T20:49:56.805730+00:00",
+    "dom": {
+      "url": "https://studio.youtube.com/channel/UCmRLVcKRR0YaWQApNNZMzOA/videos/upload?filter=%5B%5D&sort=%7B%22columnType%22%3A%22date%22%2C%22sortOrder%22%3A%22DESCENDING%22%7D",
+      "hosts": [
+        {
+          "host": {
+            "tag": "YTCP-AUTH-CONFIRMATION-DIALOG",
+            "id": "",
+            "role": null,
+            "rect": {
+              "width": 1556,
+              "height": 0
+            },
+            "hidden": false,
+            "opened": null,
+            "opened_attr": false,
+            "display": "flex",
+            "visibility": "visible"
+          },
+          "text": "Verify it's you\n\nTo continue, we need to confirm it’s really you. This extra layer of security helps keep your account safe.\n\nLearn more\nNext",
+          "children": [
+            {
+              "tag": "YTCP-CONFIRMATION-DIALOG",
+              "id": "confirmation-dialog",
+              "role": null,
+              "rect": {
+                "width": 1556,
+                "height": 0
+              },
+              "hidden": false,
+              "opened": null,
+              "opened_attr": false,
+              "display": "flex",
+              "visibility": "visible"
+            }
+          ],
+          "descendants": [
+            {
+              "tag": "YTCP-CONFIRMATION-DIALOG",
+              "id": "confirmation-dialog",
+              "role": null,
+              "rect": {
+                "width": 1556,
+                "height": 0
+              },
+              "hidden": false,
+              "opened": null,
+              "opened_attr": false,
+              "display": "flex",
+              "visibility": "visible"
+            },
+            {
+              "tag": "YTCP-DIALOG",
+              "id": "dialog",
+              "role": null,
+              "rect": {
+                "width": 1556,
+                "height": 0
+              },
+              "hidden": false,
+              "opened": true,
+              "opened_attr": false,
+              "display": "block",
+              "visibility": "visible"
+            },
+            {
+              "tag": "TP-YT-PAPER-DIALOG",
+              "id": "dialog",
+              "role": "dialog",
+              "rect": {
+                "width": 576,
+                "height": 200
+              },
+              "hidden": false,
+              "opened": true,
+              "opened_attr": false,
+              "display": "flex",
+              "visibility": "visible"
+            }
+          ]
+        }
+      ]
+    }
+  },
+  {
+    "profile": "55",
+    "port": 36923,
+    "checked_at_utc": "2026-09-13T20:49:56.808591+00:00",
+    "dom": {
+      "url": "https://studio.youtube.com/channel/UC6FO-4FFLg4wANGdECL9ssQ/videos/upload?filter=%5B%5D&sort=%7B%22columnType%22%3A%22date%22%2C%22sortOrder%22%3A%22DESCENDING%22%7D",
+      "hosts": [
+        {
+          "host": {
+            "tag": "YTCP-AUTH-CONFIRMATION-DIALOG",
+            "id": "",
+            "role": null,
+            "rect": {
+              "width": 1556,
+              "height": 0
+            },
+            "hidden": false,
+            "opened": null,
+            "opened_attr": false,
+            "display": "flex",
+            "visibility": "visible"
+          },
+          "text": "Verify it's you\n\nTo continue, we need to confirm it’s really you. This extra layer of security helps keep your account safe.\n\nLearn more\nNext",
+          "children": [
+            {
+              "tag": "YTCP-CONFIRMATION-DIALOG",
+              "id": "confirmation-dialog",
+              "role": null,
+              "rect": {
+                "width": 1556,
+                "height": 0
+              },
+              "hidden": false,
+              "opened": null,
+              "opened_attr": false,
+              "display": "flex",
+              "visibility": "visible"
+            }
+          ],
+          "descendants": [
+            {
+              "tag": "YTCP-CONFIRMATION-DIALOG",
+              "id": "confirmation-dialog",
+              "role": null,
+              "rect": {
+                "width": 1556,
+                "height": 0
+              },
+              "hidden": false,
+              "opened": null,
+              "opened_attr": false,
+              "display": "flex",
+              "visibility": "visible"
+            },
+            {
+              "tag": "YTCP-DIALOG",
+              "id": "dialog",
+              "role": null,
+              "rect": {
+                "width": 1556,
+                "height": 0
+              },
+              "hidden": false,
+              "opened": true,
+              "opened_attr": false,
+              "display": "block",
+              "visibility": "visible"
+            },
+            {
+              "tag": "TP-YT-PAPER-DIALOG",
+              "id": "dialog",
+              "role": "dialog",
+              "rect": {
+                "width": 576,
+                "height": 200
+              },
+              "hidden": false,
+              "opened": true,
+              "opened_attr": false,
+              "display": "flex",
+              "visibility": "visible"
+            }
+          ]
+        }
+      ]
+    }
+  }
+]

@@ -6,6 +6,7 @@ Rewrite Server — FastAPI-сервер для выполнения очеред
 
 import os
 import json
+import hashlib
 import re
 import time
 import io
@@ -41,6 +42,8 @@ JOB_LOG_MAX_BYTES = int(os.environ.get("REWRITE_JOB_LOG_MAX_BYTES", 20 * 1024 * 
 LOG_PUBLIC_ENABLED = os.environ.get(
     "REWRITE_LOG_PUBLIC", "1"
 ).strip().lower() not in {"0", "false", "no", "off"}
+# FIX-2026-09-13-short-gen: генерация короче цели больше чем на 30% → жёлтое предупреждение.
+GEN_SHORT_TARGET_RATIO = float(os.environ.get("REWRITE_GEN_SHORT_RATIO", "0.70"))
 
 # Создаём директории
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -49,6 +52,7 @@ PRESETS_DIR.mkdir(parents=True, exist_ok=True)
 STATIC_DIR.mkdir(parents=True, exist_ok=True)
 
 # Импорт ядра (без tkinter)
+from job_idempotency import identity as create_identity, bind as bind_create, lookup as lookup_create, IdempotencyError, snapshot_inputs, file_hash
 from job_queue import Job, JobQueue, JobWorker, JobType, JobStatus
 import rewrite_core
 from rewrite_core import (
@@ -59,6 +63,8 @@ from rewrite_core import (
     STOP_FLAG,
     SAFE_TEXT_SUPPLEMENT,
     make_output_filename,
+    read_file_as_text,
+    output_shorter_than_source,
     LANGUAGES,
     get_keys_config,
     save_keys_config,
@@ -85,6 +91,12 @@ from rewrite_core import (
     get_allowed_openai_models,
     get_allowed_claude_models,
     get_allowed_codex_models,
+    CODEX_MODEL_UNAVAILABLE_PREFIX,
+    codex_model_unavailable_message,
+    codex_model_admission_error,
+    server_key_model_error,
+    model_unavailable_reason,
+    pop_model_unavailable,
     provider_user_allowed,
     classify_provider,
     preflight_server_credential_pools,
@@ -133,7 +145,10 @@ def _add_job_for_active_user(job: Job) -> str:
     user_id = job.user_id or ADMIN_USER_ID
     if not license_mgr.is_user_active(user_id):
         raise HTTPException(status_code=403, detail="account is disabled")
-    job_id = queue.add_job(job)
+    try:
+        job_id = queue.add_job(job)
+    except IdempotencyError as exc:
+        raise HTTPException(exc.status, str(exc)) from exc
     if not license_mgr.is_user_active(user_id):
         queue.cancel_jobs_for_user(user_id)
         raise HTTPException(status_code=403, detail="account is disabled")
@@ -232,6 +247,13 @@ def _run_task_with_resume(attempts, backoff, log_q, stop_event, user_id, fn, *ar
         except Exception:
             ok = False
         if ok or STOP_FLAG.is_stopped():
+            return res
+        # FIX-2026-09-13-models: провайдер не даёт модель задачи — новый круг даст
+        # тот же отказ, вызовы на него не тратим.
+        if model_unavailable_reason(getattr(stop_event, "_rewrite_job_id", "")):
+            return res
+        from rewrite_core import host_budget_wait_until
+        if host_budget_wait_until(getattr(stop_event, "_rewrite_job_id", "")):
             return res
         if _att < attempts - 1:
             try:
@@ -371,8 +393,9 @@ def _resolve_studio_model(model: str, user_id: str) -> str:
     allowed = sorted(get_allowed_codex_models())
     if not allowed:
         return selected
+    # FIX-2026-09-13-models: по умолчанию живая terra, а не снятая gpt-5.4.
     preferred = os.environ.get(
-        "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.4"
+        "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-terra"
     ).strip()
     return preferred if preferred in allowed else allowed[0]
 
@@ -391,6 +414,10 @@ def _validate_model_admission(model: str, user_id: str) -> tuple:
         raise HTTPException(
             status_code=403, detail="provider is not enabled for this account"
         )
+    # FIX-2026-09-17-server-models: на серверных ключах — только модели из списка.
+    server_model_error = server_key_model_error(model, user_id)
+    if server_model_error:
+        raise HTTPException(status_code=422, detail=server_model_error)
     if model_is_claude:
         if model not in get_allowed_claude_models():
             raise HTTPException(
@@ -524,9 +551,24 @@ def _execute_job_common(job: Job, job_fn):
     drain_thread = threading.Thread(target=drain_log, daemon=True)
     drain_thread.start()
     try:
+        # FIX-2026-09-13-length: предупреждение прошлого запуска не переживает повтор — сброс
+        # до любой ранней остановки (проверка модели, provider_guard), иначе старая жёлтая
+        # плашка «текст короче» закрывает настоящую причину ошибки; воркер выставит новое.
+        job.warning = ""
         if not provider_guard(classify_provider(job.model)):
             job.status = JobStatus.CANCELLED.value
             job.error = "Аккаунт отключён или остановка запрошена"
+            return
+        # FIX-2026-09-13-models: сюда же приходят «Повторить» и авто-возобновление
+        # после рестарта. Модель берётся из задачи — сверяем её со списком заново и
+        # отказываем понятно, а не «422: Codex model is not allowed by server policy».
+        _model_error = codex_model_admission_error(job.model) or server_key_model_error(
+            job.model, job.user_id or ""
+        )
+        if _model_error:
+            log_queue.put(f"❌ {CODEX_MODEL_UNAVAILABLE_PREFIX}: {_model_error}")
+            job.status = JobStatus.FAILED.value
+            job.error = _model_error
             return
         _claude, _codex, runtime_oauth_tokens = _validate_model_admission(
             job.model, job.user_id or ""
@@ -543,6 +585,11 @@ def _execute_job_common(job: Job, job_fn):
         # Per-job inner concurrency is a server policy, never a tenant input.
         job.max_threads = REWRITE_MAX_THREADS_PER_JOB
         job_fn(job, log_queue, stop_event)
+        # FIX-2026-09-13-models: генерация кладёт в job.error сырой ответ провайдера —
+        # для отказа в модели показываем понятную причину.
+        if CODEX_MODEL_UNAVAILABLE_PREFIX in (job.error or ""):
+            job.error = codex_model_unavailable_message(job.model)
+            log_queue.put(f"❌ {CODEX_MODEL_UNAVAILABLE_PREFIX}: {job.error}")
     except Exception as e:
         job.error = str(e)
         job.status = JobStatus.FAILED.value
@@ -626,7 +673,8 @@ def _execute_generation_job(job: Job):
         except (TypeError, ValueError):
             chunk_override = None
 
-        preset = _preset_manager_for(job.user_id or ADMIN_USER_ID).get_preset(preset_id)  # B1: пресет владельца задачи
+        preset = (Preset.from_dict(payload["preset_snapshot"]) if payload.get("preset_snapshot") else
+                  _preset_manager_for(job.user_id or ADMIN_USER_ID).get_preset(preset_id))
         if not preset:
             job.error = f"preset not found: {preset_id}"
             job.status = JobStatus.FAILED.value
@@ -696,6 +744,13 @@ def _execute_generation_job(job: Job):
                     _fmsgs, api_key_effective, model, log_queue, "gen-funnel",
                     provider=provider, oauth_token=_primary_oauth_token,
                 )
+                # FIX-2026-09-13-models: модель снята у провайдера — ни ретрай воронки,
+                # ни сама генерация не пройдут, останавливаем задачу сразу.
+                if not _fok and str(_fraw).startswith(CODEX_MODEL_UNAVAILABLE_PREFIX):
+                    job.error = codex_model_unavailable_message(model)
+                    job.status = JobStatus.FAILED.value
+                    log_queue.put(f"❌ {CODEX_MODEL_UNAVAILABLE_PREFIX}: {job.error}")
+                    return
                 _fp = parse_funnel_response(_fraw) if _fok else None
                 # PATCH-2026-06-27-thinking: если ответ не JSON (thinking/ack «I'll design…» вместо воронки) — ОДИН ретрай.
                 if not (_fp and (_fp.get("hook") or _fp.get("plan"))):
@@ -1320,8 +1375,9 @@ def _execute_generation_job(job: Job):
 
         # === Update preset last_used_at ===
         try:
-            preset.last_used_at = time.time()
-            _preset_manager_for(job.user_id or ADMIN_USER_ID).save_preset(preset)  # B1
+            if not payload.get("preset_snapshot"):
+                preset.last_used_at = time.time()
+                _preset_manager_for(job.user_id or ADMIN_USER_ID).save_preset(preset)  # B1
         except Exception:
             pass
 
@@ -1338,6 +1394,14 @@ def _execute_generation_job(job: Job):
             job.progress_detail = f"done: preview='{preview}' title='{title}'"
             if job.status == JobStatus.RUNNING.value:
                 job.status = JobStatus.COMPLETED.value
+            # FIX-2026-09-13-short-gen: итог короче цели больше чем на 30% — жёлтое
+            # предупреждение клиенту, статус не трогаем (Grind 10.09: 2267 из ~3900 слов,
+            # второй ход беседы пропал; 27.08 — 30 генераций короче цели, 11 на 46–72%).
+            # Раньше сигнал был только в qa_findings (length_dev), клиенту не виден.
+            _script_words = len(final_script.split())
+            if target_words and _script_words < target_words * GEN_SHORT_TARGET_RATIO:
+                job.warning = f"Текст короче цели: {_script_words} из ~{target_words} слов"
+                log_queue.put(f"⚠️ Текст короче цели: {_script_words} из ~{target_words} слов")
             log_queue.put(
                 f"🎬 Done: preview={preview!r} title={title!r} script={len(final_script.split())} слов ({len(final_script)} симв) "
                 f"(postprocess=skipped)"
@@ -1355,9 +1419,35 @@ def _execute_generation_job(job: Job):
     _execute_job_common(job, _run)
 
 
+def _rewrite_output_specs(files, languages, job_id):
+    """Stable task/output identities; keep legacy names when unambiguous."""
+    from collections import Counter
+    entries = []
+    for file_index, file_path in enumerate(files):
+        for lang_index, language in enumerate(languages):
+            lang = language if isinstance(language, dict) else {"code": str(language), "display": str(language)}
+            base = os.path.splitext(os.path.basename(file_path))[0][:50]
+            code = lang.get("code", lang.get("display", ""))
+            entries.append((file_path, lang, base, make_output_filename(base, code), file_index, lang_index))
+    counts = Counter(entry[3] for entry in entries)
+    result = []
+    for file_path, lang, base, filename, file_index, lang_index in entries:
+        scope = job_id
+        if counts[filename] > 1:
+            identity = json.dumps([os.path.basename(file_path), lang, file_index, lang_index], sort_keys=True, ensure_ascii=False)
+            suffix = hashlib.sha256(identity.encode()).hexdigest()[:10]
+            base = base[:38] + "_" + suffix
+            scope = job_id + ":" + suffix
+        result.append((file_path, lang, base, scope))
+    return result
+
+
 def _execute_rewrite_job(job: Job):
     """Выполняет задачу рерайта."""
     def _run(job, log_queue, stop_event):
+        # FIX-2026-09-13-models: отметка прошлого запуска не должна остановить новый —
+        # после «Повторить» модель пробуется заново.
+        pop_model_unavailable(job.id)
         files = json.loads(job.rewrite_files)
         languages = json.loads(job.rewrite_languages)
         oauth_tokens_list = _server_oauth_tokens(job)
@@ -1365,35 +1455,40 @@ def _execute_rewrite_job(job: Job):
         os.makedirs(output_dir, exist_ok=True)
         resolved_files = []
         user_id = getattr(job, "user_id", "")
-        # B1 PATCH-2026-07-02-secfix: резолвим СТРОГО внутри директории тенанта (UPLOAD_DIR/user_id).
-        # НЕ принимаем произвольный абсолютный путь (был LFI), НЕ падаем в глобальный UPLOAD_DIR root.
-        # Containment по образцу /upload и api.py _resolve_file_id.
-        if user_id:
-            _tenant_root = (UPLOAD_DIR / user_id).resolve()
+        try:
+            if not user_id or not files:
+                raise ValueError("Не указан владелец или исходные файлы рерайта")
+            tenant_root = (UPLOAD_DIR / user_id).resolve()
             for fp in files:
-                cand = (UPLOAD_DIR / user_id / os.path.basename(fp)).resolve()
-                if str(cand).startswith(str(_tenant_root) + os.sep) and cand.exists():
-                    resolved_files.append(str(cand))
-                else:
-                    log_queue.put(f"⚠️ файл вне тенанта / не найден, пропущен: {os.path.basename(fp)!r}")
-        else:
-            for fp in files:
-                log_queue.put(f"⚠️ user_id пуст — файл пропущен: {os.path.basename(fp)!r}")
+                source = Path(fp)
+                cand = (source if source.is_absolute() else tenant_root/source).resolve()
+                if not cand.is_relative_to(tenant_root) or not cand.is_file() or cand.stat().st_size == 0:
+                    raise ValueError("Исходный файл отсутствует или недоступен: " + os.path.basename(fp))
+                rel = cand.relative_to(tenant_root)
+                if rel.parts[0] == '.job_inputs':
+                    if len(rel.parts) != 3 or len(rel.parts[1]) != 64 or file_hash(cand) != rel.parts[1]:
+                        raise ValueError("Снимок исходника повреждён: " + cand.name)
+                # Verify read access even for legacy pre-snapshot jobs.
+                with cand.open('rb') as checked:
+                    if not checked.read(1):
+                        raise ValueError("Исходный файл пуст: " + cand.name)
+                resolved_files.append(str(cand))
+        except (OSError, ValueError, TypeError) as exc:
+            job.status = JobStatus.FAILED.value
+            job.error = "Рерайт не запущен: " + str(exc)
+            log_queue.put(job.error)
+            return
         is_safe_text = getattr(job, "gen_safe_text", False)
         tasks = []
-        for file_path in resolved_files:
-            for lang in languages:
-                cp = lang.get("custom_prompt", "")
-                if is_safe_text:
-                    cp = (cp + "\n\n" + SAFE_TEXT_SUPPLEMENT) if cp else SAFE_TEXT_SUPPLEMENT
-                tasks.append((
-                    file_path,
-                    lang.get("display", ""),
-                    lang.get("code", lang.get("display", "")),
-                    lang.get("channel", ""),
-                    lang.get("host", ""),
-                    cp,
-                ))
+        output_specs = _rewrite_output_specs(resolved_files, languages, job.id)
+        for file_path, lang, output_base, progress_scope in output_specs:
+            cp = lang.get("custom_prompt", "")
+            if is_safe_text:
+                cp = (cp + "\n\n" + SAFE_TEXT_SUPPLEMENT) if cp else SAFE_TEXT_SUPPLEMENT
+            tasks.append((file_path, lang.get("display", ""),
+                          lang.get("code", lang.get("display", "")),
+                          lang.get("channel", ""), lang.get("host", ""), cp,
+                          output_base, progress_scope))
         total = len(tasks)
         completed = 0
         success_count = 0
@@ -1402,7 +1497,7 @@ def _execute_rewrite_job(job: Job):
             max_workers=min(max(1, int(job.max_threads)), REWRITE_MAX_THREADS_PER_JOB)
         ) as executor:
             futures = {}
-            for task_idx, (file_path, lang_display, lang_code, channel, host, custom_prompt) in enumerate(tasks):
+            for task_idx, (file_path, lang_display, lang_code, channel, host, custom_prompt, output_base, progress_scope) in enumerate(tasks):
                 if STOP_FLAG.is_stopped():
                     break
                 start_idx = (task_idx % len(oauth_tokens_list)) if oauth_tokens_list else 0
@@ -1419,7 +1514,7 @@ def _execute_rewrite_job(job: Job):
                     job.use_subscription, oauth_token,
                     oauth_tokens_list, start_idx,
                     bool(getattr(job, "rewrite_preserve_paragraphs", False)),
-                    job.id,
+                    job.id, output_base, progress_scope,
                 )
                 futures[future] = (file_path, lang_display, lang_code)
             for future in as_completed(futures):
@@ -1438,15 +1533,48 @@ def _execute_rewrite_job(job: Job):
                     log_queue.put(f"❌ Ошибка: {e}")
                     completed += 1
         _finalize_job_status(job, total, success_count)
+        _model_reason = pop_model_unavailable(job.id)
         output_files = []
-        for file_path in resolved_files:
-            base_name = os.path.splitext(os.path.basename(file_path))[0][:50]
-            for lang in languages:
-                lc = lang.get("code", lang.get("display", ""))
-                fname = make_output_filename(base_name, lc)
-                if (Path(output_dir) / fname).exists():
-                    output_files.append(fname)
+        # FIX-2026-09-13-short-output: итоговая сверка длины каждого файла против исходника.
+        # Кусок мог уйти в файл коротким (повтор отклонён, ретраи кончились) — это не провал,
+        # статус не трогаем, но клиент видит жёлтое предупреждение, а не считает слова сам
+        # (Влад 12.09: 3271 слово → 1332, «Готово» без единого сигнала). Сверяем по диску
+        # на каждом запуске — и части, готовые в прошлом прогоне, тоже.
+        short_warnings = []
+        for file_path, lang, base_name, progress_scope in output_specs:
+            source_text = None
+            lc = lang.get("code", lang.get("display", ""))
+            fname = make_output_filename(base_name, lc)
+            if (Path(output_dir) / fname).exists():
+                output_files.append(fname)
+                try:
+                    if source_text is None:
+                        source_text = read_file_as_text(file_path)
+                    with open(Path(output_dir) / fname, "r", encoding="utf-8", errors="replace") as fh:
+                        short = output_shorter_than_source(source_text, fh.read())
+                except Exception as exc:  # сверка — не повод ронять готовую задачу
+                    log_queue.put(f"⚠️ сверка длины не выполнена для {fname}: {exc}")
+                    short = None
+                if short:
+                    ld = lang.get("display") or lc
+                    log_queue.put(f"⚠️ {ld}: текст короче исходника: {short[0]} из {short[1]} слов → {fname}")
+                    short_warnings.append(
+                        f"{ld} ({fname}): текст короче исходника: {short[0]} из {short[1]} слов"
+                    )
         job.output_files = json.dumps(output_files, ensure_ascii=False)
+        job.warning = "\n".join(short_warnings)
+
+        # Internal contention is not a provider outage or a reason to switch keys.
+        # Persist already completed outputs before the fenced pending transition.
+        from rewrite_core import host_budget_wait_until
+        host_until = host_budget_wait_until(job.id, pop=True)
+        if host_until and not STOP_FLAG.is_stopped():
+            job.status = JobStatus.RUNNING.value
+            job.error = "Ожидание общего лимита ключа до вызова провайдера"
+            queue.update_running(job)
+            if queue.defer_job(job.id, max(time.time()+1, host_until), job.run_token):
+                log_queue.put("⏳ общий лимит ключа занят — задача ожидает в очереди, прогресс сохранён")
+                return
 
         # Защита от ложного COMPLETED (backlog #1):
         # _finalize_job_status решает по success_count из ThreadPoolExecutor,
@@ -1481,6 +1609,10 @@ def _execute_rewrite_job(job: Job):
                 job.status = JobStatus.PARTIAL.value
                 job.error = (job.error or "") + f" | saved {saved}/{total} files on disk"
             # saved == total — статус не трогаем (worker поставит COMPLETED штатно)
+        # FIX-2026-09-13-models: вместо «N из N задач не выполнено | no output files
+        # saved» — причина, с которой человек может что-то сделать.
+        if _model_reason and not STOP_FLAG.is_stopped():
+            job.error = _model_reason
 
     _execute_job_common(job, _run)
 
@@ -1495,7 +1627,7 @@ _global_job_cap = _server_int(
 _provider_job_caps = {
     "openai": _server_int(
         "REWRITE_OPENAI_MAX_CONCURRENT_JOBS",
-        max(1, _pool_stats["openai"]["capacity"]),
+        _global_job_cap,
         0,
         _global_job_cap,
     ),
@@ -1505,13 +1637,13 @@ _provider_job_caps = {
         # юзеров есть свои OAuth-токены. Кап — не место для проверки кредов:
         # их наличие проверяет admission (_validate_model_admission).
         "REWRITE_CLAUDE_MAX_CONCURRENT_JOBS",
-        max(1, _pool_stats["claude"]["capacity"]),
+        _global_job_cap,
         0,
         _global_job_cap,
     ),
     "codex": _server_int(
         "REWRITE_CODEX_MAX_CONCURRENT_JOBS",
-        max(1, _pool_stats["codex"]["capacity"]),
+        _global_job_cap,
         0,
         _global_job_cap,
     ),
@@ -1525,6 +1657,33 @@ def _job_execution_allowed(job: Job) -> bool:
     )
 
 
+# Independent host allocation: credentials never multiply the 4 GiB budget.
+_REWRITE_MEMORY_BUDGET_MIB = _server_int("REWRITE_MEMORY_BUDGET_MIB", 4096, 1024, 4096)
+
+
+def _provider_memory_reservation_mib(provider):
+    # Reserve the enforced inner-thread maximum even for smaller jobs. Measured
+    # CLI RSS/call is ~288 MiB Claude / ~166 MiB Codex; add a shared job margin.
+    per_call = {"claude": 288, "codex": 166, "openai": 64}.get(provider, 288)
+    return 128 + REWRITE_MAX_THREADS_PER_JOB * per_call
+
+
+def _memory_admission_allowed(reserve_mib=None, meminfo_path="/proc/meminfo", additional_mib=0):
+    reserve_mib = _server_int("REWRITE_MEMORY_RESERVE_MIB", 2048, 0, 32768) if reserve_mib is None else reserve_mib
+    if not reserve_mib:
+        return True
+    try:
+        with open(meminfo_path, encoding="ascii") as handle:
+            for line in handle:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) >= (reserve_mib + max(0, additional_mib)) * 1024
+    except FileNotFoundError:
+        return True  # /proc is Linux-specific; finite job caps still apply.
+    except (OSError, ValueError):
+        return False
+    return False
+
+
 worker = JobWorker(
     queue,
     generation_executor=_execute_generation_job,
@@ -1532,6 +1691,10 @@ worker = JobWorker(
     max_concurrent_jobs=_global_job_cap,
     provider_caps=_provider_job_caps,
     execution_guard=_job_execution_allowed,
+    credential_budget=rewrite_core.credential_job_budget,
+    resource_guard=lambda reserved_mib: _memory_admission_allowed(additional_mib=reserved_mib),
+    memory_budget_mib=_REWRITE_MEMORY_BUDGET_MIB,
+    provider_memory_mib=_provider_memory_reservation_mib,
 )
 
 FILE_MAX_AGE_DAYS = int(os.environ.get("REWRITE_FILE_MAX_AGE_DAYS", "7"))
@@ -1716,6 +1879,7 @@ try:
 except ImportError:                       # pragma: no cover
     def cabinet_user(_request):
         return None
+
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
@@ -2174,11 +2338,27 @@ def get_models(request: Request):
     # Codex-модели показываем только когда подписка реально доступна: серверная
     # принадлежит владельцу (задача B), остальным нужна своя.
     if provider_user_allowed("codex", uid) and credential_source("codex", uid) != "none":
-        shared.extend(
-            {"value": model, "label": model.replace("codex:", "") + " — Codex"}
-            for model in sorted(get_allowed_codex_models())
+        codex_models = sorted(get_allowed_codex_models())
+        # FIX-2026-09-13 (ui-default-model): интерфейс брал ПЕРВУЮ Codex-модель
+        # по алфавиту — ею оказалась снятая OpenAI gpt-5.4-mini. Помечаем модель,
+        # назначенную сервером (REWRITE_STUDIO_CODEX_MODEL); если её нет среди
+        # разрешённых — первую из разрешённых. Порядок списка не меняем.
+        # Значение по умолчанию — то же, что в _resolve_studio_model (FIX-2026-09-13-models),
+        # иначе без переменной интерфейс пометил бы sol, а сервер подменял бы на terra.
+        preferred = os.environ.get(
+            "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-terra"
+        ).strip()
+        default_codex = (
+            preferred if preferred in codex_models else next(iter(codex_models), "")
         )
+        for model in codex_models:
+            item = {"value": model, "label": model.replace("codex:", "") + " — Codex"}
+            if model == default_codex:
+                item["default"] = True
+            shared.append(item)
     base = shared + base
+    # FIX-2026-09-17-server-models: кабинету на серверных ключах не показываем модели вне списка.
+    base = [item for item in base if not server_key_model_error(item["value"], uid)]
     if uid == ADMIN_USER_ID:
         for model in get_keys_config(uid).get("custom_models", []):
             model = str(model).strip()
@@ -2187,8 +2367,8 @@ def get_models(request: Request):
     return base
 
 
-REWRITE_MAX_OWN_CREDENTIAL_CHARS = 4096
-REWRITE_MAX_OWN_OAUTH_TOKENS = 8
+REWRITE_MAX_OWN_CREDENTIAL_CHARS = 65536
+REWRITE_MAX_OWN_OAUTH_TOKENS = 100
 
 
 def _own_credential_field(value, field: str) -> str:
@@ -2204,14 +2384,21 @@ def _own_credential_field(value, field: str) -> str:
     secret = value.strip()
     if len(secret) > REWRITE_MAX_OWN_CREDENTIAL_CHARS:
         raise HTTPException(status_code=422, detail=f"{field} is too long")
-    if any(ch in secret for ch in ("\n", "\r", "\x00")):
+    if "\x00" in secret:
         raise HTTPException(
             status_code=422, detail=f"{field} must not contain line breaks"
         )
+    if field in {"openai_api_key", "anthropic_api_key"}:
+        values = list(dict.fromkeys(v.strip() for v in re.split(r"[\r\n,]+", secret) if v.strip()))
+        if len(values) > 100:
+            raise HTTPException(status_code=422, detail="at most 100 own API keys are supported")
+        return ",".join(values)
+    if "\n" in secret or "\r" in secret or "," in secret:
+        raise HTTPException(status_code=422, detail="one oauth token per list item is required")
     return secret
 
 
-REWRITE_MAX_OWN_CODEX_AUTH_CHARS = 32 * 1024
+REWRITE_MAX_OWN_CODEX_AUTH_CHARS = 1024 * 1024
 
 
 def _own_codex_auth_field(value) -> str:
@@ -2239,10 +2426,11 @@ def _own_codex_auth_field(value) -> str:
             status_code=422,
             detail="codex_auth must be the JSON content of your Codex auth.json",
         )
-    if not isinstance(parsed, dict):
-        raise HTTPException(
-            status_code=422, detail="codex_auth must be a JSON object"
-        )
+    try:
+        if not rewrite_core._codex_payloads(payload):
+            return ""
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"codex_auth is invalid: {exc}")
     return payload
 
 
@@ -2250,7 +2438,7 @@ def _own_oauth_tokens_field(value) -> list:
     """Validate tenant-supplied Claude OAuth tokens (list or scalar)."""
     if value is None:
         return []
-    items = value if isinstance(value, list) else [value]
+    items = value if isinstance(value, list) else re.split(r"[\r\n,]+", str(value))
     if len(items) > REWRITE_MAX_OWN_OAUTH_TOKENS:
         raise HTTPException(status_code=422, detail="too many oauth_tokens")
     return [
@@ -2277,7 +2465,18 @@ def get_settings_keys(request: Request):
     # OpenAI-ключ, Anthropic-ключ, Claude OAuth-токен, своя подписка Codex.
     # Серверные значения не показываются никому, свои — не возвращаются наружу.
     is_server_owner = server_credential_owner(uid)
+    own_counts = {
+        "openai": len(get_user_openai_keys(uid)),
+        "claude": len(get_user_claude_oauth_tokens(uid)),
+        "anthropic": len(get_user_anthropic_keys(uid)),
+        "codex": len(rewrite_core._codex_payloads(get_user_codex_auth(uid))),
+    }
     resp = {
+        "credential_mode": "own_only" if rewrite_core.own_credentials_only(uid) else "server_fallback",
+        "credential_mode_forced": "*" in rewrite_core._allowed_values("REWRITE_OWN_ONLY_USER_IDS", "") or uid in rewrite_core._allowed_values("REWRITE_OWN_ONLY_USER_IDS", ""),
+        "own_credential_counts": own_counts,
+        "own_credential_limit": 100,
+        "job_capacity": {p: (min(_provider_job_caps[p], _global_job_cap, _REWRITE_MEMORY_BUDGET_MIB // _provider_memory_reservation_mib(p), rewrite_core.credential_job_budget(p, uid)[1]) if credential_source(p, uid) != "none" else 0) for p in ("openai", "claude", "codex")},
         "anthropic_api_key": "",
         "openai_configured": bool(get_server_openai_keys()),
         "claude_configured": bool(get_server_claude_oauth_tokens()),
@@ -2322,6 +2521,10 @@ async def save_settings_keys(request: Request):
     body = await request.json()
     uid = _get_user_id(request)
     kwargs = {"user_id": uid}
+    if "credential_mode" in body:
+        if body["credential_mode"] not in {"own_only", "server_fallback"}:
+            raise HTTPException(status_code=422, detail="credential_mode must be own_only or server_fallback")
+        kwargs["credential_mode"] = body["credential_mode"]
     # BYOK-2026-07-30: свой ключ может вписать ЛЮБОЙ пользователь (не только
     # админ). Пустая строка = «удалить свой ключ» → снова заработает серверный.
     # Значение никогда не возвращается наружу и не пишется в job/лог.
@@ -2516,15 +2719,8 @@ def delete_preset_endpoint(identifier: str, request: Request):
 def create_generation_job(req: GenerationJobRequest, request: Request):
     """Round 2 generation handler (2026-05-23): single-topic flow + backward compat."""
     user_id = _get_user_id(request)
+    intent = create_identity(request, req.model_dump(), "web-generation")
     user_output = _get_user_output_dir(request)
-
-    # === Resolve preset (id новый, name legacy) ===
-    preset_identifier = req.preset_id or req.preset_name or ""
-    if not preset_identifier:
-        raise HTTPException(status_code=422, detail="preset_id (или preset_name для legacy) required")
-    preset_obj = _preset_manager_for(user_id).get_preset(preset_identifier)  # B1: пресет тенанта
-    if not preset_obj:
-        raise HTTPException(status_code=404, detail=f"preset not found: {preset_identifier}")
 
     # === Resolve темы (+опц. язык на строку): items[] | topics[] | single topic | legacy tasks ===
     # PATCH-2026-06-20-gen-batch: один POST -> N джобов; язык можно задать на каждую тему (items).
@@ -2556,6 +2752,20 @@ def create_generation_job(req: GenerationJobRequest, request: Request):
             status_code=413,
             detail=f"batch is too large (max {REWRITE_MAX_BATCH_ITEMS} jobs)",
         )
+
+    if intent:
+        existing = [lookup_create(queue, user_id, (intent[0]+':'+str(i), intent[1], intent[2])) for i in range(len(pairs))]
+        if all(existing):
+            ids = [job.id for job in existing]
+            return {"job_id":ids[0], "job_ids":ids, "count":len(ids), "failed":[], "status":existing[0].status}
+
+    # === Resolve preset (id новый, name legacy) ===
+    preset_identifier = req.preset_id or req.preset_name or ""
+    if not preset_identifier:
+        raise HTTPException(status_code=422, detail="preset_id (или preset_name для legacy) required")
+    preset_obj = _preset_manager_for(user_id).get_preset(preset_identifier)  # B1: пресет тенанта
+    if not preset_obj:
+        raise HTTPException(status_code=404, detail=f"preset not found: {preset_identifier}")
 
     # === Resolve language (legacy languages[0] fallback) ===
     language = (req.language or "").strip()
@@ -2592,7 +2802,7 @@ def create_generation_job(req: GenerationJobRequest, request: Request):
     # в цикл обёрнут ТОЛЬКО pack+Job+add_job. Каждый job — тот же проверенный single-topic v2-dict.
     job_ids = []
     failed = []
-    for topic, item_lang in pairs:
+    for item_index, (topic, item_lang) in enumerate(pairs):
         eff_lang = item_lang or language  # язык строки приоритетнее общего language/пресета
         try:
             payload = {
@@ -2600,6 +2810,7 @@ def create_generation_job(req: GenerationJobRequest, request: Request):
                 "topic": topic,
                 "preset_id": preset_obj.id,
                 "preset_name": preset_obj.name,
+                "preset_snapshot": preset_obj.to_dict(),
                 "language": eff_lang or None,
                 "target_length_words": target_words_final,
                 "max_log_entries": req.max_log_entries,
@@ -2622,7 +2833,10 @@ def create_generation_job(req: GenerationJobRequest, request: Request):
                 parallel=False,  # compatibility field; dispatcher ignores it
                 user_id=user_id,
             )
-            job_ids.append(_add_job_for_active_user(job))
+            item_intent = (intent[0]+':'+str(item_index), intent[1], intent[2]) if intent else None
+            job_ids.append(_add_job_for_active_user(bind_create(job, item_intent)))
+        except HTTPException:
+            raise
         except Exception as e:
             failed.append({"topic": topic[:60], "error": str(e)})
     if not job_ids:
@@ -2634,6 +2848,10 @@ def create_generation_job(req: GenerationJobRequest, request: Request):
 @app.post("/jobs/rewrite")
 def create_rewrite_job(req: RewriteJobRequest, request: Request):
     user_id = _get_user_id(request)
+    intent = create_identity(request, req.model_dump(), 'web-rewrite')
+    existing = lookup_create(queue, user_id, intent)
+    if existing:
+        return {"job_id": existing.id, "status": existing.status}
     user_output = _get_user_output_dir(request)
     if len(req.files or []) * len(req.languages or []) > REWRITE_MAX_BATCH_ITEMS:
         raise HTTPException(
@@ -2679,7 +2897,7 @@ def create_rewrite_job(req: RewriteJobRequest, request: Request):
         api_key="",
         max_threads=REWRITE_MAX_THREADS_PER_JOB,
         output_dir=str(user_output),
-        rewrite_files=json.dumps(req.files, ensure_ascii=False),
+        rewrite_files=json.dumps(snapshot_inputs(UPLOAD_DIR/user_id, req.files), ensure_ascii=False),
         rewrite_languages=json.dumps(langs_with_branding, ensure_ascii=False),
         rewrite_chunk_size=req.chunk_size,
         rewrite_address_style=req.address_style,
@@ -2691,7 +2909,7 @@ def create_rewrite_job(req: RewriteJobRequest, request: Request):
         parallel=False,
         user_id=user_id,
     )
-    job_id = _add_job_for_active_user(job)
+    job_id = _add_job_for_active_user(bind_create(job, intent))
     return {"job_id": job_id, "status": "pending"}
 
 
@@ -2813,6 +3031,7 @@ def list_jobs(request: Request):
             "log": "",  # PATCH-2026-06-18-joblist-nolog: лог не тащим в список (3МБ->КБ); берётся через /jobs/{id}
             "parallel": getattr(j, "parallel", False),
             "created_at": j.created_at,
+            "warning": getattr(j, "warning", "") or "",  # FIX-2026-09-13-length: жёлтая плашка в карточке
             **_job_display_meta(j),  # PATCH-2026-06-20-joblist-names: name, langs, nfiles
         }
         for j in user_jobs
@@ -3034,27 +3253,14 @@ def _full_retry_cleanup(ticket, user_id: str) -> int:
     if job.job_type == JobType.REWRITE.value:
         files = json.loads(job.rewrite_files or "[]")
         languages = json.loads(job.rewrite_languages or "[]")
-        for file_name in files:
-            for language in languages:
-                lang_name = (
-                    language.get("code")
-                    if isinstance(language, dict)
-                    else str(language)
-                )
-                if PROGRESS_MANAGER.delete_task(
-                    os.path.basename(file_name),
-                    lang_name,
-                    user_id=user_id,
-                    job_id=job.id,
-                ):
-                    cleared += 1
-                base_name = os.path.splitext(os.path.basename(file_name))[0][:50]
-                output = (
-                    Path(job.output_dir)
-                    / make_output_filename(base_name, lang_name)
-                )
-                if output.is_file():
-                    output.unlink()
+        for file_name, language, base_name, scope in _rewrite_output_specs(files, languages, job.id):
+            lang_name = language.get("code", language.get("display", ""))
+            if PROGRESS_MANAGER.delete_task(os.path.basename(file_name), lang_name,
+                                            user_id=user_id, job_id=scope):
+                cleared += 1
+            output = Path(job.output_dir) / make_output_filename(base_name, lang_name)
+            if output.is_file():
+                output.unlink()
     # Generation and any legacy output names are constrained to this job's
     # output directory and the recorded basename.
     output_root = Path(job.output_dir).resolve()
@@ -3096,6 +3302,12 @@ def retry_job(job_id: str, request: Request):
         raise HTTPException(status_code=403, detail="access denied")
     if not license_mgr.is_user_active(user_id):
         raise HTTPException(status_code=403, detail="account is disabled")
+    # FIX-2026-09-13-models: модель задачи могли убрать из списка — не ставим в очередь.
+    _model_error = codex_model_admission_error(job.model) or server_key_model_error(
+        job.model, job.user_id or user_id
+    )
+    if _model_error:
+        raise HTTPException(status_code=422, detail=_model_error)
     if not queue.retry_job(job_id):
         raise HTTPException(
             status_code=409,
@@ -3119,6 +3331,12 @@ def retry_job_full(job_id: str, request: Request):
         raise HTTPException(status_code=403, detail="access denied")
     if not license_mgr.is_user_active(user_id):
         raise HTTPException(status_code=403, detail="account is disabled")
+    # FIX-2026-09-13-models: модель задачи могли убрать из списка — прогресс не стираем.
+    _model_error = codex_model_admission_error(job.model) or server_key_model_error(
+        job.model, job.user_id or user_id
+    )
+    if _model_error:
+        raise HTTPException(status_code=422, detail=_model_error)
     ticket = queue.begin_retry(job_id, full=True)
     if not ticket:
         raise HTTPException(

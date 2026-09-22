@@ -10,7 +10,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import re
 import sqlite3
 import sys
 
@@ -19,6 +21,7 @@ BASE = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(BASE, "server"))
 
 import pub_calls                                                  # noqa: E402
+import pub_remote                                                 # noqa: E402
 import pub_services                                               # noqa: E402
 from pub_engine import ItemFailed, ResourceDown                   # noqa: E402
 
@@ -39,20 +42,36 @@ class FakeClient:
 
     made = 0
     fail_create = False
+    keys = []
+    missing = False
 
     def __init__(self, *_a, **_k):
         pass
 
+    def resolve_model(self, preset):
+        # 19.09.2026: имя модели больше не зашито в теле заказа — кабинет выясняет его
+        # до брони и передаёт в create_job готовым (pub_remote.RewriteClient).
+        # Здесь деньги считаются, а не модель выбирается, поэтому ответ постоянный.
+        return (preset or {}).get("model") or "terra"
+
     def upload_text(self, text, filename=""):
         return "file-1"
 
-    def create_job(self, file_id, lang, preset, channel_name=""):
+    def create_job(self, file_id, lang, preset, channel_name="", idempotency_key="",
+                   model="", source_sha=""):
+        # source_sha добавлен 19.09.2026 (ребейз B7): настоящий клиент подмешивает хэш
+        # донора в ключ повтора, и подделка обязана принимать тот же набор аргументов —
+        # иначе она молча разойдётся с тем, что проверяет тест.
         if FakeClient.fail_create:
             raise RuntimeError("рерайт отказал до создания задачи")
         FakeClient.made += 1
+        FakeClient.keys.append(idempotency_key)
         return f"job-{FakeClient.made}"
 
     def job(self, job_id):
+        if FakeClient.missing:
+            from pub_remote import RemoteJobMissing
+            raise RemoteJobMissing("рерайт: сохранённая задача отсутствует")
         return {"status": "done"}
 
     def result_code(self, info, lang):
@@ -71,7 +90,8 @@ def fresh():
         release_id TEXT, service TEXT, kind TEXT, remote_job_id TEXT, status TEXT,
         error TEXT, created REAL, updated REAL, UNIQUE(release_id,service,kind));
       CREATE TABLE pub_release_log(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
-        ts REAL, level TEXT, step TEXT, message TEXT);
+        ts REAL, level TEXT, step TEXT, message TEXT,
+        repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
       CREATE TABLE pub_releases(id INTEGER PRIMARY KEY, release_id TEXT, tenant_id TEXT,
         project_id TEXT, lang TEXT, preset_rewrite TEXT, updated REAL);
       CREATE TABLE users(id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT,
@@ -96,6 +116,86 @@ def services(store):
                                   "project_dir": lambda *a, **k: ""})
     s.store_source_text = lambda c, rid, text, upd: store.append(text)
     return s
+
+
+def with_real_client() -> None:
+    """Связка кабинет → клиент рерайта целиком, без подделки клиента.
+
+    Зачем отдельно. Подделка `FakeClient` принимает `source_sha` и молчит, если его
+    забыли передать: убери `source_sha=text_sha` из `do_source_ready` — все проверки
+    выше остаются зелёными, а в бою это ValueError на КАЖДОМ заказе рерайта
+    (`pub_remote._order_digest` падает без отпечатка исходника). Поэтому здесь
+    подменяется не клиент, а сеть под настоящим клиентом, и одним прогоном
+    закрывается сразу две вещи: отпечаток донора доехал, и в заголовок ушёл ровно
+    `release:<выпуск>:<отпечаток заказа>`.
+    """
+    print("\nКабинет и настоящий клиент: отпечаток исходника реально доезжает")
+    seen = []          # [(метод, адрес, что послали)] — весь разговор с соседом
+    uploads = []       # загрузки донора: у соседа каждая даёт НОВЫЙ file_id
+
+    class Resp:
+        status_code = 200
+
+        def __init__(self, data=None, text=""):
+            self._data, self.text = data, text
+
+        def json(self):
+            return self._data
+
+    def fake_call(method, url, key, service, **kw):
+        seen.append((method, url, kw))
+        if url.endswith("/files"):                       # загрузка донора
+            uploads.append(url)
+            return Resp({"file_id": f"file-{len(uploads)}"})
+        if "/files/" in url:                             # готовый текст
+            return Resp(text="П" * 900)
+        if url.endswith("/jobs"):                        # заказ
+            return Resp({"job_id": "job-1"})
+        return Resp({"status": "done", "output_files": {"pl": "out.txt"}})
+
+    def order(donor: str):
+        """Один полный заказ настоящим клиентом. Возвращает (заголовок, тело)."""
+        seen.clear()
+        pub_services.donor_text = lambda url: donor
+        svc = services([])
+        svc.do_source_ready(fresh(), REL)
+        post = [(url, kw) for method, url, kw in seen
+                if method == "POST" and url.endswith("/jobs")]
+        check("заказ ушёл один раз", len(post), 1)
+        _, kw = post[0]
+        return (kw.get("headers") or {}).get("Idempotency-Key", ""), kw.get("json") or {}
+
+    saved_call = pub_remote._call
+    saved_client = pub_services.RewriteClient
+    saved_text = pub_services.donor_text
+    pub_remote._call = fake_call
+    pub_services.RewriteClient = pub_remote.RewriteClient
+    try:
+        donor = "Исходный текст донора. " * 40
+        key, body = order(donor)
+        sha = hashlib.sha256(donor.encode("utf-8")).hexdigest()
+        # Ровно то, что должно уйти: выпуск и отпечаток ЭТОГО заказа с ЭТИМ донором.
+        check("в заголовке выпуск и отпечаток заказа",
+              key, f"release:rel-1:{pub_remote._order_digest(body, sha)}")
+        check("отпечаток на месте, а не голый release:",
+              bool(re.fullmatch(r"release:rel-1:[0-9a-f]{32}", key)), True)
+
+        # Главное: отпечаток считается от СОДЕРЖИМОГО донора. Другой текст — другой
+        # ключ, иначе второй заказ упёрся бы в «тот же ключ, другое тело» навсегда.
+        other_key, _ = order(donor + " и ещё абзац")
+        check("другой донор — другой ключ", other_key != key, True)
+
+        # И обратно: новая загрузка того же текста даёт новый file_id (подделка сети
+        # нумерует их подряд), а ключ обязан остаться прежним — на нём и держится
+        # защита от второй оплаты после потерянного ответа на POST.
+        again_key, again_body = order(donor)
+        check("тот же донор — тот же ключ", again_key, key)
+        check("а file_id при этом был другой",
+              body["files"] != again_body["files"], True)
+    finally:
+        pub_remote._call = saved_call
+        pub_services.RewriteClient = saved_client
+        pub_services.donor_text = saved_text
 
 
 def main() -> int:
@@ -192,6 +292,49 @@ def main() -> int:
         c5.execute("DELETE FROM pub_release_jobs"); c5.commit()
         out = svc5.do_source_ready(c5, REL)
         check("новый заказ НЕ создан", FakeClient.made, 1)
+
+        print("\nКлюч повтора уходит вместе с заказом (перенос правки production 14.09)")
+        # Если ответ на POST потерялся по дороге, тот же ключ вернёт ТУ ЖЕ задачу.
+        # Здесь видно только то, что кабинет ПЕРЕДАЁТ клиенту: «release:<выпуск>».
+        # Отпечаток заказа к нему добавляет сам клиент, и то, что реально уходит в
+        # заголовок, проверяется ниже — настоящим `RewriteClient`, а не подделкой.
+        check("ключ повтора привязан к выпуску",
+              [k for k in FakeClient.keys if k], ["release:rel-1"] * len(
+                  [k for k in FakeClient.keys if k]))
+        check("ключ вообще передавался", bool([k for k in FakeClient.keys if k]), True)
+
+        print("\nЗадача пропала у соседа — дубль не заказывается, строка ждёт человека")
+        c6 = fresh()
+        FakeClient.made = 0
+        svc6 = services([])
+        svc6.do_source_ready(c6, REL)
+        FakeClient.missing = True
+        try:
+            svc6.do_source_ready(c6, REL)
+            check("выпуск остановлен", "не остановлен", "RemoteJobMissing")
+        except ItemFailed as exc:
+            check("выпуск остановлен", type(exc).__name__, "RemoteJobMissing")
+        finally:
+            FakeClient.missing = False
+        row = c6.execute("SELECT status, error FROM pub_release_jobs "
+                         "WHERE service='rewrite' AND kind='job'").fetchone()
+        check("задача помечена пропавшей", row["status"], "missing")
+        check("причина сохранена", "отсутствует" in (row["error"] or ""), True)
+        # Самое важное: следующий тик не заказывает заново — это были бы вторые деньги.
+        try:
+            svc6.do_source_ready(c6, REL)
+            check("повтор остановлен тоже", "не остановлен", "ItemFailed")
+        except ItemFailed:
+            check("повтор остановлен тоже", "ItemFailed", "ItemFailed")
+        check("нового заказа не создано", FakeClient.made, 1)
+        # Строка журнала остаётся «заказано»: заказ БЫЛ и деньги за него ушли. Именно
+        # поэтому повтор пойдёт по ветке «подхватить существующий», а не «заказать».
+        call = c6.execute("SELECT status, error FROM provider_calls").fetchone()
+        check("деньги за пропавшую задачу считаются потраченными", call["status"], "ordered")
+        check("и причина записана в журнал вызовов",
+              "отсутствует" in (call["error"] or ""), True)
+
+        with_real_client()
     finally:
         pub_services.RewriteClient = saved_client
         pub_services.donor_text = saved_text

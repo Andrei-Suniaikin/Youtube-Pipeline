@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["status", "user_message", "owner_report", "changed_files"],
+  "properties": {
+    "status": {"type": "string", "enum": ["fixed", "no_problem", "not_fixed", "needs_owner"]},
+    "user_message": {"type": "string"},
+    "owner_report": {"type": "string"},
+    "changed_files": {"type": "array", "items": {"type": "string"}}
+  }
+}

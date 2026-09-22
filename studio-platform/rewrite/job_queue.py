@@ -9,6 +9,7 @@ job, so a cancelled/retried job cannot be completed by a stale worker.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -100,7 +101,14 @@ class Job:
     output_files: str = "[]"
     # Crash-safe full-retry cleanup manifest. Never exposed as a credential.
     reset_manifest: str = "[]"
+    create_scope: str = ""
+    create_key_hash: str = ""
+    create_payload_hash: str = ""
+    restore_hold: bool = False  # Only explicit offline reconciliation may clear.
     error: str = ""
+    # FIX-2026-09-13-length: жёлтое предупреждение при успешной задаче (текст короче
+    # исходника / цели). Не ошибка: статус не меняет, каждый запуск пересчитывает заново.
+    warning: str = ""
 
     # Retained in the object/JSON only for old clients. Scheduling ignores it.
     parallel: bool = False
@@ -189,6 +197,9 @@ class JobQueue:
                 """
             )
         self._migrate_db()
+        with self._lock:
+            self._conn.execute("CREATE TABLE IF NOT EXISTS create_intents (user_id TEXT NOT NULL, scope TEXT NOT NULL, key_hash TEXT NOT NULL, payload_hash TEXT NOT NULL, job_id TEXT NOT NULL, PRIMARY KEY(user_id,scope,key_hash))")
+            self._conn.commit()
 
     def _migrate_db(self) -> None:
         """Schema-only migration.
@@ -311,15 +322,35 @@ class JobQueue:
         return Job(**data)
 
     @staticmethod
-    def _select_columns() -> str:
+    def _select_columns(include_log: bool = True) -> str:
+        # include_log=False: лог (до сотен КБ) не читаем и не гоняем через фильтр секретов
+        log_column = "COALESCE(log,'')" if include_log else "''"
         return (
-            "data, COALESCE(log,''), COALESCE(user_id,''), status, "
+            f"data, {log_column}, COALESCE(user_id,''), status, "
             "COALESCE(provider,''), COALESCE(run_token,''), "
             "COALESCE(cancel_requested,0)"
         )
 
+    def _lookup_create_locked(self, uid, scope, key_hash, payload_hash):
+        from job_idempotency import IdempotencyError
+        row = self._conn.execute("SELECT payload_hash,job_id FROM create_intents WHERE user_id=? AND scope=? AND key_hash=?", (uid or "",scope,key_hash)).fetchone()
+        if not row:
+            return None
+        if row[0] != payload_hash:
+            raise IdempotencyError(409, "Этот ключ запуска уже использован с другими параметрами")
+        saved = self._conn.execute(f"SELECT {self._select_columns()} FROM jobs WHERE id=? AND user_id=?", (row[1],uid or "")).fetchone()
+        if not saved:
+            raise IdempotencyError(410, "Созданная этим запросом задача удалена; повторная оплата автоматически запрещена")
+        return self._row_to_job(saved)
+
+    def lookup_create(self, uid, scope, key_hash, payload_hash):
+        with self._lock:
+            return self._lookup_create_locked(uid, scope, key_hash, payload_hash)
+
     def add_job(self, job: Job) -> str:
         job.id = uuid.uuid4().hex[:12]
+        if job.output_dir:
+            job.output_dir = os.path.join(job.output_dir, job.id)
         job.created_at = time.time()
         job.status = JobStatus.PENDING.value
         job.provider = self._provider_for(job)
@@ -327,6 +358,10 @@ class JobQueue:
         job.cancel_requested = False
         with self._lock:
             with self._immediate_locked():
+                if job.create_key_hash:
+                    existing = self._lookup_create_locked(job.user_id, job.create_scope, job.create_key_hash, job.create_payload_hash)
+                    if existing:
+                        return existing.id
                 self._conn.execute(
                     "INSERT INTO jobs "
                     "(id,data,status,created_at,user_id,log,provider,run_token,cancel_requested) "
@@ -347,12 +382,14 @@ class JobQueue:
                     "VALUES (?,?,?)",
                     (job.provider, job.user_id or "", job.created_at),
                 )
+                if job.create_key_hash:
+                    self._conn.execute("INSERT INTO create_intents(user_id,scope,key_hash,payload_hash,job_id) VALUES(?,?,?,?,?)", (job.user_id or "",job.create_scope,job.create_key_hash,job.create_payload_hash,job.id))
         return job.id
 
-    def get_job(self, job_id: str) -> Optional[Job]:
+    def get_job(self, job_id: str, include_log: bool = True) -> Optional[Job]:
         with self._lock:
             row = self._conn.execute(
-                f"SELECT {self._select_columns()} FROM jobs WHERE id=?",
+                f"SELECT {self._select_columns(include_log)} FROM jobs WHERE id=?",
                 (job_id,),
             ).fetchone()
         return self._row_to_job(row) if row else None
@@ -591,6 +628,8 @@ class JobQueue:
                 if not row:
                     return None
                 job = self._row_to_job(row)
+                if job.restore_hold:
+                    return None
                 if job.status not in allowed:
                     return None
                 previous = job.status
@@ -764,13 +803,15 @@ class JobQueue:
         ]
         return [uid for uid in ring if uid in pending]
 
-    def claim_next(self, provider: str) -> Optional[Job]:
+    def claim_next(self, provider: str, eligible_user=None) -> Optional[Job]:
         provider = (provider or "").strip().lower()
         if provider not in PROVIDERS:
             return None
         with self._lock:
             with self._immediate_locked():
                 active = self._active_users_in_ring_locked(provider)
+                if eligible_user is not None:
+                    active = [uid for uid in active if eligible_user(uid)]
                 if not active:
                     return None
                 state = self._conn.execute(
@@ -1006,6 +1047,10 @@ class JobWorker:
         max_concurrent_jobs: int = 5,
         provider_caps: Optional[Dict[str, int]] = None,
         execution_guard: Optional[Callable[[Job], bool]] = None,
+        credential_budget: Optional[Callable[[str, str], tuple]] = None,
+        resource_guard: Optional[Callable[[int], bool]] = None,
+        memory_budget_mib: int = 0,
+        provider_memory_mib: Optional[Callable[[str], int]] = None,
     ):
         self.queue = queue
         self._gen_exec = generation_executor
@@ -1019,6 +1064,12 @@ class JobWorker:
             for provider in PROVIDERS
         }
         self._execution_guard = execution_guard
+        self._credential_budget = credential_budget
+        self._resource_guard = resource_guard
+        self._memory_budget_mib = max(0, int(memory_budget_mib))
+        self._provider_memory_mib = provider_memory_mib
+        self._running_memory_mib = {}
+        self._running_budget_keys = {}
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._executor: Optional[ThreadPoolExecutor] = None
@@ -1083,25 +1134,56 @@ class JobWorker:
         self._provider_cursor = (self._provider_cursor + 1) % len(order)
         return order[self._provider_cursor :] + order[: self._provider_cursor]
 
+    def _budget_for(self, provider, uid):
+        try:
+            return self._credential_budget(provider, uid)
+        except Exception:
+            # Fail through the executor's strict credential validation; a DB
+            # read problem must not kill the dispatcher or select server keys.
+            return provider + "\x00unavailable\x00" + str(uid), 1
+
     def _run_dispatcher(self) -> None:
         while not self._stop_event.is_set():
             with self._running_lock:
                 done = [future for future in self._running if future.done()]
                 for future in done:
                     self._running.pop(future, None)
+                    self._running_budget_keys.pop(future, None)
+                    self._running_memory_mib.pop(future, None)
+                memory_running = sum(self._running_memory_mib.values())
                 running_total = len(self._running)
                 provider_running = {provider: 0 for provider in PROVIDERS}
-                for job in self._running.values():
+                budget_running = {}
+                for future, job in self._running.items():
                     provider_running[job.provider] += 1
+                    if self._credential_budget:
+                        key = self._running_budget_keys[future]
+                        budget_running[key] = budget_running.get(key, 0) + 1
 
             free_global = self._max_concurrent - running_total
             made_progress = False
+            budget_cache = {}
             while free_global > 0 and not self._stop_event.is_set():
                 claimed = None
                 for provider in self._ordered_providers():
                     if provider_running[provider] >= self._provider_caps[provider]:
                         continue
-                    claimed = self.queue.claim_next(provider)
+                    memory_cost = max(0, int(self._provider_memory_mib(provider))) if self._provider_memory_mib else 0
+                    if self._memory_budget_mib and memory_running + memory_cost > self._memory_budget_mib:
+                        continue
+                    # Count reservations for the whole live batch, including
+                    # processes that have not grown to their expected RSS yet.
+                    if self._resource_guard and not self._resource_guard(memory_running + memory_cost):
+                        continue
+                    def eligible(uid):
+                        if not self._credential_budget:
+                            return True
+                        pair = (provider, uid)
+                        if pair not in budget_cache:
+                            budget_cache[pair] = self._budget_for(provider, uid)
+                        key, cap = budget_cache[pair]
+                        return budget_running.get(key, 0) < cap
+                    claimed = self.queue.claim_next(provider, eligible_user=eligible)
                     if claimed:
                         break
                 if not claimed:
@@ -1110,7 +1192,14 @@ class JobWorker:
                 future = self._executor.submit(self._execute_job, claimed)
                 with self._running_lock:
                     self._running[future] = claimed
+                    self._running_memory_mib[future] = memory_cost
+                    if self._credential_budget:
+                        self._running_budget_keys[future] = budget_cache[(claimed.provider, claimed.user_id)][0]
+                memory_running += memory_cost
                 provider_running[claimed.provider] += 1
+                if self._credential_budget:
+                    key, _ = budget_cache[(claimed.provider, claimed.user_id)]
+                    budget_running[key] = budget_running.get(key, 0) + 1
                 free_global -= 1
                 made_progress = True
             self._stop_event.wait(0.1 if made_progress else 0.35)

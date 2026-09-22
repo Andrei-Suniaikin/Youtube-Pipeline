@@ -13,9 +13,12 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 import re
+import time
 
 from channel_slots import next_free_slot, upcoming_slots
+from pub_ids import video_id
 
 OEMBED = "https://www.youtube.com/oembed"
 YT_HOSTS = ("youtube.com", "youtu.be")
@@ -26,6 +29,15 @@ def donor_title(url: str) -> str:
 
     Через открытый oembed YouTube — без ключей и квот. Не ответил или ролик закрыт —
     возвращаем пусто: показывать вместо названия ссылку хуже, но терять строку нельзя.
+
+    Почему именно oembed, а не `videos.list`. Ключ YouTube Data API у нас ОДИН на всё:
+    им живёт поздняя проверка выхода (`pub_verify`) и ночной обход конкурентов ВВ2,
+    и суточный кошелёк у них общий — 18.09 он кончился в 01:00, и ночь встала.
+    Вставка двухсот ссылок здесь не должна съедать единицы у проверки публикаций.
+    Если когда-нибудь понадобится то, чего oembed не отдаёт (длина, дата, статус
+    донора), это уже `videos.list` — и такой вызов обязан идти через учёт
+    `pub_calls.quota_allow()` / `quota_spend()` под именем потребителя «donor»,
+    иначе общий кошелёк снова будет опустошать тот, кто про него не знает.
     """
     if not any(h in (url or "") for h in YT_HOSTS):
         return ""          # не YouTube — спрашивать не у кого, в сеть не ходим
@@ -39,6 +51,471 @@ def donor_title(url: str) -> str:
         return ""
 
 URL_RE = re.compile(r"https?://\S+")
+
+
+# ───────────── проверка донора ДО постановки в план (19.09.2026) ─────────────
+#
+# Зачем. Ролик без субтитров сегодня узнаётся только на шаге «текст»: ссылка уже
+# вставлена, слот канала уже занят, оператор уже отработал, а выпуск падает на первом
+# же платном шаге и оставляет дыру в расписании. Спросить то же самое можно в момент
+# вставки и бесплатно — субтитры всё равно придётся качать, и скачанное здесь ложится
+# в тот же кэш `subs_cache`, откуда его возьмёт сам выпуск. То есть проверка не
+# добавляет работы, а переносит её на день раньше.
+#
+# Два закона этого кода, оба дороже точности:
+#
+# 1. **Ничего платного.** Ни одной единицы квоты YouTube Data API: ключ один на всё,
+#    и 18.09 общий суточный кошелёк кончился в час ночи. Длительность ролика берём из
+#    последней реплики субтитров (`pub_remote._subs_seconds`), название — из открытого
+#    oembed. Двести вставленных ссылок не имеют права отнять у проверки публикаций
+#    двести единиц ради числа, которое и так приезжает с текстом.
+# 2. **«Не смогли проверить» ≠ «донор плохой».** Мёртвый туннель и исчерпанная квота
+#    выхода — это наша беда, а не свойство ролика, и они НИКОГДА не отклоняют ссылку;
+#    в ответе они названы разными причинами (`exit_dead` и `exits_quota`), потому что
+#    первую чинит владелец, а вторая проходит сама. Перепутав их с «нет субтитров»,
+#    пульт начнёт браковать хорошие ссылки ровно в ту минуту, когда лёг туннель, —
+#    именно этой ошибкой уже было похоронено сорок с лишним исправных выпусков.
+
+DONOR_LIMITS_STATE = "donor_limits"      # ключ в admin_state: пороги, правленные с экрана
+
+# Пороги. Владелец называл из них ОДИН — нижнюю границу длины ролика (у него это
+# `pool_min_len` в таблице ВВ2, 20 минут). Остальные выбраны нами, и поэтому все до
+# одного вынесены в настройку: число в коде здесь — умолчание первого запуска, а не
+# правило. Подтверждение каждого — вопрос владельцу (см. отчёт).
+DONOR_DEFAULTS = {
+    # Короче — ролик берём, но помечаем: это граница владельца, а не запрет.
+    "min_minutes": 20.0,
+    # Сверху потолка не было ни у кого, а он нужен: рерайт держит длину примерно 1:1,
+    # и трёхчасовой донор тянет за собой втрое больший счёт за озвучку, кадры и рендер.
+    # Донорская полоса ВВ2 — 20–60 минут, так что 90 отсекает выбросы, а не работу.
+    "max_minutes": 90.0,
+    # Двадцать минут речи — это порядка 20 000 знаков. 2 000 — заведомо обрывок дорожки.
+    # В `donor_subs` есть жёсткий пол в 200 знаков, но он про «пусто», а этот про «клок».
+    "min_chars": 2000,
+    # Оценка речи: ~150 слов в минуту, ~6,5 знака на слово. Нужна там, где длительность
+    # неизвестна (старая строка кэша без `seconds`), и подписана на экране как оценка.
+    "chars_per_minute": 1000.0,
+    # Насколько текст может быть короче ожидаемого для своей длительности, прежде чем
+    # мы скажем «дорожка неполная». Половина — это уже не оговорка диктора, а пропуск.
+    "thin_ratio": 0.5,
+    # Отклонять ли по ОЦЕНОЧНОЙ длине (когда секунд не знаем и считаем их из знаков).
+    # Умолчание — нет: отказать исправной ссылке по догадке хуже, чем поставить лишнюю.
+    "estimate_rejects": 0,
+    # Общий бюджет времени на пачку ссылок. Предпросмотр — синхронный запрос из
+    # браузера, а один поход за субтитрами при мёртвом туннеле обходит ВСЕ выходы по
+    # VS_SUBS_TIMEOUT=25 с каждый: на 21 выходе это почти девять минут на одну ссылку.
+    # Ноль здесь означает «не ждать»: в сеть за этой пачкой не идём вовсе и отвечаем по
+    # кэшу. Раньше ноль означал ровно обратное — проверку БЕЗ потолка по времени, то
+    # есть тот, кто вписал 0, чтобы не ждать, получал самое долгое ожидание из
+    # возможных. Снять потолок можно большим числом (например, 3600).
+    "budget_sec": 20.0,
+    # Сколько ссылок в пачке проверяем субтитрами. Остальные — по кэшу и названию.
+    "limit": 20,
+    # 0 — шаг субтитров выключен совсем: когда выходы выжжены, важнее их не добивать.
+    "subs": 1,
+    # Сколько выходов субтитров разрешено опросить на ОДНУ ссылку предпросмотра.
+    # Выходы — общий дефицитный ресурс: их жжёт ночной шаг «текст», и отказ каждого
+    # отправляет выход отдыхать для всей системы. Выпуск ночью ходит по всем выходам
+    # (ему важно дойти), а человеку у экрана третий отказ подряд уже всё сказал.
+    # 0 — потолка нет, предпросмотр ходит по всем выходам наравне с выпуском.
+    "subs_exits": 3,
+    # Сколько живёт запомненное НАЗВАНИЕ донора. Длительность ролика и наличие дорожки
+    # не меняются никогда, а название владелец канала-донора переписать может — правда,
+    # редко. Месяц выбран так, чтобы проверка не ходила в oembed по второму разу в
+    # пределах одной работы над каналом, но и не показывала год назад увиденное имя.
+    # Раньше этот порог жил в pub_remote и на экран настроек не попадал вовсе.
+    "title_ttl_sec": float(30 * 24 * 3600),
+}
+
+DONOR_ENV = {
+    "min_minutes": "VS_DONOR_MIN_MINUTES", "max_minutes": "VS_DONOR_MAX_MINUTES",
+    "min_chars": "VS_DONOR_MIN_CHARS", "chars_per_minute": "VS_DONOR_CHARS_PER_MINUTE",
+    "thin_ratio": "VS_DONOR_THIN_RATIO", "estimate_rejects": "VS_DONOR_ESTIMATE_REJECTS",
+    "budget_sec": "VS_DONOR_CHECK_BUDGET_SEC", "limit": "VS_DONOR_CHECK_LIMIT",
+    "subs": "VS_DONOR_CHECK_SUBS", "subs_exits": "VS_DONOR_CHECK_EXITS",
+    "title_ttl_sec": "VS_DONOR_TITLE_TTL",
+}
+
+
+def _donor_num(raw, default):
+    """Число из настройки; мусор — это «настройки нет», а не ноль.
+
+    Ноль здесь опасен: `max_minutes=0` отклонил бы вообще всё, а `subs=0` молча выключил
+    бы проверку субтитров. Опечатка в .env не должна уметь ни того, ни другого.
+    """
+    try:
+        value = float(str(raw).strip().replace(",", "."))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if value < 0:
+        return None
+    return int(value) if isinstance(default, int) else value
+
+
+def donor_limits(c=None) -> dict:
+    """Пороги проверки донора: окружение старше базы, база старше умолчания.
+
+    Порядок тот же, что у ключа YouTube (`pub_verify.api_key`) и у остального пульта:
+    правка в systemd обязана пересиливать то, что когда-то ввели с экрана, иначе на
+    боевой машине нельзя ничего починить, не заходя в интерфейс.
+
+    В ответе есть `source` — откуда взято каждое число. Экрану это нужно, чтобы не
+    предлагать править то, что перебито окружением: владелец жал бы «сохранить» и не
+    понимал, почему ничего не меняется.
+    """
+    out, source = dict(DONOR_DEFAULTS), {}
+    saved = {}
+    if c is not None:
+        try:
+            row = c.execute("SELECT v FROM admin_state WHERE k=?",
+                            (DONOR_LIMITS_STATE,)).fetchone()
+            if row and row[0]:
+                saved = json.loads(row[0]) or {}
+        except Exception:                                          # noqa: BLE001
+            saved = {}          # нет таблицы или битый JSON — работаем на умолчаниях
+    for key, default in DONOR_DEFAULTS.items():
+        value = _donor_num(os.environ.get(DONOR_ENV[key]), default)
+        if value is not None:
+            out[key], source[key] = value, "окружение"
+            continue
+        value = _donor_num(saved.get(key), default)
+        if value is not None:
+            out[key], source[key] = value, "база"
+            continue
+        source[key] = "умолчание"
+    out["source"] = source
+    return out
+
+
+# Причины, по которым проверить НЕ УДАЛОСЬ. Ни одна из них не отклоняет ссылку: это
+# рассказ о нашей стороне. Текст пишем так, чтобы из него было понятно, надо ли
+# владельцу что-то делать, — ради этого они и разведены.
+DONOR_UNKNOWN_WHY = {
+    "exits_quota": "выходы субтитров исчерпали квоту YouTube — проверим позже, "
+                   "это проходит само",
+    "exit_dead": "выход субтитров не отвечает (туннель) — проверить не смогли, "
+                 "ждать бесполезно, нужен владелец",
+    "no_lib": "на сервере нет youtube-transcript-api — проверить нечем",
+    "ours": "сбой на нашей стороне — про ролик мы ничего не узнали",
+    "budget": "не успели за отведённое время — ссылка не проверена",
+    "over_limit": "в пачке слишком много ссылок, субтитры этой не качали",
+    "off": "проверка субтитров выключена настройкой",
+    "no_net": "в сети не спрашивали, а в кэше этого ролика нет",
+    "not_checked": "субтитры не проверяли",
+}
+
+
+def donor_facts_blank(url: str = "", now: float = 0.0) -> dict:
+    """Пустой лист фактов о доноре. Все поля существуют всегда — экрану так проще."""
+    return {"url": url, "video_id": "", "title": "", "title_from": "",
+            "has_subs": None, "chars": 0, "lang": "", "lang_ru": "",
+            "seconds": 0.0, "minutes": 0.0, "length_from": "", "cached": False,
+            "paid": False, "checked_at": float(now), "fail": "", "fail_text": ""}
+
+
+def donor_verdict(facts: dict, limits: dict = None) -> dict:
+    """Вердикт по фактам. Чистая функция: ни сети, ни базы, ни часов.
+
+    Ровно поэтому её можно проверить таблицей «вход → вердикт» и поэтому причина отказа
+    в пульте всегда совпадает с тем, что проверка на самом деле видела.
+
+    Четыре исхода:
+      `ok`      — субтитры есть, длина в границах;
+      `reject`  — ставить нельзя: не ссылка, нет дорожки, обрывок, длиннее потолка;
+      `warn`    — ставим, но показываем жёлтым: короче границы владельца, дорожка
+                  выглядит неполной, названия не добыли;
+      `unknown` — проверить не удалось. СТАВИМ. Виновата наша сторона, а не ролик.
+    """
+    lim = dict(DONOR_DEFAULTS)
+    lim.update(limits or {})
+    facts = facts or {}
+
+    def out(verdict, reason, why, warns=()):
+        return {"verdict": verdict, "reason": reason, "why": why,
+                "warns": list(warns), "can_plan": verdict != "reject",
+                "checked": verdict in ("ok", "warn", "reject")}
+
+    if not facts.get("video_id"):
+        return out("reject", "not_youtube", "это не ссылка на ролик YouTube")
+    fail = facts.get("fail") or ""
+    if fail:
+        return out("unknown", fail,
+                   facts.get("fail_text") or DONOR_UNKNOWN_WHY.get(fail, "проверить не удалось"))
+    if facts.get("has_subs") is None:
+        return out("unknown", "not_checked", DONOR_UNKNOWN_WHY["not_checked"])
+    if not facts.get("has_subs"):
+        return out("reject", "no_subs",
+                   "у ролика нет субтитров — текст выпуска брать не из чего")
+
+    chars = int(facts.get("chars") or 0)
+    if chars < lim["min_chars"]:
+        return out("reject", "short_text",
+                   f"расшифровка {chars} знаков при пороге {int(lim['min_chars'])} — "
+                   "это обрывок дорожки, а не текст ролика")
+
+    minutes = float(facts.get("minutes") or 0)
+    measured = facts.get("length_from") == "субтитры"
+    warns = []
+    if minutes and minutes > lim["max_minutes"]:
+        how = "" if measured else " (длина оценена по числу знаков, точной мы не знаем)"
+        why = (f"ролик идёт {int(round(minutes))} мин при потолке "
+               f"{int(lim['max_minutes'])}{how}")
+        if measured or lim["estimate_rejects"]:
+            return out("reject", "too_long", why)
+        warns.append(("long_estimate", why))
+
+    if measured and minutes and minutes < lim["min_minutes"]:
+        warns.append(("short_video",
+                      f"ролик идёт {int(round(minutes))} мин — короче границы "
+                      f"{int(lim['min_minutes'])} мин"))
+    if measured and minutes:
+        expect = minutes * lim["chars_per_minute"]
+        if expect and chars < expect * lim["thin_ratio"]:
+            warns.append(("thin_text",
+                          f"на {int(round(minutes))} мин всего {chars} знаков — "
+                          "похоже, дорожка неполная"))
+    if not facts.get("title"):
+        warns.append(("no_title", "название ролика не получено — возможно, он закрыт"))
+
+    if warns:
+        return out("warn", warns[0][0], "; ".join(w[1] for w in warns),
+                   [{"reason": r, "why": w} for r, w in warns])
+    return out("ok", "ok", f"субтитры есть, {chars} знаков")
+
+
+def _youtube_link(url: str) -> bool:
+    """Ссылка ведёт на YouTube — то же требование, что у `donor_title`.
+
+    Разбор идентификатора (`pub_ids.video_id`) хост не проверяет: у него есть запасное
+    правило «последние 11 символов пути», и по нему `https://vimeo.com/12345678901` или
+    `https://rutube.ru/video/abcdefghijk` выглядят ссылкой на ролик YouTube. Без этой
+    проверки такая ссылка уходила в дефицитные выходы субтитров — настоящим запросом к
+    YouTube через туннель, — а владелец получал на экране не «это не ссылка на ролик»,
+    а «у ролика нет субтитров», то есть обвинение донора в том, чего он не делал.
+
+    Голый идентификатор без ссылки (`dQw4w9WgXcQ`) остаётся допустимым: его и раньше
+    принимали, и ни на какой чужой хост он не показывает.
+    """
+    text = (url or "").strip()
+    if any(h in text for h in YT_HOSTS):
+        return True
+    return "/" not in text and "." not in text and ":" not in text
+
+
+def check_donor(url: str, *, c=None, now: float = None, net: bool = True,
+                limits: dict = None, deadline: float = None,
+                subs=None, title_fetch=None, want_subs: bool = True) -> dict:
+    """Проверить донорскую ссылку ДО постановки в план. Бесплатно и мягко.
+
+    Возвращает один плоский словарь: факты о ролике плюс вердикт (`donor_verdict`).
+    Поля перечислены в `donor_facts_blank` и в отчёте — пульт вешает эту функцию на
+    предпросмотр ссылок.
+
+    Порядок шагов — от бесплатного к дорогому, и это и есть суть: тащить субтитры
+    трёхчасового ролика через дефицитный выход, чтобы потом отклонить его по длине,
+    хуже, чем не проверять вовсе.
+
+      1. разбор ссылки — без сети, и хост обязан быть youtube (см. `_youtube_link`:
+         одиннадцать символов в конце пути бывают и у чужих сайтов);
+      2. кэш `subs_cache` по video_id — без сети (второго кэша не заводим: один ролик
+         идёт на несколько языковых каналов, и два ответа про него разойдутся);
+      3. название — открытый oembed, без ключей и квот;
+      4. субтитры — `pub_remote.donor_subs`, и скачанное остаётся в том же кэше:
+         проверка не выбрасывается, а становится первым шагом будущего выпуска;
+      5. длительность — из последней реплики дорожки, тоже бесплатно.
+
+    `deadline` — момент, после которого в сеть не ходим (бюджет пачки). `net=False` —
+    отвечать только по кэшу. `want_subs=False` — не качать субтитры этой ссылке (пачка
+    длиннее `limit`). `subs` и `title_fetch` — подставные транспорты для тестов, как
+    `fetch` у `pub_verify.check`: сети в тестах нет.
+
+    Вызывать ПОСЛЕ отсева дублей: проверять донора, который никуда не встанет, значит
+    зря дёргать выходы субтитров.
+    """
+    import pub_remote                # лениво: pub_tags читают и там, где requests лишний
+
+    now = time.time() if now is None else float(now)
+    lim = limits if limits is not None else donor_limits(c)
+    # Срок и потолок выходов передаём ВНУТРЬ похода за субтитрами: бюджет, который
+    # спрашивают только перед началом, на мёртвом туннеле не значит ничего — один
+    # донор успевает обойти все выходы по таймауту каждый (см. `pub_remote.donor_subs`).
+    subs = subs or (lambda link, net=True: pub_remote.donor_subs(
+        link, net=net, strict=False, deadline=deadline,
+        max_exits=int(lim.get("subs_exits") or 0) or None))
+    title_fetch = title_fetch or donor_title
+
+    facts = donor_facts_blank(url, now)
+    facts["video_id"] = vid = video_id(url) if _youtube_link(url) else ""
+    if not vid:
+        facts.update(donor_verdict(facts, lim))
+        return facts
+
+    # Ноль в поле бюджета — это «не ждать»: ни oembed, ни субтитры в сеть не идут, ответ
+    # собирается по кэшу. Без этого ноль означал бы ОТСУТСТВИЕ срока, то есть проверку
+    # вообще без потолка — ровно противоположное тому, что имеет в виду человек,
+    # вписывающий ноль в поле «сколько ждать».
+    #
+    # Правило работает, только когда срок не задан вызывающим. Тот, кто передал
+    # `deadline` явно, уже решил, сколько готов ждать (пульт живёт по своему потолку
+    # ожидания, `web/app.py:donor_net_deadline`), и отменять его решение мы не вправе.
+    no_wait = deadline is None and not float(lim.get("budget_sec") or 0)
+
+    def time_left() -> bool:
+        # Бюджет считается по НАСТОЯЩИМ часам, а не по `now`: `now` задаётся вызывающим
+        # (и в тестах вообще фиксирован), а ждать нас заставляет именно реальная сеть.
+        if no_wait:
+            return False
+        return deadline is None or time.time() < deadline
+
+    # ── название: сначала то, что уже знаем, и только потом сеть ──
+    title, title_at = "", 0.0
+    try:
+        title, title_at = pub_remote.donor_cache_title(vid)
+    except Exception:                                              # noqa: BLE001
+        title, title_at = "", 0.0
+    fresh = title and (now - title_at) < float(lim.get("title_ttl_sec") or 0)
+    if fresh:
+        facts["title"], facts["title_from"] = title, "кэш"
+    elif net and time_left():
+        fetched = ""
+        try:
+            fetched = title_fetch(url)
+        except Exception:                                          # noqa: BLE001
+            fetched = ""          # название — украшение, из-за него проверка не падает
+        if fetched:
+            facts["title"], facts["title_from"] = fetched, "сеть"
+            try:
+                pub_remote.donor_cache_put_title(vid, fetched, now)
+            except Exception:                                      # noqa: BLE001
+                pass
+        elif title:
+            # Свежего не добыли, но старое знаем. Показать вчерашнее название лучше,
+            # чем голую ссылку, — но пометить, что оно вчерашнее, обязательно.
+            facts["title"], facts["title_from"] = title, "кэш (устарело)"
+    elif title:
+        facts["title"], facts["title_from"] = title, "кэш (устарело)"
+
+    # ── субтитры: кэш, потом, если разрешено и есть время, сеть ──
+    got = {}
+    try:
+        got = subs(url, net=False) or {}
+    except Exception:                                              # noqa: BLE001
+        got = {}                  # кэш недоступен — это ускорение, а не условие работы
+    if not got:
+        if not want_subs:
+            facts["fail"] = "over_limit"
+            facts["fail_text"] = (DONOR_UNKNOWN_WHY["over_limit"]
+                                  + f" (предел {int(lim['limit'])})")
+        elif not lim["subs"]:
+            facts["fail"] = "off"
+        elif not net:
+            facts["fail"] = "no_net"
+        elif not time_left():
+            facts["fail"] = "budget"
+        else:
+            try:
+                got = subs(url, net=True) or {}
+            except Exception as exc:                               # noqa: BLE001
+                facts.update(_donor_subs_failure(exc, pub_remote))
+    if got and not (got.get("text") or got.get("chars")):
+        # Ответ есть, а текста в нём нет. «Нет субтитров» так НЕ выглядит — так
+        # выглядит наша поломка, и объявлять по ней донор негодным нельзя: настоящее
+        # отсутствие дорожки приходит исключением из закрытого списка `_no_subtitles`.
+        facts["fail"], got = "ours", {}
+        facts["fail_text"] = DONOR_UNKNOWN_WHY["ours"] + ": ответ без текста расшифровки"
+    if got:
+        text = got.get("text") or ""
+        facts["chars"] = int(got.get("chars") or len(text))
+        facts["has_subs"] = facts["chars"] > 0
+        facts["lang"] = got.get("lang") or ""
+        # Язык показываем только известный: `pub_remote.lang_ru` неизвестный код
+        # называет русским (там это осознанное умолчание движка), а проверке ссылки
+        # врать нельзя — по её ответу человек решает, тот ли это ролик.
+        facts["lang_ru"] = (pub_remote.LANG_TO_RU.get(facts["lang"].lower(), "")
+                            if facts["lang"] else "")
+        facts["cached"] = bool(got.get("cached"))
+        seconds = float(got.get("seconds") or 0)
+        if seconds > 0:
+            facts["seconds"], facts["minutes"] = seconds, seconds / 60.0
+            facts["length_from"] = "субтитры"
+        elif facts["chars"] and lim["chars_per_minute"]:
+            # Старые строки кэша (до 19.09) длительности не помнят. Это честное «не
+            # знаем», а не ноль минут: считаем оценку из знаков и так её и называем.
+            facts["minutes"] = facts["chars"] / float(lim["chars_per_minute"])
+            facts["seconds"] = facts["minutes"] * 60.0
+            facts["length_from"] = "оценка по знакам"
+    facts["checked_at"] = time.time()
+    facts.update(donor_verdict(facts, lim))
+    return facts
+
+
+def _donor_subs_failure(exc, pub_remote) -> dict:
+    """Отказ похода за субтитрами → причина в ответе проверки.
+
+    Единственное место, где «донор плохой» вообще может появиться, — закрытый список
+    `pub_remote._no_subtitles`, и приезжает он сюда машинным признаком `kind`, а не
+    разбором русского текста сообщения. Всё остальное — наша сторона, и она обязана
+    отвечать «не смогли проверить»: отклонить исправную ссылку из-за упавшего туннеля
+    дороже, чем поставить сомнительную и увидеть это на шаге текста.
+    """
+    kind = getattr(exc, "kind", "") or ""
+    if kind == pub_remote.FAIL_NO_SUBS:
+        return {"has_subs": False, "fail": "", "fail_text": ""}
+    # Два приговора РОЛИКУ, до которых проверка сегодня не доходит (она зовёт
+    # `donor_subs(strict=False)`, а обе причины приходят только из строгого режима).
+    # Размечены заранее и не своими словами, а фактами, по которым `donor_verdict` и
+    # так умеет судить: иначе первая же правка `strict` превратила бы честное «обрывок
+    # дорожки» в «сбой на нашей стороне» — и обрывок молча уехал бы в план.
+    if kind == pub_remote.FAIL_THIN:
+        # Дорожка есть, но это клок. Числа знаков строгий режим не отдаёт, поэтому ноль:
+        # вердикт выйдет тот же самый (reject/short_text), а придумывать длину нельзя.
+        return {"has_subs": True, "chars": 0, "fail": "", "fail_text": ""}
+    if kind == pub_remote.FAIL_NOT_YT:
+        return {"video_id": "", "fail": "", "fail_text": ""}
+    known = {pub_remote.DOWN_QUOTA: "exits_quota", pub_remote.DOWN_TUNNEL: "exit_dead",
+             pub_remote.DOWN_NO_LIB: "no_lib", pub_remote.DOWN_OURS: "ours",
+             pub_remote.DOWN_BUDGET: "budget"}
+    reason = known.get(kind, "ours")
+    # Через `_hide_creds`, а не напрямую: текст ошибки уходит на экран пульта и в лог, а
+    # прокси профилей AdsPower задаются с парой логин:пароль прямо в адресе выхода.
+    text = pub_remote._hide_creds(str(exc))[:200]
+    return {"fail": reason,
+            "fail_text": f"{DONOR_UNKNOWN_WHY[reason]}: {text}" if text
+                         else DONOR_UNKNOWN_WHY[reason]}
+
+
+def check_donors(urls: list, *, c=None, now: float = None, net: bool = True,
+                 limits: dict = None, subs=None, title_fetch=None) -> dict:
+    """Проверить пачку ссылок под общим бюджетом времени.
+
+    Предпросмотр — синхронный запрос из браузера, а один поход за субтитрами при
+    мёртвом туннеле обходит все выходы по таймауту каждый. Поэтому бюджет общий и
+    жёсткий: кончился — остальные ссылки честно возвращаются как «не успели», а не
+    держат человека перед пустым экраном несколько минут.
+
+    «Жёсткий» здесь значит именно это: срок передаётся ВНУТРЬ похода за субтитрами и
+    обрывает перебор выходов (`pub_remote.donor_subs(deadline=…)`). Пока он только
+    спрашивался перед началом, потолок был обещанием, а не правилом: одна ссылка при
+    мёртвом туннеле съедала все выходы по 25 секунд каждый при бюджете в двадцать
+    секунд на всю пачку. Оставшееся время не растягивается на ссылку: потолок общий.
+
+    Возвращает {"items": [...], "limits": {...}, "summary": {...}, "spent_sec": N}.
+    Порядок items совпадает с порядком urls: пульт показывает их строка к строке.
+    """
+    now = time.time() if now is None else float(now)
+    lim = limits if limits is not None else donor_limits(c)
+    started = time.time()
+    deadline = started + float(lim["budget_sec"]) if lim["budget_sec"] else None
+    items, summary = [], {"ok": 0, "warn": 0, "reject": 0, "unknown": 0}
+    for number, url in enumerate(urls or ()):
+        item = check_donor(url, c=c, now=now, net=net, limits=lim, deadline=deadline,
+                           subs=subs, title_fetch=title_fetch,
+                           want_subs=number < int(lim["limit"]))
+        items.append(item)
+        summary[item["verdict"]] = summary.get(item["verdict"], 0) + 1
+    return {"items": items, "limits": lim, "summary": summary,
+            "spent_sec": round(time.time() - started, 2)}
+
 
 
 # ─────────────────────────── теги ───────────────────────────
@@ -131,10 +608,18 @@ def add_links(c, tenant_id: str, channel, urls: list, now: float, slot=None,
         titles = {u: donor_title(u) for u in urls}
 
     for url in urls:
+        # Один и тот же ролик приходит в разных написаниях: `youtu.be/X`, `watch?v=X`,
+        # `watch?v=X&t=30`, ссылка с `si=…` из кнопки «Поделиться». Проверка по строке
+        # ссылки все их считала разными роликами, и канал получал дубль, оплаченный
+        # дважды — субтитры, рерайт, озвучка, картинки, рендер. Сравниваем по
+        # идентификатору ролика, а строку ссылки оставляем запасным признаком: у не-
+        # YouTube ссылок идентификатора нет.
+        vid = video_id(url)
         dup = c.execute(
-            "SELECT id FROM pub_plan_items WHERE channel_id=? AND donor_url=? "
+            "SELECT id FROM pub_plan_items WHERE channel_id=? "
+            "AND (donor_url=? OR (?!='' AND donor_video_id=?)) "
             "AND status IN ('planned','frozen','running','done')",
-            (channel["id"], url)).fetchone()
+            (channel["id"], url, vid, vid)).fetchone()
         if dup:
             skipped.append(url)
             continue
@@ -155,10 +640,11 @@ def add_links(c, tenant_id: str, channel, urls: list, now: float, slot=None,
                 queued += 1
         try:
             c.execute(
-                "INSERT INTO pub_plan_items(tenant_id,channel_id,donor_url,donor_title,slot_at,"
-                "slot_mode,position,created,updated) VALUES(?,?,?,?,?,?,?,?,?)",
-                (tenant_id, channel["id"], url, (titles or {}).get(url, ""), stamp, mode,
-                 now, now, now))
+                "INSERT INTO pub_plan_items(tenant_id,channel_id,donor_url,donor_video_id,"
+                "donor_title,slot_at,slot_mode,position,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (tenant_id, channel["id"], url, vid, (titles or {}).get(url, ""), stamp,
+                 mode, now, now, now))
         except Exception as exc:
             if "UNIQUE" in str(exc):
                 skipped.append(url)      # двойной сабмит формы: выход уже занят — не роняем пачку

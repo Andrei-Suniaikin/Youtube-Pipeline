@@ -32,6 +32,8 @@ import sqlite3
 import sys
 import time
 
+import requests
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
 sys.path.insert(0, os.path.join(BASE, "server"))
@@ -45,6 +47,65 @@ from pub_alerts_tg import Telegram                                # noqa: E402
 
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 TENANT = os.environ.get("VS_DEV_TENANT") or None
+
+_FG_USAGE_URL = "https://googler.fast-gen.ai/api/v6/usage"
+
+
+def refresh_fastgen_usage(c, now) -> None:
+    """Свежий снимок расхода ключа FastGen перед каждым тиком (пункт 8 ТЗ, батч
+    16.09.2026) — без него поводы §9/§10 (`pub_alerts.check_key_expiring`,
+    `check_usage_near_limit`) никогда бы не увидели актуальные цифры, если в кабинет
+    никто не заходит. Сбой сети не роняет проход: снимок просто не обновится, а
+    правило «устаревший снимок не повод» не даст соврать по старым цифрам.
+
+    Здесь же — единственное место, где слышно ОТКАЗ провайдера по ключу: §11
+    (`pub_alerts.check_key_dead`) сам в сеть не ходит и читает то, что запишет
+    `note_key_refused`. Запрос бесплатный (чтение статистики, 0 кредитов): проверять
+    ключ генерацией нельзя — один кадр FastGen стоит денег.
+
+    Ключ читается через `main.keys()` + `main._first_credential(..., "googler")` —
+    ТОЧНО тот же разбор, что и в кабинете (скаляр, список, `googler_pool`; путь —
+    `main.KEYS_PATH`, тот же `VS_SERVER_KEYS_PATH`). До review issue 3 здесь был свой
+    разбор файла, который не понимал `googler_pool`: если в файле ключей записан
+    только пул, снимок молча не обновлялся, и поводы §9/§10 никогда не срабатывали.
+
+    `save_fastgen_usage` живёт в `server/main.py` — та же функция, что кладёт снимок
+    из кабинета, чтобы форма записи была одна на двоих, а не две похожие. Импорт
+    кабинета лениво: он тянет `googler_worker`, и тем, кто не смотрит на модели
+    картинок (--whoami, --test, --state), этот вес не нужен.
+    """
+    if os.path.join(BASE, "workers") not in sys.path:
+        sys.path.insert(0, os.path.join(BASE, "workers"))
+    import main as vsgen                                          # noqa: E402
+    try:
+        key = vsgen._first_credential(vsgen.keys(), "googler")
+    except Exception:
+        key = ""
+    if not key:
+        return
+    try:
+        r = requests.get(_FG_USAGE_URL, headers={"X-API-Key": key}, timeout=15)
+        r.raise_for_status()
+        usage = r.json()
+    except Exception as exc:
+        # Ответ провайдера и отсутствие ответа — разные события, а до 21.09.2026 они
+        # обрабатывались одинаково: и «401, ключ не принят», и «нет интернета» просто
+        # не обновляли снимок, и мёртвый ключ выглядел как обрыв связи. Отличает их
+        # ровно один признак: у HTTPError есть `response` с кодом, у обрыва — нет.
+        code = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+        if code in A.KEY_REFUSED_CODES:
+            # Ещё не тревога: §11 ждёт второго отказа подряд. Кладём маску, чтобы в
+            # сообщении было видно, о каком ключе речь; значение ключа не сохраняется.
+            A.note_key_refused(c, A.FASTGEN_FAMILY, code, now, mask(key))
+        return
+    # Ключ принят — снимаем заявку на отказ, если она была. Принятый запрос и есть
+    # единственное доказательство того, что ключ заменили: по нему §11 гаснет и уходит
+    # «ПОЧИНИЛОСЬ», а по таймеру «само рассосётся» мы бы обещали то, чего не знаем.
+    A.note_key_accepted(c, A.FASTGEN_FAMILY, now)
+    try:
+        vsgen.save_fastgen_usage(c, usage, now)
+    except Exception:
+        pass
 
 
 def db():
@@ -63,7 +124,7 @@ def show(c, now):
           f"ожидание {A.OLDEST_SEC // 3600} ч · диск {A.DISK_MIN_GB:.0f} ГБ · "
           f"повтор раз в {A.REPEAT_SEC // 60} мин")
     if not found:
-        print("\nвсё спокойно: ни один из восьми поводов не выполнен")
+        print("\nвсё спокойно: ни один из одиннадцати поводов не выполнен")
     for key, a in sorted(found.items()):
         st = state.get(key) or {}
         said = ("сказано " + time.strftime("%H:%M", time.localtime(st["sent"]))
@@ -157,7 +218,23 @@ def main() -> int:
 
         if not tg.enabled:
             print("телеграм не настроен: тревоги будут определяться, но не отправляться")
+        # 21.09.2026: цикл переживал свой стенд и оставался сиротой. `trap "kill 0"` в
+        # dev/run.sh спасает только при Ctrl+C: если стенд гасят по имени процесса
+        # (`pkill -f "port 8084"`), умирает один uvicorn, а цикл продолжает слать
+        # тревоги в телеграм каждую минуту. За день накопилось ДВАДЦАТЬ ТРИ таких
+        # сироты — владелец получил их все сразу и попросил «поубивать студии».
+        #
+        # Поэтому цикл сам следит за родителем: остался без него (getppid() == 1) —
+        # выходит. Это работает при любом способе убийства стенда, в том числе при
+        # `kill -9`, где никакой trap не сработал бы вовсе.
+        parent = os.getppid()
         while True:
+            if args.loop and (os.getppid() != parent or os.getppid() == 1):
+                print("стенд закрылся — останавливаюсь, чтобы не слать тревоги в пустоту")
+                return 0
+            # Перед каждым тиком — свежий снимок FastGen, иначе поводы §9/§10 видят
+            # цифры только тогда, когда кто-то параллельно открывал кабинет.
+            refresh_fastgen_usage(c, time.time())
             sent = A.tick(c, tg.send, tenant=TENANT)
             stamp = time.strftime("%H:%M:%S")
             if sent:

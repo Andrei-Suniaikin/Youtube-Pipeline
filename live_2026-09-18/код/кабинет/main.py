@@ -1,0 +1,18277 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""VideoStudio Gen Server — MVP-0 (прокси ключей + мульти-юзер + админ-панель).
+
+Идея MVP-0: ключи провайдеров живут ТОЛЬКО на сервере. Клиент шлёт обычный
+запрос провайдера БЕЗ ключа, сервер подставляет ключ нужного провайдера и
+форвардит. У каждого юзера свой токен; все вызовы логируются по юзеру; владелец
+видит активность всех в админ-панели.
+
+Запуск:  cd ~/VideoStudio/server && uvicorn main:app --port 8800
+Ключи берутся из ~/video_studio_api_keys.json (на машине сервера).
+БД (юзеры + лог) — SQLite vsgen.db рядом.
+"""
+import os, sys, json, sqlite3, secrets, datetime, html, threading, subprocess, hashlib, urllib.parse, signal, re, glob, time, copy, zipfile, shutil, tempfile, unicodedata
+import asyncio
+from fastapi import FastAPI, Request, HTTPException, Header, UploadFile, File, Form
+from fastapi.responses import Response, HTMLResponse, FileResponse, RedirectResponse, StreamingResponse, JSONResponse
+from fastapi.concurrency import run_in_threadpool
+import requests
+
+# Required shared host budget; absence fails closed before provider work.
+sys.path.insert(0, os.environ.get("VIDEO_STUDIO_SHARED_DIR", "/opt/video-studio-shared"))
+import credential_budget as _host_budget
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DB = os.environ.get("VS_SERVER_DB") or os.path.join(HERE, "vsgen.db")
+KEYS_PATH = os.environ.get("VS_SERVER_KEYS_PATH") or os.path.expanduser("~/video_studio_api_keys.json")
+BACKGROUND_ENABLED = os.environ.get("VS_SERVER_DISABLE_BACKGROUND", "").strip().lower() not in ("1", "true", "yes")
+
+# Server-owned upload cards live beside this authoritative main.py.  The module has
+# no optional/provider imports at import time, so API/schema validation remains usable
+# even when background workers are disabled in tests.
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+import card_jobs as card_contract
+from pub_schema import ensure_pub_schema
+from pub_ui import register_pub_routes
+from pub_engine import tick as pub_tick
+from pub_services import PubServices
+from pub_upload_api import register_upload_routes, sweep_stuck as sweep_upload
+
+# Момент старта ЭТОГО процесса. Нужен админ-панели, чтобы поймать «залили файл, но не
+# перезапустили сервис»: код в рантайме — тот, что был на диске в момент импорта, и
+# сравнение с mtime исходников — единственный способ увидеть расхождение снаружи.
+# Инцидент 02.08: main.py залит 01.08 12:17, процесс жил с 31.07 18:29 — весь пакет
+# фиксов планировщика (lifespan/healthz/heartbeat) больше суток не работал, и
+# определить это можно было только по 404 на /healthz.
+_PROC_STARTED = time.time()
+
+# ============================================================
+# Живость фона: лог исключений + heartbeat планировщика
+# ------------------------------------------------------------
+# Инцидент 31.07.2026 18:18: после деплоя очередь встала на ~10 минут (kind=images/prompts
+# копились в 'queued'), а в journalctl было ПУСТО — все фоновые циклы глушили исключения
+# через `except Exception: pass`. Снаружи сервис выглядел живым, потому что рендеры
+# забирает внешняя нода своей HTTP-ручкой, а не диспетчер. Отсюда два правила:
+#   1) фоновый цикл НИКОГДА не глотает исключение молча — traceback идёт в stderr (journal),
+#      но с троттлингом по подписи, иначе ошибка раз в секунду зальёт журнал;
+#   2) у планировщика есть отметка живости (_SCHED_HB) — она ловит и «поток умер»,
+#      и «поток жив, но залип», чего одни только логи не показывают.
+# ============================================================
+import traceback
+
+VS_LOG_THROTTLE_SEC = float(os.environ.get("VS_LOG_THROTTLE_SEC", "60"))
+_LOG_SEEN = {}                      # подпись ошибки -> [ts последней печати, сколько подавлено]
+_LOG_LOCK = threading.Lock()
+
+
+def _exc_signature(where):
+    """Подпись = где + тип + файл:строка последнего кадра. Разные ошибки не склеиваются,
+    одинаковые (та же строка, тот же тип) — троттлятся."""
+    exc_type, _exc, tb = sys.exc_info()
+    tail = ""
+    while tb is not None:
+        tail = "%s:%d" % (os.path.basename(tb.tb_frame.f_code.co_filename), tb.tb_lineno)
+        tb = tb.tb_next
+    return "%s|%s|%s" % (where, getattr(exc_type, "__name__", "?"), tail)
+
+
+def log_exc(where, extra=""):
+    """Печатает traceback в stderr (→ journalctl -u vsgen) не чаще раза в VS_LOG_THROTTLE_SEC
+    на одинаковую подпись; подавленные повторы досчитываются и печатаются следующей строкой."""
+    try:
+        sig = _exc_signature(where)
+        now = time.time()
+        with _LOG_LOCK:
+            slot = _LOG_SEEN.get(sig)
+            if slot and now - slot[0] < VS_LOG_THROTTLE_SEC:
+                slot[1] += 1
+                return
+            suppressed = slot[1] if slot else 0
+            _LOG_SEEN[sig] = [now, 0]
+        head = "[vsgen] ОШИБКА в %s" % where
+        if extra:
+            head += " (%s)" % extra
+        if suppressed:
+            head += " — за последние %.0fс таких же подавлено: %d" % (VS_LOG_THROTTLE_SEC, suppressed)
+        print(head + "\n" + traceback.format_exc(), file=sys.stderr, flush=True)
+    except Exception:
+        # логгер не имеет права уронить вызывающий цикл
+        pass
+
+
+def log_info(msg):
+    print("[vsgen] " + msg, file=sys.stderr, flush=True)
+
+
+# Отметка живости планировщика. Обновляется в конце КАЖДОГО успешного прохода;
+# читается из /healthz и с админ-страницы. last_pass не двигается — значит поток
+# умер или залип (например, на блокирующем вызове), и это видно снаружи.
+VS_SCHED_STALE_SEC = float(os.environ.get("VS_SCHED_STALE_SEC", "60"))
+_SCHED_HB = {
+    "started": 0.0,        # когда поток стартовал
+    "last_pass": 0.0,      # конец последнего успешного прохода
+    "passes": 0,           # сколько проходов сделано
+    "errors": 0,           # сколько проходов упало
+    "last_err": "",        # текст последней ошибки
+    "last_err_ts": 0.0,
+    "last_launched": 0,    # сколько задач запущено на последнем проходе
+    "pass_ms": 0.0,        # длительность последнего прохода (ловит залипание)
+    "max_pass_ms": 0.0,
+}
+_SCHED_THREAD = None       # сам поток — чтобы watchdog видел is_alive()
+
+# Переиспользуем серверную генерацию из воркера (ключи ставим в глобалы модуля)
+sys.path.insert(0, os.path.expanduser("~/VideoStudio/src"))
+import googler_worker as gw
+import reference_contract as reference_contract
+GEN_DIR = os.path.join(HERE, "gen_out")
+os.makedirs(GEN_DIR, exist_ok=True)
+
+# --- Очередь генерации: пул из N воркеров (concurrency-cap вместо безлимитных потоков) ---
+import queue
+GEN_WORKERS = int(os.environ.get("GEN_WORKERS", "4"))           # сколько job'ов крутится разом
+DEFAULT_DAILY_QUOTA = int(os.environ.get("DEFAULT_DAILY_QUOTA", "0"))  # shared cabinet: без дневной квоты
+JOB_Q = queue.Queue()
+
+
+def _worker_loop():
+    while True:
+        fn, args = JOB_Q.get()
+        try:
+            fn(*args)
+        except Exception:
+            log_exc("_worker_loop", getattr(fn, "__name__", "?"))
+        finally:
+            JOB_Q.task_done()
+
+
+# Пул НЕ поднимается на уровне модуля — только из _lifespan (см. комментарий там).
+
+# провайдер -> (base_url, тип авторизации, имя ключа в JSON)
+PROVIDERS = {
+    "googler":      {"base": "https://googler.fast-gen.ai",     "auth": "x-api-key", "key": "googler"},
+    "openai":       {"base": "https://api.openai.com",          "auth": "bearer",    "key": "openai"},
+    "veo":          {"base": "https://veononstop.org",          "auth": "x-api-key", "key": "veo"},
+    "voicer":       {"base": "https://voicer.mat3u.com",        "auth": "x-api-key", "key": "voicer"},
+    "voicegencore": {"base": "https://api.qw1voicegencore.pro", "auth": "x-api-key", "key": "voicegencore"},
+    "elevenlabs":   {"base": "https://api.lumean.app/api/public", "auth": "x-api-key", "key": "elevenlabs"},
+    "lumean":       {"base": "https://api.lumean.app/api/public", "auth": "x-api-key", "key": "lumean"},
+}
+
+
+# Файл ключей читается ОЧЕНЬ часто: проверки доступности провайдеров зовут keys() на
+# каждую provider-группу и на каждый TTS-движок (только рендер дашборда — больше десятка
+# чтений+парсингов одного файла). Кэшируем разобранный JSON, а свежесть проверяем по
+# stat (mtime+размер+inode): дешевле полного чтения и, в отличие от кэша по TTL, правка
+# файла руками применяется СРАЗУ — «поменял ключ, а сервер ещё 10с отвечает старым»
+# было бы хуже сэкономленных микросекунд.
+_KEYS_CACHE = {"sig": None, "data": {}}
+
+
+def _invalidate_keys_cache():
+    _KEYS_CACHE["sig"] = None
+
+
+def _keys_file_sig():
+    try:
+        st = os.stat(KEYS_PATH)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def keys():
+    sig = _keys_file_sig()
+    if sig is None:
+        _KEYS_CACHE["sig"], _KEYS_CACHE["data"] = None, {}
+        return {}
+    if sig != _KEYS_CACHE["sig"]:
+        try:
+            data = json.load(open(KEYS_PATH))
+        except Exception:
+            data = {}
+        _KEYS_CACHE["data"] = data if isinstance(data, dict) else {}
+        _KEYS_CACHE["sig"] = sig
+    # ГЛУБОКАЯ копия: вызывающие (resolve_keys/_worker_keys) кладут поверх свои ключи,
+    # и мутация кэша утекла бы к другому юзеру. Поверхностной копии мало — вложенные
+    # _prompt_policy/_concurrency/*_pool оставались бы ОДНИМИ И ТЕМИ ЖЕ объектами кэша
+    # процесса (до кэширования каждый вызов давал свежий разбор файла).
+    return copy.deepcopy(_KEYS_CACHE["data"])
+
+
+_CREDENTIAL_FAMILIES = (
+    "googler",
+    "openai",
+    "veo",
+    "voicer",
+    "voicegencore",
+    "elevenlabs",
+    "lumean",
+    "claude_oauth",
+    "codex_home",
+    "alt_llm",              # ключ стороннего OpenAI-совместимого Anthropic-прокси
+)
+_CREDENTIAL_ENV_BY_FAMILY = {
+    "googler": "GOOGLER_API_KEY",
+    "openai": "OPENAI_API_KEY",
+    "veo": "VEO_API_KEY",
+    "voicer": "VOICER_API_TOKEN",
+    "voicegencore": "VGC_API_TOKEN",
+    "elevenlabs": "ELEVENLABS_API_KEY",
+    "lumean": "LUMEAN_API_KEY",
+    "claude_oauth": "CLAUDE_CODE_OAUTH_TOKEN",
+    "codex_home": "VS_CODEX_HOME",
+    "alt_llm": "VS_ALT_LLM_KEY",
+}
+# Все поддержанные/исторические aliases удаляются из parent env до overlay выбранного
+# server credential. Это важно не только для ключей API: CODEX_HOME сам является
+# credential locator (внутри auth.json), поэтому чужой home тоже нельзя наследовать.
+_WORKER_CREDENTIAL_ENV_NAMES = (
+    "GOOGLER_API_KEY", "GOOGLER_API_TOKEN", "FASTGEN_API_KEY",
+    "OPENAI_API_KEY", "OPENAI_API_TOKEN", "OPENAI_ACCESS_TOKEN",
+    "VEO_API_KEY", "VEO_API_TOKEN",
+    "VOICER_API_TOKEN", "VOICER_API_KEY",
+    "VGC_API_TOKEN", "VOICEGENCORE_API_KEY", "VOICEGENCORE_API_TOKEN",
+    "ELEVENLABS_API_KEY", "ELEVENLABS_API_TOKEN",
+    "LUMEAN_API_KEY", "LUMEAN_API_TOKEN",
+    "CLAUDE_CODE_OAUTH_TOKEN", "VS_CLAUDE_OAUTH_TOKEN",
+    "VS_ALT_LLM_KEY", "VS_ALT_LLM_BASE", "VS_ALT_LLM_MODEL",
+    "ANTHROPIC_API_KEY", "CLAUDE_API_KEY",
+    "CODEX_HOME", "VS_CODEX_HOME", "REWRITE_CODEX_HOME",
+)
+_MINIMAL_WORKER_ENV_NAMES = (
+    # Runtime only. In particular HOME/XDG/proxy/application variables are not
+    # inherited: systemd may contain unrelated secrets unknown to this service.
+    "PATH",
+    "LANG",
+    "LANGUAGE",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TZ",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE",
+    "CURL_CA_BUNDLE",
+    # Compatibility for a possible Windows-side server run.
+    "SYSTEMROOT",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+)
+
+
+def _credential_items(value):
+    """Строки credentials из scalar/list; dict-entry допускает value/key/token/path/home."""
+    if value is None:
+        return []
+    seq = value if isinstance(value, (list, tuple)) else [value]
+    out = []
+    for item in seq:
+        if isinstance(item, dict):
+            item = next((item.get(k) for k in ("value", "key", "token", "path", "home")
+                         if item.get(k)), "")
+        if isinstance(item, str) and item.strip():
+            out.append(item.strip())
+    return out
+
+
+def _credential_candidates(config, family):
+    """Уникальный server pool. Совместимы scalar, list и `<name>_pool`."""
+    config = config if isinstance(config, dict) else {}
+    names = [family, f"{family}_pool"]
+    if family == "codex_home":
+        names += ["codex_homes", "codex_pool"]
+    values = []
+    for name in names:
+        values.extend(_credential_items(config.get(name)))
+    if family == "codex_home" and not values:
+        # Старый server config задавал авторизованный home через systemd env.
+        values.extend(_credential_items(
+            os.environ.get("VS_CODEX_HOME") or os.environ.get("REWRITE_CODEX_HOME")
+        ))
+        if not values and os.path.isdir(CODEX_HOME):
+            values.append(CODEX_HOME)
+    # Одинаковый secret не создаёт фальшивую дополнительную ёмкость.
+    return list(dict.fromkeys(values))
+
+
+def _first_credential(config, family):
+    vals = _credential_candidates(config, family)
+    return vals[0] if vals else ""
+
+
+# ── Кулдаун КОНКРЕТНОГО серверного credential ────────────────────────────────
+# Было: 401/429 гасил ВЕСЬ канал промптов на 600 с (_mark_prompt_channel_dead), а
+# исчерпанный токен оставался в пуле и снова выбирался round-robin — следующая задача
+# опять падала, через 600 с канал «оживал» и снова жёг задачу. Лечилось только руками:
+# токен вынимали в «_claude_oauth_pool_paused» и руками же возвращали. 11.08.2026 в этой
+# паузе нашёлся РАБОЧИЙ токен, простоявший 4 дня после сброса, пока канал стоял пустой.
+# Стало: отдыхает ОДИН токен и ровно до названного провайдером времени сброса, а канал
+# продолжает работать, пока в пуле остался хоть один живой.
+#
+# Состояние ключуется slot_id = sha256(family\0value) — тем же, что считает пул. Сам
+# секрет не попадает ни в память состояния, ни в SQLite, ни в ответ админ-панели.
+CRED_COOLDOWN_DEFAULT = max(60, int(os.environ.get("VS_CRED_COOLDOWN_DEFAULT", "3600") or 3600))
+CRED_COOLDOWN_AUTH = max(60, int(os.environ.get("VS_CRED_COOLDOWN_AUTH", "21600") or 21600))
+CRED_COOLDOWN_MAX = max(600, int(os.environ.get("VS_CRED_COOLDOWN_MAX", "604800") or 604800))
+_CRED_COOLDOWN = {}          # slot_id -> {"until": epoch, "why": str, "family": str, "mask": str}
+_CRED_COOLDOWN_LOCK = threading.RLock()
+_CRED_COOLDOWN_KEY = "credential_cooldown"
+_CRED_COOLDOWN_LOADED = {"done": False}
+# Семейства, где отказ можно перепроверить дешёвым зондом к провайдеру.
+_CRED_PROBE_FAMILIES = ("claude_oauth",)
+
+
+
+# ── Общий семафор лимита подписки ─────────────────────────────────────────────
+# Подписка одна на все сервисы машины (rewrite-server + vsgen). Кто заметил
+# исчерпанное окно, тот записал время сброса в /var/lib/claude_limits/state.json,
+# а видят все — иначе один ждёт, второй в это время долбит тот же токен.
+# Модуль намеренно необязательный: нет его — работаем как раньше, только вслепую.
+try:
+    import claude_limits as _shared_limits
+except Exception:                                   # noqa: BLE001
+    _shared_limits = None
+
+
+def _shared_limit_until(value) -> float:
+    """До какого времени ключ спит по мнению общего семафора (0 — свободен)."""
+    if not _shared_limits or not value:
+        return 0.0
+    try:
+        return float(_shared_limits.limited_until(value) or 0.0)
+    except Exception:                               # noqa: BLE001
+        return 0.0
+
+
+def _shared_limit_state(value) -> dict:
+    if not _shared_limits or not value:
+        return {}
+    try:
+        return dict(_shared_limits.limited_state(value) or {})
+    except Exception:                               # noqa: BLE001
+        return {}
+
+
+def _shared_limit_mark(value, until_ts, kind="limit", who="", why="") -> None:
+    if not _shared_limits or not value:
+        return
+    try:
+        _shared_limits.mark_limited(value, until_ts, kind=kind, who=who, why=why)
+    except Exception:                               # noqa: BLE001
+        pass
+
+
+def _shared_limit_clear(value, who="") -> None:
+    if not _shared_limits or not value:
+        return
+    try:
+        _shared_limits.clear(value, who=who)
+    except Exception:                               # noqa: BLE001
+        pass
+
+
+def _cred_slot_id(family, value):
+    raw = f"{family}\0{value}".encode("utf-8", "replace")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def _cred_mask(value):
+    """Для человека: голова и хвост, середина скрыта. Наружу отдаём ТОЛЬКО это."""
+    v = str(value or "")
+    if not v:
+        return "—"
+    return (v[:12] + "…" + v[-4:]) if len(v) > 20 else ("…" + v[-4:])
+
+
+def _cred_until_human(until):
+    try:
+        return time.strftime("%d.%m %H:%M", time.localtime(float(until)))
+    except (TypeError, ValueError, OSError):
+        return "?"
+
+
+def _cred_cooldown_load():
+    """Ленивая загрузка из admin_state: рестарт vsgen не должен воскресить исчерпанный
+    токен и сжечь на нём задачу — лимит подписки живёт часами, а процесс столько нет."""
+    if _CRED_COOLDOWN_LOADED["done"]:
+        return
+    with _CRED_COOLDOWN_LOCK:
+        if _CRED_COOLDOWN_LOADED["done"]:
+            return
+        # Флаг ставим ДО чтения: недоступная БД не должна дёргаться на каждом вызове.
+        _CRED_COOLDOWN_LOADED["done"] = True
+        saved = _adm_state_get(_CRED_COOLDOWN_KEY, {}) or {}
+        if not isinstance(saved, dict):
+            return
+        now = time.time()
+        for sid, rec in saved.items():
+            if not isinstance(rec, dict):
+                continue
+            try:
+                until = float(rec.get("until") or 0)
+            except (TypeError, ValueError):
+                continue
+            if until > now:                      # протухшие не поднимаем
+                _CRED_COOLDOWN[str(sid)] = {
+                    "until": until,
+                    "why": str(rec.get("why") or "")[:200],
+                    "family": str(rec.get("family") or ""),
+                    "mask": str(rec.get("mask") or ""),
+                }
+
+
+def _cred_cooldown_save():
+    """Вызывать ТОЛЬКО под _CRED_COOLDOWN_LOCK."""
+    now = time.time()
+    # Протухшие не храним: слот заменённого ключа больше никто не спросит, и запись
+    # копилась бы в admin_state вечно.
+    for sid in [k for k, v in _CRED_COOLDOWN.items() if float(v.get("until") or 0) <= now]:
+        _CRED_COOLDOWN.pop(sid, None)
+    try:
+        _adm_state_set(_CRED_COOLDOWN_KEY, dict(_CRED_COOLDOWN))
+    except Exception:
+        log_exc("cred_cooldown/save")     # состояние в памяти важнее записи на диск
+
+
+def _cred_cooldown_state(family, value):
+    """Отдыхает ли credential — с учётом ОБЩЕГО семафора всех сервисов машины.
+
+    Подписка одна на vsgen и rewrite-server. Если исчерпанное окно заметил сосед,
+    мы обязаны это видеть: иначе он ждёт сброса, а мы в это время продолжаем
+    отправлять задачи в тот же мёртвый токен. Свой кулдаун остаётся главным —
+    он подробнее и переживает перезапуск; семафор только добавляет знание соседа.
+    """
+    rec = _cred_cooldown_state_local(family, value)
+    if rec:
+        return rec
+    until = _shared_limit_until(value)
+    if until <= time.time():
+        return None
+    st = _shared_limit_state(value)
+    why = f"лимит заметил сосед ({st.get('who') or '?'}): " \
+          f"{st.get('why') or 'окно подписки исчерпано'}"
+    return {"until": until, "why": why[:180], "family": str(family),
+            "mask": _cred_mask(value), "shared": True}
+
+
+def _cred_cooldown_state_local(family, value):
+    """Запись кулдауна, если credential сейчас отдыхает, иначе None (срок вышел — снимаем)."""
+    _cred_cooldown_load()
+    sid = _cred_slot_id(family, value)
+    with _CRED_COOLDOWN_LOCK:
+        rec = _CRED_COOLDOWN.get(sid)
+        if not rec:
+            return None
+        if float(rec.get("until") or 0) > time.time():
+            return dict(rec)
+        _CRED_COOLDOWN.pop(sid, None)     # проснулся сам, будильник не нужен
+        _cred_cooldown_save()
+        return None
+
+
+def _cred_park(family, value, seconds, why=""):
+    """Отправить один credential отдыхать. Возвращает epoch пробуждения."""
+    seconds = max(60, min(int(seconds or CRED_COOLDOWN_DEFAULT), CRED_COOLDOWN_MAX))
+    until = time.time() + seconds
+    sid = _cred_slot_id(family, value)
+    _cred_cooldown_load()
+    # Причина уходит в SQLite и на экран панели, а прийти она может из любого текста
+    # провайдера — вырезаем секрет здесь тоже, не полагаясь на редактор выше по стеку.
+    why_txt = " ".join(str(why or "").split()).replace(str(value), "<TOKEN>")[:180]
+    with _CRED_COOLDOWN_LOCK:
+        cur = _CRED_COOLDOWN.get(sid) or {}
+        # Уже спит дольше — не будим раньше: повторный отказ не сокращает сон.
+        until = max(until, float(cur.get("until") or 0))
+        _CRED_COOLDOWN[sid] = {"until": until, "why": why_txt,
+                               "family": str(family), "mask": _cred_mask(value)}
+        _cred_cooldown_save()
+    # Соседям по подписке: файловый ввод-вывод делаем вне замка кулдауна.
+    if str(family) in _CRED_PROBE_FAMILIES:
+        _shared_limit_mark(value, until, kind=_cred_failure_kind(why_txt) or "limit",
+                           who="vsgen", why=why_txt)
+    return until
+
+
+def _cred_wake(family=None, slot_id=None):
+    """Разбудить вручную (ключ починили / лимит докупили). Возвращает сколько снято."""
+    _cred_cooldown_load()
+    with _CRED_COOLDOWN_LOCK:
+        if slot_id:
+            victims = [str(slot_id)] if str(slot_id) in _CRED_COOLDOWN else []
+        else:
+            victims = [k for k, v in _CRED_COOLDOWN.items()
+                       if not family or v.get("family") == family]
+        for k in victims:
+            _CRED_COOLDOWN.pop(k, None)
+        if victims:
+            _cred_cooldown_save()
+    return len(victims)
+
+
+def _live_credential_candidates(config, family):
+    """Кандидаты пула МИНУС отдыхающие.
+
+    ЕДИНЫЙ источник истины: выбор слота (try_acquire), арифметика ёмкости
+    (_provider_pool_size) и «есть ли чем писать каналом» (_prompt_channel_credential)
+    обязаны видеть один и тот же список. Разойдись они — шедулер считал бы слотов 2
+    там, где пул может выдать 1, и задача висела бы в queued без объяснения.
+    """
+    values = _credential_candidates(config, family)
+    if not values:
+        return values
+    return [v for v in values if not _cred_cooldown_state(family, v)]
+
+
+def _live_first_credential(config, family):
+    """Первый НЕ отдыхающий credential. Все отдыхают → '' (канал честно недоступен, и
+    цепочка уходит на следующий, вместо того чтобы копить задачи в мёртвый канал)."""
+    vals = _live_credential_candidates(config, family)
+    return vals[0] if vals else ""
+
+
+def _cred_pool_view(family):
+    """Состояние пула для панели: только маски и сроки, без секретов."""
+    cfg = keys()
+    out = []
+    for value in _credential_candidates(cfg, family):
+        rec = _cred_cooldown_state(family, value)
+        out.append({"slot_id": _cred_slot_id(family, value),
+                    "mask": _cred_mask(value),
+                    "resting": bool(rec),
+                    "until": (rec or {}).get("until"),
+                    "until_human": _cred_until_human((rec or {}).get("until")) if rec else "",
+                    "why": (rec or {}).get("why") or ""})
+    return out
+
+
+# Провайдер сам называет время сброса: «You're out of extra usage · resets Aug 14, 10am
+# (Europe/Berlin)». Разбираем его — иначе срок пришлось бы гадать таймаутом, а лимит
+# подписки живёт часами, а не 600 секундами.
+_RESET_TZ_RE = re.compile(r"\(([A-Za-z]+/[A-Za-z_+\-]+)\)")
+_RESET_AT_RE = re.compile(r"reset[s]?\s+(?:at\s+)?(?P<body>[^()·|;]{1,48})", re.I)
+_RESET_MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+
+
+def _parse_reset_seconds(text, now_dt=None):
+    """Сколько секунд ждать до названного провайдером сброса. None — не распознали.
+
+    Живые формы: «resets Aug 14, 10am (Europe/Berlin)», «resets 3pm», «resets Aug 10».
+    Дата без времени = полночь; время без даты = ближайшее будущее.
+    """
+    raw = str(text or "")
+    m = _RESET_AT_RE.search(raw)
+    if not m:
+        return None
+    tz = None
+    tzm = _RESET_TZ_RE.search(raw)
+    if tzm:
+        try:
+            from zoneinfo import ZoneInfo
+            tz = ZoneInfo(tzm.group(1))
+        except Exception:
+            tz = None
+    if now_dt is None:
+        now_dt = datetime.datetime.now(tz) if tz else datetime.datetime.now()
+    low = m.group("body").lower()
+    mon = day = hh = minute = None
+    md = re.search(r"\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2})", low)
+    if md:
+        mon, day = _RESET_MONTHS[md.group(1)], int(md.group(2))
+    tm = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)\b", low)
+    if tm:
+        hh, minute = int(tm.group(1)) % 12, int(tm.group(2) or 0)
+        if tm.group(3) == "pm":
+            hh += 12
+    else:
+        tm = re.search(r"\b(\d{1,2}):(\d{2})\b", low)
+        if tm:
+            hh, minute = int(tm.group(1)), int(tm.group(2))
+    if mon is None and hh is None:
+        return None
+    try:
+        target = now_dt.replace(second=0, microsecond=0,
+                                hour=(hh if hh is not None else 0),
+                                minute=(minute if minute is not None else 0))
+        if mon is not None:
+            target = target.replace(month=mon, day=day)
+        if target <= now_dt:
+            # Время без даты («resets 3pm») = ближайшее будущее; дата в прошлом —
+            # значит речь о следующем годе (декабрь → январь).
+            target = (target + datetime.timedelta(days=1)) if mon is None \
+                else target.replace(year=target.year + 1)
+    except ValueError:                    # 30 февраля и прочая ерунда из текста
+        return None
+    delta = (target - now_dt).total_seconds()
+    if delta <= 0 or delta > CRED_COOLDOWN_MAX:
+        return None
+    return int(delta) + 120               # запас: лимит отпускают не секунда в секунду
+
+
+_CRED_LIMIT_MARKERS = ("out of extra usage", "out of usage", "usage limit", "rate limit",
+                       "limit reached", "hit your limit", "quota", "too many requests", "429")
+_CRED_AUTH_MARKERS = ("not logged in", "unauthorized", "invalid token", "invalid api key",
+                      "authentication", "401", "oauth token")
+
+
+# Отказ без опознанной причины и без вердикта зонда не паркует ключ с первого раза:
+# одиночный транзиент рабочего токена дороже одной задачи. Но если ОДИН И ТОТ ЖЕ слот
+# валит задачи раз за разом, он нерабочий по факту — паркуем по накоплению отказов.
+# Это страховка на случай, когда провайдер не назвал причину, а зонд не ответил.
+CRED_STRIKES_LIMIT = max(1, int(os.environ.get("VS_CRED_STRIKES", "3") or 3))
+CRED_STRIKE_WINDOW = max(60, int(os.environ.get("VS_CRED_STRIKE_WINDOW", "1800") or 1800))
+_CRED_STRIKES = {}                      # slot_id -> (count, first_ts)
+
+
+def _cred_strike(family, value):
+    """Записать отказ без вердикта. Возвращает счётчик подряд идущих отказов слота."""
+    sid = _cred_slot_id(family, value)
+    now = time.time()
+    with _CRED_COOLDOWN_LOCK:
+        cnt, first = _CRED_STRIKES.get(sid, (0, now))
+        if now - first > CRED_STRIKE_WINDOW:
+            cnt, first = 0, now         # окно вышло — считаем заново
+        cnt += 1
+        _CRED_STRIKES[sid] = (cnt, first)
+        if cnt >= CRED_STRIKES_LIMIT:
+            _CRED_STRIKES.pop(sid, None)
+        return cnt
+
+
+def _cred_strike_reset(family, value):
+    """Задача на этом ключе прошла успешно → счётчик обнуляем."""
+    if not family or not value:
+        return
+    with _CRED_COOLDOWN_LOCK:
+        _CRED_STRIKES.pop(_cred_slot_id(family, value), None)
+
+
+def _cred_failure_kind(text):
+    low = str(text or "").lower()
+    if any(x in low for x in _CRED_LIMIT_MARKERS):
+        return "limit"
+    if any(x in low for x in _CRED_AUTH_MARKERS):
+        return "auth"
+    return "unknown"
+
+
+def _claude_probe(value, timeout=90):
+    """Спросить провайдера правду про ЭТОТ токен.
+
+    `claude -p ping` печатает «out of extra usage · resets …» открытым текстом и выходит
+    с rc=0, тогда как SDK отдаёт воркеру безликий exit 1. Один вызов на инцидент — это
+    и страховка от парковки ЖИВОГО токена по транзиентной ошибке, и точное время сброса.
+    """
+    env = dict(os.environ)
+    env["CLAUDE_CODE_OAUTH_TOKEN"] = str(value)
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        env.pop(name, None)
+    model = os.environ.get("VS_CLAUDE_MODEL") or "claude-sonnet-4-6"
+    try:
+        # stdin=DEVNULL обязателен: с унаследованным открытым stdin (не TTY и не
+        # закрытый) `claude -p` блокируется на чтении и уходит в таймаут вместо ответа —
+        # замер 11.08.2026: 5 с против 45 с таймаута на одном и том же токене.
+        r = subprocess.run(["claude", "-p", "ping", "--model", model],
+                           capture_output=True, text=True, timeout=timeout, env=env,
+                           stdin=subprocess.DEVNULL)
+    except Exception as e:                       # noqa: BLE001 — зонд не должен ронять задачу
+        return "", f"зонд не удался ({type(e).__name__})"
+    out = " ".join(((r.stdout or "") + " " + (r.stderr or "")).split())[:220]
+    return out.replace(str(value), "<TOKEN>"), ""
+
+
+def _note_credential_failure(family, value, why):
+    """Отказ канала на КОНКРЕТНОМ серверном credential → отправить его отдыхать.
+
+    Возвращает (until_epoch, kind) при парковке либо (None, причина-почему-нет).
+    Транзиент парковкой не считаем: рабочий токен дороже одной задачи.
+    """
+    if not family or not value:
+        return None, "нет серверного credential"
+    kind = _cred_failure_kind(why)
+    seconds = _parse_reset_seconds(why)
+    probe_note = ""
+    if family in _CRED_PROBE_FAMILIES and (kind == "unknown" or seconds is None):
+        # Причина безликая или без времени сброса — спрашиваем провайдера напрямую.
+        out, err = _claude_probe(value)
+        probe_note = out or err
+        if out:
+            probe_kind = _cred_failure_kind(out)
+            if probe_kind == "unknown":
+                return None, f"зонд отвечает нормально ({out[:60]}) — транзиент"
+            kind = probe_kind
+            seconds = seconds or _parse_reset_seconds(out)
+            why = f"{why} | зонд: {out}"
+    if kind == "unknown":
+        hits = _cred_strike(family, value)
+        if hits < CRED_STRIKES_LIMIT:
+            return None, (f"причина отказа не опознана, отказ {hits} из {CRED_STRIKES_LIMIT}"
+                          + (f" (зонд: {probe_note[:60]})" if probe_note else ""))
+        return (_cred_park(family, value, CRED_COOLDOWN_DEFAULT,
+                           why=f"{hits} отказов подряд, причину провайдер не назвал"),
+                "strikes")
+    if seconds is None:
+        seconds = CRED_COOLDOWN_AUTH if kind == "auth" else CRED_COOLDOWN_DEFAULT
+    return _cred_park(family, value, seconds, why=why), kind
+
+
+def _sanitized_worker_env():
+    """Deny-by-default env; caller накладывает knobs и только выданный lease."""
+    env = {
+        name: os.environ[name]
+        for name in _MINIMAL_WORKER_ENV_NAMES
+        if os.environ.get(name)
+    }
+    env.setdefault("PATH", os.defpath)
+    env.setdefault("LANG", "C.UTF-8")
+    # Эти значения генерирует сервер, а не наследует из systemd.
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    env["PYTHONNOUSERSITE"] = "1"
+    return env
+
+
+def resolve_keys(u):
+    """Эффективные ключи. ПАРТНЁР (role != admin) — ТОЛЬКО свои ключи, БЕЗ fallback на ключи владельца:
+    не вписал ключ → провайдер пуст → воркер честно падает «нет ключа», деньги владельца НЕ тратятся.
+    ADMIN — серверные ключи владельца, перекрытые своими (если заданы)."""
+    try:
+        own = json.loads(u["keys"]) if (u["keys"] if "keys" in u.keys() else None) else {}
+    except Exception:
+        own = {}
+    own = {k: v for k, v in (own or {}).items() if v}
+    role = (u["role"] if "role" in u.keys() else "user")
+    if role == "admin":
+        eff = dict(keys())
+        eff.update(own)
+        return eff
+    return own  # партнёр — строго свои ключи, без ключей владельца
+
+
+# ── Чем писать промпты (см. src/prompt_llm.py) ────────────────────────────────
+# openai — API-ключ (как было); codex — подписка ChatGPT через Codex CLI (серверная
+# авторизация владельца, поэтому только admin); claude — подписка Claude по OAuth-токену юзера.
+PROMPT_PROVIDERS = [
+    ("openai", "GPT API — ключ OpenAI"),
+    ("codex",  "Codex токен — подписка ChatGPT"),
+    ("claude", "Claude токен — подписка Claude (Sonnet 5)"),
+    ("altclaude", "Альтернативный Claude API — свой адрес и ключ"),
+]
+# Страница «Мои ключи»: под выбранным каналом показываем поле ровно ЕГО credential.
+# Порядок = порядок в выпадающем списке.
+PROMPT_CHANNEL_ORDER = ("openai", "claude", "altclaude", "codex")
+# Альтернативный Claude API: адрес и модель — не секреты, поэтому у них есть дефолты.
+DEFAULT_ALT_LLM_BASE = os.environ.get("VS_ALT_LLM_BASE_DEFAULT", "https://apiclaude.ooguy.com/v1")
+DEFAULT_ALT_LLM_MODEL = os.environ.get("VS_ALT_LLM_MODEL_DEFAULT", "claude-sonnet-5")
+_ADD_KEY_JS = """<script>
+// Кнопка «+ ещё ключ»: клонирует поле, чтобы за один заход вписать несколько ключей.
+// Каждое поле уходит отдельным значением add_<провайдер> — сервер собирает их в набор.
+function addKeyField(name){
+  var f = document.querySelectorAll('[data-addfield="'+name+'"]');
+  var last = f[f.length-1];
+  if(!last) return;
+  var box = last.cloneNode(true);
+  box.value = ''; box.placeholder = 'ещё один ключ'; box.style.marginTop = '6px';
+  last.parentNode.insertBefore(box, last.nextSibling);
+  box.focus();
+}
+</script>"""
+
+
+_PROMPT_CHAN_JS = """<script>(function(){var s=document.getElementById('pchan');if(!s)return;
+function upd(){var v=s.value;var ps=document.querySelectorAll('.pchan-pane');
+for(var i=0;i<ps.length;i++){ps[i].style.display=(ps[i].getAttribute('data-ch')===v)?'':'none';}}
+s.addEventListener('change',upd);upd();})();</script>"""
+# Codex с ChatGPT-аккаунтом не принимает gpt-4.1-* → только модели подписки.
+# gpt-5.4-mini = ближайший аналог текущего API-дефолта gpt-4.1-mini.
+# 05.09.2026: gpt-5.4 убрана — OpenAI отдаёт на неё 400 «not supported when using
+# Codex with a ChatGPT account». Держать её в выборе = дать админу снова уронить промпты.
+CODEX_MODELS = ["gpt-5.4-mini", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
+DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
+# CODEX_HOME с авторизованной подпиской ChatGPT (её же использует rewrite-server).
+CODEX_HOME = os.environ.get("VS_CODEX_HOME") or os.environ.get("REWRITE_CODEX_HOME") or "/root/.codex-rewrite"
+def _policy_user_matches(u, values):
+    if not isinstance(values, (list, tuple, set)):
+        return False
+    try:
+        needles = {str(u["id"]), str(u["name"]).strip().lower()}
+    except Exception:
+        needles = set()
+    return any(str(v).strip().lower() in needles for v in values)
+
+
+PROMPT_CHANNELS = ("openai", "claude", "altclaude", "codex")
+# Короткие человеческие имена каналов для интерфейса: в очереди и на карточке проекта
+# нельзя показывать «prompt_codex». Секретов тут нет — только название канала.
+PROMPT_CHANNEL_TITLES = {
+    "openai": "GPT API",
+    "codex":  "подписка ChatGPT",
+    "claude": "подписка Claude",
+    "altclaude": "альтернативный Claude API",
+}
+
+
+def _prompt_channel_title(provider_or_channel):
+    """'prompt_codex' / 'codex' → «подписка ChatGPT». Неизвестное → '' (ничего не рисуем)."""
+    ch = str(provider_or_channel or "").strip().lower()
+    ch = ch[len("prompt_"):] if ch.startswith("prompt_") else ch
+    return PROMPT_CHANNEL_TITLES.get(ch, "")
+
+# ── «Канал промптов не работает» — состояние НА СЕРВЕРЕ ──────────────────────
+# Раньше недоступностью считалось только «нет credential»: настроенный, но исчерпанный
+# (429 лимит подписки) или разлогиненный (401) канал всё равно получал задачи. Воркер
+# идёт с VS_PROMPT_FALLBACK=0 и только своим lease, помечает канал мёртвым в СВОЁМ
+# процессе и падает — а сервер про это ничего не знал и слал туда следующую задачу.
+# Метку ставим по строке воркера «⚠️ Канал промптов «X» недоступен (…)» (её печатает
+# prompt_llm._mark_dead ровно на 401/429) и снимаем при успешной задаче этого канала.
+PROMPT_CHANNEL_DEAD_TTL = max(0, int(os.environ.get("VS_PROMPT_CHANNEL_DEAD_TTL", "600") or 0))
+_PROMPT_DEAD_RE = re.compile(r"Канал промптов [«\"']?([a-z_]+)[»\"']? недоступен", re.I)
+_PROMPT_DEAD = {}                       # канал -> monotonic-время, до которого он мёртв
+# То же самое, но для задач НА СВОЁМ credential: (uid, канал) -> monotonic-дедлайн.
+# Раньше метка была общей: партнёр с протухшим СВОИМ claude-токеном на 10 минут гасил
+# серверный канал для всех аккаунтов, и весь этап промптов уезжал на платный OpenAI.
+# Неудача чужого ключа теперь бьёт только по его владельцу.
+_PROMPT_DEAD_OWN = {}
+_PROMPT_DEAD_LOCK = threading.Lock()
+
+
+def _mark_prompt_channel_dead(ch, why="", uid=None):
+    """Пометить канал нерабочим на PROMPT_CHANNEL_DEAD_TTL секунд.
+
+    uid=None — задача шла на СЕРВЕРНОМ credential: метка общая (сервер и правда не
+    может писать этим каналом). uid задан — задача шла на СВОЁМ ключе юзера: метка
+    приватная, чужие аккаунты и серверный канал она не трогает.
+    """
+    ch = str(ch or "").strip().lower()
+    if ch not in PROMPT_CHANNELS or PROMPT_CHANNEL_DEAD_TTL <= 0:
+        return
+    until = time.monotonic() + PROMPT_CHANNEL_DEAD_TTL
+    with _PROMPT_DEAD_LOCK:
+        if uid is None:
+            _PROMPT_DEAD[ch] = until
+        else:
+            _PROMPT_DEAD_OWN[(uid, ch)] = until
+    who = "серверный" if uid is None else f"свой ключ uid={uid}"
+    print(f"[prompt] канал {ch} ({who}) помечен нерабочим на {PROMPT_CHANNEL_DEAD_TTL}с: "
+          f"{str(why)[:120]}", flush=True)
+
+
+def _clear_prompt_channel_dead(ch, uid=None):
+    """Канал ответил успешно → метка снимается сразу, не дожидаясь TTL.
+
+    Успех СВОЕГО ключа снимает только приватную метку: серверный канал мог быть мёртв
+    по своей причине, и чужой успех не повод слать туда следующие задачи.
+    """
+    ch = str(ch or "").strip().lower()
+    with _PROMPT_DEAD_LOCK:
+        if uid is None:
+            _PROMPT_DEAD.pop(ch, None)
+        else:
+            _PROMPT_DEAD_OWN.pop((uid, ch), None)
+
+
+def _prompt_channel_dead(ch, uid=None):
+    """Мёртв ли канал. uid задан → смотрим ПРИВАТНУЮ метку этого юзера (его ключ),
+    иначе — общую серверную."""
+    ch = str(ch or "").strip().lower()
+    store, key = ((_PROMPT_DEAD, ch) if uid is None else (_PROMPT_DEAD_OWN, (uid, ch)))
+    with _PROMPT_DEAD_LOCK:
+        until = store.get(key, 0)
+        if not until:
+            return False
+        if until > time.monotonic():
+            return True
+        store.pop(key, None)            # TTL истёк — даём каналу второй шанс
+    return False
+
+
+def _prompt_channel_dead_for(u, ch):
+    """Мёртв ли канал ДЛЯ ЭТОГО юзера: свой credential → его приватная метка,
+    серверный → общая. Иначе протухший личный токен партнёра гасил бы канал всем."""
+    family = _PROMPT_CHANNEL_FAMILY.get(str(ch or "").strip().lower())
+    try:
+        uid = u["id"]
+    except Exception:
+        uid = None
+    if family and uid is not None and _own_credential_for_family(u, family):
+        return _prompt_channel_dead(ch, uid)
+    return _prompt_channel_dead(ch)
+
+
+def _scan_prompt_channel_line(line, uid=None, own_credential=False, u=None):
+    """Строка вывода воркера → пометка мёртвого канала (вызывается на стриме логов).
+
+    Гейт «своя метка или общая» строится по КАНАЛУ из строки, а не по провайдеру
+    задачи: строку печатает prompt_llm по цепочке фолбэка codex→claude→openai, и её
+    печатает не только задача группы prompt_*, но и любая images-задача. Раньше сюда
+    приходил own_credential, посчитанный по family ПРОВАЙДЕРА ЗАДАЧИ (recrafter→googler,
+    veo→veo) — то есть гейт смотрел на совсем другой ключ: партнёр с протухшим СВОИМ
+    claude-токеном гасил общий канал всем, а неудача СЕРВЕРНОГО токена в задаче
+    партнёра со своим googler-ключом гасила канал только ему.
+
+    u — строка users: если передана, own/shared решается ровно так же, как в
+    _prompt_channel_dead_for (по credential КАНАЛА). Без неё остаётся прежний
+    параметр own_credential (совместимость со старыми вызовами и тестами).
+    """
+    if not line or "Канал промптов" not in line:
+        return None
+    m = _PROMPT_DEAD_RE.search(line)
+    if not m:
+        return None
+    ch = m.group(1).strip().lower()
+    if ch not in PROMPT_CHANNELS:
+        return None
+    own = bool(own_credential)
+    if u is not None:
+        family = _PROMPT_CHANNEL_FAMILY.get(ch)
+        own = bool(family and _own_credential_for_family(u, family))
+    _mark_prompt_channel_dead(ch, line.strip(), uid=(uid if own else None))
+    return ch
+
+
+# ── «Кончился лимит аккаунта image-провайдера» — причина падения задачи ──────
+# Воркер (googler_worker) на HTTP 429 + RATE_LIMIT у VeoNonStop печатает строку с маркером
+# и падает кодом 3. Без этого сервер писал в ошибку задачи голое «rc=3», и партнёр видел
+# «упало» без причины. Механика та же, что у пометки мёртвого канала промптов: скан строк
+# стрима → запомнили → отдали в ошибку задачи.
+GEN_ACCOUNT_LIMIT_MARKER = "ЛИМИТ АККАУНТА ПРОВАЙДЕРА"
+_GEN_LIMIT_REASON = {}                  # job_id -> строка воркера (уже отредактированная)
+_GEN_LIMIT_LOCK = threading.Lock()
+
+
+# Ключ провайдера умер (истёк/отозван/не принят). Без этой сверки задача падала
+# с голым «rc=1»: в логе строка была, но в карточке кабинета причины не видно, и
+# партнёр не понимает, что чинить не ему. Замер 03.09: у одного тенанта так ушли
+# в rc=1 все видео-задачи — серверный ключ VeoNonStop вернул «API key has expired».
+_PROVIDER_AUTH_DEAD = (
+    ("veo auth 401", "Ключ VeoNonStop не принят (истёк/отозван) — обновите ключ «veo» в настройках сервера"),
+    ("api key has expired", "Ключ провайдера истёк — обновите его в настройках"),
+    ("api key has been revoked", "Ключ провайдера отозван — обновите его в настройках"),
+)
+
+
+def _scan_gen_limit_line(jid, line, provider=None):
+    """Строка вывода воркера → запомнить человеческую причину отказа для этой задачи.
+
+    Две категории: исчерпан лимит аккаунта провайдера и мёртвый ключ провайдера.
+    Первая запомненная причина не перетирается — интересен исходный отказ.
+    """
+    text = str(line or "")
+    if not text:
+        return None
+    reason = ""
+    if GEN_ACCOUNT_LIMIT_MARKER in text:
+        reason = " ".join(text.split())[:300]
+    else:
+        low = text.casefold()
+        for needle, human in _PROVIDER_AUTH_DEAD:
+            if needle in low:
+                reason = human
+                break
+    if provider in ("recrafter", "openai", "veo"):
+        low = text.casefold()
+        explicit_auth = (
+            f"provider_submit_auth_rejected {provider}" in low
+            or (provider == "recrafter" and re.search(r"v6 \(generations\).*httperror: 401\b", low))
+            or (provider == "openai" and "openai auth 401" in low)
+        )
+        if explicit_auth:
+            reason = "Ключ провайдера не принят при создании задачи [submit rejected]"
+        if "provider_remote_recovery_required" in low:
+            reason = "Удалённая работа уже создана; требуется восстановление по её ID, повторное создание запрещено"
+            with _GEN_LIMIT_LOCK:
+                _GEN_LIMIT_REASON[str(jid)] = reason
+                return reason
+    if not reason:
+        return None
+    with _GEN_LIMIT_LOCK:
+        _GEN_LIMIT_REASON.setdefault(str(jid), reason)
+        return _GEN_LIMIT_REASON[str(jid)]
+
+
+def _gen_limit_reason(jid):
+    with _GEN_LIMIT_LOCK:
+        return _GEN_LIMIT_REASON.get(str(jid), "")
+
+
+def _clear_gen_limit(jid):
+    with _GEN_LIMIT_LOCK:
+        _GEN_LIMIT_REASON.pop(str(jid), None)
+
+
+def _prompt_policy():
+    cfg = keys() or {}
+    policy = cfg.get("_prompt_policy") or cfg.get("prompt_policy") or {}
+    return policy if isinstance(policy, dict) else {}
+
+
+def _prompt_channel_allowed(u, ch, policy=None):
+    """Разрешён ли канал промптов этому юзеру по server policy.
+
+    allowed_providers ограничивает набор каналов кабинета целиком. Списки
+    "<канал>_users" ограничивают канал ПЕРСОНАЛЬНО и только если НЕПУСТЫ: пустого
+    списка (как и отсутствия поля) достаточно, чтобы канал был доступен всем в
+    рамках allowed_providers. Раньше пустой codex_users читался как «нельзя никому»,
+    и владелец, сознательно открывший свою подписку общему пулу, всё равно писал
+    промпты платным API.
+    """
+    ch = str(ch or "").strip().lower()
+    if ch not in PROMPT_CHANNELS:
+        return False
+    policy = _prompt_policy() if policy is None else policy
+    allowed = policy.get("allowed_providers")
+    if isinstance(allowed, (list, tuple, set)):
+        if ch not in {str(v).strip().lower() for v in allowed}:
+            return False
+    restricted = policy.get(f"{ch}_users")
+    if isinstance(restricted, (list, tuple, set)) and len(restricted) > 0:
+        return _policy_user_matches(u, restricted)
+    return True
+
+
+def _policy_selected_channel(u=None, policy=None):
+    """ВЫБРАННЫЙ канал policy (default/scalar, перекрытый записью users) — без проверки
+    прав. Права накладывают _server_prompt_provider и _prompt_channel_chain."""
+    cfg = keys() or {}
+    policy = _prompt_policy() if policy is None else policy
+    selected = policy.get("default") or cfg.get("prompt_provider") or "openai"
+    users = policy.get("users") if isinstance(policy.get("users"), dict) else {}
+    try:
+        for ident in (str(u["id"]), str(u["name"]), str(u["name"]).lower()):
+            if ident in users:
+                selected = users[ident]
+                break
+    except Exception:
+        pass
+    selected = str(selected or "openai").strip().lower()
+    return selected if selected in PROMPT_CHANNELS else "openai"
+
+
+def _server_prompt_provider(u=None):
+    """Реальный prompt-provider только из server config/policy, никогда из job JSON/users.keys.
+
+    Схема policy (опционально):
+      "_prompt_policy": {
+        "default": "openai",
+        "order": ["codex", "claude", "openai"],
+        "users": {"7": "claude", "Morbie": "codex"},
+        "allowed_providers": ["openai", "claude", "codex"],
+        "claude_users": ["7"], "codex_users": ["admin"]
+      }
+    Старый scalar `prompt_provider` остаётся совместимым и считается явной global policy.
+    Здесь — ВЫБРАННЫЙ канал; порядок предпочтения даёт _prompt_channel_chain.
+    """
+    policy = _prompt_policy()
+    selected = _policy_selected_channel(u, policy)
+    return selected if _prompt_channel_allowed(u, selected, policy) else "openai"
+
+
+def _prompt_channel_chain(u):
+    """Приоритетная цепочка каналов промптов по server policy.
+
+    Поле "order" (например ["codex","claude","openai"]) = порядок предпочтения:
+    сначала свои подписки, платный API — последним. Поля нет → цепочка из одного
+    выбранного канала, то есть ровно прежнее поведение. Явный выбор для юзера
+    (policy.users) всегда идёт первым звеном его цепочки; если этот канал юзеру
+    не разрешён, порядок решает "order" (а не немедленный откат на платный API).
+    """
+    policy = _prompt_policy()
+    order = policy.get("order")
+    chain = []
+    for ch in [_policy_selected_channel(u, policy)] + [
+            str(v).strip().lower()
+            for v in (order if isinstance(order, (list, tuple)) else [])]:
+        if ch in PROMPT_CHANNELS and ch not in chain and _prompt_channel_allowed(u, ch, policy):
+            chain.append(ch)
+    return chain or [_server_prompt_provider(u)]
+
+
+def _codex_allowed(u):
+    """Legacy admin совместим; shared-партнёр получает Codex только по server policy
+    (канал должен быть в его цепочке — иначе серверная подписка владельца не выдаётся)."""
+    try:
+        return u is not None and (u["role"] == "admin" or "codex" in _prompt_channel_chain(u))
+    except Exception:
+        return False
+
+
+def _prompt_channel_credential(u, ch):
+    """Чем писать этим каналом: свой credential юзера, иначе серверный пул ('' — нечем)."""
+    family = _PROMPT_CHANNEL_FAMILY.get(str(ch or "").strip().lower())
+    if not family:
+        return ""
+    # Серверный пул — только ЖИВАЯ его часть: токен, отдыхающий до сброса лимита,
+    # «чем писать» не считается, иначе задачи уходили бы в заведомо мёртвый канал.
+    live_own = [v for v in _own_pool_values(u, family) if not _cred_cooldown_state(family, v)]
+    if live_own:
+        return live_own[0]
+    if _own_only(u) or _own_pool_values(u, family):
+        return ""
+    return _live_first_credential(keys(), family)
+
+
+def _effective_prompt_provider(u, prefer_free=False):
+    """Канал промптов: СВОЙ выбор юзера (только среди каналов с его credential),
+    иначе решает СЕРВЕР — первый РАБОЧИЙ канал цепочки policy (_prompt_channel_chain).
+
+    Свой credential = своя подписка и свои деньги, поэтому такой выбор уважается
+    (_own_prompt_channel). Своего credential нет — канал определяет серверная policy;
+    серверная подписка Codex остаётся личной авторизацией владельца (_codex_allowed).
+
+    Канал, помеченный нерабочим (_prompt_channel_dead: 401/429 у последней задачи)
+    или поставленный admin на provider-specific pause, пропускается наравне с каналом
+    без credential. Global maintenance останавливает только claim и provider snapshot
+    не меняет.
+
+    prefer_free=True (момент постановки задачи): среди рабочих каналов берём первый,
+    у которого СЕЙЧАС свободен слот его группы очереди. Занят codex — задача уходит
+    в claude, а не ждёт; свободных слотов нет нигде → берём НАИМЕНЕЕ загруженный канал
+    (queued+running ÷ ёмкость), а не первое звено цепочки: на батче в 20-90 проектов
+    «всегда chain[0]» снова упирало этап промптов в codex, пока claude простаивал.
+
+    BYOK меняет серверное решение ещё в одном случае: ни у одного канала цепочки нет
+    рабочего credential, но у юзера есть другой живой собственный канал → пишем его
+    credential. Это не открывает другим юзерам платные серверные ключи.
+    """
+    own_channel = _own_prompt_channel(u)
+    if (own_channel
+            and not _prompt_provider_paused(own_channel)
+            and not _prompt_channel_dead_for(u, own_channel)):
+        return own_channel
+    # Явный выбор на СЕРВЕРНОМ credential (свой выбор выше — он безусловен): уважаем,
+    # пока канал не помечен нерабочим. Помечен — идём цепочкой policy, иначе выбор
+    # означал бы «слать задачи в канал, который сейчас отвечает 401/429».
+    picked = _selected_prompt_channel(u)
+    if (picked and _prompt_channel_credential(u, picked)
+            and not _prompt_provider_paused(picked)
+            and not _prompt_channel_dead_for(u, picked)):
+        return picked
+    chain = _prompt_channel_chain(u)
+    ready = [ch for ch in chain if _prompt_channel_credential(u, ch)]
+    # Provider-specific admin pause is a routing constraint.  A task assigned to
+    # that group cannot be claimed at all, so dynamically selecting it here
+    # creates an unbounded queue stall.  Known-dead channels are also excluded:
+    # when no real route exists enqueue must fail closed instead of pinning work
+    # to a lane that cannot run.
+    usable = [ch for ch in ready
+              if not _prompt_provider_paused(ch)
+              and not _prompt_channel_dead_for(u, ch)]
+    if usable:
+        if prefer_free and len(usable) > 1:
+            try:
+                uid = u["id"]
+            except Exception:
+                uid = None
+            rows = _prompt_tasks_snapshot()     # один снимок очереди на весь выбор
+            for ch in usable:
+                if _prompt_group_free_slots("prompt_" + ch, uid, rows) > 0:
+                    return ch
+            return min(usable, key=lambda ch: (_prompt_group_load("prompt_" + ch, uid, rows),
+                                               usable.index(ch)))
+        return usable[0]
+    for ch in _own_prompt_channels(u):
+        family = _PROMPT_CHANNEL_FAMILY.get(ch)
+        if (_own_credential_for_family(u, family)
+                and not _prompt_provider_paused(ch)
+                and not _prompt_channel_dead_for(u, ch)):
+            return ch
+    return ""
+
+
+def _prompt_channel_ui_state(u):
+    """Для интерфейса: (канал сейчас, канал при постановке задачи, мёртвые каналы).
+
+    Страница «Ключи» показывала только сохранённый выбор/первое звено цепочки, а
+    очередь берёт канал в момент постановки (prefer_free — по свободному слоту) и
+    пропускает каналы, помеченные недоступными. Значения тут — только НАЗВАНИЯ
+    каналов, никаких секретов.
+    """
+    eff = _effective_prompt_provider(u)
+    try:
+        at_enqueue = _effective_prompt_provider(u, prefer_free=True)
+    except Exception:
+        at_enqueue = eff
+    dead = [ch for ch in _prompt_channel_chain(u)
+            if _prompt_channel_credential(u, ch) and _prompt_channel_dead_for(u, ch)]
+    return eff, at_enqueue, dead
+
+
+# Потоков на написание промптов. Подписке нужен пул больше API-шного: там вызов = отдельный
+# CLI-процесс, и сеть не узкое место (замер 28.07: при 40 параллельных codex 0.66 c/сцена,
+# claude 1.25 c/сцена против ~6.5 при пуле 20). Память держит бюджет ниже, а жёсткий
+# предохранитель по процессам — prompt_llm._DEFAULT_MAX_PARALLEL.
+# openai = 10: аккаунт делят ТРИ сервиса (VideoStudio + rewrite + cover), а в истории
+# проекта уже было "exceeded your current quota"; 4 задачи × 10 = 40 запросов разом.
+PROMPT_THREADS_DEFAULT = {"openai": 10, "codex": 20, "claude": 12, "altclaude": 12}
+# Статический код-потолок. РАБОЧИЙ потолок = min(этого и бюджета памяти машины),
+# считается в _prompt_threads_hard() — на маленькой машине он ниже.
+PROMPT_THREADS_HARD = {"openai": 20, "codex": 20, "claude": 12, "altclaude": 20}
+# Общий потолок одновременных задач промптов НА ЮЗЕРА поверх всех каналов. Лимит
+# «на одного юзера» действует ВНУТРИ группы, а групп теперь три: без общего потолка
+# один юзер занимал бы 2 codex + 2 claude + 4 openai = 8 задач, то есть всю ёмкость
+# этапа промптов, и второму не оставалось бы ничего. Round-robin между юзерами при
+# claim это не меняет — только не даёт одному занять все каналы разом.
+PROMPT_USER_TOTAL_JOBS = max(1, int(os.environ.get("VS_PROMPT_USER_JOBS", "4") or 4))
+
+# ── Бюджет памяти каналов промптов ───────────────────────────────────────────
+# ЗАМЕРЫ на боевом VPS 30.07.2026 (живьём, не оценка — чтобы следующий проверяющий
+# не считал числа взятыми с потолка):
+#   • железо: MemTotal 17.9 ГБ, available 16.9 ГБ, swap 4 ГБ, 6 ядер
+#     (бокс апгрейден; запись про 11.9 ГБ в tasks/todo.md устарела);
+#   • codex:  8 параллельных вызовов → пик 16 процессов, 1.33 ГБ ⇒ ~166 МБ на ВЫЗОВ
+#     (codex поднимает ДВА процесса на вызов);
+#   • claude: 8 параллельных вызовов → 8 процессов, 2.25 ГБ ⇒ ~288 МБ на вызов;
+#   • openai: HTTP из самого воркера, отдельных процессов не поднимает ⇒ 0 МБ.
+PROMPT_CALL_MEMORY_MB = {"openai": 0, "codex": 166, "claude": 288, "altclaude": 0}
+# altclaude = обычный HTTPS-запрос (как openai), CLI-процессов не поднимает → памяти не ест.
+# Подписки дороги именно процессами: claude ~288 МБ и codex ~166 МБ НА КАЖДЫЙ вызов.
+# Доля MemTotal, которую каналам промптов позволено занять СУММАРНО. Остальное —
+# uvicorn, rewrite, cover и сами воркеры картинок/озвучки (они тоже едят память),
+# поэтому доля консервативная. На 17.9 ГБ это ≈10.4 ГБ.
+PROMPT_MEMORY_SHARE = max(0.1, min(0.9, float(os.environ.get("VS_PROMPT_MEMORY_SHARE", "0.58"))))
+# Ниже этого бюджет не опускаем: каждому платящему памятью каналу должно хватать
+# хотя бы на один вызов, иначе канал стал бы непроходимым и задачи висели бы вечно.
+PROMPT_MEMORY_MIN_MB = 1024
+# Машина не отдала MemTotal (не Linux/не macOS) → считаем её маленькой.
+PROMPT_MEMORY_FALLBACK_TOTAL_MB = 8192
+# Как бюджет делится между каналами. Пропорция взята из ориентира проверяющего:
+# codex 40 вызовов (6.6 ГБ) + claude 12 (3.5 ГБ) = 10.1 ГБ; openai памяти не ест.
+PROMPT_MEMORY_WEIGHTS = {"codex": 0.66, "claude": 0.34}
+
+
+def _machine_total_memory_mb():
+    """MemTotal машины в МБ. Linux — /proc/meminfo, macOS — sysconf; не вышло —
+    консервативный фолбэк (лучше недодать памяти, чем словить OOM)."""
+    try:
+        with open("/proc/meminfo", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    return max(1, int(line.split()[1]) // 1024)
+    except (OSError, ValueError, IndexError):
+        pass
+    try:
+        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        if total > 0:
+            return max(1, int(total) // (1024 * 1024))
+    except (AttributeError, ValueError, OSError):
+        pass
+    return PROMPT_MEMORY_FALLBACK_TOTAL_MB
+
+
+def _prompt_memory_budget_mb():
+    """Бюджет памяти каналов промптов (МБ) от РЕАЛЬНОГО MemTotal машины.
+    VS_PROMPT_MEMORY_BUDGET_MB — ПОТОЛОК: env может бюджет только понизить."""
+    budget = int(_machine_total_memory_mb() * PROMPT_MEMORY_SHARE)
+    try:
+        cap = int(os.environ.get("VS_PROMPT_MEMORY_BUDGET_MB") or 0)
+    except (TypeError, ValueError):
+        cap = 0
+    if cap > 0:
+        budget = min(budget, cap)
+    return max(PROMPT_MEMORY_MIN_MB, budget)
+
+
+PROMPT_MEMORY_BUDGET_MB = _prompt_memory_budget_mb()
+
+
+def _prompt_channel_static_max_calls(ch):
+    """Код-потолок вызовов канала без учёта памяти (задачи × потоки)."""
+    jobs = _PROVIDER_HARD_JOB_CAPS.get("prompt_" + ch, _PROVIDER_DEFAULT[0])
+    return max(1, jobs * PROMPT_THREADS_HARD.get(ch, 10))
+
+
+def _prompt_channel_max_calls(ch):
+    """Верхняя граница одновременных вызовов канала: код-потолок, УРЕЗАННЫЙ бюджетом
+    памяти этой машины. Потолки не «сверяются с бюджетом тестом постфактум», а
+    выводятся из него: сумма долей = бюджет, значит вместе каналы его не превысят.
+    Админ-панель /server-limits может задать меньше, больше — никогда."""
+    static = _prompt_channel_static_max_calls(ch)
+    cost = PROMPT_CALL_MEMORY_MB.get(ch, 0)
+    if cost <= 0:                       # openai: процессов не поднимает, память не тратит
+        return static
+    share = PROMPT_MEMORY_WEIGHTS.get(ch, 0.0)
+    return max(1, min(static, int(PROMPT_MEMORY_BUDGET_MB * share) // cost))
+
+
+def _prompt_threads_hard(ch):
+    """Рабочий потолок потоков канала: код-потолок, урезанный бюджетом памяти
+    (вызовы канала = задачи × потоки, поэтому делим бюджет вызовов на потолок задач)."""
+    static = PROMPT_THREADS_HARD.get(ch, 10)
+    if PROMPT_CALL_MEMORY_MB.get(ch, 0) <= 0:
+        return static
+    jobs = max(1, _PROVIDER_HARD_JOB_CAPS.get("prompt_" + ch, _PROVIDER_DEFAULT[0]))
+    return max(1, min(static, _prompt_channel_max_calls(ch) // jobs))
+
+
+def _prompt_memory_estimate_mb(calls_by_channel=None):
+    """Оценка пиковой памяти каналов промптов (МБ) по замеренной цене вызова.
+
+    По умолчанию считаем ФАКТИЧЕСКУЮ ёмкость ОБЕИХ дорожек (server + byok) × потоки
+    задачи, а не код-потолки: пул серверных credential умножает число задач, а
+    byok-дорожка (свои ключи партнёров) поднимает столько же процессов, что и серверная.
+    Раньше в расчёт входила только серверная, и полная загрузка обеих выводила память
+    за бюджет (claude 3 задачи × 6 × 288 + codex 3 × 20 × 166 = 15.1 ГБ при 10.4 ГБ).
+    """
+    if calls_by_channel is None:
+        calls_by_channel = {
+            ch: _prompt_channel_lane_jobs("prompt_" + ch) * _prompt_threads_setting(ch)
+            for ch in PROMPT_CHANNELS
+        }
+    return sum(int(n) * PROMPT_CALL_MEMORY_MB.get(ch, 0)
+               for ch, n in calls_by_channel.items())
+
+
+def _worker_keys(u, shared=False):
+    """Shared cabinet всегда server-only; admin overlay остаётся только legacy/raw path."""
+    if shared:
+        return dict(keys())
+    return resolve_keys(u)
+
+
+def _prompt_threads_setting(prov, fallback=None):
+    """Потоков на написание промптов для канала prov: админ-таблица серверных ключей
+    (_concurrency.prompt_<prov>.threads) > legacy-скаляр prompt_threads > дефолт канала.
+    Выше рабочего потолка (_prompt_threads_hard = код-потолок ∩ бюджет памяти) не
+    поднимается никогда — и дефолт канала тоже им обрезается."""
+    hard = _prompt_threads_hard(prov)
+    # Operational one-call policy for shared subscription accounts across services.
+    if prov in ("claude", "codex"):
+        hard = min(hard, 1)
+    elif prov == "openai":
+        hard = min(hard, _host_budget.CAPACITIES["openai"])
+    val = _provider_limit_opt("prompt_" + prov, "threads")
+    if not val:
+        try:
+            val = int(fallback or 0)
+        except (TypeError, ValueError):
+            val = 0
+    if val > 0:
+        return max(1, min(hard, val))
+    return max(1, min(hard, PROMPT_THREADS_DEFAULT.get(prov, 10)))
+
+
+def _prompt_cfg(u, shared=False, provider_override=None):
+    """Настройки prompt-LLM.
+
+    shared=True — только server config/policy. Raw/admin legacy сохраняет прежний overlay.
+    """
+    k = _worker_keys(u, shared=shared)
+    prov = (provider_override or (_effective_prompt_provider(u) if shared else
+                                  (k.get("prompt_provider") or "openai")))
+    prov = str(prov).strip().lower()
+    if prov not in {p for p, _ in PROMPT_PROVIDERS}:
+        prov = "openai"
+    if not shared and prov == "codex" and not _codex_allowed(u):
+        prov = "openai"                       # партнёру подписка владельца недоступна
+    if shared:
+        # админ-таблица серверных ключей (_concurrency.prompt_*.threads), иначе — как раньше
+        thr = _prompt_threads_setting(prov, k.get("prompt_threads"))
+    else:
+        try:
+            thr = int(k.get("prompt_threads") or 0)
+        except (TypeError, ValueError):
+            thr = 0
+        hard = _prompt_threads_hard(prov)
+        thr = (max(1, min(hard, thr)) if thr > 0
+               else max(1, min(hard, PROMPT_THREADS_DEFAULT[prov])))
+    if prov in ("claude", "codex"):
+        thr = min(thr, 1)  # Also covers the legacy/raw configuration branch.
+    elif prov == "openai":
+        thr = min(thr, _host_budget.CAPACITIES["openai"])
+    return (prov, (k.get("codex_model") or DEFAULT_CODEX_MODEL),
+            _first_credential(k, "claude_oauth"), thr)
+
+
+def _key_env(u, shared=False, credential_overrides=None, prompt_provider=None):
+    """Окружение worker-процесса.
+
+    Shared cabinet получает только credentials из выданных in-memory leases.
+    Никакой credential alias не наследуется от parent process.
+    """
+    k = _worker_keys(u, shared=shared)
+    env = _sanitized_worker_env()
+    creds = dict(credential_overrides or {})
+    if not shared:
+        # Legacy/admin raw worker сохраняет прежнюю семантику, но list/pool берёт первый slot.
+        for family in _CREDENTIAL_FAMILIES:
+            if family != "codex_home":
+                creds.setdefault(family, _first_credential(k, family))
+    for family, value in creds.items():
+        name = _CREDENTIAL_ENV_BY_FAMILY.get(family)
+        if name and value is not None:
+            # Пустой synthetic lease тоже передаём явно: некоторые legacy workers
+            # имеют встроенный fallback и при отсутствующей env молча потратили бы
+            # чужой ключ вместо loud-fail.
+            env[name] = str(value)
+    # чем писать промпты (логика промптов та же — меняется только канал и модель)
+    prov, codex_model, claude_tok, prompt_threads = _prompt_cfg(
+        u, shared=shared, provider_override=prompt_provider
+    )
+    env["VS_PROMPT_PROVIDER"] = prov
+    env["VS_SCENE_THREADS"] = str(prompt_threads)     # пул параллельной генерации сцен в воркере
+    env["VS_CODEX_MODEL"] = codex_model
+    env["VS_CLAUDE_MODEL"] = str(k.get("claude_model") or "claude-sonnet-4-6")
+    env["VS_CODEX_MAX_PARALLEL"] = str(prompt_threads)
+    env["VS_CLAUDE_MAX_PARALLEL"] = str(prompt_threads)
+    if shared:
+        env["VS_SERVER_CREDENTIAL_ISOLATION"] = "1"
+        env["VS_PROMPT_FALLBACK"] = "0"                # provider queue не перелезает в чужую группу
+    if prov == "codex":
+        home = creds.get("codex_home") or ("" if shared else
+                                            _first_credential(k, "codex_home"))
+        if home:
+            env["VS_CODEX_HOME"] = str(home)
+        elif shared:
+            # Не даём Codex CLI молча подобрать ~/.codex из HOME процесса,
+            # когда synthetic empty lease должен loud-fail.
+            env["VS_CODEX_HOME"] = "/__videostudio_missing_codex_home__"
+        env["VS_CODEX_BIN"] = str(k.get("codex_bin") or
+                                  os.environ.get("VS_CODEX_BIN") or
+                                  os.environ.get("REWRITE_CODEX_BIN") or "codex")
+    elif not shared and _codex_allowed(u) and os.path.isdir(CODEX_HOME):
+        env["VS_CODEX_HOME"] = CODEX_HOME
+    if prov == "claude" and not shared and claude_tok:
+        env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_tok
+    if prov == "altclaude":
+        # Ключ приезжает как обычный credential (семейство alt_llm), а адрес и модель —
+        # не секреты: свои у юзера, иначе серверные из файла ключей, иначе дефолты.
+        srv = keys()
+        env["VS_ALT_LLM_BASE"] = str(
+            k.get("alt_llm_base") or srv.get("alt_llm_base") or DEFAULT_ALT_LLM_BASE)
+        env["VS_ALT_LLM_MODEL"] = str(
+            k.get("alt_llm_model") or srv.get("alt_llm_model") or DEFAULT_ALT_LLM_MODEL)
+        if not shared and k.get("alt_llm"):
+            env["VS_ALT_LLM_KEY"] = str(k.get("alt_llm"))
+    return env
+
+
+class _CredentialLease:
+    """In-memory lease: secret/slot никогда не пишутся в SQLite/job params/log."""
+
+    def __init__(self, owner, family, slot_id, value, units, lane=None):
+        self._owner = owner
+        self.family = family
+        self.lane = lane or family
+        self.slot_id = slot_id
+        self.value = value
+        self.units = units
+        self._released = False
+        self.host_lease = None
+
+    def release(self):
+        self._owner.release(self)
+
+
+class _ServerCredentialPool:
+    """Thread-safe least-loaded + RR tie-breaker по уникальным server credentials."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._loads = {}       # family -> {sha256 slot id: units}
+        self._cursor = {}      # family -> last candidate index
+
+    @staticmethod
+    def _slot_id(family, value):
+        if family == "codex_home":
+            try:
+                payload = json.loads(value)
+                tokens = payload.get("tokens") or {}
+                account = tokens.get("account_id") or payload.get("account_id")
+                if account:
+                    value = "account:" + str(account)
+            except (ValueError, TypeError, AttributeError):
+                pass
+        raw = f"{family}\0{value}".encode("utf-8", "replace")
+        return hashlib.sha256(raw).hexdigest()
+
+    def size(self, family, values=None):
+        """Сколько ключей семейства реально готовы принять работу.
+
+        `values` — явный список (свои ключи владельца кабинета). Без него берём
+        серверный пул, как было. Отдыхающие слоты ёмкости не дают: иначе шедулер
+        считал бы 2 задачи там, где пул может выдать 1, и вторая висела бы в queued.
+        """
+        if values is not None:
+            live = [v for v in dict.fromkeys(values) if v and not _cred_cooldown_state(family, v)]
+            return max(1, len(live))
+        return max(1, len(_live_credential_candidates(keys(), family)))
+
+    def try_acquire(self, family, units=1, capacity=1, lane=None, own_values=None, host_units=None):
+        """Lease либо None, если ни один key slot сейчас не вмещает task units.
+
+        `own_values` — свои ключи владельца кабинета: тот же раздатчик по кругу, что и
+        для серверных, только по другому списку и на своей дорожке. Раньше свой ключ
+        был один и раздавать было нечего.
+        """
+        units, capacity = max(1, int(units)), max(1, int(capacity))
+        lane = str(lane or family)
+        if own_values is not None:
+            uniq = [v for v in dict.fromkeys(own_values) if v]
+            values = [v for v in uniq if not _cred_cooldown_state(family, v)]
+            if not values and uniq:
+                return None          # все свои ключи отдыхают — ждём пробуждения
+            if not values:
+                return None
+            return self._acquire_from(family, values, units, capacity, lane, host_units)
+        cfg = keys()
+        values = _live_credential_candidates(cfg, family)
+        if not values and _credential_candidates(cfg, family):
+            # Credential есть, но ВСЕ сейчас отдыхают (исчерпан лимит / битая авторизация):
+            # lease не выдаём. Задача уйдёт в другой канал цепочки либо дождётся
+            # пробуждения — раньше исчерпанный токен продолжал выдаваться round-robin,
+            # и каждая следующая задача снова падала на нём.
+            return None
+        if not values:
+            # Missing credential должен loud-fail worker'ом, а не висеть queued навечно.
+            values = [""]
+        return self._acquire_from(family, values, units, capacity, lane, host_units)
+
+    def _acquire_from(self, family, values, units, capacity, lane, host_units=None):
+        """Общий раздатчик: наименее загруженный слот, при равенстве — следующий по кругу."""
+        slots = [(self._slot_id(family, value), value) for value in values]
+        with self._lock:
+            loads = self._loads.setdefault(lane, {})
+            live_ids = {sid for sid, _ in slots}
+            for sid in list(loads):
+                if sid not in live_ids and loads[sid] <= 0:
+                    loads.pop(sid, None)
+            eligible = [(idx, sid, value, loads.get(sid, 0))
+                        for idx, (sid, value) in enumerate(slots)
+                        if loads.get(sid, 0) + units <= capacity]
+            if not eligible:
+                return None
+            last = self._cursor.get(lane, -1)
+            ordered = sorted(eligible, key=lambda row: (row[3], (row[0]-last-1) % len(slots)))
+            for idx, sid, value, load in ordered:
+                host_family = {"googler":"fastgen", "openai":"openai", "veo":"veo",
+                               "claude_oauth":"claude_oauth", "codex_home":"codex"}.get(family)
+                host = (_host_budget.try_acquire(host_family, value, host_units or units)
+                        if host_family and value else _host_budget.Lease())
+                if host is None:
+                    continue  # Another service owns these units; try the next own key.
+                lease = _CredentialLease(self, family, sid, value, units, lane=lane)
+                lease.host_lease = host
+                loads[sid] = load + units
+                self._cursor[lane] = idx
+                return lease
+            return None
+
+    def release(self, lease):
+        with self._lock:
+            if lease._released:
+                return
+            lease._released = True
+            if lease.host_lease is not None:
+                lease.host_lease.release()
+            loads = self._loads.setdefault(lease.lane, {})
+            loads[lease.slot_id] = max(0, loads.get(lease.slot_id, 0) - lease.units)
+
+    def reset(self):
+        """Только для изолированных tests/import reload."""
+        with self._lock:
+            self._loads.clear()
+            self._cursor.clear()
+
+    def snapshot(self, family):
+        with self._lock:
+            return dict(self._loads.get(family, {}))
+
+
+SERVER_CREDENTIAL_POOL = _ServerCredentialPool()
+
+
+def _provider_credential_family(provider):
+    return {
+        "recrafter": "googler",
+        "veo": "veo",
+        "openai": "openai",
+        "voicer": "voicer",
+        "voicegencore": "voicegencore",
+        "elevenlabs": "elevenlabs",
+        "lumean": "lumean",
+        "prompt_openai": "openai",
+        "prompt_claude": "claude_oauth",
+        "prompt_codex": "codex_home",
+        "prompt_altclaude": "alt_llm",
+    }.get(provider)
+
+
+def _all_server_credential_values():
+    cfg = keys() or {}
+    out = []
+    for family in _CREDENTIAL_FAMILIES:
+        out.extend(_credential_candidates(cfg, family))
+    for name in _WORKER_CREDENTIAL_ENV_NAMES:
+        value = os.environ.get(name)
+        if value:
+            out.append(value)
+    return list(dict.fromkeys(str(v) for v in out if v))
+
+
+# ── BYOK: свой ключ юзера имеет приоритет над серверным пулом ─────────────────
+# Модель: вписал свой ключ → задача идёт на него (серверная ёмкость не тратится);
+# не вписал → берётся lease из SERVER_CREDENTIAL_POOL, как раньше. Значение живёт
+# только в памяти процесса: в SQLite лежит users.keys (его же ввёл юзер), в job
+# params/логи/HTTP-ответы оно не попадает, в лог редактируется как серверное.
+# Своя подписка Codex тоже разрешена, но КАК ОТДЕЛЬНЫЙ секрет (family codex_auth):
+# серверный codex_home — личная авторизация ВЛАДЕЛЬЦА, её не получает никто другой.
+OWN_CODEX_AUTH_FAMILY = "codex_auth"
+# Каталог под auth.json своей подписки выбирает СЕРВЕР (per-uid). Юзер вписывает только
+# СОДЕРЖИМОЕ auth.json: приняли бы путь — партнёр указал бы серверный CODEX_HOME
+# владельца и писал бы промпты его подпиской.
+OWN_CODEX_HOME_ROOT = (os.environ.get("VS_OWN_CODEX_HOME_ROOT")
+                       or os.path.join(HERE, "codex_homes"))
+_OWN_CREDENTIAL_FAMILIES = (
+    tuple(f for f in _CREDENTIAL_FAMILIES if f != "codex_home") + (OWN_CODEX_AUTH_FAMILY,)
+)
+# family провайдера → family, под которой юзер держит СВОЙ credential того же канала.
+_OWN_SOURCE_FAMILY = {"codex_home": OWN_CODEX_AUTH_FAMILY}
+# Канал промптов → family credential этого канала (см. _provider_credential_family).
+_PROMPT_CHANNEL_FAMILY = {"openai": "openai", "claude": "claude_oauth", "codex": "codex_home",
+                          "altclaude": "alt_llm"}
+_OWN_PROMPT_CHANNEL_OPT = "_prompt"       # зарезервированный ключ users.key_opts (не провайдер)
+
+
+def _own_source_family(family):
+    return _OWN_SOURCE_FAMILY.get(family, family)
+
+
+def _own_codex_auth_payload(value):
+    """Валидное СОДЕРЖИМОЕ auth.json (JSON-объект) или ''.
+
+    Путь/каталог/мусор credential-ом не считаются НИКОГДА — ни из формы, ни из
+    users.keys, правленных в обход формы: иначе значение '/root/.codex-rewrite'
+    подменило бы своё codex на серверную подписку владельца.
+    """
+    raw = value.strip() if isinstance(value, str) else ""
+    if not raw.startswith("{"):
+        return ""
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return ""
+    return raw if isinstance(data, dict) and data else ""
+
+
+_OWN_CODEX_APPLIED_SIDECAR = ".applied.sha256"   # какой блоб users.keys уже материализован
+
+
+def _own_codex_home_dir(uid, payload):
+    """Приватный CODEX_HOME юзера из его auth.json: <OWN_CODEX_HOME_ROOT>/u<uid>, 0700.
+
+    Файл переписываем ТОЛЬКО когда его нет или изменился блоб в users.keys: codex CLI
+    сам обновляет auth.json (refresh token), prompt_llm копирует обновлённый файл
+    обратно сюда, и безусловная перезапись из users.keys затирала бы свежий токен
+    при каждом запуске задачи. Признак применённого блоба — sidecar со sha256.
+    """
+    payload = _own_codex_auth_payload(payload)
+    if not payload or uid is None:
+        return ""
+    owner_root = os.path.join(OWN_CODEX_HOME_ROOT, "u%d" % int(uid))
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    legacy_sidecar = os.path.join(owner_root, "auth.json" + _OWN_CODEX_APPLIED_SIDECAR)
+    try:
+        with open(legacy_sidecar) as fh:
+            legacy_matches = fh.read().strip() == digest
+    except OSError:
+        legacy_matches = False
+    data = json.loads(payload)
+    tokens = data.get("tokens") if isinstance(data.get("tokens"), dict) else {}
+    identity = str(tokens.get("account_id") or data.get("account_id") or digest)
+    account_hash = hashlib.sha256(identity.encode()).hexdigest()[:24]
+    home = owner_root if legacy_matches else os.path.join(owner_root, account_hash)
+    os.makedirs(home, mode=0o700, exist_ok=True)
+    for path in (OWN_CODEX_HOME_ROOT, home):
+        try:
+            os.chmod(path, 0o700)
+        except OSError:
+            pass
+    auth = os.path.join(home, "auth.json")
+    sidecar = auth + _OWN_CODEX_APPLIED_SIDECAR
+    digest = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+    if os.path.isfile(auth):
+        try:
+            with open(sidecar, encoding="utf-8") as fh:
+                applied = fh.read().strip()
+        except OSError:
+            applied = ""
+        if applied == digest:
+            return home                         # тот же блоб уже применён — файл не трогаем
+    _write_private_file(auth, payload)          # атомарно: CLI не увидит полуфайл
+    _write_private_file(sidecar, digest)
+    return home
+
+
+def _write_private_file(path, text):
+    """Атомарная запись файла 0600 (tmp + os.replace)."""
+    fd, tmp = tempfile.mkstemp(prefix=".credential-", dir=os.path.dirname(path))
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
+def _drop_own_codex_home(uid):
+    """Remove materialized auth after the last running task; never truncate active CLI auth."""
+    try:
+        uid = int(uid)
+        home = os.path.join(OWN_CODEX_HOME_ROOT, "u%d" % uid)
+    except (TypeError, ValueError):
+        return
+    if not os.path.isdir(home) or os.path.islink(home):
+        return
+    marker = os.path.join(home, ".credential-cleanup-pending")
+    c = db()
+    try:
+        active = c.execute("SELECT 1 FROM queue_tasks WHERE uid=? AND status='running' LIMIT 1", (uid,)).fetchone()
+    finally:
+        c.close()
+    if active:
+        _write_private_file(marker, "pending")
+        return
+    homes = [home] + [entry.path for entry in os.scandir(home)
+                      if entry.is_dir(follow_symlinks=False) and re.fullmatch(r"[0-9a-f]{24}", entry.name)]
+    for directory in homes:
+        for name in ("auth.json", "auth.json" + _OWN_CODEX_APPLIED_SIDECAR, "auth.json.tmp"):
+            path = os.path.join(directory, name)
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+    try:
+        os.remove(marker)
+    except FileNotFoundError:
+        pass
+
+
+def _cleanup_removed_own_codex_homes():
+    for marker in glob.glob(os.path.join(OWN_CODEX_HOME_ROOT, "u*", ".credential-cleanup-pending")):
+        try:
+            uid = int(os.path.basename(os.path.dirname(marker))[1:])
+            c = db()
+            try:
+                u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+            finally:
+                c.close()
+            if not u or not _own_pool_values(u, "codex_home"):
+                _drop_own_codex_home(uid)
+        except (OSError, ValueError):
+            log_exc("own_codex_cleanup")
+
+
+
+def _own_credential_secret_values(own):
+    """Значения своих credentials для редакции лога: скаляры + строковые листья
+    auth.json (в блобе лежат access/refresh-токены, они и печатаются в ошибках CLI)."""
+    out = []
+    flattened = [(family, value) for family, pool in (own or {}).items()
+                 for value in (pool if isinstance(pool, (list, tuple)) else [pool])]
+    for family, value in flattened:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        out.append(value)
+        if family != OWN_CODEX_AUTH_FAMILY:
+            continue
+        try:
+            stack = [json.loads(value)]
+        except Exception:
+            continue
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                stack.extend(node.values())
+            elif isinstance(node, (list, tuple)):
+                stack.extend(node)
+            elif isinstance(node, str) and len(node.strip()) >= 8:
+                out.append(node.strip())
+    return list(dict.fromkeys(out))
+
+
+def _own_credentials_from_keys(own):
+    """Explicit user-owned values stay own even when also present in server config.
+
+    The common host budget accounts for the identical physical credential in
+    both lanes; dropping it would make an authorized own_only pool disappear.
+    """
+    if not isinstance(own, dict):
+        return {}
+    out = {}
+    for family in _OWN_CREDENTIAL_FAMILIES:
+        for value in _credential_candidates(own, family):
+            if family == OWN_CODEX_AUTH_FAMILY:
+                value = _own_codex_auth_payload(value)
+            if value:
+                out[family] = value
+                break
+    return out
+
+
+def _user_own_credentials(u):
+    """{family: значение} только по НЕПУСТЫМ своим ключам юзера (users.keys)."""
+    if u is None:
+        return {}
+    try:
+        own = json.loads(u["keys"]) if (u["keys"] if "keys" in u.keys() else None) else {}
+    except Exception:
+        own = {}
+    return _own_credentials_from_keys(own)
+
+
+
+def _own_pool_values(u, family) -> list:
+    """ВСЕ явно сохранённые свои ключи семейства; дубли внутри списка отброшены.
+
+    Каждый ключ несёт СВОЙ лимит провайдера, поэтому «проектов разом» в настройках —
+    это значение НА ОДИН КЛЮЧ, а общая ёмкость = значение × число ключей. Раньше свой
+    ключ читался как одиночный (_first_credential), и второй ключ ничего не добавлял.
+    """
+    if u is None or not family:
+        return []
+    try:
+        own = json.loads(u["keys"]) if (u["keys"] if "keys" in u.keys() else None) else {}
+    except Exception:
+        return []
+    if not isinstance(own, dict):
+        return []
+    src = _own_source_family(family)
+    values = _credential_candidates(own, src)
+    if src == OWN_CODEX_AUTH_FAMILY:
+        values = [_own_codex_auth_payload(v) for v in values]
+    return [v for v in values if v]
+
+
+def _own_pool_size(u, family) -> int:
+    """Сколько своих ключей семейства готовы работать (отдыхающие не считаем)."""
+    live = [v for v in _own_pool_values(u, family) if not _cred_cooldown_state(family, v)]
+    return max(1, len(live)) if _own_pool_values(u, family) else 0
+
+def _own_credential_for_family(u, family):
+    """Свой credential нужного канала. Для codex_home это СВОЙ codex_auth юзера —
+    серверный codex_home здесь не участвует вообще."""
+    if not family:
+        return ""
+    return _user_own_credentials(u).get(_own_source_family(family), "")
+
+
+def _prompt_channels_with_own_credential(creds):
+    """Каналы промптов, у которых есть СВОЙ credential (его подписка — его деньги)."""
+    return [ch for ch, fam in _PROMPT_CHANNEL_FAMILY.items()
+            if (creds or {}).get(_own_source_family(fam))]
+
+
+def _own_prompt_channels(u):
+    return _prompt_channels_with_own_credential(_user_own_credentials(u))
+
+
+def _own_prompt_channel(u):
+    """Канал промптов, ВЫБРАННЫЙ юзером, или '' (тогда решает серверная policy).
+
+    Выбор действителен ровно пока у юзера есть СВОЙ credential этого канала:
+    серверную подписку (Codex владельца, серверный Claude-токен) выбор не открывает.
+    """
+    if u is None:
+        return ""
+    try:
+        opt = _key_opts_from_row(u).get(_OWN_PROMPT_CHANNEL_OPT)
+    except Exception:
+        opt = None
+    want = _raw_prompt_channel_choice(u)
+    return want if want in _own_prompt_channels(u) else ""
+
+
+def _raw_prompt_channel_choice(u):
+    """Сырой выбор канала из users.key_opts (без проверки прав) или ''."""
+    if u is None:
+        return ""
+    try:
+        opt = _key_opts_from_row(u).get(_OWN_PROMPT_CHANNEL_OPT)
+    except Exception:
+        opt = None
+    want = str((opt or {}).get("provider") or "").strip().lower() if isinstance(opt, dict) else ""
+    return want if want in PROMPT_CHANNELS else ""
+
+
+def _prompt_channel_selectable(u, ch):
+    """Может ли юзер выбрать этот канал на странице «Мои ключи».
+
+    Свой credential — можно всегда (своя подписка, свои деньги). Серверный credential —
+    можно, если канал разрешён серверной policy (владельцу policy не мешает) и у сервера
+    действительно есть чем этим каналом ходить: иначе выбор был бы кнопкой «сломать себе
+    генерацию». Раньше выбор существовал ТОЛЬКО при своём credential, поэтому у владельца
+    (он платит серверными ключами) селектора не было вовсе — канал переключался лишь
+    правкой `_prompt_policy` в файле ключей руками.
+    """
+    ch = str(ch or "").strip().lower()
+    if ch not in PROMPT_CHANNELS:
+        return False
+    if ch in _own_prompt_channels(u):
+        return True
+    if _own_only(u):
+        return False
+    try:
+        is_admin = (u["role"] == "admin")
+    except Exception:
+        is_admin = False
+    if not is_admin and not _prompt_channel_allowed(u, ch):
+        return False
+    if ch == "codex" and not _codex_allowed(u):
+        return False                       # серверная подписка владельца — только своим
+    return bool(_first_credential(keys(), _PROMPT_CHANNEL_FAMILY.get(ch, "")))
+
+
+def _selected_prompt_channel(u):
+    """Канал, ВЫБРАННЫЙ юзером (свой credential или разрешённый серверный), или ''."""
+    own_sel = _own_prompt_channel(u)
+    if own_sel:
+        return own_sel
+    want = _raw_prompt_channel_choice(u)
+    return want if want and _prompt_channel_selectable(u, want) else ""
+
+
+_OWN_CRED_CACHE = {}      # uid -> (ts, {family: value}); только в памяти, ~10с
+
+
+def _own_credentials_by_uid(uid):
+    """Кэш ~10с: шедулер спрашивает про BYOK на каждой итерации, не бить БД."""
+    if uid is None:
+        return {}
+    now = time.time()
+    hit = _OWN_CRED_CACHE.get(uid)
+    if hit and now - hit[0] < 10:
+        return hit[1]
+    own = {}
+    try:
+        c = db()
+        r = c.execute("SELECT keys FROM users WHERE id=?", (uid,)).fetchone()
+        c.close()
+        if r:
+            own = _user_own_credentials(r)
+    except Exception:
+        own = {}
+    _OWN_CRED_CACHE[uid] = (now, own)
+    return own
+
+
+_OWN_KEY_DISABLED_STAGES_OPT = "disabled_stages"
+
+
+def _own_key_stage_disabled(opts, provider, kind):
+    """True, если личный credential не умеет этот вид задачи.
+
+    Capability живёт отдельно от секрета в users.key_opts:
+      {"recrafter": {"disabled_stages": ["video", "regen_video"]}}
+
+    Старые/битые key_opts fail-open к прежнему поведению: запрет
+    действует только для явного list/tuple/set и точного kind.
+    """
+    if not kind or not isinstance(opts, dict):
+        return False
+    cfg = opts.get(str(provider or ""))
+    if not isinstance(cfg, dict):
+        return False
+    raw = cfg.get(_OWN_KEY_DISABLED_STAGES_OPT)
+    if not isinstance(raw, (list, tuple, set)):
+        return False
+    disabled = {str(v).strip().lower() for v in raw if str(v).strip()}
+    return str(kind).strip().lower() in disabled
+
+
+def _own_credential_for_task(u, provider, kind=None):
+    """Credential BYOK для конкретной задачи с учётом capability."""
+    family = _provider_credential_family(provider)
+    if not family:
+        return ""
+    credential = _own_credential_for_family(u, family)
+    if not credential:
+        return ""
+    if _own_key_stage_disabled(_key_opts_from_row(u), provider, kind):
+        return ""
+    return credential
+
+
+def _task_uses_own_credential(uid, provider, kind=None):
+    """True → этот kind задачи пойдёт на СВОЙ ключ юзера."""
+    family = _provider_credential_family(provider)
+    if not family:
+        return False
+    if not _own_credentials_by_uid(uid).get(_own_source_family(family)):
+        return False
+    return not _own_key_stage_disabled(_user_opts(uid), provider, kind)
+
+
+def _check_quota_on_connection(c, u, additional=1):
+    """Quota guard on the caller's transaction/connection."""
+    if u["role"] == "admin":
+        return
+    q = u["daily_quota"]
+    eff = DEFAULT_DAILY_QUOTA if q is None else q
+    if eff and eff > 0:
+        today = datetime.date.today().isoformat()
+        n = c.execute("SELECT COUNT(*) FROM gen_jobs WHERE user_id=? AND substr(ts,1,10)=?", (u["id"], today)).fetchone()[0]
+        try:
+            requested = max(0, int(additional))
+        except (TypeError, ValueError):
+            requested = 1
+        if n + requested > eff:
+            raise HTTPException(
+                429,
+                f"дневная квота исчерпана ({n}/{eff}, новых задач: {requested}), сбросится завтра",
+            )
+
+
+def _check_quota(u, additional=1):
+    """Бросает 429, если новые gen_jobs не помещаются в дневную квоту.
+
+    ``additional=0`` используется идемпотентными ручками: чтение/возврат уже
+    существующей задачи не должно внезапно стать платной новой постановкой.
+    """
+    c = db()
+    try:
+        _check_quota_on_connection(c, u, additional=additional)
+    finally:
+        c.close()
+
+
+def db():
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    # WAL: читатели не ждут писателя (и наоборот) → нет блокировок страниц на чтении при пишущем шедулере
+    try:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.execute("PRAGMA busy_timeout=30000")
+        c.execute("PRAGMA synchronous=NORMAL")
+    except Exception:
+        pass
+    return c
+
+
+def init_db():
+    c = db()
+    c.execute("CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, name TEXT, token TEXT UNIQUE, role TEXT, created TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY, user_id INTEGER, provider TEXT, path TEXT, method TEXT, status INTEGER, bytes INTEGER, ts TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS gen_jobs(id INTEGER PRIMARY KEY, user_id INTEGER, type TEXT, prompt TEXT, model TEXT, status TEXT, result_path TEXT, error TEXT, ts TEXT)")
+    for _col, _typ in [("title", "TEXT"), ("source_text", "TEXT"), ("settings", "TEXT")]:
+        try:
+            c.execute(f"ALTER TABLE gen_jobs ADD COLUMN {_col} {_typ}")
+        except Exception:
+            pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN daily_quota INTEGER")  # NULL=DEFAULT, 0=безлимит, N=лимит/день
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN keys TEXT")  # JSON собственных ключей юзера; пусто → фолбэк на серверные (невидимые)
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE users ADD COLUMN key_opts TEXT")  # JSON per-provider настроек СВОЕГО ключа: {group:{threads,parallel,retries}}; пусто → серверные дефолты
+    except Exception:
+        pass
+    try:
+        c.execute("ALTER TABLE gen_jobs ADD COLUMN result_files TEXT")  # JSON список относительных путей выходных файлов (run-worker)
+    except Exception:
+        pass
+    # === A1 (мульти-тенант): таблицы кабинетов/сессий/проектов/очереди + колонки авторизации ===
+    c.execute("CREATE TABLE IF NOT EXISTS tenants(id TEXT PRIMARY KEY, name TEXT, created TEXT, is_active INTEGER DEFAULT 1, daily_quota INTEGER)")
+    c.execute("CREATE TABLE IF NOT EXISTS sessions(id TEXT PRIMARY KEY, user_id INTEGER, created REAL, expires REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS projects(id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT, dir_path TEXT, status TEXT, created REAL, updated REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS queue_tasks(job_id INTEGER PRIMARY KEY, tenant_id TEXT, project_id TEXT, kind TEXT, status TEXT, created REAL, started REAL, finished REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS job_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, ts REAL, line TEXT)")
+    c.execute("CREATE TABLE IF NOT EXISTS job_files(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, rel_path TEXT, bytes INTEGER)")
+    # Exact upload-card jobs are first-class queue_tasks, while this side table keeps
+    # their idempotency key and durable result/provenance even if queue history is cleared.
+    c.execute("CREATE TABLE IF NOT EXISTS card_jobs("
+              "job_id INTEGER PRIMARY KEY, tenant_id TEXT NOT NULL, project_id TEXT NOT NULL, "
+              "uid INTEGER NOT NULL, narration_sha256 TEXT NOT NULL, contract_version TEXT NOT NULL, "
+              "request_sha256 TEXT NOT NULL, context_json TEXT NOT NULL, provider TEXT NOT NULL, "
+              "prompt_failover TEXT NOT NULL, model TEXT NOT NULL, status TEXT NOT NULL, "
+              "attempts INTEGER NOT NULL DEFAULT 0, transient_requeues INTEGER NOT NULL DEFAULT 0, "
+              "next_attempt REAL, output_rel TEXT, output_sha256 TEXT, output_json TEXT, "
+              "raw_rel TEXT, raw_sha256 TEXT, raw_json TEXT, provenance TEXT, usage TEXT, "
+              "error_code TEXT, last_error TEXT, created REAL NOT NULL, started REAL, finished REAL, "
+              "UNIQUE(tenant_id,project_id,narration_sha256,contract_version))")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_card_jobs_project_current "
+              "ON card_jobs(tenant_id,project_id,contract_version,narration_sha256)")
+    # === 3a (пресеты + per-project настройки) ===
+    c.execute("CREATE TABLE IF NOT EXISTS presets(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT, name TEXT, settings TEXT, created REAL)")
+    c.execute("CREATE TABLE IF NOT EXISTS voice_lib(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT, name TEXT, voice_id TEXT, model_id TEXT, created REAL)")
+    for _col, _typ in [("settings", "TEXT")]:   # сохранённые настройки проекта (JSON) для пред-заполнения форм
+        try:
+            c.execute(f"ALTER TABLE projects ADD COLUMN {_col} {_typ}")
+        except Exception:
+            pass
+    for _col, _typ in [("email", "TEXT"), ("password_hash", "TEXT"), ("tenant_id", "TEXT"),
+                       # блокировка аккаунта из админ-панели: вход запрещён и новые
+                       # задачи не ставятся, уже запущенные не трогаем (см. _adm_action)
+                       ("disabled", "INTEGER DEFAULT 0")]:
+        try:
+            c.execute(f"ALTER TABLE users ADD COLUMN {_col} {_typ}")
+        except Exception:
+            pass
+    for _col, _typ in [("params", "TEXT"), ("uid", "INTEGER"), ("provider", "TEXT"),
+                       # First-class task policy. NULL is reserved for rows created
+                       # before this migration and is interpreted as legacy behavior;
+                       # every new application row writes a canonical enum explicitly.
+                       ("prompt_failover", "TEXT"),
+                       # Durable task-local retry. Unlike in-memory provider cooldowns,
+                       # this survives service restarts and cannot turn into a tight loop.
+                       ("transient_attempts", "INTEGER DEFAULT 0"),
+                       ("retry_after", "REAL"),
+                       # дорожка ёмкости (server/byok), снимок на момент claim:
+                       # пересчёт из ТЕКУЩИХ ключей юзера переатрибутировал бы
+                       # уже выполняющиеся задачи (учёт ёмкости разъезжался)
+                       ("lane", "TEXT"), ("capacity_units", "INTEGER"),
+                       ("memory_mb", "INTEGER"), ("credential_retries", "INTEGER DEFAULT 0"), ("remote_retries", "INTEGER DEFAULT 0"),
+                       ("render_sha256", "TEXT"), ("render_size", "INTEGER"),
+                       ("render_error_sha256", "TEXT"), ("transcript_sha256", "TEXT"), ("transcript_rel", "TEXT"),
+                       ("parent_job_id", "INTEGER"), ("cancel_checks", "INTEGER DEFAULT 0"), ("cancel_next_check", "REAL"),
+                       # рендер (kind='render', исполняется удалённым пуллером, НЕ локальным шедулером):
+                       ("progress", "REAL"), ("output_rel", "TEXT"), ("error", "TEXT"),
+                       ("claimed", "REAL"), ("stage", "TEXT"), ("claim_token", "TEXT")]:
+        try:
+            c.execute(f"ALTER TABLE queue_tasks ADD COLUMN {_col} {_typ}")
+        except Exception:
+            pass
+    c.execute("CREATE TABLE IF NOT EXISTS render_followups(job_id INTEGER PRIMARY KEY,status TEXT NOT NULL,next_attempt REAL NOT NULL)")
+    c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_render_child ON queue_tasks(parent_job_id,kind) WHERE parent_job_id IS NOT NULL")
+    c.execute("CREATE TABLE IF NOT EXISTS provider_rr_cursor("
+              "provider TEXT PRIMARY KEY, last_uid INTEGER NOT NULL, updated REAL NOT NULL)")
+    # Старые queue_tasks создавались до uid: восстанавливаем владельца из gen_jobs.
+    c.execute("UPDATE queue_tasks SET uid=("
+              "SELECT gen_jobs.user_id FROM gen_jobs WHERE gen_jobs.id=queue_tasks.job_id"
+              ") WHERE uid IS NULL")
+    # Legacy prompt rows не имели provider snapshot. Безопасно закрепляем их за
+    # OpenAI-группой: клиентский JSON не может внезапно отправить старую job в Claude/Codex.
+    c.execute("UPDATE queue_tasks SET provider='prompt_openai' "
+              "WHERE kind='prompts' AND (provider IS NULL OR provider='') "
+              "AND (prompt_failover IS NULL OR lower(trim(prompt_failover))='legacy')")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_queue_sched "
+              "ON queue_tasks(status, provider, kind, uid, created, job_id)")
+    # У старых БД idx_queue_sched уже существует с прежним набором колонок;
+    # новое имя гарантирует provider-aware индекс без destructive DROP.
+    c.execute("CREATE INDEX IF NOT EXISTS idx_queue_sched_provider_v2 "
+              "ON queue_tasks(status, provider, kind, uid, created, job_id)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_queue_sched_retry_v1 "
+              "ON queue_tasks(status, retry_after, provider, kind, uid, created, job_id)")
+    # индекс для быстрого чтения логов задачи (job_logs растёт до сотен тысяч строк;
+    # без индекса SELECT WHERE job_id=? сканировал всю таблицу → лог грузился медленно)
+    c.execute("CREATE INDEX IF NOT EXISTS idx_job_logs_jid ON job_logs(job_id, id)")
+    # === Админ-панель: аудит действий + переживающее рестарт состояние (пауза очереди) ===
+    # Пауза лежит в БД, а не только в памяти: рестарт vsgen не должен молча снимать
+    # аварийный стоп, который владелец поставил, чтобы не жечь кредиты ключа.
+    c.execute("CREATE TABLE IF NOT EXISTS admin_audit(id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL, "
+              "admin_id INTEGER, admin_name TEXT, action TEXT, target TEXT, detail TEXT, result TEXT)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_admin_audit_ts ON admin_audit(id DESC)")
+    ensure_pub_schema(c)   # контур публикаций: каналы → план → выпуски
+    c.execute("CREATE TABLE IF NOT EXISTS admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL)")
+    # Кнопка «Пожаловаться»: жалобы забирает служба vsfix (/opt/vsfix), итог пишет сюда же.
+    c.execute("CREATE TABLE IF NOT EXISTS complaints(id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT, "
+              "uid INTEGER, project_id TEXT, text TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', "
+              "created REAL, started REAL, finished REAL, user_message TEXT, report TEXT)")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_complaints_project ON complaints(tenant_id, project_id, id)")
+    c.commit()
+    if not c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
+        now = datetime.datetime.now().isoformat(timespec="seconds")
+        atok = "adm_" + secrets.token_urlsafe(24)
+        dtok = "usr_" + secrets.token_urlsafe(24)
+        c.execute("INSERT INTO users(name,token,role,created) VALUES(?,?,?,?)", ("admin", atok, "admin", now))
+        c.execute("INSERT INTO users(name,token,role,created) VALUES(?,?,?,?)", ("demo", dtok, "user", now))
+        c.commit()
+        print("=" * 60)
+        print("SEED admin token:", atok)
+        print("SEED demo  token:", dtok)
+        print("=" * 60)
+    c.close()
+
+
+init_db()
+
+
+# ============================================================
+# Старт фона: ТОЛЬКО отсюда, не с уровня модуля
+# ------------------------------------------------------------
+# Раньше `_recover_orphans()` и поток планировщика запускались прямо в теле модуля
+# (строка ~6248), а половина нужных им имён определяется НИЖЕ — например SRC_DIR
+# (~7878), без которого _run_task не может запустить воркер. Пока интерпретатор
+# дочитывал модуль, поток уже клеймил задачи и падал на `NameError: SRC_DIR`,
+# а `except Exception: pass` это гасил. Улика инцидента 31.07: задача 3808
+# стартовала в 18:21:24.86 и мгновенно ушла в error «name 'SRC_DIR' is not defined»,
+# а 3809, отклеймленная через 0.5 с (импорт уже закончился), отработала штатно.
+#
+# Вторая беда той же природы: вспомогательные скрипты (/root/redo_bad.py и т.п.)
+# делают `import main` — и получали ВТОРУЮ копию диспетчера плюс `_recover_orphans()`,
+# который возвращал чужие running-задачи в очередь, а потом умирал вместе со скриптом.
+#
+# lifespan решает оба случая: он выполняется после полного импорта модуля и только
+# когда приложение реально обслуживается (при `import main` не срабатывает вовсе).
+# NB: `@app.on_event("startup")` здесь использовать НЕЛЬЗЯ — на fastapi 0.135/starlette 1.2
+# он не вызывается совсем (проверено), молча оставив сервер без планировщика.
+# ============================================================
+import contextlib
+
+
+def _start_background():
+    """Поднимает фон: возврат осиротевших задач → пул воркеров → планировщик → watchdog."""
+    global _SCHED_THREAD
+    _recover_orphans()
+    for _ in range(GEN_WORKERS):
+        threading.Thread(target=_worker_loop, daemon=True).start()
+    _SCHED_HB["started"] = time.time()
+    _SCHED_HB["last_pass"] = time.time()   # чтобы первые секунды жизни не считались протухшими
+    _SCHED_THREAD = threading.Thread(target=_scheduler_loop, daemon=True, name="vs-scheduler")
+    _SCHED_THREAD.start()
+    threading.Thread(target=_sched_watchdog, daemon=True, name="vs-sched-watchdog").start()
+    log_info("фон запущен: планировщик + %d воркеров пула" % GEN_WORKERS)
+
+
+PUB_TICK_SECONDS = int(os.environ.get("VS_PUB_TICK_SECONDS", "30"))
+
+
+def _pub_engine_loop():
+    """Движок выпусков: ведёт строки плана до ролика в расписании YouTube.
+
+    Отдельный поток и своё соединение на каждый тик. Любая ошибка гасится здесь же:
+    контур публикаций не имеет права уронить очередь кабинета.
+    """
+    services = PubServices({
+        "create_project": _create_project,
+        "enqueue": _enqueue,
+        "project_dir": _project_dir,
+        # ключ для рерайта названия ролика — тот же серверный, что у остальных стадий
+        "openai_key": lambda: (_first_credential(keys(), "openai") or ""),
+    })
+    while True:
+        try:
+            c = db()
+            try:
+                pub_tick(c, services)
+                # Зависшие задания заливки уводим в разбор: возврат в очередь дал бы
+                # второй ролик на канале.
+                stuck = sweep_upload(c, time.time())
+                if stuck:
+                    c.commit()
+                    log_info("заливка: сняты по молчанию ноды: %s" % ", ".join(stuck))
+            finally:
+                c.close()
+        except Exception:
+            log_exc("pub_engine/tick")
+        time.sleep(PUB_TICK_SECONDS)
+
+
+@contextlib.asynccontextmanager
+async def _lifespan(app):
+    try:
+        # Число своих ключей известно только из базы — считаем на старте, иначе после
+        # перезапуска ёмкость дорожки схлопывалась к одному ключу до первого сохранения.
+        _refresh_byok_pool_hint()
+    except Exception:
+        log_exc("_lifespan/byok_pool_hint")
+    if BACKGROUND_ENABLED:
+        try:
+            threading.Thread(target=_pub_engine_loop, daemon=True,
+                             name="pub-engine").start()
+        except Exception:
+            log_exc("_lifespan/pub_engine")
+        try:
+            _start_background()
+        except Exception:
+            # Сервер поднимаем в любом случае: без планировщика он хотя бы отдаёт /healthz,
+            # где видно, что фон мёртв, — это лучше, чем циклический краш uvicorn.
+            log_exc("_lifespan/_start_background")
+    else:
+        log_info("фон ОТКЛЮЧЁН (VS_SERVER_DISABLE_BACKGROUND)")
+    yield
+
+
+app = FastAPI(title="VideoStudio Gen Server (MVP-0)", lifespan=_lifespan)
+
+
+# ============================================================
+# A2: пароли (pbkdf2, stdlib — без argon2-зависимости) + сессии
+# ============================================================
+SESSION_TTL = 30 * 24 * 3600          # 30 дней
+SESSION_COOKIE = "vs_session"
+
+
+def hash_password(pw: str) -> str:
+    salt = secrets.token_bytes(16)
+    it = 200000
+    dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), salt, it)
+    return f"pbkdf2${it}${salt.hex()}${dk.hex()}"
+
+
+def verify_password(pw: str, stored: str) -> bool:
+    try:
+        algo, it, salt_hex, hash_hex = stored.split("$")
+        if algo != "pbkdf2":
+            return False
+        dk = hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"), bytes.fromhex(salt_hex), int(it))
+        return secrets.compare_digest(dk.hex(), hash_hex)
+    except Exception:
+        return False
+
+
+def create_session(user_id: int) -> str:
+    sid = secrets.token_urlsafe(32)
+    now = datetime.datetime.now().timestamp()
+    c = db()
+    c.execute("INSERT INTO sessions(id,user_id,created,expires) VALUES(?,?,?,?)",
+              (sid, user_id, now, now + SESSION_TTL))
+    c.commit(); c.close()
+    return sid
+
+
+def validate_session(sid: str):
+    if not sid:
+        return None
+    c = db()
+    r = c.execute("SELECT s.expires AS _exp, u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.id=?",
+                  (sid,)).fetchone()
+    c.close()
+    if not r:
+        return None
+    if r["_exp"] and r["_exp"] < datetime.datetime.now().timestamp():
+        return None
+    # Блокировка из админ-панели действует и на УЖЕ выданные сессии: иначе заблокированный
+    # партнёр продолжал бы работать в открытой вкладке до истечения куки.
+    if _row_disabled(r):
+        return None
+    return r
+
+
+def _row_disabled(r):
+    """Заблокирован ли аккаунт. Терпим к строкам без колонки (старая БД, частичный SELECT)."""
+    try:
+        return bool(r["disabled"]) if "disabled" in r.keys() else False
+    except Exception:
+        return False
+
+
+def _user_is_disabled(uid):
+    """Проверка по uid для путей, где строки юзера под рукой нет (фоновая постановка)."""
+    if uid is None:
+        return False
+    try:
+        c = db()
+        try:
+            r = c.execute("SELECT disabled FROM users WHERE id=?", (uid,)).fetchone()
+        finally:
+            c.close()
+        return _row_disabled(r) if r else False
+    except Exception:
+        log_exc("user_disabled")
+        return False        # БД молчит — не блокируем работу, это не путь безопасности
+
+
+def delete_session(sid: str):
+    if not sid:
+        return
+    c = db(); c.execute("DELETE FROM sessions WHERE id=?", (sid,)); c.commit(); c.close()
+
+
+def web_user(request: Request):
+    """Текущий партнёр по session-cookie (None если не залогинен). Tenant в request.state."""
+    u = validate_session(request.cookies.get(SESSION_COOKIE))
+    if u is not None:
+        try:
+            request.state.tenant_id = u["tenant_id"] or str(u["id"])
+            request.state.web_user = u
+        except Exception:
+            pass
+    return u
+
+
+# ============================================================
+# A3 + A6-min: login / logout / dashboard (cookie-кабинет, инлайн-HTML)
+# ============================================================
+def _login_page(err=""):
+    e = f'<p style="color:var(--error);margin:0 0 10px;font-size:13px">{html.escape(err)}</p>' if err else ""
+    return HTMLResponse(f"""<!doctype html><html lang=ru><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>VideoStudio — вход</title>
+<style>{_CSS}
+body{{display:flex;min-height:100vh;align-items:center;justify-content:center}}
+.loginbox{{background:var(--surface);padding:30px 28px;border-radius:var(--rl);width:330px;border:1px solid var(--border);box-shadow:var(--sh-pop)}}
+.loginbox .brand{{justify-content:center;margin-bottom:22px;font-size:18px}}</style>
+<form method=post action=/login class=loginbox>
+<div class=brand><span class=mark><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span>VideoStudio</div>
+{e}
+<input class=input name=login placeholder="Логин" autofocus autocomplete=username style="margin-bottom:10px">
+<input class=input name=password type=password placeholder="Пароль" autocomplete=current-password>
+<button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:16px">Войти</button></form></html>""")
+
+
+# Мусорные имена полей: клиент прислал multipart/form-data, а разбираем мы urlencoded —
+# parse_qs тогда делает «ключом» кусок тела формы ("------WebKitFormBoundary…\r\nContent-Disposition:
+# form-data; name"). Такое имя попадало в projects.settings и оттуда в params воркеров.
+_MAX_PARAM_KEY_LEN = 80
+
+
+def _is_junk_param_key(key) -> bool:
+    """Похоже ли имя поля на осколок сырого тела формы (а не на настоящее имя настройки)."""
+    k = str(key)
+    if not k.strip() or len(k) > _MAX_PARAM_KEY_LEN:
+        return True
+    if any(ch in k for ch in ("\r", "\n", "\x00", '"')):
+        return True
+    low = k.lower()
+    return (k.startswith("--")
+            or "content-disposition" in low
+            or "content-type" in low
+            or "webkitformboundary" in low
+            or "boundary=" in low)
+
+
+def _drop_junk_keys(d):
+    """Отсечь мусорные имена полей (см. _is_junk_param_key). Не dict → {}."""
+    if not isinstance(d, dict):
+        return {}
+    return {k: v for k, v in d.items() if not _is_junk_param_key(k)}
+
+
+async def _form(request: Request) -> dict:
+    """Разбор application/x-www-form-urlencoded без python-multipart."""
+    raw = (await request.body()).decode("utf-8", "replace")
+    # keep_blank_values: очищенное поле (voice='', «Авто по языку») ДОЛЖНО доехать до settings/джобы,
+    # иначе merge не затрёт старое значение и настройка «липнет» (см. audit 02.07).
+    return _drop_junk_keys({k: v[0] for k, v in urllib.parse.parse_qs(raw, keep_blank_values=True).items()})
+
+
+
+async def _form_lists(request: Request) -> dict:
+    """Все значения полей формы, а не только первое.
+
+    Обычный `_form` схлопывает одноимённые поля в одно (v[0]) — этого хватало, пока
+    каждое поле было единственным. Ключей у провайдера теперь несколько, они приходят
+    одноимёнными полями add_<провайдер>/drop_<провайдер>, и схлопывание теряло бы все,
+    кроме первого: вписал три ключа — сохранился один.
+    """
+    raw = (await request.body()).decode("utf-8", "replace")
+    return urllib.parse.parse_qs(raw, keep_blank_values=True)
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_get(request: Request):
+    if web_user(request):
+        return RedirectResponse("/", 302)
+    return _login_page()
+
+
+@app.post("/login")
+async def login_post(request: Request):
+    d = await _form(request)
+    login, password = d.get("login", ""), d.get("password", "")
+    c = db()
+    u = c.execute("SELECT * FROM users WHERE name=?", (login,)).fetchone()
+    c.close()
+    if not u or not u["password_hash"] or not verify_password(password, u["password_hash"]):
+        return _login_page("Неверный логин или пароль")
+    if _row_disabled(u):
+        return _login_page("Аккаунт заблокирован — обратитесь к владельцу сервиса")
+    sid = create_session(u["id"])
+    resp = RedirectResponse("/", 302)
+    resp.set_cookie(SESSION_COOKIE, sid, max_age=SESSION_TTL, httponly=True, samesite="lax", secure=True)
+    return resp
+
+
+@app.post("/logout")
+async def logout_post(request: Request):
+    delete_session(request.cookies.get(SESSION_COOKIE))
+    resp = RedirectResponse("/login", 302)
+    resp.delete_cookie(SESSION_COOKIE)
+    return resp
+
+
+# ============================================================
+# B0/B1: проекты партнёра (CRUD) + экраны кабинета. Web-сессия обязательна.
+# ============================================================
+TENANTS_DIR = "/data/tenants"
+
+_CSS = """@import url('https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700;800&family=Golos+Text:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+:root{
+  --bg:#13100e;--surface:#1b1714;--surface2:#241f1a;--elev:#2c2620;--border:#332c25;--border2:#473d33;
+  --text:#f4eee7;--muted:#b1a699;--dim:#7c7167;
+  --accent:#f97316;--accent-h:#fb8a3c;--accent-d:#ea670c;--accent-soft:rgba(249,115,22,.14);--on-accent:#1a1106;
+  --done:#46c089;--running:#5aa2ff;--error:#f2615f;--warn:#f3b13c;--queued:#8d8377;
+  --rs:7px;--r:10px;--rl:14px;
+  --sans:'Golos Text',system-ui,-apple-system,sans-serif;--disp:'Onest',var(--sans);--mono:'JetBrains Mono',ui-monospace,Consolas,monospace;
+  --sh-card:0 1px 2px rgba(0,0,0,.4);--sh-pop:0 16px 40px rgba(0,0,0,.5);--ring:0 0 0 3px var(--accent-soft);
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font-family:var(--sans);font-size:14px;-webkit-font-smoothing:antialiased}
+h1{font:700 24px/1.15 var(--disp);letter-spacing:-.02em;margin:0 0 14px}
+h2{font:600 16px/1.3 var(--disp);margin:0 0 10px}
+a{color:var(--accent);text-decoration:none}a:hover{color:var(--accent-h)}
+code,.mono{font-family:var(--mono)}
+.ic{width:1em;height:1em;flex:none;vertical-align:-0.135em;display:inline-block;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round}
+.ic-lg{width:1.25em;height:1.25em}
+.wrap{max-width:1080px;margin:0 auto;padding:24px 28px}
+.muted{color:var(--muted)}.dim{color:var(--dim)}
+.hint{font-size:11.5px;color:var(--dim);margin:4px 0 0;line-height:1.5}
+.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+.sp{margin-left:auto}
+.divider{height:1px;background:var(--border);margin:18px 0;border:0}
+.topbar{display:flex;align-items:center;gap:16px;padding:12px 22px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:20}
+.brand{display:flex;align-items:center;gap:9px;font:700 16px var(--disp)}
+.brand .mark{width:30px;height:30px;border-radius:9px;background:var(--accent);color:var(--on-accent);display:flex;align-items:center;justify-content:center}
+.nav{display:flex;gap:3px}
+.nav-link{display:inline-flex;align-items:center;gap:8px;padding:8px 13px;border-radius:8px;color:var(--muted);font-size:13.5px;font-weight:500;cursor:pointer}
+.nav-link:hover{background:var(--surface2);color:var(--text)}
+.nav-link.active{background:var(--accent-soft);color:var(--accent);font-weight:600}
+.nav-link svg{width:16px;height:16px}
+.btn{display:inline-flex;align-items:center;gap:7px;padding:10px 16px;border:1px solid transparent;border-radius:var(--rs);background:var(--surface2);color:var(--text);font:600 13.5px var(--sans);white-space:nowrap;cursor:pointer;transition:filter .12s,background .12s}
+.btn:hover{filter:brightness(1.08)}
+.btn:focus-visible{outline:none;box-shadow:var(--ring)}
+.btn svg{width:16px;height:16px}
+.btn-primary{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+.btn-primary:hover{background:var(--accent-h);filter:none}
+.btn-secondary{background:var(--surface2);color:var(--text);border-color:var(--border2)}
+.btn-ghost{background:transparent;color:var(--muted)}
+.btn-ghost:hover{background:var(--surface2);color:var(--text);filter:none}
+.btn-danger{background:transparent;color:var(--error);border-color:color-mix(in srgb,var(--error) 45%,transparent)}
+.btn-sm{padding:7px 13px;font-size:12.5px}
+.btn-icon{padding:0;width:38px;height:38px;justify-content:center}
+.btn:disabled{opacity:.55;cursor:not-allowed;filter:none}
+.input,.select,.textarea{width:100%;background:var(--surface2);border:1px solid var(--border2);border-radius:var(--rs);color:var(--text);font:400 13.5px var(--sans);padding:10px 12px;outline:none}
+.input::placeholder,.textarea::placeholder{color:var(--dim)}
+.input:focus,.select:focus,.textarea:focus{border-color:var(--accent);box-shadow:var(--ring)}
+.textarea{resize:vertical;min-height:80px}
+.select{appearance:none;-webkit-appearance:none;padding-right:34px;cursor:pointer;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='20' height='20' fill='none' stroke='%23b1a699' stroke-width='1.7' stroke-linecap='round'><path d='m5 8 5 5 5-5'/></svg>");background-repeat:no-repeat;background-position:right 9px center}
+.select optgroup{background:var(--elev);color:var(--dim);font-weight:600}
+.select option{background:var(--surface);color:var(--text)}
+.field{display:flex;align-items:center;gap:10px;margin:10px 0;flex-wrap:wrap}
+.field>.cap{width:150px;flex:none;font-size:12.5px;font-weight:600;color:var(--muted)}
+.label{display:block;font-size:12px;font-weight:600;color:var(--muted);margin-bottom:6px}
+.search{display:flex;align-items:center;gap:9px;background:var(--surface2);border:1px solid var(--border2);border-radius:var(--rs);padding:0 11px}
+.search:focus-within{border-color:var(--accent);box-shadow:var(--ring)}
+.search svg{width:16px;height:16px;color:var(--muted);flex:none}
+.search input{flex:1;border:0;background:transparent;color:var(--text);font:400 13.5px var(--sans);padding:10px 0;outline:none}
+.toggle{display:inline-flex;align-items:center;cursor:pointer}
+.toggle input{position:absolute;opacity:0;width:0;height:0}
+.toggle .track{width:42px;height:24px;border-radius:999px;background:var(--surface2);border:1px solid var(--border2);position:relative;transition:background .15s}
+.toggle .track::after{content:"";position:absolute;top:3px;left:3px;width:18px;height:18px;border-radius:50%;background:var(--dim);transition:transform .15s,background .15s}
+.toggle input:checked+.track{background:var(--accent);border-color:var(--accent)}
+.toggle input:checked+.track::after{transform:translateX(18px);background:#fff}
+.segmented{display:inline-flex;background:var(--surface2);border:1px solid var(--border);border-radius:9px;padding:3px}
+.segmented .seg{padding:7px 15px;border-radius:6px;color:var(--muted);font-size:13px;font-weight:600;cursor:pointer}
+.segmented .seg.active{background:var(--elev);color:var(--text);box-shadow:var(--sh-card)}
+.panel{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);padding:18px 20px;margin:0 0 14px}
+.panel-title{font:600 13px var(--sans);color:var(--dim);text-transform:uppercase;letter-spacing:.06em;margin:0 0 12px}
+.badge{display:inline-flex;align-items:center;gap:6px;padding:5px 11px;border-radius:999px;font-size:12px;font-weight:600}
+.badge .dot{width:6px;height:6px;border-radius:50%;background:currentColor}
+.badge svg{width:13px;height:13px}
+.badge-queued{background:color-mix(in srgb,var(--queued) 18%,transparent);color:var(--queued)}
+.badge-running{background:color-mix(in srgb,var(--running) 16%,transparent);color:var(--running)}
+.badge-running .dot{animation:vs-pulse 1.4s infinite}
+.badge-done{background:color-mix(in srgb,var(--done) 16%,transparent);color:var(--done)}
+.badge-error{background:color-mix(in srgb,var(--error) 16%,transparent);color:var(--error)}
+.badge-cancelled{background:var(--surface2);color:var(--dim);border:1px solid var(--border)}
+.tag{font:600 11.5px var(--mono);padding:4px 9px;border-radius:6px;background:var(--surface2);border:1px solid var(--border2);color:var(--muted)}
+.tag-paid{background:color-mix(in srgb,var(--warn) 16%,transparent);color:var(--warn);border-color:color-mix(in srgb,var(--warn) 35%,transparent)}
+.tag-soon{font-size:10px;background:var(--surface2);color:var(--dim);border:1px solid var(--border);padding:2px 6px;border-radius:5px}
+.stepper{display:flex;gap:4px;width:156px}
+.stepper .seg{flex:1;height:6px;border-radius:3px;background:var(--surface2)}
+.stepper .seg.done{background:var(--done)}
+.stepper .seg.running{background:var(--running);animation:vs-pulse 1.4s infinite}
+.stepper .seg.queued{background:var(--queued)}
+.stepper .seg.error{background:var(--error)}
+.stepper .seg.pending{background:var(--surface2)}
+.stepper-cap{font-size:12px;margin-top:6px;font-weight:600}
+.tabs{display:flex;gap:4px;border-bottom:1px solid var(--border);margin-bottom:20px}
+.tabs .tab{padding:9px 14px;font-size:13.5px;font-weight:500;color:var(--muted);cursor:pointer;display:flex;align-items:center;gap:7px;border-bottom:2px solid transparent;margin-bottom:-1px}
+.tabs .tab:hover{color:var(--text)}
+.tabs .tab.active{color:var(--accent);font-weight:600;border-bottom-color:var(--accent)}
+.tabs .tab svg{width:15px;height:15px}
+.pane{display:none}.pane.active{display:block}
+.list{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);overflow:hidden}
+.list-head,.list-row{display:grid;gap:14px;align-items:center;padding:13px 18px}
+.list-head{background:var(--surface2);border-bottom:1px solid var(--border);font-size:11.5px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--dim)}
+.list-row{border-bottom:1px solid var(--border)}.list-row:last-child{border-bottom:0}
+.list-row.selected{background:color-mix(in srgb,var(--accent) 5%,transparent)}
+.check{width:17px;height:17px;border-radius:5px;border:1.5px solid var(--border2);background:var(--surface2);display:inline-flex;align-items:center;justify-content:center;cursor:pointer;color:transparent}
+.check.on{background:var(--accent);border-color:var(--accent);color:var(--on-accent)}
+.dropzone{border:1.5px dashed var(--border2);border-radius:var(--rl);background:var(--surface);padding:24px;display:flex;align-items:center;gap:18px}
+.dropzone:hover{border-color:var(--accent);background:color-mix(in srgb,var(--accent) 4%,var(--surface))}
+.dropzone .ico{width:48px;height:48px;border-radius:12px;background:var(--accent-soft);color:var(--accent);display:flex;align-items:center;justify-content:center;flex:none}
+.preset-bar{display:flex;align-items:center;gap:10px;background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:8px 12px}
+.preset-bar .pick{display:flex;align-items:center;gap:8px;background:var(--surface2);border:1px solid var(--border2);border-radius:var(--rs);padding:7px 11px;cursor:pointer;font-size:13px;font-weight:500}
+.menu{background:var(--elev);border:1px solid var(--border2);border-radius:var(--r);box-shadow:var(--sh-pop);overflow:hidden;min-width:200px}
+.menu .item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 13px;font-size:13px;cursor:pointer}
+.menu .item:hover{background:var(--surface2)}
+.empty{display:flex;flex-direction:column;align-items:center;text-align:center;padding:34px 24px 40px}
+.empty .ico{width:64px;height:64px;border-radius:18px;background:var(--surface2);border:1px solid var(--border2);color:var(--dim);display:flex;align-items:center;justify-content:center;margin-bottom:18px}
+.empty h2{font:700 19px var(--disp);margin:0 0 8px}
+.empty p{font-size:13.5px;color:var(--muted);line-height:1.55;max-width:380px;margin:0 0 22px}
+.log{background:var(--surface2);color:var(--muted);border:1px solid var(--border);border-radius:var(--r);padding:12px;height:270px;overflow:auto;font:12px/1.5 var(--mono);white-space:pre-wrap}
+@keyframes vs-pulse{0%,100%{opacity:1}50%{opacity:.4}}
+/* полоска «живая очередь» (дашборд + /queue). Только var() с фолбэком — своих цветов не заводим */
+.vs-qstrip{display:inline-flex;flex-wrap:wrap;align-items:center;gap:4px 8px;max-width:100%;background:var(--surface,#1b1714);border:1px solid var(--border,#332c25);color:var(--text,#f4eee7);border-radius:999px;padding:5px 13px;font-size:12.5px;font-weight:500}
+.vs-qstrip:hover{background:var(--surface2,#241f1a)}
+.vs-qstrip>span{white-space:nowrap}
+.vs-qstrip .dot{width:7px;height:7px;border-radius:50%;background:var(--done,#46c089);flex:none}
+.vs-qstrip.run .dot{background:var(--running,#5aa2ff);animation:vs-pulse 1.4s infinite}
+.vs-qstrip.pause .dot{background:var(--warn,#f3b13c)}
+.vs-qstrip.off .dot{background:var(--dim,#7c7167)}
+.vs-qstrip .mine{color:var(--muted,#b1a699)}
+@media (max-width:720px){.wrap{padding:16px}.topbar{padding:10px 14px;gap:10px}.field{flex-direction:column;align-items:stretch}.field>.cap{width:auto}.list-head{display:none}.list-row{grid-template-columns:1fr!important;gap:8px}.dropzone{flex-direction:column;text-align:center}}
+/* ---- мост старой разметки (мигрируется по экранам шагами 1-10) ---- */
+header.tb{display:flex;align-items:center;gap:12px;padding:12px 22px;background:var(--surface);border-bottom:1px solid var(--border);position:sticky;top:0;z-index:20;flex-wrap:wrap}
+header.tb b{font:700 16px var(--disp)}
+header.tb .sep,.sep{color:var(--border2);padding:0 2px}
+header.tb a{display:inline-flex}
+fieldset.lf{background:var(--surface);border:1px solid var(--border);border-radius:var(--rl);margin:0 0 14px;padding:16px 18px}
+fieldset.lf>legend{font:600 12px var(--sans);color:var(--dim);text-transform:uppercase;letter-spacing:.05em;padding:0 6px}
+label{font-size:13px;color:var(--text)}
+input:not([type=checkbox]):not([type=radio]):not([type=file]),textarea,select{font-family:var(--sans);font-size:13.5px;padding:9px 11px;border:1px solid var(--border2);border-radius:var(--rs);background:var(--surface2);color:var(--text);outline:none}
+input:focus,textarea:focus,select:focus{border-color:var(--accent);box-shadow:var(--ring)}
+input::placeholder,textarea::placeholder{color:var(--dim)}
+select option{background:var(--surface);color:var(--text)}select optgroup{background:var(--elev);color:var(--dim)}
+button{padding:9px 15px;border:1px solid transparent;border-radius:var(--rs);background:var(--surface2);color:var(--text);cursor:pointer;font:600 13px var(--sans)}
+button:hover{filter:brightness(1.08)}
+.blue,.purple,.red,.green{background:var(--accent);color:var(--on-accent);border-color:var(--accent)}
+.blue:hover,.purple:hover,.red:hover,.green:hover{background:var(--accent-h);filter:none}
+.gray,.indigo,.orange{background:var(--surface2);color:var(--text);border-color:var(--border2)}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 14px}
+.chip{padding:6px 12px;border:1px solid var(--border2);border-radius:999px;background:var(--surface2);font-size:13px;color:var(--muted)}
+.chip.on{background:var(--accent-soft);color:var(--accent);border-color:transparent;font-weight:600}
+table{width:100%;border-collapse:collapse}
+th{text-align:left;color:var(--dim);font-size:11.5px;text-transform:uppercase;letter-spacing:.04em;border-bottom:1px solid var(--border);padding:10px 8px}
+td{padding:11px 8px;border-bottom:1px solid var(--border)}
+.card{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:12px 14px;margin:0 0 8px}
+.fld{display:flex;align-items:center;gap:10px;margin:10px 0;flex-wrap:wrap}
+.fld>label.cap,.fld>.cap{width:150px;flex:none;font-size:12.5px;font-weight:600;color:var(--muted)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px}
+.grid img{width:100%;border-radius:var(--rs);border:1px solid var(--border2)}
+.pc{accent-color:var(--accent);width:16px;height:16px}
+input[type=file]{color:var(--muted);font-size:12.5px}
+details>summary{cursor:pointer}
+.vrow:hover,.lrow:hover{background:var(--surface2)}
+.vrow.on{background:var(--accent-soft)}.vrow.on span{color:var(--accent)}
+.engcard:hover{border-color:var(--dim)!important}
+.dropzone-sm{border:1.5px dashed var(--border2);border-radius:var(--r);background:var(--surface2);padding:20px;text-align:center;cursor:pointer}
+.dropzone-sm:hover{border-color:var(--accent)}
+.dropzone-sm .ico{width:36px;height:36px;border-radius:10px;background:var(--elev);color:var(--accent);display:flex;align-items:center;justify-content:center;margin:0 auto 9px}
+.file-hidden{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;clip:rect(0 0 0 0)}
+.thumbs{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+.thumb{aspect-ratio:1;border-radius:8px;background:var(--surface2);border:1px solid var(--border2);position:relative;background-size:cover;background-position:center}
+.thumb .rm{position:absolute;top:4px;right:4px;width:18px;height:18px;border-radius:5px;background:rgba(0,0,0,.55);border:0;color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;font-size:11px;line-height:1}
+.thumb-add{aspect-ratio:1;border-radius:8px;border:1.5px dashed var(--border2);display:flex;align-items:center;justify-content:center;color:var(--dim);cursor:pointer;font-size:20px}
+.thumb-add:hover{border-color:var(--accent);color:var(--accent)}
+.gimg{position:relative}
+.gimg img,.gimg video{display:block;width:100%;border-radius:8px;border:1px solid var(--border2);transition:opacity .2s,filter .2s;cursor:zoom-in}
+.gimg video{aspect-ratio:16/9;object-fit:cover;background:var(--surface2)}
+.gimg.sel img,.gimg.sel video{outline:2.5px solid var(--accent);outline-offset:-2px}
+.gimg .gbt{position:absolute;top:7px;width:27px;height:27px;padding:0;border-radius:8px;background:rgba(13,15,20,.74);border:1px solid rgba(255,255,255,.16);color:#fff;cursor:pointer;display:flex;align-items:center;justify-content:center;opacity:0;transition:opacity .15s,background .15s,border-color .15s}
+.gimg .gbt svg{width:13px;height:13px}
+.gimg:hover .gbt,.gimg.sel .gck{opacity:1}
+.gimg .gck{left:7px}
+.gimg .gck:hover,.gimg.sel .gck{background:var(--accent);border-color:var(--accent);color:var(--on-accent,#1a1106)}
+.gimg .grm{right:7px}
+.gimg .grm:hover{background:var(--error);border-color:var(--error)}
+.gimg .grg{right:39px}
+.gimg .grg:hover{background:var(--accent);border-color:var(--accent);color:var(--on-accent,#1a1106)}
+.gimg.regen .gbt{display:none}
+.gimg.regen img,.gimg.regen video{opacity:.28;filter:grayscale(.7)}
+.gimg.regen::before{content:"";position:absolute;top:calc(50% - 24px);left:calc(50% - 13px);width:26px;height:26px;border:3px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:gspin .9s linear infinite}
+.gimg.regen::after{content:"перегенерация…";position:absolute;top:calc(50% + 8px);left:0;right:0;text-align:center;font-size:11px;font-weight:600;color:var(--accent)}
+@keyframes gspin{to{transform:rotate(360deg)}}
+.glba{position:fixed;top:50%;transform:translateY(-50%);width:46px;height:68px;border-radius:11px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.16);color:#fff;font-size:30px;line-height:1;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:background .15s}
+.glba:hover{background:var(--accent);border-color:var(--accent);color:var(--on-accent,#1a1106)}
+.glbx{position:fixed;top:16px;right:16px;width:38px;height:38px;border-radius:10px;background:rgba(255,255,255,.07);border:1px solid rgba(255,255,255,.16);color:#fff;font-size:17px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+.glbx:hover{background:var(--error);border-color:var(--error)}
+.char{background:var(--surface2);border:1px solid var(--border);border-radius:var(--r);padding:12px;margin-bottom:10px}
+.char-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:9px;font-size:13px;font-weight:600}"""
+
+# JS вкладок этапов + переключение блока голоса по движку (вынесено из f-строк, чтобы не экранировать скобки)
+_PROJ_JS = """<script>
+function showTab(id){var ps=document.querySelectorAll('.pane');for(var i=0;i<ps.length;i++)ps[i].classList.remove('active');
+var ts=document.querySelectorAll('.tab');for(var j=0;j<ts.length;j++)ts[j].classList.remove('active');
+var p=document.getElementById('pane-'+id),t=document.getElementById('tab-'+id);
+if(p)p.classList.add('active');if(t)t.classList.add('active');try{history.replaceState(null,'','#'+id);}catch(e){}}
+function isLumeanTemplateId(v){return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test((v||'').trim());}
+function presetSnapshot(form){
+ var pane=document.querySelector('.pane.active'),source=pane&&pane.querySelector('form[data-project-settings="1"]');
+ if(!source)return true;
+ var old=form.querySelectorAll('input[data-preset-setting="1"]');for(var o=0;o<old.length;o++)old[o].remove();
+ var tab=form.querySelector('input[name=tab]');if(tab)tab.value=(pane.id||'pane-src').replace(/^pane-/, '');
+ var boxes=source.querySelectorAll('input[type=checkbox][name]');for(var b=0;b<boxes.length;b++){if(!boxes[b].checked){var z=document.createElement('input');z.type='hidden';z.dataset.presetSetting='1';z.name='setting__'+boxes[b].name;z.value='0';form.appendChild(z);}}
+ var fd=new FormData(source);fd.forEach(function(v,k){if(typeof v!=='string'||k==='tab')return;var h=document.createElement('input');h.type='hidden';h.dataset.presetSetting='1';h.name='setting__'+k;h.value=v;form.appendChild(h);});
+ return true;
+}
+function engChg(){var r=document.querySelector('input[name=engine]:checked');if(!r)return;var e=r.value;
+var names={edge:'Edge',voicer:'Voicer',voicegencore:'VoiceGenCore',tts:'Lumean (\u0431\u044b\u0432\u0448. ElevenLabs)'};
+names.lumean='Lumean · HeyGen';
+var t=document.getElementById('paramsTitle');if(t)t.textContent='Параметры · '+(names[e]||e);
+['edge','voicer','voicegencore','tts','lumean'].forEach(function(k){var el=document.getElementById('ep-'+k);if(el)el.style.display=(k===e)?'':'none';});
+var ve=document.getElementById('vp-edge'),vi=document.getElementById('vp-id');
+if(ve)ve.style.display=(e==='edge')?'':'none';if(vi)vi.style.display=(e==='edge')?'none':'';
+var lr=document.querySelectorAll('#vp-id .lrow'),lumean=(e==='lumean');for(var l=0;l<lr.length;l++)lr[l].style.display=(lumean&&lr[l].getAttribute('data-lumean')!=='1')?'none':'flex';
+if(lumean){var voice=document.getElementById('voiceInp'),idf=document.getElementById('idField'),cur=(voice&&voice.value)||(idf&&idf.value)||'';if(cur&&!isLumeanTemplateId(cur)){if(voice)voice.value='';if(idf)idf.value='';}}
+else if(e==='voicegencore'||e==='voicer'){var lv=document.getElementById('voiceInp'),li=document.getElementById('idField'),lc=(lv&&lv.value)||(li&&li.value)||'';if(isLumeanTemplateId(lc)){if(lv)lv.value='';if(li)li.value='';}}
+var cards=document.querySelectorAll('.engcard');for(var c=0;c<cards.length;c++){var rb=cards[c].querySelector('input');var on=rb&&rb.checked;cards[c].style.borderColor=on?'var(--accent)':'var(--border2)';cards[c].style.background=on?'var(--accent-soft)':'var(--surface2)';}}
+function pickVoice(el){var v=document.getElementById('voiceInp');if(v)v.value=el.getAttribute('data-v');var al=document.getElementById('autolang');if(al)al.checked=false;var rs=document.querySelectorAll('#vp-edge .vrow');for(var i=0;i<rs.length;i++)rs[i].classList.remove('on');el.classList.add('on');}
+function pickId(el){var idf=document.getElementById('idField'),v=document.getElementById('voiceInp');if(idf)idf.value=el.getAttribute('data-v');if(v)v.value=el.getAttribute('data-v');}
+function autoLang(){var al=document.getElementById('autolang'),v=document.getElementById('voiceInp');if(al&&al.checked&&v)v.value='';}
+function vfilter(q){q=q.toLowerCase();var rs=document.querySelectorAll('#vp-edge .vrow');for(var i=0;i<rs.length;i++){rs[i].style.display=rs[i].getAttribute('data-s').indexOf(q)>=0?'':'none';}}
+document.addEventListener('submit',function(e){var f=e.target;setTimeout(function(){
+ if(e.defaultPrevented)return;var b=f.querySelector('button[type=submit],button:not([type])');
+ if(b&&!b.disabled){b.dataset.oldtxt=b.innerHTML;b.disabled=true;b.innerHTML='<svg class="ic" viewBox="0 0 24 24"><use href="#ic-clock"/></svg> '+b.dataset.oldtxt;
+ setTimeout(function(){b.disabled=false;b.innerHTML=b.dataset.oldtxt;},10000);}},0);});
+window.addEventListener('DOMContentLoaded',function(){engChg();
+var h=(location.hash||'').replace('#','');if(h&&document.getElementById('pane-'+h))showTab(h);
+var qs=new URLSearchParams(location.search);
+if(qs.get('imgbusy')){alert('Артефакты картинок проекта уже меняются другой задачей. Дождитесь её завершения: планирование, полная генерация и любой реген используют общие файлы.');
+try{history.replaceState(null,'',location.pathname+location.hash);}catch(e1){}}
+else if(qs.get('dup')){alert('Задача этого вида уже в очереди/в работе \\u2014 вторая не поставлена.');
+try{history.replaceState(null,'',location.pathname+location.hash);}catch(e2){}}
+if(qs.get('dv')){alert('Картинки ещё не готовы \\u2014 видео поставлено ОТЛОЖЕННО и стартует автоматически, когда картинки будут.');
+try{history.replaceState(null,'',location.pathname+location.hash);}catch(e3){}}});
+</script>"""
+
+
+# Живой статус ПРЯМО в опциях <select name=model> (картинки). Тянет /api/models/health АСИНХРОННО
+# и к каждой опции дописывает слово статуса + красит её текст (Chrome/FF красят <option>; на прочих
+# остаётся слово). Закрытый селект показывает статус выбранной модели. БЕЗ эмодзи, без доп. блоков.
+_MODEL_DOT_JS = """<script>
+(function(){
+ if(!document.querySelector('select[name=model]'))return;
+ fetch('/api/models/health',{credentials:'same-origin'}).then(function(r){return r.ok?r.json():null;}).then(function(d){
+  if(!d||!d.models)return; var M=d.models;
+  document.querySelectorAll('select[name=model]').forEach(function(sel){
+   Array.prototype.forEach.call(sel.options,function(o){
+    var s=M[o.value]; if(!s)return;
+    if(o.getAttribute('data-base')==null) o.setAttribute('data-base', o.textContent);
+    o.textContent=o.getAttribute('data-base')+'  \\u00b7  '+(s.txt||'');
+    if(s.col){o.style.color=s.col;}
+    o.title=(s.pct!=null?('health '+s.pct+'/100'):'');
+   });
+   // закрытый селект подсвечиваем ТОЛЬКО когда выбранная модель проблемная (health<70) —
+   // рабочие остаются обычным цветом, чтобы не красить всё подряд.
+   function paint(){var s=M[sel.value]; sel.style.color=(s&&s.pct!=null&&s.pct<70)?s.col:'';}
+   paint(); sel.addEventListener('change',paint);
+  });
+ }).catch(function(){});
+})();
+</script>"""
+
+
+# Живой авто-апдейт: раз в 2.5с тянем свежий HTML текущей страницы и подменяем ТОЛЬКО зоны
+# [data-live="ключ"] (степперы, список очереди) — без F5, без потери скролла/чекбоксов/модалок.
+# Поллит только если на странице есть [data-live]; на скрытой вкладке молчит.
+_LIVE_JS = """<script>
+(function(){
+ if(!document.querySelector('[data-live]'))return;
+ var t=null;
+ function refresh(){
+  return fetch(location.href,{credentials:'same-origin'})
+   .then(function(r){return r.ok?r.text():null;})
+   .then(function(h){
+    if(!h)return;
+    var d=new DOMParser().parseFromString(h,'text/html');
+    document.querySelectorAll('[data-live]').forEach(function(el){
+     var f=d.querySelector('[data-live="'+el.getAttribute('data-live')+'"]');
+     if(f&&f.innerHTML!==el.innerHTML)el.innerHTML=f.innerHTML;
+    });
+   });
+ }
+ window._liveNow=function(){refresh().catch(function(){});};
+ function poll(){refresh().catch(function(){}).finally(function(){t=setTimeout(poll,2500);});}
+ document.addEventListener('visibilitychange',function(){
+  if(document.hidden){if(t){clearTimeout(t);t=null;}}else if(!t){t=setTimeout(poll,2500);}
+ });
+ t=setTimeout(poll,2500);
+})();
+// FIX-2026-07-25: отмена/повтор задачи без перезагрузки страницы (раньше form-POST → F5,
+// быстро отменить несколько задач было мучением). Кнопки в карточках очереди зовут jobAct().
+function _miniToast(m){var e=document.createElement('div');e.textContent=m;
+e.style.cssText='position:fixed;bottom:24px;left:50%;transform:translateX(-50%);background:var(--surface2,#333);color:var(--text,#fff);padding:10px 18px;border-radius:10px;font-size:13.5px;z-index:9999;box-shadow:0 4px 18px rgba(0,0,0,.35)';
+document.body.appendChild(e);setTimeout(function(){e.remove();},2600);}
+function jobAct(btn,jid,act){
+ btn.disabled=true;var old=btn.textContent;btn.textContent='…';
+ fetch('/api/jobs/'+jid+'/'+act,{method:'POST',credentials:'same-origin',headers:{'X-Requested-With':'fetch'}})
+ .then(function(r){
+  if(r.ok){_miniToast(act==='cancel'?'Задача отменена':'Задача поставлена заново');
+   if(window._liveNow)window._liveNow();return;}
+  return r.json().then(function(d){throw (d&&d.detail)||0;});
+ })
+ .catch(function(e){btn.disabled=false;btn.textContent=old;
+  _miniToast(typeof e==='string'?e:'Не получилось — попробуйте ещё раз');
+  if(window._liveNow)window._liveNow();});
+ return false;}
+</script>"""
+
+
+# Полоска «живая очередь»: свой лёгкий JSON-опрос /api/queue/pulse раз в 5с.
+# НЕ через data-live — тот перезапрашивает СТРАНИЦУ ЦЕЛИКОМ каждые 2.5с и сейчас не включён
+# на /keys /models /presets /voices /server-limits /p/{pid} (дороже всех /models — он на каждый
+# рендер ходит во внешний FastGen). Полоска есть только на дашборде и /queue; на прочих
+# страницах узла нет и IIFE молча выходит.
+_QSTRIP_JS = """<script>
+(function(){
+ var el=document.getElementById('vs-qstrip'); if(!el)return;
+ var mn=document.getElementById('vs-qs-main'), my=document.getElementById('vs-qs-mine');
+ var t=null,dead=false,fails=0,BASE=5000,iv=BASE;
+ function n(x){return (typeof x==='number'&&isFinite(x))?x:0;}
+ function wd(k,one,many){return (k%10===1&&k%100!==11)?one:many;}
+ function draw(d){
+  var T=d.totals||{},M=d.mine||{},w=n(T.waiting),r=n(T.running),cls='vs-qstrip';
+  if(d.paused){cls+=' pause';mn.textContent=d.paused_reason||'Общая очередь студии: приостановлена';}
+  else if(d.paused_reason){cls+=' pause';mn.textContent=d.paused_reason;}
+  else if(d.degraded){cls+=' off';mn.textContent='Общая очередь студии: нет данных';}
+  else if(!w&&!r){mn.textContent='Общая очередь студии пуста \\u2014 задачи стартуют сразу';}
+  else{if(r)cls+=' run';
+   var P=[];if(w)P.push(w+' '+wd(w,'ждёт','ждут'));if(r)P.push(r+' '+wd(r,'идёт','идут'));
+   mn.textContent='Общая очередь студии: '+P.join(' \\u00b7 ')+(T.people_label?(' \\u00b7 '+T.people_label+' чел.'):'');}
+  el.className=cls;
+  var mw=n(M.waiting),mr=n(M.running);
+  if(mw||mr){
+   var pos=(typeof M.position==='number')?M.position:null, of=n(M.of_total);
+   var q=mw?(mw+' в очереди'+(pos?(' \u00b7 '+pos+'-я из '+(of||mw)):'')):'';
+   my.textContent='Ваши задачи: '+q+((mw&&mr)?', ':'')+(mr?(mr+' идёт'):'');my.style.display='';}
+  else{my.textContent='';my.style.display='none';}
+ }
+ function stop(){if(t){clearTimeout(t);t=null;}}
+ function plan(ms){stop();if(!dead)t=setTimeout(tick,ms);}
+ function tick(){
+  if(dead)return;
+  fetch('/api/queue/pulse',{credentials:'same-origin'}).then(function(r){
+   if(r.status===401){dead=true;stop();return null;}
+   if(!r.ok)throw 0; return r.json();
+  }).then(function(d){
+   if(!d)return;
+   fails=0;iv=BASE;draw(d);
+   try{document.dispatchEvent(new CustomEvent('vs-pulse',{detail:d}));}catch(_){}
+   plan(iv);
+  }).catch(function(){
+   fails++; if(fails>=3)iv=Math.min(30000,BASE*4);
+   el.className='vs-qstrip off'; plan(iv);
+  });
+ }
+ document.addEventListener('visibilitychange',function(){
+  if(document.hidden){stop();}else{tick();}
+ });
+ plan(BASE);
+})();
+</script>"""
+
+
+# SVG-спрайт иконок интерфейса: вставляется ОДИН раз первым элементом <body> в _page(),
+# используется как <svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> (размер 1em, цвет currentColor).
+_SPRITE = """<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<symbol id="ic-video" viewBox="0 0 24 24"><rect x="2.5" y="5.5" width="13" height="13" rx="2.5"/><path d="M15.5 10.2l5-2.7v9l-5-2.7z"/></symbol>
+<symbol id="ic-film" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M7 4v16M17 4v16M2.5 12h19M2.5 8h4.5M2.5 16h4.5M17 8h4.5M17 16h4.5"/></symbol>
+<symbol id="ic-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="M21 16l-5-5-9 9"/></symbol>
+<symbol id="ic-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4.5-4.5M12 15l4.5-4.5"/><path d="M4 17v2.5a1.5 1.5 0 001.5 1.5h13a1.5 1.5 0 001.5-1.5V17"/></symbol>
+<symbol id="ic-upload" viewBox="0 0 24 24"><path d="M12 21V9m0 0L7.5 13.5M12 9l4.5 4.5"/><path d="M4 7V4.5A1.5 1.5 0 015.5 3h13A1.5 1.5 0 0120 4.5V7"/></symbol>
+<symbol id="ic-save" viewBox="0 0 24 24"><path d="M5 3h11l4 4v12.5A1.5 1.5 0 0118.5 21h-13A1.5 1.5 0 014 19.5v-15A1.5 1.5 0 015.5 3z"/><path d="M8 3v6h7V3M8 21v-6h8v6"/></symbol>
+<symbol id="ic-refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 11-2.6-6.1"/><path d="M20.5 4v5h-5"/></symbol>
+<symbol id="ic-trash" viewBox="0 0 24 24"><path d="M4 6.5h16M9.5 6.5V4.5A1.5 1.5 0 0111 3h2a1.5 1.5 0 011.5 1.5v2"/><path d="M6.5 6.5l1 13A1.5 1.5 0 009 21h6a1.5 1.5 0 001.5-1.5l1-13"/><path d="M10.5 10.5v7M13.5 10.5v7"/></symbol>
+<symbol id="ic-edit" viewBox="0 0 24 24"><path d="M13 5.5l5.5 5.5M4 20l1-4.5L16 4.5a2.1 2.1 0 013 3L8 18.5 4 20z"/></symbol>
+<symbol id="ic-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12.5" height="12.5" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0014.5 4h-9A1.5 1.5 0 004 5.5v9A1.5 1.5 0 005.5 16H8"/></symbol>
+<symbol id="ic-package" viewBox="0 0 24 24"><path d="M12 3l8.5 4.5v9L12 21l-8.5-4.5v-9z"/><path d="M3.5 7.5L12 12l8.5-4.5M12 12v9M7.75 5.25l8.5 4.5"/></symbol>
+<symbol id="ic-star" viewBox="0 0 24 24"><path d="M12 3.5l2.7 5.5 6 .9-4.35 4.2 1.03 6L12 17.25 6.62 20.1l1.03-6L3.3 9.9l6-.9z"/></symbol>
+<symbol id="ic-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v10M14.5 9.3c-.6-.8-1.5-1.2-2.5-1.2-1.4 0-2.5.8-2.5 1.9 0 2.6 5 1.3 5 3.9 0 1.1-1.1 2-2.5 2-1.1 0-2-.4-2.6-1.2"/></symbol>
+<symbol id="ic-flask" viewBox="0 0 24 24"><path d="M9.5 3v6L4.6 17.4A2 2 0 006.3 20.5h11.4a2 2 0 001.7-3.1L14.5 9V3"/><path d="M8 3h8M7.2 14h9.6"/></symbol>
+<symbol id="ic-ruler" viewBox="0 0 24 24"><rect x="2.2" y="8" width="19.6" height="8" rx="1.6" transform="rotate(-45 12 12)"/><path d="M9 7.5l1.6 1.6M11.5 5l1.6 1.6M6.5 10l1.6 1.6M14 2.5l1.6 1.6"/></symbol>
+<symbol id="ic-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></symbol>
+<symbol id="ic-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5.2l3.4 2"/></symbol>
+<symbol id="ic-alert" viewBox="0 0 24 24"><path d="M10.3 4.2L2.6 17.4a2 2 0 001.7 3h15.4a2 2 0 001.7-3L13.7 4.2a2 2 0 00-3.4 0z"/><path d="M12 9.5v4M12 17.2v.01"/></symbol>
+<symbol id="ic-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+<symbol id="ic-check" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></symbol>
+<symbol id="ic-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8 12.2l2.8 2.8 5.2-6"/></symbol>
+<symbol id="ic-stop" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="2.5"/></symbol>
+<symbol id="ic-play" viewBox="0 0 24 24"><path d="M7 4.8l12 7.2-12 7.2z"/></symbol>
+<symbol id="ic-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
+<symbol id="ic-scissors" viewBox="0 0 24 24"><circle cx="6.5" cy="6.5" r="2.6"/><circle cx="6.5" cy="17.5" r="2.6"/><path d="M8.7 8.3L20 18M20 6L8.7 15.7"/></symbol>
+<symbol id="ic-shuffle" viewBox="0 0 24 24"><path d="M3.5 6.5h3.2l10 11h4"/><path d="M3.5 17.5h3.2l3.1-3.4M13.6 9.4l3.1-2.9h4"/><path d="M18 3.5l3 3-3 3M18 14.5l3 3-3 3"/></symbol>
+<symbol id="ic-volume" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M15.5 9.2a4 4 0 010 5.6M18.2 6.5a7.8 7.8 0 010 11"/></symbol>
+<symbol id="ic-music" viewBox="0 0 24 24"><path d="M9 18V5.2l11-2v12.6"/><circle cx="6.5" cy="18" r="2.6"/><circle cx="17.5" cy="15.8" r="2.6"/></symbol>
+<symbol id="ic-mic" viewBox="0 0 24 24"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0013 0M12 18v3.5M8.5 21.5h7"/></symbol>
+<symbol id="ic-key" viewBox="0 0 24 24"><circle cx="7.5" cy="12" r="4"/><path d="M11.5 12H21M18 12v3.5M14.8 12v2.8"/></symbol>
+<symbol id="ic-cpu" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/><rect x="9.8" y="9.8" width="4.4" height="4.4" rx="1"/><path d="M10 3v3.5M14 3v3.5M10 17.5V21M14 17.5V21M3 10h3.5M3 14h3.5M17.5 10H21M17.5 14H21"/></symbol>
+<symbol id="ic-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.8"/><path d="M4.5 20.5a7.5 7.5 0 0115 0"/></symbol>
+<symbol id="ic-users" viewBox="0 0 24 24"><circle cx="9.5" cy="8" r="3.5"/><path d="M3 20a6.5 6.5 0 0113 0"/><path d="M16.5 5.2a3.5 3.5 0 010 6.6M17.5 14.4A6.5 6.5 0 0121 20"/></symbol>
+<symbol id="ic-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.3 15.3L21 21"/></symbol>
+<symbol id="ic-chart" viewBox="0 0 24 24"><path d="M4 20V4M4 20h16"/><path d="M8 20v-6M12.5 20V8.5M17 20v-9"/></symbol>
+<symbol id="ic-palette" viewBox="0 0 24 24"><path d="M12 3.2c-4.9 0-8.8 3.8-8.8 8.5S7.1 20 12 20c1.2 0 2-.8 2-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .9-1.8 2-1.8h1.3c2.5 0 4.5-1.9 4.5-4.3 0-3.6-3.5-6.5-7.8-6.5z"/><circle cx="7.6" cy="11.5" r="1.1"/><circle cx="10.4" cy="7.6" r="1.1"/><circle cx="15.2" cy="8.2" r="1.1"/></symbol>
+<symbol id="ic-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M19.2 14.4a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5v.3a2 2 0 01-4 0v-.2a1.6 1.6 0 00-1-1.5 1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H2.8a2 2 0 010-4H3a1.6 1.6 0 001.5-1 1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V2.8a2 2 0 014 0V3a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1h.3a2 2 0 010 4H21a1.6 1.6 0 00-1.5 1z"/></symbol>
+<symbol id="ic-link" viewBox="0 0 24 24"><path d="M10.2 13.8a4 4 0 006 .5l2.5-2.5a4.2 4.2 0 00-6-6l-1.4 1.4"/><path d="M13.8 10.2a4 4 0 00-6-.5L5.3 12.2a4.2 4.2 0 006 6l1.4-1.4"/></symbol>
+<symbol id="ic-folder" viewBox="0 0 24 24"><path d="M3 7.5A1.5 1.5 0 014.5 6h4.2l2 2.5h8.8A1.5 1.5 0 0121 10v8.5A1.5 1.5 0 0119.5 20h-15A1.5 1.5 0 013 18.5z"/></symbol>
+<symbol id="ic-file" viewBox="0 0 24 24"><path d="M13.5 3H7a1.5 1.5 0 00-1.5 1.5v15A1.5 1.5 0 007 21h10a1.5 1.5 0 001.5-1.5V8z"/><path d="M13.5 3v5h5M9 13h6M9 16.5h6"/></symbol>
+<symbol id="ic-zap" viewBox="0 0 24 24"><path d="M13.5 2.5L4.5 13.8h6.3L10.5 21.5l9-11.3h-6.3z"/></symbol>
+<symbol id="ic-flame" viewBox="0 0 24 24"><path d="M12 21c3.6 0 6.5-2.7 6.5-6 0-4.4-4-6.2-4.6-10.8-2 1.4-3.4 3.4-3.4 5.6 0 1.3-1 2-1.9 1.3-.8-.6-1.1-1.6-1.1-2.4C6 10.1 5.5 12.2 5.5 15c0 3.3 2.9 6 6.5 6z"/></symbol>
+<symbol id="ic-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.6"/><circle cx="12" cy="12" r="1"/></symbol>
+<symbol id="ic-bell" viewBox="0 0 24 24"><path d="M18 9.5a6 6 0 10-12 0c0 5-2 6.5-2 6.5h16s-2-1.5-2-6.5z"/><path d="M13.7 20a2 2 0 01-3.4 0"/></symbol>
+<symbol id="ic-lock" viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.2a4 4 0 018 0v3.3"/></symbol>
+<symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11.2v5M12 7.9v.01"/></symbol>
+<symbol id="ic-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="ic-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+<symbol id="ic-chevron-down" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></symbol>
+<symbol id="ic-chevron-right" viewBox="0 0 24 24"><path d="M9.5 6l6 6-6 6"/></symbol>
+<symbol id="ic-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3.2"/></symbol>
+<symbol id="ic-list" viewBox="0 0 24 24"><path d="M9 6.5h12M9 12h12M9 17.5h12M4 6.5v.01M4 12v.01M4 17.5v.01"/></symbol>
+<symbol id="ic-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.5 5.4 3.5 8.5s-1.2 6.1-3.5 8.5c-2.3-2.4-3.5-5.4-3.5-8.5S9.7 5.9 12 3.5z"/></symbol>
+<symbol id="ic-message" viewBox="0 0 24 24"><path d="M20.5 11.5a7.6 7.6 0 01-8.5 7.5c-.9 0-1.8-.1-2.6-.4L4 20.5l1.4-4.2A7.3 7.3 0 013.5 11.5C3.5 7.4 7.3 4 12 4s8.5 3.4 8.5 7.5z"/></symbol>
+<symbol id="ic-calendar" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/></symbol>
+<symbol id="ic-rocket" viewBox="0 0 24 24"><path d="M13 4.5c3.5-2 6.5-1.5 6.5-1.5s.5 3-1.5 6.5c-1.6 2.8-4 5-6.3 6.4l-3.6-3.6C9.5 10 11.4 6.1 13 4.5z"/><circle cx="15.2" cy="8.8" r="1.4"/><path d="M8.1 12.3L5 13.4l1.6 1.6M11.7 15.9l-1.1 3.1-1.6-1.6M6.5 17.5c-1 1-1.5 3-1.5 3s2-.5 3-1.5"/></symbol>
+</defs></svg>"""
+
+
+def _page(title, body):
+    return HTMLResponse(f"""<!doctype html><html lang=ru><meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>{html.escape(title)}</title>
+<link rel=icon href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🎬</text></svg>">
+<style>{_CSS}</style><body>{_SPRITE}{body}{_MODEL_DOT_JS}{_LIVE_JS}{_QSTRIP_JS}</body></html>""")
+
+
+def require_web_user(request: Request):
+    u = web_user(request)
+    if not u:
+        raise HTTPException(401, "нужен вход")
+    return u
+
+
+def _tid(u):
+    return u["tenant_id"] or str(u["id"])
+
+
+def _project_dir(tid, pid):
+    return os.path.join(TENANTS_DIR, tid, "projects", pid)
+
+
+def _materials_ready(proj):
+    """Готовы ли материалы для рендера: есть картинки (googler/*.jpg|png) И озвучка (_FINAL_AUDIO_*/*.mp3)."""
+    imgs = (glob.glob(os.path.join(proj, "googler", "*.jpg"))
+            + glob.glob(os.path.join(proj, "googler", "*.jpeg"))
+            + glob.glob(os.path.join(proj, "googler", "*.png"))
+            + glob.glob(os.path.join(proj, "Images", "**", "*.jpg"), recursive=True)
+            + glob.glob(os.path.join(proj, "Images", "**", "*.jpeg"), recursive=True)
+            + glob.glob(os.path.join(proj, "Images", "**", "*.png"), recursive=True))
+    auds = glob.glob(os.path.join(proj, "_FINAL_AUDIO_*", "*.mp3"))
+    return (bool(imgs) and bool(auds)), len(imgs), bool(auds)
+
+
+IMG_RENDER_MIN_RATIO = 0.70   # авто/отложенный рендер не стартует, пока картинок < 70% от ожидаемого
+
+
+def _numbered_googler_scene_id(path):
+    """Scene id из штатного googler-имени (001.jpg / 001_variant.png)."""
+    stem = os.path.splitext(os.path.basename(path))[0]
+    match = re.match(r"^(\d{3})(?:_|$)", stem)
+    if not match:
+        return None
+    scene_id = int(match.group(1))
+    return scene_id if scene_id > 0 else None
+
+
+def _images_ratio_ok(tid, pid):
+    """True, если картинок ≥ IMG_RENDER_MIN_RATIO от ожидаемого (число сцен в scenes.json).
+    Если ожидаемое неизвестно после запуска image-job — блокируем: это ещё не готовый проект.
+    Не блокируем unknown только для ручных материалов, где image-job никогда не было."""
+    try:
+        ps = _project_status(tid, pid)
+        exp = ps.get("images_expected") or 0
+        have = ps.get("images") or 0
+        if exp <= 0:
+            c = db()
+            had_image_job = c.execute(
+                "SELECT 1 FROM queue_tasks WHERE project_id=? AND tenant_id=? "
+                "AND kind='images' LIMIT 1", (pid, tid)
+            ).fetchone()
+            c.close()
+            return bool(have) and not bool(had_image_job)
+        return have >= IMG_RENDER_MIN_RATIO * exp
+    except Exception:
+        return False
+
+
+def _video_images_ready(tid, pid, params=None):
+    """Readiness исходных кадров для image-to-video.
+
+    ``first_n`` означает первые сцены, а не любые N готовых файлов.
+    Для штатного numbered googler-набора поэтому ждём все scene id
+    1..min(first_n, images_expected). Для ``first_n=0``, ручных и
+    legacy-имён сохраняем прежний контракт готовности ≥70%.
+    """
+    # Exact first_n is an additional continuity gate, never a replacement for
+    # the established completeness contract.  Ten perfect leading frames out
+    # of forty are still an incomplete image job.
+    ratio_ready = _images_ratio_ok(tid, pid)
+    if not ratio_ready:
+        return False
+    # Text-to-video reads scenes.json directly.  It deliberately ignores the
+    # image ``first_n`` field in _build_cmd and uses only ``t2v_first_n``;
+    # a stale image limit must therefore not hold this mode on image gaps.
+    if _truthy((params or {}).get("t2v"), default=False):
+        return ratio_ready
+    raw = str((params or {}).get("first_n") or "0").strip() or "0"
+    try:
+        first_n = int(raw)
+    except (TypeError, ValueError):
+        return ratio_ready  # _build_cmd выдаст понятную ошибку
+    if first_n <= 0:
+        return ratio_ready
+    try:
+        expected = int(_project_status(tid, pid).get("images_expected") or 0)
+        if expected <= 0:
+            return ratio_ready
+        projdir = _project_dir(tid, pid)
+        paths = (glob.glob(os.path.join(projdir, "googler", "*.jpg"))
+                 + glob.glob(os.path.join(projdir, "googler", "*.jpeg"))
+                 + glob.glob(os.path.join(projdir, "googler", "*.png")))
+        parsed_ids = [_numbered_googler_scene_id(path) for path in paths]
+        # Any manual/legacy name makes the whole set legacy: mixing exact and
+        # positional semantics would silently drop or reorder those sources.
+        if not paths or any(scene_id is None for scene_id in parsed_ids):
+            return ratio_ready
+        scene_ids = set(parsed_ids)
+        return all(scene_id in scene_ids
+                   for scene_id in range(1, min(first_n, expected) + 1))
+    except Exception:
+        return False
+
+
+IMG_RENDER_MAX_GAP = 5   # столько подряд пропущенных сцен рендер склеит без заметного вреда
+                         # (26.07: решение юзера — 2 слишком дёргано, гонять реген из-за пары
+                         #  кадров дороже, чем ~минута на одной картинке в середине ролика)
+
+
+def _images_gap_report(tid, pid):
+    """Дыры в нумерации картинок проекта → (ok, самая_длинная_серия, список_пропусков, сцен_всего).
+
+    Рендер отдаёт время сцены БЕЗ картинки предыдущей существующей
+    (render_worker._collapse_missing_images) — серия пропусков превращается в один
+    застывший кадр. Волна 7: 16 подряд = 5 минут статики, 49 подряд (рендер стартовал
+    по неполному набору) = 16 минут. Доля ≥70% такие дыры НЕ ловит: 269/287 = 94%
+    и всё равно пять минут одной картинки.
+    ok=False → рендер держим, пока кадры не добьют (или пока юзер не включит allow_image_gaps).
+    """
+    try:
+        proj = _project_dir(tid, pid)
+        nums = set()
+        for f in glob.glob(os.path.join(proj, "googler", "*.*")):
+            m = re.match(r"^(\d{3})(?:_|$)", os.path.splitext(os.path.basename(f))[0])
+            if m:
+                nums.add(int(m.group(1)))
+        if not nums:
+            return (True, 0, [], 0)   # ручные материалы / другое именование — не наш случай
+        expected = 0
+        scenes_json = os.path.join(proj, "googler", "scenes.json")
+        if os.path.isfile(scenes_json):
+            try:
+                expected = len(json.load(open(scenes_json, encoding="utf-8")) or [])
+            except Exception:
+                expected = 0
+        missing, run, longest = [], 0, 0
+        for i in range(1, max(expected, max(nums)) + 1):
+            if i in nums:
+                run = 0
+            else:
+                run += 1
+                longest = max(longest, run)
+                missing.append(i)
+        return (longest <= IMG_RENDER_MAX_GAP, longest, missing, expected or max(nums))
+    except Exception:
+        return (True, 0, [], 0)       # неизвестность не должна намертво блокировать рендер
+
+
+def _images_gap_ok(tid, pid, st=None):
+    """Гейт рендера по дырам. allow_image_gaps=1 в настройках проекта — «рендерить как есть»."""
+    if (st or {}).get("allow_image_gaps"):
+        return True
+    return _images_gap_report(tid, pid)[0]
+
+
+SPLIT_LONG_LEGACY_ALGORITHM_VERSION = 2
+SPLIT_LONG_LEGACY_SEMANTIC_ALGORITHM_VERSION = 3
+SPLIT_LONG_SEMANTIC_ALGORITHM_VERSION = 4
+SPLIT_LONG_DEFAULT_SECONDS = 6.0
+SPLIT_LONG_CHARS_PER_SECOND = 12.5
+SCENE_PLAN_VERSION = 3
+SEMANTIC_VISUAL_MODES = {
+    "literal_action", "object_in_context", "process", "cause_effect",
+    "comparison", "historical_artifact", "environment", "metaphor",
+}
+
+
+def _split_long_seconds(params=None):
+    """Настраиваемый приблизительный лимит до Whisper; CLI получит уже проверенное число."""
+    raw = (params or {}).get("max_solo_scene_seconds")
+    if raw in (None, ""):
+        return SPLIT_LONG_DEFAULT_SECONDS
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("лимит длинной сцены должен быть числом секунд") from exc
+    if not 1.0 <= seconds <= 60.0:       # также отклоняет NaN
+        raise ValueError("лимит длинной сцены должен быть от 1 до 60 секунд")
+    return seconds
+
+
+def _split_long_plan_contract(params=None):
+    enabled = _truthy((params or {}).get("split_long_sentences"), default=False)
+    seconds = _split_long_seconds(params) if enabled else None
+    spp_numbers = re.findall(r"\d+", str((params or {}).get("sentences_per_prompt") or "3"))
+    if len(spp_numbers) >= 3:
+        head = max(1, int(spp_numbers[0]))
+        boundary = max(0, int(spp_numbers[1]))
+        tail = max(1, int(spp_numbers[2]))
+    elif spp_numbers:
+        head = tail = max(1, int(spp_numbers[0]))
+        boundary = 0
+    else:
+        head = tail = 3
+        boundary = 0
+    # Semantic v4 нужен во всех cadence-режимах с solo-позициями. Группы из
+    # нескольких предложений остаются неделимыми, а длинное solo-предложение
+    # может дробиться только внутри собственной границы.
+    semantic = enabled and (tail == 1 or (boundary > 0 and head == 1))
+    return {
+        "split_long": enabled,
+        "split_long_algorithm": (
+            SPLIT_LONG_SEMANTIC_ALGORITHM_VERSION if semantic
+            else SPLIT_LONG_LEGACY_ALGORITHM_VERSION
+        ) if enabled else None,
+        "max_solo_scene_seconds": seconds,
+        "max_solo_scene_chars": round(seconds * SPLIT_LONG_CHARS_PER_SECOND)
+        if enabled else None,
+    }
+
+
+def _scene_plan_manual_identity(projdir, params):
+    """Manual-identity presence from the exact bundle this image operation owns."""
+    try:
+        bundle_id = str((params or {}).get("_reference_bundle_id") or "").strip()
+        if bundle_id:
+            _manifest_path, bundle = _reference_load_bundle(projdir, bundle_id)
+            return bool(bundle.get("characters"))
+        return bool(_reference_load_state(projdir).get("characters"))
+    except Exception:
+        return None
+
+
+def _scene_plan_ready(projdir, params=None):
+    """Готов ли план сцен (scenes.json от задачи «промпты») И актуален ли он для этих параметров.
+
+    Неполный/битый план = не готов. Если переданы params — сверяем паспорт плана
+    (scenes.meta.json: стиль, предложений на кадр, дробление, анализ, хэш текста): сменил стиль
+    или переписал сценарий → план ПЕРЕПИСЫВАЕТСЯ, а не переиспользуется молча.
+    """
+    scenes_path = os.path.join(projdir, "googler", "scenes.json")
+    meta_path = os.path.join(projdir, "googler", "scenes.meta.json")
+    try:
+        # meta is the commit marker. Reading it before scene bytes is race-safe:
+        # a concurrent scenes-first publication can only produce digest mismatch.
+        with open(meta_path, encoding="utf-8") as f:
+            meta = json.load(f)
+        with open(scenes_path, "rb") as f:
+            scene_bytes = f.read()
+        sc = json.loads(scene_bytes.decode("utf-8"))
+        with open(os.path.join(projdir, "source.txt"), encoding="utf-8", errors="replace") as f:
+            text = f.read()
+    except Exception:
+        return False
+    required = ("subject", "text_segment", "visual_prompt", "camera_angle", "subject_type")
+    if not (isinstance(meta, dict)
+            and meta.get("plan_version") == SCENE_PLAN_VERSION
+            and isinstance(sc, list) and bool(sc)
+            and meta.get("scene_count") == len(sc)
+            and meta.get("scenes_sha256") == hashlib.sha256(scene_bytes).hexdigest()
+            and all(isinstance(scene, dict)
+                    and all(isinstance(scene.get(key), str) and scene[key].strip()
+                            for key in required)
+                    for scene in sc)):
+        return False
+    source_bytes = text.encode("utf-8", "replace")
+    if (meta.get("source_sha1") != hashlib.sha1(source_bytes).hexdigest()
+            or meta.get("source_sha256") != hashlib.sha256(source_bytes).hexdigest()):
+        return False
+    artifacts = meta.get("prompt_artifacts")
+    if not (isinstance(artifacts, dict)
+            and isinstance(artifacts.get("subject_anchor"), dict)):
+        return False
+    story_bible = artifacts.get("story_bible")
+    hero_reference = artifacts.get("hero_reference")
+    if story_bible is not None and not isinstance(story_bible, dict):
+        return False
+    if hero_reference is not None and not isinstance(hero_reference, dict):
+        return False
+    if isinstance(story_bible, dict):
+        try:
+            story_bible = gw._validate_story_bible(story_bible)
+        except Exception:
+            return False
+    story_identity_present = bool(story_bible and story_bible.get("characters"))
+    dependency_fields = (
+        "manual_identity_present", "story_identity_present",
+        "auto_hero_prompt_required",
+    )
+    if (any(not isinstance(meta.get(key), bool) for key in dependency_fields)
+            or meta["story_identity_present"] != story_identity_present):
+        return False
+    if (meta["auto_hero_prompt_required"]
+            and (not isinstance(hero_reference, dict)
+                 or not str(hero_reference.get("prompt") or "").strip())):
+        return False
+    if meta.get("smart_mode"):
+        cursor = 0
+        for scene in sc:
+            start, end = scene.get("character_start"), scene.get("character_end")
+            if (not isinstance(start, int) or isinstance(start, bool)
+                    or not isinstance(end, int) or isinstance(end, bool)
+                    or start != cursor or end <= start or end > len(text)
+                    or scene.get("text_segment") != text[start:end]
+                    or not isinstance(scene.get("includes_main_character"), bool)):
+                return False
+            cursor = end
+        if cursor != len(text):
+            return False
+    semantic_algorithm = meta.get("split_long_algorithm")
+    if semantic_algorithm in (
+            SPLIT_LONG_LEGACY_SEMANTIC_ALGORITHM_VERSION,
+            SPLIT_LONG_SEMANTIC_ALGORITHM_VERSION):
+        if not meta.get("split_long") or meta.get("smart_mode"):
+            return False
+        cursor = 0
+        for scene in sc:
+            start, end = scene.get("character_start"), scene.get("character_end")
+            elements = scene.get("required_elements")
+            if (not isinstance(start, int) or isinstance(start, bool)
+                    or not isinstance(end, int) or isinstance(end, bool)
+                    or start != cursor or end <= start or end > len(text)
+                    or scene.get("text_segment") != text[start:end]
+                    or not isinstance(scene.get("semantic_claim"), str)
+                    or not scene["semantic_claim"].strip()
+                    or scene.get("visual_mode") not in SEMANTIC_VISUAL_MODES
+                    or not isinstance(elements, list) or not 1 <= len(elements) <= 5
+                    or any(not isinstance(item, str) or not item.strip() for item in elements)
+                    or not isinstance(scene.get("continuity_group"), str)
+                    or not scene["continuity_group"].strip()):
+                return False
+            cursor = end
+        if cursor != len(text):
+            return False
+        if semantic_algorithm == SPLIT_LONG_SEMANTIC_ALGORITHM_VERSION:
+            try:
+                gw._validate_semantic_scene_plan(
+                    sc,
+                    text,
+                    None,
+                    meta.get("sentences_per_prompt", "1"),
+                    True,
+                    meta.get("max_solo_scene_seconds", SPLIT_LONG_DEFAULT_SECONDS),
+                    enforce_cadence=True,
+                )
+            except Exception:
+                return False
+    if params is None:
+        return True
+    want = {
+        # "model" не сверяется — см. _load_plan_artifacts в googler_worker: смена
+        # модели картинок не меняет текст промптов, а переплан стоил партнёру
+        # 10–15 минут LLM и лимита подписки на ровном месте.
+        "style": str(params.get("style") or "minimalistic, cinematic, photorealistic"),
+        "sentences_per_prompt": str(params.get("sentences_per_prompt") or "3"),
+        "analyze_story": _truthy(params.get("analyze_story"), default=False),
+        "auto_hero": _truthy(params.get("auto_hero"), default=False),
+        "smart_mode": _truthy(params.get("smart_mode"), default=False),
+        "source_sha1": hashlib.sha1(source_bytes).hexdigest(),
+        "source_sha256": hashlib.sha256(source_bytes).hexdigest(),
+        **_split_long_plan_contract(params),
+    }
+    manual_identity_present = _scene_plan_manual_identity(projdir, params)
+    if manual_identity_present is None:
+        return False
+    expected_dependencies = {
+        "manual_identity_present": manual_identity_present,
+        "story_identity_present": story_identity_present,
+        "auto_hero_prompt_required": bool(
+            want["auto_hero"]
+            and not manual_identity_present
+            and not story_identity_present
+        ),
+    }
+    dependencies_match = all(
+        meta.get(key) == value for key, value in expected_dependencies.items()
+    )
+    if dependencies_match and all(meta.get(k) == v for k, v in want.items()):
+        return True
+    # v3 публиковался только для uniform SPP=1 и уже имеет exact source coverage.
+    # Разрешаем дочитать такой готовый bundle после деплоя v4, но не расширяем
+    # совместимость на mixed cadence: там новых sentence-ownership полей нет.
+    legacy_semantic_v3 = bool(
+        dependencies_match
+        and meta.get("split_long_algorithm") == SPLIT_LONG_LEGACY_SEMANTIC_ALGORITHM_VERSION
+        and want.get("split_long_algorithm") == SPLIT_LONG_SEMANTIC_ALGORITHM_VERSION
+        and str(meta.get("sentences_per_prompt") or "").strip() == "1"
+        and all(
+            meta.get(key) == value
+            for key, value in want.items()
+            if key != "split_long_algorithm"
+        )
+    )
+    return legacy_semantic_v3
+
+
+def _images_effective_params(settings, params):
+    """ОДИН набор параметров для задачи «промпты» и для будущей задачи «картинки».
+
+    Паспорт плана (scenes.meta.json) пишет задача промптов по СВОИМ params, а сверяет его
+    потом _deferred_render_tick по настройкам проекта + отложенным params. Если промптам
+    отдать голые поля запроса (партнёр по API прислал не всю форму — без analyze_story /
+    split_long_sentences), паспорт не сойдётся сам с собой: план написан и оплачен, а этап
+    картинок молча исчезает. Поэтому оба этапа считают параметры здесь и одинаково.
+    """
+    # prompt_failover is task-scoped: a one-off locked batch must not silently turn
+    # into a project default inherited by every future images run.
+    base = {k: v for k, v in (settings or {}).items()
+            if k not in _DEFERRED_KEYS
+            and k not in ("prompt_failover", "legacy_cache_action")}
+    over = {k: v for k, v in (params or {}).items() if k not in _DEFERRED_KEYS}
+    # Слои нормализуются ДО merge: явный override старого API (img_source/model)
+    # должен перебить project default, но отсутствие source в неполном API-запросе
+    # не должно само переключить сохранённый Bing на AI.
+    base = _canonical_image_params(base)
+    over = _canonical_image_params(over, partial=True)
+    return _canonical_image_params({**base, **over})
+
+
+# служебные deferred-флаги в projects.settings — не должны утекать в params воркеров
+_DEFERRED_KEYS = {"deferred_pending", "deferred_video_pending", "deferred_video_params",
+                  "deferred_render_batch", "deferred_render_params", "deferred_wait_video",
+                  "deferred_images_pending", "deferred_images_params", "deferred_images_replan",
+                  "deferred_images_prompt_provider"}
+
+# Массовая отмена по категориям (кнопки «⏹ Отменить» в батч-панели): что гасим и что чистим.
+_IMAGES_FLAGS = ("deferred_images_pending", "deferred_images_params", "deferred_images_replan",
+                 "deferred_images_prompt_provider")
+_VIDEO_FLAGS = ("deferred_video_pending", "deferred_video_params")
+_RENDER_FLAGS = ("deferred_pending", "deferred_render_params", "deferred_wait_video",
+                 "deferred_render_batch")
+# Отмена ОБЯЗАНА снимать deferred-флаги, иначе вотчер поставит задачу заново через ≤10с.
+# Флаги снимаются КАСКАДОМ вниз по конвейеру, и вот почему: активная задача сама по себе
+# блокирует вотчер (_project_has_active_work / _video_ready). Отменяя задачу, мы снимаем
+# блокировку — и отложенный этап ниже стартует НА НЕДОДЕЛАННОМ материале (реальные кредиты
+# veo/recrafter и часы рендер-ноды), либо, если материала мало, проект навсегда виснет в
+# «⏳ авто: …». Поэтому: стоп картинкам ⇒ снимаем и авто-видео, и авто-рендер; стоп озвучке ⇒
+# снимаем авто-рендер (иначе рендер уедет на обрывке mp3: _materials_ready ждёт ЛЮБОЙ mp3);
+# стоп видео ⇒ снимаем авто-рендер (иначе deferred_wait_video запирает его навсегда —
+# _deferred_video_ok требует video=done, а отменённое видео им не станет).
+# regen/regen_video включены в свои категории намеренно: они жгут те же кредиты того же
+# провайдера (_task_provider), и «стоп картинкам» без остановки перегенераций — полумера.
+_CANCEL_SPEC = {
+    "tts":    (("tts",), _RENDER_FLAGS),
+    "images": (("prompts", "images", "regen"), _IMAGES_FLAGS + _VIDEO_FLAGS + _RENDER_FLAGS),
+    "video":  (("video", "regen_video"), _VIDEO_FLAGS + _RENDER_FLAGS),
+    # chapters живут после рендера и питаются его транскриптом: стоп рендеру ⇒ стоп главам,
+    # иначе задача повиснет в очереди на транскрипт, которого уже не будет.
+    "render": (("render", "chapters"), _RENDER_FLAGS),
+    "all":    (("tts", "prompts", "images", "regen", "video", "regen_video", "render", "chapters", "cards"), tuple(_DEFERRED_KEYS)),
+}
+
+
+def _active_task(tid, pid, kind, done_too=False):
+    """Есть ли по проекту задача вида kind в очереди/работе (done_too — учитывать и завершённые)."""
+    sts = ("queued", "running", "done") if done_too else ("queued", "running")
+    c = db()
+    ex = c.execute("SELECT 1 FROM queue_tasks WHERE project_id=? AND tenant_id=? AND kind=? "
+                   f"AND status IN ({','.join('?' * len(sts))}) LIMIT 1", (pid, tid, kind, *sts)).fetchone()
+    c.close()
+    return bool(ex)
+
+
+def _active_image_mutation(tid, pid):
+    """Active scene-plan/full-image/regen artifact writer for one project, if any."""
+    c = db()
+    row = c.execute(
+        "SELECT job_id,kind FROM queue_tasks WHERE project_id=? AND tenant_id=? "
+        "AND kind IN ('prompts','images','regen') AND status IN ('queued','running') "
+        "ORDER BY job_id LIMIT 1", (pid, tid),
+    ).fetchone()
+    c.close()
+    return row
+
+
+def _project_has_active_work(tid, pid):
+    """Есть ли у проекта queued/running задача, которую рендер обязан дождаться."""
+    c = db()
+    ex = c.execute(
+        "SELECT 1 FROM queue_tasks WHERE project_id=? AND tenant_id=? "
+        # Upload-card copy depends only on source.txt and is not a render input.  It
+        # shares the queue/Claude lease but must not hold an otherwise ready render.
+        "AND kind NOT IN ('render','cards') AND status IN ('queued','running') LIMIT 1",
+        (pid, tid),
+    ).fetchone()
+    c.close()
+    return bool(ex)
+
+
+def _render_inputs_ready(tid, pid):
+    """Все входы рендера готовы: проект idle, материалы есть, картинок не меньше 70%
+    И нет длинной дыры в нумерации (иначе рендер склеит её в застывший кадр)."""
+    if _project_has_active_work(tid, pid):
+        return False
+    ready, _n, _a = _materials_ready(_project_dir(tid, pid))
+    if not (ready and _images_ratio_ok(tid, pid)):
+        return False
+    _p = _get_project(tid, pid)
+    return _images_gap_ok(tid, pid, _psettings(_p) if _p else None)
+
+
+def _video_ready(tid, pid):
+    """Готов ли проект к image-to-video: генерация картинок не идёт И картинки уже есть.
+    Источники зеркалят _materials_ready (googler/ ИЛИ ручные в Images/**) — иначе проект
+    с ручными картинками вечно держал deferred_video_pending и блокировал отложенный рендер."""
+    if _active_image_mutation(tid, pid):
+        return False
+    proj = _project_dir(tid, pid)
+    return bool(glob.glob(os.path.join(proj, "googler", "*.jpg"))
+                + glob.glob(os.path.join(proj, "googler", "*.png"))
+                + glob.glob(os.path.join(proj, "Images", "**", "*.jpg"), recursive=True)
+                + glob.glob(os.path.join(proj, "Images", "**", "*.jpeg"), recursive=True)
+                + glob.glob(os.path.join(proj, "Images", "**", "*.png"), recursive=True))
+
+
+def _deferred_video_ok(tid, pid, st):
+    """Если рендер ждал авто-видео (deferred_wait_video) — пускать только после УСПЕШНОГО
+    video-джоба: упавшее/отменённое видео не должно молча превращать проект в слайдшоу.
+    Флаг «отложено: рендер» при этом остаётся видимым, пока юзер не перезапустит видео
+    или не снимет отложенное."""
+    if not st.get("deferred_wait_video"):
+        return True
+    c = db()
+    r = c.execute("SELECT status FROM queue_tasks WHERE project_id=? AND tenant_id=? AND kind='video' "
+                  "ORDER BY job_id DESC LIMIT 1", (pid, tid)).fetchone()
+    c.close()
+    return bool(r and r["status"] == "done")
+
+
+def _get_project(tid, pid):
+    c = db()
+    r = c.execute("SELECT * FROM projects WHERE id=? AND tenant_id=?", (pid, tid)).fetchone()
+    c.close()
+    return r
+
+
+def _psettings(p):
+    """Настройки проекта (dict). Терпимо к отсутствию колонки/битому JSON → {}."""
+    try:
+        raw = p["settings"] if ("settings" in p.keys()) else None
+    except Exception:
+        raw = None
+    try:
+        return json.loads(raw) if raw else {}
+    except Exception:
+        return {}
+
+
+def _opts(values, selected=None):
+    """<option>…</option> с пометкой selected у совпавшего значения."""
+    out = []
+    for v in values:
+        sel = " selected" if str(v) == str(selected) else ""
+        out.append(f"<option{sel}>{html.escape(str(v))}</option>")
+    return "".join(out)
+
+
+# поля, которые НЕ кладём в сохранённые настройки проекта
+_SETTINGS_SKIP = {"pid", "kind", "texts", "source", "files", "name", "preset_name", "preset_id", "tab", "psel",
+                  # This is queue metadata, not a reusable project preference. It is
+                  # stored in queue_tasks and, while images wait for prompts, only in
+                  # the nested deferred_images_params hand-off.
+                  "prompt_failover", "legacy_cache_action"}
+
+
+def _mutate_project_settings(tid, pid, updates=None, remove=()):
+    """Атомарно изменить отдельные ключи settings, не затирая конкурентное сохранение UI."""
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        r = c.execute("SELECT settings FROM projects WHERE id=? AND tenant_id=?", (pid, tid)).fetchone()
+        cur = {}
+        if r and r["settings"]:
+            try:
+                cur = json.loads(r["settings"])
+            except Exception:
+                cur = {}
+        clean_updates = {k: v for k, v in _drop_junk_keys(updates).items()
+                         if k not in _SETTINGS_SKIP and not k.startswith("_")}
+        cur.update(clean_updates)
+        for k in remove:
+            cur.pop(k, None)
+        # Lazy normalization только когда пользователь/задача реально тронули image contract:
+        # служебный deferred update не переписывает сам по себе старые project settings.
+        if _image_contract_touched(clean_updates):
+            cur = _canonical_image_params(cur)
+        c.execute("UPDATE projects SET settings=?, updated=? WHERE id=? AND tenant_id=?",
+                  (json.dumps(cur, ensure_ascii=False), _now(), pid, tid))
+        c.commit()
+        return cur
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+
+def _save_project_settings(tid, pid, updates):
+    """Слить переданные параметры в projects.settings (JSON). Возвращает итоговый dict."""
+    return _mutate_project_settings(tid, pid, updates=updates)
+
+
+# ============================================================
+# microcopy — человеческие подписи + хелперы рендера (дизайн-система)
+# ============================================================
+IMAGE_MODELS = {
+    "OPENAI":     ("OpenAI",                "1 кр",      "recrafter"),
+    "FLOWER":     ("Nano Banana 2 · Flower","1 кр",      "recrafter"),
+    "NARWHAL":    ("Nano Banana 2 · Flow",  "4 кр",      "recrafter"),
+    "NARWHAL_LITE": ("Nano Banana 2 Lite · Flow", "4 кр",   "recrafter"),
+    "GEM_PIX_2":  ("Nano Banana Pro",       "4 кр",      "recrafter"),
+    "IMAGEN_3_5": ("Imagen 4",              "4 кр",      "recrafter"),
+    "GROK":       ("Grok",                  "3 кр",      "recrafter"),
+    "GROK_SPEED": ("Grok Speed",            "1 кр",      "recrafter"),
+    "VEO_BANANA":      ("Nano Banana Pro (Veo)",    "ключ veo",  "veo"),
+    "VEO_BANANA_2":    ("Nano Banana 2 (Veo)",      "ключ veo",  "veo"),
+    "VEO_BANANA_LITE": ("Nano Banana 2 Lite (Veo)", "ключ veo",  "veo"),
+    "GPT_IMAGE2": ("GPT Image",             "платно · $","openai"),
+}
+
+# Один контракт выбора источника картинок. ``image_mode`` и ``model`` — единственные
+# поля, которые сохраняются в новых project/preset/task payload. Старые имена читаются
+# только на входе и исчезают при первом сохранении/постановке (lazy normalization).
+_IMAGE_MODE_AI = "ai"
+_IMAGE_MODE_BING = "bing"
+_IMAGE_MODE_VALUES = {_IMAGE_MODE_AI, _IMAGE_MODE_BING}
+_IMAGE_CONTRACT_KEYS = {"image_mode", "img_source", "image_source", "model", "googler_model"}
+_IMAGE_FIELD_MISSING = object()
+
+
+class ImageModeContractError(ValueError):
+    """Явно некорректный/противоречивый image-mode payload; продолжать нельзя."""
+
+
+def _image_field_name(key):
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower())).strip("_")
+
+
+def _image_field(params, name, value_normalizer):
+    """Поле с учётом case/hyphen-вариантов; дубли одного приоритета обязаны совпасть."""
+    found = []
+    for key, value in (params or {}).items():
+        if _image_field_name(key) == name:
+            found.append((key, value, value_normalizer(value)))
+    if not found:
+        return _IMAGE_FIELD_MISSING
+    normalized = {item[2] for item in found}
+    if len(normalized) != 1:
+        keys = ", ".join(str(item[0]) for item in found)
+        raise ImageModeContractError(f"конфликтующие значения поля {name}: {keys}")
+    return found[0][1]
+
+
+def _image_contract_touched(params):
+    return any(_image_field_name(key) in _IMAGE_CONTRACT_KEYS for key in (params or {}))
+
+
+def _canonical_image_params(params, *, partial=False):
+    """Вернуть payload только с ``image_mode`` + активной AI-моделью.
+
+    Приоритет намеренный: image_mode > img_source > image_source и model >
+    googler_model. Поэтому preset 67 с явным Bing и конфликтующими старыми моделями
+    остаётся Bing, а не самовольно переключается на AI. Явное неизвестное значение
+    верхнего приоритета не маскируется нижним — fail closed.
+
+    ``partial=True`` используется для слоя override: отсутствие source-поля не должно
+    сбрасывать режим, уже заданный настройками проекта.
+    """
+    src = dict(params or {}) if isinstance(params, dict) else {}
+
+    mode_raw = _image_field(src, "image_mode", lambda value: str(value).strip().lower())
+    img_source_raw = _image_field(src, "img_source", lambda value: str(value).strip().lower())
+    legacy_source_raw = _image_field(src, "image_source", lambda value: str(value).strip().lower())
+
+    mode = None
+    if mode_raw is not _IMAGE_FIELD_MISSING:
+        mode = str(mode_raw).strip().lower()
+        if mode not in _IMAGE_MODE_VALUES:
+            raise ImageModeContractError("image_mode должен быть ai или bing")
+    else:
+        # Пустой legacy source исторически означал серверный default, поэтому совместим
+        # с AI. Непустой неизвестный source — ошибка, а не повод молча выбрать генератор.
+        source_raw = (img_source_raw if img_source_raw is not _IMAGE_FIELD_MISSING
+                      else legacy_source_raw)
+        if source_raw is not _IMAGE_FIELD_MISSING and str(source_raw).strip():
+            legacy_source = str(source_raw).strip().lower()
+            if legacy_source == "bing":
+                mode = _IMAGE_MODE_BING
+            elif legacy_source in ("googler", "ai"):
+                mode = _IMAGE_MODE_AI
+            else:
+                raise ImageModeContractError(f"неизвестный источник картинок: {legacy_source}")
+        elif not partial:
+            mode = _IMAGE_MODE_AI
+
+    model_raw = _image_field(src, "model", lambda value: str(value).strip().upper())
+    legacy_model_raw = _image_field(src, "googler_model", lambda value: str(value).strip().upper())
+    chosen_model = model_raw if model_raw is not _IMAGE_FIELD_MISSING else legacy_model_raw
+
+    # Удаляем aliases во всех написаниях, а затем кладём только канон.
+    out = {key: value for key, value in src.items()
+           if _image_field_name(key) not in _IMAGE_CONTRACT_KEYS}
+    if mode is not None:
+        out["image_mode"] = mode
+
+    # Bing не имеет активной AI-модели: даже старый preset с model/googler_model не
+    # должен выглядеть или маршрутизироваться как генерация. Для partial без режима
+    # модель оставляем как override и окончательно сверяем после merge слоёв.
+    if mode != _IMAGE_MODE_BING:
+        model = str(chosen_model).strip().upper() if chosen_model is not _IMAGE_FIELD_MISSING else ""
+        if not model and not partial and mode == _IMAGE_MODE_AI:
+            model = "OPENAI"
+        if model:
+            if model not in IMAGE_MODELS:
+                raise ImageModeContractError(f"неизвестная модель картинок: {model}")
+            out["model"] = model
+    return out
+
+
+def _canonical_image_task_params(kind, params):
+    # ``prompts`` также используется как самостоятельная LLM-задача в служебных
+    # путях. Нормализуем её только когда payload действительно несёт image contract;
+    # prompts, созданный image-flow, всегда уже содержит image_mode.
+    if kind == "prompts" and not _image_contract_touched(params):
+        return dict(params or {}) if isinstance(params, dict) else {}
+    if kind in ("prompts", "images", "regen"):
+        return _canonical_image_params(params)
+    return dict(params or {}) if isinstance(params, dict) else {}
+
+
+PROVIDER_LABELS = {"recrafter": "Recrafter / FastGen · кредиты", "veo": "VeoNonStop", "openai": "OpenAI напрямую"}
+VIDEO_METHODS = {
+    "veo":    ("Veo 3.1 — по умолчанию", "",       "veo"),
+    "flower": ("Flower · Veo 3.1",       "1 кр",   "recrafter"),
+    "flow":   ("Flow · Veo 3.1",         "",       "recrafter"),
+    "grok":   ("Grok",                   "2–4 кр", "recrafter"),
+}
+TTS_ENGINES = {"edge": ("Edge", "Быстро, без ключа"), "voicegencore": ("VoiceGenCore", "По ключу"),
+               "voicer": ("Voicer", "По ключу"), "tts": ("Lumean (бывш. ElevenLabs)", "По ключу"),
+               "lumean": ("Lumean · HeyGen", "Серверный ключ")}
+SPLIT_TYPE = {"smart": "Умная (по смыслу)", "sentences": "По предложениям", "paragraphs": "По абзацам", "max_length": "По длине"}
+# ElevenLabs/Voicer модели (model_id) — человеческие подписи
+ELEVEN_MODELS = {
+    "eleven_multilingual_v2": "Multilingual v2 · качество",
+    "eleven_v3": "v3 · новейшая",
+    "eleven_turbo_v2_5": "Turbo v2.5 · быстро",
+    "eleven_flash_v2_5": "Flash v2.5 · мгновенно",
+    "eleven_turbo_v2": "Turbo v2",
+    "eleven_flash_v2": "Flash v2",
+}
+# VoiceGenCore voice_engine — человеческие подписи (десктоп даёт только эти два)
+VGC_ENGINES = {"elevenLabsV3": "ElevenLabs v3", "elevenLabsV2": "ElevenLabs v2"}
+
+
+def mc_dict_options(d, selected=None):
+    """<option> с человеческими подписями из dict {код: подпись}; неизвестное selected тоже сохраняет."""
+    out = []
+    if selected and str(selected) not in {str(k) for k in d}:
+        out.append(f'<option value="{html.escape(str(selected))}" selected>{html.escape(str(selected))}</option>')
+    for k, v in d.items():
+        sel = " selected" if str(k) == str(selected) else ""
+        out.append(f'<option value="{html.escape(str(k))}"{sel}>{html.escape(str(v))}</option>')
+    return "".join(out)
+
+
+def mc_status_options(models: dict, selected=None, blocked=None):
+    """<optgroup>/<option> с человеческими подписями + кредитами по провайдеру.
+
+    blocked — provider-группы, у которых нет ни серверного, ни своего ключа: подпись
+    вешаем на группу (полный текст) и на каждый вариант (короткая метка), чтобы юзер
+    видел это ДО постановки задачи, а не получал падение воркера.
+    """
+    blocked = set(blocked or ())
+    by_prov = {}
+    for code, (label, note, prov) in models.items():
+        by_prov.setdefault(prov, []).append((code, label, note))
+    out = []
+    for prov, items in by_prov.items():
+        gl = PROVIDER_LABELS.get(prov, prov)
+        if prov in blocked:
+            gl += " — " + NO_SERVER_KEY_HINT
+        out.append(f'<optgroup label="{html.escape(gl)}">')
+        for code, label, note in items:
+            sel = " selected" if code == selected else ""
+            tail = f" — {note}" if note else ""
+            if prov in blocked:
+                tail += " · нет серверного ключа"
+            out.append(f'<option value="{code}"{sel}>{html.escape(label + tail)}</option>')
+        out.append("</optgroup>")
+    return "".join(out)
+
+
+_KIND2SEG = {"regen": "images", "regen_video": "video", "prompts": "images",
+             "chapters": "render"}   # суб-операции подсвечивают свой этап
+
+
+def _stage_sets(km):
+    """km: {kind: статус ПОСЛЕДНЕЙ задачи этого вида} → (running, queued, errored) множества
+    сегментов. Даёт подсветить НЕСКОЛЬКО параллельных этапов сразу (напр. озвучка+видео)."""
+    def _n(k):
+        return _KIND2SEG.get(k, k)
+    pipeline_segments = {"tts", "images", "video", "render"}
+    # cards is intentionally independent of render readiness and must not make the
+    # five-step project pipeline look active/failed while upload copy is generated.
+    running = {_n(k) for k, s in km.items() if s == "running" and _n(k) in pipeline_segments}
+    queued = {_n(k) for k, s in km.items() if s == "queued" and _n(k) in pipeline_segments}
+    errored = ({_n(k) for k, s in km.items() if s == "error" and _n(k) in pipeline_segments}
+               - running - queued)
+    return running, queued, errored
+
+
+def mc_stepper(st: dict) -> str:
+    """5-сегментный степпер: текст → озвучка → картинки → видео → РЕНДЕР.
+    Идущие этапы — синие (МОЖНО НЕСКОЛЬКО сразу), в очереди — серые, «Готово» только после рендера."""
+    running = st.get("running") or set()
+    queued = st.get("queued") or set()
+    errored = st.get("errored") or set()
+    n = st.get("images", 0); m = st.get("images_expected") or 0
+    has_clips = bool(st.get("video"))
+    has_render = bool(st.get("render"))
+    img_done = n > 0 and (m == 0 or n >= m)
+
+    def seg(stage, done):
+        if stage in running:
+            return "running"        # синий (может быть несколько сразу)
+        if stage in queued:
+            return "queued"         # серый — ждёт в очереди
+        if stage in errored:
+            return "error"
+        return "done" if done else "pending"
+    s_text = seg("text", st.get("text"))
+    s_audio = seg("tts", st.get("audio"))
+    s_img = seg("images", img_done)
+    s_vid = seg("video", has_clips or has_render)   # клипы опциональны, рендер = этап пройден
+    s_render = seg("render", has_render)
+
+    _LBL = {"tts": "озвучка", "prompts": "промпты", "images": "картинки", "video": "видео", "render": "рендер"}
+    if running:
+        parts = []
+        for k in ("tts", "prompts", "images", "video", "render"):
+            if k in running:
+                parts.append((f"картинки {n}/{m}" if m else f"картинки {n}") if k == "images" else _LBL[k])
+        cap, col = ("Идёт: " + ", ".join(parts) if parts else "Идёт обработка"), "var(--running)"
+    elif errored:
+        _ek = next((k for k in ("render", "video", "images", "tts") if k in errored), None)
+        cap = {"tts": "Ошибка озвучки", "images": "Ошибка картинок",
+               "video": "Ошибка видео", "render": "Ошибка рендера"}.get(_ek, "Ошибка")
+        col = "var(--error)"
+    elif queued:
+        parts = [_LBL[k] for k in ("tts", "images", "video", "render") if k in queued]
+        cap, col = ("В очереди: " + ", ".join(parts) if parts else "В очереди"), "var(--queued)"
+    elif has_render:
+        cap, col = "Готово", "var(--done)"
+    elif has_clips or img_done:
+        cap, col = "Ждёт рендер", "var(--muted)"
+    elif n > 0:
+        cap, col = "Ждёт видео", "var(--muted)"
+    elif st.get("audio"):
+        cap, col = "Ждёт картинки", "var(--muted)"
+    elif st.get("text"):
+        cap, col = "Только текст", "var(--dim)"
+    else:
+        cap, col = "Пусто", "var(--dim)"
+    segs = "".join(f'<span class="seg {c}"></span>' for c in (s_text, s_audio, s_img, s_vid, s_render))
+    return f'<div class="stepper">{segs}</div><div class="stepper-cap" style="color:{col}">{cap}</div>'
+
+
+def mc_badge(state: str) -> str:
+    text = {"queued": "в очереди", "running": "в работе", "done": "готово",
+            "error": "ошибка", "cancelled": "отменено"}.get(state, state)
+    check = ('<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2.2" '
+             'stroke-linecap="round" stroke-linejoin="round"><path d="m5 10.5 3.2 3.2L15 6.5"/></svg>')
+    inner = check if state == "done" else '<span class="dot"></span>' if state in ("queued", "running") else ""
+    return f'<span class="badge badge-{state}">{inner}{text}</span>'
+
+
+# инлайн-SVG иконки (stroke=currentColor) для нав/действий
+_IC = {
+    "projects": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 5h6l2 2h8v11a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V5z"/></svg>',
+    "queue": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h12M8 12h12M8 18h12M3.5 6h.01M3.5 12h.01M3.5 18h.01"/></svg>',
+    "keys": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><circle cx="8" cy="15" r="4"/><path d="m10.8 12.2 7-7M16 6l2 2M19 3l2 2"/></svg>',
+    "plus": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><path d="M12 5v14M5 12h14"/></svg>',
+    "voices": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>',
+    "presets": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16M4 12h16M4 18h10"/><circle cx="18" cy="18" r="2.4"/></svg>',
+    "channels": '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"><rect x="2.5" y="7" width="19" height="13" rx="2"/><path d="m8 3.5 4 3.5 4-3.5"/></svg>',
+}
+
+
+def _is_admin_row(u):
+    """role=='admin' для sqlite3.Row/dict/объекта — без исключений на неполной строке."""
+    try:
+        role = u["role"] if ("role" in u.keys()) else "user"
+    except Exception:
+        try:
+            role = u["role"]
+        except Exception:
+            role = getattr(u, "role", "user")
+    return role == "admin"
+
+
+def _header(u, active=""):
+    name = html.escape(u['name'])
+    try:
+        c = db()
+        nrun = c.execute("SELECT COUNT(*) FROM queue_tasks WHERE tenant_id=? AND status IN('queued','running')",
+                         (_tid(u),)).fetchone()[0]
+        c.close()
+    except Exception:
+        nrun = 0
+
+    def nav(href, key, label, icon):
+        cls = "nav-link active" if active == key else "nav-link"
+        return f'<a class="{cls}" href="{href}">{_IC[icon]}{label}</a>'
+    run_badge = (f'<a class="badge badge-running" href="/queue"><span class="dot"></span>{nrun} в работе</a>'
+                 if nrun else "")
+    lumean_badge = (
+        '<div style="display:flex;justify-content:center;padding:6px 12px;'
+        'background:var(--surface);border-bottom:1px solid var(--border)">'
+        '<span class="badge badge-done" style="white-space:nowrap" '
+        'title="Серверный Lumean подключён; генерация разрешена только через HeyGen">'
+        '<span class="dot"></span>Lumean · HeyGen работает</span></div>'
+        if _provider_has_server_credential("lumean") else "")
+    mark = '<span class="mark"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z"/></svg></span>'
+    return (
+        '<div class="topbar">'
+        f'<div class="brand">{mark}VideoStudio</div>'
+        '<nav class="nav">'
+        + nav("/", "projects", "Проекты", "projects")
+        + nav("/presets", "presets", "Пресеты", "presets")
+        + nav("/queue", "queue", "Очередь", "queue")
+        + nav("/voices", "voices", "Голоса", "voices")
+        + nav("/keys", "keys", "Ключи", "keys")      # свои ключи (BYOK) — доступно всем
+        + nav("/channels", "channels", "Каналы", "channels")
+        # лимиты СЕРВЕРНЫХ ключей — вход со страницы /keys (только у админа):
+        # ещё один пункт в этой строке не влезает в 1280px и даёт горизонтальный скролл
+        + '<span style="width:1px;height:18px;background:var(--line,#3a332c);margin:0 4px;align-self:center"></span>'
+        + '<a class="nav-link" href="https://rewrite.13.140.129.66.sslip.io" title="Rewrite Studio — рерайт текста"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-edit"/></svg> Текст</a>'
+        + '<a class="nav-link" href="https://cover.13.140.129.66.sslip.io" title="Cover Generator — обложки"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-image"/></svg> Обложки</a>'
+        + '</nav><span class="sp"></span>'
+        + run_badge
+        + f'<span class="muted" style="font-size:13px">{name}</span>'
+        '<a class="btn btn-primary btn-sm" href="/">' + _IC["plus"] + 'Новый проект</a>'
+        '<form id=lo method=post action=/logout style="display:inline;margin:0">'
+        '<button class="btn btn-ghost btn-sm">выйти</button></form>'
+        '</div>'
+        + lumean_badge)
+
+
+def _project_status(tid, pid):
+    import glob as _g
+    d = _project_dir(tid, pid)
+    exp = None
+    for sc in _g.glob(os.path.join(d, "**", "scenes.json"), recursive=True):
+        try:
+            exp = len(json.load(open(sc, encoding="utf-8")))
+            break
+        except Exception:
+            pass
+    return {
+        "text": os.path.exists(os.path.join(d, "source.txt")),
+        "audio": bool(_g.glob(os.path.join(d, "**", "*.mp3"), recursive=True)),
+        "images": len(_g.glob(os.path.join(d, "googler", "*.jpg"))
+                      + _g.glob(os.path.join(d, "googler", "*.jpeg"))
+                      + _g.glob(os.path.join(d, "googler", "*.png"))
+                      + _g.glob(os.path.join(d, "Images", "**", "*.jpg"), recursive=True)
+                      + _g.glob(os.path.join(d, "Images", "**", "*.jpeg"), recursive=True)
+                      + _g.glob(os.path.join(d, "Images", "**", "*.png"), recursive=True)),
+        "images_expected": exp,
+        # ТОЛЬКО клипы image→video (не рендер, не интро) — иначе любой mp4 (в т.ч. финальный
+        # рендер) давал ложное «video done» → преждевременное «Готово».
+        "video": bool(_g.glob(os.path.join(d, "googler video", "*.mp4"))),
+        # финальный отрендеренный ролик — отдельный этап (рендер-пуллер кладёт render/{jid}.mp4)
+        "render": bool(_g.glob(os.path.join(d, "render", "*.mp4"))),
+    }
+
+
+def _ago(ts):
+    try:
+        d = _now() - float(ts)
+    except Exception:
+        return ""
+    if d < 60:
+        return "только что"
+    if d < 3600:
+        return f"{int(d // 60)} мин назад"
+    if d < 86400:
+        return f"{int(d // 3600)} ч назад"
+    return f"{int(d // 86400)} дн назад"
+
+
+_DASH_JS = """<script>
+(function(){var dz=document.getElementById('dz'),fi=document.getElementById('upfile');if(!dz)return;
+['dragover','dragenter'].forEach(function(ev){dz.addEventListener(ev,function(e){e.preventDefault();dz.style.borderColor='var(--accent)';});});
+dz.addEventListener('dragleave',function(){dz.style.borderColor='';});
+dz.addEventListener('drop',function(e){e.preventDefault();dz.style.borderColor='';if(e.dataTransfer.files.length){fi.files=e.dataTransfer.files;document.getElementById('upf').submit();}});})();
+function selAll(cb){var cs=document.querySelectorAll('input.pc');for(var i=0;i<cs.length;i++)cs[i].checked=cb.checked;}
+function defCancel(pid){if(!confirm('Отменить отложенный авто-запуск (видео/рендер) для этого проекта?'))return false;
+fetch('/api/projects/'+pid+'/deferred/cancel',{method:'POST',headers:{'X-Requested-With':'fetch'}})
+.then(function(r){if(!r.ok)throw 0;toast('Отложенные запуски отменены');setTimeout(function(){location.reload();},700);})
+.catch(function(){toast('Не удалось отменить — попробуйте ещё раз');});return false;}
+function delSelected(){var cs=document.querySelectorAll('input.pc:checked');if(!cs.length){alert('Отметьте хотя бы один проект в списке');return false;}return confirm('Удалить выбранные проекты ('+cs.length+')? Это действие необратимо.');}
+function toast(h){var t=document.getElementById('vs-toast');
+if(!t){t=document.createElement('div');t.id='vs-toast';
+t.style.cssText='position:fixed;bottom:22px;left:50%;transform:translateX(-50%);background:var(--surface2,#222);color:var(--text,#eee);border:1px solid var(--border,#444);border-radius:10px;padding:11px 18px;font-size:13.5px;box-shadow:0 6px 24px rgba(0,0,0,.35);z-index:9999;transition:opacity .3s;white-space:nowrap';
+document.body.appendChild(t);}
+t.innerHTML=h;t.style.opacity='1';clearTimeout(t._h);
+t._h=setTimeout(function(){t.style.opacity='0';},6000);}
+// Батч-кнопки: fetch вместо submit — страница не перезагружается, галочки не слетают.
+(function(){var f=document.getElementById('batch');if(!f)return;
+var bs=f.querySelectorAll('button[formaction]');
+for(var i=0;i<bs.length;i++)(function(b){
+b.addEventListener('click',function(e){
+  e.preventDefault();
+  var cs=document.querySelectorAll('input.pc:checked');
+  if(!cs.length){alert('Отметьте хотя бы один проект в списке');return;}
+  var cancel=b.getAttribute('data-cancel');
+  if(cancel&&!confirm('Отменить '+cancel+' для выбранных проектов ('+cs.length+')? Активные задачи остановятся, отложенный авто-запуск снимется. Готовые файлы не удаляются.'))return;
+  var old=b.innerHTML;b.disabled=true;b.innerHTML='…';
+  fetch(b.getAttribute('formaction'),{method:'POST',headers:{'X-Requested-With':'fetch'},
+    body:new URLSearchParams(new FormData(f))})
+  .then(function(r){if(!r.ok)throw 0;return r.json();})
+  .then(function(j){
+    if(cancel){
+      b.innerHTML='<svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> отменено';
+      var mc='Отменено задач: '+(j.cancelled||0);
+      if(j.cleared)mc+=', снято отложенных авто-запусков: '+j.cleared;
+      if(!j.cancelled&&!j.cleared)mc='Нечего отменять — активных задач и отложенных запусков этой категории нет';
+      toast(mc);
+      if(window._liveNow)window._liveNow();
+      setTimeout(function(){b.disabled=false;b.innerHTML=old;},2000);
+      return;
+    }
+    b.innerHTML='<svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> поставлено';
+    var m='Задач поставлено: '+j.enqueued;
+    if(j.deferred)m+=', отложено: '+j.deferred;
+    if(j.skipped)m+=', пропущено (рендер уже идёт): '+j.skipped;
+    toast(m+' &nbsp;<a href=/queue style="color:var(--accent)">Открыть очередь →</a>');
+    setTimeout(function(){b.disabled=false;b.innerHTML=old;},2000);
+  })
+  .catch(function(){b.disabled=false;b.innerHTML=old;
+    toast(cancel?'Не удалось отменить — попробуйте ещё раз':'Не удалось поставить задачи — попробуйте ещё раз');});
+});})(bs[i]);})();
+</script>"""
+
+_ICON_UP = '<svg viewBox="0 0 24 24" width=26 height=26 fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4m0 0 4 4m-4-4-4 4M5 20h14"/></svg>'
+# иконки галереи картинок (выбор / перегенерация / удаление)
+_GI_CHECK = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6 9 17l-5-5"/></svg>'
+_GI_REFRESH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 15.5-6.4L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15.5 6.4L3 16"/><path d="M3 21v-5h5"/></svg>'
+_GI_TRASH = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M10 11v6M14 11v6"/></svg>'
+
+
+@app.get("/", response_class=HTMLResponse)
+def dashboard(request: Request):
+    u = web_user(request)
+    if not u:
+        return RedirectResponse("/login", 302)
+    tid = _tid(u)
+    qp = request.query_params
+    sort = qp.get("sort", "new")
+    try:
+        page = max(1, int(qp.get("page", "1")))
+    except ValueError:
+        page = 1
+    PER = 25
+    order = {"new": "created DESC", "old": "created ASC", "name": "name COLLATE NOCASE ASC"}.get(sort, "created DESC")
+    q = (qp.get("q") or "").strip()
+    where = "tenant_id=?"
+    wargs = [tid]
+    if q:
+        where += " AND name LIKE ? ESCAPE '\\'"
+        wargs.append("%" + q.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%")
+    c = db()
+    total = c.execute(f"SELECT COUNT(*) FROM projects WHERE {where}", wargs).fetchone()[0]
+    pages = max(1, (total + PER - 1) // PER)
+    page = min(page, pages)
+    rows = c.execute(f"SELECT * FROM projects WHERE {where} ORDER BY {order} LIMIT ? OFFSET ?",
+                     (*wargs, PER, (page - 1) * PER)).fetchall()
+    pk = {}   # project_id -> {kind: статус последней задачи этого вида} (для параллельных этапов)
+    for rr in c.execute("SELECT project_id, kind, status FROM queue_tasks WHERE tenant_id=? AND job_id IN "
+                        "(SELECT MAX(job_id) FROM queue_tasks WHERE tenant_id=? GROUP BY project_id, kind)", (tid, tid)):
+        pk.setdefault(rr["project_id"], {})[rr["kind"]] = rr["status"]
+    presets = c.execute("SELECT id,name FROM presets WHERE tenant_id=? ORDER BY name COLLATE NOCASE", (tid,)).fetchall()
+    c.close()
+    preset_opts = "<option value=''>— без пресета —</option>" + "".join(
+        f'<option value="{r["id"]}">{html.escape(r["name"])}</option>' for r in presets)
+
+    GRID = "grid-template-columns:26px 1fr 210px 96px 38px 38px"
+    c4 = db()
+    rmap = {row["project_id"]: row["jid"] for row in c4.execute(
+        "SELECT project_id, MAX(job_id) AS jid FROM queue_tasks "
+        "WHERE tenant_id=? AND kind='render' AND status='done' GROUP BY project_id", (tid,)).fetchall()}
+    c4.close()
+    trows = ""
+    for r in rows:
+        st = _project_status(tid, r["id"])
+        st["running"], st["queued"], st["errored"] = _stage_sets(pk.get(r["id"], {}))
+        dl = (f'<a class="btn btn-ghost btn-icon" style="width:32px;height:32px" title="Скачать готовый mp4" '
+              f'href="/api/render/{rmap[r["id"]]}/download"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg></a>' if r["id"] in rmap else '<span></span>')
+        _fl = _psettings(r)
+        # ожидание плана сцен показываем наравне с видео и рендером: раньше проект,
+        # ждущий промпты, в списке ничем не отличался от простаивающего
+        _defer = [n for k, n in (("deferred_images_pending", "картинки"),
+                                 ("deferred_video_pending", "видео"),
+                                 ("deferred_pending", "рендер")) if _fl.get(k)]
+        # «⏳ авто: рендер» без причины выглядит как зависание — если рендер держит дыра
+        # в картинках, говорим это прямо в списке (подробности и кнопка — на странице проекта)
+        _dtitle = "Стартует автоматически, когда дозреют материалы"
+        _dsuffix = ""
+        if _fl.get("deferred_pending") and not _fl.get("allow_image_gaps"):
+            _g_ok, _g_run, _g_miss, _g_tot = _images_gap_report(tid, r["id"])
+            if not _g_ok:
+                _dtitle = (f"Рендер ждёт кадры: не хватает {len(_g_miss)} из {_g_tot}, самая длинная дыра "
+                           f"{_g_run} подряд — иначе в ролике застынет одна картинка. Догенерируйте картинки "
+                           f"(кэш «докачивать недостающее») или откройте проект → «Рендерить как есть».")
+                _dsuffix = f' · <span style="color:var(--warn)">не хватает {len(_g_miss)} кадров</span>'
+        defer_note = (f'<div style="font-size:11px;color:var(--accent);margin-top:2px" '
+                      f'title="{html.escape(_dtitle)}"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-clock"/></svg> авто: {" + ".join(_defer)}{_dsuffix} '
+                      f'<a href="#" onclick="return defCancel(\'{r["id"]}\')" style="color:var(--muted)" '
+                      f'title="Отменить отложенный авто-запуск"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></a></div>') if _defer else ""
+        trows += (
+            f'<div class="list-row" style="{GRID}">'
+            f'<input type=checkbox class=pc form=batch name=pid value={r["id"]} style="accent-color:var(--accent);width:16px;height:16px">'
+            f'<a href=/p/{r["id"]} style="color:var(--text);font-weight:500">{html.escape(r["name"] or "—")}</a>'
+            f'<div data-live="stepper-{r["id"]}"><div>{mc_stepper(st)}</div>{defer_note}</div>'
+            f'<span class=muted style="font-size:12.5px">{_ago(r["updated"])}</span>'
+            f'{dl}'
+            f'<form method=post action=/api/projects/{r["id"]}/delete onsubmit="return confirm(\'Удалить проект?\')" style="margin:0">'
+            f'<button class="btn btn-ghost btn-icon" style="width:32px;height:32px" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button></form></div>')
+    listing = (f'<div class="list"><div class="list-head" style="{GRID}">'
+               f'<span><input type=checkbox onclick="selAll(this)" style="accent-color:var(--accent);width:15px;height:15px"></span>'
+               f'<span>Проект</span><span>Прогресс</span><span>Изменён</span><span></span><span></span></div>{trows}</div>'
+               if rows else (f'<div class="empty"><h2>Ничего не найдено по «{html.escape(q)}»</h2>'
+               f'<p><a href="/?sort={sort}">Сбросить поиск</a></p></div>' if q else
+               '<div class="empty"><div class=ico>'+_ICON_UP+'</div><h2>Пока нет проектов</h2>'
+               '<p>Перетащите .txt файлы в блок выше — каждый файл станет отдельным проектом.</p></div>'))
+
+    qarg = ("&q=" + urllib.parse.quote(q)) if q else ""
+    rsel = lambda v, lbl: f'<option value="{v}"{" selected" if sort==v else ""}>{lbl}</option>'
+    sort_sel = ('<select class=select onchange="location.href=\'/?sort=\'+this.value+\'' + qarg.replace("'", "%27") + '\'" style="width:auto">'
+                + rsel("new", "Сначала новые") + rsel("old", "Сначала старые") + rsel("name", "По имени") + '</select>')
+    search_box = (f'<form method=get action=/ style="margin:0"><input type=hidden name=sort value="{sort}">'
+                  f'<input class=input name=q value="{html.escape(q, quote=True)}" placeholder="Поиск по имени…" '
+                  f'style="width:190px" title="Enter — искать; очистить и Enter — все проекты"></form>')
+    sort_sel += search_box
+    if pages > 1:
+        pv = (f'<a class="btn btn-secondary btn-sm" href="/?sort={sort}&page={page-1}{qarg}">‹</a>' if page > 1
+              else '<span class="btn btn-secondary btn-sm" style="opacity:.35">‹</span>')
+        nx = (f'<a class="btn btn-secondary btn-sm" href="/?sort={sort}&page={page+1}{qarg}">›</a>' if page < pages
+              else '<span class="btn btn-secondary btn-sm" style="opacity:.35">›</span>')
+        pager = f'<div class=row style="gap:7px;margin-left:auto">{pv}<span class=muted style="font-size:13px">Стр. {page} из {pages}</span>{nx}</div>'
+    else:
+        pager = ""
+
+    # Батч: дефолт всех селектов = «— как в проекте —» (пустое значение → берётся из настроек/пресета
+    # проекта через merge в batch_run); явный выбор в панели — поверх для всех отмеченных.
+    _asis = '<option value="" selected>— как в проекте —</option>'
+    img_opts = _asis + mc_status_options(
+        IMAGE_MODELS, None, _blocked_providers(u, IMAGE_MODELS, kind="images")
+    )
+    img_mode_opts = (_asis + '<option value=ai>AI-генерация</option>'
+                     '<option value=bing>Поиск Bing</option>')
+    vid_opts = _asis + mc_status_options(
+        VIDEO_METHODS, None, _blocked_providers(u, VIDEO_METHODS, kind="video")
+    )
+    eng_opts = _asis + "".join(
+        f'<option value="{k}">{html.escape(v[0] + " — " + v[1] + (" · " + _tts_engine_note(u, k) if _tts_engine_note(u, k) else ""))}</option>'
+        for k, v in TTS_ENGINES.items())
+
+    body = _header(u, "projects") + f"""<div class=wrap>
+<div class=row style="gap:12px;align-items:center;margin:0 0 14px">
+<h1 style="margin:0">Проекты <span class=muted style='font:500 14px var(--sans)'>{total} всего</span></h1>
+{_qstrip(u)}</div>
+<div class="dropzone" id=dz>
+  <div class=ico>{_ICON_UP}</div>
+  <div style="flex:1;min-width:200px">
+    <div style="font-weight:600;margin-bottom:3px">Перетащите файлы <code>.txt</code> сюда</div>
+    <div class=muted style="font-size:12.5px">или выберите на компьютере — каждый файл станет отдельным проектом, имя = имя файла</div>
+  </div>
+  <form method=post action=/api/projects/upload enctype=multipart/form-data id=upf style="margin:0;display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+    <label class=cap style="width:auto;font-size:12px">Пресет:</label>
+    <select class=select name=preset_id style="width:auto" title="новые проекты создадутся сразу с этим пресетом">{preset_opts}</select>
+    <input type=file name=files multiple accept=".txt,text/plain" id=upfile style="display:none" onchange="upf.submit()">
+    <button type=button class="btn btn-secondary" onclick="document.getElementById('upfile').click()">Выбрать файлы</button>
+  </form>
+</div>
+<p class=hint style="margin:6px 0 0">Выбери пресет — проекты создадутся уже с ним (голос, модель, стиль). Управление: <a href=/presets>Пресеты</a>.</p>
+<details style="margin:8px 0 18px"><summary class=muted style="cursor:pointer;font-size:13px">…или вставить текстом (разделитель <code>===</code>)</summary>
+<form method=post action=/api/projects/batch style="margin-top:8px">
+<div class=row style="gap:8px;margin-bottom:8px"><label class=cap style="width:auto;font-size:12px">Пресет:</label>
+<select class=select name=preset_id style="width:auto">{preset_opts}</select></div>
+<textarea class=textarea name=texts rows=4 placeholder="Несколько проектов — разделяйте строкой ===&#10;Первая строка блока = название проекта."></textarea>
+<div style="margin-top:8px"><button class="btn btn-secondary">Добавить из текста</button></div></form></details>
+
+<form method=post id=batch action=/api/batch/noop>
+<div class="panel-title" style="margin:0 0 10px">Запуск для выбранных проектов <span class=muted style="text-transform:none;letter-spacing:0">— отметьте проекты в списке, параметры применятся ко всем</span></div>
+<div class=row style="align-items:stretch;gap:14px;margin-bottom:18px">
+  <div class="panel" style="flex:1;margin:0;min-width:230px">
+    <div style="font-weight:600"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-mic"/></svg> Озвучка</div><div class=muted style="font-size:12px;margin-bottom:11px">Голос из текста проекта</div>
+    <select class=select name=engine>{eng_opts}</select>
+    <button class="btn btn-primary" formaction=/api/batch/tts style="width:100%;justify-content:center;margin-top:10px">Озвучить</button>
+    <button type=button class="btn btn-ghost btn-sm" data-cancel="озвучку" formaction=/api/batch/cancel/tts style="width:100%;justify-content:center;margin-top:6px" title="Остановить задачи озвучки у отмеченных проектов"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-stop"/></svg> Отменить</button>
+    <details style="margin-top:9px"><summary class=muted style="cursor:pointer;font-size:12px">Доп. настройки</summary>
+      <input class=input name=voice value="" placeholder="голос (пусто = как в проекте / авто)" style="margin-top:8px">
+      <input class=input name=speed value="" placeholder="скорость (пусто = как в проекте)" style="margin-top:8px"></details>
+  </div>
+  <div class="panel" style="flex:1;margin:0;min-width:230px">
+    <div style="font-weight:600"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-image"/></svg> Картинки</div><div class=muted style="font-size:12px;margin-bottom:11px">Иллюстрация из сценария</div>
+    <select class=select name=image_mode id=batchImageMode onchange="var b=this.value==='bing',m=document.getElementById('batchImageModel');m.disabled=b;m.style.opacity=b?'.42':'1'">{img_mode_opts}</select>
+    <select class=select name=model id=batchImageModel style="margin-top:8px">{img_opts}</select>
+    <button class="btn btn-primary" formaction=/api/batch/images style="width:100%;justify-content:center;margin-top:10px">Сделать картинки</button>
+    <button type=button class="btn btn-ghost btn-sm" data-cancel="генерацию картинок" formaction=/api/batch/cancel/images style="width:100%;justify-content:center;margin-top:6px" title="Остановить генерацию картинок у отмеченных проектов (вместе с перегенерацией отдельных кадров)"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-stop"/></svg> Отменить</button>
+    <details style="margin-top:9px"><summary class=muted style="cursor:pointer;font-size:12px">Доп. настройки</summary>
+      <select class=select name=aspect_ratio style="margin-top:8px"><option value="" selected>— как в проекте —</option><option value=landscape>Горизонтальное 16:9</option><option value=portrait>Вертикальное 9:16</option><option value=square>Квадрат</option></select>
+      <input class=input name=style value="" placeholder="стиль (пусто = как в проекте)" style="margin-top:8px">
+      <input class=input name=sentences_per_prompt value="" placeholder="предл./картинку (пусто = как в проекте)" style="margin-top:8px" title="число или посегментно 1x100,3"></details>
+  </div>
+  <div class="panel" style="flex:1;margin:0;min-width:230px">
+    <div style="font-weight:600"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Видео</div><div class=muted style="font-size:12px;margin-bottom:11px">Оживить картинки движением</div>
+    <select class=select name=video_method>{vid_opts}</select>
+    <button class="btn btn-primary" formaction=/api/batch/video style="width:100%;justify-content:center;margin-top:10px">Сделать видео</button>
+    <div class=muted style="font-size:11px;margin-top:9px">Картинки готовы — сразу. Идёт генерация — <b>отложенно</b>: авто-старт после картинок.</div>
+    <button type=button class="btn btn-ghost btn-sm" data-cancel="генерацию видео" formaction=/api/batch/cancel/video style="width:100%;justify-content:center;margin-top:9px" title="Остановить генерацию клипов у отмеченных проектов и снять отложенный авто-старт видео"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-stop"/></svg> Отменить</button>
+    <details style="margin-top:9px"><summary class=muted style="cursor:pointer;font-size:12px">Доп. настройки</summary>
+      <input class=input name=first_n value="" placeholder="кадров (пусто = как в проекте, 0 = все)" style="margin-top:8px">
+      <input class=input name=prompt value="" placeholder="движение (пусто = как в проекте)" style="margin-top:8px"></details>
+  </div>
+  <div class="panel" style="flex:1;margin:0;min-width:230px">
+    <div style="font-weight:600"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Рендер</div><div class=muted style="font-size:12px;margin-bottom:11px">Финальное видео из материалов</div>
+    <select class=select name=quality><option value="" selected>— как в проекте —</option><option value=1080p>1080p</option><option value=720p>720p</option></select>
+    <button class="btn btn-primary" formaction=/api/batch/render style="width:100%;justify-content:center;margin-top:10px">Отрендерить</button>
+    <div class=muted style="font-size:11px;margin-top:9px">Готовые (картинки+озвучка) — сразу. Остальные — <b>отложенно</b>: авто-рендер, когда материалы дозреют.</div>
+    <button type=button class="btn btn-ghost btn-sm" data-cancel="рендер" formaction=/api/batch/cancel/render style="width:100%;justify-content:center;margin-top:9px" title="Остановить рендер у отмеченных проектов и снять отложенный авто-рендер"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-stop"/></svg> Отменить</button>
+  </div>
+</div>
+<button class="btn btn-primary" formaction=/api/batch/pipeline style="width:100%;justify-content:center;margin:-6px 0 7px" title="Озвучка и картинки стартуют сразу; видео и рендер поставятся автоматически, когда дозреют материалы"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-rocket"/></svg> Сделать всё (озвучка → картинки → видео → рендер)</button>
+<button type=button class="btn btn-ghost btn-sm" data-cancel="ВСЕ задачи (озвучка, картинки, видео, рендер)" formaction=/api/batch/cancel/all style="width:100%;justify-content:center;margin:0 0 18px" title="Остановить все активные задачи отмеченных проектов и снять все отложенные авто-запуски. Готовые файлы не удаляются."><svg class="ic" viewBox="0 0 24 24"><use href="#ic-stop"/></svg> Отменить всё у выбранных</button>
+</form>
+
+<div class=row style="margin:0 0 12px;gap:12px;align-items:center">{sort_sel}<button class="btn btn-danger btn-sm" form=batch formaction=/api/batch/delete onclick="return delSelected()" title="Удалить отмеченные проекты"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-trash"/></svg> Удалить выбранные</button>{pager}</div>
+{listing}
+</div>{_DASH_JS}"""
+    return _page("VideoStudio — проекты", body)
+
+
+def _create_project(tid, name, source_text="", settings=None):
+    pid = "p_" + secrets.token_hex(5)
+    pdir = _project_dir(tid, pid)
+    os.makedirs(pdir, exist_ok=True)
+    if source_text:
+        with open(os.path.join(pdir, "source.txt"), "w", encoding="utf-8") as f:
+            f.write(source_text)
+    now = datetime.datetime.now().timestamp()
+    c = db()
+    # наследование настроек: явные settings → иначе последний проект тенанта с настройками (как add_project в десктопе)
+    if isinstance(settings, dict):
+        initial = _normalize_lumean_settings(_canonical_preset_settings(settings))
+        sj = json.dumps(initial, ensure_ascii=False)
+    else:
+        rr = c.execute("SELECT settings FROM projects WHERE tenant_id=? AND settings IS NOT NULL AND settings!='' "
+                       "ORDER BY created DESC LIMIT 1", (tid,)).fetchone()
+        if rr and rr["settings"]:
+            try:
+                inherited = json.loads(rr["settings"])
+            except Exception:
+                inherited = {}
+            inherited = _normalize_lumean_settings(_canonical_preset_settings(inherited))
+            sj = json.dumps(inherited, ensure_ascii=False)
+        else:
+            sj = None
+    c.execute("INSERT INTO projects(id,tenant_id,name,dir_path,status,created,updated,settings) VALUES(?,?,?,?,?,?,?,?)",
+              (pid, tid, (name or "Без названия")[:120], pdir, "draft", now, now, sj))
+    c.commit(); c.close()
+    return pid
+
+
+@app.post("/api/projects")
+async def project_create(request: Request):
+    u = require_web_user(request)
+    d = await _form(request)
+    try:
+        _create_project(_tid(u), (d.get("name") or "").strip(), d.get("source") or "")
+    except (ImageModeContractError, LumeanTemplateError, PresetSettingsError) as exc:
+        raise HTTPException(400, str(exc))
+    return RedirectResponse("/", 302)
+
+
+def _preset_settings(tid, preset_id):
+    """settings dict выбранного пресета (для создания проекта сразу с пресетом) или None."""
+    if not preset_id:
+        return None
+    try:
+        pid = int(preset_id)
+    except (ValueError, TypeError):
+        return None
+    c = db()
+    r = c.execute("SELECT settings FROM presets WHERE id=? AND tenant_id=?", (pid, tid)).fetchone()
+    c.close()
+    if not r or not r["settings"]:
+        return None
+    try:
+        return _preset_project_payload(json.loads(r["settings"]), pid)
+    except (ImageModeContractError, LumeanTemplateError, PresetSettingsError):
+        raise
+    except Exception:
+        return None
+
+
+@app.post("/api/projects/batch")
+async def projects_batch_add(request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    d = await _form(request)
+    try:
+        ps = _preset_settings(tid, d.get("preset_id"))
+    except (ImageModeContractError, LumeanTemplateError, PresetSettingsError) as exc:
+        raise HTTPException(400, str(exc))
+    texts = d.get("texts") or ""
+    blocks = [b.strip() for b in re.split(r'(?m)^\s*=+\s*$', texts) if b.strip()]
+    for blk in blocks:
+        name = (blk.splitlines()[0].strip() if blk.splitlines() else "")[:80]
+        _create_project(tid, name, blk, settings=ps)
+    return RedirectResponse("/", 302)
+
+
+def _decode_text(raw: bytes) -> str:
+    """Декод .txt: BOM/utf-8 → cp1251 (рус. Windows) → latin-1. Без молчаливой потери."""
+    if raw.startswith(b"\xef\xbb\xbf"):
+        raw = raw[3:]
+    for enc in ("utf-8", "cp1251", "latin-1"):
+        try:
+            return raw.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode("utf-8", "replace")
+
+
+@app.post("/api/projects/upload")
+async def projects_upload(request: Request, files: list[UploadFile] = File(default=[]), preset_id: str = Form("")):
+    """Загрузка проектов ФАЙЛАМИ (как в десктопе): каждый .txt → проект сразу с выбранным пресетом.
+    Имя проекта = имя файла без расширения; содержимое файла = текст сценария."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    try:
+        ps = _preset_settings(tid, preset_id)
+    except (ImageModeContractError, LumeanTemplateError, PresetSettingsError) as exc:
+        raise HTTPException(400, str(exc))
+    for f in files:
+        if not f or not (f.filename or "").strip():
+            continue
+        raw = await f.read()
+        text = _decode_text(raw).strip()
+        if not text:
+            continue
+        stem = os.path.splitext(os.path.basename(f.filename))[0].strip()
+        name = (stem or "Без названия")[:80]
+        _create_project(tid, name, text, settings=ps)
+    return RedirectResponse("/", 302)
+
+
+@app.post("/api/batch/noop")
+async def batch_noop(request: Request):
+    """Безопасный сабвмит формы #batch (Enter в поле) — ничего не делает, назад на дашборд."""
+    return RedirectResponse("/", 302)
+
+
+@app.post("/api/batch/delete")
+async def batch_delete(request: Request):
+    """Удалить выбранные в списке проекты (чекбоксы name=pid формы #batch). БД + папка на диске,
+    по тому же принципу что и одиночное /api/projects/{pid}/delete, но пачкой.
+    ВАЖНО: объявлено ДО /api/batch/{kind} — иначе catch-all перехватит 'delete' и вернёт 404."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    raw = (await request.body()).decode("utf-8", "replace")
+    d = urllib.parse.parse_qs(raw)
+    pids = d.get("pid", [])
+    import shutil
+    for pid in pids:
+        # только свой тенант: проверяем принадлежность до удаления (чужие pid игнорируем молча)
+        if not _get_project(tid, pid):
+            continue
+        _cancel_project_queue_tasks(tid, pid)
+        c = db()
+        c.execute("DELETE FROM projects WHERE id=? AND tenant_id=?", (pid, tid))
+        c.commit(); c.close()
+        try:
+            shutil.rmtree(_project_dir(tid, pid), ignore_errors=True)
+        except Exception:
+            pass
+    return RedirectResponse("/", 302)
+
+
+@app.post("/api/batch/cancel/{kind}")
+async def batch_cancel(kind: str, request: Request):
+    """Массовая отмена по категории для отмеченных проектов: активные задачи + отложенный авто-запуск.
+    Путь на сегмент длиннее catch-all /api/batch/{kind}, так что тот его не перехватывает; объявлено
+    выше него по той же причине, что и /api/batch/delete (см. коммент там)."""
+    u = require_web_user(request)
+    if kind not in _CANCEL_SPEC:
+        raise HTTPException(404, "вид задачи")
+    tid = _tid(u)
+    raw = (await request.body()).decode("utf-8", "replace")
+    d = urllib.parse.parse_qs(raw)
+    kinds, flags = _CANCEL_SPEC[kind]
+    cancelled = cleared = 0
+    for pid in d.get("pid", []):
+        # только свой тенант: чужие pid игнорируем молча (как в /api/batch/delete)
+        p = _get_project(tid, pid)
+        if not p:
+            continue
+        # ПОРЯДОК ВАЖЕН: сначала снять флаги, потом гасить задачи. Наоборот вотчер успевает
+        # влезть в окно между отменой и чисткой (видит живой флаг + уже неактивную задачу)
+        # и ставит задачу заново — отмена выглядит «не сработавшей».
+        if flags and any(k in _psettings(p) for k in flags):
+            _mutate_project_settings(tid, pid, remove=flags)
+            cleared += 1
+        cancelled += _cancel_tasks_by_kind(tid, pid, kinds)
+    if request.headers.get("x-requested-with") == "fetch":
+        return JSONResponse({"ok": True, "cancelled": cancelled, "cleared": cleared})
+    return RedirectResponse("/queue", 302)
+
+
+@app.post("/api/batch/cards")
+async def cards_batch_run(request: Request):
+    """Queue exact Opus upload cards for existing projects.
+
+    Form contract: repeated ``pid`` plus one JSON ``context`` object keyed by pid.
+    No generic options are accepted.  Provider/model/fallback/credential are fixed
+    server-side and returned only as provenance, never read from the request.
+    """
+    u = require_web_user(request)
+    tid = _tid(u)
+    body = await request.body()
+    if len(body) > 1 << 20:
+        raise HTTPException(413, "card batch body exceeds 1 MiB")
+    try:
+        parsed = urllib.parse.parse_qs(
+            body.decode("utf-8", "strict"), keep_blank_values=True, strict_parsing=True
+        )
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise HTTPException(400, "malformed card batch form") from exc
+    if set(parsed) != {"pid", "context"} or len(parsed.get("context", [])) != 1:
+        raise HTTPException(400, "cards accepts exactly repeated pid plus one context JSON")
+    pids = parsed["pid"]
+    if not 1 <= len(pids) <= 25 or len(set(pids)) != len(pids):
+        raise HTTPException(400, "cards batch requires 1..25 unique project ids")
+    try:
+        contexts = json.loads(parsed["context"][0])
+    except json.JSONDecodeError as exc:
+        raise HTTPException(400, "card context is not JSON") from exc
+    if not isinstance(contexts, dict) or set(contexts) != set(pids):
+        raise HTTPException(400, "card context keys must exactly match project ids")
+    if not _provider_available_for(u, card_contract.PROVIDER_GROUP):
+        raise HTTPException(400, f"{_provider_title(card_contract.PROVIDER_GROUP)}: {NO_SERVER_KEY_HINT}")
+    normalized = {}
+    narration_hashes = {}
+    for pid in pids:
+        if not _get_project(tid, pid):
+            raise HTTPException(404, f"project not found: {pid}")
+        try:
+            normalized[pid] = card_contract.normalize_context(contexts[pid])
+            # Validate current narration before any row in the batch is mutated.
+            _raw, _text, narration_hashes[pid] = card_contract.narration_bytes(
+                os.path.join(_project_dir(tid, pid), "source.txt")
+            )
+        except (card_contract.CardRequestError, card_contract.CardContractError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+    # Cards are ordinary gen_jobs for accounting.  Idempotent identities consume no
+    # extra quota; a batch of genuinely new identities must fit before its first write.
+    request_hashes = {pid: card_contract.context_sha256(normalized[pid]) for pid in pids}
+    c = db()
+    try:
+        new_count = 0
+        for pid in pids:
+            existing = c.execute(
+                "SELECT request_sha256 FROM card_jobs WHERE tenant_id=? AND project_id=? "
+                "AND narration_sha256=? AND contract_version=?",
+                (tid, pid, narration_hashes[pid], card_contract.CONTRACT_VERSION),
+            ).fetchone()
+            if not existing:
+                new_count += 1
+            elif not secrets.compare_digest(existing["request_sha256"], request_hashes[pid]):
+                # Detect all editorial-context conflicts before the first batch write.
+                raise HTTPException(
+                    409, f"card identity already exists with different editorial context: {pid}"
+                )
+    finally:
+        c.close()
+    if new_count:
+        _check_quota(u, additional=new_count)
+    jobs = []
+    for pid in pids:
+        try:
+            result = _enqueue_card_task(u["id"], tid, pid, normalized[pid])
+        except card_contract.CardRequestError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if result:
+            jobs.append({"project_id": pid, **result})
+    return JSONResponse({
+        "ok": True,
+        "kind": "cards",
+        "contract_version": card_contract.CONTRACT_VERSION,
+        "provider": card_contract.PROVIDER_GROUP,
+        "model": card_contract.MODEL,
+        "prompt_failover": card_contract.PROMPT_FAILOVER,
+        "enqueued": sum(bool(row["created"]) for row in jobs),
+        "existing": sum(not bool(row["created"]) for row in jobs),
+        "jobs": jobs,
+    })
+
+
+@app.post("/api/batch/{kind}")
+async def batch_run(kind: str, request: Request):
+    u = require_web_user(request)
+    if kind not in ("tts", "images", "video", "render", "pipeline", "chapters"):
+        raise HTTPException(404, "вид задачи")
+    tid = _tid(u)
+    raw = (await request.body()).decode("utf-8", "replace")
+    d = urllib.parse.parse_qs(raw)
+    pids = [pid for pid in d.get("pid", []) if _get_project(tid, pid)]
+    skipped = 0
+    if kind == "render":
+        # проекты с уже идущим рендером не ставим повторно (дедуп), но и не молчим:
+        # счётчик skipped уходит в тост, иначе выглядит как «кнопка не сработала»
+        _n0 = len(pids)
+        pids = [pid for pid in pids if not _active_task(tid, pid, "render")]
+        skipped = _n0 - len(pids)
+    form_params = {k: v[0] for k, v in d.items() if k != "pid"}
+    enq = dfr = blocked = 0
+    block_reason = ""
+    # Батч-барьер СНЯТ (25.07): каждый проект стартует, как только готов сам. Cohort-режим
+    # («все ждут всех») имел смысл под RunPod-эконом аптайма GPU; с постоянной рендер-нодой
+    # он только держал готовые проекты заложниками одного отстающего.
+    for pid in pids:
+        p = _get_project(tid, pid)
+        # Настройки проекта (пресет) = БАЗА; непустые поля батч-формы — поверх. Раньше батч слал
+        # ТОЛЬКО поля панели → движок молча = edge, model/style = хардкод панели (audit 02.07).
+        st = _psettings(p)
+        merged = {k: v for k, v in st.items()
+                  if k not in _DEFERRED_KEYS and k != "prompt_failover"}
+        merged.update({k: v for k, v in form_params.items() if str(v).strip() != ""})
+        if kind in ("images", "pipeline"):
+            try:
+                merged = _images_effective_params(
+                    st, {k: v for k, v in form_params.items() if str(v).strip() != ""}
+                )
+                _reference_gate(merged, _reference_load_state(_project_dir(tid, pid)))
+            except (ImageModeContractError, reference_contract.ReferenceContractError) as exc:
+                blocked += 1
+                block_reason = block_reason or str(exc)
+                continue
+        # Провайдер без серверного ключа и без своего: проект пропускаем ЗДЕСЬ, а не даём
+        # задаче упасть в воркере. Остальные проекты батча при этом стартуют как обычно.
+        _block_kinds = ("tts", "images") if kind == "pipeline" else (kind,)
+        if "tts" in _block_kinds:
+            try:
+                merged = _normalize_lumean_settings(merged)
+            except LumeanTemplateError as exc:
+                blocked += 1
+                block_reason = block_reason or str(exc)
+                continue
+        if "images" in _block_kinds and _needs_scene_plan(tid, pid, merged):
+            # Картинкам нужен план сцен → _enqueue поставит отдельную задачу «промпты».
+            # Её канал тоже должен быть чем-то авторизован (в одиночной постановке
+            # это проверялось, в батче — нет: 20 проектов вставали и падали разом).
+            _block_kinds = _block_kinds + ("prompts",)
+        _reason = next((r for r in (_provider_block_reason(
+                                        u, bk, merged, project_id=pid)
+                                    for bk in _block_kinds) if r), "")
+        if _reason:
+            blocked += 1
+            block_reason = block_reason or _reason
+            continue
+        if kind == "render":
+            # непустые поля батч-формы переживают ожидание (как deferred_video_params у видео) —
+            # иначе отложившиеся проекты рендерились со старыми настройками, а стартовавшие сразу с новыми
+            rp = {k: v for k, v in form_params.items() if str(v).strip() != ""}
+            if not _render_inputs_ready(tid, pid) or st.get("deferred_video_pending"):
+                vals = {"deferred_pending": u["id"]}
+                if rp:
+                    vals["deferred_render_params"] = rp
+                _save_project_settings(tid, pid, vals); dfr += 1
+            else:
+                jid = _enqueue(u["id"], tid, pid, "render", merged)
+                if jid:
+                    enq += 1
+                else:
+                    vals = {"deferred_pending": u["id"]}
+                    if rp:
+                        vals["deferred_render_params"] = rp
+                    _save_project_settings(tid, pid, vals); dfr += 1
+        elif kind == "video" and not _video_ready(tid, pid):
+            # Видео без готовых картинок → ОТЛОЖЕННО: вотчер запустит после генерации картинок.
+            # Непустые поля видео-панели сохраняем отдельно — переживут ожидание.
+            vp = {k: form_params[k] for k in ("video_method", "first_n", "prompt")
+                  if str(form_params.get(k) or "").strip() != ""}
+            _save_project_settings(tid, pid, {"deferred_video_pending": u["id"], "deferred_video_params": vp})
+            dfr += 1
+        elif kind == "pipeline":
+            # FIX-2026-07-17: весь конвейер одной кнопкой — озвучка+картинки сразу,
+            # видео и рендер отложенными флагами (вотчер стартует их по мере готовности).
+            if not _active_task(tid, pid, "tts"):
+                if _enqueue(u["id"], tid, pid, "tts", merged): enq += 1
+            if not _active_task(tid, pid, "images"):
+                if _enqueue(u["id"], tid, pid, "images", merged): enq += 1
+            vp = {k: form_params[k] for k in ("video_method", "first_n", "prompt")
+                  if str(form_params.get(k) or "").strip() != ""}
+            vals = {"deferred_video_pending": u["id"],
+                    "deferred_video_params": vp,
+                    "deferred_pending": u["id"]}
+            rp = {k: v for k, v in form_params.items() if str(v).strip() != ""}
+            if rp:
+                vals["deferred_render_params"] = rp
+            _save_project_settings(tid, pid, vals)
+            dfr += 2
+        else:
+            if not _active_task(tid, pid, kind):
+                if _enqueue(u["id"], tid, pid, kind, merged): enq += 1
+    if blocked and not enq and not dfr:
+        raise HTTPException(400, block_reason)
+    if request.headers.get("x-requested-with") == "fetch":
+        return JSONResponse({"ok": True, "enqueued": enq, "deferred": dfr, "skipped": skipped,
+                             "blocked": blocked, "block_reason": block_reason, "kind": kind})
+    return RedirectResponse("/queue", 302)
+
+
+@app.post("/api/projects/{pid}/deferred/cancel")
+async def project_deferred_cancel(pid: str, request: Request):
+    """FIX-2026-07-17: снять deferred-флаги (авто-видео/авто-рендер) — раньше отменить было нельзя."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    p = _get_project(tid, pid)
+    if not p:
+        raise HTTPException(404, "нет проекта")
+    _mutate_project_settings(tid, pid, remove=_DEFERRED_KEYS)
+    if request.headers.get("x-requested-with") == "fetch":
+        return JSONResponse({"ok": True})
+    return RedirectResponse("/", 302)
+
+
+@app.post("/api/projects/{pid}/delete")
+async def project_delete(pid: str, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    _cancel_project_queue_tasks(tid, pid)
+    c = db(); c.execute("DELETE FROM projects WHERE id=? AND tenant_id=?", (pid, tid)); c.commit(); c.close()
+    import shutil
+    try:
+        shutil.rmtree(_project_dir(tid, pid), ignore_errors=True)
+    except Exception:
+        pass
+    return RedirectResponse("/", 302)
+
+
+@app.post("/api/projects/{pid}/source")
+async def project_source(pid: str, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    p = _get_project(tid, pid)
+    if not p:
+        raise HTTPException(404, "нет проекта")
+    d = await _form(request)
+    text = d.get("source") or ""
+    with open(os.path.join(_project_dir(tid, pid), "source.txt"), "w", encoding="utf-8") as f:
+        f.write(text)
+    c = db(); c.execute("UPDATE projects SET updated=? WHERE id=?", (datetime.datetime.now().timestamp(), pid)); c.commit(); c.close()
+    return RedirectResponse(f"/p/{pid}", 302)
+
+
+@app.get("/p/{pid}", response_class=HTMLResponse)
+def project_page(pid: str, request: Request):
+    u = web_user(request)
+    if not u:
+        return RedirectResponse("/login", 302)
+    tid = _tid(u)
+    p = _get_project(tid, pid)
+    if not p:
+        return _page("нет проекта", _header(u, "projects") + "<div class=wrap><p>Проект не найден.</p></div>")
+    import glob as _g
+    pdir = _project_dir(tid, pid)
+    src = ""
+    sp = os.path.join(pdir, "source.txt")
+    if os.path.exists(sp):
+        src = open(sp, encoding="utf-8").read()
+
+    def _rel(paths):
+        return [os.path.relpath(x, pdir) for x in paths]
+    audios = _rel(sorted(_g.glob(os.path.join(pdir, "**", "*.mp3"), recursive=True)))
+    images = _rel(sorted(_g.glob(os.path.join(pdir, "googler", "*.jpg"))
+                         + _g.glob(os.path.join(pdir, "Images", "**", "*.jpg"), recursive=True)))
+    videos = _rel(sorted(_g.glob(os.path.join(pdir, "**", "*.mp4"), recursive=True)))
+    fu = lambda r: f"/p/{pid}/file/" + urllib.parse.quote(r)
+
+    def _fv(rel):
+        # URL с кэш-бастером ?v=mtime: файлы отдаются с max-age, после перегенерации
+        # (тот же путь, новый контент) браузер иначе показывает старый кэш
+        try:
+            return f"{fu(rel)}?v={int(os.path.getmtime(os.path.join(pdir, rel)))}"
+        except OSError:
+            return fu(rel)
+
+    # breadcrumb + мини-степпер прогресса (вместо ряда из 40 чипсов — он забивал пол-экрана)
+    _bst = _project_status(tid, pid)
+    c = db()
+    _lk = {}
+    _lprov = {}
+    for _r in c.execute("SELECT kind, status, provider FROM queue_tasks WHERE project_id=? AND job_id IN "
+                        "(SELECT MAX(job_id) FROM queue_tasks WHERE project_id=? GROUP BY kind)", (pid, pid)):
+        _lk[_r["kind"]] = _r["status"]
+        _lprov[_r["kind"]] = _r["provider"]
+    c.close()
+    _bst["running"], _bst["queued"], _bst["errored"] = _stage_sets(_lk)
+    crumb = '<a class="nav-link" href="/" style="padding:6px 11px;display:inline-flex;margin-bottom:6px">‹ Все проекты</a>'
+    # Чем писались промпты ЭТОГО проекта — снимок канала из строки задачи. Раньше это
+    # было видно только в логе задачи, на карточке проекта — нигде.
+    _pch = _prompt_channel_title(_lprov.get("prompts"))
+    _pst = {"queued": "в очереди", "running": "идут", "error": "ошибка",
+            "done": "готово", "cancelled": "отменено"}.get(_lk.get("prompts"), "")
+    head_step = mc_stepper(_bst) + (
+        f'<div class=muted style="font-size:11.5px;margin-top:4px"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-cpu"/></svg> Промпты: '
+        f'{html.escape(_pch)}{" · " + _pst if _pst else ""}</div>' if _pch else "")
+
+    # галереи результатов по этапам
+    audio_html = ("".join(f"<audio controls src='{_fv(a)}' style='width:100%;margin:4px 0'></audio>" for a in audios[:8])
+                  if audios else "<p class=muted>Озвучки пока нет — запустите выше.</p>")
+    _gprompts = _scene_prompts(pdir)
+    # картинки, которые прямо сейчас перегенериваются (queued/running kind=regen) → спиннер на тайле
+    c4 = db()
+    _rgrows = c4.execute("SELECT params FROM queue_tasks WHERE project_id=? AND kind='regen' AND status IN ('queued','running')", (pid,)).fetchall()
+    c4.close()
+    _regen_active = set()
+    for _r in _rgrows:
+        try:
+            _regen_active.add((json.loads(_r["params"] or "{}").get("image_rel") or "").replace("\\", "/"))
+        except Exception:
+            pass
+
+    def _img_tile(rel):
+        stem = os.path.splitext(os.path.basename(rel))[0]
+        orig = _gprompts.get(int(stem), "") if stem.isdigit() else ""
+        cls = "gimg regen" if rel.replace("\\", "/") in _regen_active else "gimg"
+        try:
+            _mt = int(os.path.getmtime(os.path.join(pdir, rel)))
+        except OSError:
+            _mt = 0
+        return (f'<div class="{cls}" data-rel="{html.escape(rel)}" data-prompt="{html.escape(orig)}">'
+                f'<img src="{fu(rel)}?w=400&v={_mt}" data-full="{fu(rel)}?v={_mt}" loading=lazy decoding=async title="{html.escape(rel)}" onclick="gView(this)">'
+                f'<button class="gbt gck" onclick="gTgl(this)" title="Выбрать">{_GI_CHECK}</button>'
+                f'<button class="gbt grg" onclick="gRegen(this)" title="Перегенерировать (можно со своим промптом)">{_GI_REFRESH}</button>'
+                f'<button class="gbt grm" onclick="gDelOne(this)" title="Удалить">{_GI_TRASH}</button></div>')
+
+    # без среза [:80] — иначе при сотнях картинок «Выбрать все»/лайтбокс/удаление видят не всё (img lazy-грузятся)
+    img_html = ("<div class=grid>" + "".join(_img_tile(i) for i in images) + "</div>"
+        if images else "<p class=muted>Картинок пока нет — запустите выше.</p>")
+    # клипы image→video (только 'googler video/'; финальные рендеры живут на вкладке Рендер)
+    clips = _rel(sorted(_g.glob(os.path.join(pdir, "googler video", "*.mp4"))))
+    # кнопки «скачать одним архивом» (эндпоинт — project_download ниже). Счётчики берём у
+    # САМОГО эндпоинта (_dl_items), чтобы число на кнопке совпадало с содержимым архива;
+    # audio/clips считаны выше ровно теми же шаблонами — второй раз каталог не обходим.
+    # Кнопку рисуем ТОЛЬКО когда файлы есть: кнопка, ведущая на «скачивать нечего», хуже её отсутствия.
+    _dl_n = {"audio": len(audios), "clips": len(clips),
+             "images": len(_dl_items(pdir, "images")), "renders": len(_dl_items(pdir, "renders"))}
+    _dl_n["all"] = sum(_dl_n.values())
+
+    def _dlbtn(what, label, cls="btn-ghost"):
+        n = _dl_n.get(what, 0)
+        return (f'<a class="btn {cls} btn-sm" href="/api/projects/{pid}/download/{what}" '
+                f'title="скачать одним zip-архивом"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg> {label} ({n})</a>') if n else ""
+
+    c5 = db()
+    _vrgrows = c5.execute("SELECT params FROM queue_tasks WHERE project_id=? AND kind='regen_video' AND status IN ('queued','running')", (pid,)).fetchall()
+    c5.close()
+    _vregen_active = set()
+    for _r in _vrgrows:
+        try:
+            _vregen_active.add((json.loads(_r["params"] or "{}").get("video_rel") or "").replace("\\", "/"))
+        except Exception:
+            pass
+
+    def _vid_tile(rel):
+        base = os.path.basename(rel)
+        stem = base[:-len("_video.mp4")] if base.endswith("_video.mp4") else os.path.splitext(base)[0]
+        poster = ""
+        for _ext in (".jpg", ".jpeg", ".png", ".webp"):
+            _pp = os.path.join(pdir, "googler", stem + _ext)
+            if os.path.exists(_pp):
+                try:
+                    _pmt = int(os.path.getmtime(_pp))
+                except OSError:
+                    _pmt = 0
+                poster = f' poster="{fu("googler/" + stem + _ext)}?w=400&v={_pmt}"'
+                break
+        cls = "gimg regen" if rel.replace("\\", "/") in _vregen_active else "gimg"
+        return (f'<div class="{cls}" data-rel="{html.escape(rel)}">'
+                f'<video src="{_fv(rel)}" preload=none{poster} title="{html.escape(rel)}" onclick="vView(this)"></video>'
+                f'<button class="gbt gck" onclick="gTgl(this)" title="Выбрать">{_GI_CHECK}</button>'
+                f'<button class="gbt grg" onclick="vRegen(this)" title="Перегенерировать клип (можно со своим промптом движения)">{_GI_REFRESH}</button>'
+                f'<button class="gbt grm" onclick="vDelOne(this)" title="Удалить">{_GI_TRASH}</button></div>')
+
+    vid_html = ("<div class=grid>" + "".join(_vid_tile(v) for v in clips) + "</div>"
+                if clips else "<p class=muted>Видео пока нет — запустите выше.</p>")
+
+    # живой лог задачи
+    job = request.query_params.get("job")
+    tab = request.query_params.get("tab") or "src"
+    logpanel = ""
+    if job and job.isdigit():
+        logpanel = f"""<fieldset class=lf><legend><svg class="ic" viewBox="0 0 24 24"><use href="#ic-clock"/></svg> Лог задачи #{job} — в реальном времени</legend><div id=log class=log></div>
+<script>var lg=document.getElementById('log');var es=new EventSource('/api/jobs/{job}/logs');
+es.onmessage=function(e){{lg.textContent+=e.data+'\\n';lg.scrollTop=lg.scrollHeight;}};
+es.addEventListener('end',function(e){{es.close();if(e.data==='done'){{lg.textContent+='\\n— готово —\\n';setTimeout(function(){{location.href='/p/{pid}?tab={tab}';}},1800);}}else{{lg.textContent+='\\n— статус: '+e.data+' — задача без результата, причина в логе выше (без авто-перехода) —\\n';}}}});
+es.onerror=function(){{es.close();}};</script></fieldset>"""
+
+    # 3a: сохранённые настройки проекта → пред-заполнение форм
+    try:
+        # Legacy projects are rendered through the canonical contract in memory; the
+        # DB row is rewritten only after the user saves/runs the image form.
+        s = _canonical_image_params(_psettings(p))
+    except ImageModeContractError as exc:
+        body = (_header(u, "projects") + '<div class=wrap>' + crumb
+                + '<div class="panel" style="border-color:var(--danger)">'
+                + '<h2>Настройки картинок повреждены</h2><p>'
+                + html.escape(str(exc))
+                + '</p><p class=muted>Генерация остановлена: исправьте режим в пресете или настройках проекта.</p></div></div>')
+        return _page("Ошибка настроек картинок", body)
+    sval = lambda k, d="": html.escape(str(s.get(k) if s.get(k) not in (None, "") else d))
+    eng = s.get("engine") or "edge"
+    saved_voice = ((s.get("voice_uuid") or s.get("voice") or "")
+                   if eng == "lumean" else (s.get("voice") or ""))
+    c2 = db()
+    presets = c2.execute("SELECT id,name FROM presets WHERE tenant_id=? ORDER BY created DESC", (tid,)).fetchall()
+    vlib = c2.execute("SELECT name,voice_id,model_id FROM voice_lib WHERE tenant_id=? ORDER BY name COLLATE NOCASE", (tid,)).fetchall()
+    c2.close()
+    applied_preset = str(s.get("_applied_preset") or "")
+    preset_opts = "".join(
+        f"<option value={r['id']}{' selected' if str(r['id']) == applied_preset else ''}>{html.escape(r['name'])}</option>"
+        for r in presets)
+    if presets:
+        preset_left = (f'<form method=post id=presetF onsubmit="return false" style="display:flex;gap:8px;align-items:center;margin:0">'
+                       f'<input type=hidden name=pid value={pid}><input type=hidden name=tab value={tab}>'
+                       f'<select class=select name=psel style="width:auto;min-width:170px">{preset_opts}</select>'
+                       f'<button class="btn btn-primary btn-sm" onclick="presetF.action=\'/api/presets/\'+presetF.psel.value+\'/apply\';presetF.submit()">Применить</button>'
+                       f'<button class="btn btn-ghost btn-sm" title="Удалить пресет" onclick="if(confirm(\'Удалить пресет?\')){{presetF.action=\'/api/presets/\'+presetF.psel.value+\'/delete\';presetF.submit()}}"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>'
+                       f'</form>')
+    else:
+        preset_left = '<span class=muted style="font-size:13px">пресетов нет — <a href=/presets>создать</a></span>'
+    preset_bar = (f'<div class="preset-bar" style="margin-bottom:18px;flex-wrap:wrap">'
+                  f'<span class=dim style="font-size:11px;text-transform:uppercase;letter-spacing:.05em;font-weight:600">Пресет</span>'
+                  f'{preset_left}<span class=sp></span>'
+                  f'<form method=post action=/api/presets onsubmit="return presetSnapshot(this)" style="display:flex;gap:8px;margin:0">'
+                  f'<input type=hidden name=pid value={pid}><input type=hidden name=tab value={tab}>'
+                  f'<input class=input name=preset_name placeholder="сохранить как новый…" style="width:185px">'
+                  f'<button class="btn btn-secondary btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Снимок</button></form></div>')
+
+    edge_opts = _edge_voice_optgroups(saved_voice)   # полный каталог 317 голосов, optgroup по языку
+
+    tabs_bar = ("<div class=tabs>"
+        "<div class=tab id=tab-src onclick=\"showTab('src')\"><svg class='ic' viewBox='0 0 24 24'><use href='#ic-file'/></svg> Сценарий</div>"
+        "<div class=tab id=tab-tts onclick=\"showTab('tts')\"><svg class='ic' viewBox='0 0 24 24'><use href='#ic-mic'/></svg> Озвучка</div>"
+        "<div class=tab id=tab-img onclick=\"showTab('img')\"><svg class='ic' viewBox='0 0 24 24'><use href='#ic-image'/></svg> Изображения</div>"
+        "<div class=tab id=tab-vid onclick=\"showTab('vid')\"><svg class='ic' viewBox='0 0 24 24'><use href='#ic-video'/></svg> Видео</div>"
+        "<div class=tab id=tab-rnd onclick=\"showTab('rnd')\"><svg class='ic' viewBox='0 0 24 24'><use href='#ic-video'/></svg> Рендер</div></div>")
+
+    pane_src = f"""<div class=pane id=pane-src><fieldset class=lf><legend><svg class="ic" viewBox="0 0 24 24"><use href="#ic-file"/></svg> Исходный текст</legend>
+<form method=post action=/api/projects/{pid}/source>
+<textarea name=source rows=14 placeholder="Текст сценария...">{html.escape(src)}</textarea>
+<div style='margin-top:10px'><button class="btn btn-secondary"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Сохранить текст</button></div></form>
+<p class=hint>Edge режет текст по строкам/абзацам; картинки группируются по «предложений на промт».</p></fieldset></div>"""
+
+    _ck = lambda e: " checked" if eng == e else ""
+    eng_cards = "".join(
+        f'<label class=engcard style="flex:1;min-width:135px;border:1px solid var(--border2);border-radius:9px;'
+        f'padding:10px 12px;cursor:pointer;background:var(--surface2)">'
+        f'<input type=radio name=engine value={k}{_ck(k)} form=ttsF onchange=engChg() style="display:none">'
+        f'<div style="font-weight:600;font-size:13px">{html.escape(v[0])}</div>'
+        f'<div class=muted style="font-size:11px">{html.escape(v[1])}</div>'
+        + (f'<div class=muted style="font-size:11px;color:var(--warn,#c98a2b)"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> {html.escape(_tts_engine_note(u, k))}</div>'
+           if _tts_engine_note(u, k) else "")
+        + '</label>'
+        for k, v in TTS_ENGINES.items())
+    modelid_opts = mc_dict_options(ELEVEN_MODELS, s.get("model_id"))
+    split_opts = "".join(f'<option value="{k}"{" selected" if s.get("split_type")==k else ""}>{html.escape(v)}</option>'
+                         for k, v in SPLIT_TYPE.items())
+    autolang_on = "checked" if not saved_voice else ""
+    pause_on = "checked" if _truthy(s.get("auto_pause_enabled"), False) else ""
+    _gbl = _voices_by_lang()
+    edge_voice_rows = ""
+    for lc in sorted(_gbl, key=lambda x: _LANG_NAMES.get(x, x).lower()):
+        lang = _LANG_NAMES.get(lc, lc)
+        for vv in _gbl[lc]:
+            loc, nm = _voice_short(vv)
+            on = " on" if vv == saved_voice else ""
+            edge_voice_rows += (f'<div class="vrow{on}" data-v="{html.escape(vv)}" data-s="{html.escape((lang + " " + vv).lower())}" onclick="pickVoice(this)" '
+                f'style="display:flex;gap:8px;align-items:center;padding:7px 10px;border-radius:6px;cursor:pointer">'
+                f'<span class=tag style="min-width:52px;text-align:center">{html.escape(loc)}</span>'
+                f'<span style="flex:1;font-size:13px">{html.escape(nm)}</span>'
+                f'<span class=dim style="font-size:11px">{html.escape(lang)}</span></div>')
+    vlib_rows = "".join(
+        f'<div class="lrow" data-v="{html.escape(v["voice_id"])}" '
+        f'data-lumean="{1 if _is_lumean_template_id(v["voice_id"]) else 0}" '
+        f'onclick="pickId(this)" style="display:flex;gap:8px;align-items:center;padding:7px 10px;border-radius:6px;cursor:pointer">'
+        f'<span style="flex:1;font-size:13px;font-weight:500">{html.escape(v["name"])}</span>'
+        f'<span class="mono dim" style="font-size:11px">{html.escape((v["voice_id"] or "")[:16])}…</span></div>' for v in vlib
+    ) or '<p class=muted style="font-size:12.5px">Пусто — добавьте voice_id на странице <a href=/voices>Голоса</a>.</p>'
+    pane_tts = f'''<div class=pane id=pane-tts>
+<div class=label>Движок озвучки</div>
+<div class=row id=engCards style="gap:10px;margin-bottom:16px;flex-wrap:wrap">{eng_cards}</div>
+<form id=ttsF data-project-settings=1 method=post action=/api/projects/{pid}/tts>
+<input type=hidden name=tab value=tts>
+<input type=hidden id=voiceInp name=voice value="{html.escape(saved_voice)}">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+  <div class=panel style="margin:0">
+    <div class=panel-title id=paramsTitle>Параметры · Edge</div>
+    <div class=engparams id=ep-edge>
+      <label class=toggle style="align-items:flex-start"><input type=checkbox id=autolang {autolang_on} onchange=autoLang()><span class=track style="flex:none"></span>
+      <span style="margin-left:11px"><b style="font-size:13px">Автоопределение языка</b><div class=muted style="font-size:11.5px;margin-top:2px">голос подберётся по языку текста; выключите, чтобы выбрать вручную справа</div></span></label></div>
+    <div class=engparams id=ep-voicer style="display:none">
+      <div class=fld><label class=cap>Модель:</label><select class=select name=model_id style="width:210px">{modelid_opts}</select></div>
+      <div class=fld><label class=cap>Разбивка:</label><select class=select name=split_type style="width:210px">{split_opts}</select></div>
+      <div class=fld><label class=toggle style="margin:0"><input type=checkbox name=auto_pause_enabled value=1 {pause_on}><span class=track></span></label><span style="margin-left:9px;font-size:13px">Авто-паузы между фразами</span></div></div>
+    <div class=engparams id=ep-voicegencore style="display:none">
+      <div class=fld><label class=cap>Движок:</label><select class=select name=voice_engine style="width:200px">{mc_dict_options(VGC_ENGINES, sval('voice_engine') or 'elevenLabsV3')}</select></div>
+      <div class=fld><label class=cap>Стабильность:</label><input class=input name=stability value="{sval('stability')}" placeholder="0.5" style="width:90px">
+      <label class=cap style="width:auto">Потоков:</label><input class=input name=thread_count value="{sval('thread_count')}" placeholder="4" style="width:70px"></div></div>
+    <div class=engparams id=ep-tts style="display:none">
+      <div class=fld><label class=cap>Model ID Lumean:</label><input class=input name=model_uuid value="{sval('model_uuid')}" placeholder="из шаблона" style="width:220px"></div></div>
+    <div class=engparams id=ep-lumean style="display:none">
+      <div class=hint>Template ID выберите справа. Перед оплатой сервер проверит, что шаблон относится именно к HeyGen.</div></div>
+    <div class=fld style="margin-top:14px"><label class=cap>Скорость речи:</label><input class=input name=speed value="{sval('speed','1.0')}" style="width:90px" title="1.0=норма, 1.1=быстрее, 0.9=медленнее"></div>
+    <div class=fld><label class=cap><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> Кэш:</label><select class=select name=use_cache style="width:230px"><option value="1"{" selected" if _truthy(s.get("use_cache","1")) else ""}>докачивать недостающее</option><option value="0"{"" if _truthy(s.get("use_cache","1")) else " selected"}>переозвучить всё (смена голоса)</option></select></div>
+    <button class="btn btn-primary" style="width:100%;justify-content:center;margin-top:8px"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-mic"/></svg> Озвучить проект</button>
+  </div>
+  <div class=panel style="margin:0">
+    <div id=vp-edge>
+      <div class=panel-title>Выбрать голос вручную <span class=muted style="text-transform:none;letter-spacing:0">· {len(EDGE_ALL_VOICES)} голосов</span></div>
+      <div class=search style="margin-bottom:10px"><svg viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round><circle cx=11 cy=11 r=7/><path d="m21 21-4.3-4.3"/></svg><input placeholder="поиск по языку или имени…" oninput="vfilter(this.value)"></div>
+      <div style="max-height:300px;overflow:auto">{edge_voice_rows}</div></div>
+    <div id=vp-id style="display:none">
+      <div class=panel-title>Voice / Template ID</div>
+      <input class=input id=idField value="{'' if eng == 'edge' else html.escape(saved_voice)}" oninput="document.getElementById('voiceInp').value=this.value" placeholder="для Lumean · HeyGen — Template ID; или выберите из библиотеки" style="margin-bottom:12px">
+      <div class=label>Из библиотеки</div>
+      <div style="max-height:240px;overflow:auto">{vlib_rows}</div></div>
+  </div>
+</div></form>
+<h2 style="margin-top:18px">Результат</h2>
+{(f'<div class=row style="gap:8px;flex-wrap:wrap;margin-bottom:10px">{_dlbtn("audio", "Скачать озвучку")}</div>' if _dl_n["audio"] else '')}
+{audio_html}</div>'''
+
+    img_model_opts = mc_status_options(IMAGE_MODELS, s.get("model", "OPENAI"),
+                                       _blocked_providers(u, IMAGE_MODELS, kind="images"))
+    img_aspect_opts = _opts(("landscape","portrait","square"), s.get("aspect_ratio","landscape"))
+    uc_img = "0" if str(s.get("use_cache","1")).strip().lower() in ("0","off","false","no") else "1"
+    uc_img_opts = (f"<option value=1{' selected' if uc_img=='1' else ''}>не перегенерировать готовое</option>"
+                   f"<option value=0{' selected' if uc_img=='0' else ''}>перегенерировать всё</option>")
+    ah_img = "0" if str(s.get("auto_hero","0")).strip().lower() in ("0","off","false","no") else "1"
+    as_img = "1" if _truthy(s.get("analyze_story"), False) else "0"          # анализ персонажей/локаций
+    sl_img = "1" if _truthy(s.get("split_long_sentences"), False) else "0"   # дробление длинных предложений
+    try:
+        sl_sec = f"{_split_long_seconds(s):g}"
+    except ValueError:
+        sl_sec = f"{SPLIT_LONG_DEFAULT_SECONDS:g}"
+    ah_img_opts = (f"<option value=1{' selected' if ah_img=='1' else ''}>вкл — генерить героя (континуити, +1 генерация)</option>"
+                   f"<option value=0{' selected' if ah_img=='0' else ''}>выкл</option>")
+    is_bing = s["image_mode"] == _IMAGE_MODE_BING
+    try:
+        ref_panel = _reference_panel_html(pid, pdir, s)
+        has_refs = _reference_status(pdir, s)["raw"] > 0
+    except reference_contract.ReferenceContractError as exc:
+        # A corrupt legacy/source manifest must be visible and fail closed; the
+        # rest of the project page remains usable so the owner can repair it.
+        has_refs = True
+        ref_panel = (f'<div class=panel style="border-color:var(--error);color:var(--error)">'
+                     f'<b>Референсы требуют исправления:</b> {html.escape(str(exc))}</div>')
+    _iexp = _bst.get("images_expected") or 0
+    _gstems = set()
+    for _im in images:
+        _st0 = os.path.splitext(os.path.basename(_im))[0]
+        if _st0.isdigit():
+            _gstems.add(int(_st0))
+    _missing = [i for i in range(1, _iexp + 1) if i not in _gstems] if _iexp else []
+    img_note = ""
+    if _iexp and len(images) < _iexp:
+        if "images" in (_bst.get("running") or set()):
+            img_badge = f'<span class="badge badge-running" style="vertical-align:middle;margin-left:8px">{len(images)} из {_iexp} готово</span>'
+        else:
+            img_badge = (f'<span class=badge style="background:color-mix(in srgb,var(--warn) 16%,transparent);'
+                         f'color:var(--warn);vertical-align:middle;margin-left:8px">{len(images)} из {_iexp}</span>')
+            if _missing:
+                _mtxt = ", ".join(f"{i:03d}" for i in _missing[:12]) + (" …" if len(_missing) > 12 else "")
+                img_note = (f'<div style="background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--warn);'
+                            f'border-radius:8px;padding:10px 13px;margin:0 0 10px;font-size:13px">'
+                            f'Не хватает {len(_missing)} из {_iexp} (№ {_mtxt}). <b>Это не ошибка</b> — провайдер иногда пропускает '
+                            f'отдельные сцены (перегруз, фильтры контента). Нажмите «Сделать картинки» ещё раз с кэшем '
+                            f'«не перегенерировать готовое» — дозаполнятся только недостающие. Точечно — кнопка со стрелками на картинке.</div>')
+    elif images:
+        img_badge = f'<span class="badge badge-done" style="vertical-align:middle;margin-left:8px">{len(images)} готово</span>'
+    else:
+        img_badge = ""
+    pane_img = f'''<div class=pane id=pane-img>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+  <form method=post action=/api/projects/{pid}/images class=panel id=imgRefSettings data-project-settings=1 style="margin:0">
+<input type=hidden name=tab value=img>
+    <div class=panel-title>Картинки · {'Поиск Bing' if is_bing else 'AI-генерация'}</div>
+    <div style="display:flex;gap:12px;flex-wrap:wrap;margin-bottom:12px">
+      <div style="flex:1;min-width:150px"><label class=label>Источник</label><select class=select name=image_mode id=imgModeSel onchange="var b=this.value==='bing',m=document.getElementById('imgModelSel'),f=document.getElementById('imgModelFld'),x=document.getElementById('bingBox'),l=document.getElementById('imgModelLabel');m.disabled=b;f.style.opacity=b?'.42':'1';x.style.display=b?'':'none';l.textContent=b?'AI-модель · не используется':'AI-модель';refStatusUpdate()">
+        <option value=ai{' selected' if not is_bing else ''}>AI-генерация</option><option value=bing{' selected' if is_bing else ''}>Поиск Bing</option></select></div>
+      <div id=imgModelFld style="flex:1;min-width:150px;opacity:{'.42' if is_bing else '1'}"><label class=label id=imgModelLabel>AI-модель{' · не используется' if is_bing else ''}</label><select class=select name=model id=imgModelSel onchange="refStatusUpdate()"{' disabled aria-disabled=true' if is_bing else ''}>{img_model_opts}</select></div>
+      <div style="flex:1;min-width:130px"><label class=label>Соотношение</label><select class=select name=aspect_ratio>{img_aspect_opts}</select></div></div>
+    <div style="margin-bottom:12px"><label class=label>Стиль картинок</label>
+      <input class=input name=style value="{sval('style','minimalistic stickman, 2d, cinematic, dramatic lighting')}"></div>
+    <div style="display:flex;gap:12px;margin-bottom:6px">
+      <div style="flex:1"><label class=label>Предложений на картинку</label><input class=input name=sentences_per_prompt value="{sval('sentences_per_prompt','3')}" title="число или посегментно 1x100,3"></div>
+      <div style="flex:1"><label class=label>Seed — тот же результат</label><input class=input name=seed value="{sval('seed')}" placeholder="(пусто = случайный)"></div></div>
+    <div class=row style="background:var(--surface2);border-radius:9px;padding:11px 13px;margin-top:6px;gap:0">
+    <label class=toggle style="margin:0"><input type=hidden name=auto_hero id=ahInp value="{ah_img}"><input type=checkbox {"checked" if ah_img=="1" else ""} onchange="document.getElementById('ahInp').value=this.checked?'1':'0';refStatusUpdate()"><span class=track></span></label>
+    <span style="margin-left:11px"><b style="font-size:13px">Один герой во всех кадрах</b><div class=muted style="font-size:11.5px;margin-top:2px">континуити: персонаж не меняется между сценами (+1 генерация)</div></span></div>
+    <div class=row style="background:var(--surface2);border-radius:9px;padding:11px 13px;margin-top:8px;gap:0">
+    <label class=toggle style="margin:0"><input type=hidden name=analyze_story id=asInp value="{as_img}"><input type=checkbox {"checked" if as_img=="1" else ""} onchange="document.getElementById('asInp').value=this.checked?'1':'0';refStatusUpdate()"><span class=track></span></label>
+    <span style="margin-left:11px"><b style="font-size:13px">Разбор персонажей и мест</b><div class=muted style="font-size:11.5px;margin-top:2px">по тексту строится карта героев и локаций; промпты ссылаются на неё, лица и места не «плывут» между кадрами. Для Bing это только текстовая карта, без фото-референсов.</div></span></div>
+    <div class=row style="background:var(--surface2);border-radius:9px;padding:11px 13px;margin-top:8px;gap:0">
+    <label class=toggle style="margin:0"><input type=hidden name=split_long_sentences id=slInp value="{sl_img}"><input type=checkbox {"checked" if sl_img=="1" else ""} onchange="document.getElementById('slInp').value=this.checked?'1':'0'"><span class=track></span></label>
+    <span style="margin-left:11px"><b style="font-size:13px">Дробить длинные предложения</b><div class=muted style="font-size:11.5px;margin-top:5px">там, где кадр = одно предложение: делить по смысловым паузам примерно до <input class=input type=number name=max_solo_scene_seconds value="{sl_sec}" min=1 max=60 step=0.5 aria-label="Примерный лимит одиночной сцены, секунд" style="width:58px;height:27px;padding:3px 6px;display:inline-block"> секунд на кадр · план строится до Whisper</div></span></div>
+    <details style="margin-top:10px"{" open" if (is_bing or sval('custom_prompts')) else ""}><summary class=muted style="cursor:pointer;font-size:12px">Доп. настройки — Bing-теги · кастом-промты · кэш{" <b style='color:var(--accent)'><svg class='ic' viewBox='0 0 24 24'><use href='#ic-alert'/></svg> активны</b>" if (is_bing or sval('custom_prompts')) else ""}</summary>
+    <div class=fld style="margin-top:8px"><label class=cap><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> Кэш:</label><select class=select name=use_cache style="width:240px">{uc_img_opts}</select></div>
+    <div class=fld style="align-items:flex-start"><label class=cap><svg class="ic" viewBox="0 0 24 24"><use href="#ic-edit"/></svg> Кастом-промты:</label><textarea class=textarea name=custom_prompts id=customPromptsInp rows=2 placeholder="по одному промту на строку (пусто = авто по тексту)" oninput="refStatusUpdate()" style="flex:1;min-width:240px">{sval('custom_prompts')}</textarea></div>
+    <div id=bingBox style="display:{'none' if not is_bing else ''};margin-top:8px"><div class=fld><label class=cap>Теги Bing:</label><input class=input name=tags value="{sval('tags')}" placeholder="пусто = по плану сцен (война, солдат, 1940-е — старый режим)" style="flex:1;min-width:200px"><label class=cap style="width:auto">На тег:</label><input class=input name=num_images value="{sval('num_images','5')}" style="width:70px"></div>
+    <div class=muted style="font-size:11.5px;margin-top:4px">Теги пустые — ищется <b>одна картинка на каждую сцену</b> по плану промптов (как у генерации: галерея, реген, видео и синхрон работают). Теги заданы — старый режим: пачки картинок по тегу.</div></div></details>
+    <button class="btn btn-primary" id=imgSubmitBtn style="width:100%;justify-content:center;margin-top:12px"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-image"/></svg> Сделать картинки</button>
+  </form>
+  <div style="margin:0">
+    <details {'open' if has_refs else ''}><summary style="cursor:pointer;font-weight:600;font-size:13px;color:var(--muted);margin-bottom:12px"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-users"/></svg> Персонажи и стиль <span class=dim>· континуити (необязательно)</span></summary>
+    <div id=refPanel>{ref_panel}</div></details>
+  </div>
+</div>
+<script>
+var refCaps={json.dumps(dict(reference_contract.MODEL_REFERENCE_CAPACITIES), separators=(',', ':'))};
+async function refRequest(form){{
+  if(form.dataset.busy==='1')return;
+  form.dataset.busy='1';
+  try{{
+    var response=await fetch(form.action,{{method:'POST',body:new FormData(form),headers:{{'Accept':'application/json','X-Requested-With':'fetch'}}}});
+    var data={{}};try{{data=await response.json();}}catch(_e){{}}
+    if(!response.ok)throw new Error(data.detail||('HTTP '+response.status));
+    if(!data.panel_html)throw new Error('Сервер не вернул обновлённую панель референсов');
+    var panel=document.getElementById('refPanel');if(panel)panel.innerHTML=data.panel_html;
+    refStatusUpdate();
+  }}catch(err){{alert('Референсы не изменены: '+err.message);}}
+  finally{{form.dataset.busy='0';}}
+}}
+function refUpload(form){{if(form)refRequest(form);}}
+function refDrop(e,id){{
+  e.preventDefault();var inp=document.getElementById(id);
+  if(inp&&e.dataTransfer&&e.dataTransfer.files.length){{inp.files=e.dataTransfer.files;refUpload(inp.form);}}
+}}
+function refStatusUpdate(keepExact){{
+  var status=document.getElementById('refStatus'),count=document.getElementById('refCount'),gate=document.getElementById('refGate');
+  if(!status||!count||!gate)return;
+  var raw=Number(status.dataset.raw||0),packed=Number(status.dataset.packed||0),groups=Number(status.dataset.groups||0),style=Number(status.dataset.style||0),legacy=Number(status.dataset.cacheLegacy||0);
+  var mode=(document.getElementById('imgModeSel')||{{value:'ai'}}).value;
+  var model=(document.getElementById('imgModelSel')||{{value:'OPENAI'}}).value.toUpperCase();
+  var autoHero=(document.getElementById('ahInp')||{{value:'0'}}).value==='1';
+  var analyze=(document.getElementById('asInp')||{{value:'0'}}).value==='1';
+  var custom=((document.getElementById('customPromptsInp')||{{value:''}}).value||'').trim().length>0;
+  var capacity=Object.prototype.hasOwnProperty.call(refCaps,model)?refCaps[model]:0;
+  var required=(style?1:0)+((groups||autoHero)?1:0),visual=raw>0||autoHero,reasons=[];
+  if(!Object.prototype.hasOwnProperty.call(refCaps,model))reasons.push('для модели не зарегистрирована ёмкость refs');
+  if(mode==='bing'&&visual)reasons.push('Bing не принимает фото-референсы и auto-hero');
+  if(model==='GPT_IMAGE2'&&visual)reasons.push('GPT_IMAGE2 не принимает визуальные refs');
+  if(custom&&(analyze||autoHero||groups>1))reasons.push('кастом-промты: максимум один явный герой + стиль');
+  if(groups>1&&!analyze)reasons.push('для нескольких героев включите разбор персонажей');
+  if(visual&&required>capacity)reasons.push('модель вмещает '+capacity+' refs на сцену, одновременно нужно минимум '+required);
+  if(legacy>0&&!document.querySelector('input[name="legacy_cache_action"]:checked'))reasons.push('выберите, что делать с '+legacy+' непроверенными legacy-кадрами');
+  var exact=keepExact===true&&status.dataset.runtimeExact==='1'&&status.dataset.runtimeModel===model&&reasons.length===0;
+  if(exact){{
+    count.textContent='Исходники: '+raw+' → максимум сцены: '+status.dataset.runtimeMax+'/'+capacity+' · selected: '+status.dataset.runtimeSelected+' · потеряно: 0';
+    gate.textContent='Проверено по '+status.dataset.runtimeScenes+' сценам до платных запросов; bundle и модель совпадают.';
+  }}else{{
+    count.textContent='Исходники: '+raw+' → до '+packed+' inputs / '+capacity+' на сцену · потеряно: 0';
+    gate.textContent=reasons.length?reasons.join(' · '):'Все загруженные refs учтены; точный состав каждой сцены будет проверен до первого платного запроса.';
+  }}
+  gate.style.color=reasons.length?'var(--error)':(exact||required===0?'var(--done)':'var(--warn)');
+  var button=document.getElementById('imgSubmitBtn');if(button)button.disabled=reasons.length>0;
+}}
+document.addEventListener('change',function(e){{if(e.target.matches('.ref-upload input[type=file]'))refUpload(e.target.form);}});
+document.addEventListener('submit',function(e){{
+  var form=e.target.closest&&e.target.closest('form.ref-upload,form.ref-ajax');if(!form)return;
+  e.preventDefault();if(form.dataset.confirm&&!confirm(form.dataset.confirm))return;refRequest(form);
+}});
+refStatusUpdate(true);
+</script>
+<h2 style="margin-top:18px">Результат{img_badge}</h2>
+{img_note}
+{(f'<div class=row style="gap:8px;flex-wrap:wrap;margin-bottom:10px">'
+  f'<button class="btn btn-ghost btn-sm" onclick="gAll(1)">{_GI_CHECK} Выбрать все</button>'
+  f'<button class="btn btn-ghost btn-sm" onclick="gAll(0)">Снять выбор</button>'
+  f'{_dlbtn("images", "Скачать картинки")}'
+  f'<button class="btn btn-danger btn-sm" id=gdelsel onclick="gDelSel()" disabled>{_GI_TRASH} <span id=gdelseln>Удалить выбранные (0)</span></button>'
+  f'<span class=sp></span>'
+  f'<button class="btn btn-danger btn-sm" onclick="gDelAll()">{_GI_TRASH} Удалить ВСЕ</button></div>'
+  f'<p class=muted style="font-size:11.5px;margin:0 0 8px">Наведите на картинку: галочка — выбрать, стрелки — перегенерировать (можно со своим промптом), корзина — удалить. Удалённые номера дозаполнит повторная генерация с кэшем.</p>'
+  if images else '')}
+{img_html}
+<form id=gdelF method=post action=/api/projects/{pid}/images/delete style="display:none"></form>
+<form id=gregF method=post action=/api/projects/{pid}/images/regen style="display:none">
+<input type=hidden name=image_rel><input type=hidden name=prompt></form>
+</div>'''
+
+    # Оверлеи (модалка регена + лайтбокс) и общий скрипт галерей — строго ВНЕ .pane:
+    # вкладки скрываются display:none, и оверлей внутри pane-img был НЕВИДИМ на вкладке Видео
+    # (клип играл — звук шёл, а лайтбокс не показывался)
+    overlays = f'''<div id=gmodal style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:60;align-items:center;justify-content:center" onclick="if(event.target===this)this.style.display='none'">
+<div class=panel style="width:580px;max-width:92vw;margin:0">
+<div class=panel-title>Перегенерация <span id=gmrel class=muted style="text-transform:none;letter-spacing:0"></span></div>
+<div class=muted id=gmhint style="font-size:12px;margin-bottom:6px">Промпт — можно править; пусто = исходный из плана сцен. Модель/стиль берутся из настроек выше.</div>
+<textarea id=gmtext class=textarea rows=6 style="width:100%"></textarea>
+<div class=row style="margin-top:10px;justify-content:flex-end;gap:8px">
+<button class="btn btn-ghost" onclick="document.getElementById('gmodal').style.display='none'">Отмена</button>
+<button class="btn btn-primary" onclick="gRegenGo()">{_GI_REFRESH} Перегенерировать</button></div></div></div>
+<div id=glb style="display:none;position:fixed;inset:0;background:rgba(8,9,12,.86);z-index:70;align-items:center;justify-content:center" onclick="if(event.target===this)gLbClose()">
+<img id=glbimg style="max-width:90vw;max-height:84vh;border-radius:10px;box-shadow:0 12px 60px rgba(0,0,0,.65)">
+<video id=glbvid controls style="display:none;max-width:90vw;max-height:84vh;border-radius:10px;box-shadow:0 12px 60px rgba(0,0,0,.65)"></video>
+<div id=glbwait style="display:none;position:fixed;left:calc(50% - 16px);top:calc(50% - 16px);width:32px;height:32px;border:3px solid var(--accent);border-top-color:transparent;border-radius:50%;animation:gspin .9s linear infinite;z-index:71;pointer-events:none"></div>
+<button class=glba id=glbprev onclick="gLbNav(-1)" style="left:16px" title="Предыдущая (←)">‹</button>
+<button class=glba id=glbnext onclick="gLbNav(1)" style="right:16px" title="Следующая (→)">›</button>
+<button class=glbx onclick="gLbClose()" title="Закрыть (Esc)"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>
+<div id=glbcap style="position:fixed;bottom:16px;left:0;right:0;text-align:center;color:#cfcfcf;font-size:12.5px"></div>
+</div>
+<script>
+function gTiles(){{return document.querySelectorAll('#pane-img .gimg');}}
+function gSel(){{return document.querySelectorAll('#pane-img .gimg.sel');}}
+function vTiles(){{return document.querySelectorAll('#pane-vid .gimg');}}
+function vSel(){{return document.querySelectorAll('#pane-vid .gimg.sel');}}
+function _cnt1(sel,bid,sid){{var n=sel.length,d=document.getElementById(bid),s=document.getElementById(sid);
+ if(!d)return;d.disabled=!n;if(s)s.textContent='Удалить выбранные ('+n+')';}}
+function gCnt(){{_cnt1(gSel(),'gdelsel','gdelseln');_cnt1(vSel(),'vdelsel','vdelseln');}}
+function gTgl(b){{b.closest('.gimg').classList.toggle('sel');gCnt();}}
+function gAll(on){{gTiles().forEach(function(t){{t.classList.toggle('sel',!!on);}});gCnt();}}
+function gDelPost(rels,all){{
+ var msg=all?'Удалить ВСЕ картинки проекта? Файлы будут удалены с диска.':'Удалить '+rels.length+' шт.? Файлы будут удалены с диска.';
+ if(!confirm(msg))return;
+ var f=document.getElementById('gdelF');f.innerHTML='';
+ if(all){{var a=document.createElement('input');a.type='hidden';a.name='all';a.value='1';f.appendChild(a);}}
+ else rels.forEach(function(r){{var i=document.createElement('input');i.type='hidden';i.name='paths';i.value=r;f.appendChild(i);}});
+ f.submit();}}
+function gDelOne(b){{gDelPost([b.closest('.gimg').dataset.rel],false);}}
+function gDelSel(){{var rels=[];gSel().forEach(function(t){{rels.push(t.dataset.rel);}});if(rels.length)gDelPost(rels,false);}}
+function gDelAll(){{gDelPost([],true);}}
+function gRegen(b){{var g=b.closest('.gimg'),m=document.getElementById('gmodal');m.dataset.rel=g.dataset.rel;m.dataset.kind='img';
+ document.getElementById('gmrel').textContent='· '+g.dataset.rel;
+ document.getElementById('gmhint').textContent='Промпт — можно править; пусто = исходный из плана сцен. Модель/стиль берутся из настроек выше.';
+ document.getElementById('gmtext').value=g.dataset.prompt||'';m.style.display='flex';
+ document.getElementById('gmtext').focus();}}
+function gRegenGo(){{var m=document.getElementById('gmodal');
+ if(m.dataset.kind==='vid'){{var vf=document.getElementById('vregF');
+  vf.video_rel.value=m.dataset.rel;vf.prompt.value=document.getElementById('gmtext').value.trim();vf.submit();}}
+ else{{var f=document.getElementById('gregF');
+  f.image_rel.value=m.dataset.rel;f.prompt.value=document.getElementById('gmtext').value.trim();f.submit();}}}}
+function vAll(on){{vTiles().forEach(function(t){{t.classList.toggle('sel',!!on);}});gCnt();}}
+function vDelPost(rels,all){{
+ var msg=all?'Удалить ВСЕ видео-клипы проекта? Файлы будут удалены с диска.':'Удалить '+rels.length+' клип(ов)? Файлы будут удалены с диска.';
+ if(!confirm(msg))return;
+ var f=document.getElementById('vdelF');f.innerHTML='';
+ if(all){{var a=document.createElement('input');a.type='hidden';a.name='all';a.value='1';f.appendChild(a);}}
+ else rels.forEach(function(r){{var i=document.createElement('input');i.type='hidden';i.name='paths';i.value=r;f.appendChild(i);}});
+ f.submit();}}
+function vDelOne(b){{vDelPost([b.closest('.gimg').dataset.rel],false);}}
+function vDelSel(){{var rels=[];vSel().forEach(function(t){{rels.push(t.dataset.rel);}});if(rels.length)vDelPost(rels,false);}}
+function vDelAll(){{vDelPost([],true);}}
+function vRegen(b){{var g=b.closest('.gimg'),m=document.getElementById('gmodal');m.dataset.rel=g.dataset.rel;m.dataset.kind='vid';
+ document.getElementById('gmrel').textContent='· '+g.dataset.rel;
+ document.getElementById('gmhint').textContent='Промпт движения — можно править; пусто = как в форме видео выше. Метод берётся из настроек проекта. Клип будет заменён.';
+ var pi=document.getElementById('vidPromptInp');
+ document.getElementById('gmtext').value=(pi&&pi.value)||'';m.style.display='flex';
+ document.getElementById('gmtext').focus();}}
+function gPoll(){{var pi=document.getElementById('pane-img'),pv=document.getElementById('pane-vid'),
+ m=document.getElementById('gmodal'),l=document.getElementById('glb');
+ var act=(pi&&pi.classList.contains('active'))||(pv&&pv.classList.contains('active'));
+ if(act&&(!m||m.style.display!=='flex')&&(!l||l.style.display!=='flex')){{location.reload();}}else{{setTimeout(gPoll,7000);}}}}
+{('setTimeout(gPoll,7000);' if (_regen_active or _vregen_active) else '')}
+var GLB={{items:[],i:0}};
+function gView(img){{var t=img.closest('.gimg'),tiles=Array.prototype.slice.call(gTiles());
+ GLB.items=tiles.map(function(x){{var im=x.querySelector('img');return{{src:im.getAttribute('data-full')||im.src,rel:x.dataset.rel,v:false}};}});
+ GLB.i=tiles.indexOf(t);gLbShow();}}
+function vView(vid){{var t=vid.closest('.gimg'),tiles=Array.prototype.slice.call(vTiles());
+ GLB.items=tiles.map(function(x){{var el=x.querySelector('video');
+  return{{src:el.getAttribute('src'),poster:el.getAttribute('poster')||'',rel:x.dataset.rel,v:true}};}});
+ GLB.i=tiles.indexOf(t);gLbShow();}}
+function gLbWait(on){{var w=document.getElementById('glbwait');if(w)w.style.display=on?'block':'none';}}
+function gLbShow(){{var it=GLB.items[GLB.i];if(!it)return;
+ var im=document.getElementById('glbimg'),vd=document.getElementById('glbvid');
+ vd.pause();
+ if(it.v){{im.style.display='none';vd.style.display='';
+  if(it.poster)vd.poster=it.poster;else vd.removeAttribute('poster');
+  gLbWait(true);vd.src=it.src;vd.play().catch(function(){{}});}}
+ else{{vd.style.display='none';vd.removeAttribute('src');gLbWait(false);im.style.display='';im.src=it.src;}}
+ document.getElementById('glbcap').textContent=(GLB.i+1)+' / '+GLB.items.length+' · '+it.rel;
+ document.getElementById('glb').style.display='flex';}}
+function gLbNav(d){{if(!GLB.items.length)return;GLB.i=(GLB.i+d+GLB.items.length)%GLB.items.length;gLbShow();}}
+function gLbClose(){{var vd=document.getElementById('glbvid');vd.pause();vd.removeAttribute('src');gLbWait(false);
+ document.getElementById('glb').style.display='none';}}
+(function(){{var vd=document.getElementById('glbvid');if(!vd)return;
+ ['canplay','playing','loadeddata'].forEach(function(e){{vd.addEventListener(e,function(){{gLbWait(false);}});}});
+ vd.addEventListener('waiting',function(){{gLbWait(true);}});
+ vd.addEventListener('error',function(){{gLbWait(false);
+  var c=document.getElementById('glbcap');if(c&&vd.style.display!=='none')c.textContent+=' — не удалось загрузить видео';}});}})();
+document.addEventListener('keydown',function(e){{var o=document.getElementById('glb');
+ if(!o||o.style.display!=='flex')return;
+ if(e.key==='Escape')gLbClose();else if(e.key==='ArrowLeft')gLbNav(-1);else if(e.key==='ArrowRight')gLbNav(1);}});
+</script>'''
+
+    vid_method_opts = mc_status_options(VIDEO_METHODS, s.get("video_method", "veo"),
+                                        _blocked_providers(u, VIDEO_METHODS, kind="video"))
+    t2v_ck = "checked" if _truthy(s.get("t2v"), False) else ""
+    uc_vid = "0" if str(s.get("use_cache","1")).strip().lower() in ("0","off","false","no") else "1"
+    uc_vid_opts = (f"<option value=1{' selected' if uc_vid=='1' else ''}>не перегенерировать готовое</option>"
+                   f"<option value=0{' selected' if uc_vid=='0' else ''}>перегенерировать всё</option>")
+    pane_vid = f"""<div class=pane id=pane-vid><fieldset class=lf><legend><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Генерация видео (image→video)</legend>
+<form method=post action=/api/projects/{pid}/video data-project-settings=1>
+<input type=hidden name=tab value=vid>
+<div class=fld><label class=cap><svg class="ic" viewBox="0 0 24 24"><use href="#ic-cpu"/></svg> Метод:</label>
+<select name=video_method style='width:160px'>{vid_method_opts}</select></div>
+<div class=fld><label class=cap>Промт движения:</label>
+<input name=prompt id=vidPromptInp value="{sval('prompt','smooth cinematic motion, subtle camera movement')}" style='flex:1;min-width:320px'></div>
+<div class=fld><label class=cap>Кадров (0=все):</label>
+<input name=first_n value="{sval('first_n','0')}" style='width:80px' title="ограничить число картинок — экономит veo-кредиты">
+<label class=cap style='width:auto'><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> Кэш:</label><select name=use_cache style='width:220px'>{uc_vid_opts}</select></div>
+<div class=fld><label class=cap><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Из промптов (t2v):</label>
+<label class=toggle><input type=hidden name=t2v id=t2vInp value="{'1' if t2v_ck else '0'}"><input type=checkbox {t2v_ck} onchange="document.getElementById('t2vInp').value=this.checked?'1':'0';document.getElementById('t2vN').style.display=this.checked?'':'none'"><span class=track></span></label>
+<span id=t2vN style="{'' if t2v_ck else 'display:none'}"><label class=cap style='width:auto;margin-left:10px'>первых сцен (0=все):</label>
+<input name=t2v_first_n value="{sval('t2v_first_n','0')}" style='width:80px'></span>
+<span class=hint style="margin-left:10px">текст→видео по промптам сцен, картинки не нужны; только veo</span></div>
+<div class=fld><button class="btn btn-primary"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Генерировать видео</button></div></form>
+<p class=hint>Видео генерится из готовых картинок проекта. «Кадров» ограничивает сверху (0 = все) — без лимита veo жжёт кредиты на каждом кадре. С галкой «Из промптов» — text-to-video прямо по сценам (сначала нужны промпты: шаг «Картинки» или scenes.json).</p>
+<h2 style='margin-top:14px'>Результат{(f'<span class="badge badge-done" style="vertical-align:middle;margin-left:8px">{len(clips)} готово</span>' if clips else '')}</h2>
+{(f'<div class=row style="gap:8px;flex-wrap:wrap;margin-bottom:10px">'
+  f'<button class="btn btn-ghost btn-sm" onclick="vAll(1)">{_GI_CHECK} Выбрать все</button>'
+  f'<button class="btn btn-ghost btn-sm" onclick="vAll(0)">Снять выбор</button>'
+  f'{_dlbtn("clips", "Скачать клипы")}'
+  f'<button class="btn btn-danger btn-sm" id=vdelsel onclick="vDelSel()" disabled>{_GI_TRASH} <span id=vdelseln>Удалить выбранные (0)</span></button>'
+  f'<span class=sp></span>'
+  f'<button class="btn btn-danger btn-sm" onclick="vDelAll()">{_GI_TRASH} Удалить ВСЕ</button></div>'
+  f'<p class=muted style="font-size:11.5px;margin:0 0 8px">Клик по клипу — просмотр с листанием. Наведите: галочка — выбрать, стрелки — перегенерировать, корзина — удалить. После удаления клипа его картинка вернётся в рендер как статичная.</p>'
+  if clips else '')}
+{vid_html}
+<form id=vdelF method=post action=/api/projects/{pid}/videos/delete style="display:none"></form>
+<form id=vregF method=post action=/api/projects/{pid}/videos/regen style="display:none">
+<input type=hidden name=video_rel><input type=hidden name=prompt></form>
+</fieldset></div>"""
+
+    # --- РЕНДЕР: материалы готовы? + «Мои рендеры» (kind='render', собирается на GPU-боксе пуллером) ---
+    mats_ok = bool(images) and bool(audios)
+    _miss = ([] if images else ["картинки"]) + ([] if audios else ["озвучку"])
+    # ⚠️ эвристика неполной озвучки: размер финальных mp3 → ~сек (128kbps ≈ 16 КБ/с). Меньше 1 сек/картинку =
+    # TTS явно не завершён (кейс: отменили озвучку на 2 чанках → рендер честно собрал 10-сек ролик на 293 картинки)
+    _fin_mp3 = _g.glob(os.path.join(pdir, "_FINAL_AUDIO_*", "*.mp3")) or [os.path.join(pdir, a) for a in audios]
+    _aud_bytes = 0
+    for _a in _fin_mp3:
+        try:
+            _aud_bytes += os.path.getsize(_a)
+        except OSError:
+            pass
+    _aud_est = _aud_bytes / 16000.0
+    short_audio_note = ""
+    if images and audios and _aud_est < len(images):
+        short_audio_note = (
+            f'<div style="background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--warn);'
+            f'border-radius:8px;padding:10px 13px;margin-bottom:12px;font-size:13.5px">'
+            f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Озвучки всего ~{max(1, int(_aud_est))} сек при {len(images)} картинках — похоже, озвучка '
+            f'<b>не завершена</b> (прервана или упала на первых фразах). Видео собирается по длине озвучки: '
+            f'получится ролик на ~{max(1, int(_aud_est))} сек, и почти все картинки в него не попадут. '
+            f'Сначала запустите «Озвучить проект» на вкладке Озвучка и дождитесь конца — потом рендерите.</div>')
+    # Дыры в наборе картинок: объясняем ПОЧЕМУ рендер не стартует. Без этого проект молча
+    # висит «отложено», и причина видна только в логах генерации картинок.
+    _gap_ok, _gap_run, _gap_missing, _gap_total = _images_gap_report(tid, pid)
+    _gap_allowed = _truthy(s.get("allow_image_gaps"), False)
+    gap_note = ""
+    if _gap_missing:
+        _sec_scene = (_aud_est / _gap_total) if (_aud_est > 0 and _gap_total > 0) else 0
+        _stuck = int((_gap_run + 1) * _sec_scene)
+        _stuck_txt = (f"~{_stuck // 60} мин {_stuck % 60} сек" if _stuck >= 60 else f"~{_stuck} сек") if _stuck else "заметное время"
+        _mlist = ", ".join(str(x) for x in _gap_missing[:15]) + ("…" if len(_gap_missing) > 15 else "")
+        _box = ('background:var(--surface2);border:1px solid var(--border);border-radius:8px;'
+                'padding:10px 13px;margin-bottom:12px;font-size:13.5px;border-left:3px solid ')
+        _why = (f'Пропущенные кадры рендер не оставляет пустыми: время такой сцены он отдаёт '
+                f'<b>предыдущей</b> картинке, поэтому подряд идущая дыра превращается в один '
+                f'застывший кадр — здесь порядка <b>{_stuck_txt}</b> на одной картинке '
+                f'(в длинных сценах ближе к концу ролика — больше).')
+        if not _gap_ok and not _gap_allowed:
+            gap_note = (
+                f'<div style="{_box}var(--warn)">'
+                f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-pause"/></svg> <b>Рендер ждёт кадры.</b> Не хватает {len(_gap_missing)} картинок из {_gap_total}, '
+                f'самая длинная дыра — <b>{_gap_run} подряд</b> (сцены {_mlist}). {_why}<br><br>'
+                f'<b>Что сделать:</b> вкладка «Картинки» → «Сгенерировать» с кэшем '
+                f'«докачивать недостающее» — догенерятся только пропущенные {len(_gap_missing)} шт, '
+                f'остальные не тронутся. Как только кадры добьются, отложенный рендер стартует сам '
+                f'(порог — {IMG_RENDER_MAX_GAP} пропусков подряд, короткие дыры рендеру не мешают).'
+                f'<form method=post action="/api/projects/{pid}/settings" style="margin:9px 0 0">'
+                f'<input type=hidden name=allow_image_gaps value="1"><input type=hidden name=tab value=rnd>'
+                f'<button class="btn btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-play"/></svg> Рендерить как есть</button>'
+                f'<span class=hint style="margin-left:9px">соберёт ролик с застывшим кадром — если так и надо</span>'
+                f'</form></div>')
+        elif not _gap_ok:
+            gap_note = (
+                f'<div style="{_box}var(--warn)">'
+                f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-play"/></svg> <b>Рендерим как есть</b> (проверка дыр отключена для этого проекта). '
+                f'Не хватает {len(_gap_missing)} кадров, дыра {_gap_run} подряд → {_stuck_txt} на одной картинке.'
+                f'<form method=post action="/api/projects/{pid}/settings" style="margin:9px 0 0">'
+                f'<input type=hidden name=allow_image_gaps value="0"><input type=hidden name=tab value=rnd>'
+                f'<button class="btn btn-sm">Вернуть проверку</button></form></div>')
+        else:
+            gap_note = (
+                f'<div style="{_box}var(--border)">'
+                f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-info"/></svg> Пропущено {len(_gap_missing)} кадров (сцены {_mlist}), самая длинная дыра — '
+                f'{_gap_run} подряд, это в пределах порога {IMG_RENDER_MAX_GAP}. На этих местах предыдущая '
+                f'картинка задержится {_stuck_txt}. Рендеру не мешает.</div>')
+    c3 = db()
+    _rjobs = c3.execute("SELECT job_id,status,progress,stage,output_rel,error FROM queue_tasks "
+                        "WHERE project_id=? AND kind='render' ORDER BY job_id DESC LIMIT 12", (pid,)).fetchall()
+    c3.close()
+
+    def _rdel(jid, active=False):
+        """Кнопка «Удалить»: снимает mp4 с диска и убирает карточку из списка.
+
+        На идущей сборке она же её и останавливает — предупреждаем об этом в вопросе.
+        """
+        ask = ('Остановить эту сборку и удалить её из списка?' if active
+               else 'Удалить этот рендер? Файл mp4 будет стёрт с сервера — скачайте его заранее, если он нужен.')
+        return (f'<form method=post action="/api/render/{jid}/delete" style="margin:0" '
+                f'onsubmit="return confirm(\'{ask}\')">'
+                f'<button class="btn btn-ghost btn-sm" title="Удалить рендер">'
+                f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-trash"/></svg> Удалить</button></form>')
+
+    def _ritem(r):
+        jid = r["job_id"]; st = r["status"]; pct = int(r["progress"] or 0)
+        if st == "done":
+            return (f'<div class="render-item done"><b><svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> Готово</b>'
+                    f'<div class=muted style="font-size:12px;margin:3px 0 8px">сборка завершена</div>'
+                    f'<div class=row style="gap:6px;flex-wrap:wrap">'
+                    f'<a class="btn btn-primary btn-sm" href="/api/render/{jid}/download"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg> Скачать mp4</a>'
+                    f'{_rdel(jid)}</div></div>')
+        if st == "error":
+            return (f'<div class="render-item error"><b style="color:var(--error)">Ошибка</b>'
+                    f'<div class=muted style="font-size:12px;margin:3px 0 8px">{html.escape((r["error"] or "сборка не удалась")[:90])}</div>'
+                    f'<div class=row style="gap:6px;flex-wrap:wrap">'
+                    f'<form method=post action="/api/jobs/{jid}/retry" style="margin:0"><input type=hidden name=tab value=rnd>'
+                    f'<button class="btn btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> Повторить</button></form>'
+                    f'{_rdel(jid)}</div></div>')
+        if st == "running":
+            return (f'<div class="render-item running"><b>Собирается</b> '
+                    f'<span class=muted style="font-size:12px">{html.escape(r["stage"] or "")}</span>'
+                    f'<div class="render-bar" style="margin:7px 0 4px"><i style="width:{pct}%"></i><div class=shimmer></div></div>'
+                    f'<div class=muted style="font-size:12px;margin-bottom:8px">{pct}%</div>{_rdel(jid, active=True)}</div>')
+        if st == "cancelled":
+            return (f'<div class="render-item error"><b>Отменён</b>'
+                    f'<div class=muted style="font-size:12px;margin:3px 0 8px">сборка остановлена</div>'
+                    f'{_rdel(jid)}</div>')
+        return (f'<div class="render-item queued"><b>В очереди</b>'
+                f'<div class=muted style="font-size:12px;margin:3px 0 8px">ждёт рендер-ноду</div>'
+                f'{_rdel(jid, active=True)}</div>')
+
+    _ritems = "".join(_ritem(r) for r in _rjobs) or '<p class=muted style="font-size:13px">Здесь появятся собранные видео.</p>'
+    # скачать пачкой: все mp4 проекта + «всё одним архивом» (озвучка+картинки+клипы+готовые mp4).
+    # Поштучная кнопка «⬇ Скачать mp4» у каждого рендера остаётся как была.
+    _dl_panel = (f'<div class=row style="gap:8px;flex-wrap:wrap;margin-top:10px">'
+                 f'{_dlbtn("renders", "Все mp4")}'
+                 f'{_dlbtn("all", "Все материалы проекта", "btn-secondary")}</div>'
+                 f'<p class=muted style="font-size:11.5px;margin:6px 0 0">Архив собирается на лету и '
+                 f'скачивается одним zip — ничего не хранится на сервере лишнего.</p>'
+                 if _dl_n["all"] else '')
+    _active = any(r["status"] in ("queued", "running") for r in _rjobs)
+    _q = s.get("quality") or "1080p"
+    _tr = s.get("transitions") or "fast"
+    qa = lambda v: " active" if _q == v else ""
+    ta = lambda v: " active" if _tr == v else ""
+    kb_ck = "checked" if _truthy(s.get("kenburns", "1")) else ""
+    sub_ck = "checked" if _truthy(s.get("subtitles", "1")) else ""
+    uva_ck = "checked" if _truthy(s.get("use_video_audio"), False) else ""
+    _lang = s.get("subtitle_lang") or "Русский"
+    # паритет с десктопом (2026-07-10): синхрон + расширенные скаляры.
+    # Из UI убраны (2026-08-02, просьба владельца): уникализация (randomize_metadata),
+    # винтаж (vintage_effect), трек в конце (render_media.end), свои материалы
+    # (render_media.stock + stock_video_limit/stock_video_cycle). Серверная поддержка
+    # ОСТАЁТСЯ: значения, уже сохранённые в settings проекта/пресета, по-прежнему уезжают
+    # в конфиг рендера (_render_config_from_params), просто больше не редактируются здесь.
+    sync_ck = "checked" if _truthy(s.get("sync_audio", "1")) else ""       # как в десктопе: default ON
+    chap_ck = "checked" if _truthy(s.get("auto_chapters"), False) else ""  # главы после рендера
+    dev_ck = "checked" if _truthy(s.get("distribute_evenly", "1")) else ""
+    _mo = s.get("material_order") or "video_first"
+    _mo_opts = "".join(f'<option value="{k}"{" selected" if _mo == k else ""}>{v}</option>' for k, v in
+                       (("video_first", "Клипы в начале (реком.)"), ("images_first", "Картинки в начале"),
+                        ("alternate", "Чередовать клип–картинка"), ("alphabetical", "По алфавиту"),
+                        ("random", "Случайный")))
+    _lang_can = _SUB_LANG_CANON.get(_lang, _lang)          # legacy «Русский» из старых settings
+    _lang_seq = _SUB_LANGS_TOP + ["———"] + [l for l in _SUB_LANGS_ALL if l not in _SUB_LANGS_TOP]
+    _lang_opts = "".join('<option disabled>─────</option>' if l == "———" else
+                         f'<option value="{l}"{" selected" if _lang_can == l else ""}>{l}</option>'
+                         for l in _lang_seq)
+    _q_opts = "".join(f'<option value="{v}"{" selected" if _q == v else ""}>{v}</option>' for v in _QUALITY_OK)
+    # медиа-вставки (фон.музыка/интро/трек/оверлеи) — метаданные в settings.render_media (JSON)
+    try:
+        _rm = json.loads(s.get("render_media") or "{}")
+        if not isinstance(_rm, dict):
+            _rm = {}
+    except Exception:
+        _rm = {}
+
+    def _rm_delbtn(kind, name):
+        return (f'<form method=post action=/api/projects/{pid}/render_media/delete style="display:inline">'
+                f'<input type=hidden name=kind value="{kind}"><input type=hidden name=name value="{html.escape(name)}">'
+                f'<button class="btn btn-ghost btn-sm" title="удалить"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-trash"/></svg></button></form>')
+
+    def _rm_volform(kind, name, val, lbl):
+        return (f'<form method=post action=/api/projects/{pid}/render_media/set style="display:inline">'
+                f'<input type=hidden name=kind value="{kind}"><input type=hidden name=name value="{html.escape(name)}">'
+                f'<span class=muted style="font-size:12px">{lbl}</span> '
+                f'<input class=input name=vol value="{val}" style="width:56px"> '
+                f'<button class="btn btn-ghost btn-sm" title="сохранить"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg></button></form>')
+
+    def _rm_upform(kind, accept, vol_default=None, vol_lbl=""):
+        _v = (f'<span class=muted style="font-size:12px">{vol_lbl}</span> '
+              f'<input class=input name=vol value="{vol_default}" style="width:56px"> ') if vol_default is not None else ""
+        return (f'<form method=post enctype="multipart/form-data" action=/api/projects/{pid}/render_media/upload style="display:inline">'
+                f'<input type=hidden name=kind value="{kind}">'
+                f'<input type=file name=file accept="{accept}" required style="font-size:12px;max-width:220px"> {_v}'
+                f'<button class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-upload"/></svg> Загрузить</button></form>')
+
+    _rm_bg = _rm.get("bg") or {}
+    _bg_html = ((f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-music"/></svg> <b>{html.escape(os.path.basename(_rm_bg.get("file", "")))}</b> '
+                 + _rm_volform("bg", "", _rm_bg.get("vol", 20), "громкость %") + " " + _rm_delbtn("bg", ""))
+                if _rm_bg.get("file") else _rm_upform("bg", "audio/*", 20, "громкость %"))
+    _intro_html = "".join(f'<div style="margin:3px 0"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> {html.escape(os.path.basename(f))} {_rm_delbtn("intro", os.path.basename(f))}</div>'
+                          for f in (_rm.get("intro") or [])) + '<div style="margin-top:4px">' + _rm_upform("intro", "video/*") + "</div>"
+    _ovl_html = "".join(f'<div style="margin:3px 0">{html.escape(os.path.basename((o or {}).get("file", "")))} '
+                        + _rm_volform("overlay", os.path.basename((o or {}).get("file", "")), (o or {}).get("opacity", 50), "прозр. %")
+                        + " " + _rm_delbtn("overlay", os.path.basename((o or {}).get("file", ""))) + "</div>"
+                        for o in (_rm.get("overlays") or [])) + '<div style="margin-top:4px">' + _rm_upform("overlay", "image/*,video/*", 50, "прозр. %") + "</div>"
+    _media_panel = f"""<details style="margin-top:12px"><summary class=muted style="cursor:pointer;font-size:13px"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-music"/></svg> Музыка и вставки{' <span class="badge badge-done" style="vertical-align:middle">есть</span>' if (_rm_bg.get('file') or _rm.get('intro') or _rm.get('overlays')) else ''}</summary>
+<div class=fld style="margin-top:8px"><label class=cap>Фоновая музыка</label><div>{_bg_html}</div></div>
+<div class=fld><label class=cap>Интро-видео</label><div>{_intro_html}</div></div>
+<div class=fld><label class=cap>Оверлеи</label><div>{_ovl_html}</div></div>
+<p class=hint>Файлы хранятся в проекте и уезжают на рендер вместе с материалами. Громкость/прозрачность в %, <svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> — сохранить. Интро идут первыми в ролике; оверлеи — поверх всего видео.</p></details>"""
+    _poll_js = ("setTimeout(function(){if(location.hash=='#rnd'||((''+location.search).indexOf('tab=rnd')>=0)){location.reload();}},7000);" if _active else "")
+    _rnd_js = ("function rseg(n,v,el){var ss=el.parentNode.querySelectorAll('.seg');for(var i=0;i<ss.length;i++)ss[i].classList.remove('active');el.classList.add('active');document.getElementById('rf-'+n).value=v;}" + _poll_js)
+    if mats_ok:
+        _rform = f"""<form method=post action=/api/projects/{pid}/render data-project-settings=1>
+<div class=fld><label class=cap>Качество</label>
+<select class=select name=quality id=rf-quality style="width:auto">{_q_opts}</select></div>
+<div class=fld><label class=cap>Переходы</label><div class=segmented>
+<div class="seg{ta('none')}" onclick="rseg('transitions','none',this)">Без</div>
+<div class="seg{ta('fast')}" onclick="rseg('transitions','fast',this)">Быстрые</div>
+<div class="seg{ta('smooth')}" onclick="rseg('transitions','smooth',this)">Плавные</div></div>
+<input type=hidden id=rf-transitions name=transitions value="{_tr}">
+<span class=hint style="margin-left:10px">«Быстрые» — почти все переходы за ~2&nbsp;мин · «Плавные» — все, дольше</span></div>
+<div class=fld><label class=cap>Плавный зум (Ken Burns)</label>
+<label class=toggle><input type=hidden name=kenburns id=kbInp value="{'1' if kb_ck else '0'}"><input type=checkbox {kb_ck} onchange="document.getElementById('kbInp').value=this.checked?'1':'0'"><span class=track></span></label></div>
+<div class=fld><label class=cap>Звук из видео-клипов</label>
+<label class=toggle><input type=hidden name=use_video_audio id=uvaInp value="{'1' if uva_ck else '0'}"><input type=checkbox {uva_ck} onchange="document.getElementById('uvaInp').value=this.checked?'1':'0'"><span class=track></span></label>
+<span class=hint style="margin-left:10px">аудио клипов (veo) подмешается в озвучку на их сценах</span></div>
+<div class=fld><label class=cap><svg class="ic" viewBox="0 0 24 24"><use href="#ic-target"/></svg> Синхрон с озвучкой</label>
+<label class=toggle><input type=hidden name=sync_audio id=syncInp value="{'1' if sync_ck else '0'}"><input type=checkbox {sync_ck} onchange="document.getElementById('syncInp').value=this.checked?'1':'0'"><span class=track></span></label>
+<span class=hint style="margin-left:10px">кадры переключаются по предложениям озвучки (whisper); выкл = равномерно</span></div>
+<div class=fld><label class=cap>Главы (таймкоды в описание)</label>
+<label class=toggle><input type=hidden name=auto_chapters id=chapInp value="{'1' if chap_ck else '0'}"><input type=checkbox {chap_ck} onchange="document.getElementById('chapInp').value=this.checked?'1':'0'"><span class=track></span></label>
+<span class=hint style="margin-left:10px">после рендера — разбивка на главы по 2–4 мин с заголовками; нужен «Синхрон с озвучкой»</span></div>
+<div class=fld><label class=cap>Субтитры</label>
+<label class=toggle><input type=hidden name=subtitles id=subInp value="{'1' if sub_ck else '0'}"><input type=checkbox {sub_ck} onchange="document.getElementById('subInp').value=this.checked?'1':'0';document.getElementById('rsublang').style.display=this.checked?'':'none'"><span class=track></span></label>
+<select class=select id=rsublang name=subtitle_lang style="width:auto;margin-left:10px;{'' if sub_ck else 'display:none'}">{_lang_opts}</select></div>
+<details style="margin:6px 0"><summary class=muted style="cursor:pointer;font-size:13px">Расширенные настройки</summary>
+<div class=fld style="margin-top:8px"><label class=cap>сек/кадр мин–макс</label>
+<input class=input name=min_image_duration value="{sval('min_image_duration','2.0')}" style="width:70px"> –
+<input class=input name=max_image_duration value="{sval('max_image_duration','30.0')}" style="width:70px"></div>
+<div class=fld><label class=cap>Порядок материалов</label>
+<select class=select name=material_order style="width:auto">{_mo_opts}</select>
+<span class=hint style="margin-left:10px">клипы = анимированные первые сцены; менять только осознанно</span></div>
+<div class=fld><label class=cap>Fade, сек</label>
+<input class=input name=fade_duration value="{sval('fade_duration','0.5')}" style="width:70px">
+<label class=cap style="margin-left:14px">Ken Burns зум</label>
+<input class=input name=kenburns_zoom value="{sval('kenburns_zoom','1.1')}" style="width:70px"></div>
+<div class=fld><label class=cap>Пауза, сек / каждые N фраз</label>
+<input class=input name=pause_duration value="{sval('pause_duration','0')}" style="width:70px"> /
+<input class=input name=pause_interval value="{sval('pause_interval','0')}" style="width:70px">
+<span class=hint style="margin-left:10px">0 = без пауз</span></div>
+<div class=fld><label class=cap>Громкость озвучки % / звука клипов %</label>
+<input class=input name=main_audio_volume value="{sval('main_audio_volume','100')}" style="width:70px"> /
+<input class=input name=video_audio_volume value="{sval('video_audio_volume','100')}" style="width:70px"></div>
+<div class=fld><label class=cap>Равномерное распределение</label>
+<label class=toggle><input type=hidden name=distribute_evenly id=devInp value="{'1' if dev_ck else '0'}"><input type=checkbox {dev_ck} onchange="document.getElementById('devInp').value=this.checked?'1':'0'"><span class=track></span></label>
+<span class=hint style="margin-left:10px">без синхрона: кадры делят хронометраж поровну</span></div>
+<div class=fld><label class=cap>Масштаб медиа % / смещение X / Y</label>
+<input class=input name=media_scale_pct value="{sval('media_scale_pct','100')}" style="width:70px"> /
+<input class=input name=media_offset_x value="{sval('media_offset_x','0')}" style="width:70px"> /
+<input class=input name=media_offset_y value="{sval('media_offset_y','0')}" style="width:70px">
+<span class=hint style="margin-left:10px">глобальный зум/сдвиг всех кадров</span></div>
+</details>
+<div class=fld style="margin-top:10px"><button class="btn btn-primary"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Собрать видео</button></div>
+<p class=hint>Сборка идёт на сервере ~2–5&nbsp;мин. Можно закрыть вкладку — результат появится справа в «Мои рендеры».</p></form>"""
+    else:
+        _rform = (f'<div style="background:var(--surface2);border:1px solid var(--border);border-left:3px solid var(--queued);border-radius:8px;padding:12px;margin-bottom:12px;font-size:14px">'
+                  f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Сначала сделайте <b>{" и ".join(_miss)}</b> — без этого видео не собрать.</div>'
+                  f'<button class="btn btn-primary" disabled><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Собрать видео</button>')
+    pane_rnd = f"""<div class=pane id=pane-rnd>
+<div class=row style="gap:18px;align-items:flex-start;flex-wrap:wrap">
+<fieldset class=lf style="flex:2;min-width:340px"><legend><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Сборка видео</legend>{short_audio_note}{gap_note}{_rform}{_media_panel}</fieldset>
+<fieldset class=lf style="flex:1;min-width:260px"><legend>Мои рендеры</legend>{_ritems}{_dl_panel}</fieldset></div>
+<script>{_rnd_js}</script></div>"""
+
+    _cmp = _last_complaint(tid, pid)
+    _cmp_line = ""
+    if _cmp:
+        _cmp_state = _COMPLAINT_STATUS_TEXT.get(_cmp["status"], _cmp["status"])
+        _cmp_msg = html.escape(str(_cmp["user_message"] or ""))
+        try:
+            _cmp_when = datetime.datetime.fromtimestamp(float(_cmp["created"] or 0)).strftime("%d.%m %H:%M")
+        except (TypeError, ValueError, OSError):
+            _cmp_when = ""
+        _cmp_line = (f'Жалоба от {_cmp_when}: <b>{html.escape(_cmp_state)}</b>'
+                     + (f' — {_cmp_msg}' if _cmp_msg else ''))
+    complaint_html = (
+        '<div class=row style="gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;margin:0 0 8px">'
+        f'<span id=cmpstate class=muted style="font-size:12px">{_cmp_line}</span>'
+        '<button class="btn btn-ghost btn-sm" onclick="document.getElementById(\'cmpmodal\').style.display=\'flex\'">Пожаловаться</button></div>'
+        '<div id=cmpmodal style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:60;align-items:center;justify-content:center" onclick="if(event.target===this)this.style.display=\'none\'">'
+        '<div class=panel style="width:560px;max-width:92vw;margin:0">'
+        '<div class=panel-title>Что не так с проектом?</div>'
+        '<div class=muted style="font-size:12px;margin-bottom:6px">Опишите простыми словами: что делали, чего ждали и что получилось. Дежурный ИИ проверит проект, попробует починить и напишет итог здесь.</div>'
+        '<textarea id=cmptext class=textarea rows=5 maxlength=2000 style="width:100%"></textarea>'
+        '<div id=cmpres class=muted style="font-size:12px;margin-top:6px"></div>'
+        '<div class=row style="margin-top:10px;justify-content:flex-end;gap:8px">'
+        '<button class="btn btn-ghost" onclick="document.getElementById(\'cmpmodal\').style.display=\'none\'">Отмена</button>'
+        '<button class="btn btn-primary" id=cmpsend onclick="cmpSend()">Отправить</button></div></div></div>'
+        '<script>async function cmpSend(){var b=document.getElementById("cmpsend"),r=document.getElementById("cmpres"),'
+        't=document.getElementById("cmptext").value.trim();b.disabled=true;r.textContent="Отправляю…";'
+        'try{var resp=await fetch("/api/projects/' + pid + '/complaint",{method:"POST",'
+        'headers:{"Content-Type":"application/x-www-form-urlencoded","Accept":"application/json"},'
+        'body:"text="+encodeURIComponent(t)});var d={};try{d=await resp.json();}catch(e){}'
+        'if(resp.ok){r.textContent=d.msg||"Жалоба принята";'
+        'document.getElementById("cmpstate").textContent="Жалоба принята, скоро начну разбирать";'
+        'setTimeout(function(){document.getElementById("cmpmodal").style.display="none";},2500);}'
+        'else{r.textContent=d.detail||("Не отправилось: "+resp.status);b.disabled=false;}}'
+        'catch(e){r.textContent="Нет связи с сервером, попробуйте ещё раз";b.disabled=false;}}</script>'
+    )
+    body = _header(u, "projects") + f"""<div class=wrap>{crumb}{complaint_html}
+<div class=row style="gap:16px;align-items:flex-start;margin-bottom:10px"><h1 style="margin:0">{html.escape(p['name'])}</h1><div data-live="stepper-{pid}" style="margin-top:5px">{head_step}</div></div>
+{preset_bar}{tabs_bar}{logpanel}{pane_src}{pane_tts}{pane_img}{pane_vid}{pane_rnd}</div>{overlays}
+{_PROJ_JS}<script>showTab({json.dumps(tab)});</script>"""
+    return _page(p['name'], body)
+
+
+_THUMB_EXT = (".jpg", ".jpeg", ".png", ".webp")
+
+
+def _thumbnail(pdir, rel, full, w):
+    """Кэш-миниатюра картинки (fit в w×w, JPEG q72) под галерею — грузится моментально вместо
+    полноразмерного файла (~700КБ). Кэш в pdir/.thumbs/{w}/{rel}.jpg; регенерится, если исходник
+    новее (перегенерация картинки). Возвращает путь к миниатюре или None (не картинка / ошибка → отдать оригинал)."""
+    w = max(48, min(1024, int(w)))
+    if os.path.splitext(full)[1].lower() not in _THUMB_EXT:
+        return None
+    tp = os.path.join(pdir, ".thumbs", str(w), rel + ".jpg")
+    try:
+        if os.path.isfile(tp) and os.path.getmtime(tp) >= os.path.getmtime(full):
+            return tp
+        os.makedirs(os.path.dirname(tp), exist_ok=True)
+        from PIL import Image
+        im = Image.open(full)
+        im.thumbnail((w, w))
+        if im.mode not in ("RGB", "L"):
+            im = im.convert("RGB")
+        tmp = tp + "." + secrets.token_hex(4) + ".tmp"
+        im.save(tmp, "JPEG", quality=72)
+        os.replace(tmp, tp)
+        return tp
+    except Exception:
+        return None
+
+
+@app.get("/p/{pid}/file/{fpath:path}")
+def project_file(pid: str, fpath: str, request: Request):
+    u = web_user(request)
+    if not u:
+        raise HTTPException(401)
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404)
+    pdir = os.path.abspath(_project_dir(tid, pid))
+    full = os.path.abspath(os.path.join(pdir, fpath))
+    if not (full == pdir or full.startswith(pdir + os.sep)) or not os.path.isfile(full):
+        raise HTTPException(404)
+    w = request.query_params.get("w")
+    if w and w.isdigit():
+        tp = _thumbnail(pdir, fpath, full, w)
+        if tp:
+            return FileResponse(tp, media_type="image/jpeg",
+                                headers={"Cache-Control": "public, max-age=604800, immutable"})
+    return FileResponse(full, media_type=_media_for(full),
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
+# ============ Скачивание материалов проекта одним zip (2026-08-02) ============
+# Партнёр работает только через веб — доступа к файловой системе сервера у него нет, а по
+# одному файлу качать сотни картинок невозможно. Архив собирается НА ЛЕТУ: zipfile пишет в
+# буфер в памяти, генератор отдаёт куски клиенту. Временных архивов на диске НЕ создаём —
+# проекты бывают на сотни МБ, а диск сервера уже забивался (инцидент 28–30.07: бэкап БД
+# падал с SQLITE_FULL). Компрессия ZIP_STORED: jpg/mp3/mp4 уже сжаты, deflate только жёг бы CPU.
+_DL_CATS = {"audio": "озвучки", "images": "картинок", "clips": "клипов",
+            "renders": "готовых mp4", "all": "материалов"}
+# категория → glob-шаблоны (относительно каталога проекта, recursive?). Страница проекта
+# считает кнопки этим же списком (_dl_n), поэтому число на кнопке = число файлов в архиве
+_DL_PATTERNS = {
+    "audio":   ((("**", "*.mp3"), True),),
+    # картинки — шире галереи (та рисует только .jpg): в googler/ бывают png/jpeg от старых
+    # прогонов и ручных материалов, и молча не отдать их в архиве — потеря данных для юзера
+    "images":  ((("googler", "*.jpg"), False), (("googler", "*.jpeg"), False),
+                (("googler", "*.png"), False), (("googler", "*.webp"), False),
+                (("Images", "**", "*.jpg"), True), (("Images", "**", "*.jpeg"), True),
+                (("Images", "**", "*.png"), True), (("Images", "**", "*.webp"), True)),
+    "clips":   ((("googler video", "*.mp4"), False),),
+    "renders": ((("render", "*.mp4"), False),),
+}
+
+
+def _dl_items(pdir, what):
+    """[(абсолютный путь, имя в архиве)] для категории. Пути строятся ТОЛЬКО нашими glob'ами
+    по каталогу проекта (снаружи ничего не подставляется), и каждый файл дополнительно
+    проверяется на выход за его пределы через realpath — это ловит и симлинки."""
+    root = os.path.realpath(pdir)
+    cats = ("audio", "images", "clips", "renders") if what == "all" else (what,)
+    out, seen = [], set()
+    for cat in cats:
+        for parts, rec in _DL_PATTERNS.get(cat, ()):
+            for f in sorted(glob.glob(os.path.join(pdir, *parts), recursive=rec)):
+                full = os.path.realpath(f)
+                if not full.startswith(root + os.sep) or not os.path.isfile(full):
+                    continue          # симлинк наружу / каталог / файл исчез
+                if full in seen:
+                    continue
+                seen.add(full)
+                out.append((full, os.path.relpath(full, root).replace(os.sep, "/")))
+    return out
+
+
+class _ZipSink:
+    """Приёмник для zipfile: копит записанные байты, отдаёт их генератору. Без seek/tell —
+    zipfile сам переходит на data descriptor (запись в неперематываемый поток)."""
+
+    def __init__(self):
+        self.buf = bytearray()
+
+    def write(self, data):
+        self.buf += data
+        return len(data)
+
+    def flush(self):
+        pass
+
+    def pop(self):
+        if not self.buf:
+            return b""
+        out = bytes(self.buf)
+        del self.buf[:]
+        return out
+
+
+def _zip_stream(items, chunk=1 << 20):
+    sink = _ZipSink()
+    zf = zipfile.ZipFile(sink, "w", zipfile.ZIP_STORED, allowZip64=True)
+    for full, arc in items:
+        try:
+            mt = time.localtime(os.path.getmtime(full))[:6]
+            zi = zipfile.ZipInfo(arc, mt if mt[0] >= 1980 else (1980, 1, 1, 0, 0, 0))
+            zi.compress_type = zipfile.ZIP_STORED
+            # force_zip64: размер файла на момент записи неизвестен (пишем в поток), а без
+            # zip64 zipfile роняет RuntimeError на файле >2 ГБ — длинный рендер туда достаёт
+            with open(full, "rb") as src, zf.open(zi, "w", force_zip64=True) as dst:
+                while True:
+                    b = src.read(chunk)
+                    if not b:
+                        break
+                    dst.write(b)
+                    part = sink.pop()
+                    if part:
+                        yield part
+        except (OSError, ValueError):
+            continue          # один битый/исчезнувший файл не должен ронять весь архив
+        part = sink.pop()
+        if part:
+            yield part
+    zf.close()
+    tail = sink.pop()
+    if tail:
+        yield tail
+
+
+@app.get("/api/projects/{pid}/download/{what}")
+def project_download(pid: str, what: str, request: Request):
+    """Материалы проекта одним zip: audio | images | clips | renders | all.
+    Доступ ровно как у остальных ручек проекта: своя web-сессия + проект СВОЕГО тенанта
+    (_get_project фильтрует по tenant_id, чужой pid → 404)."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    p = _get_project(tid, pid)
+    if not p:
+        raise HTTPException(404, "нет проекта")
+    if what not in _DL_CATS:
+        raise HTTPException(404, "нет такой категории")
+    pdir = os.path.abspath(_project_dir(tid, pid))
+    items = _dl_items(pdir, what)
+    if not items:
+        # пустой архив молча не отдаём — иначе юзер скачает 22 байта и решит, что всё пропало
+        raise HTTPException(404, f"скачивать нечего — {_DL_CATS[what]} в проекте нет")
+    base = re.sub(r"[^\w\-]+", "_", (p["name"] or "")).strip("_")[:60] or str(pid)
+    items = [(f, f"{base}/{arc}") for f, arc in items]
+    fname = f"{base}_{what}.zip"
+    _q = urllib.parse.quote(fname)
+    cd = (f'attachment; filename="{fname}"' if _q == fname
+          else f"attachment; filename*=utf-8''{_q}")
+    return StreamingResponse(_zip_stream(items), media_type="application/zip",
+                             headers={"Content-Disposition": cd, "Cache-Control": "no-store"})
+
+
+def _card_api_payload(row):
+    if not row:
+        return None
+    keys_in_row = set(row.keys())
+    queue_status = row["queue_status"] if "queue_status" in keys_in_row else None
+    queue_error = row["queue_error"] if "queue_error" in keys_in_row else None
+    status = queue_status or row["status"]
+
+    def parsed(name, default):
+        try:
+            value = json.loads(row[name]) if row[name] else default
+            return value if isinstance(value, type(default)) else default
+        except Exception:
+            return default
+
+    result = {
+        "job_id": row["job_id"],
+        "project_id": row["project_id"],
+        "status": status,
+        "contract_version": row["contract_version"],
+        "narration_sha256": row["narration_sha256"],
+        "request_sha256": row["request_sha256"],
+        "provider": row["provider"],
+        "prompt_failover": row["prompt_failover"],
+        "model": row["model"],
+        "attempts": row["attempts"],
+        "transient_requeues": row["transient_requeues"],
+        "next_attempt": row["next_attempt"],
+        "created": row["created"],
+        "started": row["started"],
+        "finished": row["finished"],
+        "error_code": row["error_code"],
+        "error": queue_error or row["last_error"],
+        "usage": parsed("usage", {}),
+        "provenance": parsed("provenance", {}),
+    }
+    if status == "done" and row["output_json"]:
+        result["download_url"] = f"/api/cards/{row['job_id']}/download"
+        result["output_sha256"] = row["output_sha256"]
+    if row["raw_json"]:
+        # Invalid model output is still valuable per-task evidence; tenant-scoped
+        # raw download remains available even when the contract task is terminal.
+        result["raw_url"] = f"/api/cards/{row['job_id']}/raw"
+        result["raw_sha256"] = row["raw_sha256"]
+    return result
+
+
+def _card_row_for_tenant(tid, jid):
+    c = db()
+    try:
+        return c.execute(
+            "SELECT cj.*,q.status AS queue_status,q.error AS queue_error "
+            "FROM card_jobs cj LEFT JOIN queue_tasks q ON q.job_id=cj.job_id "
+            "WHERE cj.job_id=? AND cj.tenant_id=?", (jid, tid),
+        ).fetchone()
+    finally:
+        c.close()
+
+
+@app.get("/api/projects/{pid}/cards/status")
+def project_card_status(pid: str, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    try:
+        _raw, _text, narration_sha = card_contract.narration_bytes(
+            os.path.join(_project_dir(tid, pid), "source.txt")
+        )
+    except card_contract.CardContractError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    c = db()
+    try:
+        row = c.execute(
+            "SELECT cj.*,q.status AS queue_status,q.error AS queue_error "
+            "FROM card_jobs cj LEFT JOIN queue_tasks q ON q.job_id=cj.job_id "
+            "WHERE cj.tenant_id=? AND cj.project_id=? AND cj.narration_sha256=? "
+            "AND cj.contract_version=?",
+            (tid, pid, narration_sha, card_contract.CONTRACT_VERSION),
+        ).fetchone()
+    finally:
+        c.close()
+    return JSONResponse({
+        "ok": True,
+        "project_id": pid,
+        "contract_version": card_contract.CONTRACT_VERSION,
+        "narration_sha256": narration_sha,
+        "job": _card_api_payload(row),
+    })
+
+
+@app.get("/api/cards/{jid}/status")
+def card_job_status(jid: int, request: Request):
+    u = require_web_user(request)
+    row = _card_row_for_tenant(_tid(u), jid)
+    if not row:
+        raise HTTPException(404, "card job not found")
+    return JSONResponse({"ok": True, "job": _card_api_payload(row)})
+
+
+def _card_json_download(jid, request, column, suffix):
+    u = require_web_user(request)
+    row = _card_row_for_tenant(_tid(u), jid)
+    if (not row or not row[column]
+            or (column == "output_json" and row["status"] != "done")):
+        raise HTTPException(404, "card artifact not ready")
+    data = row[column].encode("utf-8")
+    expected = row["output_sha256" if column == "output_json" else "raw_sha256"]
+    if not expected or not secrets.compare_digest(hashlib.sha256(data).hexdigest(), expected):
+        raise HTTPException(409, "stored card artifact hash mismatch")
+    filename = f"card_{jid}{suffix}.json"
+    return Response(
+        content=data,
+        media_type="application/json; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"',
+                 "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.get("/api/cards/{jid}/download")
+def card_download(jid: int, request: Request):
+    return _card_json_download(jid, request, "output_json", "")
+
+
+@app.get("/api/cards/{jid}/raw")
+def card_raw_download(jid: int, request: Request):
+    return _card_json_download(jid, request, "raw_json", ".raw")
+
+
+# ============================================================
+# B2 (очередь+шедулер) + B3 (стриминг логов+SSE) + B4/B5/B6 (генерация) + B7 (очередь/cancel)
+# ============================================================
+SCHED_K = int(os.environ.get("SCHED_K", "2"))   # (legacy, не используется — заменён per-service лимитами ниже)
+GEN_LEASE = int(os.environ.get("GEN_LEASE", "900"))  # gen-воркер без вывода дольше → завис → возврат в очередь (детект зомби)
+
+# Concurrency ПО РЕАЛЬНОМУ ПРОВАЙДЕРУ/API (не по грубому kind). Провайдер = из ПАРАМЕТРОВ задачи
+# (движок/модель/метод): внутри одного kind разные независимые API. ОДИН провайдер = ОДИН ключ =
+# ОДИН rate-limit → задачи одного провайдера делят лимит; РАЗНЫХ провайдеров — идут параллельно.
+#   озвучка: edge / voicer / voicegencore / elevenlabs — 4 независимых API
+#   картинки: recrafter (openai/flower/grok/narwhal/gem_pix/imagen) / veo (veo_banana) / openai (gpt_image2)
+#   видео:    veo / recrafter (flower/flow/grok)
+# recrafter обслуживает И картинки, И flower-видео (один ключ googler → делят лимит); veo — видео И veo-banana.
+_TTS_ENG_PROV = {"edge": "edge", "voicer": "voicer", "voicegencore": "voicegencore",
+                 "tts": "elevenlabs", "lumean": "lumean"}
+
+_LUMEAN_TEMPLATE_ID_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.IGNORECASE,
+)
+
+
+class LumeanTemplateError(ValueError):
+    """Lumean engine received an external Voice ID instead of a template UUID."""
+
+
+class PresetSettingsError(ValueError):
+    """Preset/project settings are not a JSON object with a valid contract."""
+
+
+# Локальная ветка кабинета может отставать от production image-contract. Пресетный
+# фикс остаётся переносимым, а production по-прежнему использует строгий валидатор.
+if "ImageModeContractError" not in globals():
+    class ImageModeContractError(ValueError):
+        pass
+
+
+def _canonical_preset_settings(settings):
+    if not isinstance(settings, dict):
+        raise PresetSettingsError("настройки пресета повреждены: ожидается JSON-объект")
+    canonicalizer = globals().get("_canonical_image_params")
+    return canonicalizer(dict(settings)) if canonicalizer else dict(settings)
+
+
+def _is_lumean_template_id(value):
+    return bool(_LUMEAN_TEMPLATE_ID_RE.fullmatch(str(value or "").strip()))
+
+
+def _normalize_lumean_settings(settings):
+    """Keep one canonical HeyGen template ID in both legacy-compatible fields."""
+    out = dict(settings or {})
+    if str(out.get("engine") or "").strip().lower() != "lumean":
+        return out
+    out["engine"] = "lumean"
+    voice = str(out.get("voice") or "").strip()
+    voice_uuid = str(out.get("voice_uuid") or "").strip()
+    valid_voice = voice if _is_lumean_template_id(voice) else ""
+    valid_uuid = voice_uuid if _is_lumean_template_id(voice_uuid) else ""
+    if valid_voice and valid_uuid and valid_voice.lower() != valid_uuid.lower():
+        raise LumeanTemplateError(
+            "Lumean · HeyGen: поля Voice и Template ID содержат разные UUID"
+        )
+    template_id = valid_uuid or valid_voice
+    if not template_id:
+        raise LumeanTemplateError(
+            "Lumean · HeyGen требует UUID Template ID из библиотеки Lumean; "
+            "обычный ElevenLabs/VoiceGenCore Voice ID сюда не подходит"
+        )
+    out["voice"] = template_id
+    out["voice_uuid"] = template_id
+    # Model/voice engine live inside the validated Lumean template.  Leaving
+    # legacy per-worker values here makes the project UI look configured while
+    # the order ignores them.
+    out["model_id"] = ""
+    out["model_uuid"] = ""
+    out.pop("voice_engine", None)
+    out.pop("stability", None)
+    out.pop("thread_count", None)
+    out.pop("auto_pause_enabled", None)
+    return out
+
+
+def _preset_project_payload(settings, preset_id):
+    payload = _canonical_preset_settings(settings)
+    payload = _normalize_lumean_settings(payload)
+    payload = {k: v for k, v in payload.items()
+               if k not in _SETTINGS_SKIP and k not in _DEFERRED_KEYS
+               and not str(k).startswith("_")}
+    payload["_applied_preset"] = int(preset_id)
+    return payload
+# engine → папка озвучки (каждый TTS-воркер пишет в свою). Рендер собирает ВСЕ _FINAL_AUDIO_*/*.mp3
+# рекурсивно и склеивает → если остались озвучки двух движков, звук задваивается. Поэтому перед
+# новой озвучкой чистим папки ДРУГИХ движков.
+_ENGINE_AUDIO_DIR = {"edge": "_FINAL_AUDIO_EDGETTS", "voicer": "_FINAL_AUDIO_VOICER",
+                     "voicegencore": "_FINAL_AUDIO_VGC", "tts": "_FINAL_AUDIO_ELEVENLABS",
+                     "lumean": "_FINAL_AUDIO_LUMEAN"}
+
+
+def _clear_other_audio_dirs(projdir, engine, jid=None):
+    """Удаляет _FINAL_AUDIO_* всех ДВИЖКОВ, кроме выбранного (против задвоения озвучки при рендере).
+    Неизвестный движок → не трогаем ничего (чтобы не снести нужное)."""
+    keep = _ENGINE_AUDIO_DIR.get(engine)
+    if not keep:
+        return
+    import shutil as _sh
+    for af in glob.glob(os.path.join(projdir, "_FINAL_AUDIO_*")):
+        if os.path.isdir(af) and os.path.basename(af) != keep:
+            try:
+                n = len(glob.glob(os.path.join(af, "*.mp3")))
+                _sh.rmtree(af)
+                if jid is not None and n:
+                    _log_line(jid, f"🧹 убрал озвучку другого движка ({os.path.basename(af)}, {n} mp3) — иначе рендер склеил бы обе")
+            except Exception:
+                pass
+
+
+_PROMPT_PROVIDER_GROUPS = {"prompt_openai", "prompt_claude", "prompt_codex", "prompt_altclaude"}
+
+# Per-task scheduler policy. The client may choose whether its own task permits
+# server-policy failover, but never names a provider or credential. ``legacy`` is
+# deliberately the missing-field default so all old callers retain today's behavior.
+_PROMPT_FAILOVER_PARAM = "prompt_failover"
+_PROMPT_FAILOVER_LEGACY = "legacy"
+_PROMPT_FAILOVER_DISABLED = "disabled"
+_PROMPT_FAILOVER_VALUES = frozenset({_PROMPT_FAILOVER_LEGACY, _PROMPT_FAILOVER_DISABLED})
+_PROMPT_FAILOVER_UNSET = object()
+
+
+def _normalize_prompt_failover(value=_PROMPT_FAILOVER_UNSET):
+    """Return a canonical task policy; explicit malformed input fails closed.
+
+    Missing is the only value that means legacy compatibility. Empty strings,
+    booleans, mappings and provider names are explicit but invalid requests, so they
+    become ``disabled`` instead of accidentally enabling cross-provider fallback.
+    """
+    if value is _PROMPT_FAILOVER_UNSET:
+        return _PROMPT_FAILOVER_LEGACY
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in _PROMPT_FAILOVER_VALUES:
+            return normalized
+    return _PROMPT_FAILOVER_DISABLED
+
+
+def _prompt_failover_from_row(row):
+    """Read the authoritative policy from a queue row.
+
+    New rows have a first-class column. NULL/missing columns are pre-migration rows:
+    a canonical field in params is honored, otherwise they keep legacy behavior.
+    Corrupt/non-object params fail closed because scheduler reroute must never infer
+    permission from a payload it could not parse.
+    """
+    raw_policy = _PROMPT_FAILOVER_UNSET
+    raw_params = None
+    try:
+        keys_in_row = row.keys()
+    except Exception:
+        keys_in_row = ()
+    try:
+        if "prompt_failover" in keys_in_row:
+            raw_policy = row["prompt_failover"]
+    except Exception:
+        raw_policy = _PROMPT_FAILOVER_UNSET
+    try:
+        if "params" in keys_in_row:
+            raw_params = row["params"]
+    except Exception:
+        raw_params = None
+
+    if isinstance(raw_params, dict):
+        parsed = raw_params
+    elif raw_params in (None, ""):
+        parsed = {}
+    else:
+        try:
+            parsed = json.loads(raw_params)
+        except Exception:
+            return _PROMPT_FAILOVER_DISABLED
+        if not isinstance(parsed, dict):
+            return _PROMPT_FAILOVER_DISABLED
+
+    if raw_policy is _PROMPT_FAILOVER_UNSET or raw_policy is None:
+        if _PROMPT_FAILOVER_PARAM in parsed:
+            return _normalize_prompt_failover(parsed[_PROMPT_FAILOVER_PARAM])
+        return _PROMPT_FAILOVER_LEGACY
+    return _normalize_prompt_failover(raw_policy)
+
+
+def _prompt_group_for_uid(uid, prefer_free=False):
+    if uid is None:
+        return "prompt_openai"
+    c = db()
+    try:
+        u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    finally:
+        c.close()
+    channel = _effective_prompt_provider(u, prefer_free=prefer_free)
+    return ("prompt_" + channel) if channel else ""
+
+
+def _task_provider(kind, params, uid=None, stored_provider=None, prefer_free=False):
+    """Провайдер (rate-limit-группа) задачи из её параметров.
+
+    prefer_free=True зовёт только _enqueue: канал промптов выбирается с учётом
+    свободных слотов групп. Шедулер и все прочие вызовы читают снимок (provider),
+    поэтому лишних запросов к БД внутри claim-транзакции не появляется."""
+    try:
+        p = params if isinstance(params, dict) else (json.loads(params) if params else {})
+    except Exception:
+        p = {}
+    if kind in ("prompts", "images", "regen"):
+        p = _canonical_image_task_params(kind, p)
+    if kind == "tts":
+        eng = str(p.get("engine") or p.get("tts_engine") or "edge").strip().lower()
+        # Legacy/ручной payload с неизвестным engine не получает произвольную
+        # provider-группу и отдельный default cap. _build_cmd ниже отклонит его.
+        return _TTS_ENG_PROV.get(eng, "elevenlabs")
+    if kind == "cards":
+        # Security boundary: cards never inherit the user's chosen prompt channel
+        # and never parse a provider/model from params.  Every task is exact Opus
+        # through the existing Claude credential lane.
+        return card_contract.PROVIDER_GROUP
+    if kind in ("prompts", "chapters"):
+        # Главы ходят в тот же канал написания промптов, что и план сцен, поэтому
+        # и группа у них та же. Без этой ветки kind провалился бы в `return kind`
+        # ниже, группа «chapters» осталась бы без credential-family, и воркер
+        # стартовал бы БЕЗ ключей LLM (тот же класс бага, что был с bing).
+        # Provider snapshot записывает сервер при enqueue. Legacy/null безопасно
+        # маппится в prompt_openai; client params никогда не выбирают группу.
+        if stored_provider in _PROMPT_PROVIDER_GROUPS:
+            return stored_provider
+        return (_prompt_group_for_uid(uid, prefer_free=prefer_free)
+                if uid is not None else "prompt_openai")
+    if (kind in ("images", "regen")
+            and p.get("image_mode") == _IMAGE_MODE_BING):
+        # Bing (в т.ч. реген одной картинки поиском) — своя группа: ни ключа, ни
+        # кредитов провайдеров генерации он не тратит.
+        return "bing"
+    if kind in ("images", "regen"):
+        m = p["model"]
+        return IMAGE_MODELS.get(m, (None, None, "recrafter"))[2]      # recrafter / veo / openai
+    if kind in ("video", "regen_video"):
+        meth = (p.get("video_method") or p.get("googler_video_method") or "veo")
+        return VIDEO_METHODS.get(meth, (None, None, "veo"))[2]        # veo / recrafter
+    return kind
+
+
+# ── Серверно-недоступные провайдеры ───────────────────────────────────────────
+# «Сервер умеет провайдера» = у него есть credential в СЕРВЕРНОМ пуле (не захардкоженный
+# список): ключ протух/выкинут из файла — вариант сразу помечен в выборе и не ставится в
+# очередь. Свой ключ юзера (BYOK) открывает провайдера как обычно.
+NO_SERVER_KEY_HINT = ("серверного ключа нет — поставьте свой ключ на странице «Ключи» "
+                      "или выберите другого провайдера")
+
+
+def _provider_has_server_credential(prov):
+    """Есть ли у сервера рабочий credential этой provider-группы.
+    Бесключевые группы (bing, edge, render) credential-family не имеют → всегда доступны."""
+    family = _provider_credential_family(prov)
+    if not family:
+        return True
+    return bool(_credential_candidates(keys(), family))
+
+
+def _provider_available_for(u, prov, kind=None):
+    """Доступен ли провайдер для kind: серверный credential ИЛИ
+    личный credential, у которого этот kind не отключён."""
+    if _own_only(u) and _provider_credential_family(prov):
+        return bool(_own_credential_for_task(u, prov, kind))
+    if _provider_has_server_credential(prov):
+        return True
+    return bool(_own_credential_for_task(u, prov, kind))
+
+
+def _provider_title(prov):
+    """Человеческая подпись provider-группы (та же, что в админ-таблице лимитов)."""
+    for row in _SERVER_LIMIT_ROWS:
+        if row[0] == prov:
+            return row[1]
+    return PROVIDER_LABELS.get(prov, prov)
+
+
+def _blocked_providers(u, *model_dicts, kind=None):
+    """provider-группы из справочников моделей/методов, недоступные этому юзеру."""
+    provs = {v[2] for d in model_dicts for v in d.values()}
+    return {p for p in provs if not _provider_available_for(u, p, kind)}
+
+
+def _tts_engine_note(u, engine):
+    """Подпись «нет серверного ключа» для движка озвучки ('' — движок доступен)."""
+    prov = _TTS_ENG_PROV.get(str(engine or "").lower())
+    if not prov or _provider_available_for(u, prov, "tts"):
+        return ""
+    return NO_SERVER_KEY_HINT
+
+
+def _provider_block_reason(u, kind, params, project_id=None):
+    """Почему задачу нельзя ставить ('' — можно). Провайдер берётся из её же параметров,
+    поэтому prompts проходит через штатную policy (_prompt_group_for_uid), а не через дубль."""
+    try:
+        uid = u["id"] if u is not None else None
+    except Exception:
+        uid = None
+    prov = _task_provider(kind, params, uid=uid)
+    if kind in ("prompts", "chapters") and prov not in _PROMPT_PROVIDER_GROUPS:
+        return "Промпты: нет доступного рабочего канала"
+    if prov in _PROMPT_PROVIDER_GROUPS and _prompt_uid_paused(uid, project_id):
+        return "Генерация текстов и промптов в вашем профиле временно приостановлена"
+    # Provider-specific pause means an operator has confirmed that this exact
+    # external route is unhealthy.  Reject new work before it can join an
+    # intentionally frozen backlog.  A global maintenance pause keeps its old
+    # semantics and may still accept work for later processing.
+    if prov in _queue_pause_state()["providers"]:
+        return (f"{_provider_title(prov)}: канал временно приостановлен — "
+                "выберите другой доступный провайдер")
+    if _provider_available_for(u, prov, kind):
+        return ""
+    return f"{_provider_title(prov)}: {NO_SERVER_KEY_HINT}"
+
+
+def _assert_provider_available(u, kind, params, project_id=None):
+    """Loud-fail ПРИ ПОСТАНОВКЕ: иначе задача висела бы в очереди и падала в воркере."""
+    reason = _provider_block_reason(u, kind, params, project_id=project_id)
+    if reason:
+        raise HTTPException(400, reason)
+
+
+# (глобальный, на_тенанта) на каждый провайдер. Внутри ОДНОЙ задачи уже многопоточность на провайдера,
+# поэтому per-tenant = кол-во ПАРАЛЛЕЛЬНЫХ ЗАДАЧ на один ключ. edge — без ключа.
+# Это ДЕФОЛТЫ (env-настраиваемы); поверх них — блок "_concurrency" из video_studio_api_keys.json
+# (см. _provider_caps). voicer=(5,5): лимит API Voicer — 5 задач/ключ, а с --full_text одна джоба = одна задача.
+PROVIDER_LIMITS = {
+    "edge":         (int(os.environ.get("EDGE_G", "8")),   int(os.environ.get("EDGE_K", "3"))),
+    "voicer":       (int(os.environ.get("VOICER_G", "5")), int(os.environ.get("VOICER_K", "5"))),
+    "voicegencore": (int(os.environ.get("VGC_G", "4")),    int(os.environ.get("VGC_K", "2"))),
+    "elevenlabs":   (int(os.environ.get("EL_G", "4")),     int(os.environ.get("EL_K", "2"))),
+    "lumean":       (int(os.environ.get("LUMEAN_G", "10")), int(os.environ.get("LUMEAN_K", "10"))),
+    "recrafter":    (int(os.environ.get("RECR_G", "4")),   int(os.environ.get("RECR_K", "2"))),
+    "veo":          (int(os.environ.get("VEO_G", "4")),    int(os.environ.get("VEO_K", "1"))),
+    "openai":       (int(os.environ.get("OAI_G", "4")),    int(os.environ.get("OAI_K", "2"))),
+    "bing":          (int(os.environ.get("BING_G", "2")),   int(os.environ.get("BING_K", "1"))),
+    # Реальные prompt-провайдеры независимы. Задач × «потоков на проект» = вызовов
+    # канала разом, и потоки ВЫВОДЯТСЯ из бюджета памяти (_prompt_threads_hard),
+    # а не сверяются с ним постфактум: на боевом боксе (MemTotal 17.9 ГБ, бюджет
+    # ≈10.4 ГБ) это codex 2×20 = 40 вызовов (6.6 ГБ) + claude 2×6 = 12 (3.5 ГБ),
+    # вместе ≈10.1 ГБ. openai — HTTP-путь, процессов не поднимает и памяти не ест,
+    # его потолок держит только rate limit аккаунта (его делят три сервиса).
+    "prompt_openai": (int(os.environ.get("PROMPT_OPENAI_G", "4")),
+                      int(os.environ.get("PROMPT_OPENAI_K", "4"))),
+    "prompt_codex":  (int(os.environ.get("PROMPT_CODEX_G", "2")),
+                      int(os.environ.get("PROMPT_CODEX_K", "2"))),
+    "prompt_claude": (int(os.environ.get("PROMPT_CLAUDE_G", "2")),
+                      int(os.environ.get("PROMPT_CLAUDE_K", "2"))),
+}
+_PROVIDER_DEFAULT = (int(os.environ.get("PROV_G", "4")), int(os.environ.get("PROV_K", "2")))
+# Потолки задач НА ОДИН КЛЮЧ. Считаны по факту, а не по наследству: цифра 4 осталась
+# от машины с 957 МБ памяти, нынешняя — 18 ГБ. Замер 19.08.2026: воркер картинок держит
+# изображения в памяти и стоит 305–414 МБ, воркер озвучки — HTTP-ожидание и всего 31 МБ,
+# поэтому потолки у них не могут быть одинаковыми. Своя дорожка умножает потолок на
+# число ключей владельца (у провайдера лимит на ключ), серверная — на размер пула.
+_PROVIDER_HARD_JOB_CAPS = {
+    # Предел аккаунта VoiceGenCore (замер владельца 19.08.2026): ровно 2 задачи на
+    # ключ. Число здесь, а не ссылкой на _PROVIDER_ACCOUNT_LIMITS: та таблица
+    # объявлена ниже по файлу, и ссылка на неё роняет импорт всего сервиса.
+    "voicegencore": 2,
+    # 25 взвешенных потоков ключа расписаны владельцем: 1 обложкам + 8×3 картинкам.
+    # Подъём до 12 проектов давал 12×8=96 потоков при лимите 25 — задачи дрались за
+    # потоки у провайдера и висели часами, не завершаясь.
+    "recrafter": 4,          # 12 × ~400 МБ ≈ 4.8 ГБ на ключ
+    # Замер 19.08.2026: воркер видео стоит 3 МБ — он только ждёт ответа провайдера,
+    # ничего не держа в памяти. Потолок здесь задаёт не машина, а сам VeoNonStop.
+    "veo": 24,
+    "openai": 12,
+    "voicer": 16,
+    "lumean": 10,
+    "edge": 16,
+    # Код-потолок задач канала промптов. Вместе с PROMPT_THREADS_HARD задаёт верхнюю
+    # границу одновременных вызовов канала: выше не поднимут ни env, ни /server-limits.
+    # Сверяется с замеренным бюджетом памяти тестом (см. _prompt_memory_estimate_mb).
+    "prompt_openai": 4,
+    "prompt_codex": 2,
+    "prompt_claude": 2,
+}
+# Физический предел АККАУНТА провайдера (замеры 30.07). Аккаунт делят три сервиса
+# (VideoStudio + Cover + Rewrite), поэтому это предел на всех, а не на этот кабинет.
+_PROVIDER_ACCOUNT_LIMITS = {
+    "recrafter": (25, "25 взвешенных image-потоков и 6000 картинок/час"),
+    # Замер владельца 19.08.2026: ключ VoiceGenCore тянет РОВНО 2 задачи. Больше он не
+    # отвергает, а молча складывает в свою очередь: задачи висят «в работе» часами,
+    # занимая слоты и создавая видимость работы. Поднятие до 24 остановило озвучку
+    # полностью — ноль завершений за двадцать минут при норме три минуты на ролик.
+    "voicegencore": (2, "2 задачи на ключ"),
+    "veo":       (24, "24 задачи одновременно"),
+    "voicer":    (5,  "5 задач на ключ"),
+    "lumean":    (10, "10 одновременных HeyGen-задач на ключ"),
+}
+# Взвешенный бюджет ОДНОГО серверного ключа (units, которыми задачи занимают ключ).
+# Код-потолок = реальный предел аккаунта: выше него не поднимает ни env, ни админ-панель.
+# Дефолт остаётся консервативным (аккаунт делят три сервиса) — фактическое значение
+# владелец задаёт полем «бюджет потоков ключа» на /server-limits (см. _provider_budget_units).
+# Env по-прежнему умеет только ПОНИЗИТЬ относительно код-потолка.
+_PROVIDER_BUDGET_HARD = {
+    "recrafter": _PROVIDER_ACCOUNT_LIMITS["recrafter"][0],
+    "veo":       _PROVIDER_ACCOUNT_LIMITS["veo"][0],
+}
+FASTGEN_VIDEO_WEIGHT_BUDGET = max(
+    1, min(_PROVIDER_BUDGET_HARD["recrafter"],
+           int(os.environ.get("VS_FASTGEN_WEIGHT_BUDGET", "12")))
+)
+VEO_VIDEO_INFLIGHT_BUDGET = max(
+    1, min(_PROVIDER_BUDGET_HARD["veo"],
+           int(os.environ.get("VS_VEO_INFLIGHT_BUDGET", "20")))
+)
+# env/код-дефолт бюджета: используется, пока админ не задал key_budget на /server-limits.
+_PROVIDER_BUDGET_ENV = {
+    "recrafter": FASTGEN_VIDEO_WEIGHT_BUDGET,
+    "veo":       VEO_VIDEO_INFLIGHT_BUDGET,
+}
+
+
+def _provider_budget_units(prov):
+    """Бюджет единиц одного серверного ключа провайдера или None (бюджет не применим).
+
+    Приоритет: админ-настройка `key_budget` из /server-limits > env/код-дефолт.
+    Реальный предел АККАУНТА (_PROVIDER_BUDGET_HARD) — жёсткий потолок в обе стороны:
+    раздутое значение в JSON/форме не поднимает нагрузку на ключ выше того, что он тянет.
+    """
+    hard = _PROVIDER_BUDGET_HARD.get(prov)
+    if not hard:
+        return None
+    val = _provider_limit_opt(prov, "key_budget")
+    base = int(val) if val else _PROVIDER_BUDGET_ENV.get(prov, hard)
+    return max(1, min(int(hard), int(base)))
+
+
+# Внутренняя параллельность одного shared VoiceGenCore job: пользователь может
+# попросить меньше, но не способен поднять нагрузку выше server-owned потолка.
+VGC_THREADS_HARD = 64
+VGC_THREADS_PER_JOB = max(1, min(VGC_THREADS_HARD, int(os.environ.get("VGC_THREADS_PER_JOB", "4"))))
+# Один image-job сам запускает ThreadPoolExecutor в googler_worker. У общего
+# FastGen-ключа лимит взвешенных потоков (тяжёлая модель = вес 4), поэтому
+# кабинет не принимает клиентское значение и всегда задаёт серверный потолок.
+# HARD — код-потолок: ни env, ни админ-настройка (_concurrency.threads) выше него не поднимают.
+SHARED_IMAGE_THREADS_HARD = 12
+SHARED_VIDEO_THREADS_HARD = 20
+SHARED_IMAGE_THREADS_PER_JOB = max(
+    1, min(SHARED_IMAGE_THREADS_HARD, int(os.environ.get("SHARED_IMAGE_THREADS_PER_JOB", "3")))
+)
+SHARED_VIDEO_THREADS_PER_JOB = max(
+    1, min(SHARED_VIDEO_THREADS_HARD, int(os.environ.get("SHARED_VIDEO_THREADS_PER_JOB", "5")))
+)
+# «Попыток генерации» серверного ключа (env GOOGLER_MAX_RETRIES воркера). Код-потолок.
+SERVER_RETRIES_HARD = 20
+# Виды ключей, у которых «попытки» реально доезжают до воркера (googler_worker._gen_attempts).
+# Для остальных поле в админ-таблице НЕ рисуется — UI не должен врать.
+_SERVER_RETRY_GROUPS = ("recrafter", "veo", "openai")
+# Доля серверной дорожки, которую по умолчанию получает byok-дорожка (свои ключи юзеров).
+# Дорожек две, а железо одно: без бюджета суммарная параллельность доходила до 2× лимита.
+BYOK_LANE_RATIO = max(0.1, min(1.0, float(os.environ.get("VS_BYOK_LANE_RATIO", "0.5"))))
+
+# ── Админ-таблица серверных ключей (/server-limits → блок "_concurrency" файла ключей) ──
+# строка = вид ключа: (provider-группа, подпись, есть «потоков на проект», есть «попыток»)
+_SERVER_LIMIT_ROWS = (
+    ("recrafter",     "FastGen / Recrafter (картинки, видео)", True,  True),
+    ("veo",           "VeoNonStop (видео + banana)",           True,  True),
+    ("openai",        "OpenAI (gpt-image)",                    True,  True),
+    ("voicer",        "Voicer / mat3u (озвучка)",              False, False),
+    ("voicegencore",  "VoiceGenCore (озвучка)",                True,  False),
+    ("elevenlabs",    "Lumean (бывш. ElevenLabs) · озвучка", False, False),
+    ("lumean",        "Lumean · только HeyGen · озвучка",      False, False),
+    ("edge",          "Edge TTS (без ключа)",                  False, False),
+    ("bing",          "Bing (поиск картинок)",                 True,  False),
+    ("prompt_openai", "Промпты · GPT API",                     True,  False),
+    ("prompt_claude", "Промпты · подписка Claude",             True,  False),
+    ("prompt_codex",  "Промпты · подписка ChatGPT (Codex)",    True,  False),
+)
+# Границы полей админ-таблицы (пусто = серверный дефолт из кода). Клампится и на записи,
+# и на чтении: раздутое значение в JSON не поднимает лимит выше код-потолков.
+# ── Бюджет ВЫЗОВОВ ключа у провайдеров без взвешенного бюджета ───────────────
+# У recrafter/veo нагрузка на ключ считается в units и ограничена key_budget. У
+# остальных keyed-провайдеров units задачи = 1 (ручка «проектов разом» должна давать
+# заявленное число проектов, иначе возвращается вечное залипание bing), поэтому
+# РЕАЛЬНАЯ параллельность к ключу = задачи × «потоков на проект» и ничем не была
+# ограничена: замер 31.07 на боевом конфиге — openai 4 проекта × 3 потока = 12
+# одновременных вызовов ключа (до перевода units→1 их было 3), при админ-настройке
+# threads=12 → 16; bing 2 × 3 = 6 и 24 соответственно, а с поднятым «проектов разом»
+# доходило до 96. Аккаунт OpenAI делят ТРИ сервиса (VideoStudio + Rewrite + Cover), и
+# в истории проекта уже было "exceeded your current quota".
+# Лечение (_server_threads_setting): потоки клампятся так, чтобы задачи × потоки ≤
+# бюджета вызовов. Инвариант «units ≤ ёмкости» НЕ трогаем — units остаются 1,
+# «проектов разом» остаётся заявленным (openai 4, bing 2).
+# Дефолт openai = 4: единственная проверенная боем нагрузка на этот ключ ≈3 вызова,
+# 4 проекта × 1 поток даёт тот же порядок. bing = 6: ровно сегодняшний дефолт (2 × 3),
+# то есть при дефолтных настройках поведение НЕ меняется, режется только задранное.
+# Поднять можно полем `call_budget` в _concurrency (в границах hard).
+_PROVIDER_CALL_BUDGET_HARD = {"openai": 12, "bing": 12}
+_PROVIDER_CALL_BUDGET_DEFAULT = {"openai": 4, "bing": 6}
+
+_SERVER_LIMIT_BOUNDS = {
+    "global": (1, 64), "per_tenant": (1, 32), "threads": (1, 64),
+    "retries": (1, SERVER_RETRIES_HARD), "byok_global": (1, 64),
+    # «бюджет потоков ключа»: рисуется только у провайдеров с взвешенным бюджетом,
+    # финальный кламп — по РЕАЛЬНОМУ пределу аккаунта в _provider_budget_units.
+    "key_budget": (1, max(_PROVIDER_BUDGET_HARD.values())),
+    # «бюджет вызовов ключа» (провайдеры без взвешенного бюджета): задачи × потоки
+    # не поднимаются выше него. Формой не пишется — правится в _concurrency; кламп
+    # по КОНКРЕТНОМУ провайдеру делает _provider_call_budget.
+    "call_budget": (1, max(_PROVIDER_CALL_BUDGET_HARD.values())),
+}
+# FastGen weighted request units = КРЕДИТЫ модели у провайдера. Источник истины —
+# src/googler_worker.py::GOOGLER_MODEL_CREDITS (сверяется тестом
+# tests/test_server_key_budgets.py). OPENAI здесь стоял 4 при реальной цене 1:
+# один проект на ДЕФОЛТНОЙ модели съедал весь бюджет ключа, и второй не стартовал.
+_FASTGEN_IMAGE_WEIGHTS = {
+    "OPENAI": 1,
+    "FLOWER": 1,
+    "NARWHAL": 4,
+    "NARWHAL_LITE": 4,
+    "GEM_PIX_2": 4,
+    "IMAGEN_3_5": 4,
+    "GROK": 3,
+    "GROK_SPEED": 1,
+}
+_FASTGEN_VIDEO_WEIGHTS = {"flower": 1, "flow": 4, "grok": 3}
+
+
+def _task_fastgen_weight(kind, params):
+    p = params if isinstance(params, dict) else {}
+    if kind in ("images", "regen"):
+        p = _canonical_image_task_params(kind, p)
+        if p.get("image_mode") == _IMAGE_MODE_BING:
+            return 1
+        model = p["model"]
+        return _FASTGEN_IMAGE_WEIGHTS.get(model, 2)
+    if kind in ("video", "regen_video"):
+        method = str(p.get("video_method") or p.get("googler_video_method") or "veo").lower()
+        return _FASTGEN_VIDEO_WEIGHTS.get(method, 2)
+    return 1
+
+
+def _own_key_threads(server_threads, own_threads):
+    """Потоки на СВОЁМ ключе задаёт владелец ключа, а не сервер.
+
+    Серверный потолок защищает СЕРВЕРНЫЙ ключ; чужой оплаченный ключ он не тратит,
+    поэтому зажимать его нечем: у ключа владельца 25 потоков, у партнёра — свои,
+    и держать их на серверных 8 значит гонять чужой ключ вхолостую (замер 05.08).
+    Своя настройка не задана → берём серверную как разумный дефолт."""
+    try:
+        want = int(own_threads or 0)
+    except (TypeError, ValueError):
+        want = 0
+    return max(1, want) if want > 0 else max(1, int(server_threads))
+
+
+# Keyed image/video провайдеры: «потоков на проект» = вложенные вызовы ОДНОГО credential
+# slot, поэтому они не должны превышать ёмкость слота. Иначе учёт (_task_capacity_units
+# клампит units по ёмкости) расходится с реальной нагрузкой на ключ: threads=12 у openai
+# запускало 12 потоков при units=4.
+_SLOT_CLAMPED_THREAD_PROVIDERS = ("recrafter", "veo", "openai")
+
+def _provider_call_budget(prov):
+    """Сколько одновременных вызовов ключа держит аккаунт провайдера (или None —
+    у провайдера взвешенный бюджет units, там нагрузку ограничивает key_budget)."""
+    hard = _PROVIDER_CALL_BUDGET_HARD.get(prov)
+    if not hard:
+        return None
+    val = _provider_limit_opt(prov, "call_budget")
+    base = int(val) if val else _PROVIDER_CALL_BUDGET_DEFAULT.get(prov, hard)
+    return max(1, min(int(hard), int(base)))
+
+
+def _server_threads_setting(prov, default, hard):
+    """«Потоков на проект» серверного ключа: админ-настройка (_concurrency.threads) вместо
+    зашитого дефолта, но НИКОГДА выше код-потолка hard, ёмкости credential slot и
+    бюджета ВЫЗОВОВ ключа (задачи × потоки ≤ _provider_call_budget)."""
+    val = _provider_limit_opt(prov, "threads")
+    base = max(1, min(int(hard), int(val or default)))
+    host_family = {"recrafter":"fastgen", "veo":"veo", "openai":"openai"}.get(prov)
+    if host_family:
+        base = min(base, _host_budget.CAPACITIES[host_family])
+    if prov in _SLOT_CLAMPED_THREAD_PROVIDERS:
+        base = max(1, min(base, _provider_slot_capacity_units(prov)))
+    call_budget = _provider_call_budget(prov)
+    if call_budget:
+        base = max(1, min(base, call_budget // max(1, _provider_job_slots(prov))))
+    return base
+
+
+def _server_image_threads(params):
+    provider = _task_provider("images", params)
+    base = _server_threads_setting(provider, SHARED_IMAGE_THREADS_PER_JOB,
+                                   SHARED_IMAGE_THREADS_HARD)
+    # Делить потоки на цену модели нельзя (см. _task_capacity_units): из-за этого
+    # NARWHAL_LITE получал 5 потоков вместо 8, хотя ключ тянет 25 любой моделью.
+    if provider in ("recrafter", "veo"):
+        return max(1, min(base, _provider_budget_units(provider)))
+    return base
+
+
+def _server_video_threads(params):
+    provider = _task_provider("video", params)
+    base = _server_threads_setting(provider, SHARED_VIDEO_THREADS_PER_JOB,
+                                   SHARED_VIDEO_THREADS_HARD)
+    if provider in ("recrafter", "veo"):
+        return max(1, min(base, _provider_budget_units(provider)))
+    return base
+
+
+def _task_capacity_units(kind, params, provider=None):
+    """Nested provider calls, которыми job занимает общий account budget."""
+    provider = provider or _task_provider(kind, params)
+    # ВЗВЕШЕННЫЙ бюджет (units с ценой вызова) есть только у ключей, где он замерен —
+    # recrafter (кредиты модели) и veo. У остальных «ёмкость» из /server-limits — это
+    # ЧИСЛО ЗАДАЧ («проектов разом»), и мерить задачу ПОТОКАМИ там нельзя: openai с
+    # ручкой «4 проекта разом» получал units=3 при бюджете 4 → стартовал ОДИН проект,
+    # bing (настройка 2, units 2, бюджет 2) — тоже один, и поднять через форму было
+    # нельзя. Для таких провайдеров задача = задача (1 unit), поэтому «проектов разом»
+    # реально даёт заявленное число; инвариант units ≤ ёмкости при этом выполняется
+    # тривиально (ёмкость ≥ 1), то есть вечное залипание bing не возвращается.
+    if not _provider_budget_units(provider):
+        return 1
+    # ЦЕНА КАРТИНКИ В КРЕДИТАХ НЕ ЗАНИМАЕТ ПОТОК. У ключа FastGen два независимых
+    # ресурса: потоки (сколько запросов идёт одновременно — у ключа владельца 25) и
+    # кредиты (сколько списывается за картинку: OPENAI/FLOWER 1, NARWHAL_LITE и др. 4).
+    # Дорогая модель тратит бюджет быстрее, но занимает ровно один поток, как дешёвая.
+    # Раньше здесь стояло threads × вес → задача на NARWHAL_LITE «весила» 20 из 21, и
+    # одновременно шла РОВНО ОДНА задача картинок: 05.08 двадцать три задачи владельца
+    # стояли в очереди при полностью простаивающем ключе (0 генераций, 0 потоков).
+    if kind in ("regen", "regen_video"):
+        units = 1
+    elif kind == "images":
+        units = _server_image_threads(params)
+    elif kind == "video":
+        units = _server_video_threads(params)
+    else:
+        units = 1
+    # Единицы задачи ОБЯЗАНЫ быть сопоставимы с ёмкостью провайдера, иначе задача
+    # висит queued вечно без ошибки и без лога (было у bing: 3 потока против
+    # ёмкости 2; тот же капкан у любого провайдера, которому понизили global).
+    # Клампим по ёмкости ОДНОГО credential slot: это и потолок lease
+    # (_reserve_task_credential), и заведомо ≤ общей ёмкости провайдера.
+    return max(1, min(units, _provider_slot_capacity_units(provider)))
+
+# Оверрайд лимитов параллельности из настроек ключей: блок "_concurrency" в video_studio_api_keys.json.
+# Формат: {"voicer": {"global": 5, "per_tenant": 5}, ...}. Кэш ~10с — не читать файл на каждой
+# итерации шедулера. Меняется правкой JSON + рестартом vsgen (или подхватится в течение 10с).
+_CONC_CACHE = {"ts": 0.0, "data": {}}
+
+
+def _concurrency_cfg():
+    now = time.time()
+    if now - _CONC_CACHE["ts"] > 10:
+        try:
+            d = (keys() or {}).get("_concurrency")
+        except Exception:
+            d = None
+        _CONC_CACHE["data"] = d if isinstance(d, dict) else {}
+        _CONC_CACHE["ts"] = now
+    return _CONC_CACHE["data"]
+
+
+def _provider_limit_opt(prov, field):
+    """Поле админ-настройки серверного ключа (_concurrency[prov][field]) или None.
+
+    Значение клампится в _SERVER_LIMIT_BOUNDS ЗДЕСЬ, на чтении: правка JSON руками
+    по SSH (в обход формы) не должна поднимать лимит выше границ, а мусор — ломать
+    шедулер. Поверх этого действуют код-потолки (_PROVIDER_HARD_JOB_CAPS,
+    SHARED_*_THREADS_HARD, PROMPT_THREADS_HARD, SERVER_RETRIES_HARD).
+    """
+    o = _concurrency_cfg().get(prov)
+    if not isinstance(o, dict):
+        return None
+    raw = o.get(field)
+    if raw is None or raw == "":
+        return None
+    try:
+        val = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if val <= 0:
+        return None
+    lo, hi = _SERVER_LIMIT_BOUNDS.get(field, (1, 64))
+    return max(lo, min(hi, val))
+
+
+KEYS_BACKUPS_KEEP = max(1, int(os.environ.get("VS_KEYS_BACKUPS_KEEP", "20")))
+
+
+def _prune_keys_backups(path, keep=None):
+    """Оставить последние N бэкапов файла ключей (старые удалить). Тихо, best-effort."""
+    keep = KEYS_BACKUPS_KEEP if keep is None else max(1, int(keep))
+    d = os.path.dirname(path) or "."
+    prefix = os.path.basename(path) + ".bak."
+    try:
+        names = [n for n in os.listdir(d) if n.startswith(prefix)]
+    except OSError:
+        return
+    def _mtime(name):
+        try:
+            return os.path.getmtime(os.path.join(d, name))
+        except OSError:
+            return 0.0
+    for name in sorted(names, key=lambda n: (_mtime(n), n), reverse=True)[keep:]:
+        try:
+            os.remove(os.path.join(d, name))
+        except OSError:
+            pass
+
+
+def _save_concurrency_cfg(block):
+    """Записать блок "_concurrency" в файл серверных ключей.
+
+    САМОЕ ОПАСНОЕ МЕСТО: в этом файле лежат все серверные ключи, claude_oauth_pool и
+    _prompt_policy. Поэтому: читаем файл целиком, битый JSON → ОТКАЗ (а не перезапись
+    пустышкой), бэкап рядом, запись через tmp + os.replace с правами исходника (0600).
+    Кэш сбрасываем → настройка применяется без рестарта сервиса.
+    """
+    import shutil
+    path = KEYS_PATH
+    cfg, mode = {}, 0o600
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8") as fh:
+                cfg = json.load(fh)
+        except Exception as e:
+            raise HTTPException(500, f"файл ключей не читается ({e}) — ничего не записано")
+        if not isinstance(cfg, dict):
+            raise HTTPException(500, "файл ключей не JSON-объект — ничего не записано")
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except OSError:
+            mode = 0o600
+        # Имя бэкапа с точностью до секунды + copy2 = два сохранения в одну секунду
+        # писали в ОДИН файл, и второй бэкап содержал уже изменённое состояние —
+        # исходник терялся. Добавляем pid + случайный суффикс и не перезаписываем.
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        for _ in range(10):
+            bak = f"{path}.bak.{stamp}_{os.getpid()}_{secrets.token_hex(3)}"
+            if not os.path.exists(bak):
+                break
+        else:
+            raise HTTPException(500, "не удалось подобрать имя бэкапа — ничего не записано")
+        try:
+            shutil.copy2(path, bak)
+        except OSError as e:
+            raise HTTPException(500, f"не удалось сделать бэкап файла ключей ({e}) — ничего не записано")
+        _prune_keys_backups(path)
+    if block:
+        cfg["_concurrency"] = block
+    else:
+        cfg.pop("_concurrency", None)
+    tmp = f"{path}.tmp.{os.getpid()}"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode or 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps(cfg, ensure_ascii=False, indent=2))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.chmod(tmp, mode or 0o600)
+        os.replace(tmp, path)           # атомарно: либо старый файл целиком, либо новый
+    except Exception as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise HTTPException(500, f"не удалось записать файл ключей ({e})")
+    _CONC_CACHE["ts"] = 0.0
+    _invalidate_keys_cache()          # файл ключей переписан — кэш keys() устарел
+    return cfg.get("_concurrency") or {}
+
+
+def _parse_server_limits_form(d, current):
+    """Форма админ-таблицы → новый блок "_concurrency".
+
+    Пустое поле = серверный дефолт из кода (ключ удаляется). Значение клампится в
+    _SERVER_LIMIT_BOUNDS. Поля, которых в форме нет, и чужие записи блока не трогаем.
+    """
+    # Чужие/не-dict записи блока переносим КАК ЕСТЬ и СРАЗУ: block.update(extra) в конце
+    # затирал только что введённое админом значение, если в _concurrency лежала не-dict
+    # запись того же провайдера (правка молча терялась, страница показывала старое).
+    block = {k: (dict(v) if isinstance(v, dict) else v) for k, v in (current or {}).items()}
+    for prov, _label, has_threads, has_retries in _SERVER_LIMIT_ROWS:
+        prev = block.get(prov)
+        row = dict(prev) if isinstance(prev, dict) else {}
+        fields = ["global", "per_tenant", "byok_global"]
+        if has_threads:
+            fields.append("threads")
+        if has_retries:
+            fields.append("retries")
+        if prov in _PROVIDER_BUDGET_HARD:
+            fields.append("key_budget")
+        for f in fields:
+            name = f"lim_{prov}_{f}"
+            if name not in d:
+                continue
+            raw = str(d.get(name) or "").strip()
+            if raw.isdigit() and int(raw) > 0:
+                lo, hi = _SERVER_LIMIT_BOUNDS[f]
+                if f == "key_budget":
+                    # Общая граница поля = максимум по всем провайдерам, поэтому сырой
+                    # POST записывал veo.key_budget=25 при реальном пределе 24. Считалось
+                    # эффективное значение верно, а в файле лежала неправда — клампим
+                    # по пределу КОНКРЕТНОГО провайдера прямо здесь.
+                    hi = min(hi, _PROVIDER_BUDGET_HARD.get(prov, hi))
+                row[f] = max(lo, min(hi, int(raw)))
+            else:
+                row.pop(f, None)
+        if row:
+            block[prov] = row
+        else:
+            block.pop(prov, None)
+    return block
+
+
+def _server_retries(prov):
+    """«Попыток генерации» серверной настройки или None (= дефолт воркера).
+    Только для видов ключей, где env реально читается (_SERVER_RETRY_GROUPS)."""
+    if prov not in _SERVER_RETRY_GROUPS:
+        return None
+    val = _provider_limit_opt(prov, "retries")
+    return max(1, min(SERVER_RETRIES_HARD, int(val))) if val else None
+
+
+def _job_retries(prov, own_retries=None):
+    """Попытки для конкретной задачи. None = дефолт воркера.
+
+    own_retries приходит ТОЛЬКО у byok-задачи (см. вызов в _run_gen_job), а повторы на
+    своём ключе — расход владельца ключа, поэтому его значение и решает: серверная
+    настройка защищает серверный ключ, а не чужой. Своего значения нет → серверное."""
+    if prov in _SERVER_RETRY_GROUPS:
+        try:
+            own = int(own_retries or 0)
+        except (TypeError, ValueError):
+            own = 0
+        if own > 0:
+            return max(1, min(SERVER_RETRIES_HARD, own))
+    return _server_retries(prov)
+
+
+def _provider_caps(prov, uopts=None, own_key=False):
+    """(global, per_tenant) для провайдера. Приоритет per_tenant: настройка СВОЕГО ключа юзера
+    (uopts) > серверный _concurrency > env-дефолт PROVIDER_LIMITS. global — только серверный/env
+    (глобальный потолок держит владелец, партнёр его не поднимает).
+
+    own_key=True — задача пойдёт на СВОЁМ ключе юзера. Тогда «проектов разом» из его
+    настроек может не только понижать серверное значение, но и поднимать его: серверную
+    ёмкость такие задачи не тратят, ограничивает их только железо (hard cap провайдера).
+    На серверном ключе поведение прежнее — своя настройка умеет лишь понизить."""
+    g, k = PROVIDER_LIMITS.get(prov, _PROVIDER_DEFAULT)
+    # админ-настройка серверного ключа; клампится в _SERVER_LIMIT_BOUNDS ещё на чтении
+    g_ov = _provider_limit_opt(prov, "global")
+    if g_ov is None:
+        g_ov = _provider_limit_opt(prov, "parallel_tasks")      # legacy-алиас
+    if g_ov:
+        g = g_ov
+    k_ov = _provider_limit_opt(prov, "per_tenant")
+    if k_ov:
+        k = k_ov
+    if uopts:
+        po = uopts.get(prov)
+        if isinstance(po, dict) and po.get("parallel"):
+            try:
+                want = int(po["parallel"])
+            except (TypeError, ValueError):
+                want = 0
+            if want > 0:
+                lo, hi = _SERVER_LIMIT_BOUNDS["per_tenant"]
+                want = max(lo, min(hi, want))
+                if own_key:
+                    # Свой ключ: серверную ёмкость не тратит, поэтому значение владельца
+                    # принимается как есть — сверху только железо (hard cap ниже). Само
+                    # значение задано НА ОДИН КЛЮЧ, поэтому умножается на их число:
+                    # вписал второй ключ — столько же проектов пойдёт и на нём.
+                    k = want * max(1, int(_BYOK_POOL_HINT.get(prov, 1)))
+                else:
+                    # Серверный ключ: чужая настройка умеет лишь понизить наш потолок.
+                    k = min(k, want)
+    if prov in _PROVIDER_HARD_JOB_CAPS:
+        hard = _PROVIDER_HARD_JOB_CAPS[prov]
+        if own_key:
+            # «Проектов разом» в настройках — значение НА ОДИН КЛЮЧ, поэтому и потолок
+            # для своей дорожки растёт с числом ключей. Иначе владелец, вписавший второй
+            # ключ, упирался бы в тот же потолок и второй ключ не давал бы ничего.
+            hard *= max(1, int(_BYOK_POOL_HINT.get(prov, 1)))
+        g = min(g, hard)
+        # Железо — потолок в обе стороны, в том числе для владельца своего ключа:
+        # каждая задача это ещё один воркер-процесс на нашей машине.
+        k = min(k, hard)
+    return (max(1, g), max(1, k))
+
+
+def _provider_pool_size(prov):
+    family = _provider_credential_family(prov)
+    return SERVER_CREDENTIAL_POOL.size(family) if family else 1
+
+
+def _provider_job_slots(prov):
+    """Hard jobs cap на один unique credential × фактическое число unique slots.
+
+    Для каналов промптов сверху ещё бюджет ПАМЯТИ: пул серверных credential умножал
+    число задач (два claude-токена → 4 задачи → 48 вызовов ≈ 20 ГБ), а расчёт памяти
+    пула не видел. Теперь потолок задач канала = бюджет вызовов ÷ потоки задачи,
+    то есть пул расширяет параллельность только пока это влезает в память.
+    """
+    base, _legacy = _provider_caps(prov)
+    slots = base * _provider_pool_size(prov)
+    if prov in _PROMPT_PROVIDER_GROUPS:
+        ch = prov.removeprefix("prompt_")
+        if PROMPT_CALL_MEMORY_MB.get(ch, 0) > 0:
+            per_job = max(1, _prompt_threads_setting(ch))
+            # Бюджет вызовов канала делят ОБЕ дорожки: серверная и byok (свои ключи
+            # партнёров). Раньше сюда влезала только серверная, а byok-дорожка шла
+            # сверх бюджета — суммарно 15.1 ГБ при бюджете 10.4 ГБ. Ищем самую широкую
+            # серверную дорожку, при которой server + byok(server) ещё влезают.
+            allowed_jobs = max(1, _prompt_channel_max_calls(ch) // per_job)
+            fitted = 1                  # обе дорожки минимум по одной задаче: занулять
+            for cand in range(1, slots + 1):   # byok нельзя (партнёр должен стартовать)
+                if cand + _provider_byok_jobs_for(prov, cand) <= allowed_jobs:
+                    fitted = cand
+            slots = min(slots, fitted)
+    return slots
+
+
+def _provider_slot_capacity_units(prov):
+    """Ёмкость одного credential slot; lease не даст переполнить конкретный key."""
+    budget = _provider_budget_units(prov)
+    if budget:
+        return budget
+    base, _legacy = _provider_caps(prov)
+    return base
+
+
+def _provider_total_capacity_units(prov):
+    return _provider_slot_capacity_units(prov) * _provider_pool_size(prov)
+
+
+
+
+# Сколько своих ключей у владельца задач этого провайдера. Заполняется планировщиком
+# перед расчётом ёмкости: сама функция ёмкости о юзере не знает, а считать по всем
+# юзерам разом нельзя — ключи у каждого свои.
+_BYOK_POOL_HINT = {}
+
+
+def _refresh_byok_pool_hint():
+    """Пересчитать, сколько СВОИХ ключей на провайдера есть у пользователей кабинета.
+
+    «Проектов разом» в настройках — это значение НА ОДИН КЛЮЧ: каждый ключ несёт
+    собственный лимит провайдера. Ёмкость дорожки своих ключей = значение × число
+    ключей, и вот это число живёт здесь. Берём максимум по пользователям: у кого
+    ключей меньше, того всё равно ограничит его собственный пул при выдаче аренды.
+    """
+    hint = {}
+    try:
+        c = db()
+        try:
+            rows = c.execute("SELECT keys FROM users WHERE COALESCE(keys,'') NOT IN ('','{}')").fetchall()
+        finally:
+            c.close()
+    except Exception:
+        return
+    for row in rows:
+        try:
+            own = json.loads(row["keys"] or "{}")
+        except Exception:
+            continue
+        if not isinstance(own, dict):
+            continue
+        # Провайдеры перечислены явно: это те, у кого вообще бывает свой ключ. Брать их
+        # из _KEY_PROVIDERS нельзя — там имена СЕМЕЙСТВ ключей, а ёмкость считается по
+        # именам ПРОВАЙДЕРОВ (у recrafter семейство googler).
+        for prov in ("recrafter", "openai", "veo", "voicer", "voicegencore", "elevenlabs"):
+            family = _provider_credential_family(prov)
+            if not family:
+                continue
+            n = len([v for v in _credential_candidates(own, _own_source_family(family)) if v])
+            if n > hint.get(prov, 0):
+                hint[prov] = n
+    _BYOK_POOL_HINT.clear()
+    _BYOK_POOL_HINT.update(hint)
+    _cleanup_removed_own_codex_homes()
+
+
+def _own_pool_size(uid, prov) -> int:
+    """Сколько РАЗНЫХ своих ключей у юзера для этого провайдера.
+
+    Ёмкость своей дорожки считается на ключ: у провайдера лимит на КЛЮЧ (FastGen —
+    25 взвешенных потоков и 6000 картинок в час), поэтому второй ключ приносит вторую
+    такую же корзину. Раньше потолок был общим на дорожку, и пять ключей работали как
+    один — ровно то, что видно в замере 05.08 у ключа на 25 потоков.
+    """
+    family = _provider_credential_family(prov)
+    if not family or uid is None:
+        return 1
+    try:
+        own = _own_credentials_by_uid(uid) or {}
+    except Exception:
+        return 1
+    value = own.get(_own_source_family(family))
+    if not value:
+        return 1
+    items = value if isinstance(value, (list, tuple)) else [value]
+    uniq = {str(v) for v in items if v}
+    return max(1, len(uniq))
+
+
+def _provider_byok_jobs_for(prov, server_jobs):
+    """Бюджет byok-дорожки при ЗАДАННОЙ ширине серверной. Вынесено отдельно, чтобы
+    _provider_job_slots мог подобрать серверную дорожку с УЧЁТОМ byok (иначе была бы
+    взаимная рекурсия job_slots ↔ byok_jobs).
+
+    ⚠️ Ширина byok выводится из серверной ТОЛЬКО у каналов промптов: там обе дорожки
+    делят один реальный ресурс — оперативную память под CLI-процессы. У ключей
+    генерации общего ресурса нет: свой ключ партнёра не тратит ни кредитов, ни
+    потоков серверного ключа, поэтому мерить его половиной серверной дорожки не от
+    чего. Мерка byok у них — сколько воркеров тянет САМА МАШИНА (тот же hard cap,
+    что и у серверной дорожки), а сколько взять из этого — решает владелец ключа
+    настройкой «проектов разом» (_provider_caps, own_key=True).
+    Замер 05.08: у ключа на 25 потоков шло 2 проекта по 8 = 16 потоков, при том что
+    ключ свободен, — упиралось ровно в эту формулу."""
+    server_jobs = max(1, int(server_jobs))
+    want = _provider_limit_opt(prov, "byok_global")
+    if want:
+        cap = int(want)
+    elif prov in _PROMPT_PROVIDER_GROUPS:
+        cap = max(1, int(server_jobs * BYOK_LANE_RATIO))     # общая память — делим
+    else:
+        cap = _PROVIDER_HARD_JOB_CAPS.get(prov, server_jobs)  # общее только железо
+        # N changes per-key availability, never the machine admission limit.
+        # Пределы в _PROVIDER_ACCOUNT_LIMITS — это лимит НА КЛЮЧ (подтверждено владельцем
+        # 20.08.2026 для всех четырёх: FastGen, VoiceGenCore, VeoNonStop, Voicer). Поэтому
+        # они тоже умножаются на число ключей: второй ключ честно даёт вдвое больше.
+        # Кламп оставлен как страховка от настройки, задранной выше реального предела.
+        acc = _PROVIDER_ACCOUNT_LIMITS.get(prov)
+        if acc:
+            cap = min(cap, int(acc[0]) * max(1, int(_BYOK_POOL_HINT.get(prov, 1))))
+    return max(1, min(cap, 24))
+
+
+def _provider_byok_jobs(prov):
+    """Бюджет byok-дорожки в ЗАДАЧАХ: своих ключей серверная ёмкость не касается, но
+    железо общее, поэтому дорожка не бесконечная. Админ-настройка byok_global, иначе
+    доля BYOK_LANE_RATIO от серверной дорожки; шире серверной не бывает.
+
+    Для каналов промптов обе дорожки считаются ВМЕСТЕ в бюджете памяти: серверная
+    ширина подбирается в _provider_job_slots так, чтобы server + byok влезли целиком
+    (раньше byok шла СВЕРХ бюджета — claude 3×6×288 + codex 3×20×166 = 15.1 ГБ при
+    бюджете 10.4 ГБ)."""
+    return _provider_byok_jobs_for(prov, _provider_job_slots(prov))
+
+
+def _prompt_channel_lane_jobs(prov):
+    """Задач канала промптов ПО ОБЕИМ дорожкам разом (server + byok) — столько
+    воркеров канал может держать одновременно, и именно столько платит памятью."""
+    server_jobs = _provider_job_slots(prov)
+    return server_jobs + _provider_byok_jobs_for(prov, server_jobs)
+
+
+def _provider_lane_budget(prov, lane):
+    """(задач, единиц) ёмкости дорожки провайдера. server — пул серверных ключей
+    (жёстко держат leases); byok — отдельный бюджет задач (_provider_byok_jobs).
+    Единицы byok не урезаем: одна крупная задача сама по себе может занять весь slot,
+    и дробный бюджет вешал бы её в queued навсегда."""
+    jobs = _provider_job_slots(prov)
+    units = _provider_total_capacity_units(prov)
+    if lane == "byok":
+        jobs = _provider_byok_jobs(prov)
+        # Дорожка своих ключей ограничивается ЧИСЛОМ ЗАДАЧ, а не бюджетом серверного
+        # ключа: потоки тратятся на ключе партнёра. Раньше byok делила те же units,
+        # и одна задача (20 из 21) запирала дорожку целиком — свои ключи простаивали.
+        own_capacity = (_PROVIDER_ACCOUNT_LIMITS.get(prov) or
+                        (_PROVIDER_CALL_BUDGET_HARD.get(prov, _provider_slot_capacity_units(prov)),))[0]
+        units = jobs * max(1, int(own_capacity))
+    return (max(0, jobs), max(0, units))
+
+
+def _prompt_tasks_snapshot():
+    """queued+running задачи ВСЕХ prompt-групп: (uid, lane, provider). None — БД молчит."""
+    groups = tuple(sorted(_PROMPT_PROVIDER_GROUPS))
+    try:
+        c = db()
+        try:
+            return c.execute(
+                "SELECT uid,lane,provider FROM queue_tasks WHERE provider IN (%s) "
+                "AND status IN ('queued','running')" % ",".join("?" * len(groups)),
+                groups,
+            ).fetchall()
+        finally:
+            c.close()
+    except Exception:
+        return None
+
+
+def _user_prompt_jobs(uid, rows=None):
+    """Сколько задач промптов юзера висит во ВСЕХ каналах разом (queued+running)."""
+    if uid is None:
+        return 0
+    if rows is None:
+        rows = _prompt_tasks_snapshot()
+    if rows is None:
+        return 0
+    return sum(1 for r in rows if r["uid"] == uid)
+
+
+def _prompt_group_free_slots(prov, uid=None, rows=None):
+    """Сколько задач группы prov можно запустить прямо сейчас (0 = ждать).
+
+    Считаем и running, и queued: задача, вставшая в группу с очередью, не стартует
+    раньше стоящих перед ней. Дорожка (server/byok) та же, что выберет шедулер, плюс
+    лимит «на одного юзера» внутри канала И общий потолок задач промптов на юзера
+    (PROMPT_USER_TOTAL_JOBS) — иначе канал выглядел бы свободным, а задача всё равно
+    ждала бы. БД недоступна → считаем канал свободным (порядок цепочки).
+    """
+    lane = "byok" if _task_uses_own_credential(uid, prov) else "server"
+    jobs, _units = _provider_lane_budget(prov, lane)
+    per_uid = _provider_caps(prov, _user_opts(uid) if uid is not None else None,
+                             own_key=(lane == "byok"))[1]
+    if rows is None:
+        rows = _prompt_tasks_snapshot()
+    if rows is None:
+        return max(0, jobs)
+    busy = mine = 0
+    for r in rows:
+        if r["provider"] != prov:
+            continue
+        if _running_lane(r, prov) != lane:
+            continue
+        busy += 1
+        if uid is not None and r["uid"] == uid:
+            mine += 1
+    free = min(jobs - busy, per_uid - mine)
+    if uid is not None:
+        free = min(free, PROMPT_USER_TOTAL_JOBS - _user_prompt_jobs(uid, rows))
+    return max(0, free)
+
+
+def _prompt_group_load(prov, uid=None, rows=None):
+    """Загрузка группы (queued+running) ÷ ёмкость дорожки. Больше = длиннее очередь.
+
+    Нужна там, где свободных слотов нет НИГДЕ: перелив всегда в chain[0] на батче
+    из 20-90 проектов снова упирал этап промптов в один канал, пока другой простаивал.
+    БД недоступна → 0.0 у всех, и решает порядок цепочки (прежнее поведение).
+    """
+    lane = "byok" if _task_uses_own_credential(uid, prov) else "server"
+    jobs, _units = _provider_lane_budget(prov, lane)
+    if rows is None:
+        rows = _prompt_tasks_snapshot()
+    if rows is None:
+        return 0.0
+    busy = sum(1 for r in rows
+               if r["provider"] == prov and _running_lane(r, prov) == lane)
+    return busy / float(max(1, jobs))
+
+
+def _provider_alloc_report(prov):
+    """Что кабинет способен запустить у провайдера разом — для админ-таблицы.
+
+    Считаем вложенные вызовы: задачи × «потоков на проект» по каждой дорожке.
+    account = физический предел АККАУНТА (его делят три сервиса), поэтому over —
+    честный сигнал «раздал больше, чем есть у аккаунта».
+    """
+    server_jobs = _provider_job_slots(prov)
+    byok_jobs = _provider_byok_jobs(prov)
+    if prov in ("recrafter", "veo", "openai", "bing"):
+        per_job = _server_threads_setting(prov, SHARED_IMAGE_THREADS_PER_JOB,
+                                          SHARED_IMAGE_THREADS_HARD)
+    elif prov == "voicegencore":
+        per_job = _server_threads_setting(prov, VGC_THREADS_PER_JOB, VGC_THREADS_HARD)
+    elif prov in _PROMPT_PROVIDER_GROUPS:
+        per_job = _prompt_threads_setting(prov.removeprefix("prompt_"))
+    else:
+        per_job = 1
+    account, account_text = _PROVIDER_ACCOUNT_LIMITS.get(prov, (0, ""))
+    server_units = server_jobs * per_job
+    return {
+        "server_jobs": server_jobs, "byok_jobs": byok_jobs, "per_job": per_job,
+        "pool": _provider_pool_size(prov), "server_units": server_units,
+        "total": server_units + byok_jobs * per_job,
+        "budget": _provider_total_capacity_units(prov),
+        "account": account, "account_text": account_text,
+        # с предела АККАУНТА сравниваем только серверную дорожку: byok идёт на ключи
+        # партнёров и ёмкость нашего аккаунта не расходует.
+        "over": bool(account and server_units > account),
+    }
+
+
+# Per-user настройки СВОЕГО ключа (users.key_opts). Keyed by provider-group (recrafter/openai/veo/…).
+# Кэш ~10с по uid — шедулер дёргает на каждой итерации, не бить БД.
+_UOPTS_CACHE = {}   # uid -> (ts, dict)
+
+
+def _key_opts_from_row(row):
+    """Распарсить key_opts из строки users (Row/dict). {} при пустом/битом."""
+    try:
+        raw = row["key_opts"] if ("key_opts" in row.keys()) else None
+    except Exception:
+        raw = None
+    if not raw:
+        return {}
+    try:
+        d = json.loads(raw)
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def _user_opts(uid):
+    now = time.time()
+    e = _UOPTS_CACHE.get(uid)
+    if e and now - e[0] < 10:
+        return e[1]
+    d = {}
+    try:
+        c = db(); r = c.execute("SELECT key_opts FROM users WHERE id=?", (uid,)).fetchone(); c.close()
+        if r:
+            d = _key_opts_from_row(r)
+    except Exception:
+        d = {}
+    _UOPTS_CACHE[uid] = (now, d)
+    return d
+RUNNING_PROCS = {}                                # job_id -> Popen (для cancel)
+RUNNING_PROC_TOKENS = {}                          # job_id -> claim_token того же Popen
+RUNNING_LOCK = threading.Lock()
+CANCELLED = set()                                 # job_id, отменённые до/во время спавна процесса
+_LAST_HB = {}                                     # (job_id, claim_token) -> ts heartbeat
+_LAST_DEFERRED = [0.0]                            # ts последней проверки отложенного рендера (троттлинг)
+
+
+def _heartbeat(jid, claim_token):
+    """Отметка живости gen-воркера (последний вывод). Троттлинг ~15с, чтобы не долбить БД на каждой строке."""
+    now = time.time()
+    hb_key = (jid, str(claim_token or ""))
+    if now - _LAST_HB.get(hb_key, 0.0) >= 15:
+        _LAST_HB[hb_key] = now
+        try:
+            c = db()
+            c.execute("UPDATE queue_tasks SET claimed=? "
+                      "WHERE job_id=? AND status='running' AND claim_token=?",
+                      (now, jid, claim_token))
+            c.commit(); c.close()
+        except Exception:
+            pass
+
+
+def _kill_proc(proc):
+    """Убить процесс + всю его группу (start_new_session) — надёжно, с детьми."""
+    try:
+        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+def _now():
+    return datetime.datetime.now().timestamp()
+
+
+def _set_queue(jid, **kw):
+    cols = ",".join(f"{k}=?" for k in kw)
+    c = db(); c.execute(f"UPDATE queue_tasks SET {cols} WHERE job_id=?", (*kw.values(), jid)); c.commit(); c.close()
+
+
+def _finish_worker_task(jid, status, error="", claim_token=None, error_code=None):
+    """Завершить gen-задачу только из running; cancel/lease, выигравший гонку, не перетирать."""
+    if not claim_token:
+        return False
+    c = db(); c.execute("BEGIN IMMEDIATE")
+    cur = c.execute("UPDATE queue_tasks SET status=?, error=?, finished=? "
+                    "WHERE job_id=? AND status='running' AND claim_token=?",
+                    (status, error or None, _now(), jid, claim_token))
+    if cur.rowcount == 1:
+        c.execute("UPDATE gen_jobs SET status=?, error=? WHERE id=?", (status, error or None, jid))
+        c.execute("UPDATE card_jobs SET status=?, error_code=?, last_error=?, finished=? "
+                  "WHERE job_id=?", (status, error_code, error or None, _now(), jid))
+    c.commit(); c.close()
+    return cur.rowcount == 1
+
+
+def _mark_worker_running(jid, claim_token):
+    """Синхронно отметить gen_jobs=running, только если queue-задачу ещё не отменили."""
+    if not claim_token:
+        return False
+    c = db(); c.execute("BEGIN IMMEDIATE")
+    r = c.execute("SELECT status,claim_token FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+    ok = bool(r and r["status"] == "running"
+              and secrets.compare_digest(str(r["claim_token"] or ""), str(claim_token)))
+    if ok:
+        c.execute("UPDATE gen_jobs SET status='running' WHERE id=?", (jid,))
+        c.execute("UPDATE card_jobs SET status='running', attempts=attempts+1, "
+                  "started=COALESCE(started,?), next_attempt=NULL, error_code=NULL, last_error=NULL "
+                  "WHERE job_id=?", (_now(), jid))
+    c.commit(); c.close()
+    return ok
+
+
+_REMOTE_CANCEL_EXECUTOR = None
+
+
+def _cancel_retained_vgc(task, root):
+    """Cancel known IDs using only the still-authorized original credential."""
+    jid = task["job_id"]
+    try:
+        c = db()
+        try:
+            c.execute("BEGIN IMMEDIATE")
+            allowed = c.execute("UPDATE queue_tasks SET cancel_checks=cancel_checks+1,cancel_next_check=? WHERE job_id=? AND status='cancelled' AND cancel_checks<8 AND COALESCE(cancel_next_check,0)<=?",
+                                (_now()+60, jid, _now())).rowcount
+            c.commit()
+        finally:
+            c.close()
+        if not allowed:
+            return
+        pin = _remote_credential_pin(task)
+        if not pin:
+            return
+        c = db()
+        try:
+            owner = c.execute("SELECT * FROM users WHERE id=?", (task["uid"],)).fetchone()
+        finally:
+            c.close()
+        source = pin.get("source") or task["lane"] or "byok"
+        candidates = (_own_pool_values(owner, "voicegencore") if source == "byok"
+                      else _credential_candidates(keys(), "voicegencore"))
+        key = next((v for v in candidates if hashlib.sha256(v.encode()).hexdigest() == pin["sha256"]), None)
+        if not key or source == "server" and _own_only(owner):
+            _log_line(jid, "Удалённая отмена не подтверждена: нужен исходный ключ; журнал сохранён")
+            return
+        env = _sanitized_worker_env()
+        env.update(VGC_API_TOKEN=key, VS_REMOTE_JOURNAL_DIR=root, VS_QUEUE_JOB_ID=str(jid),
+                   VS_CREDENTIAL_SOURCE=source, VS_QUEUE_CANCEL_FILE=os.path.join(root, "cancel.requested"))
+        proc = subprocess.Popen([sys.executable, os.path.join(SRC_DIR, "voicegencore_worker.py"),
+                                 "--project_dir", _project_dir(task["tenant_id"], task["project_id"]), "--cancel_pending"],
+                                cwd=SRC_DIR, env=env, stdin=subprocess.DEVNULL,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+        try:
+            code = proc.wait(timeout=35)
+        except subprocess.TimeoutExpired:
+            _kill_proc(proc)
+            proc.wait(timeout=5)
+            code = 2
+        _log_line(jid, "Удалённая отмена подтверждена" if code == 0 else
+                  "Удалённая отмена пока не подтверждена; ID и журнал сохранены")
+    except Exception:
+        log_exc("remote cancellation", extra=str(jid))
+        _log_line(jid, "Ошибка проверки удалённой отмены; журнал необходимо сохранить")
+
+
+_REMOTE_CANCEL_LAST_SCAN = 0.0
+
+
+def _recover_remote_cancellations():
+    global _REMOTE_CANCEL_LAST_SCAN
+    now = _now()
+    if now - _REMOTE_CANCEL_LAST_SCAN < 60:
+        return
+    _REMOTE_CANCEL_LAST_SCAN = now
+    c = db()
+    try:
+        rows = c.execute("SELECT * FROM queue_tasks WHERE provider='voicegencore' AND status='cancelled' AND cancel_checks<8 AND COALESCE(cancel_next_check,0)<=? ORDER BY job_id LIMIT 100", (now,)).fetchall()
+    finally:
+        c.close()
+    for task in rows:
+        root = os.path.join(_project_dir(task["tenant_id"], task["project_id"]), ".remote_jobs", str(task["job_id"]))
+        if os.path.exists(os.path.join(root, "cancel.requested")):
+            try:
+                if _remote_credential_pin(task):
+                    with RUNNING_LOCK:
+                        proc = RUNNING_PROCS.get(task["job_id"])
+                    if proc is None or proc.poll() is not None:
+                        _request_worker_cancel(task["job_id"], None)
+            except ValueError:
+                continue
+
+
+def _request_worker_cancel(jid, proc):
+    """Explicit user cancellation gets a bounded remote-cancel opportunity; restarts do not."""
+    global _REMOTE_CANCEL_EXECUTOR
+    c = db()
+    try:
+        task = c.execute("SELECT * FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+    finally:
+        c.close()
+    if task and task["provider"] == "voicegencore":
+        root = os.path.join(_project_dir(task["tenant_id"], task["project_id"]), ".remote_jobs", str(jid))
+        os.makedirs(root, exist_ok=True)
+        path = os.path.join(root, "cancel.requested")
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("user cancellation\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if proc:
+            def wait_then_stop():
+                try:
+                    proc.wait(timeout=35)
+                except subprocess.TimeoutExpired:
+                    _kill_proc(proc)
+                _cancel_retained_vgc(task, root)
+            threading.Thread(target=wait_then_stop, daemon=True).start()
+        else:
+            with RUNNING_LOCK:
+                if _REMOTE_CANCEL_EXECUTOR is None:
+                    from concurrent.futures import ThreadPoolExecutor
+                    _REMOTE_CANCEL_EXECUTOR = ThreadPoolExecutor(max_workers=2, thread_name_prefix="remote-cancel")
+            _REMOTE_CANCEL_EXECUTOR.submit(_cancel_retained_vgc, task, root)
+    elif proc:
+        _kill_proc(proc)
+
+
+def _storage_project_held(connection, project_id, now=None):
+    row = connection.execute("SELECT v FROM admin_state WHERE k=?", ("storage_cleanup:"+str(project_id),)).fetchone()
+    if not row:
+        return False
+    from source_retention import held
+    return held(row["v"], now)
+
+
+def _cancel_project_queue_tasks(tid, pid):
+    """Отменить queued/running задачи перед удалением проекта; активные локальные процессы убить."""
+    c = db()
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        if _storage_project_held(c, pid):
+            raise HTTPException(409, "Проект архивируется; дождитесь завершения перед удалением")
+        all_rows = c.execute("SELECT job_id,kind,status FROM queue_tasks WHERE tenant_id=? AND project_id=?", (tid, pid)).fetchall()
+        with RUNNING_LOCK:
+            alive = any(RUNNING_PROCS.get(r["job_id"]) is not None and RUNNING_PROCS[r["job_id"]].poll() is None for r in all_rows)
+        if alive or any(r["status"] == "running" and r["kind"] != "render" for r in all_rows):
+            raise HTTPException(409, "Сначала отмените выполняющиеся задачи и дождитесь остановки; удаление сейчас может потерять оплаченный результат")
+        for journal_root in glob.glob(os.path.join(_project_dir(tid, pid), ".remote_jobs", "*")):
+            if not os.path.isdir(journal_root):
+                continue
+            try:
+                if _read_remote_credential_pin(journal_root):
+                    raise ValueError("remote work retained")
+            except ValueError:
+                raise HTTPException(409, "В проекте сохранён незавершённый оплаченный запрос; завершите отмену или восстановление до удаления")
+    except Exception:
+        c.rollback(); c.close()
+        raise
+    rows = c.execute("SELECT job_id FROM queue_tasks WHERE tenant_id=? AND project_id=? "
+                     "AND status IN ('queued','running')", (tid, pid)).fetchall()
+    jids = [r["job_id"] for r in rows]
+    if jids:
+        marks = ",".join("?" * len(jids))
+        c.execute(f"UPDATE queue_tasks SET status='cancelled', finished=?, claim_token=NULL, claimed=NULL "
+                  f"WHERE job_id IN ({marks}) "
+                  "AND status IN ('queued','running')",
+                  (_now(), *jids))
+        c.execute(f"UPDATE gen_jobs SET status='cancelled' WHERE id IN ({marks})", jids)
+        c.execute(f"UPDATE card_jobs SET status='cancelled', finished=?, error_code='cancelled', "
+                  f"last_error='cancelled' WHERE job_id IN ({marks})", (_now(), *jids))
+    c.execute("UPDATE render_followups SET status='cancelled' WHERE job_id IN (SELECT job_id FROM queue_tasks WHERE tenant_id=? AND project_id=?)", (tid, pid))
+    c.execute("DELETE FROM projects WHERE id=? AND tenant_id=?", (pid, tid))
+    c.commit(); c.close()
+    for jid in jids:
+        CANCELLED.add(jid)
+        with RUNNING_LOCK:
+            proc = RUNNING_PROCS.get(jid)
+        _request_worker_cancel(jid, proc)
+
+
+def _cancel_tasks_by_kind(tid, pid, kinds):
+    """Отменить queued/running задачи проекта указанных видов (для массовой отмены по категории).
+    Та же семантика, что у одиночного job_cancel: статус в БД + CANCELLED + убийство процесса.
+    Рендер исполняет удалённый пуллер — его /progress и /result апдейтят строку только при
+    status='running' AND claim_token=?, поэтому после отмены он получает 409 и статус не перетрёт."""
+    if not kinds:
+        return 0
+    c = db()
+    c.execute("BEGIN IMMEDIATE")
+    km = ",".join("?" * len(kinds))
+    rows = c.execute(f"SELECT job_id FROM queue_tasks WHERE tenant_id=? AND project_id=? "
+                     f"AND kind IN ({km}) AND status IN ('queued','running')",
+                     (tid, pid, *kinds)).fetchall()
+    jids = [r["job_id"] for r in rows]
+    if jids:
+        jm = ",".join("?" * len(jids))
+        c.execute(f"UPDATE queue_tasks SET status='cancelled', finished=?, claim_token=NULL, claimed=NULL "
+                  f"WHERE job_id IN ({jm}) "
+                  "AND status IN ('queued','running')", (_now(), *jids))
+        c.execute(f"UPDATE gen_jobs SET status='cancelled' WHERE id IN ({jm})", jids)
+        c.execute(f"UPDATE card_jobs SET status='cancelled', finished=?, error_code='cancelled', "
+                  f"last_error='cancelled' WHERE job_id IN ({jm})", (_now(), *jids))
+    c.commit(); c.close()
+    for jid in jids:
+        CANCELLED.add(jid)
+        with RUNNING_LOCK:
+            proc = RUNNING_PROCS.get(jid)
+        _request_worker_cancel(jid, proc)
+        _log_line(jid, "⏹ отменено пользователем (массовая отмена по категории)")
+    return len(jids)
+
+
+def _log_line(jid, line):
+    try:
+        c = db(); c.execute("INSERT INTO job_logs(job_id,ts,line) VALUES(?,?,?)", (jid, _now(), line)); c.commit(); c.close()
+        return True
+    except Exception:
+        return False
+
+
+# --- автодетект языка → мужской Edge-голос (порт detect_language_and_get_voice из app_main) ---
+try:
+    from langdetect import detect as _ld_detect
+    _ld_detect("test")
+    _LANGDETECT_OK = True
+except Exception:
+    _ld_detect = None
+    _LANGDETECT_OK = False
+
+EDGE_MALE_VOICES_MAP = {
+    'af': 'af-ZA-WillemNeural', 'sq': 'sq-AL-IlirNeural', 'am': 'am-ET-AmehaNeural',
+    'ar': 'ar-SA-HamedNeural', 'hy': 'hy-AM-HaykNeural', 'az': 'az-AZ-BabekNeural',
+    'bn': 'bn-IN-BashkarNeural', 'bs': 'bs-BA-GoranNeural', 'bg': 'bg-BG-BorislavNeural',
+    'my': 'my-MM-ThihaNeural', 'ca': 'ca-ES-EnricNeural', 'zh-cn': 'zh-CN-YunxiNeural',
+    'zh-tw': 'zh-TW-YunJheNeural', 'zh-hk': 'zh-HK-WanLungNeural', 'hr': 'hr-HR-SreckoNeural',
+    'cs': 'cs-CZ-AntoninNeural', 'da': 'da-DK-JeppeNeural', 'nl': 'nl-NL-MaartenNeural',
+    'en': 'en-US-GuyNeural', 'et': 'et-EE-KertNeural', 'tl': 'fil-PH-AngeloNeural',
+    'fi': 'fi-FI-HarriNeural', 'fr': 'fr-FR-HenriNeural', 'gl': 'gl-ES-RoiNeural',
+    'ka': 'ka-GE-GiorgiNeural', 'de': 'de-DE-ConradNeural', 'el': 'el-GR-NestorasNeural',
+    'gu': 'gu-IN-NiranjanNeural', 'he': 'he-IL-AvriNeural', 'hi': 'hi-IN-MadhurNeural',
+    'hu': 'hu-HU-TamasNeural', 'is': 'is-IS-GunnarNeural', 'id': 'id-ID-ArdiNeural',
+    'ga': 'ga-IE-ColmNeural', 'it': 'it-IT-DiegoNeural', 'ja': 'ja-JP-KeitaNeural',
+    'jv': 'jv-ID-DimasNeural', 'kn': 'kn-IN-GaganNeural', 'kk': 'kk-KZ-DauletNeural',
+    'km': 'km-KH-PisethNeural', 'ko': 'ko-KR-InJoonNeural', 'lo': 'lo-LA-ChanthavongNeural',
+    'lv': 'lv-LV-NilsNeural', 'lt': 'lt-LT-LeonasNeural', 'mk': 'mk-MK-AleksandarNeural',
+    'ms': 'ms-MY-OsmanNeural', 'ml': 'ml-IN-MidhunNeural', 'mt': 'mt-MT-JosephNeural',
+    'mr': 'mr-IN-ManoharNeural', 'mn': 'mn-MN-BataaNeural', 'ne': 'ne-NP-SagarNeural',
+    'no': 'nb-NO-FinnNeural', 'ps': 'ps-AF-GulNawazNeural', 'fa': 'fa-IR-FaridNeural',
+    'pl': 'pl-PL-MarekNeural', 'pt': 'pt-BR-AntonioNeural', 'ro': 'ro-RO-EmilNeural',
+    'ru': 'ru-RU-DmitryNeural', 'sr': 'sr-RS-NicholasNeural', 'si': 'si-LK-SameeraNeural',
+    'sk': 'sk-SK-LukasNeural', 'sl': 'sl-SI-RokNeural', 'so': 'so-SO-MuuseNeural',
+    'es': 'es-ES-AlvaroNeural', 'su': 'su-ID-JajangNeural', 'sw': 'sw-KE-RafikiNeural',
+    'sv': 'sv-SE-MattiasNeural', 'ta': 'ta-IN-ValluvarNeural', 'te': 'te-IN-MohanNeural',
+    'th': 'th-TH-NiwatNeural', 'tr': 'tr-TR-AhmetNeural', 'uk': 'uk-UA-OstapNeural',
+    'ur': 'ur-PK-AsadNeural', 'uz': 'uz-UZ-SardorNeural', 'vi': 'vi-VN-NamMinhNeural',
+    'cy': 'cy-GB-AledNeural', 'zu': 'zu-ZA-ThembaNeural',
+}
+
+EDGE_ALL_VOICES = [
+    "af-ZA-AdriNeural","af-ZA-WillemNeural","sq-AL-AnilaNeural","sq-AL-IlirNeural","am-ET-AmehaNeural",
+    "am-ET-MekdesNeural","ar-AE-FatimaNeural","ar-AE-HamdanNeural","ar-BH-AliNeural","ar-BH-LailaNeural",
+    "ar-DZ-AminaNeural","ar-DZ-IsmaelNeural","ar-EG-SalmaNeural","ar-EG-ShakirNeural","ar-IQ-BasselNeural",
+    "ar-IQ-RanaNeural","ar-JO-SanaNeural","ar-JO-TaimNeural","ar-KW-FahedNeural","ar-KW-NouraNeural",
+    "ar-LB-LaylaNeural","ar-LB-RamiNeural","ar-LY-ImanNeural","ar-LY-OmarNeural","ar-MA-JamalNeural",
+    "ar-MA-MounaNeural","ar-OM-AbdullahNeural","ar-OM-AyshaNeural","ar-QA-AmalNeural","ar-QA-MoazNeural",
+    "ar-SA-HamedNeural","ar-SA-ZariyahNeural","ar-SY-AmanyNeural","ar-SY-LaithNeural","ar-TN-HediNeural",
+    "ar-TN-ReemNeural","ar-YE-MaryamNeural","ar-YE-SalehNeural","hy-AM-AnahitNeural","hy-AM-HaykNeural",
+    "az-AZ-BabekNeural","az-AZ-BanuNeural","bn-BD-NabanitaNeural","bn-BD-PradeepNeural","bn-IN-BashkarNeural",
+    "bn-IN-TanishaaNeural","bs-BA-GoranNeural","bs-BA-VesnaNeural","bg-BG-BorislavNeural",
+    "bg-BG-KalinaNeural","my-MM-NilarNeural","my-MM-ThihaNeural","ca-ES-AlbaNeural","ca-ES-EnricNeural",
+    "ca-ES-JoanaNeural","zh-CN-XiaoxiaoNeural","zh-CN-YunxiNeural","zh-CN-YunjianNeural","zh-CN-XiaoyiNeural",
+    "zh-CN-YunyangNeural","zh-CN-XiaochenNeural","zh-CN-XiaohanNeural","zh-CN-XiaomengNeural",
+    "zh-CN-XiaomoNeural","zh-CN-XiaoqiuNeural","zh-CN-XiaoruiNeural","zh-CN-XiaoshuangNeural",
+    "zh-CN-XiaoxuanNeural","zh-CN-XiaoyanNeural","zh-CN-XiaoyouNeural","zh-CN-XiaozhenNeural",
+    "zh-CN-YunfengNeural","zh-CN-YunhaoNeural","zh-CN-YunxiaNeural","zh-CN-YunyeNeural","zh-CN-YunzeNeural",
+    "zh-HK-HiuGaaiNeural","zh-HK-HiuMaanNeural","zh-HK-WanLungNeural","zh-TW-HsiaoChenNeural",
+    "zh-TW-HsiaoYuNeural","zh-TW-YunJheNeural","hr-HR-GabrijelaNeural","hr-HR-SreckoNeural",
+    "cs-CZ-AntoninNeural","cs-CZ-VlastaNeural","da-DK-ChristelNeural","da-DK-JeppeNeural",
+    "nl-BE-ArnaudNeural","nl-BE-DenaNeural","nl-NL-ColetteNeural","nl-NL-FennaNeural","nl-NL-MaartenNeural",
+    "en-AU-NatashaNeural","en-AU-WilliamNeural","en-CA-ClaraNeural","en-CA-LiamNeural","en-GB-LibbyNeural",
+    "en-GB-MiaNeural","en-GB-RyanNeural","en-GB-SoniaNeural","en-GB-ThomasNeural","en-HK-SamNeural",
+    "en-HK-YanNeural","en-IE-ConnorNeural","en-IE-EmilyNeural","en-IN-NeerjaNeural","en-IN-PrabhatNeural",
+    "en-KE-AsiliaNeural","en-KE-ChilembaNeural","en-NG-AbeoNeural","en-NG-EzinneNeural",
+    "en-NZ-MitchellNeural","en-NZ-MollyNeural","en-PH-JamesNeural","en-PH-RosaNeural","en-SG-LunaNeural",
+    "en-SG-WayneNeural","en-TZ-ElimuNeural","en-TZ-ImaniNeural","en-US-AriaNeural","en-US-AnaNeural",
+    "en-US-ChristopherNeural","en-US-EricNeural","en-US-GuyNeural","en-US-JennyNeural","en-US-MichelleNeural",
+    "en-US-RogerNeural","en-US-SteffanNeural","en-ZA-LeahNeural","en-ZA-LukeNeural","et-EE-AnuNeural",
+    "et-EE-KertNeural","fil-PH-AngeloNeural","fil-PH-BlessicaNeural","fi-FI-HarriNeural","fi-FI-NooraNeural",
+    "fi-FI-SelmaNeural","fr-BE-CharlineNeural","fr-BE-GerardNeural","fr-CA-AntoineNeural","fr-CA-JeanNeural",
+    "fr-CA-SylvieNeural","fr-CH-ArianeNeural","fr-CH-FabriceNeural","fr-FR-DeniseNeural","fr-FR-EloiseNeural",
+    "fr-FR-HenriNeural","gl-ES-RoiNeural","gl-ES-SabelaNeural","ka-GE-EkaNeural","ka-GE-GiorgiNeural",
+    "de-AT-IngridNeural","de-AT-JonasNeural","de-CH-JanNeural","de-CH-LeniNeural","de-DE-AmalaNeural",
+    "de-DE-ConradNeural","de-DE-KatjaNeural","de-DE-KillianNeural","el-GR-AthinaNeural",
+    "el-GR-NestorasNeural","gu-IN-DhwaniNeural","gu-IN-NiranjanNeural","he-IL-AvriNeural","he-IL-HilaNeural",
+    "hi-IN-MadhurNeural","hi-IN-SwaraNeural","hu-HU-NoemiNeural","hu-HU-TamasNeural","is-IS-GudrunNeural",
+    "is-IS-GunnarNeural","id-ID-ArdiNeural","id-ID-GadisNeural","ga-IE-ColmNeural","ga-IE-OrlaNeural",
+    "it-IT-DiegoNeural","it-IT-ElsaNeural","it-IT-IsabellaNeural","ja-JP-KeitaNeural","ja-JP-NanamiNeural",
+    "jv-ID-DimasNeural","jv-ID-SitiNeural","kn-IN-GaganNeural","kn-IN-SapnaNeural","kk-KZ-AigulNeural",
+    "kk-KZ-DauletNeural","km-KH-PisethNeural","km-KH-SreymomNeural","ko-KR-InJoonNeural","ko-KR-SunHiNeural",
+    "lo-LA-ChanthavongNeural","lo-LA-KeomanyNeural","lv-LV-EveritaNeural","lv-LV-NilsNeural",
+    "lt-LT-LeonasNeural","lt-LT-OnaNeural","mk-MK-AleksandarNeural","mk-MK-MarijaNeural","ms-MY-OsmanNeural",
+    "ms-MY-YasminNeural","ml-IN-MidhunNeural","ml-IN-SobhanaNeural","mt-MT-GraceNeural","mt-MT-JosephNeural",
+    "mr-IN-AarohiNeural","mr-IN-ManoharNeural","mn-MN-BataaNeural","mn-MN-YesuiNeural","ne-NP-HemkalaNeural",
+    "ne-NP-SagarNeural","nb-NO-FinnNeural","nb-NO-PernilleNeural","ps-AF-GulNawazNeural","ps-AF-LatifaNeural",
+    "fa-IR-DilaraNeural","fa-IR-FaridNeural","pl-PL-MarekNeural","pl-PL-ZofiaNeural","pt-BR-AntonioNeural",
+    "pt-BR-FranciscaNeural","pt-PT-DuarteNeural","pt-PT-RaquelNeural","ro-RO-AlinaNeural","ro-RO-EmilNeural",
+    "ru-RU-DmitryNeural","ru-RU-SvetlanaNeural","sr-RS-NicholasNeural","sr-RS-SophieNeural",
+    "si-LK-SameeraNeural","si-LK-ThiliniNeural","sk-SK-LukasNeural","sk-SK-ViktoriaNeural",
+    "sl-SI-PetraNeural","sl-SI-RokNeural","so-SO-MuuseNeural","so-SO-UbaxNeural","es-AR-ElenaNeural",
+    "es-AR-TomasNeural","es-BO-MarceloNeural","es-BO-SofiaNeural","es-CL-CatalinaNeural",
+    "es-CL-LorenzoNeural","es-CO-GonzaloNeural","es-CO-SalomeNeural","es-CR-JuanNeural","es-CR-MariaNeural",
+    "es-CU-BelkysNeural","es-CU-ManuelNeural","es-DO-EmilioNeural","es-DO-RamonaNeural","es-EC-AndreaNeural",
+    "es-EC-LuisNeural","es-ES-AlvaroNeural","es-ES-ElviraNeural","es-GQ-JavierNeural","es-GQ-TeresaNeural",
+    "es-GT-AndresNeural","es-GT-MartaNeural","es-HN-CarlosNeural","es-HN-KarlaNeural","es-MX-DaliaNeural",
+    "es-MX-JorgeNeural","es-NI-FedericoNeural","es-NI-YolandaNeural","es-PA-MargaritaNeural",
+    "es-PA-RobertoNeural","es-PE-AlexNeural","es-PE-CamilaNeural","es-PR-KarinaNeural","es-PR-VictorNeural",
+    "es-PY-MarioNeural","es-PY-TaniaNeural","es-SV-LorenaNeural","es-SV-RodrigoNeural","es-US-AlonsoNeural",
+    "es-US-PalomaNeural","es-UY-MateoNeural","es-UY-ValentinaNeural","es-VE-PaolaNeural",
+    "es-VE-SebastianNeural","su-ID-JajangNeural","su-ID-TutiNeural","sw-KE-RafikiNeural","sw-KE-ZuriNeural",
+    "sw-TZ-DaudiNeural","sw-TZ-RehemaNeural","sv-SE-MattiasNeural","sv-SE-SofieNeural","ta-IN-PallaviNeural",
+    "ta-IN-ValluvarNeural","ta-LK-KumarNeural","ta-LK-SaranyaNeural","ta-MY-KaniNeural","ta-MY-SuryaNeural",
+    "ta-SG-AnbuNeural","ta-SG-VenbaNeural","te-IN-MohanNeural","te-IN-ShrutiNeural","th-TH-NiwatNeural",
+    "th-TH-PremwadeeNeural","tr-TR-AhmetNeural","tr-TR-EmelNeural","uk-UA-OstapNeural","uk-UA-PolinaNeural",
+    "ur-IN-GulNeural","ur-IN-SalmanNeural","ur-PK-AsadNeural","ur-PK-UzmaNeural","uz-UZ-MadinaNeural",
+    "uz-UZ-SardorNeural","vi-VN-HoaiMyNeural","vi-VN-NamMinhNeural","cy-GB-AledNeural","cy-GB-NiaNeural",
+    "zu-ZA-ThandoNeural","zu-ZA-ThembaNeural",
+]
+
+
+_LANG_NAMES = {
+    "af": "Afrikaans", "am": "Amharic", "ar": "العربية", "az": "Azərbaycan", "bg": "Български", "bn": "বাংলা",
+    "bs": "Bosanski", "ca": "Català", "cs": "Čeština", "cy": "Cymraeg", "da": "Dansk", "de": "Deutsch",
+    "el": "Ελληνικά", "en": "English", "es": "Español", "et": "Eesti", "fa": "فارسی", "fi": "Suomi",
+    "fil": "Filipino", "fr": "Français", "ga": "Gaeilge", "gl": "Galego", "gu": "ગુજરાતી", "he": "עברית",
+    "hi": "हिन्दी", "hr": "Hrvatski", "hu": "Magyar", "id": "Indonesia", "is": "Íslenska", "it": "Italiano",
+    "ja": "日本語", "jv": "Jawa", "ka": "ქართული", "kk": "Қазақ", "km": "ខ្មែរ", "kn": "ಕನ್ನಡ", "ko": "한국어",
+    "lo": "ລາວ", "lt": "Lietuvių", "lv": "Latviešu", "mk": "Македонски", "ml": "മലയാളം", "mn": "Монгол",
+    "mr": "मराठी", "ms": "Melayu", "mt": "Malti", "my": "မြန်မာ", "nb": "Norsk", "ne": "नेपाली", "nl": "Nederlands",
+    "pl": "Polski", "ps": "پښتو", "pt": "Português", "ro": "Română", "ru": "Русский", "si": "සිංහල",
+    "sk": "Slovenčina", "sl": "Slovenščina", "so": "Soomaali", "sq": "Shqip", "sr": "Српски", "su": "Sunda",
+    "sv": "Svenska", "sw": "Kiswahili", "ta": "தமிழ்", "te": "తెలుగు", "th": "ไทย", "tr": "Türkçe",
+    "uk": "Українська", "ur": "اردو", "uz": "Oʻzbek", "vi": "Tiếng Việt", "zh": "中文", "zu": "isiZulu",
+}
+
+
+def _voices_by_lang():
+    g = {}
+    for v in EDGE_ALL_VOICES:
+        g.setdefault(v.split("-")[0], []).append(v)
+    return g
+
+
+def _voice_short(v):
+    parts = v.split("-")
+    loc = "-".join(parts[:2])
+    nm = re.sub(r"(Multilingual)?Neural$", "", parts[-1]) if parts else v
+    return loc, nm
+
+
+def _edge_voice_optgroups(selected=""):
+    out = [f"<option value=''{' selected' if not selected else ''}>Авто по тексту (по языку)</option>"]
+    g = _voices_by_lang()
+    for lc in sorted(g, key=lambda x: _LANG_NAMES.get(x, x).lower()):
+        out.append(f'<optgroup label="{html.escape(_LANG_NAMES.get(lc, lc))}">')
+        for v in g[lc]:
+            loc, nm = _voice_short(v)
+            sel = " selected" if v == selected else ""
+            out.append(f'<option value="{html.escape(v)}"{sel}>{html.escape(loc + " · " + nm)}</option>')
+        out.append("</optgroup>")
+    return "".join(out)
+
+
+def _detect_edge_voice(text):
+    """Язык текста → мужской Edge-голос (как десктоп). Любой сбой → ru-RU-DmitryNeural."""
+    if not (_LANGDETECT_OK and _ld_detect):
+        return "ru-RU-DmitryNeural"
+    try:
+        lang = _ld_detect((text or "")[:500])
+        v = EDGE_MALE_VOICES_MAP.get(lang)
+        if not v and "-" in lang:
+            v = EDGE_MALE_VOICES_MAP.get(lang.split("-")[0])
+        return v or "ru-RU-DmitryNeural"
+    except Exception:
+        return "ru-RU-DmitryNeural"
+
+
+def _truthy(v, default=True):
+    """Истинность строкового флага формы. Пустая строка/отсутствие → default."""
+    s = str(v).strip().lower()
+    if s == "" or v is None:
+        return default
+    return s not in ("0", "off", "false", "no")
+
+
+def _build_cmd(kind, projdir, params, own_threads=None, *, job_id=None, project_id=None):
+    """Маппинг (вид задачи + параметры UI + проект) → (воркер, argv). Пред-обработка на сервере.
+
+    own_threads — настройка СВОЕГО ключа юзера (может только понизить серверный
+    потолок потоков, см. _own_key_threads); для серверного ключа всегда None.
+    """
+    if kind == "cards":
+        if not isinstance(job_id, int) or job_id <= 0 or not project_id:
+            raise RuntimeError("cards: missing server-owned job identity")
+        if not isinstance(params, dict):
+            raise RuntimeError("cards: malformed internal params")
+        required = {"contract_version", "narration_sha256", "request_sha256", "context"}
+        if set(params) != required:
+            raise RuntimeError("cards: internal params fields differ")
+        if params.get("contract_version") != card_contract.CONTRACT_VERSION:
+            raise RuntimeError("cards: unsupported contract version")
+        context = card_contract.normalize_context(params.get("context"))
+        if card_contract.context_sha256(context) != params.get("request_sha256"):
+            raise RuntimeError("cards: editorial context hash mismatch")
+        return os.path.join(HERE, "card_jobs.py"), [
+            "--project-dir", projdir,
+            "--project-id", str(project_id),
+            "--job-id", str(job_id),
+            "--narration-sha256", str(params["narration_sha256"]),
+            "--request-sha256", str(params["request_sha256"]),
+            "--context-json", json.dumps(context, ensure_ascii=False, separators=(",", ":")),
+            "--src-dir", SRC_DIR,
+        ]
+    if kind in ("prompts", "images", "regen"):
+        params = _canonical_image_task_params(kind, params)
+    if kind == "prompts":
+        # Тот же pipeline и те же параметры, что у картинок, но только план сцен (--plan_only).
+        # Так промпты и картинки — разные задачи разных очередей, без дублирования сборки argv.
+        plan_params = params
+        if params.get("image_mode") != _IMAGE_MODE_AI:
+            # План сцен ВСЕГДА пишет googler-pipeline (LLM-часть), даже если картинки
+            # потом будет искать Bing: источник картинок и его кастом-промты не должны
+            # выбирать воркер плана.
+            plan_params = {**params, "image_mode": _IMAGE_MODE_AI, "custom_prompts": ""}
+        worker, argv = _build_cmd("images", projdir, plan_params, own_threads=own_threads)
+        if worker != "googler_worker.py" or not argv or argv[0] != "pipeline":
+            raise RuntimeError("для этого источника картинок план сцен не нужен")
+        # --use_plan здесь запрещён: prompt-job сам строит новый plan bundle.
+        # --use_cache сохраняем по явной настройке проекта: versioned source-hash
+        # caches ускоряют повтор, не меняя проверяемый контракт плана.
+        return worker, [a for a in argv if a != "--use_plan"] + ["--plan_only"]
+    if kind == "chapters":
+        # Главы: LLM-задача без провайдеров генерации. Транскрипт (chapters/transcript.json)
+        # приносит рендер-нода вместе с mp4 — сам whisper здесь не гоняется.
+        argv = ["--project_dir", projdir]
+        for key, flag in (("chapters_target", "--target"), ("chapters_min_gap", "--min_gap"),
+                          ("chapters_max_gap", "--max_gap"), ("chapters_offset", "--offset")):
+            val = (params or {}).get(key)
+            if val not in (None, ""):
+                try:
+                    argv += [flag, str(int(val))]
+                except (TypeError, ValueError):
+                    raise ValueError(f"{flag}: ожидается целое число секунд, пришло {val!r}")
+        return "chapters.py", argv
+    src = os.path.join(projdir, "source.txt")
+    speed = (str(params.get("speed") or "1.0").strip() or "1.0")
+    if kind == "tts":
+        engine = str(params.get("engine") or params.get("tts_engine") or "edge").strip().lower()
+        if engine not in _TTS_ENG_PROV:
+            raise ValueError(f"неизвестный TTS-движок: {engine}")
+        voice = (params.get("voice") or "").strip()
+        # ГВАРД engine↔voice — ПОСЛЕДНЯЯ ЛИНИЯ ОБОРОНЫ: закрывает все входы разом (UI-desync смены
+        # движка, retry старых джоб, merge пресетов, батч). Не даём голосу ЧУЖОГО движка уехать в воркер
+        # (это был баг 30/30 у mazr: VGC voice_id уезжал в edge). См. audit 02.07.
+        if engine == "edge":
+            if voice and not _is_edge_voice(voice):
+                voice = ""            # чужой id (VGC/voicer) в edge → сброс → ниже автодетект языка
+        elif _is_edge_voice(voice):
+            voice = ""                # edge-голос уехал в id-движок (voicer/vgc/tts) → сброс
+        uc = _truthy(params.get("use_cache"), default=True)
+        if engine == "edge":
+            txt = open(src, encoding="utf-8").read() if os.path.exists(src) else ""
+            # автодетект языка → голос, если голос не задан/стоит дефолтный ru (как десктоп)
+            if (not voice) and txt.strip():   # пустой голос = «Авто» → детект языка
+                voice = _detect_edge_voice(txt)
+            voice = voice or "ru-RU-DmitryNeural"
+            paras = [{"text": p.strip()} for p in txt.splitlines() if p.strip()]
+            pj = os.path.join(projdir, "paragraphs.json")
+            json.dump(paras, open(pj, "w", encoding="utf-8"), ensure_ascii=False)
+            argv = ["--project_dir", projdir, "--voice_name", voice, "--paragraphs_file", pj, "--speed", speed]
+            if uc:
+                argv.append("--use_cache")
+            return "edgetts_worker.py", argv
+        if engine == "voicer":
+            # --full_text: весь скрипт ОДНОЙ задачей → один mp3 (как десктопная кнопка «весь текст»).
+            # Voicer сам режет на чанки (split_type) и склеивает. Так одна джоба = одна задача API,
+            # и параллельность на ключ управляется числом джоб (PROVIDER_LIMITS voicer, см. _provider_caps).
+            argv = ["--source_file", src, "--project_dir", projdir, "--full_text",
+                    "--voice_id", voice or "AB9XsbSA4eLG12t2myjN",
+                    "--model_id", params.get("model_id") or "eleven_multilingual_v2",
+                    "--split_type", params.get("split_type") or "smart", "--speed", speed]
+            if _truthy(params.get("auto_pause_enabled"), default=False):
+                argv += ["--auto_pause_enabled",
+                         "--auto_pause_duration", str(params.get("auto_pause_duration") or "0.5"),
+                         "--auto_pause_frequency", str(params.get("auto_pause_frequency") or "1")]
+            if uc:
+                argv.append("--use_cache")
+            return "voicer_worker.py", argv
+        if engine == "voicegencore":
+            if not voice:
+                raise RuntimeError("VoiceGenCore требует voice_id — выберите голос в настройках проекта")
+            # --full_text: весь скрипт ОДНОЙ задачей → один mp3 (VGC чанкает на сервере). Раньше VGC
+            # слал сотни абзацев ПОСЛЕДОВАТЕЛЬНО (~47 мин/ролик); full_text = как у voicer, кратно быстрее.
+            argv = ["--source_file", src, "--project_dir", projdir, "--voice_id", voice, "--speed", speed, "--full_text"]
+            if str(params.get("voice_engine") or "").strip():
+                argv += ["--voice_engine", str(params["voice_engine"]).strip()]
+            if str(params.get("stability") or "").strip():
+                argv += ["--stability", str(params["stability"]).strip()]
+            # потолок держит сервер: админ-таблица (_concurrency.voicegencore.threads) или код
+            vgc_cap = _server_threads_setting("voicegencore", VGC_THREADS_PER_JOB, VGC_THREADS_HARD)
+            try:
+                requested_threads = int(str(params.get("thread_count") or vgc_cap).strip())
+            except (TypeError, ValueError):
+                requested_threads = vgc_cap
+            argv += ["--thread_count", str(max(1, min(vgc_cap, requested_threads)))]
+            if uc:
+                argv.append("--use_cache")
+            return "voicegencore_worker.py", argv
+        if engine == "lumean":
+            # Отдельная серверная дорожка: один платный order на весь текст, свой
+            # credential family и обязательная read-only проверка service=heygen
+            # внутри worker до POST /orders. Legacy engine=tts не меняем.
+            vu = (params.get("voice_uuid") or params.get("voice") or "").strip()
+            if not _is_lumean_template_id(vu):
+                raise RuntimeError(
+                    "Lumean · HeyGen требует UUID Template ID из библиотеки Lumean, "
+                    "а не внешний Voice ID"
+                )
+            argv = ["--source_file", src, "--project_dir", projdir, "--speed", speed,
+                    "--template_id", vu, "--full_text",
+                    "--required_service", "heygen",
+                    "--audio_dir_name", "_FINAL_AUDIO_LUMEAN"]
+            if str(params.get("model_uuid") or "").strip():
+                argv += ["--model_id", str(params["model_uuid"]).strip()]
+            if uc:
+                argv.append("--use_cache")
+            return "tts_worker.py", argv
+        # tts (Lumean; legacy provider slug elevenlabs) → template_id/model_id
+        argv = ["--source_file", src, "--project_dir", projdir, "--speed", speed]
+        vu = (params.get("voice_uuid") or params.get("voice") or "").strip()
+        if vu:
+            argv += ["--template_id", vu]
+        if str(params.get("model_uuid") or "").strip():
+            argv += ["--model_id", str(params["model_uuid"]).strip()]
+        if uc:
+            argv.append("--use_cache")
+        return "tts_worker.py", argv
+    if kind == "images":
+        ar = params.get("aspect_ratio") or "landscape"
+        uc = _truthy(params.get("use_cache"), default=True)
+        legacy_action = str(params.get("legacy_cache_action") or "").strip().lower()
+        if legacy_action not in ("", "regenerate", "keep"):
+            raise RuntimeError("invalid legacy cache action")
+        if legacy_action == "regenerate":
+            uc = False
+        elif legacy_action == "keep":
+            uc = True
+        source = params["image_mode"]
+        reference_manifest = _reference_manifest_from_params(projdir, params)
+        # --- Bing-источник (image_worker) ---
+        if source == _IMAGE_MODE_BING:
+            tags = (params.get("tags") or "").strip()
+            if tags:
+                # СТАРЫЙ РЕЖИМ 1:1 — теги, картинок на тег → Images/{i}/
+                n = str(params.get("num_images") or "5").strip()
+                argv = ["--tags", tags, "--num_images", (n if n.isdigit() else "5"),
+                        "--project_dir", projdir, "--aspect_ratio", ar]
+                if uc:
+                    argv.append("--use_cache")
+                return "image_worker.py", argv
+            # НОВЫЙ РЕЖИМ (теги не заданы): по плану сцен — одна картинка на сцену,
+            # путь и имя ровно как у генерации (googler/NNN.jpg), поэтому галерея,
+            # реген, видео-из-картинки и синхрон работают без изменений.
+            argv = ["--project_dir", projdir, "--from_scenes", "--aspect_ratio", ar,
+                    "--image_threads", str(_own_key_threads(
+                        _server_image_threads(params), own_threads))]
+            if uc:
+                argv.append("--use_cache")
+            return "image_worker.py", argv
+        model = params["model"]
+        # Custom prompts use the same immutable single-subject/style bundle.
+        # Multi-subject custom input was rejected by the server gate at enqueue.
+        cp = (params.get("custom_prompts") or "").strip()
+        if cp:
+            prompts = [ln.strip() for ln in cp.splitlines() if ln.strip()]
+            style = params.get("style") or "minimalistic, cinematic, photorealistic"
+            argv = ["images", "--project_dir", projdir, "--aspect_ratio", ar, "--model", model,
+                    "--style", style,
+                    "--prompts_json", json.dumps(prompts, ensure_ascii=False),
+                    "--image_threads", str(_own_key_threads(
+                        _server_image_threads(params), own_threads))]
+            seed = str(params.get("seed") or "").strip()
+            if seed.lstrip("-").isdigit():
+                argv += ["--seed", seed]
+            if reference_manifest:
+                argv += ["--reference_manifest", reference_manifest]
+            if legacy_action == "keep":
+                argv.append("--trust_legacy_cache")
+            if uc:
+                argv.append("--use_cache")
+            return "googler_worker.py", argv
+        # --- обычный pipeline (GPT-сцены) + seed + auto_hero + референсы персонажей/стиля ---
+        style = params.get("style") or "minimalistic, cinematic, photorealistic"
+        spp = str(params.get("sentences_per_prompt") or "3")
+        argv = ["pipeline", "--source_file", src, "--project_dir", projdir,
+                "--style", style, "--sentences_per_prompt", spp, "--aspect_ratio", ar, "--model", model,
+                "--image_threads", str(_own_key_threads(
+                    _server_image_threads(params), own_threads))]
+        if _scene_plan_ready(projdir, params):
+            argv.append("--use_plan")     # план уже написала задача «промпты» — не платим за него второй раз
+        seed = str(params.get("seed") or "").strip()
+        if seed.lstrip("-").isdigit():
+            argv += ["--seed", seed]
+        if _truthy(params.get("auto_hero"), default=False):
+            argv.append("--auto_hero")
+        if _truthy(params.get("analyze_story"), default=False):
+            argv.append("--analyze_story")          # story-bible: карта персонажей и локаций
+        if _truthy(params.get("smart_mode"), default=False):
+            argv.append("--smart_mode")             # semantic scene boundaries; same in prompts/use_plan
+        if _truthy(params.get("split_long_sentences"), default=False):
+            argv += ["--split_long_sentences",      # длинные предложения в позициях «по 1» → свои кадры
+                     "--max_solo_scene_seconds", f"{_split_long_seconds(params):g}"]
+        if reference_manifest:
+            argv += ["--reference_manifest", reference_manifest]
+        else:
+            # Compatibility only for already-queued pre-contract tasks.  Every
+            # new enqueue, including the empty set, carries an immutable bundle.
+            ur = _collect_user_refs(projdir)
+            if ur:
+                argv += ["--user_refs", ur]
+            sr = _collect_style_refs(projdir)
+            if sr:
+                argv += ["--style_refs", sr]
+        if legacy_action == "keep":
+            argv.append("--trust_legacy_cache")
+        if uc:
+            argv.append("--use_cache")
+        return "googler_worker.py", argv
+    if kind == "regen":
+        # перегенерация ОДНОЙ картинки: путь строго из галереи, настройки — из сохранённых настроек проекта
+        rel = (params.get("image_rel") or "").strip().replace("\\", "/")
+        full = _gallery_regen_image_ok(projdir, rel)
+        if not full:
+            raise RuntimeError(f"недопустимый путь картинки: {rel!r}")
+        if params.get("image_mode") == _IMAGE_MODE_BING:
+            # Bing-проект: перегенерация = НОВЫЙ ПОИСК по той же сцене, а не вызов
+            # AI-генератора (иначе кадр выпадал бы из стиля проекта и жёг кредиты).
+            argv = ["--project_dir", projdir, "--regen_image", full,
+                    "--aspect_ratio", params.get("aspect_ratio") or "landscape"]
+            prompt = (params.get("prompt") or "").strip()
+            if prompt:
+                argv += ["--query", prompt]  # свой текст из модалки = поисковый запрос
+            tags = (params.get("tags") or "").strip()
+            if tags:
+                argv += ["--tags", tags]     # старый режим «теги»: номера сцены нет
+            return "image_worker.py", argv
+        _reference_regen_analysis_gate(projdir, params)
+        argv = ["regen_image", "--project_dir", projdir, "--image_file", full,
+                "--aspect_ratio", params.get("aspect_ratio") or "landscape",
+                "--model", params["model"]]
+        style = (params.get("style") or "").strip()
+        if style:
+            argv += ["--style", style]
+        prompt = (params.get("prompt") or "").strip()
+        if prompt:
+            argv += ["--prompt", prompt]
+        seed = str(params.get("seed") or "").strip()
+        if seed.lstrip("-").isdigit():
+            argv += ["--seed", seed]
+        reference_manifest = _reference_manifest_from_params(projdir, params)
+        if reference_manifest:
+            argv += ["--reference_manifest", reference_manifest]
+        else:
+            sr = _collect_style_refs(projdir)
+            if sr:
+                argv += ["--style_refs", sr]
+        if _truthy(params.get("auto_hero"), default=False):
+            argv.append("--auto_hero")
+        # Regen is a separate command and must not inherit an old story bible
+        # merely because one is present on disk.  The worker treats absence of
+        # both switches as a corrupt/legacy task, so every server task is exact.
+        argv.append("--analyze_story" if _truthy(
+            params.get("analyze_story"), default=False
+        ) else "--no_analyze_story")
+        return "googler_worker.py", argv
+    if kind == "regen_video":
+        # перегенерация ОДНОГО клипа: воркер videos по одному пути; БЕЗ --use_cache (иначе «клип уже есть» = скип);
+        # воркер перезапишет NNN_video.mp4, а references-json мержится (не затирается) — фикс в googler_worker
+        rel = (params.get("video_rel") or "").strip().replace("\\", "/")
+        full = _gallery_video_ok(projdir, rel)
+        if not full:
+            raise RuntimeError(f"недопустимый путь клипа: {rel!r}")
+        src_img = _clip_source_image(projdir, full)
+        if not src_img:
+            raise RuntimeError(f"исходная картинка для клипа {os.path.basename(full)} не найдена — перегенерация невозможна")
+        ipf = os.path.join(projdir, "regen_video_paths.json")
+        json.dump([src_img], open(ipf, "w", encoding="utf-8"), ensure_ascii=False)
+        prompt = (params.get("prompt") or "").strip() or "smooth cinematic motion, subtle camera movement"
+        argv = ["videos", "--project_dir", projdir, "--prompt", prompt,
+                "--image_paths_file", ipf,
+                "--video_method", params.get("video_method") or "veo",
+                "--video_threads", "1"]
+        return "googler_worker.py", argv
+    if kind == "video":
+        prompt = params.get("prompt") or "smooth cinematic motion, subtle camera movement"
+        method = params.get("video_method") or "veo"
+        argv = ["videos", "--project_dir", projdir, "--prompt", prompt, "--video_method", method,
+                "--video_threads", str(_own_key_threads(
+                    _server_video_threads(params), own_threads))]
+        # 🎥 t2v: text-to-video по промптам сцен (scenes.json), картинки-исходники не нужны (veo-only)
+        if _truthy(params.get("t2v"), False):
+            argv += ["--from_prompts"]
+            _t2vn_raw = str(params.get("t2v_first_n") or "0").strip() or "0"
+            try:
+                _t2vn = int(_t2vn_raw)
+            except ValueError:
+                # опечатка НЕ должна молча превращаться в 0 = «все сцены» (veo-кредиты на каждую)
+                raise RuntimeError(f"«первых сцен» должно быть числом (0 = все), получено: {_t2vn_raw!r}")
+            if _t2vn > 0:
+                argv += ["--first_n_scenes", str(_t2vn)]
+            if params.get("aspect_ratio"):
+                argv += ["--aspect_ratio", str(params["aspect_ratio"])]
+            if params.get("style"):
+                argv += ["--style", str(params["style"])]
+            if _truthy(params.get("use_cache"), default=True):
+                argv.append("--use_cache")
+            return "googler_worker.py", argv
+        # ограничение числа кадров (first_n) — отбираем первые N, зеркалим googler/ + Images/
+        _fn_raw = str(params.get("first_n") or "0").strip() or "0"
+        try:
+            first_n = int(_fn_raw)
+        except ValueError:
+            # опечатка НЕ должна молча превращаться в 0 = «все кадры» (veo-кредиты на каждый кадр)
+            raise RuntimeError(f"«Кадров» должно быть числом (0 = все кадры), получено: {_fn_raw!r}")
+        if first_n < 0:
+            raise RuntimeError(f"«Кадров» не может быть отрицательным, получено: {first_n}")
+        import glob as _g
+        _g_imgs = sorted(_g.glob(os.path.join(projdir, "googler", "*.jpg"))
+                         + _g.glob(os.path.join(projdir, "googler", "*.jpeg"))
+                         + _g.glob(os.path.join(projdir, "googler", "*.png")))
+        _m_imgs = _g_imgs or sorted(_g.glob(os.path.join(projdir, "Images", "**", "*.jpg"), recursive=True)
+                                    + _g.glob(os.path.join(projdir, "Images", "**", "*.jpeg"), recursive=True)
+                                    + _g.glob(os.path.join(projdir, "Images", "**", "*.png"), recursive=True))
+        _numbered_g_imgs = [(scene_id, path) for path in _g_imgs
+                            if (scene_id := _numbered_googler_scene_id(path)) is not None]
+        _all_g_imgs_numbered = bool(_g_imgs) and len(_numbered_g_imgs) == len(_g_imgs)
+        numbered_ceiling = first_n
+        if first_n > 0 and _all_g_imgs_numbered:
+            try:
+                with open(os.path.join(projdir, "googler", "scenes.json"),
+                          encoding="utf-8") as scenes_file:
+                    expected_scenes = json.load(scenes_file)
+                if isinstance(expected_scenes, list) and expected_scenes:
+                    numbered_ceiling = min(first_n, len(expected_scenes))
+            except Exception:
+                pass
+        # без --image_paths_file воркер сканирует ТОЛЬКО googler/ — ручные картинки в Images/
+        # (пара к _video_ready) обязаны уходить явным списком, иначе «Папка не найдена»
+        if (first_n > 0 or not _g_imgs) and _m_imgs:
+            ipf = os.path.join(projdir, "video_image_paths.json")
+            # Numbered googler-кадры: first_n = scene id ceiling. Дыра 006
+            # не должна подменяться кадром 011. Ручные/legacy-имена
+            # не имеют scene id, поэтому для них остаётся прежний slice.
+            selected = ([path for scene_id, path in _numbered_g_imgs
+                         if scene_id <= numbered_ceiling]
+                        if first_n > 0 and _all_g_imgs_numbered
+                        else (_m_imgs[:first_n] if first_n > 0 else _m_imgs))
+            json.dump(selected,
+                      open(ipf, "w", encoding="utf-8"), ensure_ascii=False)
+            argv += ["--image_paths_file", ipf]
+        if _truthy(params.get("use_cache"), default=True):
+            argv.append("--use_cache")
+        return "googler_worker.py", argv
+    raise ValueError(f"unknown kind {kind}")
+
+
+_REF_EXT = (".jpg", ".jpeg", ".png", ".webp")
+_REFERENCE_SOURCE_SCHEMA = 1
+_REFERENCE_SOURCE_MANIFEST_REL = os.path.join("_ASSETS", "reference_sources.v1.json")
+_REFERENCE_UPLOADS_REL = os.path.join("_ASSETS", "reference_uploads")
+_REFERENCE_BUNDLES_REL = os.path.join("_ASSETS", "reference_bundles")
+_REFERENCE_BUNDLE_PARAM = "_reference_bundle_id"
+_REFERENCE_BUNDLE_UNSET = object()
+_REFERENCE_BUNDLE_RE = re.compile(r"^[0-9a-f]{64}$")
+_LEGACY_CACHE_ACTION_PARAM = "legacy_cache_action"
+_LEGACY_CACHE_ACTIONS = {"regenerate", "keep"}
+_REFERENCE_LOCKS = {}
+_REFERENCE_LOCKS_GUARD = threading.Lock()
+
+
+def _reference_lock(projdir):
+    """Один writer source-manifest/bundle на проект; разные проекты не блокируют друг друга."""
+    key = os.path.realpath(projdir)
+    with _REFERENCE_LOCKS_GUARD:
+        return _REFERENCE_LOCKS.setdefault(key, threading.RLock())
+
+
+def _reference_owned_storage_path(projdir, *parts, must_exist=False,
+                                  expected_type=None):
+    """Return a lexical project-owned path after rejecting every reparse component.
+
+    ``realpath`` containment alone is insufficient here: a symlink that currently
+    points inside the project is still mutable storage controlled through another
+    namespace, and Windows junctions/reparse points are not always reported by
+    ``islink``.  Reference manifests and immutable bundles therefore use only raw
+    directories/files owned directly by the project tree.
+    """
+    if not parts or any(
+            not isinstance(part, str) or not part or part in (".", "..")
+            or os.path.isabs(part) or "/" in part or "\\" in part
+            for part in parts):
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference storage path is invalid"
+        )
+    lexical_root = os.path.abspath(projdir)
+    lexical_path = os.path.abspath(os.path.join(lexical_root, *parts))
+    try:
+        if os.path.commonpath((lexical_root, lexical_path)) != lexical_root:
+            raise ValueError
+    except ValueError as exc:
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference storage escapes project"
+        ) from exc
+
+    current = lexical_root
+    for part in parts:
+        current = os.path.join(current, part)
+        try:
+            st = os.lstat(current)
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            raise reference_contract.ReferenceContractError(
+                "cannot inspect project-owned reference storage"
+            ) from exc
+        file_attributes = int(getattr(st, "st_file_attributes", 0) or 0)
+        if os.path.islink(current) or file_attributes & 0x400:
+            rel = os.path.relpath(current, lexical_root).replace("\\", "/")
+            raise reference_contract.ReferenceContractError(
+                f"project-owned reference storage cannot be a symlink/reparse point: {rel}"
+            )
+
+    try:
+        real_root = os.path.realpath(lexical_root)
+        if os.path.commonpath((real_root, os.path.realpath(lexical_path))) != real_root:
+            raise ValueError
+    except ValueError as exc:
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference storage escapes project"
+        ) from exc
+
+    exists = os.path.lexists(lexical_path)
+    if must_exist and not exists:
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference storage is missing"
+        )
+    if exists and expected_type == "dir" and not os.path.isdir(lexical_path):
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference storage directory is invalid"
+        )
+    if exists and expected_type == "file" and not os.path.isfile(lexical_path):
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference storage file is invalid"
+        )
+    return lexical_path
+
+
+def _reference_fsync_directory(path):
+    """Persist prior directory-entry mutations or fail on supported filesystems."""
+    if os.name != "posix":
+        # Python cannot portably open directory handles for fsync on Windows.
+        return False
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True
+
+
+def _reference_ensure_owned_reference_directory(projdir, child_name):
+    """Durably ensure project -> _ASSETS -> one reference-storage directory."""
+    if child_name not in {"reference_uploads", "reference_bundles"}:
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference directory is invalid"
+        )
+    project_root = os.path.abspath(projdir)
+    try:
+        project_stat = os.lstat(project_root)
+    except OSError as exc:
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference project directory is missing"
+        ) from exc
+    project_attributes = int(
+        getattr(project_stat, "st_file_attributes", 0) or 0
+    )
+    if (os.path.islink(project_root) or project_attributes & 0x400
+            or not os.path.isdir(project_root)):
+        raise reference_contract.ReferenceContractError(
+            "project-owned reference project directory is invalid"
+        )
+    # create_project may have returned before its directory entry reached disk.
+    # Repeat on every mutation/retry: existence in the page cache is not durability.
+    _reference_fsync_directory(os.path.dirname(project_root))
+
+    assets_root = _reference_owned_storage_path(
+        projdir, "_ASSETS", expected_type="dir"
+    )
+    os.makedirs(assets_root, exist_ok=True)
+    assets_root = _reference_owned_storage_path(
+        projdir, "_ASSETS", must_exist=True, expected_type="dir"
+    )
+    _reference_fsync_directory(project_root)
+
+    child_root = _reference_owned_storage_path(
+        projdir, "_ASSETS", child_name, expected_type="dir"
+    )
+    os.makedirs(child_root, exist_ok=True)
+    child_root = _reference_owned_storage_path(
+        projdir, "_ASSETS", child_name, must_exist=True, expected_type="dir"
+    )
+    _reference_fsync_directory(assets_root)
+    # A retry may be observing entries from an earlier replace whose directory
+    # fsync failed.  Re-barrier the child before trusting any existing payload.
+    _reference_fsync_directory(child_root)
+    return assets_root, child_root
+
+
+def _reference_atomic_write(path, payload):
+    """Same-filesystem fsync+replace; читатель видит старый файл целиком либо новый."""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix="." + os.path.basename(path) + ".", suffix=".tmp",
+                               dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(payload)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+        tmp = None
+        _reference_fsync_directory(os.path.dirname(path))
+    finally:
+        if tmp:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+
+
+def _reference_project_path(projdir, rel, *, must_exist=False):
+    """Resolve только относительного пути строго внутри проекта, включая symlink target."""
+    if not isinstance(rel, str) or not rel or os.path.isabs(rel):
+        raise reference_contract.ReferenceContractError("reference path must be relative")
+    root = os.path.realpath(projdir)
+    full = os.path.realpath(os.path.join(root, rel.replace("\\", "/")))
+    if not full.startswith(root + os.sep):
+        raise reference_contract.ReferenceContractError("reference path escapes project")
+    if must_exist and not os.path.isfile(full):
+        raise reference_contract.ReferenceContractError(f"reference file is missing: {rel}")
+    return full
+
+
+def _reference_decode_bytes(raw, *, declared_format=None):
+    """Shared Pillow boundary: spoofed/animated/oversize input is blocking, never skipped."""
+    return reference_contract.canonicalize_reference_image(
+        raw,
+        declared_format=declared_format,
+        max_bytes=reference_contract.MAX_REFERENCE_BYTES,
+        max_pixels=reference_contract.MAX_REFERENCE_PIXELS,
+        max_dimension=reference_contract.MAX_REFERENCE_DIMENSION,
+    )
+
+
+def _reference_source_from_file(projdir, rel, *, content_addressed=False):
+    normalized_rel = str(rel or "").replace("\\", "/")
+    if content_addressed:
+        match = re.fullmatch(
+            r"_ASSETS/reference_uploads/([0-9a-f]{64})\.jpg", normalized_rel
+        )
+        if not match:
+            raise reference_contract.ReferenceContractError(
+                "content-addressed reference path is invalid"
+            )
+        full = _reference_owned_storage_path(
+            projdir, "_ASSETS", "reference_uploads", match.group(1) + ".jpg",
+            must_exist=True, expected_type="file",
+        )
+    else:
+        full = _reference_project_path(projdir, rel, must_exist=True)
+    try:
+        with open(full, "rb") as fh:
+            raw = fh.read(reference_contract.MAX_REFERENCE_BYTES + 1)
+    except OSError as exc:
+        raise reference_contract.ReferenceContractError(f"cannot read reference file: {rel}") from exc
+    if len(raw) > reference_contract.MAX_REFERENCE_BYTES:
+        raise reference_contract.ReferenceContractError(f"reference file is too large: {rel}")
+    checked = _reference_decode_bytes(raw)
+    if content_addressed:
+        digest = hashlib.sha256(raw).hexdigest()
+        if os.path.splitext(os.path.basename(rel))[0] != digest:
+            raise reference_contract.ReferenceContractError(
+                f"content-addressed reference hash mismatch: {rel}"
+            )
+        return {"sha256": digest, "bytes": raw, "rel": rel,
+                "width": checked.width, "height": checked.height}
+    # Legacy uploads are normalized in memory; the next mutation snapshots exactly
+    # these canonical bytes without deleting the user's original directory.
+    if len(checked.jpeg_bytes) > reference_contract.MAX_REFERENCE_BYTES:
+        raise reference_contract.ReferenceContractError(
+            f"normalized reference is too large: {rel}"
+        )
+    return {"sha256": checked.sha256, "bytes": checked.jpeg_bytes, "rel": rel,
+            "width": checked.width, "height": checked.height}
+
+
+def _reference_group_id(name, prefix="g"):
+    alias = reference_contract.normalize_alias(name)
+    return f"{prefix}_{hashlib.sha256(alias.encode('utf-8')).hexdigest()[:20]}"
+
+
+def _reference_validate_digest_ownership(state):
+    """One canonical image belongs to exactly one hero group or to style."""
+    digest_owner = {}
+    for row in state.get("characters", []):
+        owner = str(row.get("name") or row.get("group_id") or "hero")
+        for source in row.get("sources", []):
+            digest = str(source.get("sha256") or "")
+            previous = digest_owner.get(digest)
+            if previous is not None:
+                raise reference_contract.ReferenceContractError(
+                    f"the same reference image is assigned to both {previous!r} and {owner!r}"
+                )
+            digest_owner[digest] = owner
+    for source in state.get("style", []):
+        digest = str(source.get("sha256") or "")
+        previous = digest_owner.get(digest)
+        if previous is not None:
+            raise reference_contract.ReferenceContractError(
+                f"the same reference image is assigned to both {previous!r} and 'style'"
+            )
+        digest_owner[digest] = "style"
+    return state
+
+
+def _reference_legacy_state(projdir):
+    """Read old `_refs/_style_refs` once as a virtual v1 state; no destructive migration."""
+    characters = []
+    base = os.path.join(projdir, "_refs")
+    if os.path.isdir(base):
+        for dirname in sorted(os.listdir(base)):
+            directory = os.path.join(base, dirname)
+            if not os.path.isdir(directory):
+                continue
+            sources, seen = [], set()
+            for filename in sorted(os.listdir(directory)):
+                if not filename.lower().endswith(_REF_EXT):
+                    continue
+                rel = os.path.relpath(os.path.join(directory, filename), projdir)
+                source = _reference_source_from_file(projdir, rel)
+                if source["sha256"] not in seen:
+                    sources.append(source); seen.add(source["sha256"])
+            if sources:
+                if len(characters) >= reference_contract.MAX_HERO_GROUPS:
+                    raise reference_contract.ReferenceContractError(
+                        f"project accepts at most {reference_contract.MAX_HERO_GROUPS} hero groups"
+                    )
+                if len(sources) > reference_contract.MAX_HERO_ANGLES:
+                    raise reference_contract.ReferenceContractError(
+                        f"hero {dirname!r} has {len(sources)} angles; maximum is "
+                        f"{reference_contract.MAX_HERO_ANGLES}"
+                    )
+                characters.append({"group_id": _reference_group_id(dirname, "legacy"),
+                                   "name": unicodedata.normalize("NFC", dirname),
+                                   "sources": sources})
+    styles, seen = [], set()
+    style_dir = os.path.join(projdir, "_style_refs")
+    if os.path.isdir(style_dir):
+        for filename in sorted(os.listdir(style_dir)):
+            if not filename.lower().endswith(_REF_EXT):
+                continue
+            rel = os.path.relpath(os.path.join(style_dir, filename), projdir)
+            source = _reference_source_from_file(projdir, rel)
+            if source["sha256"] not in seen:
+                styles.append(source); seen.add(source["sha256"])
+    if len(styles) > reference_contract.MAX_STYLE_SOURCES:
+        raise reference_contract.ReferenceContractError(
+            f"style has {len(styles)} sources; maximum is {reference_contract.MAX_STYLE_SOURCES}"
+        )
+    return _reference_validate_digest_ownership(
+        {"characters": characters, "style": styles}
+    )
+
+
+def _reference_load_state(projdir):
+    """Authoritative v1 state, or a validated virtual import of the legacy folders."""
+    _reference_owned_storage_path(projdir, "_ASSETS", expected_type="dir")
+    _reference_owned_storage_path(
+        projdir, "_ASSETS", "reference_uploads", expected_type="dir"
+    )
+    manifest_path = _reference_owned_storage_path(
+        projdir, "_ASSETS", "reference_sources.v1.json", expected_type="file"
+    )
+    if not os.path.isfile(manifest_path):
+        return _reference_legacy_state(projdir)
+    try:
+        with open(manifest_path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        raise reference_contract.ReferenceContractError("reference source manifest is corrupt") from exc
+    if (not isinstance(data, dict)
+            or set(data) != {"schema_version", "characters", "style"}
+            or data.get("schema_version") != _REFERENCE_SOURCE_SCHEMA):
+        raise reference_contract.ReferenceContractError("unsupported reference source manifest")
+    rows = data.get("characters")
+    style_paths = data.get("style")
+    if not isinstance(rows, list) or not isinstance(style_paths, list):
+        raise reference_contract.ReferenceContractError("reference source manifest shape is invalid")
+    if len(rows) > reference_contract.MAX_HERO_GROUPS:
+        raise reference_contract.ReferenceContractError(
+            f"project accepts at most {reference_contract.MAX_HERO_GROUPS} hero groups"
+        )
+    characters, group_ids, aliases = [], set(), set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {"group_id", "name", "files"}:
+            raise reference_contract.ReferenceContractError("reference character row is invalid")
+        group_id, name, files = row.get("group_id"), row.get("name"), row.get("files")
+        if (not isinstance(group_id, str) or not re.fullmatch(r"[a-z0-9_]{3,80}", group_id)
+                or group_id in group_ids or not isinstance(name, str) or not name.strip()
+                or not isinstance(files, list)):
+            raise reference_contract.ReferenceContractError("reference character identity is invalid")
+        alias = reference_contract.normalize_alias(name)
+        if alias in aliases:
+            raise reference_contract.ReferenceContractError("duplicate normalized character names")
+        sources, seen = [], set()
+        for rel in files:
+            normalized_rel = str(rel or "").replace("\\", "/")
+            if not re.fullmatch(
+                    r"_ASSETS/reference_uploads/[0-9a-f]{64}\.jpg", normalized_rel):
+                raise reference_contract.ReferenceContractError(
+                    "reference source manifest path is invalid"
+                )
+            source = _reference_source_from_file(projdir, rel, content_addressed=True)
+            if source["sha256"] in seen:
+                raise reference_contract.ReferenceContractError("duplicate hero angle in manifest")
+            sources.append(source); seen.add(source["sha256"])
+        if not 1 <= len(sources) <= reference_contract.MAX_HERO_ANGLES:
+            raise reference_contract.ReferenceContractError(
+                f"hero {name!r} must contain 1..{reference_contract.MAX_HERO_ANGLES} angles"
+            )
+        characters.append({"group_id": group_id, "name": unicodedata.normalize("NFC", name.strip()),
+                           "sources": sources})
+        group_ids.add(group_id); aliases.add(alias)
+    styles, seen = [], set()
+    for rel in style_paths:
+        normalized_rel = str(rel or "").replace("\\", "/")
+        if not re.fullmatch(
+                r"_ASSETS/reference_uploads/[0-9a-f]{64}\.jpg", normalized_rel):
+            raise reference_contract.ReferenceContractError(
+                "reference source manifest path is invalid"
+            )
+        source = _reference_source_from_file(projdir, rel, content_addressed=True)
+        if source["sha256"] in seen:
+            raise reference_contract.ReferenceContractError("duplicate style source in manifest")
+        styles.append(source); seen.add(source["sha256"])
+    if len(styles) > reference_contract.MAX_STYLE_SOURCES:
+        raise reference_contract.ReferenceContractError(
+            f"style must contain at most {reference_contract.MAX_STYLE_SOURCES} sources"
+        )
+    return _reference_validate_digest_ownership(
+        {"characters": characters, "style": styles}
+    )
+
+
+def _reference_commit_state(projdir, state):
+    """Persist pixels first, then atomically publish their manifest as the batch commit."""
+    _reference_validate_digest_ownership(state)
+    _assets_root, uploads = _reference_ensure_owned_reference_directory(
+        projdir, "reference_uploads"
+    )
+    all_sources = [s for row in state["characters"] for s in row["sources"]] + list(state["style"])
+    for source in all_sources:
+        digest, payload = source["sha256"], source["bytes"]
+        if hashlib.sha256(payload).hexdigest() != digest:
+            raise reference_contract.ReferenceContractError("reference source changed before commit")
+        target = _reference_owned_storage_path(
+            projdir, "_ASSETS", "reference_uploads", digest + ".jpg",
+            expected_type="file",
+        )
+        if os.path.isfile(target):
+            with open(target, "rb") as fh:
+                if hashlib.sha256(fh.read()).hexdigest() != digest:
+                    raise reference_contract.ReferenceContractError("stored reference hash mismatch")
+        else:
+            _reference_atomic_write(target, payload)
+    def rel_for(source):
+        return os.path.relpath(os.path.join(uploads, source["sha256"] + ".jpg"), projdir).replace("\\", "/")
+    payload = {
+        "schema_version": _REFERENCE_SOURCE_SCHEMA,
+        "characters": [
+            {"group_id": row["group_id"], "name": row["name"],
+             "files": [rel_for(s) for s in sorted(row["sources"], key=lambda item: item["sha256"])]}
+            for row in sorted(state["characters"], key=lambda item: item["group_id"])
+        ],
+        "style": [rel_for(s) for s in sorted(state["style"], key=lambda item: item["sha256"])],
+    }
+    manifest_path = _reference_owned_storage_path(
+        projdir, "_ASSETS", "reference_sources.v1.json", expected_type="file"
+    )
+    _reference_atomic_write(
+        manifest_path,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8"),
+    )
+    return _reference_load_state(projdir)
+
+
+def _reference_validate_uploads(items):
+    """Validate the whole multipart batch before any project-visible state changes."""
+    if not items:
+        raise reference_contract.ReferenceContractError("select at least one reference image")
+    checked, seen = [], set()
+    for filename, raw in items:
+        ext = os.path.splitext(str(filename or ""))[1].lower()
+        if ext not in _REF_EXT:
+            raise reference_contract.ReferenceContractError(
+                f"{filename or 'file'}: only JPEG, PNG, or WEBP is allowed"
+            )
+        canonical = _reference_decode_bytes(raw, declared_format=ext)
+        if len(canonical.jpeg_bytes) > reference_contract.MAX_REFERENCE_BYTES:
+            raise reference_contract.ReferenceContractError(
+                f"{filename or 'file'}: normalized reference exceeds the "
+                f"{reference_contract.MAX_REFERENCE_BYTES}-byte limit"
+            )
+        if canonical.sha256 in seen:
+            continue
+        checked.append({"sha256": canonical.sha256, "bytes": canonical.jpeg_bytes,
+                        "rel": "", "width": canonical.width, "height": canonical.height})
+        seen.add(canonical.sha256)
+    if not checked:
+        raise reference_contract.ReferenceContractError("all selected references are duplicates")
+    return checked
+
+
+def _reference_add_sources(projdir, reftype, name, sources, *, with_receipt=False):
+    with _reference_lock(projdir):
+        state = _reference_load_state(projdir)
+        added = 0
+        if reftype == "style":
+            existing = {s["sha256"] for s in state["style"]}
+            new = [s for s in sources if s["sha256"] not in existing]
+            if len(state["style"]) + len(new) > reference_contract.MAX_STYLE_SOURCES:
+                raise reference_contract.ReferenceContractError(
+                    f"style accepts at most {reference_contract.MAX_STYLE_SOURCES} source images"
+                )
+            state["style"].extend(new)
+            added = len(new)
+        else:
+            display = unicodedata.normalize("NFC", str(name or "").strip())
+            if not display:
+                raise reference_contract.ReferenceContractError("character name is required")
+            if len(display) > 80:
+                raise reference_contract.ReferenceContractError("character name must not exceed 80 characters")
+            alias = reference_contract.normalize_alias(display)
+            matches = [row for row in state["characters"]
+                       if reference_contract.normalize_alias(row["name"]) == alias]
+            if len(matches) > 1:
+                raise reference_contract.ReferenceContractError("character name is ambiguous")
+            if matches:
+                row = matches[0]
+            else:
+                if len(state["characters"]) >= reference_contract.MAX_HERO_GROUPS:
+                    raise reference_contract.ReferenceContractError(
+                        f"project accepts at most {reference_contract.MAX_HERO_GROUPS} hero groups"
+                    )
+                row = {"group_id": _reference_group_id(display), "name": display, "sources": []}
+                state["characters"].append(row)
+            existing = {s["sha256"] for s in row["sources"]}
+            new = [s for s in sources if s["sha256"] not in existing]
+            if len(row["sources"]) + len(new) > reference_contract.MAX_HERO_ANGLES:
+                raise reference_contract.ReferenceContractError(
+                    f"hero accepts at most {reference_contract.MAX_HERO_ANGLES} angles"
+                )
+            row["sources"].extend(new)
+            added = len(new)
+        committed = _reference_commit_state(projdir, state)
+        return (committed, {"added": added}) if with_receipt else committed
+
+
+def _reference_delete_sources(projdir, *, reftype, group_id="", rel=""):
+    with _reference_lock(projdir):
+        state = _reference_load_state(projdir)
+        if rel:
+            rel = rel.replace("\\", "/")
+            owners = [
+                ("char", row["group_id"])
+                for row in state["characters"]
+                if any(source["rel"].replace("\\", "/") == rel
+                       for source in row["sources"])
+            ]
+            if any(source["rel"].replace("\\", "/") == rel
+                   for source in state["style"]):
+                owners.append(("style", ""))
+            if not owners:
+                raise reference_contract.ReferenceContractError("reference file is not in project manifest")
+            if reftype:
+                if reftype not in ("char", "style"):
+                    raise reference_contract.ReferenceContractError("unknown reference type")
+                if reftype == "char" and not group_id:
+                    raise reference_contract.ReferenceContractError(
+                        "character group is required to delete one reference"
+                    )
+                owner = (reftype, group_id if reftype == "char" else "")
+                if owner not in owners:
+                    raise reference_contract.ReferenceContractError(
+                        "reference file does not belong to the selected owner"
+                    )
+            else:
+                # Compatibility for a page rendered before owner fields existed.
+                # Content-addressed files may belong to several cards, so a path
+                # alone is safe only when it identifies exactly one occurrence.
+                if len(owners) != 1:
+                    raise reference_contract.ReferenceContractError(
+                        "reference file owner is ambiguous; refresh the page and retry"
+                    )
+                reftype, group_id = owners[0]
+            if reftype == "style":
+                state["style"] = [
+                    source for source in state["style"]
+                    if source["rel"].replace("\\", "/") != rel
+                ]
+            else:
+                for row in state["characters"]:
+                    if row["group_id"] == group_id:
+                        row["sources"] = [
+                            source for source in row["sources"]
+                            if source["rel"].replace("\\", "/") != rel
+                        ]
+                        break
+                state["characters"] = [row for row in state["characters"] if row["sources"]]
+        elif reftype == "style":
+            state["style"] = []
+        else:
+            before = len(state["characters"])
+            state["characters"] = [row for row in state["characters"] if row["group_id"] != group_id]
+            if len(state["characters"]) == before:
+                raise reference_contract.ReferenceContractError("reference character group is missing")
+        return _reference_commit_state(projdir, state)
+
+
+def _reference_source_fingerprint(state):
+    return reference_contract.canonical_fingerprint({
+        "characters": [
+            {"group_id": row["group_id"], "name": row["name"],
+             "hashes": sorted(source["sha256"] for source in row["sources"])}
+            for row in sorted(state["characters"], key=lambda item: item["group_id"])
+        ],
+        "style": sorted(source["sha256"] for source in state["style"]),
+    })
+
+
+def _reference_gate(params, state, *, raise_on_block=True):
+    """One server-side compatibility gate for UI, batch, deferred, retry, and regen."""
+    mode = str((params or {}).get("image_mode") or (params or {}).get("img_source") or "ai").strip().lower()
+    if mode == "googler":
+        mode = "ai"
+    model = str((params or {}).get("model") or "OPENAI").strip().upper()
+    raw = sum(len(row["sources"]) for row in state["characters"]) + len(state["style"])
+    packed = len(state["characters"]) + (1 if state["style"] else 0)
+    auto_hero = _truthy((params or {}).get("auto_hero"), default=False)
+    # Capacity is per provider request/scene, never per whole project.  The
+    # project-wide packed value is an upper bound; exact scene usage is checked
+    # by the worker before its first paid request.  Only the demand that is
+    # provably simultaneous may be rejected here (style + at least one hero).
+    required_min = (1 if state["style"] else 0) + (
+        1 if state["characters"] or auto_hero else 0
+    )
+    visual_requested = bool(raw or auto_hero)
+    analyze = _truthy((params or {}).get("analyze_story"), default=False)
+    custom = bool(str((params or {}).get("custom_prompts") or "").strip())
+    reasons = []
+    try:
+        capacity = reference_contract.reference_capacity(model)
+    except reference_contract.ReferenceContractError as exc:
+        capacity = 0; reasons.append(str(exc))
+    if mode == "bing" and visual_requested:
+        reasons.append("Bing does not accept visual references or auto hero")
+    if model == "GPT_IMAGE2" and visual_requested:
+        reasons.append("GPT_IMAGE2 does not accept visual references")
+    if custom and (analyze or auto_hero or len(state["characters"]) > 1):
+        reasons.append("custom prompts require at most one explicit hero and optional style reference")
+    if len(state["characters"]) > 1 and not analyze:
+        reasons.append("multiple named heroes require story analysis for exact scene binding")
+    if visual_requested and required_min > capacity:
+        reasons.append(
+            f"model {model} accepts {capacity} references per scene but at least "
+            f"{required_min} are simultaneously required"
+        )
+    result = {"raw": raw, "packed": packed, "required_min": required_min,
+              "capacity": capacity, "dropped": 0,
+              "blocking": reasons, "model": model, "mode": mode}
+    if reasons and raise_on_block:
+        raise reference_contract.ReferenceContractError("; ".join(reasons))
+    return result
+
+
+def _reference_regen_analysis_gate(projdir, params):
+    """Fail closed before regen can consume a stale/missing story-bible plan."""
+    mode = str((params or {}).get("image_mode") or "ai").strip().lower()
+    if mode == "bing" or not _truthy(
+            (params or {}).get("analyze_story"), default=False):
+        return
+    if not _scene_plan_ready(projdir, params):
+        raise reference_contract.ReferenceContractError(
+            "перегенерация с разбором требует актуальный план сцен и story bible; "
+            "сначала пересоберите картинки с включённым разбором"
+        )
+
+
+def _reference_bundle_payload(state):
+    characters = []
+    for row in sorted(state["characters"], key=lambda item: item["group_id"]):
+        hashes = sorted(source["sha256"] for source in row["sources"])
+        characters.append({"group_id": row["group_id"], "name": row["name"],
+                           "files": [f"sources/{digest}.jpg" for digest in hashes]})
+    style_hashes = sorted(source["sha256"] for source in state["style"])
+    payload = {
+        "schema_version": reference_contract.CONTRACT_SCHEMA_VERSION,
+        "characters": characters,
+        "style": [f"sources/{digest}.jpg" for digest in style_hashes],
+        "source_fingerprint": _reference_source_fingerprint(state),
+    }
+    return payload, reference_contract.canonical_fingerprint(payload)
+
+
+def _reference_load_bundle(projdir, bundle_id):
+    if not isinstance(bundle_id, str) or not _REFERENCE_BUNDLE_RE.fullmatch(bundle_id):
+        raise reference_contract.ReferenceContractError("trusted reference bundle id is invalid")
+    _reference_owned_storage_path(projdir, "_ASSETS", must_exist=True, expected_type="dir")
+    _reference_owned_storage_path(
+        projdir, "_ASSETS", "reference_bundles", must_exist=True, expected_type="dir"
+    )
+    _reference_owned_storage_path(
+        projdir, "_ASSETS", "reference_bundles", bundle_id,
+        must_exist=True, expected_type="dir",
+    )
+    _reference_owned_storage_path(
+        projdir, "_ASSETS", "reference_bundles", bundle_id, "sources",
+        must_exist=True, expected_type="dir",
+    )
+    manifest = _reference_owned_storage_path(
+        projdir, "_ASSETS", "reference_bundles", bundle_id, "manifest.json",
+        must_exist=True, expected_type="file",
+    )
+    try:
+        with open(manifest, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception as exc:
+        raise reference_contract.ReferenceContractError("trusted reference bundle is corrupt") from exc
+    required_keys = {"schema_version", "bundle_id", "characters", "style", "source_fingerprint"}
+    if (not isinstance(data, dict) or set(data) != required_keys
+            or data.get("schema_version") != reference_contract.CONTRACT_SCHEMA_VERSION
+            or data.get("bundle_id") != bundle_id
+            or not isinstance(data.get("characters"), list)
+            or not isinstance(data.get("style"), list)):
+        raise reference_contract.ReferenceContractError("trusted reference bundle identity mismatch")
+    if len(data["characters"]) > reference_contract.MAX_HERO_GROUPS:
+        raise reference_contract.ReferenceContractError("trusted reference hero group count is invalid")
+    unsigned = dict(data); unsigned.pop("bundle_id", None)
+    if reference_contract.canonical_fingerprint(unsigned) != bundle_id:
+        raise reference_contract.ReferenceContractError("trusted reference bundle fingerprint mismatch")
+    logical_state = {"characters": [], "style": []}
+    seen_groups, seen_aliases = set(), set()
+    paths = []
+    for row in data["characters"]:
+        if (not isinstance(row, dict) or set(row) != {"group_id", "name", "files"}
+                or not isinstance(row.get("group_id"), str)
+                or not re.fullmatch(r"[a-z0-9_]{3,80}", row["group_id"])
+                or row["group_id"] in seen_groups or not isinstance(row.get("name"), str)
+                or not row["name"].strip() or not isinstance(row.get("files"), list)
+                or not 1 <= len(row["files"]) <= reference_contract.MAX_HERO_ANGLES):
+            raise reference_contract.ReferenceContractError("trusted reference hero group is invalid")
+        alias = reference_contract.normalize_alias(row["name"])
+        if alias in seen_aliases:
+            raise reference_contract.ReferenceContractError("trusted reference hero names are ambiguous")
+        seen_groups.add(row["group_id"]); seen_aliases.add(alias)
+        hashes = []
+        for rel in row["files"]:
+            if not isinstance(rel, str) or not re.fullmatch(r"sources/[0-9a-f]{64}\.jpg", rel):
+                raise reference_contract.ReferenceContractError("trusted reference source path is invalid")
+            hashes.append(os.path.splitext(os.path.basename(rel))[0]); paths.append(rel)
+        if len(set(hashes)) != len(hashes):
+            raise reference_contract.ReferenceContractError("trusted reference hero contains duplicates")
+        logical_state["characters"].append(
+            {"group_id": row["group_id"], "name": row["name"],
+             "sources": [{"sha256": digest} for digest in hashes]}
+        )
+    if len(data["style"]) > reference_contract.MAX_STYLE_SOURCES:
+        raise reference_contract.ReferenceContractError("trusted style reference count is invalid")
+    style_hashes = []
+    for rel in data["style"]:
+        if not isinstance(rel, str) or not re.fullmatch(r"sources/[0-9a-f]{64}\.jpg", rel):
+            raise reference_contract.ReferenceContractError("trusted style reference path is invalid")
+        digest = os.path.splitext(os.path.basename(rel))[0]
+        style_hashes.append(digest); paths.append(rel)
+        logical_state["style"].append({"sha256": digest})
+    if len(set(style_hashes)) != len(style_hashes):
+        raise reference_contract.ReferenceContractError("trusted style references contain duplicates")
+    _reference_validate_digest_ownership(logical_state)
+    if _reference_source_fingerprint(logical_state) != data["source_fingerprint"]:
+        raise reference_contract.ReferenceContractError("trusted reference source fingerprint mismatch")
+    for rel in paths:
+        filename = os.path.basename(rel)
+        if not re.fullmatch(r"[0-9a-f]{64}\.jpg", filename):
+            raise reference_contract.ReferenceContractError("trusted reference bundle source path is invalid")
+        full = _reference_owned_storage_path(
+            projdir, "_ASSETS", "reference_bundles", bundle_id, "sources", filename,
+            must_exist=True, expected_type="file",
+        )
+        with open(full, "rb") as fh:
+            if hashlib.sha256(fh.read()).hexdigest() != os.path.splitext(os.path.basename(full))[0]:
+                raise reference_contract.ReferenceContractError("trusted reference bundle source hash mismatch")
+    return manifest, data
+
+
+def _snapshot_reference_bundle(projdir, params):
+    """Immutable content-addressed raw-input snapshot, including the empty set."""
+    with _reference_lock(projdir):
+        state = _reference_load_state(projdir)
+        _reference_gate(params, state)
+        payload, bundle_id = _reference_bundle_payload(state)
+        _assets_root, root = _reference_ensure_owned_reference_directory(
+            projdir, "reference_bundles"
+        )
+        target = _reference_owned_storage_path(
+            projdir, "_ASSETS", "reference_bundles", bundle_id, expected_type="dir"
+        )
+        if os.path.isdir(target):
+            _reference_load_bundle(projdir, bundle_id)
+            return bundle_id
+        tmp = tempfile.mkdtemp(prefix=".bundle-", dir=root)
+        try:
+            sources_dir = os.path.join(tmp, "sources")
+            os.makedirs(sources_dir, exist_ok=True)
+            unique = {}
+            for source in ([s for row in state["characters"] for s in row["sources"]]
+                           + list(state["style"])):
+                unique[source["sha256"]] = source["bytes"]
+            for digest, raw in unique.items():
+                _reference_atomic_write(os.path.join(sources_dir, digest + ".jpg"), raw)
+            manifest = {**payload, "bundle_id": bundle_id}
+            _reference_atomic_write(
+                os.path.join(tmp, "manifest.json"),
+                json.dumps(manifest, ensure_ascii=False, sort_keys=True,
+                           separators=(",", ":")).encode("utf-8"),
+            )
+            published = False
+            try:
+                os.replace(tmp, target)
+                tmp = None
+                published = True
+            except OSError:
+                if not os.path.isdir(target):
+                    raise
+            if published:
+                _reference_fsync_directory(root)
+            _reference_load_bundle(projdir, bundle_id)
+            return bundle_id
+        finally:
+            if tmp:
+                shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _reference_manifest_from_params(projdir, params):
+    bundle_id = (params or {}).get(_REFERENCE_BUNDLE_PARAM)
+    if not bundle_id:
+        return None
+    return _reference_load_bundle(projdir, bundle_id)[0]
+
+
+def _reference_bundle_state(data):
+    """Minimal logical state used by the server gate; pixels stay in the bundle."""
+    return {
+        "characters": [
+            {"group_id": row["group_id"], "name": row["name"],
+             "sources": [{} for _path in row["files"]]}
+            for row in data["characters"]
+        ],
+        "style": [{} for _path in data["style"]],
+    }
+
+
+def _reference_prepare_bundle(projdir, params, trusted_bundle_id=_REFERENCE_BUNDLE_UNSET):
+    """Mint once from live sources, or reuse only a server-supplied verified bundle."""
+    if trusted_bundle_id is _REFERENCE_BUNDLE_UNSET:
+        return _snapshot_reference_bundle(projdir, params)
+    _manifest, data = _reference_load_bundle(projdir, trusted_bundle_id)
+    _reference_gate(params, _reference_bundle_state(data))
+    return trusted_bundle_id
+
+
+def _reference_file_url(pid, projdir, rel):
+    quoted = urllib.parse.quote(rel.replace("\\", "/"))
+    try:
+        version = int(os.path.getmtime(_reference_project_path(projdir, rel, must_exist=True)))
+        return f"/p/{pid}/file/{quoted}?v={version}"
+    except (OSError, reference_contract.ReferenceContractError):
+        return f"/p/{pid}/file/{quoted}"
+
+
+def _reference_receipt_context(projdir, params, model, runtime):
+    """Exact worker-compatible frame fingerprints for the current saved plan/settings."""
+    if not isinstance(runtime, dict) or not callable(getattr(gw, "_frame_generation_fingerprint", None)):
+        return None
+    try:
+        scenes_path = os.path.join(projdir, "googler", "scenes.json")
+        with open(scenes_path, "rb") as fh:
+            scene_bytes = fh.read()
+        scenes = json.loads(scene_bytes.decode("utf-8"))
+        if not isinstance(scenes, list) or len(scenes) != len(runtime["scenes"]):
+            return None
+        style = str((params or {}).get("style") or
+                    "minimalistic, cinematic, photorealistic")
+        custom_prompts = str((params or {}).get("custom_prompts") or "").strip()
+        if custom_prompts:
+            with open(os.path.join(projdir, "googler", "scenes.meta.json"),
+                      encoding="utf-8") as fh:
+                meta = json.load(fh)
+            prompts = [line.strip() for line in custom_prompts.splitlines() if line.strip()]
+            custom_fingerprint = reference_contract.canonical_fingerprint({
+                "schema_version": 1,
+                "kind": "custom-prompts",
+                "prompts": prompts,
+                "style": style,
+                "model": str(model).upper(),
+            })
+            manual_identity_present = _scene_plan_manual_identity(projdir, params)
+            artifacts = meta.get("prompt_artifacts") if isinstance(meta, dict) else None
+            if (not isinstance(meta, dict)
+                    or meta.get("plan_version") != "custom-prompts-v1"
+                    or meta.get("scene_count") != len(scenes)
+                    or meta.get("scenes_sha256") != hashlib.sha256(scene_bytes).hexdigest()
+                    or str(meta.get("model") or "").upper() != str(model).upper()
+                    or meta.get("style") != style
+                    or meta.get("custom_prompts_fingerprint") != custom_fingerprint
+                    or manual_identity_present is None
+                    or meta.get("manual_identity_present") is not manual_identity_present
+                    or meta.get("story_identity_present") is not False
+                    or meta.get("auto_hero_prompt_required") is not False
+                    or meta.get("auto_hero") is not False
+                    or not isinstance(artifacts, dict)):
+                return None
+        elif not _scene_plan_ready(projdir, params):
+            return None
+        aspect = str((params or {}).get("aspect_ratio") or "landscape")
+        raw_seed = str((params or {}).get("seed") or "").strip()
+        seed = (int(raw_seed) if raw_seed.lstrip("-").isdigit()
+                else int(hashlib.md5(style.encode("utf-8")).hexdigest()[:8], 16) % 1000000 + 1)
+        by_index = {row["index"]: row for row in runtime["scenes"]}
+        if set(by_index) != set(range(len(scenes))):
+            return None
+        return {
+            f"{index + 1:03d}": {
+                "generation_fingerprint": gw._frame_generation_fingerprint(
+                    scene, style, aspect, seed, model, by_index[index]
+                ),
+                "runtime": by_index[index],
+            }
+            for index, scene in enumerate(scenes)
+        }
+    except Exception:
+        return None
+
+
+def _reference_cache_summary(projdir, bundle_id, model, params=None, runtime=None,
+                             *, active_refs=False):
+    """Strict worker-receipt view; never infer a fresh cache from filenames alone."""
+    images = sorted(glob.glob(os.path.join(projdir, "googler", "*.jpg")))
+    if not images:
+        return {"fresh": 0, "stale": 0, "legacy": 0, "trusted": 0}
+    receipt_path = os.path.join(projdir, "googler", "image_receipts.v1.json")
+    try:
+        with open(receipt_path, encoding="utf-8") as fh:
+            receipt = json.load(fh)
+    except Exception:
+        # Existing bytes without a parseable receipt are unverified legacy,
+        # regardless of whether new refs are active.  Calling them merely
+        # "stale" would allow a default cache run to decide/spend silently.
+        return {"fresh": 0, "stale": 0, "legacy": len(images), "trusted": 0}
+    required = {"schema_version", "bundle_id", "reference_fingerprint", "model", "frames"}
+    if (not isinstance(receipt, dict) or set(receipt) != required
+            or receipt.get("schema_version") != 2
+            or not _REFERENCE_BUNDLE_RE.fullmatch(
+                str(receipt.get("reference_fingerprint") or "")
+            )
+            or not isinstance(receipt.get("model"), str)
+            or not isinstance(receipt.get("frames"), dict)):
+        return {"fresh": 0, "stale": 0, "legacy": len(images), "trusted": 0}
+    rows = receipt["frames"]
+    top_bundle = receipt.get("bundle_id")
+    model_matches = receipt["model"].strip().upper() == str(model).strip().upper()
+    receipt_context = _reference_receipt_context(projdir, params, model, runtime)
+    runtime_matches = bool(
+        receipt_context is not None
+        and receipt.get("reference_fingerprint") == runtime.get("reference_fingerprint")
+    )
+    fresh = stale = legacy = trusted = 0
+    for path in images:
+        stem = os.path.splitext(os.path.basename(path))[0]
+        frame_key = f"{int(stem):03d}" if stem.isdigit() else stem
+        row = rows.get(frame_key) or rows.get(stem)
+        context = receipt_context.get(frame_key) if receipt_context else None
+        row_keys = {"generation_fingerprint", "completed_fingerprint",
+                    "reference_fingerprint", "status", "used", "capacity",
+                    "references", "output_sha256", "trusted_by_user",
+                    "legacy_trusted_at"}
+        status = None
+        if isinstance(row, dict) and set(row) == row_keys:
+            refs = row.get("references")
+            generation = str(row.get("generation_fingerprint") or "")
+            completed = row.get("completed_fingerprint")
+            output_sha = row.get("output_sha256")
+            used, capacity = row.get("used"), row.get("capacity")
+            trusted_by_user = row.get("trusted_by_user")
+            legacy_trusted_at = row.get("legacy_trusted_at")
+            valid = (
+                _REFERENCE_BUNDLE_RE.fullmatch(generation)
+                and (completed is None or _REFERENCE_BUNDLE_RE.fullmatch(str(completed)))
+                and _REFERENCE_BUNDLE_RE.fullmatch(
+                    str(row.get("reference_fingerprint") or "")
+                )
+                and row.get("status") in ("fresh", "stale", "legacy")
+                and isinstance(used, int) and not isinstance(used, bool) and used >= 0
+                and isinstance(capacity, int) and not isinstance(capacity, bool)
+                and 0 <= used <= capacity
+                and isinstance(refs, list) and len(refs) == used
+                and all(
+                    isinstance(ref, dict)
+                    and set(ref) == {"slot_id", "kind", "entity_id",
+                                     "canonical_name", "artifact_sha256"}
+                    and isinstance(ref.get("slot_id"), str)
+                    and isinstance(ref.get("kind"), str)
+                    and (ref.get("entity_id") is None
+                         or isinstance(ref.get("entity_id"), str))
+                    and (ref.get("canonical_name") is None
+                         or isinstance(ref.get("canonical_name"), str))
+                    and _REFERENCE_BUNDLE_RE.fullmatch(
+                        str(ref.get("artifact_sha256") or "")
+                    )
+                    for ref in refs
+                )
+                and (output_sha is None
+                     or _REFERENCE_BUNDLE_RE.fullmatch(str(output_sha)))
+                and isinstance(trusted_by_user, bool)
+                and (legacy_trusted_at is None
+                     or (isinstance(legacy_trusted_at, int)
+                         and not isinstance(legacy_trusted_at, bool)
+                         and legacy_trusted_at > 0))
+            )
+            if valid and row.get("status") == "legacy":
+                valid = trusted_by_user and isinstance(legacy_trusted_at, int)
+            elif valid:
+                valid = trusted_by_user is False and legacy_trusted_at is None
+            if valid:
+                status = row["status"]
+                # A fresh/legacy claim is complete only when it binds the exact
+                # generation and output fingerprints written by the worker.
+                if status in ("fresh", "legacy") and (
+                        completed != generation
+                        or not _REFERENCE_BUNDLE_RE.fullmatch(str(output_sha or ""))):
+                    status = None
+        current_claim = False
+        if status and context:
+            runtime_scene = context["runtime"]
+            expected_references = [
+                {"slot_id": ref["slot_id"], "kind": ref["kind"],
+                 "entity_id": ref["entity_id"], "canonical_name": ref["canonical_name"],
+                 "artifact_sha256": ref["artifact"]["sha256"]}
+                for ref in runtime_scene["selected"]
+            ]
+            try:
+                with open(path, "rb") as image_fh:
+                    output_digest = hashlib.sha256()
+                    for chunk in iter(lambda: image_fh.read(1024 * 1024), b""):
+                        output_digest.update(chunk)
+                    actual_output_sha = output_digest.hexdigest()
+            except OSError:
+                actual_output_sha = ""
+            current_claim = bool(
+                runtime_matches
+                and row["reference_fingerprint"] == runtime_scene["fingerprint"]
+                and row["used"] == runtime_scene["used"]
+                and row["capacity"] == runtime_scene["capacity"]
+                and row["references"] == expected_references
+                and row["generation_fingerprint"] == context["generation_fingerprint"]
+                and row["output_sha256"] == actual_output_sha
+            )
+        if top_bundle != bundle_id or not model_matches or not runtime_matches:
+            stale += 1
+        elif status == "fresh" and current_claim:
+            fresh += 1
+        elif status == "legacy" and current_claim:
+            trusted += 1
+        elif status in ("fresh", "stale", "legacy"):
+            stale += 1
+        else:
+            # No exact row for an existing image is the same unverified legacy
+            # situation as a missing receipt, not permission to regenerate it.
+            legacy += 1
+    return {"fresh": fresh, "stale": stale, "legacy": legacy, "trusted": trusted}
+
+
+def _reference_runtime_artifact_valid(projdir, artifact):
+    """Verify one worker artifact against trusted project storage and its bytes."""
+    try:
+        sha256 = str(artifact.get("sha256") or "")
+        kind = str(artifact.get("kind") or "")
+        width, height = artifact.get("width"), artifact.get("height")
+        source_hashes = artifact.get("source_hashes")
+        if (not _REFERENCE_BUNDLE_RE.fullmatch(sha256)
+                or not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,63}", kind)
+                or not isinstance(width, int) or isinstance(width, bool) or width <= 0
+                or not isinstance(height, int) or isinstance(height, bool) or height <= 0
+                or not isinstance(source_hashes, list) or not source_hashes
+                or any(not _REFERENCE_BUNDLE_RE.fullmatch(str(value or ""))
+                       for value in source_hashes)):
+            return False
+        filename = f"{kind}-{sha256}.jpg"
+        artifact_path = _reference_owned_storage_path(
+            projdir, "_ASSETS", "reference_artifacts", filename,
+            must_exist=True, expected_type="file",
+        )
+        if os.path.abspath(str(artifact.get("path") or "")) != artifact_path:
+            return False
+        digest = hashlib.sha256()
+        with open(artifact_path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                digest.update(chunk)
+        if digest.hexdigest() != sha256:
+            return False
+        from PIL import Image
+        with Image.open(artifact_path) as image:
+            if (str(image.format or "").upper() != "JPEG"
+                    or getattr(image, "is_animated", False)):
+                return False
+            image.load()
+            if image.size != (width, height):
+                return False
+        expected = reference_contract.canonical_fingerprint({
+            "schema_version": reference_contract.CONTRACT_SCHEMA_VERSION,
+            "kind": kind,
+            "sha256": sha256,
+            "source_hashes": source_hashes,
+            "width": width,
+            "height": height,
+        })
+        return artifact.get("fingerprint") == expected
+    except Exception:
+        return False
+
+
+def _reference_runtime_summary(projdir, bundle_id, source_fingerprint, model,
+                               source_count, *, include_runtime=False):
+    """Return exact scene maximum only for a fully shaped current worker runtime."""
+    path = os.path.join(projdir, "googler", "references.runtime.v1.json")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            runtime = json.load(fh)
+        with open(os.path.join(projdir, "googler", "scenes.json"), "rb") as fh:
+            published_scene_bytes = fh.read()
+        published_scenes = json.loads(published_scene_bytes.decode("utf-8"))
+        with open(os.path.join(projdir, "googler", "scenes.meta.json"), encoding="utf-8") as fh:
+            published_meta = json.load(fh)
+        scenes_sha256 = hashlib.sha256(published_scene_bytes).hexdigest()
+        scene_fingerprint_fn = getattr(gw, "_scene_reference_fingerprint", None)
+        if not callable(scene_fingerprint_fn):
+            return None
+        top_keys = {"schema_version", "bundle_id", "source_fingerprint",
+                    "reference_fingerprint", "scenes_sha256", "model", "capacity",
+                    "source_count", "packed_slots", "scenes"}
+        if (not isinstance(runtime, dict) or set(runtime) != top_keys
+                or runtime.get("schema_version") != 1
+                or runtime.get("bundle_id") != bundle_id
+                or runtime.get("source_fingerprint") != source_fingerprint
+                or str(runtime.get("model") or "").upper() != model
+                or not _REFERENCE_BUNDLE_RE.fullmatch(str(runtime.get("source_fingerprint") or ""))
+                or not _REFERENCE_BUNDLE_RE.fullmatch(str(runtime.get("reference_fingerprint") or ""))
+                or not _REFERENCE_BUNDLE_RE.fullmatch(str(runtime.get("scenes_sha256") or ""))
+                or runtime.get("scenes_sha256") != scenes_sha256
+                or not isinstance(published_meta, dict)
+                or published_meta.get("scenes_sha256") != scenes_sha256
+                or not isinstance(published_scenes, list) or not published_scenes
+                or published_meta.get("scene_count") != len(published_scenes)
+                or not isinstance(runtime.get("capacity"), int)
+                or isinstance(runtime.get("capacity"), bool)
+                or runtime.get("capacity") != reference_contract.reference_capacity(model)
+                or not isinstance(runtime.get("source_count"), int)
+                or isinstance(runtime.get("source_count"), bool)
+                or runtime.get("source_count") != source_count
+                or not isinstance(runtime.get("packed_slots"), int)
+                or isinstance(runtime.get("packed_slots"), bool)
+                or runtime["packed_slots"] < 0
+                or not isinstance(runtime.get("scenes"), list)
+                or len(runtime["scenes"]) != len(published_scenes)):
+            return None
+        seen, used_total, exact_max = set(), 0, 0
+        scene_keys = {"index", "bundle_id", "source_fingerprint", "fingerprint", "used",
+                      "capacity", "identity_block", "selected", "audit"}
+        audit_statuses = set(reference_contract.REFERENCE_AUDIT_STATUSES)
+        for expected_index, scene in enumerate(runtime["scenes"]):
+            if (not isinstance(scene, dict) or set(scene) != scene_keys
+                    or not isinstance(scene.get("index"), int) or isinstance(scene.get("index"), bool)
+                    or scene["index"] != expected_index or scene["index"] in seen
+                    or scene.get("bundle_id") != bundle_id
+                    or scene.get("source_fingerprint") != runtime["source_fingerprint"]
+                    or not _REFERENCE_BUNDLE_RE.fullmatch(str(scene.get("fingerprint") or ""))
+                    or not isinstance(scene.get("used"), int) or isinstance(scene.get("used"), bool)
+                    or not 0 <= scene["used"] <= runtime["capacity"]
+                    or scene.get("capacity") != runtime["capacity"]
+                    or not isinstance(scene.get("identity_block"), str)
+                    or not isinstance(scene.get("selected"), list)
+                    or len(scene["selected"]) != scene["used"]
+                    or not isinstance(scene.get("audit"), list)
+                    or any(
+                        not isinstance(row, dict)
+                        or set(row) != {"slot_id", "kind", "entity_id", "canonical_name", "artifact"}
+                        or not isinstance(row.get("slot_id"), str)
+                        or not isinstance(row.get("kind"), str)
+                        or row.get("entity_id") is not None and not isinstance(row.get("entity_id"), str)
+                        or row.get("canonical_name") is not None and not isinstance(row.get("canonical_name"), str)
+                        or not isinstance(row.get("artifact"), dict)
+                        or set(row["artifact"]) != {"path", "sha256", "width", "height",
+                                                        "source_hashes", "kind", "fingerprint"}
+                        or not _reference_runtime_artifact_valid(projdir, row["artifact"])
+                        for row in scene["selected"]
+                    )
+                    or any(
+                        not isinstance(row, dict)
+                        or set(row) != {"slot_id", "kind", "status", "artifact_sha256",
+                                        "reason", "superseded_by"}
+                        or not isinstance(row.get("slot_id"), str)
+                        or not isinstance(row.get("kind"), str)
+                        or row.get("status") not in audit_statuses
+                        or row.get("status") == "blocking"
+                        or (row.get("artifact_sha256") is not None
+                            and not _REFERENCE_BUNDLE_RE.fullmatch(
+                                str(row.get("artifact_sha256") or "")))
+                        or not isinstance(row.get("reason"), str)
+                        or (row.get("superseded_by") is not None
+                            and not isinstance(row.get("superseded_by"), str))
+                        for row in scene["audit"]
+                    )):
+                return None
+            audit_ids = [row["slot_id"] for row in scene["audit"]]
+            selected_ids = [row["slot_id"] for row in scene["selected"]]
+            if len(audit_ids) != len(set(audit_ids)) or len(selected_ids) != len(set(selected_ids)):
+                return None
+            selected_audit = {
+                row["slot_id"]: row for row in scene["audit"] if row["status"] == "selected"
+            }
+            if set(selected_audit) != set(selected_ids):
+                return None
+            if any(
+                selected_audit[row["slot_id"]]["kind"] != row["kind"]
+                or selected_audit[row["slot_id"]]["artifact_sha256"]
+                   != row["artifact"]["sha256"]
+                for row in scene["selected"]
+            ):
+                return None
+            pack_fingerprint = reference_contract.canonical_fingerprint({
+                "schema_version": reference_contract.CONTRACT_SCHEMA_VERSION,
+                "model": model,
+                "capacity": runtime["capacity"],
+                "slots": [
+                    {"slot_id": row["slot_id"], "kind": row["kind"],
+                     "status": row["status"],
+                     "artifact_sha256": row["artifact_sha256"],
+                     "superseded_by": row["superseded_by"]}
+                    for row in scene["audit"]
+                ],
+            })
+            expected_scene_fingerprint = scene_fingerprint_fn(
+                pack_fingerprint, scene["selected"], scene["identity_block"]
+            )
+            if scene["fingerprint"] != expected_scene_fingerprint:
+                return None
+            seen.add(scene["index"]); used_total += scene["used"]
+            exact_max = max(exact_max, scene["used"])
+        if used_total != runtime["packed_slots"]:
+            return None
+        expected_runtime_fingerprint = reference_contract.canonical_fingerprint({
+            "schema_version": 1,
+            "scenes_sha256": runtime["scenes_sha256"],
+            "bundle_id": runtime["bundle_id"],
+            "source_fingerprint": runtime["source_fingerprint"],
+            "model": model,
+            "scenes": [
+                {"index": row["index"], "fingerprint": row["fingerprint"],
+                 "identity_block": row["identity_block"]}
+                for row in runtime["scenes"]
+            ],
+        })
+        if runtime["reference_fingerprint"] != expected_runtime_fingerprint:
+            return None
+        summary = {"exact": True, "max_scene": exact_max, "selected": used_total,
+                   "capacity": runtime["capacity"], "scenes": len(runtime["scenes"])}
+        if include_runtime:
+            summary["_runtime"] = runtime
+        return summary
+    except Exception:
+        return None
+
+
+def _reference_status(projdir, params):
+    state = _reference_load_state(projdir)
+    gate = _reference_gate(params, state, raise_on_block=False)
+    bundle_payload, bundle_id = _reference_bundle_payload(state)
+    runtime = _reference_runtime_summary(
+        projdir, bundle_id, bundle_payload["source_fingerprint"], gate["model"],
+        gate["raw"], include_runtime=True
+    )
+    runtime_data = runtime.pop("_runtime", None) if runtime else None
+    gate.update({
+        "bundle_id": bundle_id,
+        "characters": len(state["characters"]),
+        "style_sources": len(state["style"]),
+        "cache": _reference_cache_summary(
+            projdir, bundle_id, gate["model"], params, runtime_data,
+            active_refs=bool(
+                gate["raw"] > 0
+                or _truthy((params or {}).get("auto_hero"), default=False)
+                or _truthy((params or {}).get("analyze_story"), default=False)
+            )
+        ),
+        "runtime": runtime,
+    })
+    return gate
+
+
+def _reference_apply_legacy_cache_choice(projdir, params):
+    """Require a task-scoped decision before touching receipt-less image bytes."""
+    out = dict(params or {})
+    action = str(out.get(_LEGACY_CACHE_ACTION_PARAM) or "").strip().lower()
+    if action and action not in _LEGACY_CACHE_ACTIONS:
+        raise reference_contract.ReferenceContractError(
+            "legacy_cache_action должен быть regenerate или keep"
+        )
+    legacy = _reference_status(projdir, out)["cache"]["legacy"]
+    if not legacy:
+        out.pop(_LEGACY_CACHE_ACTION_PARAM, None)
+        return out
+    if not action:
+        raise reference_contract.ReferenceContractError(
+            f"Найдено непроверенных legacy-кадров: {legacy}. "
+            "Явно выберите: перегенерировать их или доверить и сохранить."
+        )
+    # The decision is immutable queue metadata.  Regenerate disables cache so
+    # every legacy byte is replaced; keep enables worker-side explicit trust.
+    out["use_cache"] = "0" if action == "regenerate" else "1"
+    out[_LEGACY_CACHE_ACTION_PARAM] = action
+    return out
+
+
+def _reference_panel_html(pid, projdir, params, notice=""):
+    state = _reference_load_state(projdir)
+    status = _reference_status(projdir, params)
+
+    def thumb(source, reftype, group_id=""):
+        rel = source["rel"].replace("\\", "/")
+        return (f'<div class=thumb style="background-image:url(\'{_reference_file_url(pid, projdir, rel)}\')">'
+                f'<form class=ref-ajax method=post action=/api/projects/{pid}/refs/delfile style="display:contents">'
+                f'<input type=hidden name=path value="{html.escape(rel)}">'
+                f'<input type=hidden name=reftype value="{html.escape(reftype)}">'
+                f'<input type=hidden name=group_id value="{html.escape(group_id)}">'
+                f'<button class=rm title="Удалить">'
+                f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button></form></div>')
+
+    cards = []
+    for index, row in enumerate(state["characters"]):
+        cards.append(
+            f'<div class=char><div class=char-head><span>{html.escape(row["name"])} '
+            f'<span class=muted>· {len(row["sources"])} → 1 input</span></span>'
+            f'<form class=ref-ajax method=post action=/api/projects/{pid}/refs/delete style="margin:0;display:flex" '
+            f'data-confirm="Удалить персонажа?"><input type=hidden name=reftype value=char>'
+            f'<input type=hidden name=group_id value="{html.escape(row["group_id"])}">'
+            f'<button class="btn btn-ghost btn-sm" style="padding:2px 8px"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button></form></div>'
+            f'<div class=thumbs>{"".join(thumb(source, "char", row["group_id"]) for source in row["sources"])}'
+            f'<label class=thumb-add for=refChar{index}>＋</label></div>'
+            f'<form class=ref-upload method=post action=/api/projects/{pid}/refs enctype=multipart/form-data style="margin:0">'
+            f'<input type=hidden name=reftype value=char><input type=hidden name=name value="{html.escape(row["name"])}">'
+            f'<input type=file id=refChar{index} name=files class=file-hidden multiple accept="image/jpeg,image/png,image/webp"></form></div>'
+        )
+    style_clear = (
+        f'<form class=ref-ajax method=post action=/api/projects/{pid}/refs/delete style="margin-left:auto">'
+        f'<input type=hidden name=reftype value=style><button class="btn btn-ghost btn-sm" title="Удалить все style refs">'
+        f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button></form>'
+        if state["style"] else ""
+    )
+    style_picker = (
+        f'<div class=thumbs>{"".join(thumb(source, "style") for source in state["style"])}'
+        f'<label class=thumb-add for=styFile>＋</label></div>'
+        if state["style"] else
+        f'<div class=dropzone-sm onclick="document.getElementById(\'styFile\').click()" '
+        f'ondragover="event.preventDefault();this.style.borderColor=\'var(--accent)\'" '
+        f'ondragleave="this.style.borderColor=\'\'" ondrop="refDrop(event,\'styFile\')">'
+        f'<div class=ico>{_ICON_UP}</div><div style="font-weight:600;font-size:13px">'
+        f'Перетащите образцы стиля <span style="color:var(--accent)">или выберите</span></div>'
+        f'<div class=muted style="font-size:11px;margin-top:3px">JPG · PNG · WEBP · до '
+        f'{reference_contract.MAX_STYLE_SOURCES} образцов</div></div>'
+    )
+    blocking = " · ".join(status["blocking"])
+    cache = status["cache"]
+    runtime = status["runtime"]
+    status_cls = ("var(--error)" if blocking else
+                  "var(--done)" if runtime or status["required_min"] == 0 else "var(--warn)")
+    cache_text = (f'Актуальны: {cache["fresh"]} · устарели: {cache["stale"]} · '
+                  f'явно сохранены legacy: {cache.get("trusted", 0)} · '
+                  f'непроверены legacy: {cache["legacy"]}')
+    legacy_choice = ""
+    if cache["legacy"]:
+        legacy_choice = (
+            f'<fieldset id=refLegacyChoice style="border:1px solid var(--warn);'
+            f'border-radius:8px;padding:8px 10px;margin:8px 0 0;color:var(--warn)">'
+            f'<legend style="padding:0 4px;font-size:11px;font-weight:700">'
+            f'Непроверенные кадры: {cache["legacy"]} — нужен явный выбор</legend>'
+            '<label style="display:block;margin:3px 0"><input type=radio '
+            'name=legacy_cache_action value=regenerate form=imgRefSettings '
+            'onchange="refStatusUpdate(true)"> Перегенерировать '
+            'непроверенные (может потребовать кредиты)</label>'
+            '<label style="display:block;margin:3px 0"><input type=radio '
+            'name=legacy_cache_action value=keep form=imgRefSettings '
+            'onchange="refStatusUpdate(true)"> Я проверил — доверить '
+            'и сохранить как есть</label></fieldset>'
+        )
+    if runtime:
+        count_text = (f'Исходники: {status["raw"]} → максимум сцены: '
+                      f'{runtime["max_scene"]}/{runtime["capacity"]} · '
+                      f'selected: {runtime["selected"]} · потеряно: 0')
+        gate_text = (f'Проверено по {runtime["scenes"]} сценам до платных запросов; '
+                     'bundle и модель совпадают.')
+    else:
+        count_text = (f'Исходники: {status["raw"]} → до {status["packed"]} inputs / '
+                      f'{status["capacity"]} на сцену · потеряно: 0')
+        gate_text = ('Все загруженные refs учтены; точный состав каждой сцены '
+                     'будет проверен до первого платного запроса.')
+    notice_html = (
+        f'<div id=refMutationNotice role=status aria-live=polite '
+        f'style="border:1px solid var(--done);border-radius:8px;padding:8px 12px;'
+        f'margin-bottom:10px;color:var(--done);font-size:12px">{html.escape(notice)}</div>'
+        if notice else ""
+    )
+    return f'''{notice_html}
+<div id=refStatus data-raw="{status['raw']}" data-packed="{status['packed']}" data-required="{status['required_min']}" data-groups="{status['characters']}" data-style="{status['style_sources']}" data-cache-legacy="{cache['legacy']}" data-runtime-exact="{1 if runtime else 0}" data-runtime-max="{runtime['max_scene'] if runtime else 0}" data-runtime-selected="{runtime['selected'] if runtime else 0}" data-runtime-scenes="{runtime['scenes'] if runtime else 0}" data-runtime-model="{html.escape(status['model'])}">
+  <div style="border:1px solid var(--border);border-left:3px solid {status_cls};border-radius:8px;padding:9px 12px;margin-bottom:12px;font-size:12px">
+    <b id=refCount>{count_text}</b>
+    <div id=refGate class=muted style="font-size:11px;margin-top:3px;color:{status_cls}">{html.escape(blocking or gate_text)}</div>
+    <div class=muted style="font-size:11px;margin-top:3px">{cache_text}</div>
+    {legacy_choice}
+  </div>
+</div>
+<div class=panel style="margin:0 0 14px">
+  <div class=panel-title><svg class="ic" viewBox="0 0 24 24"><use href="#ic-users"/></svg> Персонажи <span class=muted style="text-transform:none;letter-spacing:0">· до {reference_contract.MAX_HERO_GROUPS} персонажей · до {reference_contract.MAX_HERO_ANGLES} ракурсов → 1 input/герой</span><span class=muted style="float:right">{len(state['characters'])}/{reference_contract.MAX_HERO_GROUPS}</span></div>
+  {''.join(cards)}
+  <form class=ref-upload method=post action=/api/projects/{pid}/refs enctype=multipart/form-data style="margin:0">
+    <input type=hidden name=reftype value=char><input class=input name=name placeholder="имя персонажа — напр. «Капитан»" style="margin-bottom:10px">
+    <input type=file name=files class=file-hidden id=newCharFile multiple accept="image/jpeg,image/png,image/webp">
+    <div class=dropzone-sm onclick="document.getElementById('newCharFile').click()" ondragover="event.preventDefault();this.style.borderColor='var(--accent)'" ondragleave="this.style.borderColor=''" ondrop="refDrop(event,'newCharFile')">
+      <div class=ico>{_ICON_UP}</div><div style="font-weight:600;font-size:13px">Перетащите фото героя <span style="color:var(--accent)">или выберите</span></div>
+      <div class=muted style="font-size:11px;margin-top:3px">JPG · PNG · WEBP · максимум {reference_contract.MAX_HERO_ANGLES} ракурсов</div></div>
+  </form>
+</div>
+<div class=panel style="margin:0">
+  <div class=panel-title style="display:flex"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-palette"/></svg> Стиль-рефы <span class=muted style="text-transform:none;letter-spacing:0">· {len(state['style'])} образцов → {1 if state['style'] else 0} input</span>{style_clear}</div>
+  {style_picker}
+  <form class=ref-upload method=post action=/api/projects/{pid}/refs enctype=multipart/form-data style="margin:0">
+    <input type=hidden name=reftype value=style><input type=file id=styFile name=files class=file-hidden multiple accept="image/jpeg,image/png,image/webp">
+  </form>
+  <div class=muted style="font-size:11px;margin-top:5px">До {reference_contract.MAX_STYLE_SOURCES} образцов собираются в один детерминированный moodboard; ни один не отбрасывается.</div>
+</div>'''
+
+
+def _reference_wants_json(request):
+    return (request.headers.get("x-requested-with", "").lower() == "fetch"
+            or "application/json" in request.headers.get("accept", "").lower())
+
+
+def _reference_mutation_response(request, pid, projdir, params, *, mutation=None, notice=""):
+    if not _reference_wants_json(request):
+        return RedirectResponse(f"/p/{pid}?tab=img", 302)
+    payload = {
+        "ok": True,
+        "panel_html": _reference_panel_html(pid, projdir, params, notice=notice),
+        "status": _reference_status(projdir, params),
+    }
+    if mutation is not None:
+        payload["mutation"] = mutation
+        payload["notice"] = notice
+    return JSONResponse(payload)
+
+
+def _reference_mutation_error(request, exc):
+    if _reference_wants_json(request):
+        return JSONResponse({"ok": False, "detail": str(exc)}, status_code=400)
+    raise HTTPException(400, str(exc))
+
+
+def _scene_prompts(projdir):
+    """index(1-based) → исходный промпт из googler/scenes.json | prompts.json (prefill модалки регена)."""
+    out = {}
+    gd = os.path.join(projdir, "googler")
+    try:
+        scenes = json.load(open(os.path.join(gd, "scenes.json"), encoding="utf-8"))
+        for i, sc in enumerate(scenes):
+            if isinstance(sc, dict):
+                out[i + 1] = sc.get("visual_prompt") or sc.get("visual_description") or ""
+    except Exception:
+        pass
+    if not out:
+        try:
+            pdata = json.load(open(os.path.join(gd, "prompts.json"), encoding="utf-8"))
+            for i, pr in enumerate(pdata.get("prompts") or []):
+                out[i + 1] = (pr or {}).get("prompt") or ""
+        except Exception:
+            pass
+    return out
+
+
+def _gallery_image_ok(projdir, rel):
+    """Абсолютный путь картинки галереи, если rel легален (строго под googler/ или Images/), иначе None."""
+    if not rel:
+        return None
+    try:
+        root = os.path.realpath(projdir)
+        lexical = os.path.abspath(os.path.join(root, rel))
+        full = os.path.realpath(lexical)
+        # Do not turn a user-visible symlink into deletion/regeneration of its
+        # target. Component symlinks are rejected by the same exact comparison.
+        if lexical != full:
+            return None
+        in_dirs = any(
+            os.path.commonpath((full, os.path.realpath(os.path.join(root, dirname))))
+            == os.path.realpath(os.path.join(root, dirname))
+            and full != os.path.realpath(os.path.join(root, dirname))
+            for dirname in ("googler", "Images")
+        )
+        if in_dirs and full.lower().endswith((".jpg", ".jpeg", ".png", ".webp")):
+            return full
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _gallery_regen_image_ok(projdir, rel):
+    """Only a real canonical generated frame may be an AI/Bing regen target."""
+    normalized = str(rel or "").replace("\\", "/")
+    dirname, basename = os.path.split(normalized)
+    stem, suffix = os.path.splitext(basename)
+    try:
+        canonical_basename = f"{int(stem):03d}.jpg"
+    except (TypeError, ValueError):
+        return None
+    if dirname != "googler" or suffix != ".jpg" or basename != canonical_basename:
+        return None
+    full = _gallery_image_ok(projdir, normalized)
+    return full if full and os.path.isfile(full) else None
+
+
+def _gallery_video_ok(projdir, rel):
+    """Абсолютный путь клипа галереи, если rel легален (строго под 'googler video/'), иначе None."""
+    if not rel:
+        return None
+    projdir = os.path.abspath(projdir)
+    full = os.path.abspath(os.path.join(projdir, rel))
+    if (full.startswith(os.path.join(projdir, "googler video") + os.sep)
+            and full.lower().endswith((".mp4", ".webm", ".mov"))):
+        return full
+    return None
+
+
+def _clip_source_image(projdir, clip_path):
+    """Исходная картинка клипа NNN_video.mp4 → googler/NNN.jpg (или Images/**). None если не нашли."""
+    base = os.path.basename(clip_path)
+    stem = base[:-len("_video.mp4")] if base.endswith("_video.mp4") else os.path.splitext(base)[0]
+    import glob as _g
+    cands = (_g.glob(os.path.join(projdir, "googler", stem + ".*"))
+             + _g.glob(os.path.join(projdir, "Images", "**", stem + ".*"), recursive=True))
+    cands = [c for c in cands if c.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
+    return cands[0] if cands else None
+
+
+def _collect_user_refs(projdir):
+    """Legacy argv only. New jobs always carry an immutable --reference_manifest."""
+    state = _reference_load_state(projdir)
+    parts = []
+    for row in state["characters"]:
+        files = [_reference_project_path(projdir, source["rel"], must_exist=True)
+                 for source in row["sources"]]
+        if files:
+            parts.append(f"{row['name']}:" + ";".join(files))
+    return "|".join(parts)
+
+
+def _collect_style_refs(projdir):
+    """Legacy argv only. New jobs always carry an immutable --reference_manifest."""
+    state = _reference_load_state(projdir)
+    files = [_reference_project_path(projdir, source["rel"], must_exist=True)
+             for source in state["style"]]
+    return ";".join(files)
+
+
+def _verify_output(kind, projdir, params=None):
+    """rc=0 ещё НЕ значит успех: воркеры (voicegencore/tts и др.) при фатальной ошибке
+    логируют ❌, но возвращают 0. Гейтим по наличию ожидаемого артефакта. → (ok, reason)."""
+    import glob as _g
+    if kind == "tts":
+        files = _g.glob(os.path.join(projdir, "**", "*.mp3"), recursive=True)
+        return (bool(files), "" if files else "нет mp3-файла озвучки")
+    if kind == "images":
+        files = (_g.glob(os.path.join(projdir, "googler", "*.jpg"))
+                 or _g.glob(os.path.join(projdir, "**", "*.jpg"), recursive=True)
+                 or _g.glob(os.path.join(projdir, "**", "*.png"), recursive=True))
+        return (bool(files), "" if files else "не создано ни одной картинки")
+    if kind == "chapters":
+        # rc=0 мало: воркер мог забраковать собственный результат (мало глав, почти все
+        # заголовки запасные) — тогда description.txt он намеренно НЕ пишет.
+        try:
+            with open(os.path.join(projdir, "chapters", "chapters.json"), encoding="utf-8") as fh:
+                res = json.load(fh)
+            ok = (res.get("status") == "ok" and len(res.get("chapters") or []) >= 3
+                  and os.path.exists(os.path.join(projdir, "chapters", "description.txt")))
+            reason = "" if ok else (
+                "; ".join(str(w) for w in (res.get("warnings") or [])[-2:])
+                or "главы не собрались")
+        except Exception:
+            ok, reason = False, "не создан chapters/chapters.json"
+        return (ok, reason)
+    if kind == "cards":
+        # Full schema/hash verification is performed by _complete_card_task with the
+        # expected narration/request fingerprints.  This is only the generic guard.
+        files = glob.glob(os.path.join(projdir, "_cards", "v1", "job-*", "manifest.json"))
+        return (bool(files), "" if files else "не создан card manifest")
+    if kind == "prompts":
+        ok = _scene_plan_ready(projdir, params)
+        return (ok, "" if ok else
+                "не создан coherent scenes.json + scenes.meta.json v3 (digest/count/params)")
+    if kind in ("video", "regen_video"):
+        files = _g.glob(os.path.join(projdir, "**", "*.mp4"), recursive=True)
+        return (bool(files), "" if files else "не создано mp4-видео")
+    return (True, "")   # неизвестный вид — не гейтим
+
+
+def _verify_image_completion(projdir):
+    """Не считать image-job успешным, если известны сцены, но сохранено < 70% кадров."""
+    import glob as _g
+    expected = 0
+    for sc in _g.glob(os.path.join(projdir, "**", "scenes.json"), recursive=True):
+        try:
+            expected = len(json.load(open(sc, encoding="utf-8")))
+            break
+        except Exception:
+            pass
+    if expected <= 0:
+        return (True, "")
+    have = len(_g.glob(os.path.join(projdir, "googler", "*.jpg"))
+               + _g.glob(os.path.join(projdir, "googler", "*.jpeg"))
+               + _g.glob(os.path.join(projdir, "googler", "*.png"))
+               + _g.glob(os.path.join(projdir, "Images", "**", "*.jpg"), recursive=True)
+               + _g.glob(os.path.join(projdir, "Images", "**", "*.jpeg"), recursive=True)
+               + _g.glob(os.path.join(projdir, "Images", "**", "*.png"), recursive=True))
+    if have < IMG_RENDER_MIN_RATIO * expected:
+        pct = int(have * 100 / expected)
+        return (False, f"создано только {have}/{expected} картинок ({pct}%, нужно ≥70%)")
+    return (True, "")
+
+
+_FATAL_PAT = re.compile(
+    r"(ключ не установлен|api[- ]?ключ|не указан\s+voice|не указан\s+.*id|не удалось обработать|"
+    r"не вернул|service unavailable|maintenance|❌\s*ошибка:|fatal|traceback|quota|insufficient)",
+    re.I)
+_SUCCESS_PAT = re.compile(r"(заверш|готов|сохранен|saved|успешн|100%|completed|перегенерир)", re.I)
+
+
+def _judge_success(kind, projdir, jid, params=None):
+    """rc=0 ещё НЕ значит успех (воркеры при фатале логируют ❌, но возвращают 0).
+    Судим ПО ЛОГУ ЭТОЙ задачи (job-scoped, не рейсит на общем проекте) + наличию артефакта.
+    Приоритет: явный success-маркер > фатальный маркер > наличие файла. → (ok, reason)."""
+    try:
+        c = db()
+        rows = c.execute("SELECT line FROM job_logs WHERE job_id=? ORDER BY id", (jid,)).fetchall()
+        c.close()
+    except Exception:
+        rows = []            # лог недоступен — всё равно проверяем реальный артефакт
+    body = [(r["line"] or "") for r in rows
+            if not (r["line"] or "").startswith(("▶ старт", "$ ", "✅ готово", "❌ заверш"))]
+    has_success = any(("✅" in l and _SUCCESS_PAT.search(l)) for l in body)
+    any_out, why = _verify_output(kind, projdir, params=params)
+    if kind == "images" and any_out:
+        ratio_ok, ratio_why = _verify_image_completion(projdir)
+        if not ratio_ok:
+            return (False, ratio_why)
+    if has_success and any_out:
+        return (True, "")          # воркер отрапортовал успех и файл на месте
+    fatal = ""
+    for l in reversed(body):
+        if "❌" in l and _FATAL_PAT.search(l):
+            fatal = l.lstrip("❌ ℹ️⚠️ ").strip()[:300]
+            break
+    if fatal:
+        return (False, fatal)       # фатал в логе — важнее чужого/старого файла
+    if not any_out:
+        return (False, why)         # ни успеха, ни файла
+    return (True, "")               # нет фатала, файл есть (кэш/повтор) → ок
+
+
+def _redact_worker_output(line, worker_env=None, extra_secrets=None):
+    """Не допускает server credentials и их debug-префиксы в job_logs/SSE."""
+    out = str(line or "")
+    secrets_to_hide = []
+    for name in _WORKER_CREDENTIAL_ENV_NAMES:
+        secret = str((worker_env or {}).get(name) or "")
+        if secret:
+            secrets_to_hide.append(secret)
+    secrets_to_hide.extend(str(v) for v in (extra_secrets or []) if v)
+    for secret in dict.fromkeys(secrets_to_hide):
+        if not secret:
+            continue
+        out = out.replace(secret, "[REDACTED]")
+        if len(secret) >= 4:
+            out = out.replace(secret[:4] + "...", "[REDACTED]")
+            out = out.replace(secret[:4] + "…", "[REDACTED]")
+    return out
+
+
+def _task_provider_from_row(t, params=None):
+    try:
+        stored = t["provider"]
+    except Exception:
+        stored = None
+    try:
+        uid = t["uid"]
+    except Exception:
+        uid = None
+    if params is None:
+        try:
+            params = json.loads(t["params"] or "{}")
+        except Exception:
+            params = {}
+    return _task_provider(t["kind"], params, uid=uid, stored_provider=stored)
+
+
+def _running_lane(row, provider):
+    """Дорожка ёмкости выполняющейся задачи: снимок момента claim (колонка lane).
+
+    Старые строки (claim до миграции) снимка не имеют — для них считаем по текущим
+    ключам юзера, как раньше. Пересчёт «сейчас» для новых строк запрещён: добавил или
+    удалил свой ключ на ходу — running-задачи не должны менять дорожку.
+    """
+    try:
+        stored = row["lane"]
+    except Exception:
+        stored = None
+    stored = str(stored or "").strip()
+    if stored in ("server", "byok"):
+        return stored
+    try:
+        uid = row["uid"]
+    except Exception:
+        uid = None
+    try:
+        kind = row["kind"]
+    except Exception:
+        kind = None
+    return "byok" if _task_uses_own_credential(uid, provider, kind) else "server"
+
+
+def _own_only(u):
+    policy = _key_opts_from_row(u).get("_credentials", {}) if u is not None else {}
+    return isinstance(policy, dict) and policy.get("mode") == "own_only"
+
+
+def _own_task_budget(u, provider, kind, params):
+    """Actual per-job calls and per-key capacity; never infer N from another user."""
+    opts = _key_opts_from_row(u).get(provider, {})
+    opts = opts if isinstance(opts, dict) else {}
+    account = _PROVIDER_ACCOUNT_LIMITS.get(provider)
+    if provider in ("recrafter", "veo", "openai"):
+        capacity = int(account[0]) if account else int(_PROVIDER_CALL_BUDGET_HARD.get(provider, 12))
+        host_family = {"recrafter":"fastgen", "veo":"veo", "openai":"openai"}[provider]
+        capacity = min(capacity, _host_budget.CAPACITIES[host_family])
+        if kind in ("regen", "regen_video"):
+            units = 1
+        else:
+            default = (_server_video_threads(params) if kind == "video"
+                       else _server_image_threads(params) if kind == "images" else 1)
+            units = min(capacity, _own_key_threads(default, opts.get("threads")))
+    else:
+        default = _provider_caps(provider)[1]
+        try:
+            capacity = max(1, int(opts.get("parallel") or default))
+        except (TypeError, ValueError):
+            capacity = default
+        hard = int(account[0]) if account else _PROVIDER_HARD_JOB_CAPS.get(provider, default)
+        capacity = 1 if provider == "prompt_codex" else min(capacity, hard)
+        units = 1
+    return max(1, units), max(1, capacity)
+
+
+def _own_user_job_limit(uid, provider):
+    c = db()
+    try:
+        u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    finally:
+        c.close()
+    family = _provider_credential_family(provider)
+    values = _own_pool_values(u, family)
+    live = [v for v in values if not _cred_cooldown_state(family, v)]
+    opts = _key_opts_from_row(u).get(provider, {})
+    default = _provider_caps(provider)[1]
+    try:
+        per_key = max(1, int(opts.get("parallel") or default)) if isinstance(opts, dict) else default
+    except (TypeError, ValueError):
+        per_key = default
+    account = _PROVIDER_ACCOUNT_LIMITS.get(provider)
+    per_key = min(per_key, int(account[0]) if account else _PROVIDER_HARD_JOB_CAPS.get(provider, per_key))
+    return per_key * len(live)
+
+
+def _resume_retained_remote_job(task, automatic=False, claim_token=None):
+    """Keep the queue identity on retries so the paid operation journal is reused."""
+    try:
+        pin = _remote_credential_pin(task)
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+    root = os.path.join(_project_dir(task["tenant_id"], task["project_id"]), ".remote_jobs", str(task["job_id"]))
+    if not pin and not os.path.isfile(os.path.join(root, "credential_pin.json")):
+        return None
+    if automatic:
+        # An uncertain submit cannot be reconciled by blind repetition.
+        try:
+            records = [json.load(open(path)) for path in glob.glob(os.path.join(root, "**", "*.json"), recursive=True)
+                       if os.path.basename(path) != "credential_pin.json"]
+            if not records or any(r.get("state") in ("intent", "uncertain") for r in records):
+                return None
+        except Exception:
+            return None
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        live = c.execute("SELECT * FROM queue_tasks WHERE job_id=?", (task["job_id"],)).fetchone()
+        if live and _storage_project_held(c, live["project_id"]):
+            raise HTTPException(409, "Проект архивируется; восстановление временно отложено")
+        allowed = ("running",) if automatic else ("error", "cancelled")
+        if not live or live["status"] not in allowed:
+            raise HTTPException(409, "состояние задачи изменилось")
+        if automatic and (live["claim_token"] != claim_token or int(live["remote_retries"] or 0) >= 3):
+            return None
+        conflict = c.execute("SELECT 1 FROM queue_tasks WHERE tenant_id=? AND project_id=? AND job_id!=? AND status IN ('queued','running') LIMIT 1",
+                             (live["tenant_id"],live["project_id"],live["job_id"])).fetchone()
+        if conflict:
+            if automatic:
+                return None
+            raise HTTPException(409, "проект занят другой задачей; оплаченный запрос сохранён")
+        cancel_marker = os.path.join(root, "cancel.requested")
+        if os.path.exists(cancel_marker):
+            settled = False
+            try:
+                records = [json.load(open(path)) for path in glob.glob(os.path.join(root, "request-*.json"))]
+                settled = not pin and bool(records) and all(r.get("state") in {"completed","cancelled","failed","rejected"} for r in records)
+            except Exception:
+                pass
+            if not settled:
+                raise HTTPException(409, "удалённая отмена требует проверки статуса перед повтором")
+            os.replace(cancel_marker, cancel_marker + ".handled-" + str(time.time_ns()))
+        attempts = int(live["remote_retries"] or 0)
+        delay = (30, 120, 300)[attempts] if automatic else 0
+        c.execute("UPDATE queue_tasks SET status='queued',started=NULL,finished=NULL,claimed=NULL,claim_token=NULL,error=NULL,retry_after=?,remote_retries=remote_retries+? WHERE job_id=?",
+                  (_now()+delay, 1 if automatic else 0, live["job_id"]))
+        c.execute("UPDATE gen_jobs SET status='queued',error=NULL WHERE id=?",(live["job_id"],))
+        c.commit()
+        if not automatic:
+            CANCELLED.discard(live["job_id"])
+        return live["job_id"]
+    finally:
+        c.close()
+
+
+def _read_remote_credential_pin(root, expected_family=None):
+    path = os.path.join(root, "credential_pin.json")
+    record_paths = glob.glob(os.path.join(root, "**", "*.json"), recursive=True)
+    record_paths = [p for p in record_paths if p != path]
+    if not os.path.exists(path) and not record_paths:
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            pin = json.load(f)
+        if (not isinstance(pin, dict)
+                or pin.get("state") not in ("active", "uncertain", "released")
+                or pin.get("family") not in ("googler", "veo", "openai", "voicegencore")
+                or expected_family and pin.get("family") != expected_family
+                or pin.get("source") not in ("byok", "server")
+                or not isinstance(pin.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", pin["sha256"])):
+            raise ValueError("invalid pin")
+        if pin["state"] == "released":
+            # A corrupt/partial released flag must not bypass the retained job.
+            terminal = ({"done", "failed", "rejected"} if pin["family"] != "voicegencore"
+                        else {"completed", "failed", "rejected", "cancelled"})
+            if not record_paths:
+                raise ValueError("released pin without records")
+            for record_path in record_paths:
+                with open(record_path, encoding="utf-8") as f:
+                    record = json.load(f)
+                if not isinstance(record, dict) or record.get("state") not in terminal:
+                    raise ValueError("released pin with unresolved records")
+            return None
+        return pin
+    except Exception as exc:
+        raise ValueError("журнал оплаченной задачи повреждён; восстановите журнал перед повтором") from exc
+
+
+def _remote_credential_pin(task):
+    root = os.path.join(_project_dir(task["tenant_id"], task["project_id"]), ".remote_jobs", str(task["job_id"]))
+    return _read_remote_credential_pin(root, _provider_credential_family(task["provider"]))
+
+
+def _shared_task_units(provider, kind, params, units):
+    # Local job slots and host provider calls are distinct dimensions for OpenAI.
+    if provider == "prompt_openai":
+        return _prompt_threads_setting("openai", keys().get("prompt_threads"))
+    if provider == "openai" and kind == "images":
+        return max(units, _server_image_threads(params))
+    return units
+
+
+def _reserve_own_task_credential(u, provider, kind, params, required_hash=None):
+    family = _provider_credential_family(provider)
+    values = _own_pool_values(u, family)
+    if required_hash:
+        values = [v for v in values if hashlib.sha256(v.encode()).hexdigest() == required_hash]
+    if not values or _own_key_stage_disabled(_key_opts_from_row(u), provider, kind):
+        return None
+    units, capacity = _own_task_budget(u, provider, kind, params)
+    # Same physical key shared by two users must still share its call budget.
+    lease = SERVER_CREDENTIAL_POOL.try_acquire(
+        family, units=units, capacity=capacity,
+        lane="byok:" + provider, own_values=values,
+        host_units=_shared_task_units(provider, kind, params, units),
+    )
+    if lease is not None:
+        lease.source = "byok"
+        lease.uid = int(u["id"])
+    return lease
+
+
+def _reserve_task_credential(provider, kind, params, required_hash=None):
+    family = _provider_credential_family(provider)
+    if not family:
+        return None
+    units = _task_capacity_units(kind, params, provider)
+    candidates = None
+    if required_hash:
+        candidates = [v for v in _credential_candidates(keys(), family)
+                      if hashlib.sha256(v.encode()).hexdigest() == required_hash]
+    return SERVER_CREDENTIAL_POOL.try_acquire(
+        family, units=units, capacity=_provider_slot_capacity_units(provider),
+        lane=provider, own_values=candidates,
+        host_units=_shared_task_units(provider, kind, params, units),
+    )
+
+
+def _park_failed_credential(jid, lease, incident):
+    """Канал промптов отказал на выданном серверном credential → отдыхать отправляем
+    ИМЕННО ЕГО, а не гасим весь канал.
+
+    Если в пуле остались живые токены, общая метка «канал недоступен», поставленная на
+    стриме, снимается: иначе один исчерпанный токен на 10 минут уводил бы в простой
+    целый канал при живом соседе — ровно та боль, из-за которой токены двигали руками.
+    """
+    ch = str(incident.get("ch") or "")
+    family = _PROMPT_CHANNEL_FAMILY.get(ch)
+    value = getattr(lease, "value", "")
+    if not family or family != getattr(lease, "family", None) or not value:
+        # Упал ДРУГОЙ канал (фолбэк внутри воркера), не тот, чей токен мы выдавали:
+        # чужой credential этой задаче не давали, парковать нечего.
+        return None, "чужой канал"
+    try:
+        until, kind = _note_credential_failure(family, value, incident.get("why") or "")
+    except Exception:
+        log_exc("cred_cooldown/park")
+        return None, "зонд не отработал"
+    mask = _cred_mask(value)
+    if not until:
+        _log_line(jid, f"ℹ️ канал «{ch}»: ключ {mask} не паркую — {kind}")
+        return None, kind
+    reason = {"limit": "исчерпан лимит подписки",
+              "auth": "проблема с авторизацией"}.get(kind, "череда отказов подряд")
+    when = _cred_until_human(until)
+    owner_uid = getattr(lease, "uid", None) if getattr(lease, "source", "server") == "byok" else None
+    if owner_uid is not None:
+        c = db()
+        try:
+            owner = c.execute("SELECT * FROM users WHERE id=?", (owner_uid,)).fetchone()
+        finally:
+            c.close()
+        live = [v for v in _own_pool_values(owner, family) if not _cred_cooldown_state(family, v)]
+    else:
+        live = _live_credential_candidates(keys(), family)
+    _log_line(jid, f"😴 канал «{ch}»: ключ {mask} — {reason}, отдыхает до {when}")
+    print(f"[cred] {family} {mask}: {reason}, отдыхает до {when}; "
+          f"живых ключей в пуле {len(live)}", flush=True)
+    if live:
+        _clear_prompt_channel_dead(ch, uid=owner_uid)
+        _log_line(jid, f"↔️ канал «{ch}» продолжает работать: живых ключей {len(live)}")
+    return until, kind
+
+
+CARD_TRANSIENT_BACKOFF = (15, 60, 300, 900)
+
+
+def _complete_card_task(t, params, projdir, claim_token):
+    """Validate artifact hashes/schema again and commit queue + card result atomically."""
+    jid = t["job_id"]
+    internal = _card_internal_params(params)
+    _raw, narration, current_sha = card_contract.narration_bytes(
+        os.path.join(projdir, "source.txt")
+    )
+    if not secrets.compare_digest(current_sha, internal["narration_sha256"]):
+        raise card_contract.CardContractError("narration changed before card completion")
+    loaded = card_contract.load_completion(
+        projdir,
+        project_id=t["project_id"],
+        job_id=jid,
+        narration=narration,
+        narration_sha256=internal["narration_sha256"],
+        request_sha256=internal["request_sha256"],
+    )
+    manifest = loaded["manifest"]
+    provenance = json.dumps(manifest["provenance"], ensure_ascii=False, sort_keys=True)
+    usage = json.dumps(manifest["usage"], ensure_ascii=False, sort_keys=True)
+    finished = _now()
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        cur = c.execute(
+            "UPDATE queue_tasks SET status='done',error=NULL,finished=? "
+            "WHERE job_id=? AND status='running' AND claim_token=?",
+            (finished, jid, claim_token),
+        )
+        if cur.rowcount != 1:
+            c.rollback()
+            return False
+        c.execute("UPDATE gen_jobs SET status='done',error=NULL WHERE id=?", (jid,))
+        c.execute(
+            "UPDATE card_jobs SET status='done',output_rel=?,output_sha256=?,output_json=?,"
+            "raw_rel=?,raw_sha256=?,raw_json=?,provenance=?,usage=?,error_code=NULL,"
+            "last_error=NULL,next_attempt=NULL,finished=? WHERE job_id=?",
+            (manifest["output_rel"], manifest["output_sha256"], loaded["output_json"],
+             manifest["raw_rel"], manifest["raw_sha256"], loaded["raw_json"],
+             provenance, usage, finished, jid),
+        )
+        c.commit()
+        return True
+    finally:
+        c.close()
+
+
+def _record_card_failure_artifacts(t, params, projdir):
+    """Persist a model's invalid raw response for per-task diagnosis, if present."""
+    try:
+        internal = _card_internal_params(params)
+        failure = card_contract.load_failure(
+            projdir,
+            project_id=t["project_id"],
+            job_id=t["job_id"],
+            narration_sha256=internal["narration_sha256"],
+            request_sha256=internal["request_sha256"],
+        )
+        if not failure:
+            return
+        manifest = failure["manifest"]
+        c = db()
+        try:
+            c.execute(
+                "UPDATE card_jobs SET raw_rel=?,raw_sha256=?,raw_json=?,provenance=?,usage=? "
+                "WHERE job_id=?",
+                (manifest["raw_rel"], manifest["raw_sha256"], failure["raw_json"],
+                 json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+                 json.dumps(failure["usage"], ensure_ascii=False, sort_keys=True), t["job_id"]),
+            )
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        log_exc("cards/record_failure", str(t.get("job_id") if isinstance(t, dict) else ""))
+
+
+def _requeue_card_transient(jid, claim_token, error):
+    """Durable bounded backoff using the existing queue row and CAS lease token."""
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT transient_requeues FROM card_jobs WHERE job_id=?", (jid,)).fetchone()
+        used = int(row["transient_requeues"] or 0) if row else len(CARD_TRANSIENT_BACKOFF)
+        if used >= len(CARD_TRANSIENT_BACKOFF):
+            c.rollback()
+            return None
+        delay = CARD_TRANSIENT_BACKOFF[used]
+        next_attempt = _now() + delay
+        cur = c.execute(
+            "UPDATE queue_tasks SET status='queued',started=NULL,claimed=NULL,claim_token=NULL,error=NULL "
+            "WHERE job_id=? AND status='running' AND claim_token=?", (jid, claim_token),
+        )
+        if cur.rowcount != 1:
+            c.rollback()
+            return False
+        c.execute("UPDATE gen_jobs SET status='queued',error=NULL WHERE id=?", (jid,))
+        c.execute(
+            "UPDATE card_jobs SET status='queued',transient_requeues=transient_requeues+1,"
+            "next_attempt=?,error_code='transient',last_error=? WHERE job_id=?",
+            (next_attempt, str(error or "")[:600], jid),
+        )
+        c.commit()
+        return delay
+    finally:
+        c.close()
+
+
+def _retry_own_credential_failure(jid, claim_token, lease, reason):
+    """Only explicit rejected auth/quota may rotate; ambiguous submissions never do."""
+    if not lease or getattr(lease, "source", "server") != "byok" or not reason:
+        return False
+    quota = GEN_ACCOUNT_LIMIT_MARKER in reason
+    auth = (reason == "Ключ провайдера не принят при создании задачи [submit rejected]"
+            or (lease.lane.startswith("byok:prompt_") and _cred_failure_kind(reason) == "auth"))
+    if not (quota or auth):
+        return False
+    _cred_park(lease.family, lease.value, 900 if quota else CRED_COOLDOWN_AUTH,
+               why="account quota" if quota else "rejected credential")
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute("SELECT credential_retries FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+        attempts = int(row["credential_retries"] or 0) if row else 8
+        if attempts >= 8:
+            c.rollback()
+            return False
+        cur = c.execute(
+            "UPDATE queue_tasks SET status='queued',started=NULL,claimed=NULL,claim_token=NULL,"
+            "retry_after=?,credential_retries=credential_retries+1,error=NULL "
+            "WHERE job_id=? AND status='running' AND claim_token=?",
+            (time.time() + min(60, 2 ** attempts), jid, claim_token))
+        if cur.rowcount != 1:
+            c.rollback()
+            return False
+        c.execute("UPDATE gen_jobs SET status='queued',error=NULL WHERE id=?", (jid,))
+        c.commit()
+        _log_line(jid, "↩️ личный ключ отклонил авторизацию или квоту; результат сохранён, очередь выберет доступный ключ")
+        return True
+    finally:
+        c.close()
+
+
+def _run_task(t):
+    """Release the scheduler lease even if validation fails before worker setup."""
+    lease = t.get("_credential_lease")
+    try:
+        return _run_task_inner(t)
+    except Exception as exc:
+        # Do not echo malformed payloads or credential-bearing exceptions.
+        _finish_worker_task(t["job_id"], "error", "Не удалось подготовить задачу: " + type(exc).__name__,
+                            claim_token=t.get("claim_token"))
+    finally:
+        if lease:
+            lease.release()
+        _cleanup_removed_own_codex_homes()
+
+
+def _run_task_inner(t):
+    """Выполнить задачу СТРИМИНГОМ (Popen, построчные логи). t — dict из queue_tasks (уже claimed=running)."""
+    jid, uid, tenant_id = t["job_id"], t["uid"], t["tenant_id"]
+    claim_token = t.get("claim_token") if isinstance(t, dict) else t["claim_token"]
+    projdir = _project_dir(tenant_id, t["project_id"])
+    params = json.loads(t["params"] or "{}")
+    provider = _task_provider_from_row(t, params)
+    family = _provider_credential_family(provider)
+    # Lease связываем ДО первого обращения к БД: исключение из db()/execute (база
+    # заблокирована/полна) не должно уносить резерв шедулера мимо finally — иначе
+    # занятые единицы не освобождались бы до рестарта процесса.
+    lease = t.get("_credential_lease") if isinstance(t, dict) else None
+    proc = None
+    redaction_secrets = []
+    own_credential = ""
+    # Первый отказ канала промптов за этот запуск: решение о парковке КОНКРЕТНОГО
+    # токена принимается в finally, когда воркер уже закончил (зонд к провайдеру
+    # занимает секунды и не должен тормозить стрим логов).
+    channel_incident = {}
+    card_worker_error = ""
+    remote_recovery = False
+
+    def _wait_for_window():
+        """True — окно подписки исчерпано, задача возвращена в очередь до сброса.
+
+        Парковку токена делаем здесь же и чистим channel_incident, чтобы finally
+        не припарковал второй раз. Вердикт берём у _park_failed_credential: он уже
+        сходил зондом к провайдеру и знает и причину, и время сброса.
+        """
+        if not channel_incident or lease is None:
+            return False
+        try:
+            until, kind = _park_failed_credential(jid, lease, channel_incident)
+        except Exception:
+            log_exc("limit_wait/park")
+            return False
+        channel_incident.clear()
+        if until and kind == "auth" and getattr(lease, "source", "server") == "byok":
+            return _retry_own_credential_failure(jid, claim_token, lease, "invalid api key")
+        if not until or kind != "limit":
+            return False        # авторизация, череда отказов, транзиент — падаем как раньше
+        if not _limit_wait_allowed(jid):
+            _log_line(jid, "⛔ окно подписки не освободилось за отведённое время — "
+                           "задача снята с ожидания")
+            return False
+        if not _requeue_running_task(jid, claim_token):
+            return False        # отменена или перехвачена другим claim — не мешаем
+        _log_line(jid, f"⏳ окно подписки исчерпано, ключ отдыхает до "
+                       f"{_cred_until_human(until)} — задача ждёт сброса в очереди")
+        return True
+
+    try:
+        c = db(); u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone(); c.close()
+        desired_own = bool(_own_credential_for_task(u, provider, t["kind"]))
+        claimed_own = _running_lane(t, provider) == "byok"
+        if lease is not None and getattr(lease, "source", "server") == "byok":
+            if (not desired_own or getattr(lease, "uid", None) != uid
+                    or lease.value not in _own_pool_values(u, family)):
+                lease.release()
+                lease = None
+        elif lease is not None and (desired_own or _own_only(u)):
+            lease.release()
+            lease = None
+        if lease is None and desired_own:
+            lease = _reserve_own_task_credential(u, provider, t["kind"], params)
+        if lease is not None and getattr(lease, "source", "server") == "byok":
+            own_credential = lease.value
+        if lease is None and family:
+            if desired_own:
+                if _requeue_running_task(jid, claim_token):
+                    _log_line(jid, "↩️ личный пул занят или ожидает сброса лимита — задача возвращена в очередь")
+                return
+            if claimed_own or _own_only(u):
+                _finish_worker_task(jid, "error", "Личный ключ удалён или недоступен; серверные ключи не использованы", claim_token=claim_token)
+                return
+            lease = _reserve_task_credential(provider, t["kind"], params)
+        if family == "codex_home" and not own_credential and not _codex_allowed(u):
+            # Серверный CODEX_HOME — личная подписка ВЛАДЕЛЬЦА. Даже если группа задачи
+            # оказалась prompt_codex (устаревший snapshot: свою авторизацию удалили
+            # после постановки), серверный секрет не выдаём — честная ошибка.
+            _finish_worker_task(
+                jid,
+                "error",
+                "нет своей авторизации Codex; серверная подписка ChatGPT недоступна",
+                claim_token=claim_token,
+            )
+            return
+        if family and lease is None and not own_credential:
+            # Задача была заклеймлена на byok (свой ключ), но ключа уже нет: серверный
+            # слот сейчас занят — это НЕ ошибка задачи, а гонка. Возвращаем в очередь,
+            # шедулер подберёт её с серверной дорожкой, когда освободится слот.
+            if _running_lane(t, provider) == "byok" and _byok_requeue_allowed(jid):
+                if _requeue_running_task(jid, claim_token):
+                    _log_line(jid, "↩️ свой ключ исчез до старта, серверный слот занят "
+                                   "— задача возвращена в очередь")
+                return
+            if _requeue_running_task(jid, claim_token):
+                _log_line(jid, "⏳ общий лимит ключа занят — задача ждёт в очереди до вызова провайдера")
+            return
+        _byok_requeue_clear(jid)
+        # Свои ключи юзера редактируются в логах ровно так же, как серверные (для своей
+        # подписки Codex — и строковые листья auth.json). Берём ВСЕ свои credentials,
+        # как в SSE-пути job_logs_sse: воркер может напечатать не только credential той
+        # family, на которой идёт задача (например OpenAI-ключ из канала промптов).
+        redaction_secrets = (_all_server_credential_values()
+                             + _own_credential_secret_values(_own_keys(u)))
+        if lease and lease.value:
+            redaction_secrets.append(lease.value)
+        if not _mark_worker_running(jid, claim_token):
+            return
+        _log_line(jid, f"▶ старт: {t['kind']}"
+                       + (" · на своём ключе" if own_credential else ""))
+        if t["kind"] == "tts":
+            # перед озвучкой сносим папки других движков → рендер не склеит две озвучки в одну
+            _clear_other_audio_dirs(
+                projdir,
+                params.get("engine") or params.get("tts_engine") or "edge",
+                jid,
+            )
+        # Настройки СВОЕГО ключа читаются только для BYOK-задачи и умеют лишь
+        # понизить серверный потолок потоков (_own_key_threads).
+        own_threads = own_retries = None
+        if own_credential:
+            own_opt = (_key_opts_from_row(u) or {}).get(provider)
+            if isinstance(own_opt, dict):
+                own_threads = own_opt.get("threads")
+                own_retries = own_opt.get("retries")
+            if provider in ("recrafter", "veo", "openai"):
+                own_threads = lease.units
+        worker, args = _build_cmd(
+            t["kind"], projdir, params, own_threads=own_threads,
+            job_id=jid, project_id=t["project_id"],
+        )
+        # Credential задачи: свой ключ юзера, иначе выданный серверный lease.
+        # concurrency/retries общей очереди остаются server-controlled в любом случае.
+        prompt_provider = provider.removeprefix("prompt_") if provider in _PROMPT_PROVIDER_GROUPS else None
+        if own_credential:
+            if family == "codex_home":
+                # Своя подписка Codex: auth.json юзера кладём в ЕГО приватный
+                # CODEX_HOME (путь задаёт сервер) — воркеру уходит только этот путь.
+                own_env_value = _own_codex_home_dir(uid, own_credential)
+                if not own_env_value:
+                    raise RuntimeError("своя авторизация Codex непригодна (нужно содержимое auth.json)")
+            else:
+                own_env_value = own_credential
+            credential_overrides = {family: own_env_value}
+        else:
+            credential_overrides = (
+                {lease.family: lease.value} if lease is not None else {}
+            )
+        job_env = _key_env(
+            u,
+            shared=True,
+            credential_overrides=credential_overrides,
+            prompt_provider=prompt_provider,
+        )
+        job_env["VS_QUEUE_CANCEL_FILE"] = os.path.join(projdir, ".remote_jobs", str(jid), "cancel.requested")
+        job_env["VS_QUEUE_JOB_ID"] = str(jid)
+        job_env["VS_REMOTE_JOURNAL_DIR"] = os.path.join(projdir, ".remote_jobs", str(jid))
+        job_env["VS_CREDENTIAL_SOURCE"] = str(t.get("lane") or "server")
+        pin = _remote_credential_pin(t)
+        if pin and (not lease or hashlib.sha256(lease.value.encode()).hexdigest() != pin["sha256"]):
+            raise RuntimeError("исходный ключ оплаченной задачи не совпадает с выданным lease")
+        if t["kind"] == "cards":
+            # Defense in depth: _task_provider already hard-locks the queue lane and
+            # card_jobs.py asserts these values before calling prompt_llm.
+            job_env["VS_PROMPT_PROVIDER"] = card_contract.PROMPT_PROVIDER
+            job_env["VS_CLAUDE_MODEL"] = card_contract.MODEL
+            job_env["VS_PROMPT_FALLBACK"] = "0"
+            job_env["VS_SERVER_CREDENTIAL_ISOLATION"] = "1"
+        # «Попыток генерации» из админ-таблицы серверных ключей → env воркера
+        # (googler_worker._gen_attempts). Не задано → дефолт воркера, как раньше.
+        job_retries = _job_retries(provider, own_retries)
+        if job_retries and worker == "googler_worker.py":
+            job_env["GOOGLER_MAX_RETRIES"] = str(job_retries)
+        if t["kind"] in ("images", "video", "regen", "regen_video"):
+            # Generation-job получает только credential своего provider. Content
+            # filter обрабатывается детерминированным local sanitizer воркера;
+            # незапланированные OpenAI/Claude/Codex calls запрещены до сети.
+            job_env["VS_DISABLE_PROMPT_LLM"] = "1"
+        # Кабинетный worker не должен печатать даже префиксы общих ключей. Помимо
+        # отключения известного debug-флага редактируем stdout централизованно:
+        # это защищает job_logs/SSE и от случайного полного вывода секрета.
+        job_env.pop("VIDEO_STUDIO_DEBUG", None)
+        worker_path = worker if os.path.isabs(worker) else os.path.join(SRC_DIR, worker)
+        cmd = [sys.executable, worker_path] + [str(a) for a in args]
+        _log_line(jid, "$ " + os.path.basename(worker) + " " + " ".join(args[:2]) + " …")
+        if t["kind"] == "chapters":
+            c = db()
+            try:
+                if t.get("parent_job_id"):
+                    parent = c.execute("SELECT transcript_rel,transcript_sha256 FROM queue_tasks WHERE job_id=? AND tenant_id=? AND project_id=? AND status='done' AND kind='render'",
+                                       (t["parent_job_id"], tenant_id, t["project_id"])).fetchone()
+                else:
+                    parent = c.execute("SELECT transcript_rel,transcript_sha256 FROM queue_tasks WHERE tenant_id=? AND project_id=? AND status='done' AND kind='render' AND transcript_rel IS NOT NULL ORDER BY finished DESC,job_id DESC LIMIT 1",
+                                       (tenant_id, t["project_id"])).fetchone()
+            finally:
+                c.close()
+            if t.get("parent_job_id") and (not parent or not parent["transcript_rel"]):
+                raise RuntimeError("нет подтверждённого транскрипта родительского рендера")
+            if parent:
+                transcript = os.path.join(projdir, parent["transcript_rel"])
+                with open(transcript, "rb") as source:
+                    actual_hash = hashlib.sha256(source.read()).hexdigest()
+                if actual_hash != parent["transcript_sha256"]:
+                    raise RuntimeError("контрольная сумма транскрипта родительского рендера изменилась")
+                cmd += ["--transcript", transcript]
+        proc = subprocess.Popen(cmd, cwd=(os.path.dirname(worker_path) if os.path.isabs(worker) else SRC_DIR), env=job_env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1, errors="replace",
+                                start_new_session=True)
+        with RUNNING_LOCK:
+            RUNNING_PROCS[jid] = proc
+            RUNNING_PROC_TOKENS[jid] = claim_token
+        if jid in CANCELLED:   # explicit cancel arrived between claim and spawn
+            _request_worker_cancel(jid, proc)
+        for line in proc.stdout:
+            clean = _redact_worker_output(
+                line.rstrip(), job_env, extra_secrets=redaction_secrets
+            )
+            _log_line(jid, clean)
+            if t["kind"] == "cards" and clean.startswith(("CARD_TRANSIENT:", "CARD_CONTRACT_ERROR:")):
+                card_worker_error = clean.split(":", 1)[1].strip()[:600]
+            # «Канал промптов «X» недоступен» = 401/429 у канала. Сервер запоминает это
+            # сам: у кабинетной задачи фолбэка внутри воркера нет, и без серверной
+            # пометки следующая задача снова ушла бы в мёртвый канал и снова упала.
+            # Гейт по ИСТОЧНИКУ credential ЭТОГО КАНАЛА (u), а не по провайдеру задачи:
+            # канал промптов почти никогда не совпадает с провайдером задачи (images
+            # идёт на recrafter, а промпты пишутся claude/codex). Свой токен канала →
+            # приватная метка владельца; серверный → общая, как и задумано.
+            dead_ch = _scan_prompt_channel_line(line, uid=uid,
+                                                own_credential=bool(own_credential), u=u)
+            # Первой почти всегда прилетает безликая «Command failed with exit code 1»,
+            # и только следом — «You've hit your limit · resets 2:10pm». Перезаписываем
+            # инцидент, если распознали лимит: иначе вердикт по токену будет «unknown»
+            # и задача упадёт вместо ожидания.
+            if dead_ch and (not channel_incident
+                            or (_cred_failure_kind(channel_incident.get("why", "")) != "limit"
+                                and _cred_failure_kind(clean) == "limit")):
+                channel_incident.update({"ch": dead_ch, "why": clean.strip()[:400]})
+            # «ЛИМИТ АККАУНТА ПРОВАЙДЕРА …» = исчерпан аккаунт image-провайдера (429
+            # RATE_LIMIT у VeoNonStop). Запоминаем текст, чтобы ошибка задачи была
+            # «кончился лимит аккаунта — смените модель», а не голое «rc=3».
+            if ("provider_remote_recovery_required" in clean.casefold()
+                    or "__VGC_REMOTE_PENDING__" in clean
+                    or "__VGC_CREDENTIAL_REQUIRED__" in clean):
+                remote_recovery = True
+            _scan_gen_limit_line(jid, clean, provider=provider)
+            _heartbeat(jid, claim_token)   # heartbeat только своего run-token
+        proc.wait()
+        rc = proc.returncode
+        # не перетирать статус, если задачу отменили
+        c = db()
+        cur = c.execute("SELECT status,claim_token FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+        c.close()
+        if (not cur or cur["status"] != "running"
+                or not secrets.compare_digest(str(cur["claim_token"] or ""), str(claim_token or ""))):
+            # cancelled — отменён юзером; queued — lease вернул завис в очередь (не перетираем статус на error)
+            _log_line(jid, "⏹ stale run завершён, новый claim не затронут")
+            return
+        if remote_recovery:
+            resumed = _resume_retained_remote_job(t, automatic=True, claim_token=claim_token)
+            if resumed:
+                _log_line(jid, "↩️ удалённая задача сохранена; повторим получение результата по тому же ID")
+                return
+            _finish_worker_task(jid, "error", "Результат удалённого запроса не подтверждён; журнал сохранён, повторное создание заблокировано", claim_token=claim_token)
+            return
+        if rc == 0:
+            if t["kind"] == "cards":
+                try:
+                    ok = _complete_card_task(t, params, projdir, claim_token)
+                    why = "" if ok else "card lease changed before completion"
+                except card_contract.CardContractError as exc:
+                    ok, why = False, str(exc)[:600]
+            else:
+                ok, why = _judge_success(t["kind"], projdir, jid, params=params)
+            if ok:
+                if prompt_provider:
+                    # канал отработал → снимаем метку «нерабочий», не дожидаясь TTL.
+                    # Успех на СВОЁМ ключе снимает только приватную метку владельца:
+                    # серверный канал мог быть мёртв по своей причине.
+                    _clear_prompt_channel_dead(
+                        prompt_provider, uid=(uid if own_credential else None))
+                if lease is not None and getattr(lease, "value", ""):
+                    # Ключ отработал задачу целиком → счётчик его отказов обнуляем,
+                    # иначе редкие транзиенты за сутки накопились бы в парковку.
+                    _cred_strike_reset(lease.family, lease.value)
+                _limit_wait_clear(jid)
+                if t["kind"] == "cards":
+                    # _complete_card_task already committed queue/gen/card in one CAS.
+                    _log_line(jid, "✅ card готова · exact claude-opus-4-6")
+                elif _finish_worker_task(jid, "done", claim_token=claim_token):
+                    _log_line(jid, "✅ готово")
+            else:
+                if _wait_for_window():
+                    return
+                _limit_wait_clear(jid)
+                if _finish_worker_task(
+                        jid, "error", why[:200], claim_token=claim_token,
+                        error_code=("contract_error" if t["kind"] == "cards" else None)):
+                    _log_line(jid, f"❌ завершилось с кодом 0, но без результата: {why}")
+        else:
+            if rc == _WORKER_TEMPFAIL and t["kind"] in ("prompts", "chapters"):
+                retry = _requeue_transient_prompt_task(jid, claim_token)
+                if retry is None:
+                    _log_line(jid, "⏹ transient run завершён после смены claim; очередь не затронута")
+                    return
+                if retry.get("state") == "queued":
+                    _log_line(
+                        jid,
+                        "⏳ временная ошибка prompt-провайдера — повтор %d/%d через %d с"
+                        % (retry["attempt"], len(_PROMPT_TRANSIENT_RETRY_DELAYS), retry["delay"]),
+                    )
+                    return
+                if retry.get("state") == "exhausted":
+                    err = ("временная ошибка prompt-провайдера не восстановилась после "
+                           f"{len(_PROMPT_TRANSIENT_RETRY_DELAYS)} отложенных повторов")
+                    if _finish_worker_task(jid, "error", err, claim_token=claim_token):
+                        _log_line(jid, f"❌ {err}")
+                    return
+            # Убит сигналом (rc<0, при рестарте сервиса это -15): не хоронить, а вернуть
+            # в очередь — ту же политику применяет _recover_orphans на старте, но задачи
+            # до неё не доживают, потому что умирающий _run_task успевает записать error.
+            # Отмена пользователем сюда не попадёт: там статус уже не 'running' и CAS в
+            # _requeue_running_task вернёт False.
+            if rc is not None and rc < 0 and _byok_requeue_allowed(jid) \
+                    and _requeue_running_task(jid, claim_token):
+                _log_line(jid, "♻️ воркер убит сигналом — задача возвращена в очередь")
+                return
+            if _wait_for_window():
+                return
+            if t["kind"] == "cards" and rc == card_contract.TRANSIENT_EXIT:
+                delay = _requeue_card_transient(
+                    jid, claim_token, card_worker_error or "card worker transient failure"
+                )
+                if delay is not None and delay is not False:
+                    _log_line(jid, f"♻️ временная ошибка card — возврат в очередь через {delay}с")
+                    return
+                if delay is False:
+                    return
+            if t["kind"] == "cards" and rc == card_contract.PERMANENT_EXIT:
+                _record_card_failure_artifacts(t, params, projdir)
+            _limit_wait_clear(jid)
+            limit_msg = _gen_limit_reason(jid)
+            if _retry_own_credential_failure(jid, claim_token, lease, limit_msg):
+                return
+            err = limit_msg or card_worker_error or f"rc={rc}"
+            card_error_code = None
+            if t["kind"] == "cards":
+                card_error_code = ("contract_error" if rc == card_contract.PERMANENT_EXIT
+                                   else "transient_exhausted" if rc == card_contract.TRANSIENT_EXIT
+                                   else "worker_error")
+            if _finish_worker_task(
+                    jid, "error", err[:200], claim_token=claim_token,
+                    error_code=card_error_code):
+                _log_line(jid, f"❌ ошибка (код {rc}): {err}" if limit_msg
+                          else f"❌ ошибка (код {rc})")
+    except Exception as e:
+        msg = _redact_worker_output(
+            str(e)[:200], extra_secrets=redaction_secrets
+        )
+        if t["kind"] == "cards":
+            try:
+                delay = _requeue_card_transient(jid, claim_token, msg)
+            except Exception:
+                delay = None
+            if delay is not None and delay is not False:
+                _log_line(jid, f"♻️ временная ошибка orchestration — возврат card через {delay}с")
+                return
+            if delay is False:
+                return
+        if _finish_worker_task(
+                jid, "error", msg, claim_token=claim_token,
+                error_code=("transient_exhausted" if t["kind"] == "cards" else None)):
+            _log_line(jid, f"❌ исключение: {msg}")
+    finally:
+        _clear_gen_limit(jid)
+        with RUNNING_LOCK:
+            # Старый run после lease-reclaim не имеет права удалить Popen нового claim.
+            if (proc is not None and RUNNING_PROCS.get(jid) is proc
+                    and secrets.compare_digest(
+                        str(RUNNING_PROC_TOKENS.get(jid) or ""), str(claim_token or "")
+                    )):
+                RUNNING_PROCS.pop(jid, None)
+                RUNNING_PROC_TOKENS.pop(jid, None)
+        _LAST_HB.pop((jid, str(claim_token or "")), None)
+        try:
+            if channel_incident and lease is not None:
+                _park_failed_credential(jid, lease, channel_incident)
+        finally:
+            if lease:
+                lease.release()
+
+
+def _requeue_stale_generation(c, jid, claim_token, cutoff):
+    """CAS-reclaim одного gen lease.
+
+    Snapshot мог устареть между SELECT и UPDATE: heartbeat того же run уже поднял
+    ``claimed`` либо новый claim сменил token. В обоих случаях rowcount=0 и живой
+    процесс не трогаем.
+    """
+    if not claim_token:
+        return False
+    cur = c.execute(
+        "UPDATE queue_tasks SET status='queued', started=NULL, claimed=NULL, claim_token=NULL "
+        "WHERE job_id=? AND status='running' AND claim_token=? "
+        "AND (claimed IS NULL OR claimed < ?)",
+        (jid, claim_token, cutoff),
+    )
+    if cur.rowcount != 1:
+        return False
+    c.execute("UPDATE gen_jobs SET status='queued', error=NULL WHERE id=?", (jid,))
+    c.execute("UPDATE card_jobs SET status='queued', next_attempt=NULL, "
+              "error_code=NULL, last_error=NULL WHERE job_id=?", (jid,))
+    with RUNNING_LOCK:
+        proc = None
+        if secrets.compare_digest(
+            str(RUNNING_PROC_TOKENS.get(jid) or ""), str(claim_token or "")
+        ):
+            proc = RUNNING_PROCS.pop(jid, None)
+            RUNNING_PROC_TOKENS.pop(jid, None)
+    if proc:
+        _kill_proc(proc)
+    return True
+
+
+# ── BYOK-задача осталась без credential к моменту старта воркера ─────────────
+# Задачу заклеймили на дорожку byok (у юзера был свой ключ), а к старту воркера ключ
+# исчез — серверный lease тогда берётся уже ВНЕ учёта шедулера, и при насыщенном
+# серверном ключе задача ПАДАЛА с «server credential slot недоступен». Замер: поток,
+# правящий users.keys каждые 2-20 мс, уводил 15-36 задач из 200 в error (контрольный
+# прогон без правок — 0 ошибок), при том что бюджет не превышался. Правильная реакция —
+# ВЕРНУТЬ строку в queued (как делает _requeue_stale_generation): следующий тик
+# шедулера подберёт её уже по-честному, с серверной дорожкой и leases. Обычно хватает
+# одного возврата, поэтому лимит возвратов — защита от вечного цикла, а не режим работы.
+BYOK_REQUEUE_MAX = max(1, int(os.environ.get("VS_BYOK_REQUEUE_MAX", "5") or 5))
+_BYOK_REQUEUES = {}                     # job_id -> сколько раз уже возвращали
+_BYOK_REQUEUE_LOCK = threading.Lock()
+
+
+def _byok_requeue_allowed(jid):
+    """Занять попытку возврата. False — лимит исчерпан, дальше честная ошибка."""
+    with _BYOK_REQUEUE_LOCK:
+        used = _BYOK_REQUEUES.get(str(jid), 0)
+        if used >= BYOK_REQUEUE_MAX:
+            return False
+        _BYOK_REQUEUES[str(jid)] = used + 1
+        return True
+
+
+def _byok_requeue_clear(jid):
+    """Задача стартовала нормально → счётчик возвратов больше не нужен."""
+    with _BYOK_REQUEUE_LOCK:
+        _BYOK_REQUEUES.pop(str(jid), None)
+
+
+# ── Ожидание сброса окна подписки ──────────────────────────────────────────────
+# Задача, которую исчерпанное окно застало в работе, возвращается в очередь и ждёт
+# сброса. Потолки обязательны: CRED_COOLDOWN_MAX допускает парковку на неделю, а
+# ошибочно опознанный «limit» без потолка дал бы бесконечный цикл queued→running→queued.
+VS_LIMIT_WAIT_MAX_TRIES = max(1, int(os.environ.get("VS_LIMIT_WAIT_MAX_TRIES", "8") or 8))
+VS_LIMIT_WAIT_MAX_SEC = max(600, int(os.environ.get("VS_LIMIT_WAIT_MAX_SEC", "86400") or 86400))
+_LIMIT_WAITS = {}                       # job_id -> [сколько раз ждали, ts первого ожидания]
+_LIMIT_WAIT_LOCK = threading.Lock()
+
+
+def _limit_wait_allowed(jid):
+    """Занять попытку ожидания. False — ждём слишком долго или слишком много раз."""
+    now = time.time()
+    with _LIMIT_WAIT_LOCK:
+        cnt, first = _LIMIT_WAITS.get(jid, (0, now))
+        if cnt >= VS_LIMIT_WAIT_MAX_TRIES or (now - first) > VS_LIMIT_WAIT_MAX_SEC:
+            _LIMIT_WAITS.pop(jid, None)
+            return False
+        _LIMIT_WAITS[jid] = (cnt + 1, first)
+        return True
+
+
+def _limit_wait_clear(jid):
+    """Задача дошла до терминального состояния — счётчик больше не нужен.
+
+    Чистим и на успехе, и на ошибке: иначе редкие ожидания за сутки накопятся до
+    потолка на живой задаче, а словарь потечёт.
+    """
+    with _LIMIT_WAIT_LOCK:
+        _LIMIT_WAITS.pop(jid, None)
+
+
+def _requeue_running_task(jid, claim_token):
+    """Вернуть running-задачу в queued (CAS по claim_token, как lease-reclaim)."""
+    if not claim_token:
+        return False
+    c = db()
+    try:
+        cur = c.execute(
+            "UPDATE queue_tasks SET status='queued', started=NULL, claimed=NULL, "
+            "claim_token=NULL WHERE job_id=? AND status='running' AND claim_token=?",
+            (jid, claim_token),
+        )
+        if cur.rowcount != 1:
+            c.rollback()
+            return False
+        c.execute("UPDATE gen_jobs SET status='queued', error=NULL WHERE id=?", (jid,))
+        c.execute("UPDATE card_jobs SET status='queued', next_attempt=NULL, "
+                  "error_code=NULL, last_error=NULL WHERE job_id=?", (jid,))
+        c.commit()
+        return True
+    finally:
+        c.close()
+
+
+_WORKER_TEMPFAIL = getattr(os, "EX_TEMPFAIL", 75)
+_PROMPT_TRANSIENT_RETRY_DELAYS = (30, 120, 300)
+
+
+def _requeue_transient_prompt_task(jid, claim_token, now=None):
+    """Durably requeue one transient prompt failure with bounded backoff.
+
+    The same job_id is retained, the retry budget lives in SQLite, and the CAS on
+    claim_token prevents a late worker from resurrecting a cancelled/reclaimed job.
+    ``None`` means the row is stale; ``exhausted`` means the caller must terminalize it.
+    """
+    if not claim_token:
+        return None
+    now = _now() if now is None else float(now)
+    c = db(); c.execute("BEGIN IMMEDIATE")
+    try:
+        row = c.execute(
+            "SELECT status,claim_token,kind,COALESCE(transient_attempts,0) attempts "
+            "FROM queue_tasks WHERE job_id=?", (jid,),
+        ).fetchone()
+        if (not row or row["status"] != "running"
+                or not secrets.compare_digest(
+                    str(row["claim_token"] or ""), str(claim_token or ""))):
+            c.rollback()
+            return None
+        if row["kind"] not in ("prompts", "chapters"):
+            c.rollback()
+            return {"state": "unsupported", "attempt": int(row["attempts"] or 0)}
+        attempt = int(row["attempts"] or 0) + 1
+        if attempt > len(_PROMPT_TRANSIENT_RETRY_DELAYS):
+            c.rollback()
+            return {"state": "exhausted", "attempt": attempt}
+        delay = _PROMPT_TRANSIENT_RETRY_DELAYS[attempt - 1]
+        retry_after = now + delay
+        cur = c.execute(
+            "UPDATE queue_tasks SET status='queued',started=NULL,claimed=NULL,"
+            "claim_token=NULL,finished=NULL,error=NULL,transient_attempts=?,retry_after=? "
+            "WHERE job_id=? AND status='running' AND claim_token=?",
+            (attempt, retry_after, jid, claim_token),
+        )
+        if cur.rowcount != 1:
+            c.rollback()
+            return None
+        c.execute("UPDATE gen_jobs SET status='queued',error=NULL WHERE id=?", (jid,))
+        c.commit()
+        return {"state": "queued", "attempt": attempt, "delay": delay,
+                "retry_after": retry_after}
+    finally:
+        c.close()
+
+
+# сколько раз вотчер имеет право переписать план сцен, прежде чем сдаться (защита от петли:
+# каждый переплан — реальные деньги подписки/API)
+_IMAGES_REPLAN_MAX = int(os.environ.get("VS_IMAGES_REPLAN_MAX", "2") or 2)
+
+
+def _project_note(tid, pid, text, kinds=("prompts", "images")):
+    """Записать строку в лог последней задачи проекта — иначе снятый этап исчезает МОЛЧА
+    (ни ошибки, ни задачи в очереди: пользователь видит «ничего не происходит»)."""
+    jid = None
+    try:
+        c = db()
+        for kind in (*kinds, None):
+            if kind:
+                r = c.execute("SELECT job_id FROM queue_tasks WHERE tenant_id=? AND project_id=? "
+                              "AND kind=? ORDER BY job_id DESC LIMIT 1", (tid, pid, kind)).fetchone()
+            else:
+                r = c.execute("SELECT job_id FROM queue_tasks WHERE tenant_id=? AND project_id=? "
+                              "ORDER BY job_id DESC LIMIT 1", (tid, pid)).fetchone()
+            if r:
+                jid = r["job_id"]
+                break
+        c.close()
+    except Exception:
+        pass
+    print(f"[deferred] {tid}/{pid}: {text}", flush=True)
+    if jid is not None:
+        _log_line(jid, text)
+    return jid
+
+
+# Отказы плана сцен, которые кабинет обходит ЯВНО: код выхода воркера → настройка проекта,
+# без которой у того же текста такой проверки нет (googler_worker.EX_PLAN_*).
+_PLAN_DEGRADE_BY_ERROR = {
+    "rc=11": ("analyze_story", "разбор персонажей и мест"),
+    "rc=12": ("split_long_sentences", "дробление длинных предложений"),
+}
+_PLAN_DEGRADE_SETTING = "auto_degraded_plan"
+
+
+def _plan_failure_reason(job_id):
+    """Суть отказа из строки «План сцен отклонён» лога задачи — чтобы откат объяснял себя."""
+    try:
+        c = db()
+        try:
+            row = c.execute(
+                "SELECT line FROM job_logs WHERE job_id=? AND line LIKE ? ORDER BY id DESC LIMIT 1",
+                (job_id, "%План сцен отклонён%"),
+            ).fetchone()
+        finally:
+            c.close()
+    except Exception:
+        return ""
+    if not row:
+        return ""
+    return str(row["line"] or "").split("План сцен отклонён:", 1)[-1].strip()[:160]
+
+
+def _plan_auto_degrade(tid, pid, st, image_params, latest_prompt, iuid,
+                       image_failover, prompt_snapshot, projdir):
+    """Один явный откат плана сцен вместо снятия этапа картинок.
+
+    Воркер отвечает кодом 11, когда план отклонил канон разбора персонажей и мест (одно
+    имя у персонажа и места, неотмеченное каноническое место), и кодом 12, когда не сошлась
+    смысловая нарезка длинных предложений. У того же текста без этой настройки таких
+    проверок нет. Поэтому один раз на настройку: выключаем её В ПРОЕКТЕ (пользователь
+    видит это в форме и в логе), ставим промпты заново с пересобранным набором референсов
+    и оставляем картинки ждать. Повторный отказ той же природы, уже выключенная настройка
+    или любой другой отказ — прежнее снятие этапа. Возвращает updates для settings или None.
+
+    12.09.2026: из 79 упавших планов 42 отклонил канон (топонимы и компании вроде «DuPont»,
+    «Norwegia», «Ziemia»), 29 — смысловая нарезка; каждый такой проект пользователь
+    пересоздавал руками по нескольку раз.
+    """
+    if not latest_prompt:
+        return None
+    rule = _PLAN_DEGRADE_BY_ERROR.get(str(latest_prompt["error"] or "").strip())
+    if not rule:
+        return None
+    setting, label = rule
+    done = st.get(_PLAN_DEGRADE_SETTING)
+    done = [str(x) for x in done] if isinstance(done, list) else []
+    if setting in done or not _truthy(image_params.get(setting), default=False):
+        return None
+    degraded = dict(image_params)
+    degraded[setting] = "0"
+    degraded.pop(_REFERENCE_BUNDLE_PARAM, None)
+    try:
+        degraded = _reference_apply_legacy_cache_choice(projdir, degraded)
+        bundle_id = _reference_prepare_bundle(projdir, degraded, _REFERENCE_BUNDLE_UNSET)
+    except reference_contract.ReferenceContractError as exc:
+        _project_note(tid, pid, f"⚠️ откат «{label}» не выполнен: контракт референсов ({exc})")
+        return None
+    degraded[_REFERENCE_BUNDLE_PARAM] = bundle_id
+    replan_jid = _enqueue(
+        iuid, tid, pid, "prompts", degraded,
+        prompt_failover=image_failover,
+        prompt_provider_snapshot=prompt_snapshot,
+        reference_bundle_id=bundle_id,
+    )
+    if not replan_jid:
+        return None
+    reason = _plan_failure_reason(latest_prompt["job_id"])
+    deferred = dict(st.get("deferred_images_params") or {})
+    deferred[setting] = "0"
+    deferred[_REFERENCE_BUNDLE_PARAM] = bundle_id
+    updates = {
+        setting: "0",
+        _PLAN_DEGRADE_SETTING: sorted(set(done) | {setting}),
+        "deferred_images_params": deferred,
+    }
+    st.update(updates)
+    _project_note(
+        tid, pid,
+        f"🔁 {label}: выключено автоматически — план сцен отклонён"
+        + (f" ({reason})" if reason else "")
+        + f"; переписываю промпты без этой настройки (задача #{replan_jid})",
+    )
+    return updates
+
+
+def _mark_stage_broken(tid, pid, reason):
+    """Оставить видимый след того, что этап снят: строка queue_tasks(images, error).
+
+    Без неё снятие авто-картинок исчезает бесследно — ни задачи, ни ошибки: озвучка done,
+    очередь пуста, проект выглядит здоровым и стоит мёртвым вечно (за волну так выпало
+    12 проектов из 65). Строка со статусом error даёт и красную плашку в списке, и рабочую
+    кнопку «Повторить», которая ставит images → промпты → deferred_images_pending.
+    Идемпотентно: если последняя images-задача уже такой маркер, второй не плодим.
+    """
+    try:
+        c = db()
+        try:
+            last = c.execute(
+                "SELECT status, COALESCE(error,'') FROM queue_tasks WHERE tenant_id=? AND project_id=? "
+                "AND kind='images' ORDER BY job_id DESC LIMIT 1", (tid, pid)).fetchone()
+            if last and last[0] == "error" and str(last[1]).startswith("конвейер оборван"):
+                return
+            now = time.time()
+            c.execute(
+                "INSERT INTO queue_tasks(tenant_id, project_id, kind, status, created, started, "
+                "finished, params, error) VALUES(?,?,'images','error',?,?,?,?,?)",
+                (tid, pid, now, now, now, "{}", f"конвейер оборван: {reason}"[:200]))
+            c.commit()
+        finally:
+            c.close()
+    except Exception as exc:      # вотчер важнее маркера: тик не должен падать
+        print(f"[deferred] {tid}/{pid}: маркер обрыва не записан: {exc}", flush=True)
+
+
+def _deferred_render_tick():
+    """Отложенные задачи: видео с флагом deferred_video_pending авто-стартует, как только
+    догенерились картинки; одиночный рендер ждёт готовности своего проекта; batch-cohort
+    не выпускает НИ ОДНОГО участника, пока одновременно не готовы все участники."""
+    now = time.time()
+    if now - _LAST_DEFERRED[0] < 10:   # троттлинг: раз в 10с (не на каждой итерации шедулера)
+        return
+    _LAST_DEFERRED[0] = now
+    c = None
+    try:
+        c = db()
+        rows = c.execute("SELECT id, tenant_id, settings FROM projects WHERE settings LIKE '%deferred_%'").fetchall()
+        c.close(); c = None
+        parsed = []
+        for r in rows:
+            try:
+                st = json.loads(r["settings"] or "{}")
+            except Exception:
+                st = {}
+            parsed.append((r["tenant_id"], r["id"], st))
+
+        # Отложенное видео и deferred-render; батч-барьер снят 25.07 — каждый по своей готовности.
+        # Каждый проект в своём try: одна битая запись не должна глушить остальные отложенные.
+        for tid, pid, st in parsed:
+            try:
+                # гонка с /deferred/cancel: снапшот rows мог устареть за время обхода —
+                # перечитываем settings прямо перед действием (окно сужается до миллисекунд)
+                p = _get_project(tid, pid)
+                if not p:
+                    continue
+                st = _psettings(p)
+                base = {k: v for k, v in st.items() if k not in _DEFERRED_KEYS}
+                remove_keys = []
+                updates = {}
+                # Картинки ждут план сцен от задачи «промпты».
+                iuid = st.get("deferred_images_pending")
+                if iuid and not _active_task(tid, pid, "prompts"):
+                    projdir = _project_dir(tid, pid)
+                    image_params = _images_effective_params(
+                        base, st.get("deferred_images_params") or {}
+                    )
+                    image_bundle_id = image_params.get(
+                        _REFERENCE_BUNDLE_PARAM, _REFERENCE_BUNDLE_UNSET
+                    )
+                    image_failover = _normalize_prompt_failover(
+                        image_params.get(_PROMPT_FAILOVER_PARAM, _PROMPT_FAILOVER_UNSET)
+                    )
+                    prompt_snapshot = (
+                        st.get("deferred_images_prompt_provider", _PROMPT_FAILOVER_UNSET)
+                        if image_failover == _PROMPT_FAILOVER_DISABLED
+                        else _PROMPT_FAILOVER_UNSET
+                    )
+                    images_dropped = False
+
+                    def _drop_images(reason):
+                        nonlocal images_dropped
+                        images_dropped = True
+                        _project_note(tid, pid, f"⏹ авто-картинки сняты: {reason}")
+                        _mark_stage_broken(tid, pid, reason)
+                        st.pop("deferred_images_pending", None)
+                        st.pop("deferred_images_params", None)
+                        st.pop("deferred_images_replan", None)
+                        st.pop("deferred_images_prompt_provider", None)
+
+                    try:
+                        image_bundle_id = _reference_prepare_bundle(
+                            projdir, image_params, image_bundle_id
+                        )
+                        image_params[_REFERENCE_BUNDLE_PARAM] = image_bundle_id
+                    except reference_contract.ReferenceContractError as exc:
+                        _drop_images(f"контракт референсов повреждён: {exc}")
+                        _mutate_project_settings(tid, pid, remove=list(_IMAGES_FLAGS))
+                        continue
+
+                    pc = db()
+                    try:
+                        latest_prompt = pc.execute(
+                            "SELECT job_id,status,error FROM queue_tasks "
+                            "WHERE tenant_id=? AND project_id=? AND kind='prompts' "
+                            "ORDER BY job_id DESC LIMIT 1", (tid, pid),
+                        ).fetchone()
+                    finally:
+                        pc.close()
+                    prompt_status = str(latest_prompt["status"] or "") if latest_prompt else "missing"
+
+                    # Disk artifacts are not authority: a failed newer prompt job may
+                    # leave an older valid scenes.json behind. Only the latest prompt
+                    # task reaching done is allowed to release images.
+                    if prompt_status != "done":
+                        rollback = _plan_auto_degrade(
+                            tid, pid, st, image_params, latest_prompt, iuid,
+                            image_failover, prompt_snapshot, projdir,
+                        )
+                        if rollback:
+                            updates.update(rollback)
+                        else:
+                            _drop_images(
+                                "последняя задача промптов не завершилась успешно "
+                                f"(status={prompt_status})"
+                            )
+                            remove_keys += list(_IMAGES_FLAGS)
+                    elif _scene_plan_ready(projdir, image_params):
+                        active_writer = _active_image_mutation(tid, pid)
+                        if active_writer and active_writer["kind"] != "images":
+                            # A racing plan/regen owns the shared artifact set.
+                            # Preserve the durable image request for the next tick.
+                            continue
+                        image_started = bool(active_writer)
+                        if not image_started:
+                            image_started = bool(_enqueue(
+                                iuid, tid, pid, "images", image_params,
+                                prompt_failover=image_failover,
+                                prompt_provider_snapshot=prompt_snapshot,
+                                reference_bundle_id=image_bundle_id,
+                            ))
+                        if not image_started:
+                            continue
+                        st.pop("deferred_images_pending", None); st.pop("deferred_images_params", None)
+                        st.pop("deferred_images_replan", None)
+                        st.pop("deferred_images_prompt_provider", None)
+                        remove_keys += list(_IMAGES_FLAGS)
+                    elif _scene_plan_ready(projdir):
+                        # План на диске ЕСТЬ и он валиден, но паспорт не совпал с параметрами
+                        # (сменили стиль/сценарий, либо задача промптов получила другой набор
+                        # полей). Это НЕ повод бросать этап — план надо ПЕРЕПИСАТЬ.
+                        if (image_failover == _PROMPT_FAILOVER_DISABLED
+                                and prompt_snapshot not in _PROMPT_PROVIDER_GROUPS):
+                            _drop_images("повреждён server snapshot prompt-provider; "
+                                         "failover запрещён")
+                            remove_keys += list(_IMAGES_FLAGS)
+                        else:
+                            tries = int(st.get("deferred_images_replan") or 0)
+                        if not images_dropped and tries < _IMAGES_REPLAN_MAX:
+                            replan_jid = _enqueue(
+                                    iuid, tid, pid, "prompts", image_params,
+                                    prompt_failover=image_failover,
+                                    prompt_provider_snapshot=prompt_snapshot,
+                                    reference_bundle_id=image_bundle_id)
+                            # Route-less fail-closed is not an attempt: no job was
+                            # persisted and no provider credit can be spent.  Keep
+                            # the durable wait flags/counter unchanged so a later
+                            # healthy route can be picked without exhausting the
+                            # bounded replan budget on scheduler ticks alone.
+                            if replan_jid:
+                                updates["deferred_images_replan"] = tries + 1
+                                st["deferred_images_replan"] = tries + 1
+                                _project_note(tid, pid, "♻️ план сцен не соответствует настройкам "
+                                                        "проекта — переписываю промпты")
+                        elif not images_dropped:
+                            _drop_images("план сцен не соответствует настройкам проекта, "
+                                         f"переплан не помог ({tries} попытк(и))")
+                            remove_keys += list(_IMAGES_FLAGS)
+                    else:
+                        # промпты не идут и плана нет (упали/отменены) → снимаем ожидание,
+                        # НЕ ставим картинки: рисовать без плана = мусорные кадры и жжёные кредиты
+                        _drop_images("задача промптов не выполнилась (план сцен не создан)")
+                        remove_keys += list(_IMAGES_FLAGS)
+                vuid = st.get("deferred_video_pending")
+                if vuid:
+                    video_params = {**base, **(st.get("deferred_video_params") or {})}
+                    # first_n ждёт конкретные первые сцены; без лимита и для
+                    # ручных имён остаётся прежний порог ≥70%.
+                    if (_video_ready(tid, pid)
+                            and _video_images_ready(tid, pid, video_params)):
+                        video_released = _active_task(tid, pid, "video")
+                        if not video_released:
+                            video_released = bool(_enqueue(
+                                vuid, tid, pid, "video", video_params
+                            ))
+                        if video_released:
+                            st.pop("deferred_video_pending", None)
+                            st.pop("deferred_video_params", None)
+                            remove_keys += ["deferred_video_pending",
+                                            "deferred_video_params"]
+                            if st.get("deferred_pending"):
+                                updates["deferred_wait_video"] = 1
+                                st["deferred_wait_video"] = 1
+                uid = st.get("deferred_pending")
+                if (uid and not st.get("deferred_video_pending") and _render_inputs_ready(tid, pid)
+                        and _deferred_video_ok(tid, pid, st)):
+                    remove_render_flag = False
+                    if not _active_task(tid, pid, "render"):
+                        remove_render_flag = bool(_enqueue(uid, tid, pid, "render",
+                                                           {**base, **(st.get("deferred_render_params") or {})}))
+                    else:
+                        remove_render_flag = True
+                    if remove_render_flag:
+                        st.pop("deferred_pending", None)
+                        # deferred_render_batch — легаси-ключ старых когорт, дочищаем
+                        remove_keys += ["deferred_pending", "deferred_render_params",
+                                        "deferred_wait_video", "deferred_render_batch"]
+                        updates.pop("deferred_wait_video", None)
+                if remove_keys or updates:
+                    _mutate_project_settings(tid, pid, updates=updates, remove=remove_keys)
+            except Exception as e:
+                print(f"[deferred] {tid}/{pid}: {e!r}", flush=True)
+
+    except Exception as e:
+        print(f"[deferred] tick: {e!r}", flush=True)
+        if c:
+            try: c.close()
+            except Exception: pass
+
+
+def _next_rr_uid(ordered_uids, last_uid):
+    """Следующий uid в устойчивом числовом RR-кольце; без cursor — самый старый pending."""
+    if not ordered_uids:
+        return None
+    if last_uid is None:
+        return ordered_uids[0]
+    ring = sorted(ordered_uids)
+    for uid in ring:
+        if uid > last_uid:
+            return uid
+    return ring[0]
+
+
+def _rr_uid_order(ordered_uids, last_uid):
+    """Все uid один раз в порядке после cursor (для поиска первой fit-задачи)."""
+    ring = sorted(set(ordered_uids))
+    if not ring:
+        return []
+    first = _next_rr_uid(ring, last_uid)
+    pos = ring.index(first)
+    return ring[pos:] + ring[:pos]
+
+
+# ── Защита от обгона (barging prevention): накопление ёмкости под тяжёлую задачу ──
+# Ёмкость взвешенных ключей считается в units, и задачи ОЧЕНЬ разного размера: на
+# боевом recrafter (бюджет 21, «потоков на проект» 7) лёгкая модель весит 7 units,
+# тяжёлая (NARWHAL/GEM_PIX_2/IMAGEN_3_5) — 20, GROK — 21. Тяжёлой нужен практически
+# пустой ключ. Шедулер такую задачу просто ПРОПУСКАЛ и отдавал освободившиеся units
+# следующему юзеру: замер на боевой копии — тяжёлая не стартовала ни разу за 300
+# освобождений слота (и, стоя головой FIFO своего тенанта, держала его собственные
+# лёгкие задачи). Ошибки нет, в логе пусто — задача «висит в очереди» часами.
+#
+# Лечение: задача, которую пропустили по нехватке units QUEUE_RESERVE_AFTER_SKIPS раз
+# (или которая ждёт дольше QUEUE_RESERVE_AFTER_SEC), становится РЕЗЕРВИРУЮЩЕЙ на своей
+# (provider, lane) — освобождающиеся units копятся под неё. Work-conserving не теряем
+# полностью: чужие задачи продолжают стартовать, но только из ИЗЛИШКА сверх
+# зарезервированного (task_units ≤ free_units − reserved_units), то есть ни одна из них
+# не отодвигает старт зарезервированной ни на одно освобождение. Отсюда ПОТОЛОК
+# ожидания: пока резерв активен, занятые units только убывают, поэтому тяжёлая
+# стартует не позже, чем закончатся задачи, работавшие в момент резервирования
+# (≤ бюджета задач дорожки) + порог пропусков.
+QUEUE_RESERVE_AFTER_SKIPS = max(1, int(os.environ.get("VS_QUEUE_RESERVE_SKIPS", "3") or 3))
+# Второй, НЕЗАВИСИМЫЙ от памяти процесса триггер: время ожидания берётся из
+# queue_tasks.created, поэтому переживает рестарт (см. _queue_reservation_state).
+QUEUE_RESERVE_AFTER_SEC = max(0.0, float(os.environ.get("VS_QUEUE_RESERVE_SEC", "60") or 0))
+QUEUE_RESERVE_LOG_EVERY = max(10.0, float(os.environ.get("VS_QUEUE_RESERVE_LOG_SEC", "120") or 120))
+# Состояние резервирования ЖИВЁТ В ПАМЯТИ и при рестарте vsgen обнуляется — это
+# осознанный выбор: рестарт и так возвращает все gen-задачи в queued (_recover_orphans),
+# так что после него задача просто снова начинает копить, а гарантия не теряется —
+# триггер по времени ожидания считается от created в БД и срабатывает сразу.
+_QUEUE_SKIPS = {}        # (provider, lane, job_id) -> пропусков по нехватке units
+_QUEUE_RESERVED = {}     # (provider, lane) -> {job_id, uid, units, since, logged}
+_QUEUE_RESERVE_LOCK = threading.Lock()
+_PAUSE_WAIT_LOG_EVERY = max(
+    60.0, float(os.environ.get("VS_PAUSE_WAIT_LOG_SEC", "21600") or 21600)
+)
+_PAUSE_WAIT_LOGGED = {}  # (job_id, pause_signature) -> last committed log timestamp
+_PAUSE_WAIT_LOG_LOCK = threading.Lock()
+
+
+def _reserve_key(prov, lane, owner=None):
+    """Ключ резерва. На byok у каждого владельца ключа СВОЙ счёт ёмкости, поэтому
+    и резерв персональный: общий резерв соседа (20 из 21 юнита) иначе блокировал бы
+    чужие задачи, которые тратят вообще другой ключ."""
+    return (prov, lane, owner) if (lane == "byok" and owner is not None) else (prov, lane)
+
+
+def _queue_reservation(prov, lane, owner=None):
+    """Активный резерв ёмкости этой дорожки (копия) или None."""
+    with _QUEUE_RESERVE_LOCK:
+        rec = _QUEUE_RESERVED.get(_reserve_key(prov, lane, owner))
+        return dict(rec) if rec else None
+
+
+def _queue_reservation_state():
+    """Снимок всех резервов — для тестов и диагностики (кто и сколько ждёт)."""
+    with _QUEUE_RESERVE_LOCK:
+        return {key: dict(rec) for key, rec in _QUEUE_RESERVED.items()}
+
+
+def _drop_queue_reservation(prov, lane, job_id=None, owner=None):
+    """Снять резерв (задача стартовала/отменена/её держит уже не ёмкость)."""
+    with _QUEUE_RESERVE_LOCK:
+        k = _reserve_key(prov, lane, owner)
+        rec = _QUEUE_RESERVED.get(k)
+        if rec and (job_id is None or rec["job_id"] == job_id):
+            _QUEUE_RESERVED.pop(k, None)
+            _QUEUE_SKIPS.pop((prov, lane, rec["job_id"]), None)
+        if job_id is not None:
+            _QUEUE_SKIPS.pop((prov, lane, job_id), None)
+
+
+def _purge_queue_skips(alive):
+    """Выкинуть счётчики пропусков и резервы задач, которых больше НЕТ в очереди.
+
+    alive — множество (provider, job_id) реально стоящих queued-задач этого тика.
+    Раньше _QUEUE_SKIPS чистился ТОЛЬКО через _drop_queue_reservation, то есть запись
+    оставалась навсегда, если пропущенную по units задачу отменили/удалили вместе с
+    проектом или она сменила дорожку (server→byok после вписывания своего ключа) — и
+    до резерва не дошла. Замер: 30 отмен → 30 висящих записей.
+
+    Резерв тоже снимаем: копить ёмкость под исчезнувшую задачу нельзя. Задача,
+    которая ещё стоит в очереди (в т.ч. зарезервированная и копящая), в alive есть —
+    barging prevention не затрагивается.
+    """
+    with _QUEUE_RESERVE_LOCK:
+        for key in list(_QUEUE_SKIPS):
+            if (key[0], key[2]) not in alive:
+                _QUEUE_SKIPS.pop(key, None)
+        for key, rec in list(_QUEUE_RESERVED.items()):
+            if (key[0], rec["job_id"]) not in alive:
+                _QUEUE_RESERVED.pop(key, None)
+def _note_queue_starvation(prov, lane, job_id, uid, units, free_units, now, waited):
+    """Задача не влезла по units. Копим пропуски и, дойдя до порога (или по времени
+    ожидания), включаем накопление ёмкости под неё. Возвращает строку для лога задачи
+    или None — чтобы человек видел, ПОЧЕМУ ничего не происходит."""
+    key = (prov, lane, job_id)
+    with _QUEUE_RESERVE_LOCK:
+        skips = _QUEUE_SKIPS.get(key, 0) + 1
+        _QUEUE_SKIPS[key] = skips
+        rec = _QUEUE_RESERVED.get(_reserve_key(prov, lane, uid))
+        if rec is not None and rec["job_id"] != job_id:
+            return None                     # копит другая задача — ждём своей очереди
+        ripe = (skips >= QUEUE_RESERVE_AFTER_SKIPS
+                or (QUEUE_RESERVE_AFTER_SEC and waited >= QUEUE_RESERVE_AFTER_SEC))
+        if rec is None:
+            if not ripe:
+                return None
+            _QUEUE_RESERVED[_reserve_key(prov, lane, uid)] = {
+                "job_id": job_id, "uid": uid, "units": units,
+                "since": now, "logged": now,
+            }
+            return (f"⏳ ждёт ёмкости ключа «{prov}»: нужно {units} ед., свободно "
+                    f"{free_units} — освобождающиеся units резервируются под эту задачу "
+                    f"(мелкие задачи её больше не обгоняют)")
+        rec["units"] = units                # настройки могли поменяться на ходу
+        if now - float(rec.get("logged") or 0) < QUEUE_RESERVE_LOG_EVERY:
+            return None
+        rec["logged"] = now
+        return (f"⏳ всё ещё копим ёмкость ключа «{prov}»: нужно {units} ед., свободно "
+                f"{free_units}, ждём {int(now - float(rec['since']))}с")
+
+
+def _note_paused_task(job_id, pause_signature, reason, created, now):
+    """Return one throttled, human-readable reason for a queued task's pause."""
+    key = (int(job_id), str(pause_signature))
+    with _PAUSE_WAIT_LOG_LOCK:
+        last = float(_PAUSE_WAIT_LOGGED.get(key) or 0.0)
+        if last and now - last < _PAUSE_WAIT_LOG_EVERY:
+            return None
+    waited = max(0.0, now - float(created or now))
+    if waited >= 86400:
+        age = f"{int(waited // 86400)} сут"
+    elif waited >= 3600:
+        age = f"{int(waited // 3600)} ч"
+    else:
+        age = f"{int(waited // 60)} мин"
+    return f"⏸️ [queue-pause] {reason}; в очереди уже {age}"
+
+
+def _mark_paused_task_logged(job_id, pause_signature, now):
+    """Start throttle only after the job-log INSERT has actually committed."""
+    key = (int(job_id), str(pause_signature))
+    with _PAUSE_WAIT_LOG_LOCK:
+        _PAUSE_WAIT_LOGGED[key] = float(now)
+
+
+def _purge_pause_wait_logs(alive_keys):
+    """Do not retain throttle state after a task leaves its paused queue."""
+    alive = set(alive_keys)
+    with _PAUSE_WAIT_LOG_LOCK:
+        for key in list(_PAUSE_WAIT_LOGGED):
+            if key not in alive:
+                _PAUSE_WAIT_LOGGED.pop(key, None)
+
+
+def _human_wait(seconds):
+    seconds = int(max(0, seconds))
+    if seconds < 3600:
+        return f"{seconds // 60} мин"
+    if seconds < 86400:
+        return f"{seconds // 3600} ч {(seconds % 3600) // 60} мин"
+    return f"{seconds // 86400} сут {(seconds % 86400) // 3600} ч"
+
+
+# ── Пауза очереди из админ-панели (аварийный стоп) ────────────────────────────
+# Зачем в БД, а не только в памяти: пауза ставится ровно в тех ситуациях, где нельзя
+# дать очереди тронуться — провайдер отдаёт мусор, ключ жжёт кредиты впустую, идёт
+# разбор инцидента. Рестарт сервиса (в том числе автоматический по Restart=on-failure)
+# не должен молча снимать этот стоп.
+# Уже запущенные задачи пауза НЕ убивает — она только перекрывает выдачу новых:
+# убийство на полпути сожгло бы уже потраченные кредиты без результата.
+_ADM_PAUSE_TTL = 2.0                    # кэш: тик шедулера ~1 с, читать БД на каждый провайдер незачем
+_ADM_PAUSE_CACHE = {
+    "ts": 0.0,
+    "val": {
+        "all": False,
+        "providers": [],
+        "prompt_uids": [],
+    },
+}
+_ADM_PAUSE_LOCK = threading.Lock()
+
+
+def _adm_state_get(key, default=None):
+    """Значение из admin_state (JSON). БД недоступна → default, без исключения наружу."""
+    try:
+        c = db()
+        try:
+            r = c.execute("SELECT v FROM admin_state WHERE k=?", (key,)).fetchone()
+        finally:
+            c.close()
+        return json.loads(r["v"]) if r and r["v"] else default
+    except Exception:
+        log_exc("admin_state/get")
+        return default
+
+
+def _adm_state_set(key, value):
+    c = db()
+    try:
+        c.execute("INSERT INTO admin_state(k,v,updated) VALUES(?,?,?) "
+                  "ON CONFLICT(k) DO UPDATE SET v=excluded.v, updated=excluded.updated",
+                  (key, json.dumps(value, ensure_ascii=False), time.time()))
+        c.commit()
+    finally:
+        c.close()
+    with _ADM_PAUSE_LOCK:                # свежее значение видно сразу, не через TTL
+        _ADM_PAUSE_CACHE["ts"] = 0.0
+
+
+def _queue_pause_state():
+    """Глобальная, provider- и персональная prompt-пауза. Кэш на _ADM_PAUSE_TTL."""
+    with _ADM_PAUSE_LOCK:
+        now = time.time()
+        if now - _ADM_PAUSE_CACHE["ts"] < _ADM_PAUSE_TTL:
+            return _ADM_PAUSE_CACHE["val"]
+        # Read and publish under the same lock as _adm_state_set invalidation.
+        # Otherwise a reader can fetch the old DB value, an admin action can
+        # commit+invalidate, and that reader can then overwrite the cache with
+        # the stale value for another full TTL.
+        raw = _adm_state_get(
+            "queue_pause",
+            {
+                "all": False,
+                "providers": [],
+                "prompt_uids": [],
+            },
+        ) or {}
+        # Сохраняем незнакомые поля: admin actions ниже записывают этот снимок обратно,
+        # поэтому реконструкция только из известных ключей молча удаляла бы настройки,
+        # добавленные более новой версией сервера или операторским скриптом.
+        val = dict(raw) if isinstance(raw, dict) else {}
+        prompt_uids = []
+        for raw_uid in val.get("prompt_uids") or []:
+            try:
+                uid = int(raw_uid)
+            except (TypeError, ValueError):
+                continue
+            if uid > 0:
+                prompt_uids.append(uid)
+        prompt_projects = []
+        if "prompt_project_allowlist" in val:
+            raw_projects = val.get("prompt_project_allowlist") or []
+            if isinstance(raw_projects, (list, tuple, set)):
+                for raw_project_id in raw_projects:
+                    # project_id — серверная строковая identity. Не приводим числа и
+                    # прочие JSON-типы к строке: allowlist должен совпадать только точно.
+                    if not isinstance(raw_project_id, str):
+                        continue
+                    project_id = raw_project_id.strip()
+                    if project_id:
+                        prompt_projects.append(project_id)
+        val.update({
+            "all": bool(val.get("all")),
+            "providers": list(val.get("providers") or []),
+            "prompt_uids": sorted(set(prompt_uids)),
+        })
+        if "prompt_project_allowlist" in val:
+            val["prompt_project_allowlist"] = sorted(set(prompt_projects))
+        _ADM_PAUSE_CACHE["ts"], _ADM_PAUSE_CACHE["val"] = now, val
+        return val
+
+
+def _queue_paused(prov=None):
+    st = _queue_pause_state()
+    if st["all"]:
+        return True
+    return bool(prov and prov in st["providers"])
+
+
+def _prompt_uid_paused(uid, project_id=None):
+    try:
+        uid = int(uid)
+    except (TypeError, ValueError):
+        return False
+    state = _queue_pause_state()
+    if uid not in state["prompt_uids"]:
+        return False
+    # Allowlist снимает только персональную prompt-паузу и только для точной
+    # строковой identity проекта. Глобальную/provider-паузу проверяют отдельные
+    # guards, поэтому allowlist никогда не обходит аварийный стоп.
+    if (isinstance(project_id, str)
+            and project_id in state.get("prompt_project_allowlist", [])):
+        return False
+    return True
+
+
+def _active_queue_pause_reason(rows=None, uid=None):
+    """Human-readable reason for an active provider-specific queue pause.
+
+    ``rows`` is the privacy-safe in-memory pulse snapshot tuple list.  A paused
+    provider with no queued/running work is not advertised as an outage to all
+    cabinets, while a real frozen backlog is made visible immediately.
+    """
+    st = _queue_pause_state()
+    if st["all"]:
+        return "Общая очередь студии приостановлена администратором"
+    if _prompt_uid_paused(uid):
+        return "Генерация текстов и промптов в вашем профиле временно приостановлена"
+    paused = set(st["providers"])
+    active = sorted({prov for status, _uid, _kind, prov, _created in (rows or [])
+                     if status in ("queued", "running") and prov in paused})
+    if not active:
+        return ""
+    titles = ", ".join(_provider_title(prov) for prov in active)
+    return (f"Приостановлены провайдеры: {titles}. "
+            "Новые задачи через них не принимаются")
+
+
+def _prompt_provider_paused(provider_or_channel):
+    """Provider-specific routing pause for prompt lanes.
+
+    ``queue_pause.all`` is maintenance for claiming: tasks may still be enqueued and
+    keep their provider snapshot while the scheduler is stopped.  Only exact
+    membership in ``queue_pause.providers`` makes a prompt route ineligible and
+    permits legacy migration to another lane.
+    """
+    provider = str(provider_or_channel or "").strip().lower()
+    if provider in PROMPT_CHANNELS:
+        provider = "prompt_" + provider
+    if provider not in _PROMPT_PROVIDER_GROUPS:
+        return False
+    return provider in _queue_pause_state()["providers"]
+
+
+QUEUE_MAX_LOCAL_JOBS = max(1, min(64, int(os.environ.get("VS_QUEUE_MAX_LOCAL_JOBS", "24"))))
+QUEUE_MEMORY_BUDGET_MB = max(512, int(os.environ.get("VS_QUEUE_MEMORY_BUDGET_MB", "8192")))
+QUEUE_MEMORY_RESERVE_MB = max(512, int(os.environ.get("VS_QUEUE_MEMORY_RESERVE_MB", "2048")))
+
+
+def _task_memory_mb(kind, provider):
+    if provider in _PROMPT_PROVIDER_GROUPS:
+        ch = provider.removeprefix("prompt_")
+        return 192 + PROMPT_CALL_MEMORY_MB.get(ch, 0) * max(1, _prompt_threads_setting(ch))
+    return 512 if kind in ("images", "video", "regen", "regen_video") else 192
+
+
+def _available_memory_mb():
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) // 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def _claim_fair_tasks(c, claim_now=None):
+    """Атомарно заполнить свободные provider slots честным uid round-robin.
+
+    FIFO внутри uid задаёт ORDER BY created,job_id. Provider cursor хранится в
+    SQLite, поэтому рестарт не возвращает scheduler к началу чужого backlog.
+
+    У каждого провайдера ДВЕ независимые дорожки ёмкости: 'server' (общий ключ,
+    ограничен пулом serverных credentials) и 'byok' (свои ключи юзеров). BYOK-задача
+    не ждёт свободного серверного слота и не занимает его; при этом её параллельность
+    всё равно ограничена server-owned формулой — железо у нас общее.
+    """
+    claim_now = time.time() if claim_now is None else float(claim_now)
+    launched = []
+    # Аварийный стоп из админ-панели: новых задач не выдаём вовсе. Проход шедулера при
+    # этом продолжается (heartbeat тикает, lease-возврат зависших работает) — пауза не
+    # должна выглядеть как «планировщик умер».
+    if _queue_paused():
+        _purge_pause_wait_logs(set())
+        return launched
+    wait_logs = []                  # (job_id, строка) — пишем ПОСЛЕ commit, вне транзакции
+    pause_logs = []                 # (job_id, строка, signature) — mark only after INSERT
+    paused_wait_keys = set()
+    # Пропуск считаем не чаще одного раза за ВЫЗОВ (= тик шедулера ≈ 1с): внутренний
+    # while перебирает RR-круги много раз подряд, и без этого порог накопления
+    # срабатывал бы в первую же секунду — ёмкость резервировалась бы раньше, чем
+    # шедулер вообще попробовал раздать её честно.
+    starved_seen = set()
+    reserved_leases = []
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        machine_jobs = 0
+        machine_memory_mb = 0
+        available_mb = _available_memory_mb()
+        batch_memory_mb = 0
+        run_prov_jobs = {}
+        run_prov_units = {}
+        run_uid_jobs = {}            # (provider, uid) -> сколько задач юзера уже идёт
+        run_uid_prompt = {}          # uid -> задач промптов юзера ВО ВСЕХ каналах
+        for r in c.execute(
+                "SELECT kind,params,uid,provider,prompt_failover,lane,capacity_units,memory_mb FROM queue_tasks "
+                "WHERE status='running' AND kind!='render'").fetchall():
+            machine_jobs += 1
+            machine_memory_mb += int(r["memory_mb"] or _task_memory_mb(r["kind"], r["provider"]))
+            if (r["kind"] == "cards"
+                    and (r["provider"] != card_contract.PROVIDER_GROUP
+                         # For cards the stored enum itself is evidence.  Generic
+                         # normalization maps malformed values to fail-closed disabled,
+                         # but a corrupt snapshot is still not an exact card policy.
+                         or r["prompt_failover"] != card_contract.PROMPT_FAILOVER)):
+                # Corrupt card metadata must never be repaired by inference: it is
+                # exact Claude/Opus work or it does not execute.
+                continue
+            if (r["kind"] == "prompts"
+                    and _prompt_failover_from_row(r) == _PROMPT_FAILOVER_DISABLED
+                    and r["provider"] not in _PROMPT_PROVIDER_GROUPS):
+                # Corrupt disabled rows must not be attributed to a newly inferred
+                # provider. New application rows can never reach this branch.
+                continue
+            try:
+                prov = _task_provider(
+                    r["kind"], r["params"], uid=r["uid"], stored_provider=r["provider"]
+                )
+            except ImageModeContractError:
+                # Legacy running row уже исполняется старым claim. Не даём её битому
+                # payload обрушить учёт всего тика; новый queued payload ниже будет
+                # изолирован в terminal error до запуска.
+                continue
+            try:
+                task_params = json.loads(r["params"] or "{}")
+            except Exception:
+                task_params = {}
+            # Дорожку берём СНИМКОМ момента claim: юзер мог вписать/удалить свой ключ
+            # на ходу, и пересчёт «сейчас» переносил бы уже работающую задачу в другую
+            # дорожку (обе дорожки считали бы не то, что реально запущено).
+            _lane = _running_lane(r, prov)
+            # Both lanes consume a finite machine budget; per-key leases are additional.
+            key = (prov, _lane)
+            run_prov_jobs[key] = run_prov_jobs.get(key, 0) + 1
+            run_prov_units[key] = (
+                run_prov_units.get(key, 0)
+                + int(r["capacity_units"] or _task_capacity_units(r["kind"], task_params, prov))
+            )
+            run_uid_jobs[(prov, r["uid"])] = run_uid_jobs.get((prov, r["uid"]), 0) + 1
+            if prov in _PROMPT_PROVIDER_GROUPS:
+                run_uid_prompt[r["uid"]] = run_uid_prompt.get(r["uid"], 0) + 1
+
+        # dict сохраняет порядок первого появления: без cursor первым идёт uid
+        # с самой старой ожидающей задачей, затем устойчивый RR.
+        pending = {}
+        for r in c.execute(
+                "SELECT q.* FROM queue_tasks q LEFT JOIN card_jobs cj ON cj.job_id=q.job_id "
+                "WHERE q.status='queued' AND q.kind!='render' AND q.uid IS NOT NULL "
+                "AND (q.retry_after IS NULL OR q.retry_after<=?) "
+                "AND (q.kind!='cards' OR COALESCE(cj.next_attempt,0)<=?) "
+                "ORDER BY q.created,q.job_id", (claim_now, claim_now)).fetchall():
+            if (r["kind"] == "cards"
+                    and (r["provider"] != card_contract.PROVIDER_GROUP
+                         or r["prompt_failover"] != card_contract.PROMPT_FAILOVER)):
+                continue
+            if (r["kind"] == "prompts"
+                    and _prompt_failover_from_row(r) == _PROMPT_FAILOVER_DISABLED
+                    and r["provider"] not in _PROMPT_PROVIDER_GROUPS):
+                # No provider snapshot means there is nothing safe to execute.
+                # Keep the row queued for operator repair; never select a replacement.
+                continue
+            try:
+                prov = _task_provider(
+                    r["kind"], r["params"], uid=r["uid"], stored_provider=r["provider"]
+                )
+            except ImageModeContractError as exc:
+                # Одна старая/ручная битая строка не должна откатывать BEGIN и лишать
+                # claim всех соседей. Fail closed только эту задачу, до worker spawn.
+                err = ("некорректный режим картинок: " + str(exc))[:200]
+                cur = c.execute(
+                    "UPDATE queue_tasks SET status='error',finished=?,error=?,"
+                    "claim_token=NULL,claimed=NULL WHERE job_id=? AND status='queued'",
+                    (claim_now, err, r["job_id"]),
+                )
+                if cur.rowcount == 1:
+                    c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?",
+                              (err, r["job_id"]))
+                    wait_logs.append((r["job_id"], "❌ " + err))
+                continue
+            if (prov in _PROMPT_PROVIDER_GROUPS
+                    and _prompt_uid_paused(r["uid"], r["project_id"])):
+                pause_key = (int(r["job_id"]), f"prompt_uid:{int(r['uid'])}")
+                paused_wait_keys.add(pause_key)
+                note = _note_paused_task(
+                    r["job_id"], pause_key[1],
+                    "генерация текстов и промптов вашего профиля на паузе",
+                    r["created"], claim_now,
+                )
+                if note:
+                    pause_logs.append((r["job_id"], note, pause_key[1]))
+                continue
+            try:
+                pin = _remote_credential_pin(r)
+                if pin:
+                    family = _provider_credential_family(prov)
+                    owner = c.execute("SELECT * FROM users WHERE id=?", (r["uid"],)).fetchone()
+                    source = pin.get("source") or r["lane"] or "byok"
+                    values = (_own_pool_values(owner, family) if source == "byok"
+                              else _credential_candidates(keys(), family))
+                    if (family != pin.get("family") or
+                            not any(hashlib.sha256(v.encode()).hexdigest() == pin["sha256"] for v in values) or
+                            source == "server" and _own_only(owner)):
+                        raise ValueError("для восстановления оплаченной задачи нужен исходный ключ; другой ключ не подставлен")
+            except ValueError as exc:
+                error = str(exc)
+                c.execute("UPDATE queue_tasks SET status='error',finished=?,error=? WHERE job_id=? AND status='queued'", (claim_now, error, r["job_id"]))
+                c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?", (error, r["job_id"]))
+                wait_logs.append((r["job_id"], error))
+                continue
+            pending.setdefault(prov, {}).setdefault(r["uid"], []).append(r)
+
+        # Память шедулера чистится по РЕАЛЬНОЙ очереди этого тика: пропущенная по units
+        # задача могла исчезнуть (отмена, удаление проекта, переезд server→byok) так и
+        # не дойдя до резерва — её счётчик пропусков висел бы вечно. Делаем это ДО
+        # раздачи слотов и ВНЕ цикла по провайдерам: у провайдера, у которого сейчас
+        # вообще нет queued-задач, цикл ниже не выполняется ни разу.
+        _purge_queue_skips({
+            (prov, r["job_id"])
+            for prov, by_uid in pending.items()
+            for jobs in by_uid.values()
+            for r in jobs
+        })
+
+        for prov in sorted(pending):
+            if _queue_paused(prov):     # точечный стоп: например, провайдер отдаёт мусор,
+                for jobs in pending[prov].values():
+                    for task in jobs:
+                        pause_key = (int(task["job_id"]), f"provider:{prov}")
+                        paused_wait_keys.add(pause_key)
+                        note = _note_paused_task(
+                            task["job_id"], pause_key[1],
+                            f"провайдер «{prov}» на паузе",
+                            task["created"], claim_now,
+                        )
+                        if note:
+                            pause_logs.append((task["job_id"], note, pause_key[1]))
+                continue                # а остальные каналы должны продолжать работать
+            # Обе дорожки считаются server-owned формулой (клиент ни одну поднять не
+            # может), но бюджеты у них РАЗНЫЕ: у byok свой лимит задач, иначе суммарная
+            # параллельность доходила бы до 2× серверной (железо-то одно).
+            free = {}
+            for lane in ("server", "byok"):
+                lane_jobs, lane_units = _provider_lane_budget(prov, lane)
+                free[lane] = [
+                    max(0, lane_jobs - run_prov_jobs.get((prov, lane), 0)),
+                    max(0, lane_units - run_prov_units.get((prov, lane), 0)),
+                ]
+            if not any(j > 0 and un > 0 for j, un in free.values()):
+                continue
+            cr = c.execute(
+                "SELECT last_uid FROM provider_rr_cursor WHERE provider=?", (prov,)
+            ).fetchone()
+            last_uid = cr["last_uid"] if cr else None
+            by_uid = pending[prov]
+            # Резерв живёт, только пока зарезервированная задача ещё стоит головой
+            # своей FIFO-очереди. Стартовала/отменена → снимаем, иначе дорожка копила
+            # бы ёмкость под несуществующую задачу.
+            heads = {jobs[0]["job_id"] for jobs in by_uid.values() if jobs}
+            for lane in ("server", "byok"):
+                res = _queue_reservation(prov, lane)
+                if res and res["job_id"] not in heads:
+                    _drop_queue_reservation(prov, lane, res["job_id"])
+            # у byok резерв персональный — чистим по каждому владельцу очереди
+            for _owner in list(by_uid):
+                _res_o = _queue_reservation(prov, "byok", _owner)
+                if _res_o and _res_o["job_id"] not in heads:
+                    _drop_queue_reservation(prov, "byok", _res_o["job_id"], owner=_owner)
+
+            while by_uid and any(j > 0 and un > 0 for j, un in free.values()):
+                claimed_any = False
+                ordered_uids = [uid for uid, jobs in by_uid.items() if jobs]
+                for uid in _rr_uid_order(ordered_uids, last_uid):
+                    jobs = by_uid.get(uid) or []
+                    if not jobs:
+                        by_uid.pop(uid, None)
+                        continue
+                    # FIFO per uid: если oldest task сейчас не помещается, более
+                    # новые этого uid не обгоняют её; пробуем следующего uid.
+                    t = jobs[0]
+                    if _storage_project_held(c, t["project_id"], claim_now):
+                        by_uid.pop(uid, None)
+                        continue
+                    try:
+                        task_params = json.loads(t["params"] or "{}")
+                    except Exception:
+                        task_params = {}
+                    from storage_admission import admission as _storage_admission
+                    if not _storage_admission(c, _project_dir(t["tenant_id"], t["project_id"]), task_params)["allowed"]:
+                        c.execute("UPDATE queue_tasks SET stage=? WHERE job_id=? AND status='queued'", ("Ожидание свободного места на сервере", t["job_id"]))
+                        by_uid.pop(uid, None)
+                        continue
+                    task_units = _task_capacity_units(t["kind"], task_params, prov)
+                    pin = _remote_credential_pin(t)
+                    byok = ((pin.get("source") or t["lane"] or "byok") == "byok" if pin else
+                            _task_uses_own_credential(uid, prov, t["kind"]))
+                    lane = "byok" if byok else "server"
+                    free_jobs, free_units = free[lane]
+                    if byok:
+                        owner = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+                        task_units, _own_capacity = _own_task_budget(owner, prov, t["kind"], task_params)
+                    else:
+                        owner = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+                        if _own_only(owner) and _provider_credential_family(prov):
+                            c.execute("UPDATE queue_tasks SET status='error',finished=?,error=? WHERE job_id=? AND status='queued'",
+                                      (claim_now, "Нет личного ключа выбранного этапа; серверные ключи отключены", t["job_id"]))
+                            c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?",
+                                      ("Нет личного ключа выбранного этапа; серверные ключи отключены", t["job_id"]))
+                            jobs.pop(0)
+                            if not jobs:
+                                by_uid.pop(uid, None)
+                            claimed_any = True
+                            break
+                    if free_jobs <= 0:
+                        continue
+                    # Гейты «на одного юзера» проверяются ДО ёмкости (порядок для
+                    # результата нейтрален, оба ветки — continue), чтобы задача,
+                    # которую держит собственный лимит тенанта, не начинала копить
+                    # ёмкость: резерв встал бы за задачей, которая всё равно не может
+                    # стартовать, и дорожка простаивала бы зря.
+                    # «на одного юзера» из админ-таблицы: сколько задач ОДНОГО uid идёт
+                    # разом у этого вида ключа. Раньше значение только сохранялось и
+                    # рисовалось — шедулер его не применял (ручка ничего не делала).
+                    # Общий потолок задач промптов на юзера ПОВЕРХ всех каналов:
+                    # лимит «на одного юзера» действует внутри группы, а групп три,
+                    # и без этого один юзер занимал бы весь этап промптов целиком.
+                    if (run_uid_jobs.get((prov, uid), 0)
+                            >= (_own_user_job_limit(uid, prov) if byok else _provider_caps(prov, _user_opts(uid))[1])
+                        or (prov in _PROMPT_PROVIDER_GROUPS
+                            and run_uid_prompt.get(uid, 0) >= PROMPT_USER_TOTAL_JOBS)):
+                        _drop_queue_reservation(prov, lane, t["job_id"],
+                                                owner=uid if byok else None)
+                        continue
+                    # Barging prevention: чужой резерв берём в расчёт — стартуем только
+                    # из излишка сверх зарезервированного, свой (или отсутствие резерва)
+                    # проверяем как раньше.
+                    res = _queue_reservation(prov, lane, uid if byok else None)
+                    if res and res["job_id"] != t["job_id"]:
+                        if task_units > free_units - res["units"]:
+                            continue
+                    elif task_units > free_units:
+                        skip_key = (prov, lane, t["job_id"])
+                        if skip_key not in starved_seen:
+                            starved_seen.add(skip_key)
+                            note = _note_queue_starvation(
+                                prov, lane, t["job_id"], uid, task_units, free_units,
+                                claim_now, claim_now - float(t["created"] or claim_now),
+                            )
+                            if note:
+                                wait_logs.append((t["job_id"], note))
+                        continue
+                    memory_mb = _task_memory_mb(t["kind"], prov)
+                    if (machine_jobs >= QUEUE_MAX_LOCAL_JOBS
+                            or machine_memory_mb + memory_mb > QUEUE_MEMORY_BUDGET_MB
+                            or (available_mb is not None and
+                                available_mb - batch_memory_mb - memory_mb < QUEUE_MEMORY_RESERVE_MB)):
+                        continue
+                    # BYOK reserves its actual personal key, outside the server pool.
+                    lease = (_reserve_own_task_credential(owner, prov, t["kind"], task_params, required_hash=pin["sha256"] if pin else None) if byok else
+                             _reserve_task_credential(prov, t["kind"], task_params, required_hash=pin["sha256"] if pin else None))
+                    if _provider_credential_family(prov) and lease is None:
+                        continue
+                    if lease:
+                        reserved_leases.append(lease)
+                    run_token = secrets.token_urlsafe(24)
+                    if (_prompt_failover_from_row(t) == _PROMPT_FAILOVER_DISABLED
+                            and t["kind"] in ("prompts", "cards")):
+                        # Do not even include provider in this UPDATE: disabled means
+                        # the scheduler may claim the row, never rewrite its snapshot.
+                        cur = c.execute(
+                            "UPDATE queue_tasks SET status='running',started=?,claimed=?,"
+                            "lane=?,claim_token=? WHERE job_id=? AND status='queued'",
+                            (claim_now, claim_now, lane, run_token, t["job_id"]),
+                        )
+                    else:
+                        cur = c.execute(
+                            "UPDATE queue_tasks SET status='running',started=?,claimed=?,"
+                            "provider=COALESCE(NULLIF(provider,''),?),lane=?,claim_token=? "
+                            "WHERE job_id=? AND status='queued'",
+                            (claim_now, claim_now, prov, lane, run_token, t["job_id"]),
+                        )
+                    if cur.rowcount == 1:
+                        c.execute("UPDATE queue_tasks SET capacity_units=?,memory_mb=? WHERE job_id=? AND claim_token=?",
+                                  (task_units, memory_mb, t["job_id"], run_token))
+                        machine_jobs += 1
+                        machine_memory_mb += memory_mb
+                        batch_memory_mb += memory_mb
+                        jobs.pop(0)
+                        if not jobs:
+                            by_uid.pop(uid, None)
+                        # Задача стартовала → её резерв (если был) больше не нужен,
+                        # дорожка снова раздаёт ёмкость всем.
+                        _drop_queue_reservation(prov, lane, t["job_id"],
+                                                owner=uid if byok else None)
+                        # Сдвигаем cursor только после успешного conditional claim.
+                        c.execute(
+                            "INSERT INTO provider_rr_cursor(provider,last_uid,updated) VALUES(?,?,?) "
+                            "ON CONFLICT(provider) DO UPDATE SET "
+                            "last_uid=excluded.last_uid,updated=excluded.updated",
+                            (prov, uid, claim_now),
+                        )
+                        last_uid = uid
+                        # Shared lane budget decreases for every owner.
+                        _ckey = (prov, lane)
+                        free[lane][0] = free_jobs - 1
+                        free[lane][1] = free_units - task_units
+                        run_prov_jobs[_ckey] = run_prov_jobs.get(_ckey, 0) + 1
+                        run_prov_units[_ckey] = (
+                            run_prov_units.get(_ckey, 0) + task_units
+                        )
+                        run_uid_jobs[(prov, uid)] = run_uid_jobs.get((prov, uid), 0) + 1
+                        if prov in _PROMPT_PROVIDER_GROUPS:
+                            run_uid_prompt[uid] = run_uid_prompt.get(uid, 0) + 1
+                        task_dict = dict(t)
+                        task_dict["provider"] = prov
+                        task_dict["lane"] = lane
+                        task_dict["claim_token"] = run_token
+                        task_dict["_provider"] = prov
+                        task_dict["_capacity_units"] = task_units
+                        task_dict["_credential_lease"] = lease
+                        launched.append(task_dict)
+                        claimed_any = True
+                        break
+                    if lease:
+                        lease.release()
+                    # Строку уже claim-нул другой actor: выкидываем stale snapshot.
+                    _drop_queue_reservation(prov, lane, t["job_id"],
+                                            owner=uid if byok else None)
+                    jobs.pop(0)
+                    if not jobs:
+                        by_uid.pop(uid, None)
+                if not claimed_any:
+                    break
+        c.commit()
+        _purge_pause_wait_logs(paused_wait_keys)
+        # Логи ожидания пишем ПОСЛЕ commit (отдельным соединением), чтобы не держать
+        # write-транзакцию шедулера. Человек должен видеть, почему задача стоит.
+        for _jid, _msg in wait_logs:
+            try:
+                _log_line(_jid, _msg)
+            except Exception:
+                pass
+        for _jid, _msg, _signature in pause_logs:
+            try:
+                if _log_line(_jid, _msg):
+                    _mark_paused_task_logged(_jid, _signature, claim_now)
+            except Exception:
+                pass
+        return launched
+    except Exception:
+        c.rollback()
+        for lease in reserved_leases:
+            if lease:
+                lease.release()
+        raise
+
+
+# ─────────────────── уборка исходников завершённых проектов ───────────────────
+# Механизма уборки не было вообще: 732 проекта, 374 ГБ, в кроне только бэкапы,
+# а rmtree звался лишь при ручном удалении проекта. При 300 роликах/сутки это
+# 155 ГБ в день — свободное место кончилось бы за трое суток посреди прогона.
+#
+# Убираем ТОЛЬКО перегенерируемое медиа и только у проектов, чей рендер давно готов.
+# Никогда не трогаем:
+#   *.json          — scenes.json и scenes.meta.json лежат ВНУТРИ googler/ рядом с
+#                     картинками; это план сцен, самое дорогое в стеке (промпты)
+#   render/         — готовый mp4, ради него всё и делалось
+#   _RENDER_MEDIA/  — свои материалы юзера, их неоткуда взять заново
+#   _ASSETS/, _style_refs/, source.txt
+RETENTION_DAYS = float(os.environ.get("VS_RETENTION_DAYS", "7") or 7)
+RETENTION_EVERY_SEC = int(os.environ.get("VS_RETENTION_EVERY_SEC", "3600") or 3600)
+RETENTION_BUDGET_SEC = float(os.environ.get("VS_RETENTION_BUDGET_SEC", "20") or 20)
+_RETENTION_TICK = {"at": 0.0}
+_RETENTION_MEDIA_EXT = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".gif"}
+_RETENTION_DIRS = ("googler video", "Images", ".thumbs")
+_RETENTION_DIR_PREFIX = ("_FINAL_AUDIO_",)
+_RETENTION_MARKER = "_sources_purged.json"
+
+
+def _sweep_project_sources():
+    """Bounded source retention with the shared transactional project fence."""
+    try:
+        from source_retention import sweep
+        result = sweep(DB, TENANTS_DIR, RETENTION_DAYS, RETENTION_BUDGET_SEC)
+        if result["projects"] or result["retained"]:
+            print("[retention] " + json.dumps(result, ensure_ascii=False), flush=True)
+    except Exception:
+        log_exc("_sweep_project_sources:fenced")
+
+
+def _scheduler_loop():
+    """Persistent work-conserving round-robin по uid, независимо для каждого provider.
+
+    Каждый проход отмечается в _SCHED_HB — это единственный способ увидеть снаружи,
+    что диспетчер жив (см. /healthz и плашку на /admin). Исключения НЕ глотаются:
+    traceback уходит в journal через log_exc с троттлингом.
+    """
+    import time as _t
+    while True:
+        c = None
+        _pass_started = time.time()
+        try:
+            c = db()
+            # LEASE: gen-задача 'running' без heartbeat дольше GEN_LEASE = завис/зомби → убить проц + вернуть в очередь.
+            # (claimed обновляется _heartbeat на каждой строке вывода; нет вывода GEN_LEASE сек = воркер мёртв/висит.)
+            _cutoff = time.time() - GEN_LEASE
+            _stale = c.execute(
+                "SELECT job_id,claim_token,claimed FROM queue_tasks "
+                "WHERE status='running' AND kind!='render' "
+                "AND (claimed IS NULL OR claimed < ?)",
+                (_cutoff,),
+            ).fetchall()
+            _reclaimed_jids = []
+            for _r in _stale:
+                if _requeue_stale_generation(
+                    c, _r["job_id"], _r["claim_token"], _cutoff
+                ):
+                    _reclaimed_jids.append(_r["job_id"])
+            if _reclaimed_jids:
+                c.commit()
+                for _jid in _reclaimed_jids:
+                    try:
+                        _log_line(_jid, "♻️ воркер завис (нет вывода) — возврат в очередь")
+                    except Exception:
+                        pass
+            launched = _claim_fair_tasks(c)
+            c.close(); c = None
+            for t in launched:
+                threading.Thread(target=_run_task, args=(t,), daemon=True).start()
+            _deferred_render_tick()
+            _run_render_followups()
+            _recover_remote_cancellations()
+            # Канал промптов может стать непригодным и БЕЗ рестарта (кончились кредиты, канал
+            # убрали из policy, воркер пометил его нерабочим) — редкая сверка, не в каждый проход.
+            if time.time() - _PROMPT_CHAN_TICK["at"] >= PROMPT_CHANNEL_RECHECK_SEC:
+                _PROMPT_CHAN_TICK["at"] = time.time()
+                _refresh_stale_prompt_channels()
+            # Ротация лога задач — раз в час, пачками с бюджетом времени (см. _rotate_job_logs)
+            if time.time() - _JOB_LOGS_TICK["at"] >= JOB_LOGS_ROTATE_EVERY_SEC:
+                _JOB_LOGS_TICK["at"] = time.time()
+                _rotate_job_logs()
+            # Уборка исходников давно отрендеренных проектов — раз в час, с бюджетом времени
+            if time.time() - _RETENTION_TICK["at"] >= RETENTION_EVERY_SEC:
+                _RETENTION_TICK["at"] = time.time()
+                _sweep_project_sources()
+            _pass_ms = (time.time() - _pass_started) * 1000.0
+            _SCHED_HB["last_pass"] = time.time()
+            _SCHED_HB["passes"] += 1
+            _SCHED_HB["last_launched"] = len(launched)
+            _SCHED_HB["pass_ms"] = _pass_ms
+            if _pass_ms > _SCHED_HB["max_pass_ms"]:
+                _SCHED_HB["max_pass_ms"] = _pass_ms
+        except Exception as e:
+            if c:
+                try: c.close()
+                except Exception: pass
+            _SCHED_HB["errors"] += 1
+            _SCHED_HB["last_err"] = "%s: %s" % (type(e).__name__, str(e)[:300])
+            _SCHED_HB["last_err_ts"] = time.time()
+            log_exc("_scheduler_loop")
+        _t.sleep(1.0)
+
+
+def _sched_watchdog():
+    """Поток планировщика умер (не «залип», а именно исчез) → поднять заново и сказать об этом
+    в журнал. Залипший (жив, но last_pass не двигается) НЕ трогаем: убивать поток, который
+    сидит в write-транзакции, опаснее, чем показать красную плашку и отдать 503 на /healthz."""
+    global _SCHED_THREAD
+    while True:
+        time.sleep(15)
+        try:
+            th = _SCHED_THREAD
+            if th is not None and not th.is_alive():
+                log_info("⚠️ поток планировщика МЁРТВ — поднимаю заново "
+                         "(проходов было %d, последняя ошибка: %s)"
+                         % (_SCHED_HB["passes"], _SCHED_HB["last_err"] or "нет"))
+                _SCHED_HB["last_pass"] = time.time()
+                _SCHED_THREAD = threading.Thread(target=_scheduler_loop, daemon=True, name="vs-scheduler")
+                _SCHED_THREAD.start()
+        except Exception:
+            log_exc("_sched_watchdog")
+
+
+def _sched_health():
+    """Снимок живости планировщика для /healthz и админки."""
+    now = time.time()
+    th = _SCHED_THREAD
+    alive = bool(th is not None and th.is_alive())
+    last = _SCHED_HB["last_pass"] or 0.0
+    age = (now - last) if last else None
+    if not BACKGROUND_ENABLED:
+        ok, state = True, "disabled"
+    elif not alive:
+        ok, state = False, "dead"
+    elif age is None or age > VS_SCHED_STALE_SEC:
+        ok, state = False, "stale"
+    else:
+        ok, state = True, "ok"
+    return {
+        "ok": ok,
+        "state": state,
+        "thread_alive": alive,
+        "age_sec": round(age, 2) if age is not None else None,
+        "stale_after_sec": VS_SCHED_STALE_SEC,
+        "passes": _SCHED_HB["passes"],
+        "errors": _SCHED_HB["errors"],
+        "last_err": _SCHED_HB["last_err"],
+        "last_err_age_sec": round(now - _SCHED_HB["last_err_ts"], 1) if _SCHED_HB["last_err_ts"] else None,
+        "last_launched": _SCHED_HB["last_launched"],
+        "pass_ms": round(_SCHED_HB["pass_ms"], 1),
+        "max_pass_ms": round(_SCHED_HB["max_pass_ms"], 1),
+        "uptime_sec": round(now - _SCHED_HB["started"], 1) if _SCHED_HB["started"] else None,
+    }
+
+
+@app.get("/healthz")
+def healthz():
+    """Живость сервиса для внешнего мониторинга. Без авторизации и без секретов.
+
+    503 отдаётся, когда фон включён, но планировщик мёртв или не делал прохода дольше
+    VS_SCHED_STALE_SEC. Именно этого не хватило 31.07: сервис отвечал на HTTP (рендеры
+    забирает внешняя нода своей ручкой), а очередь при этом не двигалась.
+    Caddy проксирует gen.* обычным reverse_proxy без health-checks, так что 503 здесь
+    роут не выключает — это сигнал мониторингу, а не самоотключение.
+    """
+    sched = _sched_health()
+    queued = {}
+    try:
+        c = db()
+        for r in c.execute("SELECT kind, COUNT(*) n FROM queue_tasks WHERE status='queued' GROUP BY kind"):
+            queued[r["kind"]] = r["n"]
+        c.close()
+        db_ok = True
+    except Exception:
+        log_exc("healthz/db")
+        db_ok = False
+    ok = bool(sched["ok"] and db_ok)
+    return JSONResponse(
+        {"ok": ok, "db": db_ok, "scheduler": sched, "queued": queued},
+        status_code=200 if ok else 503,
+    )
+
+
+# восстановление: при рестарте 'running' (осиротевшие) → обратно в 'queued'.
+# kind='render' НЕ трогаем: рендеры выполняются на внешней ноде (Минск-бокс) и рестарт
+# vsgen переживают — сброс в queued вёл к ДВОЙНОМУ клейму (второй слот пуллера забирал
+# job, который первый ещё рендерил; live-инцидент 15.07: jobs 1149/1150, rmtree чужого
+# projdir). Реально осиротевшие рендеры (нода умерла) вернёт lease-механизм в
+# render_claim (claimed < cutoff RENDER_LEASE_SEC).
+#
+# ВНИМАНИЕ: вызывается ТОЛЬКО из _lifespan, никогда с уровня модуля. Раньше вызов стоял
+# в теле модуля, и любой скрипт с `import main` (аудиты, разовые правки в /root) возвращал
+# в очередь running-задачи РАБОТАЮЩЕГО сервера — тот терял исполнителя молча.
+# Как часто планировщик сверяет каналы стоящих задач промптов (сек). Не в каждый проход:
+# сверка ходит в БД за пользователями, а меняется policy редко.
+PROMPT_CHANNEL_RECHECK_SEC = max(30, int(os.environ.get("VS_PROMPT_CHANNEL_RECHECK_SEC", "120") or 120))
+_PROMPT_CHAN_TICK = {"at": 0.0}
+
+# ── Ротация job_logs ─────────────────────────────────────────────────────────
+# Лог задач копился без ограничения: 4.1 млн строк и БД 523 МБ на 04.08 (аудит 02.08 показывал
+# 3.5 млн — ~200 тыс/сутки, а один плохой прогон 04.08 добавил 60 тыс за два часа). Чистка была
+# только кнопкой в админ-панели. Критерий тот же, что у кнопки: строки ЗАВЕРШЁННЫХ задач старше
+# N дней. Живые и недавние задачи не трогаем — по ним юзер смотрит лог.
+JOB_LOGS_RETENTION_DAYS = max(0, int(os.environ.get("VS_JOB_LOGS_RETENTION_DAYS", "30") or 0))
+JOB_LOGS_ROTATE_EVERY_SEC = max(600, int(os.environ.get("VS_JOB_LOGS_ROTATE_EVERY_SEC", "3600") or 3600))
+# Удаляем ПАЧКАМИ с коммитом между ними: один DELETE на миллионы строк держит write-лок
+# всей БД (кабинет и планировщик встают). Бюджет времени на проход — тоже жёсткий.
+JOB_LOGS_ROTATE_BATCH = max(1000, int(os.environ.get("VS_JOB_LOGS_ROTATE_BATCH", "20000") or 20000))
+JOB_LOGS_ROTATE_BUDGET_SEC = max(1.0, float(os.environ.get("VS_JOB_LOGS_ROTATE_BUDGET_SEC", "5") or 5))
+_JOB_LOGS_TICK = {"at": 0.0}
+
+
+def _rotate_job_logs():
+    """Удалить строки лога завершённых задач старше JOB_LOGS_RETENTION_DAYS. Возвращает число строк.
+
+    Файл БД при этом не уменьшается (освободившиеся страницы переиспользуются) — это штатно;
+    физическое сжатие делает VACUUM, он лочит базу целиком и остаётся ручной кнопкой в панели.
+    """
+    if not JOB_LOGS_RETENTION_DAYS:
+        return 0                                  # 0 = ротация выключена
+    cutoff = time.time() - JOB_LOGS_RETENTION_DAYS * 86400
+    deadline = time.time() + JOB_LOGS_ROTATE_BUDGET_SEC
+    removed = 0
+    try:
+        while time.time() < deadline:
+            c = db()
+            try:
+                cur = c.execute(
+                    "DELETE FROM job_logs WHERE id IN ("
+                    "  SELECT l.id FROM job_logs l JOIN queue_tasks q ON q.job_id = l.job_id"
+                    "  WHERE q.status IN ('done','error','cancelled')"
+                    "    AND q.finished IS NOT NULL AND CAST(q.finished AS REAL) < ?"
+                    "  LIMIT ?)", (cutoff, JOB_LOGS_ROTATE_BATCH))
+                n = cur.rowcount or 0
+                c.commit()
+            finally:
+                c.close()
+            removed += n
+            if n < JOB_LOGS_ROTATE_BATCH:         # вычистили всё, что подпадало
+                break
+        if removed:
+            log_info("ротация лога задач: удалено %d строк (старше %d дн)"
+                     % (removed, JOB_LOGS_RETENTION_DAYS))
+    except Exception:
+        log_exc("_rotate_job_logs")
+    return removed
+
+
+def _prompt_channel_usable_for(u, ch):
+    """Годен ли канал промптов для ЭТОГО юзера прямо сейчас (есть чем платить и он разрешён).
+
+    Свой credential обходит server policy, но не admin pause и не собственную dead-метку.
+    Серверный канал дополнительно должен быть разрешён policy и обеспечен ключом.
+    """
+    ch = str(ch or "").strip().lower()
+    if (ch not in PROMPT_CHANNELS
+            or _prompt_provider_paused(ch)
+            or not _prompt_channel_credential(u, ch)):
+        return False
+    if ch in _own_prompt_channels(u):
+        return not _prompt_channel_dead_for(u, ch)
+    if ch == "codex" and not _codex_allowed(u):
+        return False                       # серверная подписка владельца — не для всех
+    if not _prompt_channel_allowed(u, ch):
+        return False                       # канал выключен серверной policy
+    return not _prompt_channel_dead_for(u, ch)
+
+
+def _refresh_stale_prompt_channels():
+    """Переставить СТОЯЩИЕ задачи промптов с непригодного канала на рабочий.
+
+    Канал фиксируется в строке задачи в момент постановки (`queue_tasks.provider`) и дальше
+    не пересматривается. Из-за этого 04.08 задачи, поставленные когда серверный OpenAI-ключ
+    был жив, продолжали уезжать в него после того, как у ключа кончились кредиты и канал убрали
+    из policy: `_recover_orphans` возвращал их в очередь С ПРЕЖНИМ каналом, и пришлось
+    переписывать `provider` руками (13 задач). Теперь непригодный канал заменяется сам.
+
+    Переставляем ТОЛЬКО legacy-задачи, когда текущий канал реально непригоден
+    (нет credential / выключен policy / pause / помечен нерабочим) и есть годная замена.
+    ``prompt_failover=disabled`` оставляет server-selected snapshot неизменным;
+    повреждённая политика/параметры тоже fail closed и не разрешают rewrite.
+    """
+    moved = []
+    try:
+        c = db()
+        try:
+            rows = c.execute(
+                "SELECT job_id, uid, provider, prompt_failover, params FROM queue_tasks "
+                "WHERE status='queued' AND kind='prompts'").fetchall()
+            users = {}
+            for r in rows:
+                if _prompt_failover_from_row(r) == _PROMPT_FAILOVER_DISABLED:
+                    continue
+                uid, cur_prov = r["uid"], str(r["provider"] or "")
+                ch = cur_prov[len("prompt_"):] if cur_prov.startswith("prompt_") else ""
+                if not ch:
+                    continue
+                if uid not in users:
+                    users[uid] = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+                u = users[uid]
+                if u is None or _prompt_channel_usable_for(u, ch):
+                    continue
+                want = _prompt_group_for_uid(uid, prefer_free=True)
+                if want == cur_prov or not _prompt_channel_usable_for(u, want[len("prompt_"):]):
+                    continue               # замены нет — пусть падает честно, а не молча
+                cur = c.execute(
+                    "UPDATE queue_tasks SET provider=? WHERE job_id=? AND status='queued' "
+                    "AND lower(trim(COALESCE(prompt_failover,'legacy')))='legacy'",
+                    (want, r["job_id"]),
+                )
+                if cur.rowcount == 1:
+                    moved.append((r["job_id"], ch, want))
+            if moved:
+                c.commit()
+        finally:
+            c.close()
+        # Лог пишем ТОЛЬКО после закрытия соединения: _log_line открывает своё и на незакрытой
+        # write-транзакции упирался бы в блокировку БД (замер: ~30 с ожидания на строку, то есть
+        # проход планировщика вставал бы намертво). Тихой подмены канала при этом нет — строка
+        # в лог задачи всё равно попадает.
+        for jid, ch, want in moved:
+            _log_line(jid, "↩️ канал промптов «%s» больше не доступен — задача переставлена на «%s»"
+                      % (_prompt_channel_title(ch) or ch, _prompt_channel_title(want) or want))
+        if moved:
+            log_info("канал промптов пересчитан у %d задач в очереди" % len(moved))
+    except Exception:
+        log_exc("_refresh_stale_prompt_channels")
+    return len(moved)
+
+
+def _recover_orphans():
+    try:
+        c = db()
+        cur = c.execute("UPDATE queue_tasks SET status='queued',started=NULL,claimed=NULL,claim_token=NULL "
+                        "WHERE status='running' AND kind!='render'")
+        n = cur.rowcount
+        c.execute("UPDATE card_jobs SET status='queued', next_attempt=NULL "
+                  "WHERE job_id IN (SELECT job_id FROM queue_tasks "
+                  "WHERE kind='cards' AND status='queued') AND status='running'")
+        c.commit(); c.close()
+        if n:
+            log_info("восстановление после рестарта: %d осиротевших gen-задач возвращено в очередь" % n)
+    except Exception:
+        log_exc("_recover_orphans")
+    # ...и сразу проверить, что каналы промптов у возвращённых задач ещё живы: рестарт часто
+    # и делается ПОТОМУ, что канал/ключ поменяли.
+    _refresh_stale_prompt_channels()
+
+
+# Фон поднимается из _lifespan (см. комментарий у него) — здесь НИЧЕГО не запускаем.
+
+
+def _needs_scene_plan(tenant_id, project_id, params):
+    """Нужно ли СНАЧАЛА написать промпты отдельной задачей (и только потом рисовать).
+
+    Да — когда картинки идут обычным путём (googler-источник, без готового плана и без
+    своих промптов), а также для Bing БЕЗ тегов: он тоже работает по плану сцен
+    (одна найденная картинка на сцену). Кастомные промпты и Bing с тегами плана
+    не используют вовсе.
+    """
+    p = _canonical_image_params(params)
+    source = p["image_mode"]
+    if source == _IMAGE_MODE_BING:
+        if (p.get("tags") or "").strip():
+            return False                       # старый режим «теги» — план не нужен
+    elif (p.get("custom_prompts") or "").strip():
+        return False
+    return not _scene_plan_ready(_project_dir(tenant_id, project_id), p)
+
+
+def _regen_dedup_target(kind, params):
+    """Stable target for regen_video; image regen uses one project-wide writer mutex."""
+    if kind == "regen":
+        raw = (params or {}).get("image_rel")
+    elif kind == "regen_video":
+        raw = (params or {}).get("video_rel")
+    else:
+        return ""
+    rel = str(raw or "").strip().replace("\\", "/")
+    return os.path.normpath(rel).replace("\\", "/")
+
+
+def _normalize_task_param_key(key):
+    """Case/hyphen/underscore-варианты одного имени → единый snake_case."""
+    return re.sub(r"_+", "_", re.sub(r"[^a-z0-9]+", "_", str(key).strip().lower())).strip("_")
+
+
+_TASK_PARAM_SECRET_KEYS = {
+    "keys",
+    "api_key",
+    "api_token",
+    "access_token",
+    "provider",
+    "provider_id",
+    "credential",
+    "credential_id",
+    "credential_family",
+    "prompt_provider",
+    "prompt_provider_snapshot",
+    "prompt_provider_locked",
+    "deferred_images_prompt_provider",
+    "token",
+    "authorization",
+    "bearer_token",
+    "oauth_token",
+    "x_api_key",
+    "auth_token",
+    "apikey",
+    "client_secret",
+    *(_normalize_task_param_key(name) for name in _WORKER_CREDENTIAL_ENV_NAMES),
+    *(_normalize_task_param_key(name) for name in _CREDENTIAL_FAMILIES),
+    *(_normalize_task_param_key(f"{name}_pool") for name in _CREDENTIAL_FAMILIES),
+    # свои credentials юзера (в т.ч. codex_auth) и выбор канала промптов тоже не
+    # приходят из client JSON: канал берётся из users.key_opts, credential — из users.keys
+    *(_normalize_task_param_key(name) for name in _OWN_CREDENTIAL_FAMILIES),
+    *(_normalize_task_param_key(f"{name}_pool") for name in _OWN_CREDENTIAL_FAMILIES),
+    "codex_homes",
+    "codex_pool",
+    "prompt_channel",
+}
+
+
+def _sanitize_task_params(params):
+    """Client/job JSON не выбирает server credential и не хранит присланные secrets.
+
+    Заодно отсекаются мусорные имена полей (осколки сырого multipart-тела, см.
+    _is_junk_param_key): в params воркеров им делать нечего.
+    """
+    if not isinstance(params, dict):
+        return {}
+    clean = {}
+    failover_values = []
+    for key, value in params.items():
+        normalized_key = _normalize_task_param_key(key)
+        # This is an internal capability, not a client-selectable path/id.  It is
+        # reattached only through `_enqueue(..., reference_bundle_id=...)` after
+        # the immutable bundle has been verified inside the tenant project.
+        if normalized_key == _normalize_task_param_key(_REFERENCE_BUNDLE_PARAM):
+            continue
+        if normalized_key in _TASK_PARAM_SECRET_KEYS or _is_junk_param_key(key):
+            continue
+        if normalized_key == _PROMPT_FAILOVER_PARAM:
+            # All case/hyphen variants collapse into one canonical field. Conflicts
+            # also fail closed: any invalid/disabled duplicate wins over ``legacy``.
+            failover_values.append(_normalize_prompt_failover(value))
+            continue
+        clean[key] = value
+    if failover_values:
+        clean[_PROMPT_FAILOVER_PARAM] = (
+            _PROMPT_FAILOVER_DISABLED
+            if _PROMPT_FAILOVER_DISABLED in failover_values
+            else _PROMPT_FAILOVER_LEGACY
+        )
+    return clean
+
+
+def _card_internal_params(row_or_values):
+    """Canonical queue payload built only from card_jobs/server-validated values."""
+    get = row_or_values.get if isinstance(row_or_values, dict) else row_or_values.__getitem__
+    try:
+        context_raw = get("context_json")
+    except Exception:
+        context_raw = None
+    if isinstance(context_raw, str):
+        try:
+            context = json.loads(context_raw)
+        except Exception as exc:
+            raise card_contract.CardContractError("stored card context is invalid JSON") from exc
+    else:
+        try:
+            context = get("context")
+        except Exception:
+            context = None
+    context = card_contract.normalize_context(context)
+    return {
+        "contract_version": card_contract.CONTRACT_VERSION,
+        "narration_sha256": str(get("narration_sha256")),
+        "request_sha256": str(get("request_sha256")),
+        "context": context,
+    }
+
+
+def _enqueue_card_task(uid, tenant_id, project_id, context):
+    """Atomically enqueue/get one exact card identity.
+
+    Idempotency is intentionally independent of request timing and queue cleanup:
+    ``tenant + project + current source.txt SHA-256 + contract version``.  Editorial
+    context is bound by its own SHA; a conflicting context for the same identity is a
+    loud 409-style contract error, never a second paid task.
+    """
+    if _user_is_disabled(uid):
+        return None
+    project = _get_project(tenant_id, project_id)
+    if not project:
+        raise card_contract.CardRequestError("project does not belong to this tenant")
+    normalized = card_contract.normalize_context(context)
+    context_bytes = card_contract.canonical_json_bytes(normalized)
+    context_json = context_bytes.decode("utf-8")
+    request_sha = card_contract.sha256_bytes(context_bytes)
+    _raw, _text, narration_sha = card_contract.narration_bytes(
+        os.path.join(_project_dir(tenant_id, project_id), "source.txt")
+    )
+    now_epoch = _now()
+    now_iso = datetime.datetime.now().isoformat(timespec="seconds")
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        existing = c.execute(
+            "SELECT job_id,status,request_sha256 FROM card_jobs "
+            "WHERE tenant_id=? AND project_id=? AND narration_sha256=? AND contract_version=?",
+            (tenant_id, project_id, narration_sha, card_contract.CONTRACT_VERSION),
+        ).fetchone()
+        if existing:
+            if not secrets.compare_digest(str(existing["request_sha256"]), request_sha):
+                raise card_contract.CardRequestError(
+                    "card identity already exists with different editorial context"
+                )
+            c.commit()
+            return {"job_id": existing["job_id"], "created": False,
+                    "status": existing["status"], "narration_sha256": narration_sha}
+        # Enforce accounting at the actual insertion boundary as well as the batch
+        # preflight.  BEGIN IMMEDIATE serializes competing enqueues, so concurrent
+        # callers cannot collectively cross the user's normal gen_jobs quota.
+        quota_user = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        if not quota_user:
+            raise card_contract.CardRequestError("card owner is absent")
+        _check_quota_on_connection(c, quota_user, additional=1)
+        next_id = c.execute(
+            "SELECT MAX(v) FROM (SELECT MAX(rowid) v FROM gen_jobs "
+            "UNION ALL SELECT MAX(job_id) FROM queue_tasks "
+            "UNION ALL SELECT MAX(job_id) FROM card_jobs)"
+        ).fetchone()[0]
+        jid = int(next_id or 0) + 1
+        params = {
+            "contract_version": card_contract.CONTRACT_VERSION,
+            "narration_sha256": narration_sha,
+            "request_sha256": request_sha,
+            "context": normalized,
+        }
+        c.execute(
+            "INSERT INTO gen_jobs(rowid,user_id,type,status,ts,title) VALUES(?,?,?,?,?,?)",
+            (jid, uid, "cards", "queued", now_iso, f"cards:{project_id}"),
+        )
+        c.execute(
+            "INSERT INTO queue_tasks(job_id,tenant_id,project_id,kind,params,uid,provider,"
+            "prompt_failover,status,created) VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (jid, tenant_id, project_id, "cards", json.dumps(params, ensure_ascii=False), uid,
+             card_contract.PROVIDER_GROUP, card_contract.PROMPT_FAILOVER, "queued", now_epoch),
+        )
+        c.execute(
+            "INSERT INTO card_jobs(job_id,tenant_id,project_id,uid,narration_sha256,"
+            "contract_version,request_sha256,context_json,provider,prompt_failover,model,status,created) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (jid, tenant_id, project_id, uid, narration_sha, card_contract.CONTRACT_VERSION,
+             request_sha, context_json, card_contract.PROVIDER_GROUP,
+             card_contract.PROMPT_FAILOVER, card_contract.MODEL, "queued", now_epoch),
+        )
+        c.commit()
+        return {"job_id": jid, "created": True, "status": "queued",
+                "narration_sha256": narration_sha}
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+
+
+def _retry_card_task(jid, tenant_id):
+    """Requeue the same durable card identity; never mint a duplicate job id."""
+    c = db()
+    try:
+        card = c.execute("SELECT * FROM card_jobs WHERE job_id=? AND tenant_id=?",
+                         (jid, tenant_id)).fetchone()
+        if not card:
+            raise HTTPException(404, "card job not found")
+        q = c.execute("SELECT status FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+        status = q["status"] if q else card["status"]
+        if status not in ("error", "cancelled"):
+            raise HTTPException(409, "retry is available only for failed or cancelled card jobs")
+        _raw, _text, current_sha = card_contract.narration_bytes(
+            os.path.join(_project_dir(tenant_id, card["project_id"]), "source.txt")
+        )
+        if not secrets.compare_digest(current_sha, card["narration_sha256"]):
+            raise HTTPException(409, "narration changed; enqueue the current card identity")
+        params = _card_internal_params(card)
+        c.execute("BEGIN IMMEDIATE")
+        if q:
+            c.execute("UPDATE queue_tasks SET status='queued',started=NULL,finished=NULL,claimed=NULL,"
+                      "claim_token=NULL,error=NULL,provider=?,prompt_failover=?,params=? WHERE job_id=?",
+                      (card_contract.PROVIDER_GROUP, card_contract.PROMPT_FAILOVER,
+                       json.dumps(params, ensure_ascii=False), jid))
+        else:
+            c.execute(
+                "INSERT INTO queue_tasks(job_id,tenant_id,project_id,kind,params,uid,provider,"
+                "prompt_failover,status,created) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (jid, tenant_id, card["project_id"], "cards",
+                 json.dumps(params, ensure_ascii=False), card["uid"],
+                 card_contract.PROVIDER_GROUP, card_contract.PROMPT_FAILOVER, "queued", _now()),
+            )
+        c.execute("UPDATE gen_jobs SET status='queued',error=NULL WHERE id=?", (jid,))
+        # An operator retry follows an external repair (credential/provider outage or
+        # reviewed contract issue), so it gets a fresh bounded transient budget while
+        # preserving the same paid/idempotent job identity and lifetime attempts count.
+        c.execute("UPDATE card_jobs SET status='queued',transient_requeues=0,next_attempt=NULL,"
+                  "error_code=NULL,last_error=NULL,finished=NULL WHERE job_id=?", (jid,))
+        c.commit()
+        return jid
+    except HTTPException:
+        raise
+    except Exception:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        raise
+    finally:
+        c.close()
+
+
+def _enqueue(uid, tenant_id, project_id, kind, params,
+             prompt_failover=_PROMPT_FAILOVER_UNSET,
+             prompt_provider_snapshot=_PROMPT_FAILOVER_UNSET,
+             reference_bundle_id=_REFERENCE_BUNDLE_UNSET, parent_job_id=None):
+    """Атомарная постановка. Основные этапы не дублируются; render ставится только у idle-проекта."""
+    # Страховка для ФОНОВЫХ путей постановки (_deferred_render_tick и пр.): веб и API
+    # блокировку ловят раньше, но отложенные этапы заблокированного аккаунта поднимались
+    # бы сами по себе. Отказ тихий — исключение отсюда всплыло бы в тик планировщика.
+    if _user_is_disabled(uid):
+        return None
+    if kind == "cards":
+        if not isinstance(params, dict) or set(params) != {"context"}:
+            raise card_contract.CardRequestError("cards accepts exactly one validated context")
+        result = _enqueue_card_task(uid, tenant_id, project_id, params["context"])
+        return result["job_id"] if result else None
+    params = _sanitize_task_params(params)
+    if kind in ("prompts", "regen"):
+        params = _canonical_image_task_params(kind, params)
+        if kind == "regen":
+            _reference_regen_analysis_gate(
+                _project_dir(tenant_id, project_id), params
+            )
+        reference_bundle_id = _reference_prepare_bundle(
+            _project_dir(tenant_id, project_id), params, reference_bundle_id
+        )
+        params[_REFERENCE_BUNDLE_PARAM] = reference_bundle_id
+    # The public payload supplies only the failover enum. A provider snapshot can
+    # arrive through this private argument solely from server-owned retry/deferred
+    # code; provider-ish JSON fields were removed by _sanitize_task_params above.
+    if prompt_failover is _PROMPT_FAILOVER_UNSET:
+        prompt_failover = _normalize_prompt_failover(
+            params.get(_PROMPT_FAILOVER_PARAM, _PROMPT_FAILOVER_UNSET)
+        )
+    else:
+        prompt_failover = _normalize_prompt_failover(prompt_failover)
+    params[_PROMPT_FAILOVER_PARAM] = prompt_failover
+    # Промпты — отдельная задача своей очереди: пока один проект пишет план сцен, другой
+    # рисует картинки (иначе этап промптов простаивал бы внутри images). Картинки поднимет
+    # _deferred_render_tick, как только scenes.json готов. См. tasks/prompts_queue_plan.md.
+    if kind == "images":
+        active_writer = _active_image_mutation(tenant_id, project_id)
+        if active_writer:
+            _log_line(
+                active_writer["job_id"],
+                "↔ полная генерация картинок не поставлена: проект уже меняет "
+                f"картинки задачей «{active_writer['kind']}»",
+            )
+            return None
+        _project = _get_project(tenant_id, project_id)
+        st_now = _psettings(_project or {}) if _project else {}
+        # промпты получают ровно те параметры, с которыми потом пойдут картинки (настройки
+        # проекта + поля запроса), и по ним же сверяется готовность плана — иначе паспорт
+        # не сойдётся сам с собой (см. _images_effective_params и ветку переплана в
+        # _deferred_render_tick: план оплачен, а этап картинок исчезал молча)
+        plan_params = _images_effective_params(st_now, params)
+        plan_params = _reference_apply_legacy_cache_choice(
+            _project_dir(tenant_id, project_id), plan_params
+        )
+        reference_bundle_id = _reference_prepare_bundle(
+            _project_dir(tenant_id, project_id), plan_params, reference_bundle_id
+        )
+        plan_params[_REFERENCE_BUNDLE_PARAM] = reference_bundle_id
+        if _needs_scene_plan(tenant_id, project_id, plan_params):
+            if st_now.get("deferred_images_pending"):
+                return None                                # уже ждём план — второй раз не ставим
+            # ``disabled`` freezes the first server-selected prompt channel for
+            # every replan in this images operation. Legacy keeps selecting afresh.
+            nested_snapshot = prompt_provider_snapshot
+            if (prompt_failover == _PROMPT_FAILOVER_DISABLED
+                    and nested_snapshot is _PROMPT_FAILOVER_UNSET):
+                nested_snapshot = _task_provider(
+                    "prompts", plan_params, uid=uid, prefer_free=True
+                )
+            pj = _enqueue(
+                uid, tenant_id, project_id, "prompts", plan_params,
+                prompt_failover=prompt_failover,
+                prompt_provider_snapshot=nested_snapshot,
+                reference_bundle_id=reference_bundle_id,
+            )
+            if pj:
+                deferred_updates = {"deferred_images_pending": uid,
+                                    "deferred_images_params": plan_params}
+                if prompt_failover == _PROMPT_FAILOVER_DISABLED:
+                    deferred_updates["deferred_images_prompt_provider"] = nested_snapshot
+                _save_project_settings(tenant_id, project_id, deferred_updates)
+            return pj
+        # план готов → картинки идут ТЕМ ЖЕ набором, по которому проверялась готовность:
+        # иначе _build_cmd не даст --use_plan и воркер напишет (оплатит) план заново
+        params = _canonical_image_task_params(kind, _sanitize_task_params(plan_params))
+        params[_REFERENCE_BUNDLE_PARAM] = reference_bundle_id
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    # prefer_free: канал промптов выбирается ЗДЕСЬ, с учётом свободных слотов групп
+    # (занят codex — уходим в claude, а не ждём). Дальше группа живёт снимком в строке.
+    pinned_prompt_snapshot = False
+    if (kind == "prompts" and prompt_failover == _PROMPT_FAILOVER_DISABLED
+            and prompt_provider_snapshot is not _PROMPT_FAILOVER_UNSET):
+        # Fail closed on corrupt internal metadata: never replace it with a freshly
+        # selected channel. The snapshot is server-owned and must be a known group.
+        if prompt_provider_snapshot not in _PROMPT_PROVIDER_GROUPS:
+            return None
+        provider_group = prompt_provider_snapshot
+        pinned_prompt_snapshot = True
+    else:
+        provider_group = _task_provider(kind, params, uid=uid, prefer_free=True)
+    if (provider_group in _PROMPT_PROVIDER_GROUPS
+            and _prompt_uid_paused(uid, project_id)):
+        return None
+    # Defense in depth for background/internal callers that do not pass through
+    # the web preflight.  Never persist a freshly selected prompt task in a
+    # provider-specific paused or route-less group.  An explicit valid snapshot
+    # under failover=disabled stays queued and pinned until unpause.
+    if (kind in ("prompts", "chapters")
+            and (provider_group not in _PROMPT_PROVIDER_GROUPS
+                 or (_prompt_provider_paused(provider_group)
+                     and not pinned_prompt_snapshot))):
+        return None
+    # Internal/deferred callers do not pass through the web preflight.  They
+    # must not keep adding work to a provider deliberately frozen after an
+    # incident.  A pinned prompt snapshot is the sole legacy exception: its
+    # contract explicitly waits for that exact route to be resumed.
+    if (provider_group in _queue_pause_state()["providers"]
+            and not (kind == "prompts" and pinned_prompt_snapshot)):
+        return None
+    c = db()
+    c.execute("BEGIN IMMEDIATE")
+    if not c.execute("SELECT 1 FROM projects WHERE id=? AND tenant_id=?", (project_id,tenant_id)).fetchone():
+        c.rollback(); c.close()
+        return None
+
+    if _storage_project_held(c, project_id):
+        c.rollback(); c.close()
+        raise HTTPException(409, "Проект архивируется; повторите запуск после завершения")
+
+    if parent_job_id is not None:
+        existing = c.execute("SELECT job_id FROM queue_tasks WHERE parent_job_id=? AND kind=? AND tenant_id=? AND project_id=? AND uid=?",
+                             (parent_job_id, kind, tenant_id, project_id, uid)).fetchone()
+        if existing:
+            c.rollback(); c.close()
+            return existing["job_id"]
+
+    if kind in ("images", "regen", "video", "regen_video", "tts"):
+        retained = c.execute("SELECT * FROM queue_tasks WHERE tenant_id=? AND project_id=? AND status IN ('error','cancelled') AND kind IN ('images','regen','video','regen_video','tts') ORDER BY job_id DESC",
+                             (tenant_id, project_id)).fetchall()
+        try:
+            for old in retained:
+                if _remote_credential_pin(old):
+                    raise HTTPException(409, f"У задачи #{old['job_id']} сохранён незавершённый оплаченный запрос; используйте её восстановление перед новой генерацией")
+        except (ValueError, HTTPException) as exc:
+            c.rollback(); c.close()
+            if isinstance(exc, ValueError):
+                raise HTTPException(409, str(exc))
+            raise
+    if kind == "render":
+        duplicate = c.execute(
+            "SELECT 1 FROM queue_tasks WHERE tenant_id=? AND project_id=? "
+            "AND status IN ('queued','running') LIMIT 1", (tenant_id, project_id)
+        ).fetchone()
+    elif kind in ("prompts", "images", "regen"):
+        # Both commands rewrite googler outputs plus the same runtime/receipt
+        # files.  Different regen targets are therefore not independent.  Keep
+        # this check inside BEGIN IMMEDIATE so concurrent requests serialize.
+        image_conflict = c.execute(
+            "SELECT job_id,kind FROM queue_tasks WHERE tenant_id=? AND project_id=? "
+            "AND kind IN ('prompts','images','regen') AND status IN ('queued','running') "
+            "ORDER BY job_id LIMIT 1", (tenant_id, project_id),
+        ).fetchone()
+        duplicate = image_conflict
+    elif kind in ("tts", "video", "chapters"):
+        duplicate = c.execute(
+            "SELECT 1 FROM queue_tasks WHERE tenant_id=? AND project_id=? AND kind=? "
+            "AND status IN ('queued','running') LIMIT 1", (tenant_id, project_id, kind)
+        ).fetchone()
+    elif kind == "regen_video":
+        target = _regen_dedup_target(kind, params)
+        duplicate = None
+        for row in c.execute(
+                "SELECT params FROM queue_tasks WHERE tenant_id=? AND project_id=? AND kind=? "
+                "AND status IN ('queued','running')",
+                (tenant_id, project_id, kind)).fetchall():
+            try:
+                active_params = json.loads(row["params"] or "{}")
+            except Exception:
+                active_params = {}
+            if _regen_dedup_target(kind, active_params) == target:
+                duplicate = True
+                break
+    else:
+        duplicate = None
+    if duplicate:
+        c.rollback(); c.close()
+        if kind in ("prompts", "images", "regen") and image_conflict:
+            _log_line(
+                image_conflict["job_id"],
+                f"↔ параллельная задача «{kind}» не поставлена: проект уже меняет "
+                f"картинки задачей «{image_conflict['kind']}»",
+            )
+        return None
+    # job_id раньше = rowid gen_jobs, а он у SQLite (без AUTOINCREMENT) равен max(rowid)+1
+    # ТЕКУЩЕЙ таблицы. Стоит удалить хвост gen_jobs — и счётчик откатывается назад, на
+    # уже занятые в queue_tasks номера: постановка ЛЮБОЙ задачи падает с
+    # «UNIQUE constraint failed: queue_tasks.job_id» (500 в кабинете у всех тенантов).
+    # Замер 05.08: gen_jobs дошёл до 5332, queue_tasks до 5350 — 18 номеров в мёртвой зоне.
+    # Берём номер по максимуму ОБЕИХ таблиц: внутри BEGIN IMMEDIATE это атомарно, а чистка
+    # любой из них больше не ломает выдачу.
+    _next = c.execute("SELECT MAX(v) FROM (SELECT MAX(rowid) v FROM gen_jobs "
+                      "UNION ALL SELECT MAX(job_id) FROM queue_tasks)").fetchone()[0]
+    jid = int(_next or 0) + 1
+    c.execute("INSERT INTO gen_jobs(rowid,user_id,type,status,ts,title) VALUES(?,?,?,?,?,?)",
+              (jid, uid, kind, "queued", now, f"{kind}:{project_id}"))
+    c.execute("INSERT INTO queue_tasks("
+              "job_id,tenant_id,project_id,kind,params,uid,provider,prompt_failover,status,created,parent_job_id"
+              ") VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+              (jid, tenant_id, project_id, kind, json.dumps(params, ensure_ascii=False),
+               uid, provider_group, prompt_failover, "queued", _now(), parent_job_id))
+    c.commit(); c.close()
+    # Ручной «Повтор» на упавших промптах ставил план сцен, но картинки после него не
+    # вставали НИКОГДА: флаг ожидания снимается вместе с падением и обратно не приходит.
+    # Возвращаем его здесь — тогда готовый план подхватит _deferred_render_tick.
+    if kind == "prompts":
+        try:
+            _cur = _get_project(tenant_id, project_id)
+            if _cur and not _psettings(_cur).get("deferred_images_pending"):
+                deferred_updates = {
+                    "deferred_images_pending": uid,
+                    "deferred_images_params": dict(params or {}),
+                }
+                if prompt_failover == _PROMPT_FAILOVER_DISABLED:
+                    deferred_updates["deferred_images_prompt_provider"] = provider_group
+                _save_project_settings(tenant_id, project_id, deferred_updates)
+        except Exception as _exc:
+            print(f"[enqueue] {tenant_id}/{project_id}: не выставил ожидание картинок: {_exc}",
+                  flush=True)
+    return jid
+
+
+# --- 3a: per-project настройки + пресеты (ДО catch-all {kind}, иначе gen_submit перехватит) ---
+@app.get("/api/projects/{pid}/settings")
+async def project_settings_get(pid: str, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    p = _get_project(tid, pid)
+    if not p:
+        raise HTTPException(404, "нет проекта")
+    try:
+        return JSONResponse(_canonical_image_params(_psettings(p)))
+    except ImageModeContractError as exc:
+        raise HTTPException(400, str(exc))
+
+
+# Кнопка «Пожаловаться» (13.09.2026). Жалоба ложится в complaints; служба vsfix на этом же
+# сервере (tools/vsfix) отдаёт её Codex с правом чинить, сама проверяет результат и откатывает
+# поломку, итог пишет в complaints.user_message — его видно на странице проекта.
+_COMPLAINT_COOLDOWN_SEC = 30 * 60
+_COMPLAINT_TENANT_DAILY = max(1, int(os.environ.get("VS_COMPLAINT_TENANT_DAILY", "10") or 10))
+_COMPLAINT_STATUS_TEXT = {
+    "queued": "принята, скоро начну разбирать",
+    "running": "разбираюсь и чиню",
+    "fixed": "починено",
+    "no_problem": "проблем не нашёл",
+    "not_fixed": "не получилось починить — передано владельцу",
+    "needs_owner": "нужен владелец — передано ему",
+    "rolled_back": "исправление не прошло проверку — всё как было, передано владельцу",
+    "error": "разбор не удался — передано владельцу",
+}
+
+
+def _last_complaint(tid, pid):
+    try:
+        c = db()
+        try:
+            return c.execute("SELECT * FROM complaints WHERE tenant_id=? AND project_id=? "
+                             "ORDER BY id DESC LIMIT 1", (tid, pid)).fetchone()
+        finally:
+            c.close()
+    except sqlite3.Error:
+        return None
+
+
+@app.post("/api/projects/{pid}/complaint")
+async def project_complaint(pid: str, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    d = await _form(request)
+    text = str(d.get("text") or "").strip()
+    if len(text) < 5:
+        raise HTTPException(400, "Опишите, что не так, хотя бы парой слов")
+    text = text[:2000]
+    now = _now()
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")   # две вкладки не обойдут лимит одновременной отправкой
+        last = c.execute("SELECT created, status FROM complaints WHERE tenant_id=? AND project_id=? "
+                         "ORDER BY id DESC LIMIT 1", (tid, pid)).fetchone()
+        if last and last["status"] in ("queued", "running"):
+            raise HTTPException(429, "Прошлая жалоба по этому проекту ещё разбирается")
+        if last and now - float(last["created"] or 0) < _COMPLAINT_COOLDOWN_SEC:
+            wait = int((_COMPLAINT_COOLDOWN_SEC - (now - float(last["created"] or 0))) // 60) + 1
+            raise HTTPException(429, f"Следующую жалобу по этому проекту можно отправить через {wait} мин")
+        today = c.execute("SELECT COUNT(*) FROM complaints WHERE tenant_id=? AND created > ?",
+                          (tid, now - 86400)).fetchone()[0]
+        if today >= _COMPLAINT_TENANT_DAILY:
+            raise HTTPException(429, "Лимит жалоб на сегодня исчерпан — напишите владельцу напрямую")
+        cur = c.execute("INSERT INTO complaints(tenant_id,uid,project_id,text,status,created) VALUES(?,?,?,?,?,?)",
+                        (tid, u["id"], pid, text, "queued", now))
+        c.commit()
+        cid = cur.lastrowid
+    finally:
+        c.close()
+    return JSONResponse({"ok": True, "id": cid,
+                         "msg": "Жалоба принята. Дежурный ИИ разберётся и напишет итог здесь, на странице проекта."})
+
+
+@app.post("/api/projects/{pid}/settings")
+async def project_settings_save(pid: str, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    d = await _form(request)
+    safe_settings = _sanitize_task_params(dict(d))
+    try:
+        tts_touched = any(k in safe_settings for k in ("engine", "voice", "voice_uuid"))
+        if tts_touched:
+            effective = _psettings(_get_project(tid, pid) or {})
+            effective.update(safe_settings)
+            if (str(effective.get("engine") or "").strip().lower() == "lumean"
+                    and "voice" in safe_settings):
+                effective["voice_uuid"] = safe_settings["voice"]
+            effective = _normalize_lumean_settings(effective)
+            if effective.get("engine") == "lumean":
+                safe_settings.update({
+                    k: effective.get(k, "")
+                    for k in ("engine", "voice", "voice_uuid", "model_id", "model_uuid")
+                })
+                _mutate_project_settings(
+                    tid, pid, updates=safe_settings,
+                    remove=("voice_engine", "stability", "thread_count", "auto_pause_enabled"),
+                )
+            else:
+                _save_project_settings(tid, pid, safe_settings)
+        else:
+            _save_project_settings(tid, pid, safe_settings)
+    except (ImageModeContractError, LumeanTemplateError) as exc:
+        raise HTTPException(400, str(exc))
+    tab = (d.get("tab") or "src")
+    return RedirectResponse(f"/p/{pid}?tab={tab}", 302)
+
+
+# ============ Музыка и вставки: файлы для рендера (проект/_RENDER_MEDIA/<kind>/) ============
+# Файлы уезжают на рендер-ноду в общем tar (render_assets), конфиг ссылается ОТНОСИТЕЛЬНЫМИ
+# путями "_RENDER_MEDIA/<kind>/<file>" — render_worker резолвит их от project_dir (патч 2026-07-10).
+_RM_DIR = "_RENDER_MEDIA"
+_RM_KINDS = {                                       # kind → (расширения, single-файл)
+    "bg":      ((".mp3", ".wav", ".m4a", ".aac", ".ogg"), True),
+    "end":     ((".mp3", ".wav", ".m4a", ".aac", ".ogg"), True),
+    "intro":   ((".mp4", ".mov", ".webm", ".mkv"), False),
+    "overlay": ((".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov", ".webm"), False),
+    # свои материалы (стоковые видео/фото) — подмешиваются к картинкам ролика, как папка
+    # «дополнительные материалы» в десктопе (config.extra_materials_dir)
+    "stock":   ((".mp4", ".mov", ".webm", ".mkv", ".jpg", ".jpeg", ".png", ".webp"), False),
+}
+
+
+def _rm_get(tid, pid):
+    """settings.render_media (JSON) → dict. Формат: {bg:{file,vol}, end:{file,vol},
+    intro:[rel,...], overlays:[{file,opacity},...]} — пути относительны _RENDER_MEDIA/."""
+    p = _get_project(tid, pid)
+    s = _psettings(p) if p else {}
+    try:
+        rm = json.loads(s.get("render_media") or "{}")
+        return rm if isinstance(rm, dict) else {}
+    except Exception:
+        return {}
+
+
+def _rm_put(tid, pid, rm):
+    _save_project_settings(tid, pid, {"render_media": json.dumps(rm, ensure_ascii=False)})
+
+
+@app.post("/api/projects/{pid}/render_media/upload")
+async def render_media_upload(pid: str, request: Request, file: UploadFile = File(...),
+                              kind: str = Form(""), vol: str = Form("")):
+    u = require_web_user(request)
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    if kind not in _RM_KINDS:
+        raise HTTPException(400, "kind")
+    exts, single = _RM_KINDS[kind]
+    name = re.sub(r"[^\w.\-]+", "_", os.path.basename(file.filename or "")).strip("._") or "file"
+    if not name.lower().endswith(exts):
+        raise HTTPException(400, f"допустимые форматы: {' '.join(exts)}")
+    d = os.path.join(_project_dir(tid, pid), _RM_DIR, kind)
+    os.makedirs(d, exist_ok=True)
+    if single:                                       # bg/end — ровно один файл: старый убираем
+        for old in glob.glob(os.path.join(d, "*")):
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+    with open(os.path.join(d, name), "wb") as out:
+        while True:
+            chunk = await file.read(1 << 20)
+            if not chunk:
+                break
+            out.write(chunk)
+    rm = _rm_get(tid, pid)
+    rel = f"{kind}/{name}"
+    try:
+        v = int(float(vol))
+    except Exception:
+        v = 20 if kind == "bg" else (100 if kind == "end" else 50)
+    if kind in ("bg", "end"):
+        rm[kind] = {"file": rel, "vol": v}
+    elif kind == "intro":
+        lst = [x for x in (rm.get("intro") or []) if x != rel]
+        lst.append(rel)
+        rm["intro"] = lst
+    else:
+        lst = [o for o in (rm.get("overlays") or []) if (o or {}).get("file") != rel]
+        lst.append({"file": rel, "opacity": v})
+        rm["overlays"] = lst
+    _rm_put(tid, pid, rm)
+    return RedirectResponse(f"/p/{pid}?tab=rnd", 302)
+
+
+@app.post("/api/projects/{pid}/render_media/set")
+async def render_media_set(pid: str, request: Request):
+    """Обновить громкость (bg/end, %) или прозрачность (overlay, %) без перезагрузки файла."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    dd = await _form(request)
+    kind = dd.get("kind", "")
+    name = os.path.basename(dd.get("name", ""))
+    try:
+        v = int(float(dd.get("vol", "")))
+    except Exception:
+        raise HTTPException(400, "vol — число в %")
+    rm = _rm_get(tid, pid)
+    if kind in ("bg", "end") and rm.get(kind):
+        rm[kind]["vol"] = v
+    elif kind == "overlay":
+        for o in rm.get("overlays") or []:
+            if os.path.basename((o or {}).get("file", "")) == name:
+                o["opacity"] = v
+    _rm_put(tid, pid, rm)
+    return RedirectResponse(f"/p/{pid}?tab=rnd", 302)
+
+
+@app.post("/api/projects/{pid}/render_media/delete")
+async def render_media_delete(pid: str, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    dd = await _form(request)
+    kind = dd.get("kind", "")
+    name = os.path.basename(dd.get("name", ""))
+    if kind not in _RM_KINDS:
+        raise HTTPException(400, "kind")
+    rm = _rm_get(tid, pid)
+    base = os.path.join(_project_dir(tid, pid), _RM_DIR, kind)
+    if kind in ("bg", "end"):
+        rm.pop(kind, None)
+        for old in glob.glob(os.path.join(base, "*")):
+            try:
+                os.remove(old)
+            except Exception:
+                pass
+    elif kind == "intro":
+        rm["intro"] = [x for x in (rm.get("intro") or []) if os.path.basename(x) != name]
+        try:
+            os.remove(os.path.join(base, name))
+        except Exception:
+            pass
+    else:
+        rm["overlays"] = [o for o in (rm.get("overlays") or []) if os.path.basename((o or {}).get("file", "")) != name]
+        try:
+            os.remove(os.path.join(base, name))
+        except Exception:
+            pass
+    _rm_put(tid, pid, rm)
+    return RedirectResponse(f"/p/{pid}?tab=rnd", 302)
+
+
+@app.post("/api/presets")
+async def preset_save(request: Request):
+    """Атомарно сохранить активную форму как пресет и применить её к проекту."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    d = await _form(request)
+    pid = (d.get("pid") or "").strip()
+    name = (d.get("preset_name") or "").strip()[:80]
+    if not pid or not name:
+        return RedirectResponse(f"/p/{pid}" if pid else "/", 302)
+    active_updates = {
+        k[len("setting__"):]: v for k, v in d.items()
+        if k.startswith("setting__") and len(k) > len("setting__")
+    }
+    active_updates = _sanitize_task_params({
+        k: v for k, v in _drop_junk_keys(active_updates).items()
+        if k not in _SETTINGS_SKIP and k not in _DEFERRED_KEYS
+        and not str(k).startswith("_")
+    })
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        row = c.execute(
+            "SELECT settings FROM projects WHERE id=? AND tenant_id=?", (pid, tid)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "нет проекта")
+        try:
+            effective = json.loads(row["settings"]) if row["settings"] else {}
+        except Exception:
+            effective = {}
+        effective.update(active_updates)
+        # Проектная TTS-форма исторически отправляет поле voice. При Lumean это
+        # именно UUID шаблона, поэтому оно обязано перебить старый voice_uuid.
+        if (str(effective.get("engine") or "").strip().lower() == "lumean"
+                and "voice" in active_updates):
+            effective["voice_uuid"] = active_updates["voice"]
+        effective = _canonical_preset_settings(effective)
+        effective = _normalize_lumean_settings(effective)
+        snapshot = {
+            k: v for k, v in effective.items()
+            if k not in _SETTINGS_SKIP and k not in _DEFERRED_KEYS
+            and not str(k).startswith("_")
+        }
+        cur = c.execute(
+            "INSERT INTO presets(tenant_id,name,settings,created) VALUES(?,?,?,?)",
+            (tid, name, json.dumps(snapshot, ensure_ascii=False), _now()),
+        )
+        effective["_applied_preset"] = int(cur.lastrowid)
+        updated = c.execute(
+            "UPDATE projects SET settings=?, updated=? WHERE id=? AND tenant_id=?",
+            (json.dumps(effective, ensure_ascii=False), _now(), pid, tid),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("проект исчез во время сохранения пресета")
+        c.commit()
+    except (ImageModeContractError, LumeanTemplateError, PresetSettingsError) as exc:
+        c.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    return RedirectResponse(f"/p/{pid}?tab={d.get('tab') or 'src'}", 302)
+
+
+@app.post("/api/presets/{prid}/apply")
+async def preset_apply(prid: int, request: Request):
+    """Применить пресет к проекту (скопировать его настройки в projects.settings)."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    d = await _form(request)
+    pid = (d.get("pid") or "").strip()
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        if not c.execute(
+            "SELECT 1 FROM projects WHERE id=? AND tenant_id=?", (pid, tid)
+        ).fetchone():
+            raise HTTPException(404, "нет проекта")
+        row = c.execute(
+            "SELECT settings FROM presets WHERE id=? AND tenant_id=?", (prid, tid)
+        ).fetchone()
+        if not row:
+            raise HTTPException(404, "нет пресета")
+        try:
+            raw = json.loads(row["settings"]) if row["settings"] else {}
+        except json.JSONDecodeError as exc:
+            raise HTTPException(400, "настройки пресета повреждены") from exc
+        payload = _preset_project_payload(raw, prid)
+        updated = c.execute(
+            "UPDATE projects SET settings=?, updated=? WHERE id=? AND tenant_id=?",
+            (json.dumps(payload, ensure_ascii=False), _now(), pid, tid),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("проект исчез во время применения пресета")
+        c.commit()
+    except (ImageModeContractError, LumeanTemplateError, PresetSettingsError) as exc:
+        c.rollback()
+        raise HTTPException(400, str(exc)) from exc
+    except Exception:
+        c.rollback()
+        raise
+    finally:
+        c.close()
+    return RedirectResponse(f"/p/{pid}?tab={d.get('tab') or 'src'}", 302)
+
+
+@app.post("/api/presets/{prid}/delete")
+async def preset_delete(prid: int, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    d = await _form(request)
+    pid = (d.get("pid") or "").strip()
+    c = db(); c.execute("DELETE FROM presets WHERE id=? AND tenant_id=?", (prid, tid)); c.commit(); c.close()
+    return RedirectResponse(f"/p/{pid}" if pid else "/", 302)
+
+
+# ============================================================
+# Пресеты (страница управления) + редактор — пресет-первый воркфлоу
+# ============================================================
+def _preset_summary(s):
+    try:
+        s = _canonical_image_params(s)
+    except ImageModeContractError as exc:
+        return "ошибка режима картинок: " + html.escape(str(exc))
+    eng = s.get("engine", "edge")
+    eng_lbl = TTS_ENGINES.get(eng, (eng, ""))[0]
+    voice = s.get("voice") or s.get("voice_uuid") or "авто по языку"
+    image_label = ("Поиск Bing" if s["image_mode"] == _IMAGE_MODE_BING else
+                   IMAGE_MODELS[s["model"]][0])
+    return f"{html.escape(eng_lbl)} · голос {html.escape(str(voice)[:24])} · {html.escape(image_label)}"
+
+
+@app.get("/presets", response_class=HTMLResponse)
+def presets_page(request: Request):
+    u = web_user(request)
+    if not u:
+        return RedirectResponse("/login", 302)
+    tid = _tid(u)
+    c = db()
+    rows = c.execute("SELECT id,name,settings FROM presets WHERE tenant_id=? ORDER BY name COLLATE NOCASE", (tid,)).fetchall()
+    c.close()
+    cards = ""
+    for r in rows:
+        try:
+            s = json.loads(r["settings"]) if r["settings"] else {}
+        except Exception:
+            s = {}
+        cards += (f'<div class="list-row" style="grid-template-columns:1fr 150px 56px">'
+                  f'<div><div style="font-weight:600">{html.escape(r["name"])}</div>'
+                  f'<div class=muted style="font-size:12px">{_preset_summary(s)}</div></div>'
+                  f'<a class="btn btn-secondary btn-sm" href="/presets/{r["id"]}/edit">Редактировать</a>'
+                  f'<form method=post action=/api/presets/{r["id"]}/delete onsubmit="return confirm(\'Удалить пресет?\')" style="margin:0">'
+                  f'<button class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button></form></div>')
+    listing = f'<div class="list">{cards}</div>' if rows else '<p class=muted>Пресетов пока нет — создайте первый.</p>'
+    body = _header(u, "presets") + f"""<div class=wrap><h1>Пресеты <span class=muted style='font:500 14px var(--sans)'>{len(rows)}</span></h1>
+<p class=hint style="margin-bottom:14px">Пресет = голос + модель картинок + стиль + настройки видео. При добавлении проектов выбери пресет — проекты создадутся сразу с ним.</p>
+<form method=post action=/api/presets/create style="margin-bottom:18px;display:flex;gap:8px">
+<input class=input name=name placeholder="имя нового пресета" required minlength=1 style="max-width:280px"><button class="btn btn-primary">＋ Создать пустой</button></form>
+<p class=hint style="margin:-8px 0 14px">…или открой проект → настрой → «<svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Снимок» в баре пресетов — сохранит готовый набор.</p>
+{listing}</div>"""
+    return _page("Пресеты", body)
+
+
+@app.post("/api/presets/create")
+async def preset_create(request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    d = await _form(request)
+    name = (d.get("name") or "").strip()[:80]
+    if not name:
+        return RedirectResponse("/presets", 302)
+    c = db()
+    cur = c.execute("INSERT INTO presets(tenant_id,name,settings,created) VALUES(?,?,?,?)", (tid, name, "{}", _now()))
+    prid = cur.lastrowid
+    c.commit(); c.close()
+    return RedirectResponse(f"/presets/{prid}/edit", 302)
+
+
+@app.get("/presets/{prid}/edit", response_class=HTMLResponse)
+async def preset_edit_page(prid: int, request: Request):
+    u = web_user(request)
+    if not u:
+        return RedirectResponse("/login", 302)
+    tid = _tid(u)
+    c = db()
+    r = c.execute("SELECT * FROM presets WHERE id=? AND tenant_id=?", (prid, tid)).fetchone()
+    vlib = c.execute("SELECT name,voice_id FROM voice_lib WHERE tenant_id=? ORDER BY name", (tid,)).fetchall()
+    c.close()
+    if not r:
+        return _page("нет пресета", _header(u, "presets") + "<div class=wrap><p>Пресет не найден.</p></div>")
+    try:
+        s = _canonical_image_params(json.loads(r["settings"]) if r["settings"] else {})
+    except ImageModeContractError as exc:
+        body = (_header(u, "presets") + '<div class=wrap><p><a href=/presets>← Пресеты</a></p>'
+                + '<div class="panel" style="border-color:var(--danger)"><h2>Режим картинок повреждён</h2><p>'
+                + html.escape(str(exc)) + '</p></div></div>')
+        return _page("Ошибка пресета", body)
+    except Exception:
+        s = _canonical_image_params({})
+    sv = lambda k, d="": html.escape(str(s.get(k) if s.get(k) not in (None, "") else d))
+    eng = s.get("engine", "edge")
+    eng_opts = "".join(
+        f'<option value="{k}"{" selected" if eng==k else ""}>'
+        f'{html.escape(v[0] + (" · " + _tts_engine_note(u, k) if _tts_engine_note(u, k) else ""))}</option>'
+        for k, v in TTS_ENGINES.items())
+    model_opts = mc_status_options(IMAGE_MODELS, s.get("model", "OPENAI"),
+                                   _blocked_providers(u, IMAGE_MODELS, kind="images"))
+    preset_is_bing = s["image_mode"] == _IMAGE_MODE_BING
+    vid_opts = mc_status_options(VIDEO_METHODS, s.get("video_method", "veo"),
+                                 _blocked_providers(u, VIDEO_METHODS, kind="video"))
+    split_opts = "".join(f'<option value="{k}"{" selected" if s.get("split_type")==k else ""}>{html.escape(v)}</option>' for k, v in SPLIT_TYPE.items())
+    aspect_opts = _opts(("landscape", "portrait", "square"), s.get("aspect_ratio", "landscape"))
+    ah = "0" if str(s.get("auto_hero", "0")).lower() in ("0", "off", "false", "no") else "1"
+    ah_opts = (f'<option value=1{" selected" if ah=="1" else ""}>вкл (континуити)</option>'
+               f'<option value=0{" selected" if ah=="0" else ""}>выкл</option>')
+    vlist = "".join(f'<option value="{html.escape(v["voice_id"])}">{html.escape(v["name"])}</option>' for v in vlib)
+
+    # Остальные настройки пресета. Имена полей ОБЯЗАНЫ совпадать с формами страницы
+    # проекта: пресет применяется как settings проекта, а читают их _build_cmd и
+    # _render_config_from_params по этим самым ключам. Пустое значение = «не задавать»
+    # (÷ _truthy("") → серверный дефолт), поэтому у каждого поля есть пустой вариант.
+    def _p_sel(name, pairs, width="auto", empty="— по умолчанию —"):
+        cur = "" if s.get(name) is None else str(s.get(name))
+        out = (f'<option value=""{" selected" if cur == "" else ""}>{empty}</option>'
+               if empty is not None else "")
+        out += "".join(
+            f'<option value="{html.escape(str(v))}"{" selected" if cur == str(v) else ""}>'
+            f'{html.escape(str(t))}</option>' for v, t in pairs)
+        return f'<select class=select name={name} style="width:{width}">{out}</select>'
+
+    def _p_bool(name, default=True, hint=""):
+        """Тумблер как на странице проекта: реальное значение уезжает скрытым полем."""
+        on = _truthy(s.get(name), default)
+        return (f'<label class=toggle><input type=hidden name={name} id=pf_{name} '
+                f'value="{"1" if on else "0"}">'
+                f'<input type=checkbox {"checked" if on else ""} '
+                f"onchange=\"document.getElementById('pf_{name}').value=this.checked?'1':'0'\">"
+                f'<span class=track></span></label>'
+                + (f'<span class=hint style="margin-left:10px">{hint}</span>' if hint else ""))
+
+    def _p_seg(name, pairs, default):
+        cur = str(s.get(name) or default)
+        segs = "".join(
+            f'<div class="seg{" active" if cur == v else ""}" '
+            f"onclick=\"pseg('{name}','{v}',this)\">{t}</div>" for v, t in pairs)
+        return (f'<div class=segmented>{segs}</div>'
+                f'<input type=hidden id=pf_{name} name={name} value="{html.escape(cur)}">')
+
+    def _p_num(name, ph="", width="78px"):
+        return (f'<input class=input name={name} value="{sv(name)}" '
+                f'placeholder="{html.escape(str(ph))}" style="width:{width}">')
+
+    _lang_cur = _SUB_LANG_CANON.get(s.get("subtitle_lang") or "", s.get("subtitle_lang") or "")
+    _lang_all = _SUB_LANGS_TOP + [l for l in _SUB_LANGS_ALL if l not in _SUB_LANGS_TOP]
+    _sub_opts = ('<option value=""%s>— по умолчанию —</option>' % (" selected" if not _lang_cur else "")) + "".join(
+        f'<option value="{l}"{" selected" if _lang_cur == l else ""}>{l}</option>' for l in _lang_all)
+    body = _header(u, "presets") + f"""<div class=wrap><p><a href=/presets>← Пресеты</a></p>
+<h1>Пресет: {html.escape(r["name"])}</h1>
+<form method=post action=/api/presets/{prid}/edit>
+<input class=input name=name value="{html.escape(r["name"])}" style="max-width:320px;margin-bottom:14px">
+<div class=panel><div class=panel-title><svg class="ic" viewBox="0 0 24 24"><use href="#ic-mic"/></svg> Озвучка</div>
+<div class=fld><label class=cap>Движок:</label><select class=select name=engine style="width:200px">{eng_opts}</select>
+<label class=cap style="width:auto">Скорость:</label><input class=input name=speed value="{sv('speed','1.0')}" style="width:70px"></div>
+<div class=fld><label class=cap>Голос / Voice ID:</label><input class=input name=voice value="{sv('voice')}" placeholder="ElevenLabs voice_id (voicer/vgc) · пусто = авто по языку (edge)" list=vlib style="flex:1;min-width:300px"><datalist id=vlib>{vlist}</datalist></div>
+<div class=fld><label class=cap>Voicer модель:</label><select class=select name=model_id style="width:230px">{mc_dict_options(ELEVEN_MODELS, sv('model_id'))}</select>
+<label class=cap style="width:auto">Разбивка:</label><select class=select name=split_type style="width:170px">{split_opts}</select></div>
+<div class=fld><label class=cap>VGC stability:</label><input class=input name=stability value="{sv('stability')}" placeholder="0.5" style="width:80px">
+<label class=cap style="width:auto">Lumean template_id:</label><input class=input name=voice_uuid value="{sv('voice_uuid')}" style="width:200px">
+<label class=cap style="width:auto">model_id:</label><input class=input name=model_uuid value="{sv('model_uuid')}" style="width:150px"></div>
+<div class=fld><label class=cap>VGC движок:</label>{_p_sel('voice_engine', VGC_ENGINES.items(), '210px')}
+<label class=cap style="width:auto">Потоков:</label>{_p_num('thread_count', '4', '70px')}
+<label class=cap style="width:auto">Авто-паузы (voicer):</label>{_p_bool('auto_pause_enabled', False)}</div></div>
+<div class=panel><div class=panel-title><svg class="ic" viewBox="0 0 24 24"><use href="#ic-image"/></svg> Картинки · {'Поиск Bing' if preset_is_bing else 'AI-генерация'}</div>
+<div class=fld><label class=cap>Источник:</label><select class=select name=image_mode id=pf_image_mode style="width:190px" onchange="var b=this.value==='bing',m=document.getElementById('pf_image_model'),w=document.getElementById('pf_image_model_wrap');m.disabled=b;w.style.opacity=b?'.42':'1'">
+<option value=ai{' selected' if not preset_is_bing else ''}>AI-генерация</option><option value=bing{' selected' if preset_is_bing else ''}>Поиск Bing</option></select>
+<span id=pf_image_model_wrap style="display:flex;align-items:center;gap:8px;opacity:{'.42' if preset_is_bing else '1'}"><label class=cap style="width:auto">AI-модель:</label><select class=select name=model id=pf_image_model style="width:230px"{' disabled aria-disabled=true' if preset_is_bing else ''}>{model_opts}</select></span>
+<label class=cap style="width:auto">Соотношение:</label><select class=select name=aspect_ratio style="width:150px">{aspect_opts}</select></div>
+<div class=fld><label class=cap>Стиль:</label><input class=input name=style value="{sv('style')}" style="flex:1;min-width:320px"></div>
+<div class=fld><label class=cap>Предложений:</label><input class=input name=sentences_per_prompt value="{sv('sentences_per_prompt','3')}" style="width:90px">
+<label class=cap style="width:auto">Seed:</label><input class=input name=seed value="{sv('seed')}" placeholder="(пусто)" style="width:120px">
+<label class=cap style="width:auto">Авто-герой:</label><select class=select name=auto_hero style="width:160px">{ah_opts}</select></div>
+<div class=fld><label class=cap>Кэш:</label>{_p_sel('use_cache', (('1', 'использовать'), ('0', 'не использовать')), '190px')}</div>
+<div class=fld><label class=cap>Разбор персонажей и мест:</label>{_p_bool('analyze_story', False)}
+<label class=cap style="width:auto">Дробить длинные предложения:</label>{_p_bool('split_long_sentences', False)}
+<label class=cap style="width:auto">примерно, сек:</label><input class=input type=number name=max_solo_scene_seconds value="{sv('max_solo_scene_seconds','6')}" min=1 max=60 step=0.5 style="width:75px"></div>
+<div class=fld><label class=cap>Теги для Bing:</label><input class=input name=tags value="{sv('tags')}" placeholder="через запятую; только для источника «Поиск Bing»" style="flex:1;min-width:280px">
+<label class=cap style="width:auto">Картинок на тег:</label>{_p_num('num_images', '3', '70px')}</div>
+<div class=fld style="align-items:flex-start"><label class=cap>Кастом-промты:</label>
+<textarea class=textarea name=custom_prompts rows=2 placeholder="по одному в строке; пусто = промты пишет LLM" style="flex:1;min-width:320px">{html.escape(str(s.get('custom_prompts') or ''))}</textarea></div></div>
+<div class=panel><div class=panel-title><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Видео</div>
+<div class=fld><label class=cap>Метод:</label><select class=select name=video_method style="width:230px">{vid_opts}</select>
+<label class=cap style="width:auto">Кадров (0=все):</label><input class=input name=first_n value="{sv('first_n','0')}" style="width:90px"></div>
+<div class=fld><label class=cap>Промт движения:</label><input class=input name=prompt value="{sv('prompt')}" style="flex:1;min-width:320px"></div>
+<div class=fld><label class=cap>Из промптов (t2v):</label>{_p_bool('t2v', False, 'текст→видео по промптам сцен, картинки не нужны; только veo')}
+<label class=cap style="width:auto">первых сцен (0=все):</label>{_p_num('t2v_first_n', '0')}</div></div>
+<div class=panel><div class=panel-title><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Рендер</div>
+<div class=fld><label class=cap>Качество</label>{_p_sel('quality', ((q, q) for q in _QUALITY_OK), 'auto', None)}</div>
+<div class=fld><label class=cap>Переходы</label>{_p_seg('transitions', (('none', 'Без'), ('fast', 'Быстрые'), ('smooth', 'Плавные')), 'fast')}
+<span class=hint style="margin-left:10px">«Быстрые» — почти все переходы за ~2&nbsp;мин · «Плавные» — все, дольше</span></div>
+<div class=fld><label class=cap>Плавный зум (Ken Burns)</label>{_p_bool('kenburns')}</div>
+<div class=fld><label class=cap>Звук из видео-клипов</label>{_p_bool('use_video_audio', False, 'аудио клипов (veo) подмешается в озвучку на их сценах')}</div>
+<div class=fld><label class=cap>🎧 Фон и эффекты автоматически</label>{_p_bool('auto_sound', False, 'по тексту ролика подбирается фоновый звук (лес, дождь, огонь, комната…), он приседает под голосом')}</div>
+<div class=fld><label class=cap><svg class="ic" viewBox="0 0 24 24"><use href="#ic-target"/></svg> Синхрон с озвучкой</label>{_p_bool('sync_audio', True, 'кадры переключаются по предложениям озвучки (whisper); выкл = равномерно')}</div>
+<div class=fld><label class=cap>Главы (таймкоды в описание)</label>{_p_bool('auto_chapters', False, 'после рендера — разбивка на главы по 2–4 мин с заголовками; нужен «Синхрон с озвучкой»')}</div>
+<div class=fld><label class=cap>Субтитры</label>{_p_bool('subtitles')}
+<select class=select name=subtitle_lang style="width:auto;margin-left:10px">{_sub_opts}</select></div>
+<details style="margin:6px 0"><summary class=muted style="cursor:pointer;font-size:13px">Расширенные настройки</summary>
+<div class=fld style="margin-top:8px"><label class=cap>сек/кадр мин–макс</label>{_p_num('min_image_duration', '2.0')} – {_p_num('max_image_duration', '30.0')}</div>
+<div class=fld><label class=cap>Порядок материалов</label>{_p_sel('material_order', (('video_first', 'Клипы в начале (реком.)'), ('images_first', 'Картинки в начале'), ('alternate', 'Чередовать клип–картинка'), ('alphabetical', 'По алфавиту'), ('random', 'Случайный')), 'auto', None)}
+<span class=hint style="margin-left:10px">клипы = анимированные первые сцены; менять только осознанно</span></div>
+<div class=fld><label class=cap>Fade, сек</label>{_p_num('fade_duration', '0.5')}
+<label class=cap style="margin-left:14px">Ken Burns зум</label>{_p_num('kenburns_zoom', '1.1')}</div>
+<div class=fld><label class=cap>Пауза, сек / каждые N фраз</label>{_p_num('pause_duration', '0')} / {_p_num('pause_interval', '0')}
+<span class=hint style="margin-left:10px">0 = без пауз</span></div>
+<div class=fld><label class=cap>Громкость озвучки % / звука клипов %</label>{_p_num('main_audio_volume', '100')} / {_p_num('video_audio_volume', '100')}</div>
+<div class=fld><label class=cap>Равномерное распределение</label>{_p_bool('distribute_evenly', True, 'без синхрона: кадры делят хронометраж поровну')}</div>
+<div class=fld><label class=cap>Масштаб медиа % / смещение X / Y</label>{_p_num('media_scale_pct', '100')} / {_p_num('media_offset_x', '0')} / {_p_num('media_offset_y', '0')}
+<span class=hint style="margin-left:10px">глобальный зум/сдвиг всех кадров</span></div></details>
+<p class=hint>Пустое числовое поле = настройка не задаётся, применится серверный дефолт. Применение пресета ЗАМЕНЯЕТ настройки проекта целиком, а не дополняет их.</p></div>
+<script>function pseg(n,v,el){{var ss=el.parentNode.querySelectorAll('.seg');for(var i=0;i<ss.length;i++)ss[i].classList.remove('active');el.classList.add('active');document.getElementById('pf_'+n).value=v;}}</script>
+<button class="btn btn-primary"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Сохранить пресет</button></form></div>"""
+    return _page("Пресет", body)
+
+
+@app.post("/api/presets/{prid}/edit")
+async def preset_edit_save(prid: int, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    d = await _form(request)
+    name = (d.get("name") or "").strip()[:80]
+    # MERGE с текущими настройками пресета: ключи, которых нет в форме редактора (use_cache, quality,
+    # transitions, custom_prompts…), НЕ затираются; пустое поле формы теперь явно очищает значение.
+    c0 = db(); r0 = c0.execute("SELECT settings FROM presets WHERE id=? AND tenant_id=?", (prid, tid)).fetchone(); c0.close()
+    try:
+        settings = json.loads(r0["settings"]) if r0 and r0["settings"] else {}
+    except Exception:
+        settings = {}
+    settings.update({k: v for k, v in d.items() if k != "name"})
+    try:
+        settings = _canonical_image_params(settings)
+        settings = _normalize_lumean_settings(settings)
+    except ImageModeContractError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except LumeanTemplateError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    c = db()
+    c.execute("UPDATE presets SET name=COALESCE(NULLIF(?,''),name), settings=? WHERE id=? AND tenant_id=?",
+              (name, json.dumps(settings, ensure_ascii=False), prid, tid))
+    c.commit(); c.close()
+    return RedirectResponse("/presets", 302)
+
+
+@app.post("/api/projects/{pid}/refs")
+async def project_refs_upload(pid: str, request: Request,
+                              files: list[UploadFile] = File(default=[]),
+                              name: str = Form(""),
+                              reftype: str = Form("char")):
+    """Validate and atomically publish one whole reference upload batch."""
+    u = require_web_user(request); tid = _tid(u)
+    project = _get_project(tid, pid)
+    if not project:
+        raise HTTPException(404, "нет проекта")
+    projdir = _project_dir(tid, pid)
+    try:
+        if reftype not in ("char", "style"):
+            raise reference_contract.ReferenceContractError("unknown reference type")
+        if reftype == "char" and not str(name or "").strip():
+            raise reference_contract.ReferenceContractError("character name is required")
+        selected_uploads = [
+            upload for upload in files
+            if upload and (upload.filename or "").strip()
+        ]
+        batch_limit = (reference_contract.MAX_STYLE_SOURCES if reftype == "style"
+                       else reference_contract.MAX_HERO_ANGLES)
+        if len(selected_uploads) > batch_limit:
+            raise reference_contract.ReferenceContractError(
+                f"one upload batch accepts at most {batch_limit} files"
+            )
+        items = []
+        for upload in selected_uploads:
+            raw = await upload.read(reference_contract.MAX_REFERENCE_BYTES + 1)
+            items.append((upload.filename, raw))
+        checked = _reference_validate_uploads(items)
+        _state, add_receipt = _reference_add_sources(
+            projdir, reftype, name, checked, with_receipt=True
+        )
+        mutation = {
+            "received": len(selected_uploads),
+            "added": add_receipt["added"],
+            "duplicates": len(selected_uploads) - add_receipt["added"],
+        }
+        notice = (f'Получено: {mutation["received"]} · добавлено: {mutation["added"]} · '
+                  f'дубликаты: {mutation["duplicates"]}')
+        return _reference_mutation_response(
+            request, pid, projdir, _psettings(project), mutation=mutation, notice=notice
+        )
+    except reference_contract.ReferenceContractError as exc:
+        return _reference_mutation_error(request, exc)
+
+
+@app.post("/api/projects/{pid}/refs/delete")
+async def project_refs_delete(pid: str, request: Request):
+    u = require_web_user(request); tid = _tid(u)
+    project = _get_project(tid, pid)
+    if not project:
+        raise HTTPException(404, "нет проекта")
+    projdir = _project_dir(tid, pid)
+    d = await _form(request)
+    try:
+        reftype = (d.get("reftype") or "char").strip()
+        if reftype not in ("char", "style"):
+            raise reference_contract.ReferenceContractError("unknown reference type")
+        group_id = (d.get("group_id") or "").strip()
+        if reftype == "char" and not group_id:
+            # Compatibility for a page rendered immediately before deployment.
+            alias = reference_contract.normalize_alias(d.get("name") or "")
+            matches = [row["group_id"] for row in _reference_load_state(projdir)["characters"]
+                       if reference_contract.normalize_alias(row["name"]) == alias]
+            if len(matches) != 1:
+                raise reference_contract.ReferenceContractError("reference character group is ambiguous")
+            group_id = matches[0]
+        _reference_delete_sources(projdir, reftype=reftype, group_id=group_id)
+        return _reference_mutation_response(request, pid, projdir, _psettings(project))
+    except reference_contract.ReferenceContractError as exc:
+        return _reference_mutation_error(request, exc)
+
+
+@app.post("/api/projects/{pid}/refs/delfile")
+async def project_refs_delfile(pid: str, request: Request):
+    """Remove one manifest entry; immutable bundles and legacy originals stay intact."""
+    u = require_web_user(request); tid = _tid(u)
+    project = _get_project(tid, pid)
+    if not project:
+        raise HTTPException(404, "нет проекта")
+    projdir = _project_dir(tid, pid)
+    d = await _form(request)
+    try:
+        _reference_delete_sources(
+            projdir,
+            reftype=(d.get("reftype") or "").strip(),
+            group_id=(d.get("group_id") or "").strip(),
+            rel=(d.get("path") or "").strip(),
+        )
+        return _reference_mutation_response(request, pid, projdir, _psettings(project))
+    except reference_contract.ReferenceContractError as exc:
+        return _reference_mutation_error(request, exc)
+
+
+@app.post("/api/projects/{pid}/images/delete")
+async def project_images_delete(pid: str, request: Request):
+    """Удаление сгенерированных картинок из галереи: paths (rel, multi) или all=1.
+    Только файлы строго под googler/ и Images/ (path-traversal отсечён в _gallery_image_ok)."""
+    u = require_web_user(request); tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    projdir = os.path.abspath(_project_dir(tid, pid))
+    raw = (await request.body()).decode("utf-8", "replace")
+    q = urllib.parse.parse_qs(raw, keep_blank_values=True)   # свой разбор: _form теряет multi-value
+    rels = [v for v in q.get("paths", []) if v]
+    if (q.get("all", [""])[0] or "") == "1":
+        import glob as _g
+        files = (_g.glob(os.path.join(projdir, "googler", "*.jpg"))
+                 + _g.glob(os.path.join(projdir, "googler", "*.png"))
+                 + _g.glob(os.path.join(projdir, "Images", "**", "*.jpg"), recursive=True)
+                 + _g.glob(os.path.join(projdir, "Images", "**", "*.png"), recursive=True))
+        rels = [os.path.relpath(f, projdir) for f in files]
+    n = 0
+    for rel in rels:
+        full = _gallery_image_ok(projdir, rel.replace("\\", "/"))
+        if full and os.path.isfile(full):
+            try:
+                os.remove(full)
+                n += 1
+            except OSError:
+                pass
+    return RedirectResponse(f"/p/{pid}?tab=img", 302)
+
+
+@app.post("/api/projects/{pid}/images/regen")
+async def project_images_regen(pid: str, request: Request):
+    """Перегенерация одной картинки (опц. свой промпт). Модель/стиль/aspect/seed — из настроек проекта.
+    Отдельный роут (не gen_submit): форму регена НЕ сохраняем в настройки проекта."""
+    u = require_web_user(request); tid = _tid(u)
+    p = _get_project(tid, pid)
+    if not p:
+        raise HTTPException(404, "нет проекта")
+    if _active_image_mutation(tid, pid):
+        return RedirectResponse(f"/p/{pid}?imgbusy=1&tab=img", 302)
+    d = await _form(request)
+    rel = (d.get("image_rel") or "").strip()
+    if not _gallery_regen_image_ok(_project_dir(tid, pid), rel.replace("\\", "/")):
+        raise HTTPException(400, "недопустимый путь картинки")
+    try:
+        s = _canonical_image_params(_psettings(p))
+    except ImageModeContractError as exc:
+        raise HTTPException(400, str(exc))
+    params = {
+        "image_rel": rel,
+        "prompt": (d.get("prompt") or "").strip(),
+        "style": s.get("style") or "",
+        "model": s.get("model") or "OPENAI",
+        "aspect_ratio": s.get("aspect_ratio") or "landscape",
+        "seed": s.get("seed") or "",
+        # Источник картинок берём из НАСТРОЕК ПРОЕКТА (не из формы): для Bing-проекта
+        # реген = новый поиск по сцене, а не вызов AI-генератора.
+        "image_mode": s["image_mode"],
+        "tags": s.get("tags") or "",
+        "auto_hero": s.get("auto_hero") or "0",
+        "analyze_story": s.get("analyze_story") or "0",
+        "custom_prompts": s.get("custom_prompts") or "",
+        "sentences_per_prompt": s.get("sentences_per_prompt") or "3",
+        "smart_mode": s.get("smart_mode") or "0",
+        "split_long_sentences": s.get("split_long_sentences") or "0",
+        "max_solo_scene_seconds": s.get("max_solo_scene_seconds") or "",
+    }
+    params = _canonical_image_task_params("regen", params)
+    _assert_provider_available(u, "regen", params, project_id=pid)
+    try:
+        jid = _enqueue(u["id"], tid, pid, "regen", params)
+    except reference_contract.ReferenceContractError as exc:
+        raise HTTPException(400, str(exc))
+    if jid is None:
+        conflict = _active_image_mutation(tid, pid)
+        return RedirectResponse(
+            f"/p/{pid}?{'imgbusy=1' if conflict else 'dup=regen'}&tab=img", 302
+        )
+    return RedirectResponse(f"/p/{pid}?job={jid}&tab=img", 302)
+
+
+def _prune_video_references(projdir, deleted_clips):
+    """После удаления клипов выпилить их исходные картинки из googler_video_references.json —
+    иначе рендер продолжит исключать картинку, у которой больше нет клипа (дыра в материале)."""
+    refs_file = os.path.join(projdir, "googler_video_references.json")
+    if not os.path.exists(refs_file) or not deleted_clips:
+        return
+    stems = set()
+    for c in deleted_clips:
+        b = os.path.basename(c)
+        stems.add(b[:-len("_video.mp4")] if b.endswith("_video.mp4") else os.path.splitext(b)[0])
+    try:
+        refs = json.load(open(refs_file, encoding="utf-8")) or []
+        kept = [p for p in refs if os.path.splitext(os.path.basename(p))[0] not in stems]
+        if len(kept) != len(refs):
+            with open(refs_file, "w", encoding="utf-8") as f:
+                json.dump(kept, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+@app.post("/api/projects/{pid}/videos/delete")
+async def project_videos_delete(pid: str, request: Request):
+    """Удаление видео-клипов галереи: paths (rel, multi) или all=1. Только 'googler video/'.
+    Исходные картинки удалённых клипов выпиливаются из googler_video_references.json."""
+    u = require_web_user(request); tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    projdir = os.path.abspath(_project_dir(tid, pid))
+    raw = (await request.body()).decode("utf-8", "replace")
+    q = urllib.parse.parse_qs(raw, keep_blank_values=True)
+    rels = [v for v in q.get("paths", []) if v]
+    if (q.get("all", [""])[0] or "") == "1":
+        import glob as _g
+        rels = [os.path.relpath(f, projdir) for f in _g.glob(os.path.join(projdir, "googler video", "*.mp4"))]
+    deleted = []
+    for rel in rels:
+        full = _gallery_video_ok(projdir, rel.replace("\\", "/"))
+        if full and os.path.isfile(full):
+            try:
+                os.remove(full)
+                deleted.append(full)
+            except OSError:
+                pass
+    _prune_video_references(projdir, deleted)
+    return RedirectResponse(f"/p/{pid}?tab=vid", 302)
+
+
+@app.post("/api/projects/{pid}/videos/regen")
+async def project_videos_regen(pid: str, request: Request):
+    """Перегенерация одного клипа (опц. свой промпт движения). Метод — из настроек проекта."""
+    u = require_web_user(request); tid = _tid(u)
+    p = _get_project(tid, pid)
+    if not p:
+        raise HTTPException(404, "нет проекта")
+    d = await _form(request)
+    rel = (d.get("video_rel") or "").strip()
+    if not _gallery_video_ok(_project_dir(tid, pid), rel.replace("\\", "/")):
+        raise HTTPException(400, "недопустимый путь клипа")
+    s = _psettings(p)
+    params = {
+        "video_rel": rel,
+        "prompt": (d.get("prompt") or "").strip() or (s.get("prompt") or ""),
+        "video_method": s.get("video_method") or "veo",
+    }
+    _assert_provider_available(u, "regen_video", params, project_id=pid)
+    jid = _enqueue(u["id"], tid, pid, "regen_video", params)
+    if jid is None:
+        return RedirectResponse(f"/p/{pid}?dup=regen_video&tab=vid", 302)
+    return RedirectResponse(f"/p/{pid}?job={jid}&tab=vid", 302)
+
+
+@app.post("/api/projects/{pid}/{kind}")
+async def gen_submit(pid: str, kind: str, request: Request):
+    u = require_web_user(request)
+    if kind not in ("tts", "images", "video", "render"):
+        raise HTTPException(404, "вид задачи")
+    tid = _tid(u)
+    if not _get_project(tid, pid):
+        raise HTTPException(404, "нет проекта")
+    tab = {"tts": "tts", "prompts": "img", "images": "img", "video": "vid", "render": "rnd"}.get(kind, "src")
+    # FIX-2026-07-17: дедуп — дабл-клик/повторный сабмит при уже идущей задаче того же вида
+    # раньше молча ставил вторую (двойной расход кредитов). Батч-путь такой гвард уже имел.
+    if kind == "images" and _active_image_mutation(tid, pid):
+        return RedirectResponse(f"/p/{pid}?imgbusy=1&tab={tab}", 302)
+    if _active_task(tid, pid, kind):
+        return RedirectResponse(f"/p/{pid}?dup={kind}&tab={tab}", 302)
+    if kind == "render":
+        if not _render_inputs_ready(tid, pid):
+            _save_project_settings(tid, pid, {"deferred_pending": u["id"]})
+            return RedirectResponse(f"/p/{pid}?dr=1&tab={tab}", 302)
+    d = await _form(request)
+    dd = _sanitize_task_params(dict(d))
+    image_effective = None
+    if kind == "images":
+        try:
+            # Новый form/API payload валидируется до сохранения и до проверки ключа.
+            # Overlay нормализуется отдельно, чтобы неполный запрос не сбросил режим
+            # проекта, а затем весь downstream получает один effective payload.
+            dd = _canonical_image_params(dd, partial=True)
+            image_effective = _images_effective_params(
+                _psettings(_get_project(tid, pid) or {}), dd
+            )
+            _reference_gate(
+                image_effective,
+                _reference_load_state(_project_dir(tid, pid)),
+            )
+            image_effective = _reference_apply_legacy_cache_choice(
+                _project_dir(tid, pid), image_effective
+            )
+        except (ImageModeContractError, reference_contract.ReferenceContractError) as exc:
+            raise HTTPException(400, str(exc))
+    if kind == "tts":
+        engine = str(dd.get("engine") or dd.get("tts_engine") or "edge").strip().lower()
+        if engine not in _TTS_ENG_PROV:
+            raise HTTPException(400, f"неизвестный TTS-движок: {engine}")
+        dd["engine"] = engine
+        try:
+            dd = _normalize_lumean_settings(dd)
+        except LumeanTemplateError as exc:
+            raise HTTPException(400, str(exc)) from exc
+    # Провайдера без серверного ключа и без своего отклоняем СРАЗУ: иначе задача висит
+    # в очереди и падает в воркере «нет ключа» уже после ожидания.
+    _assert_provider_available(
+        u, kind, image_effective if image_effective is not None else dd,
+        project_id=pid,
+    )
+    # тот же набор параметров, что уйдёт в промпты/картинки (настройки проекта + поля
+    # запроса): по голым полям запроса проверка плана расходилась с _enqueue и вотчером
+    if kind == "images" and _needs_scene_plan(tid, pid, image_effective):
+        # _enqueue сам поставит отдельную задачу «промпты» — её канал (штатная policy
+        # _effective_prompt_provider) тоже должен быть чем-то авторизован.
+        _assert_provider_available(u, "prompts", dd, project_id=pid)
+    _save_project_settings(tid, pid, dd)   # task-scoped legacy choice is filtered by _SETTINGS_SKIP
+    # FIX-2026-07-17: одиночный запуск видео без готовых картинок — отложенно (как в батче);
+    # раньше задача вставала сразу и падала вхолостую.
+    if kind == "video" and not _video_ready(tid, pid):
+        vp = {k: str(dd.get(k) or "") for k in ("video_method", "first_n", "prompt")
+              if str(dd.get(k) or "").strip() != ""}
+        _save_project_settings(tid, pid, {"deferred_video_pending": u["id"], "deferred_video_params": vp})
+        return RedirectResponse(f"/p/{pid}?dv=1&tab={tab}", 302)
+    try:
+        jid = _enqueue(u["id"], tid, pid, kind, dd)
+    except reference_contract.ReferenceContractError as exc:
+        raise HTTPException(400, str(exc))
+    if jid is None:
+        conflict = _active_image_mutation(tid, pid) if kind == "images" else None
+        duplicate_query = "imgbusy=1" if conflict else f"dup={kind}"
+        return RedirectResponse(f"/p/{pid}?{duplicate_query}&tab={tab}", 302)
+    return RedirectResponse(f"/p/{pid}?job={jid}&tab={tab}", 302)
+
+
+# ============ РЕНДЕР: удалённая сборка mp4 на GPU-ноде через пуллер ============
+PULLER_TOKEN = os.environ.get("PULLER_TOKEN", "")
+RENDER_LEASE_SEC = int(os.environ.get("RENDER_LEASE_SEC", "1200"))  # без апдейта прогресса дольше → задание вернётся в очередь
+# Пульс внешней рендер-ноды: обновляется на каждом опросе /api/render/claim (см. там же).
+# В памяти, не в БД: после рестарта «пульса ещё не было» — честное состояние, а не старая
+# отметка, выдающая мёртвую ноду за живую.
+_RENDER_POLL = {"ts": 0.0, "polls": 0, "peer": ""}
+
+
+def _require_puller(request: Request):
+    tok = request.headers.get("X-Puller-Token", "")
+    if not PULLER_TOKEN or not secrets.compare_digest(tok, PULLER_TOKEN):
+        raise HTTPException(403, "puller auth")
+
+
+def _require_render_claim(request: Request, task):
+    """Не принимать heartbeat/result от устаревшего владельца после lease-reclaim."""
+    got = request.headers.get("X-Render-Claim", "")
+    want = (task["claim_token"] or "") if task and "claim_token" in task.keys() else ""
+    if not got or not want or not secrets.compare_digest(got, want):
+        raise HTTPException(409, "render lease устарела")
+
+
+# UI-имена языков субтитров → канонические для whisper (кабинет исторически слал «Русский» сырьём)
+_SUB_LANG_CANON = {"Русский": "Russian", "Polski": "Polish", "Čeština": "Czech", "Română": "Romanian",
+                   "Deutsch": "German", "Français": "French", "Italiano": "Italian",
+                   "Español": "Spanish", "Português": "Portuguese"}
+# Полный список языков субтитров — паритет с десктопом (SUBTITLE_LANGUAGES app_main.py)
+_SUB_LANGS_ALL = [
+    'Afrikaans', 'Albanian', 'Amharic', 'Arabic', 'Armenian', 'Azerbaijani',
+    'Bangla', 'Bosnian', 'Bulgarian', 'Burmese', 'Catalan', 'Chinese',
+    'Croatian', 'Czech', 'Danish', 'Dutch', 'English', 'Estonian',
+    'Filipino', 'Finnish', 'French', 'Galician', 'Georgian', 'German',
+    'Greek', 'Gujarati', 'Hebrew', 'Hindi', 'Hungarian', 'Icelandic',
+    'Indonesian', 'Irish', 'Italian', 'Japanese', 'Javanese', 'Kannada',
+    'Kazakh', 'Khmer', 'Korean', 'Lao', 'Latvian', 'Lithuanian',
+    'Macedonian', 'Malay', 'Malayalam', 'Maltese', 'Marathi', 'Mongolian',
+    'Nepali', 'Norwegian', 'Pashto', 'Persian', 'Polish', 'Portuguese',
+    'Romanian', 'Russian', 'Serbian', 'Sinhala', 'Slovak', 'Slovenian',
+    'Somali', 'Spanish', 'Sundanese', 'Swahili', 'Swedish', 'Tamil',
+    'Telugu', 'Thai', 'Turkish', 'Ukrainian', 'Urdu', 'Uzbek',
+    'Vietnamese', 'Welsh', 'Zulu']
+# наверху селекта — ходовые языки ферм, дальше остальные по алфавиту
+_SUB_LANGS_TOP = ['Russian', 'English', 'Polish', 'Czech', 'Romanian', 'German',
+                  'French', 'Italian', 'Spanish', 'Portuguese']
+_SUB_LANG_OK = set(_SUB_LANGS_ALL)
+_MATERIAL_ORDERS = {"video_first", "images_first", "alternate", "alphabetical", "random"}
+_QUALITY_OK = ("144p", "240p", "360p", "480p", "720p", "1080p")
+
+
+def _render_config_from_params(p):
+    """UI-форма рендера → конфиг render_worker. Бокс: force libx264 veryfast — НЕ потому что
+    NVENC сломан (это было про RunPod; на минской 4070S NVENC жив), а по бенчу 15.07.2026:
+    на слайдшоу x264 быстрее NVENC (12.9x vs 11.3x) и БИТРЕЙТ nvenc cq26 = +61%…×3.2 к crf26;
+    на KB nvenc даёт лишь +11% скорости. Снимать force → video-тяжёлые джобы уйдут в nvenc
+    и раздуются по размеру. Если появится нода без живого x264-запаса — пересмотреть.
+    Переходы: none→без fade; fast→fade+fast_batch_stitch (94%, ~2мин); smooth→fade+полные (100%, ~5мин).
+    Паритет с десктопом (2026-07-10): sync_audio/уникализация/винтаж/паузы/громкости/порядок/fade/KB-зум."""
+    q = (p.get("quality") or "1080p").strip()
+    if q not in _QUALITY_OK:
+        q = "1080p"
+    tr = (p.get("transitions") or "fast").strip()   # none | fast | smooth
+    # «Плавные» переходы отключены осознанно (замер 03.08): они пересобирали ВЕСЬ ролик ради
+    # стыков пачек (×3.4 по времени) и съедали по fade на каждом стыке — картинки уезжали
+    # вперёд накопительно. Настоящие кроссфейды делаются ВНУТРИ пачек и одинаковы в обоих
+    # режимах, поэтому склейка всегда stream-copy. crf оставлен 26: понижение до 24 на сервере
+    # дало 0% скорости (пресет тут и так veryfast) при +24% размера файла.
+    rs = {"force_encoder": "libx264", "cpu_preset": "veryfast", "crf": 26,
+          "fast_batch_stitch": True,
+          # ffmpeg под nice+10 (воркер применяет в run_ffmpeg_command, POSIX-only): при
+          # параллельных рендерах 40-60 потоков x264 душили whisper-процесс (python, GPU
+          # простаивал на 9-17% util) → фаза синхрона растягивалась с ~2 до 5-10+ мин
+          # (live-профиль 15.07). Приоритет python-воркера выше ffmpeg → whisper дышит,
+          # энкод забирает всё остальное. Замер до/после — в памяти minsk-render-node.
+          "process_priority": "low"}
+    _lang_raw = (p.get("subtitle_lang") or "Russian").strip()
+    _lang = _SUB_LANG_CANON.get(_lang_raw, _lang_raw)
+    if _lang not in _SUB_LANG_OK:
+        _lang = "Russian"
+    # video_first: клипы NNN_video.mp4 — это анимированные ПЕРВЫЕ сцены (first_n), их картинки
+    # исключены через googler_video_references. images_first уводил клипы В КОНЕЦ ролика →
+    # весь ряд картинок сдвигался относительно озвучки (баг «рендер всё напутал», 03.07).
+    # Теперь порядок выбирается в «Расширенных настройках»; дефолт остаётся video_first.
+    mo = (p.get("material_order") or "video_first").strip()
+    if mo not in _MATERIAL_ORDERS:
+        mo = "video_first"
+    cfg = {
+        "quality": q,
+        "enable_fade": (tr != "none"),
+        "enable_kenburns": _truthy(p.get("kenburns"), False),
+        "add_subtitles": _truthy(p.get("subtitles"), False),
+        "auto_sound": _truthy(p.get("auto_sound"), False),
+        "auto_chapters": _truthy(p.get("auto_chapters"), False),
+        "subtitle_language": _lang,
+        "material_order": mo,
+        "use_video_audio": _truthy(p.get("use_video_audio"), False),
+        # дефолты True — как у воркера/десктопа: старые задачи без ключей ведут себя по-прежнему
+        "sync_audio": _truthy(p.get("sync_audio"), True),
+        "distribute_evenly": _truthy(p.get("distribute_evenly"), True),
+        "randomize_metadata": _truthy(p.get("randomize_metadata"), False),
+        "vintage_effect": _truthy(p.get("vintage_effect"), False),
+        "render_settings": rs,
+    }
+    for k in ("min_image_duration", "max_image_duration", "fade_duration", "kenburns_zoom",
+              "pause_duration"):
+        try:
+            if p.get(k) not in (None, ""):
+                cfg[k] = float(p[k])
+        except Exception:
+            pass
+    try:
+        if p.get("pause_interval") not in (None, ""):
+            cfg["pause_interval"] = max(0, int(float(p["pause_interval"])))
+    except Exception:
+        pass
+    try:
+        if p.get("stock_video_limit") not in (None, ""):
+            cfg["stock_video_limit"] = max(0, int(float(p["stock_video_limit"])))   # 0 = брать все
+    except Exception:
+        pass
+    cfg["stock_video_cycle"] = _truthy(p.get("stock_video_cycle"), True)            # повторять по кругу
+    # громкости в UI — проценты (как в десктопе), воркер ждёт множитель 0.0–2.0
+    for k_ui, k_cfg in (("main_audio_volume", "main_audio_volume"),
+                        ("video_audio_volume", "video_audio_volume")):
+        try:
+            if p.get(k_ui) not in (None, ""):
+                cfg[k_cfg] = max(0.0, min(2.0, float(p[k_ui]) / 100.0))
+        except Exception:
+            pass
+    # глобальный масштаб/смещение медиа
+    try:
+        if p.get("media_scale_pct") not in (None, ""):
+            cfg["media_scale_pct"] = max(10.0, min(400.0, float(p["media_scale_pct"])))
+    except Exception:
+        pass
+    for k in ("media_offset_x", "media_offset_y"):
+        try:
+            if p.get(k) not in (None, ""):
+                cfg[k] = max(-2000, min(2000, int(float(p[k]))))
+        except Exception:
+            pass
+    # музыка и вставки: settings.render_media (JSON) → файловые ключи конфига.
+    # Пути ОТНОСИТЕЛЬНЫЕ ("_RENDER_MEDIA/<kind>/<file>") — render_worker резолвит от project_dir,
+    # на рендер-ноде файлы приезжают в общем tar (render_assets).
+    rm = p.get("render_media")
+    if isinstance(rm, str) and rm.strip():
+        try:
+            rm = json.loads(rm)
+        except Exception:
+            rm = None
+    if isinstance(rm, dict):
+        def _rel(f):
+            return "/".join((_RM_DIR, str(f).replace("..", "").lstrip("/")))
+        _bg = rm.get("bg") or {}
+        if _bg.get("file"):
+            cfg["background_audio_file"] = _rel(_bg["file"])
+            try:
+                cfg["background_audio_volume"] = max(0.0, min(2.0, float(_bg.get("vol", 20)) / 100.0))
+            except Exception:
+                pass
+        _end = rm.get("end") or {}
+        if _end.get("file"):
+            cfg["end_track_file"] = _rel(_end["file"])
+            try:
+                cfg["end_track_volume"] = max(0.0, min(2.0, float(_end.get("vol", 100)) / 100.0))
+            except Exception:
+                pass
+        if [f for f in (rm.get("stock") or []) if isinstance(f, str) and f]:
+            # воркеру нужна ПАПКА: он сам обходит её и подмешивает материалы к картинкам
+            cfg["extra_materials_dir"] = "/".join((_RM_DIR, "stock"))
+        _intro = [f for f in (rm.get("intro") or []) if isinstance(f, str) and f]
+        if _intro:
+            cfg["intro_video_files"] = [_rel(f) for f in _intro]
+        _ovl = []
+        for o in (rm.get("overlays") or []):
+            if isinstance(o, dict) and o.get("file"):
+                try:
+                    _op = max(0.0, min(1.0, float(o.get("opacity", 50)) / 100.0))
+                except Exception:
+                    _op = 0.5
+                _ovl.append({"path": _rel(o["file"]), "opacity": _op})
+        if _ovl:
+            cfg["overlays"] = _ovl
+    if "narration_files" in p:
+        cfg["narration_files"] = p["narration_files"]
+    return cfg
+
+
+@app.post("/api/render/claim")
+async def render_claim(request: Request):
+    """Пуллер забирает старейшее queued render-задание (+ lease, + возврат зависших в очередь)."""
+    _require_puller(request)
+    # Отметка живости рендер-ноды. Прогресс (claimed) показывает её только когда рендер
+    # ИДЁТ; при пустой очереди «нода жива» и «нода умерла» выглядят одинаково — а разница
+    # в том, начнётся ли следующий рендер вообще. Опрос ручки claim и есть тот пульс.
+    _RENDER_POLL["ts"] = time.time()
+    _RENDER_POLL["polls"] += 1
+    try:
+        _RENDER_POLL["peer"] = (request.client.host if request.client else "") or ""
+    except Exception:
+        pass
+    # Пауза из админ-панели: нода продолжает опрашивать ручку, но заданий не получает.
+    # Уже начатый на ноде рендер идёт до конца — его результат примут как обычно.
+    if _queue_paused("render"):
+        return JSONResponse({"job": None})
+    c = db()
+    cutoff = time.time() - RENDER_LEASE_SEC
+    c.execute("UPDATE queue_tasks SET status='queued', claimed=NULL, claim_token=NULL "
+              "WHERE kind='render' AND status='running' AND (claimed IS NULL OR claimed < ?)", (cutoff,))
+    c.execute("UPDATE gen_jobs SET status='queued',error=NULL WHERE id IN ("
+              "SELECT job_id FROM queue_tasks WHERE kind='render' AND status='queued') "
+              "AND status='running'")
+    c.commit()
+    c.execute("BEGIN IMMEDIATE")
+    candidates = c.execute(
+        "SELECT r.* FROM queue_tasks r "
+        "WHERE r.kind='render' AND r.status='queued' "
+        "AND NOT EXISTS (SELECT 1 FROM queue_tasks w "
+        "WHERE w.tenant_id=r.tenant_id AND w.project_id=r.project_id "
+        "AND w.kind!='render' AND w.status IN ('queued','running')) "
+        "ORDER BY r.created ASC LIMIT 100"
+    ).fetchall()
+    row = next((r for r in candidates if not _storage_project_held(c, r["project_id"]) and _render_inputs_ready(r["tenant_id"], r["project_id"])), None)
+    if not row:
+        c.commit(); c.close()
+        return JSONResponse({"job": None})
+    jid = row["job_id"]
+    _project = _get_project(row["tenant_id"], row["project_id"])
+    _snapshot = {**(_psettings(_project) if _project else {}), **json.loads(row["params"] or "{}")}
+    from storage_admission import admission as _storage_admission
+    if not _storage_admission(c, _project_dir(row["tenant_id"], row["project_id"]), _snapshot)["allowed"]:
+        c.commit(); c.close()
+        return JSONResponse({"job": None, "wait_reason": "disk_reserve"})
+    try:
+        from render_narration import select_narration
+        selected = select_narration(_project_dir(row["tenant_id"], row["project_id"]), _snapshot)
+        if not selected:
+            raise ValueError("Нет файлов основной озвучки")
+        _snapshot["narration_files"] = selected
+    except ValueError as exc:
+        c.execute("UPDATE queue_tasks SET status='error',error=?,finished=? WHERE job_id=? AND status='queued'", (str(exc),_now(),jid))
+        c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?", (str(exc),jid))
+        c.commit(); c.close()
+        return JSONResponse({"job": None})
+    claim_token = secrets.token_urlsafe(24)
+    cur = c.execute(
+        "UPDATE queue_tasks SET status='running', started=?, claimed=?, progress=0, stage='claimed', "
+        "error=NULL, claim_token=?,params=?,transcript_sha256=NULL,transcript_rel=NULL,render_sha256=NULL,render_size=NULL,render_error_sha256=NULL "
+        "WHERE job_id=? AND status='queued' AND NOT EXISTS (SELECT 1 FROM queue_tasks w "
+        "WHERE w.tenant_id=queue_tasks.tenant_id AND w.project_id=queue_tasks.project_id "
+        "AND w.kind!='render' AND w.status IN ('queued','running'))",
+        (_now(), time.time(), claim_token, json.dumps(_snapshot, ensure_ascii=False), jid),
+    )
+    if cur.rowcount == 1:
+        c.execute("UPDATE gen_jobs SET status='running',error=NULL WHERE id=?", (jid,))
+    c.commit()
+    t = c.execute("SELECT * FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+    c.close()
+    if cur.rowcount != 1 or not t or t["status"] != "running":
+        return JSONResponse({"job": None})
+    proj = _get_project(t["tenant_id"], t["project_id"])
+    # база = settings проекта (render_media и пр. живут там), поверх — params задачи (свежая форма)
+    try:
+        _base = _psettings(proj) if proj else {}
+    except Exception:
+        _base = {}
+    cfg = _render_config_from_params({**_base, **json.loads(t["params"] or "{}")})
+    return JSONResponse({"job": {"job_id": jid, "claim_token": claim_token,
+                                 "tenant_id": t["tenant_id"], "project_id": t["project_id"],
+                                 "name": (proj["name"] if proj else t["project_id"]), "config": cfg}})
+
+
+_AUTO_SOUND_LOCK = threading.Lock()
+
+
+def _prepare_render_sound(task, project_dir):
+    params = json.loads(task.get("params") or "{}")
+    if not _truthy(params.get("auto_sound"), False):
+        return None
+    import auto_sound
+    logger = lambda message: _log_line(task["job_id"], message)
+    # One bounded auxiliary CLI process per machine, sharing the owner's real
+    # Codex pool with prompts. An absent/busy key uses the documented local bed.
+    with _AUTO_SOUND_LOCK:
+        c = db()
+        try:
+            current = c.execute("SELECT status,claim_token FROM queue_tasks WHERE job_id=?", (task["job_id"],)).fetchone()
+            owner = c.execute("SELECT * FROM users WHERE id=?", (task["uid"],)).fetchone()
+        finally:
+            c.close()
+        if not current or current["status"] != "running" or current["claim_token"] != task["claim_token"]:
+            return None
+        lease = None
+        home = None
+        try:
+            own = _own_pool_values(owner, "codex_home")
+            if own:
+                lease = _reserve_own_task_credential(owner, "prompt_codex", "prompts", {})
+                if lease:
+                    home = _own_codex_home_dir(task["uid"], lease.value)
+            elif not _own_only(owner) and _codex_allowed(owner):
+                lease = _reserve_task_credential("prompt_codex", "prompts", {})
+                if lease and lease.value:
+                    home = lease.value
+            if home is None:
+                logger("[autosound] личный ключ не настроен или занят; используется локальный фоновый слой")
+            return auto_sound.prepare(project_dir, log=logger, codex_home=home, narration_files=params.get("narration_files"))
+        finally:
+            if lease:
+                lease.release()
+
+
+_DELIVERY_EVIDENCE_SLOTS = threading.BoundedSemaphore(2)
+
+
+def _accept_delivery_evidence(payload):
+    ops_dir = os.environ.get("VS_OPS_DIR", "/opt/video-studio-ops")
+    if ops_dir not in sys.path:
+        sys.path.insert(0, ops_dir)
+    from delivery_evidence import accept_envelope
+    with open(os.path.join(ops_dir, "storage.production.json"), encoding="utf-8") as fh:
+        config = json.load(fh)
+    return accept_envelope(config, payload)
+
+
+@app.post("/api/render/delivery-evidence")
+async def render_delivery_evidence(request: Request):
+    """Receive authenticated delivery proof; media retirement validates its full binding."""
+    _require_puller(request)
+    if not _DELIVERY_EVIDENCE_SLOTS.acquire(blocking=False):
+        raise HTTPException(429, "Обработчик подтверждений занят; повторите позже")
+    try:
+        async def read_bounded_body():
+            body = bytearray()
+            async for block in request.stream():
+                body.extend(block)
+                if len(body) > 2*1024*1024:
+                    raise HTTPException(413, "Подтверждение больше 2 МиБ")
+            return body
+        try:
+            body = await asyncio.wait_for(read_bounded_body(), timeout=30)
+        except asyncio.TimeoutError:
+            raise HTTPException(408, "Время передачи подтверждения истекло; повторите запрос")
+        try:
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise ValueError("expected object")
+        except (ValueError, UnicodeDecodeError):
+            raise HTTPException(400, "Некорректное подтверждение доставки")
+        try:
+            result = await run_in_threadpool(_accept_delivery_evidence, payload)
+        except Exception as exc:
+            code = getattr(exc, "status_code", 400 if isinstance(exc, ValueError) else 503)
+            raise HTTPException(code if code in (400,409,503) else 503,
+                                "Подтверждение не принято; сохраните исходное доказательство и повторите после проверки")
+        if (not isinstance(result, dict) or result.get("accepted") is not True
+                or not re.fullmatch(r"[0-9a-f]{64}", str(result.get("evidence_sha256", "")))):
+            raise HTTPException(503, "Сохранение подтверждения не проверено; повторите позже")
+        return JSONResponse({"accepted": True, "evidence_sha256": result["evidence_sha256"]})
+    finally:
+        _DELIVERY_EVIDENCE_SLOTS.release()
+
+
+@app.post("/api/render/node-health")
+async def render_node_health(request: Request):
+    _require_puller(request)
+    raw = bytearray()
+    async for chunk in request.stream():
+        raw.extend(chunk)
+        if len(raw) > 4096:
+            raise HTTPException(413, "слишком большой отчёт")
+    try:
+        payload = json.loads(raw)
+        numeric = ("free_bytes", "outbox_retained_bytes", "outbox_attention", "outbox_stuck", "active_jobs")
+        data = {name: payload[name] for name in numeric}
+        if any(type(v) is not int or v < 0 or v > 2**63-1 for v in data.values()):
+            raise ValueError("invalid metrics")
+        for name in ("puller_sha256", "worker_sha256"):
+            if not isinstance(payload.get(name), str) or not re.fullmatch(r"[0-9a-f]{64}", payload[name]):
+                raise ValueError("invalid digest")
+            data[name] = payload[name]
+    except (ValueError, KeyError, TypeError):
+        raise HTTPException(400, "некорректный отчёт ноды")
+    data["generated_at"] = time.time()
+    data["ok"] = (data["free_bytes"] >= 32*1024**3 and data["outbox_retained_bytes"] <= 64*1024**3
+                  and not data["outbox_attention"] and not data["outbox_stuck"])
+    _adm_state_set("render_node_health", data)
+    return JSONResponse({"accepted": True})
+
+
+@app.get("/api/render/{jid}/assets")
+async def render_assets(jid: int, request: Request):
+    """Стримит tar.gz материалов проекта (googler/ + _ASSETS/ + _FINAL_AUDIO_*/)."""
+    _require_puller(request)
+    c = db(); t = c.execute("SELECT * FROM queue_tasks WHERE job_id=? AND kind='render'", (jid,)).fetchone(); c.close()
+    if not t:
+        raise HTTPException(404)
+    _require_render_claim(request, t)
+    if t["status"] != "running":
+        raise HTTPException(409, "render job уже не активен")
+    proj = _project_dir(t["tenant_id"], t["project_id"])
+    # Preparation can call Codex and ffprobe: never block the ASGI event loop.
+    try:
+        await run_in_threadpool(_prepare_render_sound, dict(t), proj)
+    except Exception as exc:
+        _log_line(jid, "[autosound] подготовка фона не удалась (" + type(exc).__name__ + "); основной рендер продолжится")
+    _c = db()
+    try:
+        latest = _c.execute("SELECT * FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+    finally:
+        _c.close()
+    if not latest or latest["status"] != "running":
+        raise HTTPException(409, "render job уже не активен")
+    _require_render_claim(request, latest)
+    # «googler video» — сгенерированные видео-клипы: БЕЗ них рендер на боксе соберёт слайдшоу без видео (audit 02.07)
+    items = [d for d in ("googler", "Images", "googler video", "_ASSETS", "_RENDER_MEDIA") if os.path.isdir(os.path.join(proj, d))]
+    items += [os.path.basename(p) for p in glob.glob(os.path.join(proj, "_FINAL_AUDIO_*")) if os.path.isdir(p)]
+    if not items:
+        raise HTTPException(404, "нет материалов")
+    # карта «картинка→видео»: абсолютные VPS-пути внутри не существуют на GPU-боксе → относим к project_dir
+    # (render_worker понимает относительные: см. render_worker.py ~4360)
+    vrf = os.path.join(proj, "googler_video_references.json")
+    if os.path.isfile(vrf):
+        try:
+            _lst = json.load(open(vrf, encoding="utf-8"))
+            if isinstance(_lst, list):
+                _base = proj.rstrip(os.sep) + os.sep
+                _rel = [os.path.relpath(str(p), proj) if str(p).startswith(_base) else str(p) for p in _lst]
+                with open(vrf, "w", encoding="utf-8") as _f:
+                    json.dump(_rel, _f, ensure_ascii=False)
+            items.append("googler_video_references.json")
+        except Exception:
+            pass
+    proc = subprocess.Popen(["tar", "czf", "-", "-C", proj] + items, stdout=subprocess.PIPE)
+
+    def _gen():
+        try:
+            while True:
+                chunk = proc.stdout.read(262144)
+                if not chunk:
+                    break
+                yield chunk
+        finally:
+            try: proc.stdout.close()
+            except Exception: pass
+            proc.wait()
+    return StreamingResponse(_gen(), media_type="application/gzip",
+                             headers={"Content-Disposition": f"attachment; filename=assets_{jid}.tar.gz"})
+
+
+@app.post("/api/render/{jid}/progress")
+async def render_progress(jid: int, request: Request):
+    """Пуллер шлёт прогресс (urlencoded: pct, stage) + обновляет lease."""
+    _require_puller(request)
+    d = await _form(request)
+    try:
+        pct = float(d.get("pct") or 0)
+    except Exception:
+        pct = 0
+    stage = (d.get("stage") or "")[:120]
+    token = request.headers.get("X-Render-Claim", "")
+    c = db(); cur = c.execute("UPDATE queue_tasks SET progress=?, stage=?, claimed=? "
+                              "WHERE job_id=? AND kind='render' AND status='running' AND claim_token=?",
+                              (pct, stage, time.time(), jid, token)); c.commit(); c.close()
+    if cur.rowcount != 1:
+        raise HTTPException(409, "render job отменён или завершён")
+    return JSONResponse({"ok": True})
+
+
+def _render_row(jid, connection=None):
+    c = connection or db()
+    try:
+        t = c.execute("SELECT * FROM queue_tasks WHERE job_id=? AND kind='render'", (jid,)).fetchone()
+        if not t:
+            raise HTTPException(404, "нет задачи рендера")
+        return t
+    finally:
+        if connection is None:
+            c.close()
+
+
+def _render_receipt(t):
+    receipt = {"ok": True, "accepted": False, "job_id": t["job_id"], "status": t["status"]}
+    if t["status"] == "done":
+        path = os.path.join(_project_dir(t["tenant_id"], t["project_id"]), t["output_rel"] or "")
+        if not t["render_sha256"] or not os.path.isfile(path) or os.path.getsize(path) != t["render_size"]:
+            raise HTTPException(503, "квитанция не подтверждена файлом; MP4 на ноде необходимо сохранить")
+        # Receipt is infrequent; verify durable bytes rather than trusting DB alone.
+        with open(path, "rb") as f:
+            h = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1024 * 1024), b""):
+                h.update(chunk)
+            digest = h.hexdigest()
+        if digest != t["render_sha256"]:
+            raise HTTPException(503, "контрольная сумма MP4 изменилась; сохраните копию на ноде")
+        receipt.update(accepted=True, sha256=digest, size=t["render_size"])
+    elif t["status"] == "error" and t["render_error_sha256"]:
+        receipt.update(accepted=True, error_sha256=t["render_error_sha256"])
+    elif t["status"] != "running":
+        raise HTTPException(409, "задача отменена или передана другому исполнителю")
+    return receipt
+
+
+def _render_fsync_dir(path):
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _render_staged_file(directory):
+    os.makedirs(directory, exist_ok=True)
+    fd, path = tempfile.mkstemp(prefix=".incoming-", dir=directory)
+    return os.fdopen(fd, "wb"), path
+
+
+@app.get("/api/render/{jid}/receipt")
+async def render_receipt(jid: int, request: Request):
+    _require_puller(request)
+    t = _render_row(jid)
+    _require_render_claim(request, t)
+    return JSONResponse(await run_in_threadpool(_render_receipt, t))
+
+
+@app.post("/api/render/{jid}/result")
+async def render_result(jid: int, request: Request):
+    """Stage, verify, fence and commit; a repeated delivery returns the same receipt."""
+    _require_puller(request)
+    status = request.query_params.get("status", "done")
+    if status not in ("done", "error"):
+        raise HTTPException(400, "неверный статус рендера")
+    t = _render_row(jid)
+    _require_render_claim(request, t)
+    expected = request.headers.get("X-Render-SHA256", "").lower()
+    err = (request.query_params.get("error", "") or "ошибка рендера")[:480]
+    error_hash = hashlib.sha256(err.encode("utf-8")).hexdigest()
+    supplied_error = request.headers.get("X-Render-Error-SHA256", "").lower()
+    if expected and not re.fullmatch(r"[0-9a-f]{64}", expected):
+        raise HTTPException(400, "неверный SHA256")
+    if status == "error" and supplied_error and supplied_error != error_hash:
+        raise HTTPException(400, "SHA256 ошибки не совпадает")
+    if t["status"] != "running":
+        receipt = await run_in_threadpool(_render_receipt, t)
+        same = (status == "done" and t["status"] == "done" and expected == t["render_sha256"]
+                or status == "error" and t["status"] == "error" and error_hash == t["render_error_sha256"])
+        if not same:
+            raise HTTPException(409, "другой результат уже принят")
+        return JSONResponse(receipt)
+    stage = None
+    size = 0
+    digest = None
+    proj = _project_dir(t["tenant_id"], t["project_id"])
+    try:
+        if status == "done":
+            render_dir = os.path.join(proj, "render")
+            f, stage = _render_staged_file(render_dir)
+            h = hashlib.sha256()
+            with f:
+                async for chunk in request.stream():
+                    if chunk:
+                        size += len(chunk)
+                        if size > 64 * 1024**3:
+                            raise HTTPException(413, "MP4 больше 64 GiB")
+                        await run_in_threadpool(f.write, chunk)
+                        await run_in_threadpool(h.update, chunk)
+                await run_in_threadpool(f.flush)
+                await run_in_threadpool(os.fsync, f.fileno())
+            digest = h.hexdigest()
+            length = request.headers.get("Content-Length")
+            if size < 1024 or length and (not length.isdigit() or int(length) != size):
+                raise HTTPException(400, "неполный MP4")
+            if expected and digest != expected:
+                raise HTTPException(400, "SHA256 MP4 не совпадает")
+        def commit_result():
+            nonlocal stage
+            c = db()
+            try:
+                c.execute("PRAGMA synchronous=FULL")
+                c.execute("BEGIN IMMEDIATE")
+                live = _render_row(jid, c)
+                _require_render_claim(request, live)
+                if live["status"] != "running":
+                    if (status == "done" and live["status"] == "done" and digest == live["render_sha256"]
+                            or status == "error" and live["status"] == "error" and error_hash == live["render_error_sha256"]):
+                        c.rollback()
+                        return JSONResponse(_render_receipt(live))
+                    raise HTTPException(409, "состояние рендера изменилось во время загрузки")
+                if status == "done":
+                    params = json.loads(live["params"] or "{}")
+                    if _truthy(params.get("auto_chapters"), False):
+                        transcript = os.path.join(proj, live["transcript_rel"] or "")
+                        if not live["transcript_sha256"] or not os.path.isfile(transcript):
+                            raise HTTPException(409, "главы включены: сначала доставьте транскрипт")
+                        with open(transcript, "rb") as source:
+                            actual_hash = hashlib.sha256(source.read()).hexdigest()
+                        if actual_hash != live["transcript_sha256"]:
+                            raise HTTPException(409, "транскрипт повреждён; MP4 на ноде необходимо сохранить")
+                    # Claim-specific path also protects a crash between rename and DB commit.
+                    suffix = hashlib.sha256(live["claim_token"].encode()).hexdigest()[:20]
+                    out_rel = f"render/{jid}_{suffix}.mp4"
+                    os.replace(stage, os.path.join(proj, out_rel))
+                    stage = None
+                    _render_fsync_dir(render_dir)
+                    c.execute("UPDATE queue_tasks SET status='done',progress=100,stage='done',output_rel=?,"
+                              "render_sha256=?,render_size=?,finished=? WHERE job_id=?",
+                              (out_rel, digest, size, _now(), jid))
+                    c.execute("UPDATE gen_jobs SET status='done',error=NULL WHERE id=?", (jid,))
+                    if _truthy(params.get("auto_chapters"), False) and live["uid"]:
+                        c.execute("INSERT OR IGNORE INTO render_followups(job_id,status,next_attempt) VALUES(?,'pending',0)", (jid,))
+                else:
+                    c.execute("UPDATE queue_tasks SET status='error',error=?,render_error_sha256=?,finished=? WHERE job_id=?",
+                              (err, error_hash, _now(), jid))
+                    c.execute("UPDATE gen_jobs SET status='error',error=? WHERE id=?", (err, jid))
+                c.commit()
+                receipt = _render_receipt(_render_row(jid, c))
+            except Exception:
+                c.rollback()
+                raise
+            finally:
+                c.close()
+            return JSONResponse(receipt)
+        return await run_in_threadpool(commit_result)
+    finally:
+        if stage:
+            try:
+                os.unlink(stage)
+            except FileNotFoundError:
+                pass
+
+
+_TRANSCRIPT_MAX_BYTES = 8 * 1024 * 1024
+
+
+@app.post("/api/render/{jid}/transcript")
+async def render_transcript(jid: int, request: Request):
+    _require_puller(request)
+    t = _render_row(jid)
+    _require_render_claim(request, t)
+    buf = bytearray()
+    async for chunk in request.stream():
+        buf.extend(chunk)
+        if len(buf) > _TRANSCRIPT_MAX_BYTES:
+            raise HTTPException(413, "транскрипт больше 8 МБ")
+    try:
+        data = json.loads(buf)
+        segs = data.get("segments")
+        if not isinstance(segs, list) or not segs:
+            raise ValueError("нет сегментов")
+    except Exception:
+        raise HTTPException(400, "неверный транскрипт")
+    digest = hashlib.sha256(buf).hexdigest()
+    directory = os.path.join(_project_dir(t["tenant_id"], t["project_id"]), "chapters")
+    f, stage = _render_staged_file(directory)
+    c = db()
+    try:
+        with f:
+            f.write(buf)
+            f.flush()
+            os.fsync(f.fileno())
+        c.execute("PRAGMA synchronous=FULL")
+        c.execute("BEGIN IMMEDIATE")
+        live = _render_row(jid, c)
+        _require_render_claim(request, live)
+        if live["status"] != "running":
+            if live["status"] == "done" and digest == live["transcript_sha256"]:
+                return JSONResponse({"ok": True, "sha256": digest, "segments": len(segs)})
+            raise HTTPException(409, "задача уже не выполняется")
+        if live["transcript_sha256"] and live["transcript_sha256"] != digest:
+            raise HTTPException(409, "этот claim уже доставил другой транскрипт")
+        suffix = hashlib.sha256(live["claim_token"].encode()).hexdigest()[:20]
+        rel = f"chapters/transcript_{jid}_{suffix}.json"
+        os.replace(stage, os.path.join(directory, os.path.basename(rel)))
+        _render_fsync_dir(directory)
+        c.execute("UPDATE queue_tasks SET transcript_sha256=?,transcript_rel=? WHERE job_id=?", (digest, rel, jid))
+        c.commit()
+        return JSONResponse({"ok": True, "sha256": digest, "segments": len(segs)})
+    finally:
+        c.close()
+        if os.path.exists(stage):
+            os.unlink(stage)
+
+
+def _run_render_followups():
+    c = db()
+    try:
+        pending = c.execute("SELECT q.* FROM render_followups f JOIN queue_tasks q ON q.job_id=f.job_id "
+                            "WHERE f.status='pending' AND f.next_attempt<=? LIMIT 10", (_now(),)).fetchall()
+    finally:
+        c.close()
+    for row in pending:
+        try:
+            params = json.loads(row["params"] or "{}")
+            child = _enqueue(row["uid"], row["tenant_id"], row["project_id"], "chapters",
+                             {k: v for k, v in params.items() if k.startswith("chapters_")},
+                             parent_job_id=row["job_id"])
+            c = db()
+            c.execute("UPDATE render_followups SET status=?,next_attempt=? WHERE job_id=?",
+                      ("done" if child else "pending", _now() + 60, row["job_id"]))
+            c.commit()
+            c.close()
+        except Exception:
+            log_exc("render follow-up", extra=str(row["job_id"]))
+            c = db()
+            c.execute("UPDATE render_followups SET next_attempt=? WHERE job_id=?", (_now() + 60, row["job_id"]))
+            c.commit()
+            c.close()
+
+
+@app.get("/api/render/{jid}/download")
+async def render_download(jid: int, request: Request):
+    """Партнёр скачивает готовый mp4 (session-auth)."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    c = db(); t = c.execute("SELECT * FROM queue_tasks WHERE job_id=? AND tenant_id=?", (jid, tid)).fetchone(); c.close()
+    if not t or t["kind"] != "render" or t["status"] != "done" or not t["output_rel"]:
+        raise HTTPException(404, "нет готового файла")
+    path = os.path.join(_project_dir(tid, t["project_id"]), t["output_rel"])
+    if not os.path.exists(path):
+        raise HTTPException(404)
+    proj = _get_project(tid, t["project_id"])
+    base = re.sub(r"[^\w\-]+", "_", (proj["name"] if proj else "video"))[:60] or "video"
+    return FileResponse(path, media_type="video/mp4", filename=base + ".mp4")
+
+
+@app.post("/api/render/{jid}/delete")
+async def render_delete(jid: int, request: Request):
+    """Удалить рендер: mp4 с диска + строку задачи из списка «Мои рендеры».
+
+    Работает в любом состоянии. Идущую сборку это же и останавливает: у ноды
+    следующий post_progress по удалённой строке получит 409, и пуллер бросит рендер
+    (см. tools/render_puller.py: 409 → False → выход). Сироты на диске не остаётся —
+    mp4 пишет сервер в /api/render/{jid}/result, а без строки он туда не дойдёт.
+    """
+    u = require_web_user(request)
+    tid = _tid(u)
+    c = db()
+    t = c.execute("SELECT * FROM queue_tasks WHERE job_id=? AND tenant_id=?",
+                  (jid, tid)).fetchone()
+    c.close()
+    if not t or t["kind"] != "render":
+        raise HTTPException(404, "нет такого рендера")
+    pid = t["project_id"]
+    projdir = os.path.abspath(_project_dir(tid, pid))
+    # Файл берём только из output_rel и только изнутри каталога проекта.
+    rel = (t["output_rel"] or "").replace("\\", "/").lstrip("/")
+    if rel:
+        full = os.path.abspath(os.path.join(projdir, rel))
+        if (full == os.path.join(projdir, *rel.split("/"))
+                and full.startswith(projdir + os.sep) and os.path.isfile(full)):
+            try:
+                os.remove(full)
+            except OSError:
+                pass
+    c = db()
+    c.execute("DELETE FROM queue_tasks WHERE job_id=? AND tenant_id=? AND kind='render'",
+              (jid, tid))
+    c.execute("DELETE FROM job_logs WHERE job_id=?", (jid,))
+    # Строку gen_jobs НЕ трогаем намеренно: это реестр номеров задач. Номер берётся как
+    # max(rowid gen_jobs, job_id queue_tasks)+1 (см. _enqueue), и если вычистить обе таблицы,
+    # счётчик откатится назад и следующая задача переиспользует только что освобождённый id.
+    # Пометка «удалён» держит номер занятым; пользователю эта строка нигде не видна.
+    c.execute("UPDATE gen_jobs SET status='deleted', error=NULL WHERE id=?", (jid,))
+    c.commit()
+    c.close()
+    if request.headers.get("X-Requested-With") == "fetch":
+        return {"ok": True}
+    return RedirectResponse(f"/p/{pid}?tab=rnd", 302)
+
+
+@app.get("/api/jobs/{jid}/logs")
+async def job_logs_sse(jid: int, request: Request):
+    u = web_user(request)
+    if not u:
+        raise HTTPException(401)
+    tid = _tid(u)
+    c = db(); t = c.execute("SELECT tenant_id FROM queue_tasks WHERE job_id=?", (jid,)).fetchone(); c.close()
+    if not t or t["tenant_id"] != tid:
+        raise HTTPException(403)
+
+    # + свои ключи владельца тенанта: BYOK-секрет тоже не должен доехать до экрана
+    sse_secrets = (_all_server_credential_values()
+                   + _own_credential_secret_values(_own_keys(u)))
+
+    def _clean(line):
+        safe = _redact_worker_output(line or "", extra_secrets=sse_secrets)
+        return safe.replace("\r", "").replace("\n", " ")
+
+    async def gen():
+        import asyncio
+        # 1) НАЧАЛЬНЫЙ бэклог — пакетами (одно SSE-событие на ~800 строк вместо тысяч кадров) →
+        #    мгновенная отрисовка даже для логов на 15k строк. Индекс (job_id,id) делает выборку быстрой.
+        MAXB = 3000   # кап хвоста: огромные логи (до 15k строк) не грузим целиком — тянем последние 3000
+        c = db()
+        total = c.execute("SELECT COUNT(*) FROM job_logs WHERE job_id=?", (jid,)).fetchone()[0]
+        if total > MAXB:
+            rows = c.execute("SELECT id,line FROM job_logs WHERE job_id=? ORDER BY id DESC LIMIT ?",
+                             (jid, MAXB)).fetchall()[::-1]   # индекс (job_id,id) → дешёвый забор с конца
+        else:
+            rows = c.execute("SELECT id,line FROM job_logs WHERE job_id=? ORDER BY id", (jid,)).fetchall()
+        st = c.execute("SELECT status FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+        c.close()
+        last = rows[-1]["id"] if rows else 0
+        if total > MAXB:
+            yield f"data: … показаны последние {MAXB} строк из {total} (начало лога скрыто для скорости) …\n\n"
+        CH = 800
+        for i in range(0, len(rows), CH):
+            yield "data: " + "\ndata: ".join(_clean(r["line"]) for r in rows[i:i + CH]) + "\n\n"
+        status = st["status"] if st else "?"
+        if status in ("done", "error", "cancelled"):
+            yield f"event: end\ndata: {status}\n\n"
+            return
+        # 2) ЖИВОЙ хвост — построчно, короткими опросами (только новые строки, id>last по индексу)
+        idle = 0
+        while True:
+            c = db()
+            rows = c.execute("SELECT id,line FROM job_logs WHERE job_id=? AND id>? ORDER BY id", (jid, last)).fetchall()
+            st = c.execute("SELECT status FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+            c.close()
+            for r in rows:
+                last = r["id"]
+                yield "data: " + _clean(r["line"]) + "\n\n"
+            status = st["status"] if st else "?"
+            if status in ("done", "error", "cancelled"):
+                yield f"event: end\ndata: {status}\n\n"
+                break
+            yield ": ping\n\n"
+            await asyncio.sleep(0.8)
+            idle += 1
+            if idle > 2400:   # ~32 мин страховка
+                yield "event: end\ndata: timeout\n\n"; break
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
+
+
+@app.post("/api/jobs/{jid}/cancel")
+async def job_cancel(jid: int, request: Request):
+    u = require_web_user(request)
+    tid = _tid(u)
+    c = db(); c.execute("BEGIN IMMEDIATE")
+    t = c.execute("SELECT tenant_id,status FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+    if not t or t["tenant_id"] != tid:
+        c.rollback(); c.close()
+        raise HTTPException(403)
+    if t["status"] not in ("queued", "running"):
+        c.rollback(); c.close()
+        raise HTTPException(409, "задача уже завершена")
+    cur = c.execute("UPDATE queue_tasks SET status='cancelled', finished=?, "
+                    "claim_token=NULL, claimed=NULL "
+                    "WHERE job_id=? AND status IN ('queued','running')", (_now(), jid))
+    if cur.rowcount != 1:
+        c.rollback(); c.close()
+        raise HTTPException(409, "задача уже завершена")
+    c.execute("UPDATE gen_jobs SET status='cancelled' WHERE id=?", (jid,))
+    c.execute("UPDATE card_jobs SET status='cancelled', finished=?, error_code='cancelled', "
+              "last_error='cancelled' WHERE job_id=?", (_now(), jid))
+    c.commit(); c.close()
+    CANCELLED.add(jid)
+    with RUNNING_LOCK:
+        proc = RUNNING_PROCS.get(jid)
+    _request_worker_cancel(jid, proc)
+    _log_line(jid, "⏹ отменено пользователем")
+    if request.headers.get("X-Requested-With") == "fetch":
+        return {"ok": True}
+    return RedirectResponse("/queue", 302)
+
+
+@app.post("/api/jobs/{jid}/retry")
+async def job_retry(jid: int, request: Request):
+    """Повторить упавшую/отменённую задачу — новая постановка с теми же параметрами."""
+    u = require_web_user(request)
+    tid = _tid(u)
+    c = db()
+    t = c.execute("SELECT * FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+    c.close()
+    if not t or t["tenant_id"] != tid:
+        raise HTTPException(403)
+    if t["status"] not in ("error", "cancelled"):
+        raise HTTPException(409, "повтор доступен только для ошибочной или отменённой задачи")
+    if t["kind"] == "cards":
+        if not _provider_available_for(u, card_contract.PROVIDER_GROUP):
+            raise HTTPException(400, f"{_provider_title(card_contract.PROVIDER_GROUP)}: {NO_SERVER_KEY_HINT}")
+        _retry_card_task(jid, tid)
+        return ({"ok": True, "job_id": jid}
+                if request.headers.get("X-Requested-With") == "fetch"
+                else RedirectResponse("/queue", 302))
+    if t["kind"] in ("prompts", "images", "regen"):
+        conflict = _active_image_mutation(tid, t["project_id"])
+        if conflict:
+            raise HTTPException(
+                409,
+                f"картинки проекта уже меняются задачей #{conflict['job_id']} "
+                f"({conflict['kind']}); дождитесь её завершения",
+            )
+    elif _active_task(tid, t["project_id"], t["kind"]):
+        raise HTTPException(409, "такая задача проекта уже в очереди или выполняется")
+    resumed = _resume_retained_remote_job(t)
+    if resumed:
+        return ({"ok": True, "job_id": resumed, "resumed": True}
+                if request.headers.get("X-Requested-With") == "fetch" else RedirectResponse("/queue", 302))
+    task_failover = _prompt_failover_from_row(t)
+    prompt_snapshot = _PROMPT_FAILOVER_UNSET
+    if t["kind"] == "prompts" and task_failover == _PROMPT_FAILOVER_DISABLED:
+        prompt_snapshot = t["provider"]
+        if prompt_snapshot not in _PROMPT_PROVIDER_GROUPS:
+            raise HTTPException(409, "у закреплённой задачи повреждён snapshot prompt-provider")
+    try:
+        params = json.loads(t["params"] or "{}")
+    except Exception:
+        params = {}
+    reference_bundle_id = params.pop(_REFERENCE_BUNDLE_PARAM, _REFERENCE_BUNDLE_UNSET)
+    _is_fetch = request.headers.get("X-Requested-With") == "fetch"
+    if t["kind"] == "render" and not _render_inputs_ready(tid, t["project_id"]):
+        _save_project_settings(tid, t["project_id"], {"deferred_pending": t["uid"] or u["id"]})
+        return {"ok": True, "deferred": True} if _is_fetch else RedirectResponse("/queue", 302)
+    if t["kind"] != "render":
+        # Тот же гвард, что на постановке (gen_submit): задача упала «нет ключа» —
+        # «Повторить» не должен снова ставить её в очередь под тот же провал.
+        if prompt_snapshot is not _PROMPT_FAILOVER_UNSET:
+            if not _provider_available_for(u, prompt_snapshot):
+                raise HTTPException(400, f"{_provider_title(prompt_snapshot)}: {NO_SERVER_KEY_HINT}")
+        else:
+            _assert_provider_available(
+                u, t["kind"], params, project_id=t["project_id"]
+            )
+        if t["kind"] == "images" and _needs_scene_plan(tid, t["project_id"], params):
+            _assert_provider_available(
+                u, "prompts", params, project_id=t["project_id"]
+            )
+    try:
+        njid = _enqueue(
+            t["uid"] or u["id"], tid, t["project_id"], t["kind"], params,
+            prompt_failover=task_failover,
+            prompt_provider_snapshot=prompt_snapshot,
+            reference_bundle_id=reference_bundle_id,
+        )
+    except (ImageModeContractError, reference_contract.ReferenceContractError) as exc:
+        raise HTTPException(409, f"повреждён контракт исходной задачи: {exc}")
+    if njid is None:
+        raise HTTPException(409, "такая задача проекта уже в очереди или выполняется")
+    return {"ok": True} if _is_fetch else RedirectResponse("/queue", 302)
+
+
+# Модалка лога задачи (клик «📄 Лог» на карточке очереди) — стрим через существующий SSE
+# /api/jobs/{jid}/logs (реплеит сохранённый лог + живой хвост, шлёт event:end на done/error/cancelled).
+_QLOG_MODAL = """
+<div id=qlog onclick="if(event.target===this)qLogClose()" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.62);z-index:300;align-items:center;justify-content:center;padding:20px">
+ <div style="background:var(--surface);border:1px solid var(--border);border-radius:12px;width:min(880px,96vw);max-height:88vh;display:flex;flex-direction:column;box-shadow:0 16px 70px rgba(0,0,0,.6)">
+  <div style="display:flex;align-items:center;gap:10px;padding:13px 16px;border-bottom:1px solid var(--border)">
+   <span id=qlogttl style="font-weight:600;font-size:14px;flex:1">Лог задачи</span>
+   <span id=qlogst class=muted style="font-size:12px"></span>
+   <button type=button class="btn btn-ghost btn-sm" onclick="qLogClose()">Закрыть</button>
+  </div>
+  <div id=qlogbody class=log style="margin:0;height:auto;flex:1;min-height:220px;border:0;border-radius:0 0 12px 12px"></div>
+ </div>
+</div>
+<script>
+var QES=null;
+function qLog(jid,title){
+ var ov=document.getElementById('qlog'),b=document.getElementById('qlogbody');
+ document.getElementById('qlogttl').textContent='Лог задачи #'+jid+(title?(' \\u00b7 '+title):'');
+ document.getElementById('qlogst').textContent='загрузка…';
+ b.textContent=''; ov.style.display='flex';
+ if(QES){QES.close();}
+ QES=new EventSource('/api/jobs/'+jid+'/logs');
+ QES.onmessage=function(e){var atB=b.scrollHeight-b.scrollTop-b.clientHeight<50;b.textContent+=e.data+'\\n';if(atB)b.scrollTop=b.scrollHeight;document.getElementById('qlogst').textContent='';};
+ QES.addEventListener('end',function(e){QES.close();QES=null;var s={done:'готово',error:'ошибка',cancelled:'отменено',timeout:'таймаут'}[e.data]||e.data;document.getElementById('qlogst').textContent='статус: '+s;b.scrollTop=b.scrollHeight;});
+ QES.onerror=function(){if(QES){QES.close();QES=null;}document.getElementById('qlogst').textContent='соединение прервано';};
+}
+function qLogClose(){document.getElementById('qlog').style.display='none';if(QES){QES.close();QES=null;}}
+document.addEventListener('keydown',function(e){if(e.key==='Escape')qLogClose();});
+</script>
+"""
+
+
+# ============================================================
+# Живая очередь (полоска-виджет): один лёгкий read-only снимок на процесс.
+# Наружу отдаём ТОЛЬКО целые числа-агрегаты + свои собственные — ни логинов, ни uid,
+# ни tenant_id, ни названий проектов, ни чужих ошибок.
+# ============================================================
+# Режим показа числа людей считает СЕРВЕР: переключение «точно ↔ бакеты» — одной
+# константой, фронт при этом не трогаем (он рисует готовый people_label).
+PULSE_PEOPLE_MODE = "exact"       # "exact" — точное число; "bucket" — 1 / 2-3 / 4-9 / 10+
+_PULSE_TTL = 3.0
+_PULSE_LOCK = threading.Lock()
+_PULSE_CACHE = {"ts": 0.0, "data": None}
+
+
+def _pulse_people_label(n):
+    if PULSE_PEOPLE_MODE == "bucket":
+        if n <= 0:
+            return "0"
+        if n == 1:
+            return "1"
+        if n <= 3:
+            return "2-3"
+        if n <= 9:
+            return "4-9"
+        return "10+"
+    return str(int(n))
+
+
+def _pulse_snapshot():
+    """Снимок активной очереди: (data, cache_age).
+
+    ОДИН SELECT по покрывающему индексу idx_queue_sched, колонку params НЕ читаем —
+    чтение JSON превращает индексный скан в row lookup. Глобальная часть одинакова для
+    всех, поэтому кэшируется на _PULSE_TTL (образец — _CONC_CACHE выше): 20 вкладок по
+    5с дают ≤0.35 запроса в БД в секунду. Персональные числа берём из этой же выборки,
+    по карте uid→[ждут, идут] (карта живёт только в памяти процесса, наружу не уходит).
+    """
+    now = time.time()
+    with _PULSE_LOCK:
+        d = _PULSE_CACHE["data"]
+        if d is not None and now - _PULSE_CACHE["ts"] < _PULSE_TTL:
+            return d, now - _PULSE_CACHE["ts"]
+    waiting = running = 0
+    people = set()
+    mine = {}
+    rows = []            # (status, uid, kind, provider, created) — слоты и позиция в очереди
+    degraded = False
+    try:
+        c = db()
+        try:
+            for st, uid, kind, prov, created in c.execute(
+                    "SELECT status, uid, kind, provider, created FROM queue_tasks "
+                    "WHERE status IN ('queued','running')"):
+                rows.append((st, uid, kind, prov, created))
+                w = 1 if st == "queued" else 0
+                waiting += w
+                running += 1 - w
+                # uid IS NULL — legacy-строки; без отброса они слиплись бы в одного
+                # фантомного человека (шедулер страхуется так же).
+                if uid is None:
+                    continue
+                people.add(uid)
+                m = mine.get(uid)
+                if m is None:
+                    m = mine[uid] = [0, 0]
+                m[0] += w
+                m[1] += 1 - w
+        finally:
+            c.close()
+    except Exception:
+        waiting = running = 0
+        people, mine, rows, degraded = set(), {}, [], True
+    data = {"waiting": waiting, "running": running, "people": len(people),
+            "mine": mine, "rows": rows, "degraded": degraded}
+    with _PULSE_LOCK:
+        _PULSE_CACHE["data"], _PULSE_CACHE["ts"] = data, time.time()
+    return data, 0.0
+
+
+# ── Свободные слоты по этапам + позиция в очереди ────────────────────────────
+# Виджет «Свободные слоты» из локального приложения, но по СЕРВЕРНОЙ очереди:
+# сколько мест ещё влезет на каждом этапе и какая задача по счёту в очереди.
+# Считается из того же снимка (_pulse_snapshot), лишних запросов в БД нет.
+_STAGES = (
+    # (код, подпись, виды задач, провайдеры-обслуживающие)
+    ("script", "Сценарий", ("prompts", "chapters", "cards"), tuple(sorted(_PROMPT_PROVIDER_GROUPS))),
+    ("photo",  "Фото",     ("images", "regen"),     ("recrafter", "veo", "openai", "bing")),
+    ("video",  "Видео",    ("video", "regen_video"), ("veo", "recrafter")),
+    ("voice",  "Озвучка",  ("tts",),                 tuple(sorted(set(_TTS_ENG_PROV.values())))),
+    ("render", "Монтаж",   ("render",),              ("render",)),
+)
+
+
+def _stage_slots(rows):
+    """Свободные слоты по этапам: [{code,label,busy,total,free,waiting}].
+
+    total — сумма job-слотов провайдеров этапа (сколько задач влезает разом);
+    busy  — сколько уже идёт НА ЭТИХ провайдерах (любого вида: veo и recrafter
+            обслуживают и фото, и видео — общий пул, врать нельзя);
+    waiting — сколько задач этапа стоит в очереди.
+    """
+    out = []
+    for code, label, kinds, provs in _STAGES:
+        total = 0
+        for prov in provs:
+            try:
+                total += max(0, _provider_job_slots(prov))
+            except Exception:
+                pass
+        busy = waiting = 0
+        for st, _uid, kind, prov, _created in rows or []:
+            in_prov = prov in provs
+            in_kind = kind in kinds
+            if st == "running" and (in_prov or (prov is None and in_kind)):
+                busy += 1
+            elif st == "queued" and in_kind:
+                waiting += 1
+        out.append({"code": code, "label": label,
+                    "total": total, "busy": busy,
+                    "free": max(0, total - busy), "waiting": waiting})
+    return out
+
+
+def _queue_position(uid, rows):
+    """Позиция ближайшей задачи юзера: (номер, всего ждущих в её группе).
+
+    Номер — по времени постановки среди queued-задач ТОЙ ЖЕ группы провайдера:
+    именно в этом порядке шедулер их и разберёт. Нет своих задач → (None, 0).
+    """
+    if uid is None:
+        return None, 0
+    mine_q = [(created, prov) for st, u, _k, prov, created in (rows or [])
+              if st == "queued" and u == uid]
+    if not mine_q:
+        return None, 0
+    mine_q.sort(key=lambda x: (x[0] or 0))
+    my_created, my_prov = mine_q[0]
+    same = [created for st, _u, _k, prov, created in (rows or [])
+            if st == "queued" and prov == my_prov]
+    ahead = sum(1 for c in same if (c or 0) < (my_created or 0))
+    return ahead + 1, len(same)
+
+
+def _slots_widget(u):
+    """Карточки «Свободные слоты» по этапам СЕРВЕРНОЙ очереди.
+
+    Первый рендер сразу с настоящими числами (без мигания нулями), дальше их
+    обновляет тот же поллинг /api/queue/pulse, что и полоску, — своих запросов
+    виджет не добавляет (подписан на событие vs-pulse).
+    """
+    try:
+        snap, _age = _pulse_snapshot()
+        lanes = _stage_slots(snap.get("rows"))
+    except Exception:
+        lanes = []
+    cards = []
+    for L in lanes:
+        free, total, waiting = L["free"], L["total"], L["waiting"]
+        state = "ok" if free > 0 else "busy"
+        note = ("Свободно: %d из %d" % (free, total)) if total else "нет ключа"
+        if waiting:
+            note += " · ждёт %d" % waiting
+        cards.append(
+            '<div class="vs-slot %s" data-slot="%s">'
+            '<div class="vs-slot-h">%s<span class="vs-slot-cap">%d слот.</span></div>'
+            '<div class="vs-slot-s"><span class="dot"></span>'
+            '<b data-slot-state>%s</b></div>'
+            '<div class="vs-slot-n" data-slot-note>%s</div></div>'
+            % (state, L["code"], html.escape(L["label"]), total,
+               ("Свободен" if free > 0 else "Занят"), html.escape(note)))
+    return ('<div class="vs-slots" id="vs-slots">'
+            '<div class="vs-slots-h">Свободные слоты'
+            '<span class="muted" id="vs-slots-upd"></span></div>'
+            '<div class="vs-slots-grid">' + "".join(cards) + '</div></div>')
+
+
+_SLOTS_CSS = """<style>
+.vs-slots{border:1px solid var(--bd,#2a2f3a);border-radius:12px;padding:12px 14px;margin:0 0 18px;background:var(--card,#161a22)}
+.vs-slots-h{font-weight:600;margin:0 0 10px;display:flex;gap:10px;align-items:baseline}
+.vs-slots-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px}
+.vs-slot{border:1px solid var(--bd,#2a2f3a);border-radius:10px;padding:9px 11px;min-width:0}
+.vs-slot-h{display:flex;justify-content:space-between;gap:8px;font-size:13px;font-weight:600;align-items:baseline}
+.vs-slot-cap{font-size:11px;font-weight:400;opacity:.55;white-space:nowrap}
+.vs-slot-s{display:flex;align-items:center;gap:6px;margin:6px 0 2px;font-size:13px}
+.vs-slot-s .dot{width:7px;height:7px;border-radius:50%;background:#3ddc84;flex:none}
+.vs-slot.busy .dot{background:#e0a33e}
+.vs-slot-n{font-size:11.5px;opacity:.6}
+</style>"""
+
+
+_SLOTS_JS = """<script>
+(function(){
+ var box=document.getElementById('vs-slots'); if(!box)return;
+ function upd(d){
+  var L=(d&&d.lanes)||[]; if(!L.length)return;
+  L.forEach(function(x){
+   var el=box.querySelector('[data-slot="'+x.code+'"]'); if(!el)return;
+   var free=x.free|0, total=x.total|0, w=x.waiting|0;
+   el.className='vs-slot '+(free>0?'ok':'busy');
+   var st=el.querySelector('[data-slot-state]'); if(st)st.textContent=free>0?'Свободен':'Занят';
+   var n=el.querySelector('[data-slot-note]');
+   if(n)n.textContent=(total?('Свободно: '+free+' из '+total):'нет ключа')+(w?(' \u00b7 ждёт '+w):'');
+  });
+  var u=document.getElementById('vs-slots-upd');
+  if(u){var t=new Date();u.textContent='обновлено '+t.toTimeString().slice(0,8);}
+ }
+ document.addEventListener('vs-pulse',function(e){ try{upd(e.detail);}catch(_){} });
+})();
+</script>"""
+
+
+def _qstrip(u):
+    """Разметка полоски + первый рендер уже с настоящими числами (без «мигания нулями»).
+
+    Ставится ТОЛЬКО на дашборд и /queue. В общую шапку (_header) не идёт сознательно:
+    она рисуется на всех страницах, включая /models, и тащить туда поллинг незачем.
+    Любая ошибка не должна ронять страницу — отсюда общий try/except.
+    """
+    main_txt, mine_txt, cls = "Общая очередь студии: …", "", "vs-qstrip"
+    try:
+        snap, _age = _pulse_snapshot()
+        w, r = snap["waiting"], snap["running"]
+        mw, mr = (snap["mine"].get(u["id"]) or [0, 0])
+        pause_reason = _active_queue_pause_reason(snap.get("rows"), u["id"])
+        if _queue_paused():
+            cls += " pause"
+            main_txt = pause_reason or "Общая очередь студии: приостановлена"
+        elif pause_reason:
+            cls += " pause"
+            main_txt = pause_reason
+        elif snap["degraded"]:
+            cls += " off"
+            main_txt = "Общая очередь студии: нет данных"
+        elif not w and not r:
+            main_txt = "Общая очередь студии пуста — задачи стартуют сразу"
+        else:
+            if r:
+                cls += " run"
+            # согласование по числу: «1 ждёт», «2 ждут»; нулевую часть не показываем
+            _wd = lambda k, one, many: one if (k % 10 == 1 and k % 100 != 11) else many
+            _parts = ([f"{w} {_wd(w, 'ждёт', 'ждут')}"] if w else []) + ([f"{r} {_wd(r, 'идёт', 'идут')}"] if r else [])
+            main_txt = f"Общая очередь студии: {' · '.join(_parts)} · {_pulse_people_label(snap['people'])} чел."
+        if mw or mr:
+            mine_txt = "Ваши задачи: " + (f"{mw} в очереди" if mw else "") + (", " if (mw and mr) else "") + (f"{mr} идёт" if mr else "")
+    except Exception:
+        cls = "vs-qstrip off"
+    hid = "" if mine_txt else ' style="display:none"'
+    return (f'<a class="{cls}" id="vs-qstrip" href="/queue" '
+            f'title="Общая очередь студии — обновляется автоматически">'
+            f'<span class="dot"></span><span id="vs-qs-main">{html.escape(main_txt)}</span>'
+            f'<span class="mine" id="vs-qs-mine"{hid}>{html.escape(mine_txt)}</span></a>')
+
+
+@app.get("/api/queue/pulse")
+def api_queue_pulse(request: Request):
+    """Живая очередь для полоски: целые агрегаты по всей студии + СВОИ числа.
+
+    Read-only, для любого залогиненного юзера. Ошибка БД → 200 c degraded:true и нулями
+    (виджет не должен ронять страницу), а НЕ 500. Поля ahead/eta_sec/lanes есть в ответе,
+    но в минимальном варианте всегда null/[] — фронт один на три кабинета.
+    """
+    u = require_web_user(request)
+    snap, age = _pulse_snapshot()
+    try:
+        paused = bool(_queue_paused())
+        paused_reason = _active_queue_pause_reason(snap.get("rows"), u["id"])
+    except Exception:
+        paused = False
+        paused_reason = ""
+    mw, mr = (snap["mine"].get(u["id"]) or [0, 0])
+    # Заготовки lanes/ahead наконец заполняем: слоты по этапам и номер в очереди.
+    # Любая ошибка расчёта не должна ронять полоску — она и так рисуется по totals.
+    try:
+        lanes = _stage_slots(snap.get("rows"))
+    except Exception:
+        lanes = []
+    try:
+        pos, of_total = _queue_position(u["id"], snap.get("rows"))
+    except Exception:
+        pos, of_total = None, 0
+    return JSONResponse({
+        "service": "gen",
+        "ts": time.time(),
+        "cache_age": round(age, 2),
+        "paused": paused,
+        "paused_reason": paused_reason,
+        "totals": {"waiting": snap["waiting"], "running": snap["running"],
+                   "people": (None if PULSE_PEOPLE_MODE == "bucket" else snap["people"]),
+                   "people_label": _pulse_people_label(snap["people"])},
+        "mine": {"waiting": mw, "running": mr,
+                 "ahead": (None if pos is None else max(0, pos - 1)),
+                 "position": pos, "of_total": of_total,
+                 "eta_sec": None, "eta_approx": True},
+        "lanes": lanes,
+        "health": {"worker": "ok", "note": paused_reason},
+        "degraded": bool(snap["degraded"]),
+    })
+
+
+_QUEUE_CLEAR_JS = """<script>
+function clearDone(btn){
+ if(!confirm('Убрать из списка все завершённые задачи? Активные останутся, файлы проектов не удаляются.'))return;
+ btn.disabled=true; var old=btn.innerHTML; btn.textContent='Убираю…';
+ fetch('/api/queue/clear',{method:'POST'}).then(function(r){return r.json();}).then(function(d){
+  if(d&&d.ok){location.reload();}
+  else{alert((d&&d.msg)||'Не получилось очистить');btn.disabled=false;btn.innerHTML=old;}
+ }).catch(function(){alert('Сеть недоступна');btn.disabled=false;btn.innerHTML=old;});
+}
+</script>"""
+
+
+@app.post("/api/queue/clear")
+async def queue_clear(request: Request):
+    """Убрать из очереди завершённые задачи СВОЕГО тенанта (queued/running не трогаем).
+
+    Чистятся queue_tasks + job_logs. gen_jobs остаются: там result_files, то есть
+    ссылки на готовые результаты — их удаление было бы потерей данных, а просьба
+    была про длину списка.
+    """
+    u = web_user(request)
+    if not u:
+        return JSONResponse({"ok": False, "msg": "нужен вход"}, status_code=403)
+    tid = _tid(u)
+    c = db()
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        rows = c.execute("SELECT job_id FROM queue_tasks WHERE tenant_id=? "
+                         "AND status NOT IN ('queued','running')", (tid,)).fetchall()
+        jids = [r["job_id"] for r in rows]
+        if jids:
+            for i in range(0, len(jids), 400):     # SQLite ограничивает число параметров
+                chunk = jids[i:i + 400]
+                marks = ",".join("?" * len(chunk))
+                c.execute(f"DELETE FROM job_logs WHERE job_id IN ({marks})", chunk)
+                c.execute(f"DELETE FROM queue_tasks WHERE job_id IN ({marks}) "
+                          "AND status NOT IN ('queued','running')", chunk)
+        c.commit()
+    except Exception as e:
+        try:
+            c.rollback()
+        except Exception:
+            pass
+        c.close()
+        return JSONResponse({"ok": False, "msg": f"не удалось очистить: {e}"}, status_code=500)
+    c.close()
+    return JSONResponse({"ok": True, "removed": len(jids),
+                         "msg": (f"Убрано записей: {len(jids)}" if jids else "Нечего убирать")})
+
+
+@app.get("/queue", response_class=HTMLResponse)
+def queue_page(request: Request):
+    u = web_user(request)
+    if not u:
+        return RedirectResponse("/login", 302)
+    tid = _tid(u)
+    c = db()
+    # active: ВСЕ queued/running без лимита. Раньше грузили одним запросом ...LIMIT 80
+    # (по created DESC) и фильтровали активные из окна — при >80 строках активные,
+    # созданные раньше завершённых, выпадали из окна → страница «0 в работе» при
+    # непустом бейдже (бейдж считает queued+running без лимита). Разнесли на 2 запроса.
+    active = c.execute("SELECT q.*, g.error AS err, p.name AS pname FROM queue_tasks q "
+                       "LEFT JOIN gen_jobs g ON g.id=q.job_id LEFT JOIN projects p ON p.id=q.project_id "
+                       "WHERE q.tenant_id=? AND q.status IN ('queued','running') "
+                       "ORDER BY q.created ASC", (tid,)).fetchall()
+    # done: последние 80 завершённых — история «Завершено недавно».
+    # Сортируем по ВРЕМЕНИ ЗАВЕРШЕНИЯ: по created список врал — карточка показывает «сколько
+    # прошло с завершения» (_ago(finished)), а порядок был по созданию, поэтому свежезавершённая
+    # задача, поставленная давно, уезжала вниз или вовсе не попадала в восьмёрку.
+    # CAST(... AS REAL) обязателен: 84 старые строки держат created ТЕКСТОМ ('2026-07-09T18:58:02'),
+    # а в SQLite текст больше любого числа — без каста эти прошлогодние отменённые задачи
+    # всплывали в «Завершено недавно» поверх сегодняшних. coalesce — на отменённые без finished.
+    done = c.execute("SELECT q.*, g.error AS err, p.name AS pname FROM queue_tasks q "
+                     "LEFT JOIN gen_jobs g ON g.id=q.job_id LEFT JOIN projects p ON p.id=q.project_id "
+                     "WHERE q.tenant_id=? AND q.status NOT IN ('queued','running') "
+                     "ORDER BY CAST(COALESCE(q.finished, q.started, q.created) AS REAL) DESC "
+                     "LIMIT 80", (tid,)).fetchall()
+    # Место в очереди (глобально, по created). render — строгий порядок пуллера (точно);
+    # gen — приблизительно (шедулер round-robin по тенантам может пустить раньше).
+    _qr = [x["job_id"] for x in c.execute("SELECT job_id FROM queue_tasks WHERE kind='render' AND status='queued' ORDER BY created ASC").fetchall()]
+    # gen — позиция ОТДЕЛЬНО по каждому провайдеру (очереди voicer/voicegencore/recrafter/veo… независимы)
+    _svc_q = {}
+    for x in c.execute("SELECT job_id, kind, params FROM queue_tasks WHERE kind!='render' AND status='queued' ORDER BY created ASC").fetchall():
+        _svc_q.setdefault(_task_provider(x["kind"], x["params"]), []).append(x["job_id"])
+    c.close()
+    pos_map = {}
+    for _i, _j in enumerate(_qr, 1):
+        pos_map[_j] = (_i, len(_qr))
+    for _lst in _svc_q.values():
+        for _i, _j in enumerate(_lst, 1):
+            pos_map[_j] = (_i, len(_lst))
+    kind_lbl = {"tts": "озвучка", "prompts": "промпты", "cards": "карточка", "images": "картинки",
+                "video": "видео", "render": "рендер", "chapters": "главы"}
+    kind_ico = {"tts": '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-volume"/></svg>', "prompts": '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-cpu"/></svg>', "cards": '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-message"/></svg>', "images": '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-image"/></svg>', "video": '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg>', "render": '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-film"/></svg>'}
+    # active/done уже получены выше двумя отдельными запросами (фикс LIMIT-80)
+
+    def _elapsed(r):
+        st = r["started"] or r["created"]
+        try:
+            d = _now() - float(st)
+        except Exception:
+            return "идёт"
+        return f"идёт · {int(d)} сек" if d < 90 else f"идёт · {int(d // 60)} мин"
+
+    def _chan(r):
+        """Канал промптов задачи — по снимку в строке (колонка provider).
+
+        Раньше понять, чем именно писались промпты, можно было только из строки в логе
+        задачи. Показываем человеческим языком («подписка ChatGPT»), а не «prompt_codex».
+        """
+        if r["kind"] not in ("prompts", "cards"):
+            return ""
+        try:
+            title = _prompt_channel_title(r["provider"])
+        except Exception:
+            title = ""
+        if not title:
+            try:
+                title = _prompt_channel_title(_task_provider_from_row(r))
+            except Exception:
+                title = ""
+        return f" · <svg class='ic' viewBox='0 0 24 24'><use href='#ic-cpu'/></svg> {html.escape(title)}" if title else ""
+
+    def _prog(r):
+        if r["status"] != "running" or r["kind"] not in ("images", "video"):
+            return ""
+        ps = _project_status(tid, r["project_id"])
+        if r["kind"] == "images":
+            n, m = ps["images"], ps.get("images_expected") or 0
+        else:
+            import glob as _g
+            n = len(_g.glob(os.path.join(_project_dir(tid, r["project_id"]), "**", "*.mp4"), recursive=True))
+            m = ps["images"]
+        if not m:
+            return ""
+        pct = min(100, int(n / m * 100))
+        return (f'<div style="margin-top:8px;max-width:340px"><div style="height:6px;border-radius:3px;background:var(--surface2)">'
+                f'<div style="height:6px;border-radius:3px;background:var(--running);width:{pct}%;transition:width .4s"></div></div>'
+                f'<div class=muted style="font-size:11.5px;margin-top:4px">{n} / {m}</div></div>')
+
+    def card(r):
+        nm = html.escape(r["pname"] or r["project_id"] or "—")
+        run = r["status"] == "running"
+        bc = "var(--running)" if run else ("var(--queued)" if r["status"] == "queued" else
+                                           "var(--error)" if r["status"] == "error" else "transparent")
+        if r["status"] == "running":
+            right = f'<span class="badge badge-running"><span class=dot></span>{_elapsed(r)}</span>'
+            right += f'<button class="btn btn-ghost btn-sm" onclick="jobAct(this,{r["job_id"]},\'cancel\')">Отменить</button>'
+        elif r["status"] == "queued":
+            _pi = pos_map.get(r["job_id"])
+            if _pi:
+                _appr = "" if r["kind"] == "render" else "~"
+                _badge = (f'<span class="badge badge-queued"><span class=dot></span>'
+                          f'в очереди · {_appr}{_pi[0]}-й из {_pi[1]}</span>')
+            else:
+                _badge = mc_badge("queued")
+            right = _badge + f'<button class="btn btn-ghost btn-sm" onclick="jobAct(this,{r["job_id"]},\'cancel\')">Отменить</button>'
+        elif r["status"] == "error":
+            right = mc_badge("error") + f'<button class="btn btn-primary btn-sm" onclick="jobAct(this,{r["job_id"]},\'retry\')">Повторить</button>'
+        else:
+            right = f'<span class=muted style="font-size:12px">{_ago(r["finished"] or r["created"])}</span>' + mc_badge(r["status"])
+            if r["kind"] == "render" and r["status"] == "done":
+                right += f'<a class="btn btn-primary btn-sm" href="/api/render/{r["job_id"]}/download"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg> mp4</a>'
+        err = (f'<div style="color:var(--error);font-size:12px;margin-top:5px">{html.escape(str(r["err"])[:200])}</div>'
+               if r["status"] == "error" and r["err"] else "")
+        logbtn = (f'<button type=button class="btn btn-ghost btn-sm" data-t="{html.escape(kind_lbl.get(r["kind"], r["kind"]))}" '
+                  f'onclick="qLog({r["job_id"]}, this.dataset.t)" title="Показать лог задачи"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-file"/></svg> Лог</button>')
+        return (f'<div class="panel" style="padding:13px 16px;margin:0 0 10px;border-left:3px solid {bc}">'
+                f'<div class=row style="gap:12px"><span style="font-size:17px">{kind_ico.get(r["kind"], "•")}</span>'
+                f'<div style="flex:1"><a href=/p/{r["project_id"]} style="color:var(--text);font-weight:500">{nm}</a>'
+                f'<span class=muted style="font-size:12.5px"> · {kind_lbl.get(r["kind"], r["kind"])}'
+                f'{_chan(r)}</span>{err}{_prog(r)}</div>'
+                f'<div class=row style="gap:8px">{logbtn}{right}</div></div></div>')
+    act_html = ("".join(card(r) for r in active)) if active else '<p class=muted>Сейчас ничего не выполняется.</p>'
+    clear_btn = ('<button class="btn btn-sm" onclick="clearDone(this)" '
+                 'title="Убрать из списка завершённые задачи (активные не трогаются)">'
+                 '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-trash"/></svg> '
+                 f'Очистить завершённые ({len(done)})</button>')
+    hist = (f'<div class="row" style="margin:22px 0 12px;gap:12px;align-items:center;justify-content:space-between">'
+            f'<div class="panel-title" style="margin:0">Завершено недавно</div>{clear_btn}</div>'
+            f'{"".join(card(r) for r in done[:8])}'
+            f'<details style="margin-top:8px"><summary class=muted style="cursor:pointer">Показать всю историю ({len(done)})</summary>'
+            f'<div style="margin-top:12px">{"".join(card(r) for r in done[8:60])}</div></details>') if done else ""
+    body = (f'{_QUEUE_CLEAR_JS}<div class=wrap><h1>Очередь</h1><p class=muted style="margin:-6px 0 12px">Что студия делает прямо сейчас</p>'
+            f'<div style="margin:0 0 18px">{_qstrip(u)}</div>'
+            f'{_SLOTS_CSS}{_slots_widget(u)}{_SLOTS_JS}'
+            f'<div data-live="queue"><div class="panel-title" style="margin:0 0 12px">Сейчас в работе · {len(active)}</div>{act_html}{hist}</div></div>'
+            + _QLOG_MODAL)
+    return _page("Очередь", _header(u, "queue") + body)
+
+
+def _user(authorization, x_token):
+    tok = None
+    if authorization and authorization.lower().startswith("bearer "):
+        tok = authorization[7:].strip()
+    elif x_token:
+        tok = x_token.strip()
+    if not tok:
+        raise HTTPException(401, "missing token")
+    c = db()
+    r = c.execute("SELECT * FROM users WHERE token=?", (tok,)).fetchone()
+    c.close()
+    if not r:
+        raise HTTPException(401, "invalid token")
+    if _row_disabled(r):                 # блокировка из админ-панели закрывает и API-путь
+        raise HTTPException(403, "аккаунт заблокирован")
+    return r
+
+
+def _admin(authorization, x_token):
+    u = _user(authorization, x_token)
+    if u["role"] != "admin":
+        raise HTTPException(403, "admin only")
+    return u
+
+
+def _log(uid, provider, path, method, status, nbytes):
+    c = db()
+    c.execute("INSERT INTO jobs(user_id,provider,path,method,status,bytes,ts) VALUES(?,?,?,?,?,?,?)",
+              (uid, provider, path, method, status, nbytes, datetime.datetime.now().isoformat(timespec="seconds")))
+    c.commit()
+    c.close()
+
+
+@app.get("/api/me")
+def me(authorization: str = Header(None), x_token: str = Header(None)):
+    u = _user(authorization, x_token)
+    # Только ИМЕНА провайдеров со своим ключом — значения не отдаются никогда.
+    own = sorted(_user_own_credentials(u).keys())
+    return {"id": u["id"], "name": u["name"], "role": u["role"],
+            # BYOK-first: свои ключи используются, где заданы; остальное — серверный пул.
+            "credential_mode": "own_keys" if own else "server_shared",
+            "own_keys": own,
+            "fallback_to_server_keys": len(own) < len(_OWN_CREDENTIAL_FAMILIES)}
+
+
+@app.api_route("/api/proxy/{provider}/{path:path}", methods=["GET", "POST"])
+async def proxy(provider: str, path: str, request: Request,
+                authorization: str = Header(None), x_token: str = Header(None)):
+    u = _user(authorization, x_token)
+    if (u["role"] if "role" in u.keys() else "user") != "admin":
+        raise HTTPException(403, "proxy доступен только админу; партнёр генерит через кабинет на серверных ключах")
+    if provider not in PROVIDERS:
+        raise HTTPException(404, f"unknown provider '{provider}'")
+    p = PROVIDERS[provider]
+    if request.method == "POST" and p["key"] in ("googler", "veo"):
+        raise HTTPException(409, "Асинхронная генерация через proxy отключена: используйте API очереди, которое сохраняет remote ID и удерживает лимит до завершения")
+    key = _first_credential(keys(), p["key"])
+    if not key:
+        raise HTTPException(502, f"no server key for provider '{provider}'")
+    url = p["base"].rstrip("/") + "/" + path
+    headers = {}
+    ct = request.headers.get("content-type")
+    if ct:
+        headers["Content-Type"] = ct
+    if p["auth"] == "bearer":
+        headers["Authorization"] = f"Bearer {key}"
+    else:
+        headers["X-API-Key"] = key
+    params = dict(request.query_params)
+    raw = await request.body()
+
+    def _do():
+        if request.method == "GET":
+            return requests.get(url, headers=headers, params=params, timeout=200)
+        family = {"openai":"openai", "claude_oauth":"claude_oauth"}.get(p["key"])
+        host = _host_budget.try_acquire(family, key, 1) if family else _host_budget.Lease()
+        if host is None:
+            raise HTTPException(429, "Общий лимит ключа занят; повторите позже до вызова провайдера")
+        with host:
+            return requests.post(url, headers=headers, params=params, data=raw, timeout=600)
+
+    try:
+        resp = await run_in_threadpool(_do)
+    except HTTPException:
+        raise
+    except Exception as e:
+        _log(u["id"], provider, path, request.method, 0, 0)
+        raise HTTPException(502, f"upstream error: {e}")
+    _log(u["id"], provider, path, request.method, resp.status_code, len(resp.content))
+    return Response(content=resp.content, status_code=resp.status_code,
+                    media_type=resp.headers.get("content-type", "application/json"))
+
+
+def _prime_googler(pinned_keys=None):
+    k = pinned_keys if pinned_keys is not None else keys()
+    gw.GOOGLER_API_KEY = _first_credential(k, "googler") or None
+    gw.OPENAI_API_KEY = _first_credential(k, "openai") or None
+
+
+def _set_gen(jid, **kw):
+    cols = ", ".join(f"{c}=?" for c in kw)
+    c = db()
+    c.execute(f"UPDATE gen_jobs SET {cols} WHERE id=?", (*kw.values(), jid))
+    c.commit()
+    c.close()
+
+
+_LEGACY_GOOGER_LOCK = threading.Lock()
+
+
+def _legacy_budget_reserve(values, whole_capacity=False):
+    leases = []
+    try:
+        reservations = {}
+        for family, value in values.items():
+            if not value:
+                continue
+            units = _host_budget.CAPACITIES[family] if whole_capacity else 1
+            identity = _host_budget.credential_identity(family, value)
+            previous = reservations.get(identity)
+            if previous is None or units > previous[2]:
+                reservations[identity] = (family, value, units)
+        # Codex API-key auth can alias an ordinary OpenAI key. One physical
+        # reservation covers both sequential worker branches; never self-wait.
+        for family, value, units in reservations.values():
+            lease = _host_budget.try_acquire(family, value, units)
+            if lease is None:
+                for previous in leases:
+                    previous.release()
+                return None
+            leases.append(lease)
+        return leases
+    except Exception:
+        for previous in leases:
+            previous.release()
+        raise
+
+
+def _legacy_wait_budget(jid, fn, args, values, whole_capacity=False):
+    deadline = time.monotonic() + 2
+    while True:
+        leases = _legacy_budget_reserve(values, whole_capacity)
+        if leases is not None:
+            from storage_admission import reserve_legacy
+            connection = db()
+            try:
+                row = connection.execute("SELECT settings FROM gen_jobs WHERE id=?", (jid,)).fetchone()
+                try:
+                    params = json.loads(row[0] or "{}") if row else {}
+                except (ValueError, TypeError):
+                    params = {}
+                decision = reserve_legacy(connection, GEN_DIR, jid, params)
+            except BaseException:
+                for lease in leases:
+                    lease.release()
+                raise
+            finally:
+                connection.close()
+            if decision["allowed"]:
+                return leases
+            for lease in leases:
+                lease.release()
+            if decision.get("reason") == "job_not_queued":
+                return None
+            _set_gen(jid, status="queued", error="Ожидание свободного места до вызова провайдера")
+            JOB_Q.put((fn, args))
+            return None
+        if time.monotonic() >= deadline:
+            _set_gen(jid, status="queued", error="Ожидание общего лимита ключа до вызова провайдера")
+            JOB_Q.put((fn, args))
+            return None
+        time.sleep(0.1)
+
+
+def _raw_budget_values(env):
+    mapping = {"fastgen":"GOOGLER_API_KEY", "openai":"OPENAI_API_KEY",
+               "veo":"VEO_API_KEY", "claude_oauth":"CLAUDE_CODE_OAUTH_TOKEN",
+               "codex":"VS_CODEX_HOME"}
+    return {family:env.get(name) for family,name in mapping.items() if env.get(name)}
+
+
+def _bounded_raw_args(worker, args):
+    result = [str(a) for a in args]
+    if worker != "googler_worker.py":
+        return result
+    # This compatibility path reserves whole budgets. Force explicit image/video
+    # parallelism <=12; transform's fixed default is10. Prompt env is clamped below.
+    for flag in ("--image_threads", "--video_threads"):
+        for i, value in enumerate(result):
+            if value == flag and i+1 < len(result):
+                result[i+1] = str(max(1, min(12, int(result[i+1]))))
+            elif value.startswith(flag+"="):
+                result[i] = flag+"="+str(max(1, min(12, int(value.split("=",1)[1]))))
+    command = result[0] if result else ""
+    flag = "--image_threads" if command in ("images", "pipeline") else "--video_threads" if command == "videos" else None
+    if flag and not any(a==flag or a.startswith(flag+"=") for a in result):
+        result += [flag,"12"]
+    return result
+
+
+def _run_gen_job(jid, prompt, style, model, aspect):
+    from remote_generation_journal import journal_context
+    with _LEGACY_GOOGER_LOCK, journal_context(os.path.join(GEN_DIR, ".remote_jobs", str(jid)), "server"):
+        pinned = {family:_first_credential(keys(), family) for family in ("googler","openai","veo")}
+        values = {"fastgen":pinned["googler"],"openai":pinned["openai"],"veo":pinned["veo"]}
+        leases = _legacy_wait_budget(jid, _run_gen_job, (jid,prompt,style,model,aspect), values)
+        if leases is None:
+            return
+        try:
+            return _run_gen_job_impl(jid, prompt, style, model, aspect, pinned)
+        finally:
+            for lease in leases:
+                lease.release()
+
+
+def _run_gen_job_impl(jid, prompt, style, model, aspect, pinned=None):
+    """Фоновая генерация ОДНОЙ картинки на сервере (ключи только на сервере)."""
+    _set_gen(jid, status="running")
+    try:
+        _prime_googler(pinned)
+        if pinned is not None:
+            gw.VEO_API_KEY = pinned.get("veo") or None
+        # Мы в ДОЛГОЖИВУЩЕМ процессе uvicorn: метка «лимит аккаунта провайдера» от прошлого
+        # вызова не должна пережить его и молча отказывать всем следующим (у воркера прогон =
+        # процесс, у нас — нет). Метка в googler_worker и так с TTL, но здесь начинаем с чистого.
+        if hasattr(gw, "_reset_account_limit"):
+            gw._reset_account_limit()
+        gw.GOOGLER_MODEL = model or "OPENAI"
+        out = os.path.join(GEN_DIR, f"job_{jid}.jpg")
+        scene = {"visual_prompt": prompt, "camera_angle": "Wide Shot", "subject_type": "object"}
+        idx, img = gw.generate_image(scene, style, output_path=out, aspect_ratio=aspect)
+        if img and os.path.exists(out) and os.path.getsize(out) > 0:
+            _set_gen(jid, status="done", result_path=out)
+        else:
+            _set_gen(jid, status="error", error="генерация не вернула изображение")
+    except Exception as e:
+        _set_gen(jid, status="error", error=str(e)[:400])
+
+
+def _media_for(path):
+    """MIME по расширению результата (картинка/видео/аудио)."""
+    p = (path or "").lower()
+    if p.endswith(".mp4"):
+        return "video/mp4"
+    if p.endswith(".mp3"):
+        return "audio/mpeg"
+    return "image/jpeg"
+
+
+def _run_video_job(jid, prompt, aspect):
+    from remote_generation_journal import journal_context
+    with _LEGACY_GOOGER_LOCK, journal_context(os.path.join(GEN_DIR, ".remote_jobs", str(jid)), "server"):
+        key = _first_credential(keys(), "veo")
+        leases = _legacy_wait_budget(jid, _run_video_job, (jid,prompt,aspect), {"veo":key})
+        if leases is None:
+            return
+        try:
+            return _run_video_job_impl(jid, prompt, aspect, key)
+        finally:
+            for lease in leases:
+                lease.release()
+
+
+def _run_video_job_impl(jid, prompt, aspect, pinned_key=None):
+    """Фоновая генерация ВИДЕО на сервере (Veo NonStop, ключ только на сервере). Блокирующий поллинг до 1200с — ок, мы в потоке."""
+    _set_gen(jid, status="running")
+    try:
+        veo = pinned_key if pinned_key is not None else _first_credential(keys(), "veo")
+        if not veo:
+            _set_gen(jid, status="error", error="нет ключа 'veo' в video_studio_api_keys.json")
+            return
+        gw.VEO_API_KEY = veo
+        gw.VIDEO_METHOD = "veo"
+        out = os.path.join(GEN_DIR, f"job_{jid}.mp4")
+        idx, b64 = gw.generate_video_from_prompt_only(prompt, aspect_ratio=aspect, index=0)
+        if b64 and gw.save_base64_to_file(b64, out) and os.path.exists(out) and os.path.getsize(out) > 0:
+            _set_gen(jid, status="done", result_path=out)
+        else:
+            _set_gen(jid, status="error", error="видео не сгенерировано (таймаут/ошибка провайдера Veo)")
+    except Exception as e:
+        _set_gen(jid, status="error", error=str(e)[:400])
+
+
+def _is_edge_voice(v):
+    return bool(v) and ("Neural" in v or v.lower().startswith(("ru-", "en-", "de-")))
+
+
+def _tts_edge(out, text, voice):
+    """edge-tts (локально, БЕЗ ключа). Бесплатный эндпоинт Microsoft флакует → ретрай×5."""
+    import time as _t
+    import asyncio
+    import edge_tts
+    vc = voice if _is_edge_voice(voice) else "ru-RU-DmitryNeural"
+    last = ""
+    for _ in range(5):
+        try:
+            async def _synth():
+                await edge_tts.Communicate(text=text, voice=vc, rate="-20%").save(out)
+            loop = asyncio.new_event_loop()
+            try:
+                loop.run_until_complete(_synth())
+            finally:
+                loop.close()
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                return True, ""
+            last = "пустой аудиофайл"
+        except Exception as e:
+            last = f"{type(e).__name__}: {str(e)[:150]}"
+        _t.sleep(2)
+    return False, f"edge-tts 5 попыток: {last}"
+
+
+def _tts_voicer(out, text, voice):
+    """Voicer (mat3u) — ключ на сервере. voice=voice_id (или дефолтный, если не задан/edge-голос)."""
+    tok = _first_credential(keys(), "voicer")
+    if not tok:
+        return False, "нет ключа 'voicer' в video_studio_api_keys.json"
+    os.environ["VOICER_API_TOKEN"] = tok
+    import voicer_worker as vw
+    vid = None if _is_edge_voice(voice) else (voice or None)
+    task_id, est = vw.create_task(text, voice_id=vid)
+    vw.wait_for_completed(task_id, estimated_time_seconds=est)
+    vw.download_audio(task_id, out)
+    if os.path.exists(out) and os.path.getsize(out) > 0:
+        return True, ""
+    return False, "voicer не вернул аудио"
+
+
+def _tts_vgc(out, text, voice):
+    """VoiceGenCore — ключ на сервере. Нужен voice_id (поле voice), движок elevenLabsV3."""
+    tok = _first_credential(keys(), "voicegencore")
+    if not tok:
+        return False, "нет ключа 'voicegencore' в video_studio_api_keys.json"
+    os.environ["VGC_API_TOKEN"] = tok
+    import voicegencore_worker as vg
+    vid = "" if _is_edge_voice(voice) else (voice or "").strip()
+    if not vid:
+        return False, "для voicegencore нужен voice_id (передай в поле voice)"
+    ok = vg.process_text(tok, text, vid, vg.DEFAULT_VOICE_ENGINE, 0.5,
+                         os.path.dirname(out), os.path.basename(out), 4)
+    if ok and os.path.exists(out) and os.path.getsize(out) > 0:
+        return True, ""
+    return False, "voicegencore не вернул аудио"
+
+
+def _run_tts_job(jid, text, voice, engine):
+    """Фоновый TTS: edge (без ключа) | voicer | voicegencore (ключи только на сервере)."""
+    if _legacy_wait_budget(jid, _run_tts_job, (jid,text,voice,engine), {}) is None:
+        return
+    _set_gen(jid, status="running")
+    out = os.path.join(GEN_DIR, f"job_{jid}.mp3")
+    try:
+        if engine == "voicer":
+            ok, err = _tts_voicer(out, text, voice)
+        elif engine == "voicegencore":
+            ok, err = _tts_vgc(out, text, voice)
+        else:
+            ok, err = _tts_edge(out, text, voice)
+        _set_gen(jid, status="done", result_path=out) if ok else _set_gen(jid, status="error", error=err)
+    except Exception as e:
+        _set_gen(jid, status="error", error=str(e)[:400])
+
+
+SRC_DIR = os.path.expanduser("~/VideoStudio/src")
+WORKER_WHITELIST = {"edgetts_worker.py", "voicer_worker.py", "voicegencore_worker.py", "tts_worker.py", "googler_worker.py", "youtube_slide_extractor.py", "image_worker.py"}
+RUN_WORKER_TIMEOUT = int(os.environ.get("RUN_WORKER_TIMEOUT", "3600"))
+
+
+def _run_worker_job(jid, uid, worker, args, files, files_b64=None):
+    c = db()
+    try:
+        user = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    finally:
+        c.close()
+    env = _key_env(user)
+    # Whole-account legacy reservation cannot permit nested subscription fanout.
+    for name in ("VS_SCENE_THREADS","VS_CODEX_MAX_PARALLEL","VS_CLAUDE_MAX_PARALLEL"):
+        env[name] = "1"
+    safe_args = _bounded_raw_args(worker,args)
+    leases = _legacy_wait_budget(jid, _run_worker_job, (jid,uid,worker,args,files,files_b64), _raw_budget_values(env), True)
+    if leases is None:
+        return
+    try:
+        return _run_worker_job_impl(jid, uid, worker, safe_args, files, files_b64, env)
+    finally:
+        for lease in leases:
+            lease.release()
+
+
+def _run_worker_job_impl(jid, uid, worker, args, files, files_b64=None, pinned_env=None):
+    """Запускает РЕАЛЬНЫЙ воркер отдельным процессом с ключами юзера в env (изоляция = нет race ключей,
+    сохраняется мульти-файловый контракт, код воркера на сервере). Возвращает все выходные файлы.
+    Протокол args: значение '__OUT__' → каталог вывода; значение = имя загруженного файла → его путь в песочнице;
+    имя загруженного файла ВНУТРИ строки-аргумента (напр. --user_refs hero:ref1.jpg) → подстановка пути."""
+    _set_gen(jid, status="running")
+    try:
+        import base64 as _b64
+        c = db()
+        u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+        c.close()
+        # A5: файловая изоляция — sandbox строго под каталогом ТЕНАНТА (партнёра), не в общем GEN_DIR
+        _tid = (u["tenant_id"] if (u and u["tenant_id"]) else str(uid))
+        sandbox = os.path.join(TENANTS_DIR, _tid, "jobs", f"rw_{jid}")
+        proj = os.path.join(sandbox, "project")
+        os.makedirs(proj, exist_ok=True)
+        written = {}
+        for name, content in (files or {}).items():
+            base = os.path.basename(str(name))
+            fp = os.path.join(sandbox, base)
+            with open(fp, "w", encoding="utf-8") as f:
+                f.write(content if isinstance(content, str) else json.dumps(content, ensure_ascii=False))
+            written[base] = fp
+        # бинарные входы (картинки-референсы, кадры для video/transform): base64 → запись байтами
+        for name, b64 in (files_b64 or {}).items():
+            base = os.path.basename(str(name))
+            fp = os.path.join(sandbox, base)
+            with open(fp, "wb") as f:
+                f.write(_b64.b64decode(b64))
+            written[base] = fp
+        ra = []
+        for a in (args or []):
+            if a == "__OUT__":
+                ra.append(proj)
+            elif a in written:
+                ra.append(written[a])
+            else:
+                s = str(a)
+                # подстановка путей загруженных файлов, если их имена встречаются ВНУТРИ строки-аргумента
+                # (--user_refs/--style_refs/--prompts и т.п.); самые длинные имена — первыми, чтобы не задеть префиксы
+                for base in sorted(written, key=len, reverse=True):
+                    if base in s:
+                        s = s.replace(base, written[base])
+                ra.append(s)
+        # если есть --image_paths_file, указывающий на загруженный JSON-список путей —
+        # переписать в нём basename → путь в песочнице (для video/transform с залитыми кадрами)
+        for k in range(len(ra) - 1):
+            if ra[k] == "--image_paths_file" and os.path.isfile(ra[k + 1]):
+                try:
+                    with open(ra[k + 1], "r", encoding="utf-8") as _f:
+                        _lst = json.load(_f)
+                    if isinstance(_lst, list):
+                        _new = [written.get(os.path.basename(str(x)), x) for x in _lst]
+                        with open(ra[k + 1], "w", encoding="utf-8") as _f:
+                            json.dump(_new, _f, ensure_ascii=False)
+                except Exception:
+                    pass
+        cmd = [sys.executable, os.path.join(SRC_DIR, worker)] + ra
+        job_env = dict(pinned_env) if pinned_env is not None else _key_env(u)
+        job_env["VS_REMOTE_JOURNAL_DIR"] = os.path.join(proj, ".remote_jobs", str(jid))
+        job_env["VS_QUEUE_JOB_ID"] = str(jid)
+        job_env["VS_CREDENTIAL_SOURCE"] = "byok" if _user_own_credentials(u) else "server"
+        p = subprocess.run(cmd, cwd=SRC_DIR, env=job_env, capture_output=True, text=True, timeout=RUN_WORKER_TIMEOUT)
+        out = []
+        for root, _d, fs in os.walk(proj):
+            _d[:] = [d for d in _d if d != ".remote_jobs"]
+            for fn in fs:
+                out.append(os.path.relpath(os.path.join(root, fn), proj))
+        if out and p.returncode == 0:
+            _set_gen(jid, status="done", result_path=proj, result_files=json.dumps(sorted(out)))
+        else:
+            tail = ((p.stdout or "")[-400:] + " | " + (p.stderr or "")[-400:]).strip()
+            _set_gen(jid, status="error", error=f"воркер не создал файлов (code {p.returncode}). {tail[:380]}")
+    except subprocess.TimeoutExpired:
+        _set_gen(jid, status="error", error="таймаут run-worker")
+    except Exception as e:
+        _set_gen(jid, status="error", error=str(e)[:400])
+
+
+@app.post("/api/jobs")
+def create_job(prompt: str, type: str = "image", style: str = "cinematic, photorealistic",
+               model: str = "OPENAI", aspect_ratio: str = "landscape",
+               voice: str = "ru-RU-DmitryNeural", tts_engine: str = "edge",
+               title: str = "", source_text: str = "",
+               authorization: str = Header(None), x_token: str = Header(None)):
+    u = _user(authorization, x_token)
+    if (u["role"] if "role" in u.keys() else "user") != "admin":
+        raise HTTPException(403, "token-API генерация только для админа; партнёр генерит через веб-кабинет на серверных ключах")
+    if type not in ("image", "video", "tts"):
+        raise HTTPException(400, "type: image | video | tts")
+    if not (prompt or "").strip():
+        raise HTTPException(400, "prompt обязателен")
+    # дневная квота (admin — безлимит; quota=0 — безлимит; NULL — DEFAULT_DAILY_QUOTA)
+    if u["role"] != "admin":
+        q = u["daily_quota"]
+        eff = DEFAULT_DAILY_QUOTA if q is None else q
+        if eff and eff > 0:
+            today = datetime.date.today().isoformat()
+            cq = db()
+            n = cq.execute("SELECT COUNT(*) FROM gen_jobs WHERE user_id=? AND substr(ts,1,10)=?",
+                           (u["id"], today)).fetchone()[0]
+            cq.close()
+            if n >= eff:
+                raise HTTPException(429, f"дневная квота исчерпана ({n}/{eff}), сбросится завтра")
+    # model-колонка и settings — по типу (для читаемой админки)
+    if type == "video":
+        model_col = "veo"
+        settings = json.dumps({"method": "veo", "aspect_ratio": aspect_ratio}, ensure_ascii=False)
+    elif type == "tts":
+        if tts_engine not in ("edge", "voicer", "voicegencore"):
+            raise HTTPException(400, "tts_engine: edge | voicer | voicegencore")
+        model_col = f"{tts_engine}/{voice}"
+        settings = json.dumps({"engine": tts_engine, "voice": voice}, ensure_ascii=False)
+    else:
+        model_col = model
+        settings = json.dumps({"style": style, "model": model, "aspect_ratio": aspect_ratio}, ensure_ascii=False)
+    c = db()
+    cur = c.execute("INSERT INTO gen_jobs(user_id,type,prompt,model,status,ts,title,source_text,settings) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (u["id"], type, prompt, model_col, "queued",
+                     datetime.datetime.now().isoformat(timespec="seconds"), title, source_text, settings))
+    jid = cur.lastrowid
+    c.commit()
+    c.close()
+    if type == "video":
+        JOB_Q.put((_run_video_job, (jid, prompt, aspect_ratio)))
+    elif type == "tts":
+        JOB_Q.put((_run_tts_job, (jid, prompt, voice, tts_engine)))
+    else:
+        JOB_Q.put((_run_gen_job, (jid, prompt, style, model, aspect_ratio)))
+    return {"job_id": jid, "status": "queued", "queue_depth": JOB_Q.qsize()}
+
+
+def _get_gen(jid, u):
+    c = db()
+    r = c.execute("SELECT * FROM gen_jobs WHERE id=?", (jid,)).fetchone()
+    c.close()
+    if not r:
+        raise HTTPException(404, "job not found")
+    if r["user_id"] != u["id"] and u["role"] != "admin":
+        raise HTTPException(403, "not your job")
+    return r
+
+
+@app.get("/api/jobs/{jid}")
+def job_status(jid: int, authorization: str = Header(None), x_token: str = Header(None)):
+    u = _user(authorization, x_token)
+    r = _get_gen(jid, u)
+    return {"job_id": r["id"], "status": r["status"], "type": r["type"],
+            "error": r["error"], "has_result": bool(r["result_path"])}
+
+
+@app.get("/api/jobs/{jid}/result")
+def job_result(jid: int, authorization: str = Header(None), x_token: str = Header(None)):
+    u = _user(authorization, x_token)
+    r = _get_gen(jid, u)
+    if r["status"] != "done" or not r["result_path"] or not os.path.exists(r["result_path"]):
+        raise HTTPException(409, f"не готово (status={r['status']})")
+    return FileResponse(r["result_path"], media_type=_media_for(r["result_path"]))
+
+
+@app.post("/api/my/keys")
+async def my_keys(request: Request, authorization: str = Header(None), x_token: str = Header(None)):
+    """Legacy key management: только admin; кабинет партнёра работает на server keys."""
+    u = _admin(authorization, x_token)
+    body = await request.json()
+    clean = {str(k): str(v).strip() for k, v in body.items() if isinstance(k, str) and v}
+    c = db()
+    c.execute("UPDATE users SET keys=? WHERE id=?", (json.dumps(clean, ensure_ascii=False), u["id"]))
+    c.commit()
+    c.close()
+    if not _own_codex_auth_payload(clean.get(OWN_CODEX_AUTH_FAMILY, "")):
+        # этот путь тоже умеет УБРАТЬ свою авторизацию Codex → материализованный
+        # плейнтекст auth.json не должен пережить удаление секрета из users.keys
+        _drop_own_codex_home(u["id"])
+    _OWN_CRED_CACHE.pop(u["id"], None)
+    return {"ok": True, "providers": sorted(clean.keys())}
+
+
+# (row_key ключа, подпись, provider-группа для лимитов/настроек — совпадает с _task_provider)
+_KEY_PROVIDERS = [("googler", "Googler / Recrafter (картинки, видео)", "recrafter"), ("openai", "OpenAI (gpt-image)", "openai"),
+                  ("elevenlabs", "Lumean (бывш. ElevenLabs) · озвучка", "elevenlabs"), ("voicer", "Voicer / mat3u (озвучка)", "voicer"),
+                  ("lumean", "Lumean · только HeyGen · озвучка", "lumean"),
+                  ("voicegencore", "VoiceGenCore (озвучка)", "voicegencore"), ("veo", "VeoNonStop (видео veo + banana)", "veo")]
+# Провайдеры, у которых есть «потоки» и «попытки» (всё через googler_worker). Остальным — только «параллель».
+_GEN_GROUPS = {"recrafter", "openai", "veo"}
+# Границы числовых полей (пусто = серверный дефолт). На сохранении значение клампится в [lo,hi].
+_OPT_BOUNDS = {"threads": (1, 64), "parallel": (1, 20), "retries": (1, 20)}
+
+
+def _own_keys(u):
+    try:
+        return json.loads(u["keys"]) if (u["keys"] if "keys" in u.keys() else None) else {}
+    except Exception:
+        return {}
+
+
+def _key_provider_ui_state(own, server, family):
+    """Источник credential для строки /keys, без вывода самого секрета."""
+    if _first_credential(own, family):
+        return "own", "var(--accent)", "свой ключ подключён"
+    if _first_credential(server, family):
+        return "server", "var(--done)", "серверный ключ подключён"
+    return "missing", "var(--error)", "ключ недоступен"
+
+
+@app.get("/voices", response_class=HTMLResponse)
+def voices_page(request: Request):
+    u = web_user(request)
+    if not u:
+        return RedirectResponse("/login", 302)
+    tid = _tid(u)
+    c = db()
+    lib = c.execute("SELECT id,name,voice_id,model_id FROM voice_lib WHERE tenant_id=? ORDER BY name COLLATE NOCASE", (tid,)).fetchall()
+    c.close()
+    rows = ""
+    for v in lib:
+        rows += (f'<div class="list-row" style="grid-template-columns:1fr 250px 150px 44px">'
+                 f'<span style="font-weight:500">{html.escape(v["name"])}</span>'
+                 f'<span class="mono muted" style="font-size:12px">{html.escape(v["voice_id"] or "")}</span>'
+                 f'<span class="muted" style="font-size:12px">{html.escape(v["model_id"] or "—")}</span>'
+                 f'<form method=post action=/api/voices/{v["id"]}/delete style="margin:0"><button class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button></form></div>')
+    listing = f'<div class="list">{rows}</div>' if lib else '<p class=muted>Голосов пока нет — добавьте Lumean Template ID ниже.</p>'
+    g = _voices_by_lang()
+    edge_rows = ""
+    for lc in sorted(g, key=lambda x: _LANG_NAMES.get(x, x).lower()):
+        lang = _LANG_NAMES.get(lc, lc)
+        for vv in g[lc]:
+            loc, nm = _voice_short(vv)
+            edge_rows += (f'<div class="list-row vrow" data-s="{html.escape((lang + " " + vv).lower())}" style="grid-template-columns:130px 1fr 100px 36px">'
+                          f'<span style="font-size:12.5px">{html.escape(lang)}</span>'
+                          f'<span class=muted style="font-size:12px">{html.escape(vv)}</span><span class=tag>{html.escape(loc)}</span>'
+                          f'<button type=button class="btn btn-ghost btn-icon" style="width:28px;height:28px" onclick="playV(this,\'{html.escape(vv)}\')">▶</button></div>')
+    body = _header(u, "voices") + f"""<div class=wrap><h1>Голоса <span class=muted style="font:500 14px var(--sans)">{len(lib)} Lumean Template ID</span></h1>
+<p class=hint style="margin-bottom:14px">Библиотека твоих Lumean Template ID (имя → ID). Эти ID подставляются в пресеты и в озвучку проекта; внутри шаблона остаётся ElevenLabs voice_id.</p>
+<form method=post action=/api/voices/add style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:18px">
+<input class=input name=name placeholder="имя (напр. Польша Крайм)" style="max-width:220px">
+<input class=input name=voice_id placeholder="Template ID (Lumean)" style="max-width:280px">
+<select class=select name=model_id style="max-width:220px" title="Model ID Lumean (необязательно)"><option value="">— модель по умолчанию —</option>{mc_dict_options(ELEVEN_MODELS, None)}</select>
+<button class="btn btn-primary">＋ Добавить</button></form>
+{listing}
+<details style="margin-top:26px"><summary class=muted style="cursor:pointer"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-search"/></svg> Каталог бесплатных Edge-голосов ({len(EDGE_ALL_VOICES)}) — для авто-озвучки по языку</summary>
+<div class="search" style="max-width:420px;margin:12px 0"><svg viewBox="0 0 24 24" fill=none stroke=currentColor stroke-width=1.7 stroke-linecap=round><circle cx=11 cy=11 r=7/><path d="m21 21-4.3-4.3"/></svg>
+<input placeholder="поиск…" oninput="vfilter(this.value)"></div>
+<div class="list">{edge_rows}</div></details></div>
+<audio id=vplayer style="display:none"></audio>
+<script>
+function vfilter(q){{q=q.toLowerCase();var rs=document.querySelectorAll('.vrow');for(var i=0;i<rs.length;i++){{rs[i].style.display=rs[i].getAttribute('data-s').indexOf(q)>=0?'':'none';}}}}
+function playV(btn,v){{var a=document.getElementById('vplayer');btn.textContent='…';a.src='/api/voice-sample?voice='+encodeURIComponent(v);a.onended=function(){{btn.textContent='▶'}};a.play().then(function(){{btn.textContent='■'}}).catch(function(){{btn.textContent='▶'}});}}
+</script>"""
+    return _page("Голоса", body)
+
+
+@app.post("/api/voices/add")
+async def voice_add(request: Request):
+    u = require_web_user(request); tid = _tid(u)
+    d = await _form(request)
+    name = (d.get("name") or "").strip()[:60]
+    vid = (d.get("voice_id") or "").strip()[:80]
+    mid = (d.get("model_id") or "").strip()[:80]
+    if name and vid:
+        c = db()
+        c.execute("INSERT INTO voice_lib(tenant_id,name,voice_id,model_id,created) VALUES(?,?,?,?,?)", (tid, name, vid, mid, _now()))
+        c.commit(); c.close()
+    return RedirectResponse("/voices", 302)
+
+
+@app.post("/api/voices/{vid}/delete")
+async def voice_del(vid: int, request: Request):
+    u = require_web_user(request); tid = _tid(u)
+    c = db(); c.execute("DELETE FROM voice_lib WHERE id=? AND tenant_id=?", (vid, tid)); c.commit(); c.close()
+    return RedirectResponse("/voices", 302)
+
+
+@app.get("/api/voice-sample")
+async def voice_sample(request: Request, voice: str = ""):
+    u = web_user(request)
+    if not u:
+        raise HTTPException(401)
+    voice = (voice or "").strip()
+    if voice not in EDGE_ALL_VOICES:
+        raise HTTPException(404, "нет такого голоса")
+    cache_dir = "/data/voice_samples"
+    os.makedirs(cache_dir, exist_ok=True)
+    fp = os.path.join(cache_dir, voice + ".mp3")
+    if not os.path.exists(fp):
+        try:
+            import edge_tts
+            lc = voice.split("-")[0]
+            text = ("Привет! Это короткий пример голоса." if lc in ("ru", "uk", "be", "bg", "sr", "mk", "kk")
+                    else "Hello! This is a short voice sample.")
+            await edge_tts.Communicate(text, voice).save(fp)
+        except Exception as e:
+            raise HTTPException(500, f"сэмпл не сгенерирован: {str(e)[:120]}")
+    return FileResponse(fp, media_type="audio/mpeg")
+
+
+# ── Статус моделей FastGen (живой health из API провайдера, 0 кредитов) ──────
+# Источник: googler.fast-gen.ai — GET /api/stats/error-rate → healthScores (0-100 per
+# операцию/провайдера, ИМЕННО то что показывает страница fast-gen.ai/stats), /api/v6/models
+# (маппинг id→операция+кредиты), /api/v6/usage (лимиты). Чисто чтение статистики, ничего не генерим.
+_FG_HOST = (getattr(gw, "GOOGLER_BASE_URL_V6", "https://googler.fast-gen.ai/api/v6")
+            .split("/api/")[0].rstrip("/"))
+_FG_TTL = 30.0
+_fg_cache = {"ts": 0.0, "data": None}
+
+
+def _fg_get(path, key):
+    r = requests.get(_FG_HOST + path, headers={"X-API-Key": key}, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+_FG_STYLE = {                # code → цвет точки (без эмодзи — чистый индикатор)
+    "ok":   "var(--done)",
+    "warn": "#e0a020",
+    "down": "var(--error)",
+    "na":   "var(--dim)",
+}
+
+
+def _fg_classify(score):
+    """Официальный healthScore FastGen (0-100, ровно как на fast-gen.ai/stats) → (code, txt).
+    Это НЕ мгновенный success-rate одного 30-сек окна (тот шумит на редких моделях),
+    а сглаженный health-индекс провайдера/операции, который считает сам FastGen."""
+    if score is None:
+        return ("na", "нет данных")
+    if score >= 70:
+        return ("ok", "работает")
+    if score >= 40:
+        return ("warn", "нестабильно")
+    return ("down", "лежит")
+
+
+def fastgen_status(key, force=False):
+    """Статус FastGen-моделей из health-API. Кэш 30с (health глобальный, ключ — только auth)."""
+    now = time.time()
+    if not force and _fg_cache["data"] is not None and now - _fg_cache["ts"] < _FG_TTL:
+        return _fg_cache["data"]
+    out = {"models": [], "error": None, "usage": None, "checked": None, "bucket_ts": None}
+    try:
+        models = _fg_get("/api/v6/models", key)
+        # ОФИЦИАЛЬНЫЙ health: /api/stats/error-rate → healthScores (0-100 на операцию/провайдера),
+        # ровно то, что показывает страница fast-gen.ai/stats (Grok 48 / Flow 94 / Flower 88 / OpenAI 6).
+        er = _fg_get("/api/stats/error-rate", key) or {}
+        scores = er.get("healthScores") or {}
+        data = er.get("data") or []
+        out["bucket_ts"] = data[-1].get("timestamp") if data else None
+        try:
+            out["usage"] = _fg_get("/api/v6/usage", key)
+        except Exception:
+            out["usage"] = None
+        by_id = {m.get("id"): m for m in models if m.get("media_type") == "image"}
+        img_v6 = getattr(gw, "IMAGE_MODEL_V6", {})
+        labels = getattr(gw, "GOOGLER_MODEL_LABELS", {})
+        order = [x for x in getattr(gw, "GOOGLER_AVAILABLE_MODELS", []) if x in img_v6]
+        for our in order:
+            m = by_id.get(img_v6[our], {})
+            ops = m.get("operations") or []
+            genop = next((o for o in ops if o.endswith("_generate")), (ops[0] if ops else None))
+            prov = m.get("provider") or ""
+            score = scores.get(genop)
+            if score is None:
+                score = scores.get(prov)      # фолбэк на провайдер-уровень
+            code, txt = _fg_classify(score)
+            out["models"].append({
+                "id": our, "label": labels.get(our, our), "provider": prov,
+                "credits": (m.get("billing") or {}).get("display") or "",
+                "deprecated": bool(m.get("deprecated")),
+                "pct": score, "code": code, "txt": txt, "col": _FG_STYLE.get(code, _FG_STYLE["na"]),
+            })
+        out["checked"] = time.strftime("%H:%M:%S")
+    except Exception as e:
+        out["error"] = str(e)[:200]
+    _fg_cache["data"] = out
+    _fg_cache["ts"] = now
+    return out
+
+
+def _fg_hhmm_utc(iso):
+    try:
+        return iso[11:16] + " UTC"
+    except Exception:
+        return "?"
+
+
+@app.get("/api/models/health")
+def api_models_health(request: Request):
+    """JSON статус моделей для инлайн-точки у выпадашки (грузится асинхронно из _MODEL_DOT_JS)."""
+    u = web_user(request)
+    if not u:
+        raise HTTPException(401, "нужен вход")
+    key = (_first_credential(keys(), "googler")
+           or _first_credential(resolve_keys(u), "googler"))
+    if not key:
+        return {"ok": False, "models": {}}
+    st = fastgen_status(key)
+    models = {m["id"]: {"col": m["col"], "txt": m["txt"], "pct": m["pct"]}
+             for m in st.get("models", [])}
+    return {"ok": not st.get("error"),
+            "checked": st.get("checked"),
+            "bucket": _fg_hhmm_utc(st["bucket_ts"]) if st.get("bucket_ts") else None,
+            "note": "Официальный health-score FastGen (0-100, как на fast-gen.ai/stats). Общий по платформе, не по вашей квоте.",
+            "models": models}
+
+
+@app.get("/keys", response_class=HTMLResponse)
+def keys_page(request: Request):
+    u = web_user(request)
+    if not u:
+        return RedirectResponse("/login", 302)
+    own = _own_keys(u)      # ТОЛЬКО свои ключи юзера; серверные не показываются никому
+    server_keys = keys()    # только признак наличия; значения в HTML не попадают
+    own_opts = _key_opts_from_row(u)
+
+    rows = ""
+    for k, label, group in _KEY_PROVIDERS:
+        has = bool(_first_credential(own, k))
+        key_state, dotcol, stat = _key_provider_ui_state(own, server_keys, k)
+        if _own_only(u) and key_state == "server":
+            key_state, dotcol, stat = "missing", "var(--error)", "нет личного ключа; серверный отключён"
+        group_opts = own_opts.get(group) if isinstance(own_opts.get(group), dict) else {}
+        raw_disabled = group_opts.get(_OWN_KEY_DISABLED_STAGES_OPT)
+        disabled_stages = ({str(v).strip().lower() for v in raw_disabled if str(v).strip()}
+                           if isinstance(raw_disabled, (list, tuple, set)) else set())
+        own_count = len([v for v in _credential_candidates(own, k) if v])
+        image_only = (key_state == "own" and group == "recrafter" and
+                      {"video", "regen_video"}.issubset(disabled_stages))
+        if image_only:
+            stat = "свой ключ подключён · только картинки"
+        statcol = {"own": "var(--accent)", "server": "var(--done)",
+                   "missing": "var(--error)"}[key_state]
+        # значение ключа не выводим никогда — только источник доступного credential
+        ph = "вставьте ещё один ключ" if has else "введите свой ключ"
+        opt_field = ""
+        if has:
+            # Настройки СВОЕГО ключа. Потоки и попытки — расход ВАШЕГО ключа, их задаёте
+            # вы (серверный потолок к чужому оплаченному ключу не применяется, см.
+            # _own_key_threads/_job_retries). «Проектов разом» — это процессы на сервере
+            # владельца, поэтому оно может только опускаться ниже серверного потолка.
+            cur = group_opts
+            fields = ((("threads", "Потоков на задачу"), ("parallel", "Проектов разом"),
+                       ("retries", "Попыток"))
+                      if group in _GEN_GROUPS else (("parallel", "Проектов разом"),))
+            cells = ""
+            # Имя переменной цикла НЕ должно совпадать с `label` провайдера: ниже это же
+            # имя идёт в шапку плитки, и после цикла в нём оставалось «Попыток» — вместо
+            # названия провайдера пользователь видел последнюю подпись поля.
+            for opt, opt_label in fields:
+                lo, hi = _OPT_BOUNDS[opt]
+                cells += (
+                    '<label style="display:flex;align-items:center;gap:7px;'
+                    f'font-size:11.5px;color:var(--muted)">{opt_label}'
+                    f'<input class=input type=number min={lo} max={hi} '
+                    f'name=opt_{group}_{opt} value="{html.escape(str(cur.get(opt) or ""))}" '
+                    'placeholder="серверное" style="width:104px"></label>')
+            opt_field = ('<div style="display:flex;gap:16px;flex-wrap:wrap;margin-top:8px">'
+                         + cells + '</div>')
+        # ── строки ключей: существующие + пустое поле для нового ──────────────────
+        existing = [v for v in _credential_candidates(own, k) if v]
+        key_rows = ""
+        for idx, val in enumerate(existing):
+            tail = str(val)[-6:] if len(str(val)) > 6 else "……"
+            key_rows += (
+                '<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">'
+                '<code style="flex:1;font-size:11.5px;color:var(--muted);'
+                'background:var(--card,#1b1815);padding:6px 8px;border-radius:6px">'
+                f'ключ {idx + 1} · …{html.escape(tail)}</code>'
+                '<label style="display:flex;align-items:center;gap:5px;font-size:11.5px;'
+                'color:var(--error);white-space:nowrap">'
+                f'<input type=checkbox name=drop_{k} value="{idx}"> удалить</label>'
+                '</div>')
+        key_rows += (
+            f'<input class=input type=password autocomplete="new-password" spellcheck=false '
+            f'name=add_{k} placeholder="{ph}" style="width:100%" '
+            f'data-addfield="{k}">'
+            f'<div style="display:flex;gap:10px;align-items:center;margin-top:6px">'
+            f'<button type=button class="btn btn-ghost btn-sm" '
+            f'onclick="addKeyField(\'{k}\')">+ ещё ключ</button>'
+            f'<span class=hint style="font-size:11px">'
+            + (f'Ключей сейчас: <b>{len(existing)}</b>. ' if existing else 'Ключей пока нет. ')
+            + 'Числа ниже задаются <b>на один ключ</b> — общая ёмкость умножается на их число.'
+            '</span></div>')
+        rows += (
+            '<div class="kp" style="border-bottom:1px solid var(--border);padding:14px 4px">'
+            # шапка: точка + название + статус (всегда видно)
+            '<div style="display:flex;align-items:center;gap:10px;margin-bottom:9px">'
+            f'<span style="width:8px;height:8px;border-radius:50%;background:{dotcol};flex:none"></span>'
+            f'<span style="font-weight:500;font-size:13px;flex:1">{html.escape(label)}</span>'
+            f'<span style="font-size:12px;color:{statcol};font-weight:600">{stat}</span>'
+            '</div>'
+            # поле ключа — ВСЕГДА видно, но значение секретное: не показываем на экране
+            # и не отдаём автозаполнению браузера (страница открыта любому юзеру)
+            # Ключи — отдельными строками: видно, сколько их, каждый снимается своей
+            # галкой, новый добавляется пустым полем. Значения не показываем никогда —
+            # только хвост, чтобы отличать ключи друг от друга.
+            + key_rows
+            + opt_field
+            + (('<div class=hint style="margin-top:7px;color:var(--warn,#c98a2b)">'
+                '<b>Ограничение личного ключа:</b> картинки и их регенерация '
+                'идут на личном ключе. Видео Flower / Flow / Grok и их '
+                'регенерация автоматически идут на <b>серверном ключе</b>.</div>')
+               if image_only and _first_credential(server_keys, k) else
+               (('<div class=hint style="margin-top:7px;color:var(--error)">'
+                 '<b>Ограничение личного ключа:</b> он используется только для '
+                 'картинок; видео Flower / Flow / Grok недоступно, пока нет '
+                 'подходящего серверного ключа.</div>') if image_only else ''))
+            + ('<div class=hint style="margin-top:7px">'
+                + ('Для картинок <b>расход идёт на личный ключ</b>; '
+                   if image_only else
+                   'Свой ключ задан → <b>расход идёт на него</b>; ')
+               + 'слот общей очереди для этих задач не занимается. '
+               '<b>Потоки и попытки</b> личного ключа применяются только к задачам, '
+               'которые идут на нём. <b>Проектов разом</b> — это задачи '
+               'на сервере, поэтому не выше серверного потолка. Пусто = серверное значение. '
+               'Цена модели в кредитах на число потоков не влияет.</div>'
+               if key_state == "own" else
+               ('<div class=hint style="margin-top:7px">Свой ключ не задан → задачи идут на '
+                '<b>подключённый серверный ключ</b>, его параллельность и ретраи задаёт сервер.</div>'
+                if key_state == "server" else
+                '<div class=hint style="margin-top:7px;color:var(--error)">Нет ни своего, ни '
+                'серверного ключа → задачи этого провайдера недоступны. Введите свой ключ.</div>'))
+            + '</div>'
+        )
+    # ── Чем писать промпты: свой credential → канал выбирает юзер, иначе сервер ──
+    is_admin = (u["role"] == "admin")
+    own_creds = _user_own_credentials(u)
+    # ФАКТИЧЕСКИЙ канал (а не только сохранённый выбор): очередь берёт канал в момент
+    # постановки и обходит каналы, помеченные недоступными — страница обязана
+    # показывать то же самое, иначе она врёт.
+    eff_prov, enq_prov, dead_chs = _prompt_channel_ui_state(u)
+    prov_label = dict(PROMPT_PROVIDERS).get(eff_prov, eff_prov)
+    chan_note = ""
+    if dead_chs:
+        _names = ", ".join(_prompt_channel_title(ch) or ch for ch in dead_chs)
+        if eff_prov in dead_chs:
+            _tail = ('запасного канала с credential нет — задачи упадут с ошибкой '
+                     'авторизации или лимита, пока канал не оживёт.')
+        else:
+            _tail = ('задачи пойдут следующим каналом цепочки: <b>'
+                     + html.escape(_prompt_channel_title(eff_prov) or eff_prov) + '</b>.')
+        chan_note += (
+            '<div style="margin:-6px 0 10px;font-size:12px;color:var(--warn,#c98a2b)">'
+            f'<svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Канал сейчас недоступен (401/429): <b>{html.escape(_names)}</b> — {_tail}</div>')
+    if enq_prov and enq_prov != eff_prov:
+        chan_note += (
+            '<div class=hint style="margin:-6px 0 10px">Этот канал сейчас загружен: '
+            f'ближайшая задача уйдёт в <b>{html.escape(_prompt_channel_title(enq_prov) or enq_prov)}</b> '
+            '— канал выбирается в момент постановки, по свободному слоту.</div>')
+    own_tok = _first_credential(own, "claude_oauth")
+    tok_state = (f'своих токенов: {len(_credential_candidates(own, "claude_oauth"))}' if own_tok else 'не задан')
+    # своя подписка Codex: отдельный секрет, серверный CODEX_HOME владельца тут не при чём
+    own_codex = own_creds.get(OWN_CODEX_AUTH_FAMILY, "")
+    codex_state = ('своя авторизация задана' if own_codex else
+                   ('не задана → серверная подписка владельца' if _codex_allowed(u) else
+                    'не задана → канал Codex недоступен'))
+    own_oai = _first_credential(own, "openai")
+    oai_state = ('свой ключ задан' if own_oai else
+                 ('не задан → используется серверный' if _first_credential(keys(), "openai")
+                  else 'не задан, серверного тоже нет'))
+    err = str((getattr(request, "query_params", None) or {}).get("err") or "")
+    codex_err = ('<div style="margin-top:6px;font-size:12px;color:var(--error,#c0392b)">'
+                 '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Это не похоже на auth.json: нужен JSON-объект целиком '
+                 '(<code>{"tokens": …}</code>), путь к каталогу не принимается.</div>'
+                 if err == "codex_auth" else "")
+    own_channels = _own_prompt_channels(u)
+    sel_channel = _selected_prompt_channel(u)
+    # ── Сначала ВЫБОР канала, под ним — поле ровно его ключа ────────────────────
+    # Раньше тут висели все поля сразу + абзац объяснений, а самого выбора у юзера без
+    # своего credential не было вовсе. Теперь: один список каналов + одно поле.
+    srv_label = _prompt_channel_title(_server_prompt_provider(u)) or ""
+    ch_opts = ('<option value=""%s>Авто — решает сервер (сейчас: %s)</option>'
+               % ("" if sel_channel else " selected", html.escape(srv_label)))
+    for ch in PROMPT_CHANNEL_ORDER:
+        if ch in own_channels:
+            tail = "свой ключ"
+        elif _prompt_channel_selectable(u, ch):
+            # Владельцу выбор policy не запрещает, но молчать об этом нельзя: канал,
+            # выключенный в серверной политике, сам по себе задачам не достаётся.
+            tail = ("серверный ключ, в серверной политике выключен"
+                    if not _prompt_channel_allowed(u, ch) else "серверный ключ")
+        else:
+            tail = "ключа нет — впишите ниже"
+        if ch in dead_chs:
+            tail += ", сейчас недоступен"
+        ch_opts += ('<option value="%s"%s>%s · %s</option>'
+                    % (ch, " selected" if sel_channel == ch else "",
+                       html.escape(dict(PROMPT_PROVIDERS).get(ch, ch)), tail))
+    chan_err = ('<div style="margin:8px 0 0;font-size:12px;color:var(--error,#c0392b)">'
+                '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Канал не выбран: у него нет ни вашего ключа, '
+                'ни доступного серверного. Впишите ключ канала в поле ниже и сохраните ещё раз.</div>'
+                if err == "prompt_channel" else "")
+
+    def _pane(ch, inner):
+        """Поле credential канала. Видно только у выбранного канала (переключает JS);
+        начальное состояние ставит сервер — без JS форма тоже пригодна."""
+        vis = "" if sel_channel == ch else "display:none"
+        return ('<div class=pchan-pane data-ch="%s" style="margin-top:12px;%s">%s</div>'
+                % (ch, vis, inner))
+
+    codex_opts = "".join(f'<option value="{m}"{" selected" if m == (own.get("codex_model") or DEFAULT_CODEX_MODEL) else ""}>{m}</option>'
+                         for m in CODEX_MODELS)
+    legacy_block = ""
+    if is_admin:
+        legacy_block = (
+            '<label style="display:flex;flex-direction:column;gap:4px;margin-top:10px;'
+            'font-size:11.5px;color:var(--muted)">Модель подписки (legacy raw-запуск)'
+            f'<select class=input name=codex_model style="width:190px">{codex_opts}</select></label>'
+        )
+    pane_openai = _pane("openai",
+        '<label style="display:block;font-size:11.5px;color:var(--muted);margin-bottom:4px">OpenAI-ключ</label>'
+        '<input class=input type=password autocomplete="new-password" spellcheck=false '
+        'name=prompt_key_openai placeholder="sk-proj-…" style="width:100%">'
+        f'<div class=hint style="font-size:11px;margin-top:5px">Сейчас: {oai_state} · пусто = не менять · «-» = очистить. '
+        'Это тот же ключ, что «OpenAI (gpt-image)» в списке ниже.</div>')
+    pane_claude = _pane("claude",
+        '<label style="display:block;font-size:11.5px;color:var(--muted);margin-bottom:4px">Claude OAuth-токен</label>'
+        '<input class=input type=password autocomplete="new-password" spellcheck=false '
+        'name=claude_oauth placeholder="sk-ant-oat01-…" style="width:100%">'
+        f'<div class=hint style="font-size:11px;margin-top:5px">Сейчас: {tok_state} · пусто = не менять · «-» = очистить. '
+        'Несколько токенов: через пробел или запятую; ввод заменяет пул. Получить: <code>claude setup-token</code>.</div>')
+    pane_codex = _pane("codex",
+        '<label style="display:block;font-size:11.5px;color:var(--muted);margin-bottom:4px">'
+        'Codex — содержимое <code>auth.json</code></label>'
+        '<textarea class=input name=codex_auth rows=3 autocomplete="off" spellcheck=false '
+        'style="width:100%;font-family:monospace;font-size:11.5px" '
+        'placeholder=\'{"tokens": {"access_token": "…", "refresh_token": "…"}} — файл ~/.codex/auth.json после `codex login`\'></textarea>'
+        f'<div class=hint style="font-size:11px;margin-top:5px">Сейчас: {codex_state} · пусто = не менять · «-» = очистить. '
+        'Вставляй <b>содержимое файла</b>; несколько аккаунтов — массив JSON-объектов. Ввод заменяет пул.</div>' + codex_err + legacy_block)
+    own_alt = _first_credential(own, "alt_llm")
+    alt_state = ('свой ключ задан' if own_alt else
+                 ('не задан → используется серверный' if _first_credential(keys(), "alt_llm")
+                  else 'не задан, серверного тоже нет'))
+    _alt_base_val = html.escape(str(own.get("alt_llm_base") or ""))
+    _alt_model_val = html.escape(str(own.get("alt_llm_model") or ""))
+    pane_alt = _pane("altclaude",
+        '<label style="display:block;font-size:11.5px;color:var(--muted);margin-bottom:4px">'
+        'Ключ альтернативного Claude API</label>'
+        '<input class=input type=password autocomplete="new-password" spellcheck=false '
+        'name=alt_llm placeholder="sk-ant-…" style="width:100%">'
+        f'<div class=hint style="font-size:11px;margin-top:5px">Сейчас: {alt_state} · пусто = не менять · «-» = очистить.</div>'
+        '<label style="display:block;font-size:11.5px;color:var(--muted);margin:10px 0 4px">'
+        'Адрес API (необязательно)</label>'
+        f'<input class=input name=alt_llm_base spellcheck=false value="{_alt_base_val}" '
+        f'placeholder="{html.escape(DEFAULT_ALT_LLM_BASE)}" style="width:100%">'
+        '<label style="display:block;font-size:11.5px;color:var(--muted);margin:10px 0 4px">'
+        'Модель (необязательно)</label>'
+        f'<input class=input name=alt_llm_model spellcheck=false value="{_alt_model_val}" '
+        f'placeholder="{html.escape(DEFAULT_ALT_LLM_MODEL)}" style="width:100%">'
+        '<div class=hint style="font-size:11px;margin-top:5px">OpenAI-совместимый эндпоинт '
+        '<code>/chat/completions</code>. Пусто = серверные значения по умолчанию.</div>')
+    warn = ""
+    if eff_prov == "claude" and not own_tok and not _first_credential(keys(), "claude_oauth"):
+        warn = ('<div style="margin-top:10px;font-size:12px;color:var(--warn,#c98a2b)"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Промпты идут каналом Claude, '
+                'но токена нет ни своего, ни серверного — генерация остановится с ошибкой. Получи токен командой '
+                '<code>claude setup-token</code> и вставь выше.</div>')
+    prompts_block = (
+        '<div style="border:1px solid var(--border);border-radius:10px;padding:15px 16px;margin-bottom:18px">'
+        '<div style="font-weight:500;font-size:13px;margin-bottom:5px"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-cpu"/></svg>&nbsp; Чем писать промпты</div>'
+        '<div class=hint style="margin-bottom:12px">Меняется только канал — правила, схемы, ретраи и потоки одни и те же. '
+        'Вписан свой ключ канала — <b>расход идёт на твою подписку</b>; не вписан — платит сервер.</div>'
+        + chan_note +
+        '<label style="display:block;font-size:11.5px;color:var(--muted);margin-bottom:4px">Канал</label>'
+        f'<select class=input id=pchan name=prompt_channel style="width:100%">{ch_opts}</select>'
+        f'<div class=hint style="font-size:11px;margin-top:5px">Сейчас промпты пишет: <b>{html.escape(prov_label)}</b>.</div>'
+        + chan_err + pane_openai + pane_claude + pane_alt + pane_codex + warn + '</div>' + _PROMPT_CHAN_JS
+    )
+    admin_link = ('<p class=hint style="margin-bottom:10px"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-settings"/></svg> <a href="/server-limits">Серверные ключи — лимиты</a>'
+                  ' (проекты / потоки / попытки общих ключей)</p>' if is_admin else "")
+    body = _header(u, "keys") + f"""<div class=wrap><h1>Мои API-ключи</h1>{admin_link}
+<p class=hint style="margin-bottom:6px">Свой ключ перекрывает общий серверный для тех видов задач, которые он поддерживает: эти задачи пойдут <b>на него</b> и не будут ждать слот общего ключа. <b>Пусто = не менять.</b> Чтобы очистить и вернуться на серверный — введите <code>-</code>.</p>
+<p class=hint style="margin-bottom:16px">Значения ключей не показываются — ни своих, ни серверных. Ключи личного пула распределяются по загрузке и по кругу. Лимиты ключа и общий предел сервера защищают очередь от перегрузки.</p>
+{_ADD_KEY_JS}\n<form method=post action=/api/my/keys/web>
+<label style="display:block;margin:12px 0"><input type=hidden name=credential_mode_present value=1><input type=checkbox name=own_only value=1 {"checked" if _own_only(u) else ""}> Использовать только мои ключи. Если ключ этапа не задан — остановить задачу без расхода серверного пула.</label>
+{prompts_block}
+<div class="list" style="border-top:1px solid var(--border)">{rows}</div>
+<div style="margin-top:16px"><button class="btn btn-primary">Сохранить</button></div></form></div>"""
+    return _page("Мои ключи", body)
+
+
+@app.post("/api/my/keys/web")
+async def my_keys_web(request: Request):
+    """Свои ключи (BYOK) сохраняет ЛЮБОЙ авторизованный юзер — только себе.
+
+    Серверные ключи и серверная параллельность формой не затрагиваются: пишем
+    исключительно users.keys/users.key_opts текущего uid.
+    """
+    u = require_web_user(request)
+    d = await _form(request)
+    lists = await _form_lists(request)      # одноимённые поля ключей целиком
+    own = _own_keys(u)
+    opts = _key_opts_from_row(u)
+    if "credential_mode_present" in d:
+        opts["_credentials"] = {"mode": "own_only" if d.get("own_only") == "1" else "server_fallback"}
+    for k, _label, group in _KEY_PROVIDERS:
+        # Ключи правятся по одному: отмеченные галкой снимаются, поля add_<ключ>
+        # добавляют новые. Каждый ключ несёт СВОЙ лимит провайдера, поэтому «проектов
+        # разом» задаётся на один ключ, а общая ёмкость умножается на их число.
+        current = [x for x in _credential_candidates(own, k) if x]
+        drop_idx = set()
+        for raw in lists.get(f"drop_{k}", []):
+            if str(raw).strip().isdigit():
+                drop_idx.add(int(str(raw).strip()))
+        kept = [v for i, v in enumerate(current) if i not in drop_idx]
+        for raw in lists.get(f"add_{k}", []):
+            val = str(raw or "").strip()
+            if val and val != "-":
+                kept.append(val)
+        legacy = (d.get(k) or "").strip()          # старое одиночное поле формы
+        if legacy == "-":
+            kept = []
+        elif legacy:
+            kept.append(legacy)
+        kept = list(dict.fromkeys(kept))           # дубли ёмкости не дают
+        if kept:
+            own[k] = kept if len(kept) > 1 else kept[0]
+        else:
+            own.pop(k, None)
+        # Настройки СВОЕГО ключа — пока свой ключ задан. Набор полей тот же, что рисует
+        # форма: у gen-групп потоки/проекты/попытки, у остальных только «проектов разом».
+        # Пустое поле = убрать свою настройку и вернуться к серверному значению.
+        if own.get(k):
+            names = ("threads", "parallel", "retries") if group in _GEN_GROUPS else ("parallel",)
+            grp = dict(opts.get(group) or {}) if isinstance(opts.get(group), dict) else {}
+            touched = False
+            for opt in names:
+                fname = f"opt_{group}_{opt}"
+                if fname not in d:
+                    continue
+                touched = True
+                raw = (d.get(fname) or "").strip()
+                if raw.isdigit() and int(raw) > 0:
+                    lo, hi = _OPT_BOUNDS[opt]
+                    grp[opt] = max(lo, min(hi, int(raw)))
+                else:
+                    grp.pop(opt, None)
+            if touched:
+                if grp:
+                    opts[group] = grp
+                else:
+                    opts.pop(group, None)
+    # чем писать промпты: от юзера — свой credential канала (claude_oauth / codex_auth /
+    # openai выше в списке ключей) и выбор канала СРЕДИ СВОИХ; серверные ключи и
+    # серверная подписка Codex владельца формой недостижимы.
+    # Число своих ключей меняется прямо здесь — пересчитываем ёмкость дорожки сразу,
+    # иначе второй ключ начал бы работать только после перезапуска сервиса.
+    cm = (d.get("codex_model") or "").strip()
+    if cm in CODEX_MODELS and u["role"] == "admin":
+        own["codex_model"] = cm                    # legacy raw-путь владельца
+    alt = (d.get("alt_llm") or "").strip()
+    if alt == "-":
+        own.pop("alt_llm", None)
+    elif alt:
+        tokens = list(dict.fromkeys(v.strip() for v in re.split(r"[\s,]+", alt) if v.strip()))
+        own["alt_llm"] = tokens[0] if len(tokens) == 1 else tokens
+    for _fld in ("alt_llm_base", "alt_llm_model"):
+        _v = (d.get(_fld) or "").strip()
+        if _v == "-" or (_fld in d and not _v):
+            own.pop(_fld, None)                 # пусто = вернуться к серверному дефолту
+        elif _v:
+            own[_fld] = _v
+    tok = (d.get("claude_oauth") or "").strip()
+    if tok == "-":
+        own.pop("claude_oauth", None)
+    elif tok:
+        tokens = list(dict.fromkeys(v.strip() for v in re.split(r"[\s,]+", tok) if v.strip()))
+        own["claude_oauth"] = tokens[0] if len(tokens) == 1 else tokens
+    bad_codex = False
+    ca = (d.get("codex_auth") or "").strip()
+    if ca == "-":
+        own.pop(OWN_CODEX_AUTH_FAMILY, None)
+        _drop_own_codex_home(u["id"])              # материализованный auth.json сносим
+    elif ca:
+        try:
+            parsed = json.loads(ca)
+            entries = parsed if isinstance(parsed, list) else [parsed]
+            payloads = list(dict.fromkeys(_own_codex_auth_payload(json.dumps(v, ensure_ascii=False))
+                                        for v in entries if isinstance(v, dict)))
+            valid = bool(payloads) and all(payloads) and len(entries) == len(payloads)
+        except (TypeError, ValueError):
+            valid = False
+        if valid:
+            own[OWN_CODEX_AUTH_FAMILY] = payloads[0] if len(payloads) == 1 else payloads
+        else:
+            bad_codex = True
+    # Ключ канала «GPT API» вписывается прямо в блоке промптов — это тот же own["openai"],
+    # что и строка «OpenAI (gpt-image)» выше в форме (она применяется первой, здесь —
+    # осознанное перекрытие тем, что юзер ввёл в блоке промптов).
+    pk = (d.get("prompt_key_openai") or "").strip()
+    if pk == "-":
+        own.pop("openai", None)
+    elif pk:
+        own["openai"] = pk
+    bad_channel = False
+    if "prompt_channel" in d:
+        # Канал со СВОИМ credential — можно всегда (проверяем по уже применённым в этой
+        # же форме ключам). Серверный credential — только если канал разрешён серверной
+        # policy и сервером обеспечен (_prompt_channel_selectable). Ни того, ни другого →
+        # выбор не сохраняем и говорим об этом, а не молча откатываем на «решает сервер».
+        want = (d.get("prompt_channel") or "").strip().lower()
+        fresh_own = _prompt_channels_with_own_credential(_own_credentials_from_keys(own))
+        if want and (want in fresh_own or _prompt_channel_selectable(u, want)):
+            opts[_OWN_PROMPT_CHANNEL_OPT] = {"provider": want}
+        else:
+            opts.pop(_OWN_PROMPT_CHANNEL_OPT, None)
+            bad_channel = bool(want)
+    if "prompt_threads" in d:                       # поля в форме больше нет: не теряем legacy-значение
+        thr = (d.get("prompt_threads") or "").strip()
+        if thr.isdigit() and int(thr) > 0:
+            own["prompt_threads"] = max(1, min(64, int(thr)))
+        else:
+            own.pop("prompt_threads", None)         # пусто = дефолт канала
+    c = db()
+    c.execute(
+        "UPDATE users SET keys=?,key_opts=? WHERE id=?",
+        (json.dumps(own, ensure_ascii=False),
+         json.dumps(opts, ensure_ascii=False), u["id"]),
+    )
+    c.commit(); c.close()
+    _UOPTS_CACHE.pop(u["id"], None)   # сброс кэша → настройки применяются сразу
+    _OWN_CRED_CACHE.pop(u["id"], None)
+    _refresh_byok_pool_hint()
+    dest = ("/keys?err=codex_auth" if bad_codex else
+            "/keys?err=prompt_channel" if bad_channel else "/keys")
+    return RedirectResponse(dest, 302)
+
+
+# ── Админ-панель серверных ключей: проекты / потоки / попытки (только role=admin) ──
+def _web_admin(request: Request):
+    """Веб-гейт админ-страниц. Партнёр не должен ни открыть, ни сохранить серверные лимиты."""
+    u = require_web_user(request)
+    if not _is_admin_row(u):
+        raise HTTPException(403, "только для владельца сервера")
+    return u
+
+
+def _fastgen_cached_account_limits():
+    """Живой предел FastGen-аккаунта из УЖЕ прочитанного кэша (без запроса в сеть)."""
+    try:
+        st = _fg_cache.get("data") or {}
+        lim = (st.get("usage") or {}).get("account_limits") or {}
+        return lim if isinstance(lim, dict) else {}
+    except Exception:
+        return {}
+
+
+def _limit_input(prov, field, cur, ph):
+    lo, hi = _SERVER_LIMIT_BOUNDS[field]
+    if field == "key_budget":
+        hi = _PROVIDER_BUDGET_HARD.get(prov, hi)   # предел конкретного аккаунта
+    val = cur.get(field)
+    return (f'<input class=input type=number min={lo} max={hi} name=lim_{prov}_{field} '
+            f'value="{html.escape(str(val if val else ""))}" placeholder="{html.escape(ph)}" '
+            'style="width:100%;padding:5px 7px;font-size:12px">')
+
+
+@app.get("/server-limits", response_class=HTMLResponse)
+def server_limits_page(request: Request):
+    u = _web_admin(request)
+    cfg = _concurrency_cfg()
+    fg = _fastgen_cached_account_limits()
+    head = ('<div class="list-row" style="grid-template-columns:1fr 92px 92px 92px 92px 92px 100px 240px;'
+            'align-items:end;font-size:11px;color:var(--muted)">'
+            '<span>вид серверного ключа</span><span>проектов<br>разом</span>'
+            '<span>на одного<br>юзера</span><span>потоков<br>на проект</span>'
+            '<span>попыток</span><span>своих ключей<br>разом</span>'
+            '<span>бюджет потоков<br>ключа</span>'
+            '<span>предел аккаунта / раздано</span></div>')
+    rows = ""
+    for prov, label, has_thr, has_ret in _SERVER_LIMIT_ROWS:
+        raw = cfg.get(prov)
+        cur = dict(raw) if isinstance(raw, dict) else {}
+        g, k = _provider_caps(prov)
+        rep = _provider_alloc_report(prov)
+        acc = rep["account_text"]
+        if prov == "recrafter" and fg:
+            acc = (f'{fg.get("img_generation_threads_allowed", "?")} потоков, '
+                   f'{fg.get("img_gen_per_hour_limit", "?")} картинок/час (живой ответ ключа)')
+        col = "var(--error)" if rep["over"] else "var(--muted)"
+        pool_txt = f' · ключей в пуле: {rep["pool"]}' if rep["pool"] > 1 else ""
+        alloc = (f'раздано на серверные ключи ≈ <b style="color:{col}">{rep["server_units"]}</b> '
+                 f'вызовов разом (проектов {rep["server_jobs"]} × потоков {rep["per_job"]}'
+                 f'{pool_txt})<br>+ свои ключи юзеров: проектов {rep["byok_jobs"]} '
+                 '(ёмкость аккаунта не тратят)')
+        limit_txt = (f'предел аккаунта: {html.escape(acc)}<br>' if acc else
+                     'предел аккаунта: не задан<br>')
+        dash = '<span class=muted style="text-align:center">—</span>'
+        rows += (
+            '<div class="list-row" style="grid-template-columns:1fr 92px 92px 92px 92px 92px 100px 240px;'
+            'align-items:center">'
+            f'<span style="font-size:12.5px;font-weight:500">{html.escape(label)}'
+            f'<br><span class=muted style="font-size:11px">{html.escape(prov)} · '
+            f'сейчас {g} / {k}{" / " + str(rep["per_job"]) + " потоков" if rep["per_job"] > 1 else ""}'
+            f'</span></span>'
+            + _limit_input(prov, "global", cur, str(g))
+            + _limit_input(prov, "per_tenant", cur, str(k))
+            + (_limit_input(prov, "threads", cur, str(rep["per_job"])) if has_thr else dash)
+            + (_limit_input(prov, "retries", cur, "дефолт") if has_ret else dash)
+            + _limit_input(prov, "byok_global", cur, str(rep["byok_jobs"]))
+            + (_limit_input(prov, "key_budget", cur, str(_provider_budget_units(prov)))
+               if prov in _PROVIDER_BUDGET_HARD else dash)
+            + f'<span class=muted style="font-size:11px">{limit_txt}{alloc}</span>'
+            '</div>')
+    # без вложенных f-строк внутри f"""…""" — на старых Python это синтаксическая ошибка,
+    # а такая ошибка в этом файле роняет ВЕСЬ кабинет
+    # рабочий потолок = код-потолок ∩ бюджет памяти этой машины (не статическая константа)
+    prompt_hard = " / ".join("%s %s" % (p, _prompt_threads_hard(p)) for p in PROMPT_THREADS_HARD)
+    budget_now = " / ".join("%s %s из %s" % (p, _provider_budget_units(p), h)
+                            for p, h in _PROVIDER_BUDGET_HARD.items())
+    body = _header(u, "srvlimits") + f"""<div class=wrap><h1>Серверные ключи — лимиты</h1>
+<p class=hint style="margin-bottom:6px">Те же параметры, что у личных ключей, но для <b>общих серверных</b>: сколько проектов идёт разом, сколько на одного юзера, сколько потоков внутри проекта и сколько попыток генерации. <b>Пусто = серверный дефолт из кода.</b></p>
+<p class=hint style="margin-bottom:6px">Значение выше код-потолка обрезается (не применяется): проекты — <code>_PROVIDER_HARD_JOB_CAPS</code>, потоки — {SHARED_IMAGE_THREADS_HARD} картинки / {SHARED_VIDEO_THREADS_HARD} видео / промпты {prompt_hard}, попытки — {SERVER_RETRIES_HARD}. Прочерк = у этого вида ключа параметр не работает и поэтому не рисуется.</p>
+<p class=hint style="margin-bottom:6px">«Потоков на проект» — это база и для картинок, и для видео (дефолты кода {SHARED_IMAGE_THREADS_PER_JOB} и {SHARED_VIDEO_THREADS_PER_JOB}, сверху действует «бюджет потоков ключа»: тяжёлая модель = вес 4, дефолтная = 1). «Своих ключей разом» — бюджет отдельной дорожки BYOK: своих ключей серверная ёмкость не касается, но железо общее.</p>
+<p class=hint style="margin-bottom:6px"><b>«Бюджет потоков ключа»</b> — сколько одновременных вызовов кабинет отдаёт ОДНОМУ серверному ключу; проекты делят его между собой (3 проекта × 7 потоков дефолтной модели = 21). Сейчас: {budget_now} (потолок = предел аккаунта, остаток оставляйте другим сервисам того же ключа).</p>
+<p class=hint style="margin-bottom:16px;color:var(--warn,#c98a2b)"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Предел, показанный справа — на <b>весь аккаунт провайдера</b>: тот же аккаунт делят VideoStudio, Cover и Rewrite. Оставляй запас, «раздано» краснеет только при превышении предела аккаунта.</p>
+<form method=post action=/api/server/limits>
+<div class="list" style="border-top:1px solid var(--border)">{head}{rows}</div>
+<div style="margin-top:16px"><button class="btn btn-primary">Сохранить</button>
+<span class=hint style="margin-left:12px">Пишется в блок <code>_concurrency</code> файла ключей (бэкап + атомарная замена), применяется без рестарта.</span></div>
+</form></div>"""
+    return _page("Серверные лимиты", body)
+
+
+@app.post("/api/server/limits")
+async def server_limits_save(request: Request):
+    """Сохранить админ-таблицу лимитов серверных ключей. Только role=admin.
+
+    Ключи, claude_oauth_pool и _prompt_policy файла НЕ ТРОГАЕМ: пишем ровно блок
+    "_concurrency" (см. _save_concurrency_cfg).
+    """
+    _web_admin(request)
+    d = await _form(request)
+    try:
+        current = (keys() or {}).get("_concurrency")      # свежее чтение файла, не 10с-кэш
+    except Exception:
+        current = None
+    block = _parse_server_limits_form(d, current if isinstance(current, dict) else {})
+    _save_concurrency_cfg(block)
+    return RedirectResponse("/server-limits", 302)
+
+
+@app.post("/api/run-worker")
+async def run_worker_ep(request: Request, authorization: str = Header(None), x_token: str = Header(None)):
+    """Legacy raw worker endpoint: только admin, не является путём партнёрского кабинета."""
+    u = _admin(authorization, x_token)
+    _check_quota(u)
+    body = await request.json()
+    worker = body.get("worker")
+    args = body.get("args") or []
+    files = body.get("files") or {}
+    files_b64 = body.get("files_b64") or {}
+    title = body.get("title") or ""
+    source_text = body.get("source_text") or ""
+    if worker not in WORKER_WHITELIST:
+        raise HTTPException(400, f"worker не разрешён: {worker}")
+    settings = json.dumps({"worker": worker, "args": args, "files": list(files.keys()), "files_b64": list(files_b64.keys())}, ensure_ascii=False)
+    c = db()
+    cur = c.execute("INSERT INTO gen_jobs(user_id,type,prompt,model,status,ts,title,source_text,settings) VALUES(?,?,?,?,?,?,?,?,?)",
+                    (u["id"], f"worker:{worker}", (source_text or worker)[:200], worker, "queued",
+                     datetime.datetime.now().isoformat(timespec="seconds"), title, source_text, settings))
+    jid = cur.lastrowid
+    c.commit()
+    c.close()
+    JOB_Q.put((_run_worker_job, (jid, u["id"], worker, args, files, files_b64)))
+    return {"job_id": jid, "status": "queued", "queue_depth": JOB_Q.qsize()}
+
+
+@app.get("/api/jobs/{jid}/files")
+def job_files(jid: int, authorization: str = Header(None), x_token: str = Header(None)):
+    u = _user(authorization, x_token)
+    r = _get_gen(jid, u)
+    files = json.loads(r["result_files"]) if r["result_files"] else []
+    return {"job_id": jid, "status": r["status"], "error": r["error"], "files": files}
+
+
+@app.get("/api/jobs/{jid}/file/{name:path}")
+def job_file(jid: int, name: str, authorization: str = Header(None), x_token: str = Header(None)):
+    u = _user(authorization, x_token)
+    r = _get_gen(jid, u)
+    base = os.path.normpath(r["result_path"] or "")
+    full = os.path.normpath(os.path.join(base, name))
+    if not base or not (full == base or full.startswith(base + os.sep)):
+        raise HTTPException(400, "bad path")
+    if not os.path.exists(full) or not os.path.isfile(full):
+        raise HTTPException(404, "no file")
+    return FileResponse(full, media_type=_media_for(full))
+
+
+@app.get("/admin/api/jobs")
+def admin_jobs(authorization: str = Header(None), x_token: str = Header(None)):
+    _admin(authorization, x_token)
+    c = db()
+    rows = c.execute("SELECT j.id,u.name uname,j.provider,j.path,j.method,j.status,j.bytes,j.ts "
+                     "FROM jobs j JOIN users u ON u.id=j.user_id ORDER BY j.id DESC LIMIT 300").fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+@app.get("/admin/api/users")
+def admin_users(authorization: str = Header(None), x_token: str = Header(None)):
+    _admin(authorization, x_token)
+    c = db()
+    rows = c.execute("SELECT id,name,role,created,daily_quota,(SELECT COUNT(*) FROM jobs WHERE user_id=users.id) jobs FROM users ORDER BY id").fetchall()
+    c.close()
+    return [dict(r) for r in rows]
+
+
+@app.post("/admin/api/users")
+def admin_create_user(name: str, authorization: str = Header(None), x_token: str = Header(None)):
+    _admin(authorization, x_token)
+    tok = "usr_" + secrets.token_urlsafe(24)
+    c = db()
+    c.execute("INSERT INTO users(name,token,role,created) VALUES(?,?,?,?)",
+              (name, tok, "user", datetime.datetime.now().isoformat(timespec="seconds")))
+    c.commit()
+    c.close()
+    return {"name": name, "token": tok}
+
+
+@app.post("/admin/api/users/{uid}/quota")
+def admin_set_quota(uid: int, quota: int, authorization: str = Header(None), x_token: str = Header(None)):
+    """Дневная квота юзера: 0 = безлимит, N = N job'ов/день."""
+    _admin(authorization, x_token)
+    c = db()
+    c.execute("UPDATE users SET daily_quota=? WHERE id=?", (quota, uid))
+    c.commit()
+    c.close()
+    return {"user_id": uid, "daily_quota": quota}
+
+
+@app.post("/admin/api/create_partner")
+async def admin_create_partner(request: Request):
+    """Создать партнёра (tenant+user+password_hash+каталог) из админ-панели (токен-авторизация)."""
+    d = await _form(request)
+    token = d.get("token") or ""
+    c = db()
+    a = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+    if not a or a["role"] != "admin":
+        c.close(); raise HTTPException(401, "нужен админ-токен")
+    login = (d.get("login") or "").strip()
+    password = (d.get("password") or "").strip()
+    quota = (d.get("quota") or "").strip()
+    if not login or not password:
+        c.close(); return RedirectResponse(f"/admin?token={token}", 302)
+    if c.execute("SELECT 1 FROM users WHERE name=?", (login,)).fetchone():
+        c.close()
+        return HTMLResponse(f"<p style='font-family:sans-serif'>Логин '{html.escape(login)}' уже занят. "
+                            f"<a href='/admin?token={html.escape(token)}'>← назад</a></p>", status_code=409)
+    now = datetime.datetime.now().isoformat(timespec="seconds")
+    tok = "usr_" + secrets.token_urlsafe(24)
+    q = int(quota) if quota.lstrip("-").isdigit() else None
+    cur = c.execute("INSERT INTO users(name,token,role,created,password_hash,daily_quota) VALUES(?,?,?,?,?,?)",
+                    (login, tok, "user", now, hash_password(password), q))
+    uid = cur.lastrowid; tid = str(uid)
+    c.execute("UPDATE users SET tenant_id=? WHERE id=?", (tid, uid))
+    c.execute("INSERT OR REPLACE INTO tenants(id,name,created,is_active,daily_quota) VALUES(?,?,?,1,?)", (tid, login, now, q))
+    c.commit(); c.close()
+    try:
+        os.makedirs(os.path.join(TENANTS_DIR, tid, "projects"), exist_ok=True)
+    except Exception:
+        pass
+    return RedirectResponse(f"/admin?token={token}", 302)
+
+
+# ============================================================
+# АДМИН-ПАНЕЛЬ: весь контур на одном экране + управление
+# ------------------------------------------------------------
+# Что здесь принципиально:
+#  1. Снимки состояния (_adm_*) НИЧЕГО не меняют и не бросают наружу — панель опрашивается
+#     раз в несколько секунд, и падение одного датчика не должно ронять весь экран:
+#     каждый блок ловит свои исключения и отдаёт {"error": ...}.
+#  2. Дорогие датчики (du по каталогу тенантов, systemctl, journalctl) — только через
+#     _adm_cache: без него polling раз в 5 с превратился бы в постоянный du по 200 ГБ.
+#  3. Действия — строго из белого списка (_ADM_ACTIONS), systemctl — только по
+#     перечисленным юнитам. Из веба нельзя выполнить произвольную команду.
+#  4. Секреты не выходят на экран никогда: ключи только маской (_adm_mask).
+# ============================================================
+
+# Юниты, которыми панель имеет право управлять. Это ВЕСЬ список — произвольное имя
+# из запроса сюда не попадает (см. _adm_unit_ok).
+_ADM_UNITS = (
+    ("vsgen",          "Кабинет генерации", "этот сервис: очередь, воркеры, кабинет"),
+    ("rewrite-server", "Rewrite",           "переписывание текстов, порт 8899"),
+    ("cover-server",   "Cover",             "генератор обложек, порт 8900"),
+    ("caddy",          "Caddy",             "HTTPS-фронт всех трёх сервисов"),
+)
+_ADM_UNIT_NAMES = tuple(u[0] for u in _ADM_UNITS)
+_ADM_CACHE = {}
+_ADM_CACHE_LOCK = threading.Lock()
+
+
+def _adm_unit_ok(unit):
+    return (unit or "").strip() in _ADM_UNIT_NAMES
+
+
+def _adm_cache(key, ttl, fn):
+    """Значение с TTL. Пересчёт вне лока: du/journalctl держат секунды, и держать на них
+    общий лок значило бы сериализовать всю панель."""
+    now = time.time()
+    with _ADM_CACHE_LOCK:
+        hit = _ADM_CACHE.get(key)
+        if hit and now - hit[0] < ttl:
+            return hit[1]
+    try:
+        val = fn()
+    except Exception:
+        log_exc("admin/cache/" + str(key))
+        with _ADM_CACHE_LOCK:
+            hit = _ADM_CACHE.get(key)
+        return hit[1] if hit else None
+    with _ADM_CACHE_LOCK:
+        _ADM_CACHE[key] = (now, val)
+    return val
+
+
+def _adm_sh(args, timeout=8):
+    """Список аргументов, НИКОГДА не shell-строка. Возвращает (rc, stdout+stderr)."""
+    try:
+        p = subprocess.run(args, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, ((p.stdout or "") + (p.stderr or ""))
+    except subprocess.TimeoutExpired:
+        return 124, "таймаут команды"
+    except Exception as e:
+        return 127, f"{type(e).__name__}: {e}"
+
+
+def _adm_mask(val):
+    """Маска секрета: достаточно, чтобы узнать ключ, недостаточно, чтобы им воспользоваться."""
+    s = str(val or "")
+    if not s:
+        return ""
+    if len(s) <= 12:
+        return s[:2] + "…" + s[-2:]
+    return s[:6] + "…" + s[-4:]
+
+
+def _adm_dur(sec):
+    """Человеческая длительность: панель читают глазами, а не парсером."""
+    try:
+        sec = float(sec)
+    except Exception:
+        return "—"
+    if sec < 0:
+        sec = 0
+    if sec < 60:
+        return f"{int(sec)} с"
+    if sec < 3600:
+        return f"{int(sec // 60)} мин"
+    if sec < 86400:
+        h = int(sec // 3600); m = int((sec % 3600) // 60)
+        return f"{h} ч {m} мин" if m else f"{h} ч"
+    d = int(sec // 86400); h = int((sec % 86400) // 3600)
+    return f"{d} д {h} ч" if h else f"{d} д"
+
+
+def _adm_bytes(n):
+    try:
+        n = float(n)
+    except Exception:
+        return "—"
+    for unit, div in (("ТБ", 1024 ** 4), ("ГБ", 1024 ** 3), ("МБ", 1024 ** 2), ("КБ", 1024)):
+        if n >= div:
+            return f"{n / div:.1f} {unit}"
+    return f"{int(n)} Б"
+
+
+def _adm_boot_time():
+    """Момент загрузки машины — чтобы перевести monotonic-метки systemd в обычное время."""
+    try:
+        with open("/proc/uptime") as f:
+            return time.time() - float(f.read().split()[0])
+    except Exception:
+        return None
+
+
+def _adm_services():
+    """Состояние всех сервисов контура. systemctl недоступен (не Linux/нет прав) →
+    честное «неизвестно», а не пустой экран."""
+    def _collect():
+        boot = _adm_boot_time()
+        out = []
+        props = ("LoadState", "ActiveState", "SubState", "NRestarts", "MemoryCurrent",
+                 "MainPID", "ActiveEnterTimestampMonotonic")
+        for unit, title, note in _ADM_UNITS:
+            rc, txt = _adm_sh(["systemctl", "show", unit, "-p", ",".join(props)], timeout=6)
+            d = {}
+            for line in (txt or "").splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    d[k.strip()] = v.strip()
+            if rc != 0 and not d:
+                out.append({"unit": unit, "title": title, "note": note,
+                            "state": "unknown", "err": (txt or "").strip()[:160]})
+                continue
+            started = None
+            try:
+                mono = float(d.get("ActiveEnterTimestampMonotonic") or 0) / 1e6
+                if boot and mono > 0:
+                    started = boot + mono
+            except Exception:
+                started = None
+            try:
+                mem = int(d.get("MemoryCurrent") or 0)
+                mem = mem if mem > 0 else None
+            except Exception:
+                mem = None
+            out.append({
+                "unit": unit, "title": title, "note": note,
+                "state": d.get("ActiveState") or "unknown",
+                "sub": d.get("SubState") or "",
+                "loaded": d.get("LoadState") or "",
+                "restarts": int(d.get("NRestarts") or 0),
+                "mem": mem, "pid": d.get("MainPID") or "",
+                "uptime_sec": round(time.time() - started) if started else None,
+                "self": unit == "vsgen",
+            })
+        return out
+    return _adm_cache("services", 10.0, _collect) or []
+
+
+def _adm_code_drift():
+    """Код в рантайме vs код на диске.
+
+    Ровно тот отказ, который 02.08 прожил больше суток незамеченным: main.py залит,
+    сервис не перезапущен, в рантайме старая версия. Снаружи это не видно ничем —
+    сервис отвечает, очередь идёт, а свежих фиксов просто нет.
+    ВАЖНО про воркеры: они запускаются отдельным процессом на каждую задачу, поэтому
+    свежий файл воркера применяется сразу — их дрейф показываем как справку, не как тревогу.
+    """
+    def _collect():
+        res = {"proc_started": _PROC_STARTED, "runtime_stale": False, "runtime": [], "workers": []}
+        try:
+            for path in (os.path.abspath(__file__),):
+                try:
+                    mt = os.path.getmtime(path)
+                except Exception:
+                    continue
+                if mt > _PROC_STARTED + 1:
+                    res["runtime_stale"] = True
+                    res["runtime"].append({"file": os.path.basename(path), "mtime": mt,
+                                           "older_by": mt - _PROC_STARTED})
+        except Exception:
+            log_exc("admin/drift/runtime")
+        try:
+            src = globals().get("SRC_DIR")
+            if src and os.path.isdir(src):
+                for p in sorted(glob.glob(os.path.join(src, "*.py")))[:200]:
+                    try:
+                        mt = os.path.getmtime(p)
+                    except Exception:
+                        continue
+                    if mt > _PROC_STARTED:
+                        res["workers"].append({"file": os.path.basename(p), "mtime": mt})
+                res["workers"].sort(key=lambda x: -x["mtime"])
+                res["workers"] = res["workers"][:12]
+        except Exception:
+            log_exc("admin/drift/workers")
+        return res
+    return _adm_cache("drift", 20.0, _collect) or {"runtime_stale": False, "runtime": [], "workers": []}
+
+
+_ADM_SIZE_JOBS = set()          # какие каталоги считаются прямо сейчас (не запускать du дважды)
+
+
+def _adm_dir_size(path, ttl=600.0):
+    """Размер каталога — считается В ФОНЕ, панель на него никогда не ждёт.
+
+    du по каталогу тенантов (боевые 200 ГБ, сотни тысяч файлов) на холодном кэше
+    занимает минуты. Синхронный вызов означал бы, что панель — единственный инструмент,
+    которым смотрят на упавший сервис, — сама открывается минуту. Поэтому: есть
+    посчитанное значение (пусть и просроченное) — отдаём его, а свежее считает поток.
+    """
+    key = "dirsize:" + str(path)
+    now = time.time()
+    with _ADM_CACHE_LOCK:
+        hit = _ADM_CACHE.get(key)
+        fresh = bool(hit and now - hit[0] < ttl)
+        running = key in _ADM_SIZE_JOBS
+        if not fresh and not running:
+            _ADM_SIZE_JOBS.add(key)
+            need_calc = True
+        else:
+            need_calc = False
+    if need_calc:
+        def _calc():
+            try:
+                if not path or not os.path.isdir(path):
+                    val = None
+                else:
+                    rc, out = _adm_sh(["du", "-sb", path], timeout=600)
+                    mult = 1
+                    if rc != 0:           # BSD du (macOS) не знает -b — считаем в килобайтах
+                        rc, out = _adm_sh(["du", "-sk", path], timeout=600)
+                        mult = 1024
+                    val = int((out or "0").split()[0]) * mult if rc == 0 else None
+            except Exception:
+                log_exc("admin/dirsize")
+                val = None
+            with _ADM_CACHE_LOCK:
+                if val is not None:
+                    _ADM_CACHE[key] = (time.time(), val)
+                _ADM_SIZE_JOBS.discard(key)
+        threading.Thread(target=_calc, name="adm-dirsize", daemon=True).start()
+    return hit[1] if hit else None
+
+
+def _adm_disk_history(used, total):
+    """Точки заполнения диска → прогноз «на сколько хватит».
+
+    Пишем не чаще раза в 30 минут: панель открыта постоянно, и без этого история
+    состояла бы из тысяч точек за один день.
+    """
+    try:
+        hist = _adm_state_get("disk_history", []) or []
+        now = time.time()
+        if not hist or now - float(hist[-1][0]) > 1800:
+            hist.append([now, int(used)])
+            hist = hist[-96:]                       # ~2 суток при шаге 30 мин
+            _adm_state_set("disk_history", hist)
+        if len(hist) >= 2:
+            dt = float(hist[-1][0]) - float(hist[0][0])
+            dv = float(hist[-1][1]) - float(hist[0][1])
+            if dt > 3600 and dv > 0:
+                per_day = dv / dt * 86400.0
+                free = max(0, total - used)
+                return {"per_day": per_day, "days_left": (free / per_day) if per_day > 0 else None,
+                        "points": len(hist)}
+        return {"per_day": None, "days_left": None, "points": len(hist)}
+    except Exception:
+        log_exc("admin/disk_history")
+        return {"per_day": None, "days_left": None, "points": 0}
+
+
+def _adm_resources():
+    """Железо бокса: нагрузка, память, диск, размеры того, что растёт."""
+    res = {}
+    try:
+        res["cpus"] = os.cpu_count()
+        res["load"] = [round(x, 2) for x in os.getloadavg()]
+    except Exception:
+        res["load"] = None
+    try:
+        mem = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                k, _, v = line.partition(":")
+                mem[k.strip()] = int(v.split()[0]) * 1024        # кБ → байты
+        res["mem_total"] = mem.get("MemTotal")
+        res["mem_avail"] = mem.get("MemAvailable")
+        res["swap_total"] = mem.get("SwapTotal")
+        res["swap_free"] = mem.get("SwapFree")
+    except Exception:
+        res["mem_total"] = res["mem_avail"] = None
+    try:
+        st = os.statvfs("/")
+        total = st.f_blocks * st.f_frsize
+        free = st.f_bavail * st.f_frsize
+        res["disk_total"], res["disk_free"] = total, free
+        res["disk_used"] = total - free
+        res["disk_forecast"] = _adm_disk_history(total - free, total)
+    except Exception:
+        res["disk_total"] = None
+    try:
+        rss = None
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    rss = int(line.split()[1]) * 1024
+                    break
+        res["self_rss"] = rss
+        res["self_threads"] = threading.active_count()
+    except Exception:
+        res["self_rss"] = None
+    try:
+        db_bytes = 0
+        for suffix in ("", "-wal", "-shm"):
+            p = DB + suffix
+            if os.path.exists(p):
+                db_bytes += os.path.getsize(p)
+        res["db_bytes"] = db_bytes
+    except Exception:
+        res["db_bytes"] = None
+    res["tenants_bytes"] = _adm_dir_size(TENANTS_DIR)
+    res["server_dir_bytes"] = _adm_dir_size(HERE, ttl=900.0)
+    try:
+        c = db()
+        try:
+            res["job_logs_rows"] = c.execute("SELECT COUNT(*) FROM job_logs").fetchone()[0]
+            res["tasks_rows"] = c.execute("SELECT COUNT(*) FROM queue_tasks").fetchone()[0]
+        finally:
+            c.close()
+    except Exception:
+        res["job_logs_rows"] = None
+    return res
+
+
+def _adm_provider_load():
+    """Загрузка дорожек ёмкости по провайдерам — тем же счётом, каким живёт шедулер.
+
+    Считаем ИМЕННО так, как _claim_fair_tasks: провайдер из снимка строки, дорожка
+    из lane, вес задачи из _task_capacity_units. Иначе панель показывала бы «свободно»
+    там, где шедулер видит «занято», и объяснить простой очереди стало бы нечем.
+    """
+    load = {}
+    c = db()
+    try:
+        rows = c.execute("SELECT job_id,kind,params,uid,provider,lane,status,created,started,claimed,capacity_units "
+                         "FROM queue_tasks WHERE status IN ('queued','running')").fetchall()
+    finally:
+        c.close()
+    for r in rows:
+        if r["kind"] == "render":
+            prov = "render"
+        else:
+            prov = _task_provider(r["kind"], r["params"], uid=r["uid"], stored_provider=r["provider"])
+        try:
+            params = json.loads(r["params"] or "{}")
+        except Exception:
+            params = {}
+        if r["status"] == "running":
+            lane = _running_lane(r, prov) if r["kind"] != "render" else "server"
+        else:
+            lane = ("byok" if (r["kind"] != "render" and
+                                _task_uses_own_credential(r["uid"], prov, r["kind"]))
+                    else "server")
+        d = load.setdefault(prov, {"provider": prov, "running": 0, "queued": 0,
+                                   "lanes": {}, "paused": _queue_paused(prov)})
+        ln = d["lanes"].setdefault(lane, {"running_jobs": 0, "running_units": 0,
+                                          "queued_jobs": 0, "budget_jobs": None, "budget_units": None})
+        if r["status"] == "running":
+            d["running"] += 1
+            ln["running_jobs"] += 1
+            if r["kind"] != "render":
+                ln["running_units"] += int(r["capacity_units"] or _task_capacity_units(r["kind"], params, prov))
+        else:
+            d["queued"] += 1
+            ln["queued_jobs"] += 1
+    # бюджеты: и для провайдеров без активных задач — иначе пустой канал исчезал бы с экрана
+    try:
+        known = set(load) | set(_concurrency_cfg().keys()) | {"render"}
+    except Exception:
+        known = set(load) | {"render"}
+    for prov in known:
+        d = load.setdefault(prov, {"provider": prov, "running": 0, "queued": 0,
+                                   "lanes": {}, "paused": _queue_paused(prov)})
+        d["paused"] = _queue_paused(prov)
+        if prov == "render":
+            continue
+        for lane in ("server", "byok"):
+            try:
+                bj, bu = _provider_lane_budget(prov, lane)
+            except Exception:
+                bj, bu = None, None
+            ln = d["lanes"].setdefault(lane, {"running_jobs": 0, "running_units": 0,
+                                              "queued_jobs": 0, "budget_jobs": None, "budget_units": None})
+            ln["budget_jobs"], ln["budget_units"] = bj, bu
+    # резервы ёмкости под голодающие тяжёлые задачи (barging prevention)
+    try:
+        for (prov, lane), rec in (_queue_reservation_state() or {}).items():
+            d = load.get(prov)
+            if not d:
+                continue
+            d.setdefault("reserved", []).append(
+                {"lane": lane, "job_id": rec.get("job_id"), "units": rec.get("units"),
+                 "waiting_sec": round(time.time() - float(rec.get("since") or time.time()))})
+    except Exception:
+        log_exc("admin/reservations")
+    # Состояние пула серверных ключей: какой слот занят, а какой отдыхает и до какого
+    # часа. Без этого «канал молчит» выглядит загадкой, и токены снова начнут двигать
+    # руками. Наружу уходят только маски и сроки — секретов тут нет.
+    for prov, d in load.items():
+        if prov == "render":
+            continue
+        try:
+            fam = _provider_credential_family(prov)
+            pool = _cred_pool_view(fam) if fam else []
+        except Exception:
+            log_exc("admin/cred_pool")
+            pool = []
+        if len(pool) > 1 or any(s.get("resting") for s in pool):
+            d["pool"] = pool
+    # пустые дорожки без бюджета и без задач не показываем — это шум
+    for d in load.values():
+        d["lanes"] = {k: v for k, v in d["lanes"].items()
+                      if v["running_jobs"] or v["queued_jobs"] or v.get("budget_jobs")}
+    return sorted(load.values(), key=lambda x: (-x["running"] - x["queued"], x["provider"]))
+
+
+def _adm_tasks(status=None, kind=None, uid=None, provider=None, q=None, limit=120):
+    """Задачи ВСЕХ тенантов с фильтрами. Активные — всегда целиком (их немного),
+    история — окном: панель не должна тянуть 3600 строк на каждый polling."""
+    where, args = [], []
+    if status == "active":
+        where.append("q.status IN ('queued','running')")
+    elif status:
+        where.append("q.status=?"); args.append(status)
+    if kind:
+        where.append("q.kind=?"); args.append(kind)
+    if uid:
+        where.append("q.uid=?"); args.append(int(uid))
+    if provider:
+        where.append("(q.provider=? OR (q.kind='render' AND ?='render'))"); args += [provider, provider]
+    if q:
+        where.append("(p.name LIKE ? OR u.name LIKE ? OR q.error LIKE ? OR CAST(q.job_id AS TEXT)=?)")
+        args += [f"%{q}%", f"%{q}%", f"%{q}%", str(q)]
+    sql = ("SELECT q.job_id,q.uid,q.kind,q.status,q.provider,q.lane,q.created,q.started,q.finished,"
+           "q.progress,q.stage,q.claimed,q.error,q.project_id,q.tenant_id,"
+           "u.name AS uname,p.name AS pname "
+           "FROM queue_tasks q LEFT JOIN users u ON u.id=q.uid "
+           "LEFT JOIN projects p ON p.id=q.project_id "
+           + ("WHERE " + " AND ".join(where) + " " if where else "")
+           + "ORDER BY CASE q.status WHEN 'running' THEN 0 WHEN 'queued' THEN 1 ELSE 2 END, "
+             "q.job_id DESC LIMIT ?")
+    args.append(int(limit))
+    c = db()
+    try:
+        rows = c.execute(sql, args).fetchall()
+    finally:
+        c.close()
+    now = time.time()
+    out = []
+    for r in rows:
+        prov = r["provider"] or ("render" if r["kind"] == "render" else "")
+        started, claimed = r["started"], r["claimed"]
+        age = now - float(r["created"] or now)
+        # «зависла» = не по общей длительности, а по МОЛЧАНИЮ: lease-механизм считает так же
+        # (claimed обновляется heartbeat'ом воркера / прогрессом рендер-ноды).
+        silent = (now - float(claimed)) if (r["status"] == "running" and claimed) else None
+        lease = RENDER_LEASE_SEC if r["kind"] == "render" else GEN_LEASE
+        out.append({
+            "job_id": r["job_id"], "uid": r["uid"], "user": r["uname"] or "—",
+            "kind": r["kind"], "status": r["status"], "provider": prov, "lane": r["lane"] or "",
+            "project": r["pname"] or r["project_id"] or "—", "project_id": r["project_id"],
+            "tenant": r["tenant_id"],
+            "progress": r["progress"], "stage": r["stage"] or "",
+            "age_sec": round(age),
+            "run_sec": round(now - float(started)) if (r["status"] == "running" and started) else None,
+            "silent_sec": round(silent) if silent is not None else None,
+            "lease_sec": lease,
+            "stuck": bool(silent is not None and silent > lease * 0.6),
+            "error": (r["error"] or "")[:400],
+            "finished": r["finished"],
+        })
+    return out
+
+
+def _adm_queue_counts():
+    c = db()
+    try:
+        rows = c.execute("SELECT status,kind,COUNT(*) n FROM queue_tasks GROUP BY status,kind").fetchall()
+        day = c.execute("SELECT kind,status,COUNT(*) n FROM queue_tasks "
+                        "WHERE finished>=? GROUP BY kind,status", (time.time() - 86400,)).fetchall()
+        hour_done = c.execute("SELECT COUNT(*) FROM queue_tasks WHERE status='done' AND finished>=?",
+                              (time.time() - 3600,)).fetchone()[0]
+        durs = c.execute("SELECT kind,started,finished FROM queue_tasks "
+                         "WHERE status='done' AND finished>=? AND started IS NOT NULL",
+                         (time.time() - 86400,)).fetchall()
+    finally:
+        c.close()
+    by_status, by_kind_day = {}, {}
+    for r in rows:
+        by_status[r["status"]] = by_status.get(r["status"], 0) + r["n"]
+    for r in day:
+        d = by_kind_day.setdefault(r["kind"], {"done": 0, "error": 0, "cancelled": 0})
+        if r["status"] in d:
+            d[r["status"]] = r["n"]
+    med = {}
+    buckets = {}
+    for r in durs:
+        try:
+            v = float(r["finished"]) - float(r["started"])
+        except Exception:
+            continue
+        if v > 0:
+            buckets.setdefault(r["kind"], []).append(v)
+    for kind, vals in buckets.items():
+        vals.sort()
+        med[kind] = vals[len(vals) // 2]
+    return {"by_status": by_status, "day_by_kind": by_kind_day,
+            "done_hour": hour_done, "median_sec": med}
+
+
+def _adm_render_node():
+    """Внешняя рендер-нода: жива ли, что делает, и не копится ли очередь впустую."""
+    c = db()
+    try:
+        act = c.execute("SELECT q.job_id,q.progress,q.stage,q.claimed,q.started,q.status,"
+                        "p.name AS pname,u.name AS uname FROM queue_tasks q "
+                        "LEFT JOIN projects p ON p.id=q.project_id LEFT JOIN users u ON u.id=q.uid "
+                        "WHERE q.kind='render' AND q.status IN ('running','queued') "
+                        "ORDER BY q.status, q.created").fetchall()
+        last_done = c.execute("SELECT job_id,finished FROM queue_tasks WHERE kind='render' "
+                              "AND status='done' ORDER BY finished DESC LIMIT 1").fetchone()
+    finally:
+        c.close()
+    now = time.time()
+    running, queued = [], 0
+    for r in act:
+        if r["status"] == "queued":
+            queued += 1
+            continue
+        running.append({
+            "job_id": r["job_id"], "project": r["pname"] or "—", "user": r["uname"] or "—",
+            "progress": r["progress"], "stage": r["stage"] or "",
+            "silent_sec": round(now - float(r["claimed"])) if r["claimed"] else None,
+            "run_sec": round(now - float(r["started"])) if r["started"] else None,
+        })
+    pulse_age = (now - _RENDER_POLL["ts"]) if _RENDER_POLL["ts"] else None
+    # Пульс — опрос ручки claim. Нода опрашивает часто; молчание дольше 5 минут при
+    # непустой очереди означает, что рендеры не начнутся вообще.
+    if pulse_age is None:
+        state = "unknown"          # после рестарта сервиса нода ещё не заходила
+    elif pulse_age > 300:
+        state = "dead"
+    elif pulse_age > 90:
+        state = "slow"
+    else:
+        state = "ok"
+    return {
+        "state": state, "pulse_age_sec": round(pulse_age) if pulse_age is not None else None,
+        "polls": _RENDER_POLL["polls"], "peer": _RENDER_POLL["peer"],
+        "running": running, "queued": queued,
+        "paused": _queue_paused("render"),
+        "lease_sec": RENDER_LEASE_SEC,
+        "last_done_age_sec": (round(now - float(last_done["finished"]))
+                              if last_done and last_done["finished"] else None),
+        "stalled": bool(queued and state in ("dead", "slow") and not running),
+    }
+
+
+_ADM_ERR_NUM_RE = re.compile(r"\d+")
+
+
+def _adm_errors(hours=24, limit=12):
+    """Топ ошибок за период: одинаковые по сути схлопываются (числа/пути обобщаются),
+    иначе 281 упавшая картинка выглядит как 281 разная проблема."""
+    c = db()
+    try:
+        rows = c.execute("SELECT job_id,kind,uid,error,finished FROM queue_tasks "
+                         "WHERE status='error' AND finished>=? ORDER BY finished DESC",
+                         (time.time() - hours * 3600,)).fetchall()
+    finally:
+        c.close()
+    groups = {}
+    for r in rows:
+        raw = (r["error"] or "").strip() or "(пустая ошибка)"
+        norm = _ADM_ERR_NUM_RE.sub("N", raw)[:160]
+        g = groups.setdefault(norm, {"sample": raw[:400], "count": 0, "kinds": set(),
+                                     "last_job": r["job_id"], "last_ts": r["finished"]})
+        g["count"] += 1
+        g["kinds"].add(r["kind"])
+    out = [{"text": g["sample"], "count": g["count"], "kinds": sorted(g["kinds"]),
+            "last_job": g["last_job"], "last_ts": g["last_ts"]}
+           for g in groups.values()]
+    out.sort(key=lambda x: -x["count"])
+    return {"total": len(rows), "groups": out[:limit], "hours": hours}
+
+
+def _adm_users():
+    """Пользователи с расходом и активностью — чтобы видеть, кто и чем занимает контур."""
+    today = datetime.date.today().isoformat()
+    day_ago = time.time() - 86400
+    c = db()
+    try:
+        rows = c.execute("SELECT id,name,role,created,daily_quota,tenant_id,keys,disabled FROM users "
+                         "ORDER BY id").fetchall()
+        act = c.execute("SELECT uid,status,COUNT(*) n FROM queue_tasks "
+                        "WHERE status IN ('queued','running') GROUP BY uid,status").fetchall()
+        day = c.execute("SELECT uid,status,COUNT(*) n FROM queue_tasks WHERE created>=? "
+                        "GROUP BY uid,status", (day_ago,)).fetchall()
+        gtoday = c.execute("SELECT user_id,COUNT(*) n FROM gen_jobs WHERE substr(ts,1,10)=? "
+                           "GROUP BY user_id", (today,)).fetchall()
+        last_seen = c.execute("SELECT user_id,MAX(created) t FROM sessions GROUP BY user_id").fetchall()
+    finally:
+        c.close()
+    a_map, d_map = {}, {}
+    for r in act:
+        a_map.setdefault(r["uid"], {})[r["status"]] = r["n"]
+    for r in day:
+        d_map.setdefault(r["uid"], {})[r["status"]] = r["n"]
+    g_map = {r["user_id"]: r["n"] for r in gtoday}
+    s_map = {r["user_id"]: r["t"] for r in last_seen}
+    now = time.time()
+    out = []
+    for r in rows:
+        try:
+            own = json.loads(r["keys"] or "{}") if r["keys"] else {}
+            own_families = sorted(k for k, v in own.items() if v and not str(k).startswith("_"))
+        except Exception:
+            own_families = []
+        a, d = a_map.get(r["id"], {}), d_map.get(r["id"], {})
+        out.append({
+            "id": r["id"], "name": r["name"], "role": r["role"] or "user",
+            "tenant": r["tenant_id"] or str(r["id"]),
+            "quota": r["daily_quota"], "disabled": bool(_row_disabled(r)),
+            "created": r["created"],
+            "running": a.get("running", 0), "queued": a.get("queued", 0),
+            "day_total": sum(d.values()), "day_error": d.get("error", 0),
+            "gen_today": g_map.get(r["id"], 0),
+            "own_keys": own_families,
+            "last_seen_sec": round(now - float(s_map[r["id"]])) if s_map.get(r["id"]) else None,
+        })
+    return out
+
+
+def _adm_keys_state():
+    """Серверные ключи и каналы промптов. Значения ключей наружу НЕ уходят — только маска."""
+    k = keys() or {}
+    known = [("googler", "FastGen / Recrafter", "recrafter"), ("veo", "VeoNonStop", "veo"),
+             ("openai", "OpenAI API", "openai"), ("voicegencore", "VoiceGenCore", "voicegencore"),
+             ("voicer", "Voicer", "voicer"), ("elevenlabs", "Lumean (бывш. ElevenLabs)", "elevenlabs")]
+    out_keys = []
+    for field, title, group in known:
+        val = k.get(field)
+        if isinstance(val, list):
+            val = val[0] if val else ""
+        out_keys.append({"field": field, "title": title, "group": group,
+                         "present": bool(val), "mask": _adm_mask(val) if val else ""})
+    # каналы промптов: политика + метки «канал мёртв» (общие; приватные метки BYOK не
+    # показываем поимённо — это состояние конкретного партнёрского токена)
+    chans = []
+    try:
+        policy = _prompt_policy() or {}
+        order = list(policy.get("order") or PROMPT_CHANNELS)
+        now_m = time.monotonic()
+        with _PROMPT_DEAD_LOCK:
+            dead = dict(_PROMPT_DEAD)
+            own_dead = len(_PROMPT_DEAD_OWN)
+        srv = keys() or {}
+        for ch in order:
+            until = dead.get(ch)
+            fam = _PROMPT_CHANNEL_FAMILY.get(ch)
+            chans.append({"channel": ch,
+                          "title": _prompt_channel_title(ch) or ch,
+                          "dead": bool(until and until > now_m),
+                          "dead_for_sec": round(until - now_m) if (until and until > now_m) else None,
+                          # серверный credential канала: без него канал в цепочке
+                          # бесполезен для тех, у кого нет своего
+                          "has_credential": bool(_first_credential(srv, fam)) if fam else False})
+        return {"keys": out_keys, "channels": chans, "own_dead_marks": own_dead,
+                "policy_default": policy.get("default")}
+    except Exception:
+        log_exc("admin/keys/channels")
+        return {"keys": out_keys, "channels": chans, "own_dead_marks": 0}
+
+
+def _adm_journal(unit="vsgen", lines=120, grep=""):
+    """Хвост системного журнала. Только чтение, только юниты из белого списка."""
+    if not _adm_unit_ok(unit):
+        return {"error": "неизвестный сервис"}
+    lines = max(20, min(600, int(lines or 120)))
+    rc, out = _adm_sh(["journalctl", "-u", unit, "-n", str(lines), "--no-pager", "-o", "short-iso"],
+                      timeout=12)
+    if rc != 0:
+        # текст исключения/ошибки — не строки журнала: без этой ветки на экран уходил
+        # сырой FileNotFoundError и выглядел как содержимое лога
+        return {"error": "journalctl недоступен (%s)" % (out or "rc=%d" % rc).strip()[:160]}
+    rows = [ln for ln in (out or "").splitlines() if ln.strip()]
+    if grep:
+        g = grep.lower()
+        rows = [ln for ln in rows if g in ln.lower()]
+    return {"unit": unit, "lines": rows[-lines:]}
+
+
+def _adm_audit_log(limit=40):
+    c = db()
+    try:
+        rows = c.execute("SELECT * FROM admin_audit ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+    finally:
+        c.close()
+    return [{"ts": r["ts"], "admin": r["admin_name"], "action": r["action"],
+             "target": r["target"], "detail": r["detail"], "result": r["result"]} for r in rows]
+
+
+def _adm_audit_write(u, action, target, detail, result):
+    """Кто что сделал. Без этого «почему сервис перезапустился» останется без ответа."""
+    try:
+        c = db()
+        try:
+            c.execute("INSERT INTO admin_audit(ts,admin_id,admin_name,action,target,detail,result) "
+                      "VALUES(?,?,?,?,?,?,?)",
+                      (time.time(), (u["id"] if u else None), (u["name"] if u else "?"),
+                       action, str(target or "")[:200], str(detail or "")[:500], str(result or "")[:500]))
+            c.commit()
+        finally:
+            c.close()
+    except Exception:
+        log_exc("admin/audit")
+
+
+@app.get("/admin/legacy", response_class=HTMLResponse)
+def admin_page_legacy(token: str = ""):
+    """Прежняя админ-страница (списки юзеров/генераций/прокси-активности).
+
+    Оставлена как есть: новая панель живёт на /admin, а старые закладки и curl-рецепты
+    из заметок продолжают работать. Удалять её отдельной задачей.
+    """
+    c = db()
+    u = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+    if not u or u["role"] != "admin":
+        c.close()
+        return HTMLResponse("<p style='font-family:sans-serif'>Нужен админ-токен: <code>/admin?token=adm_...</code></p>", status_code=401)
+    _today = datetime.date.today().isoformat()
+    users = c.execute("SELECT id,name,role,created,daily_quota,"
+                      "(SELECT COUNT(*) FROM jobs WHERE user_id=users.id) jobs,"
+                      "(SELECT COUNT(*) FROM gen_jobs WHERE user_id=users.id AND substr(ts,1,10)=?) gtoday "
+                      "FROM users ORDER BY id", (_today,)).fetchall()
+    jobs = c.execute("SELECT j.id,u.name uname,j.provider,j.path,j.method,j.status,j.bytes,j.ts "
+                     "FROM jobs j JOIN users u ON u.id=j.user_id ORDER BY j.id DESC LIMIT 200").fetchall()
+    gens = c.execute("SELECT g.id,u.name uname,g.type,g.model,g.status,g.prompt,g.ts "
+                     "FROM gen_jobs g JOIN users u ON u.id=g.user_id ORDER BY g.id DESC LIMIT 100").fetchall()
+    c.close()
+    def esc(x): return html.escape(str(x))
+    def _qstr(uu):
+        if uu["role"] == "admin" or uu["daily_quota"] == 0:
+            return "∞"
+        return str(DEFAULT_DAILY_QUOTA if uu["daily_quota"] is None else uu["daily_quota"])
+    # Плашка живости планировщика: при мёртвом/залипшем диспетчере очередь стоит, а сервис
+    # снаружи выглядит рабочим (рендеры забирает внешняя нода). Инцидент 31.07 — ровно этот случай.
+    _sh = _sched_health()
+    if _sh["state"] == "ok":
+        _sched_box = (f"<div style='border:1px solid #2c4a2c;background:#182418;padding:10px 12px;"
+                      f"border-radius:6px;margin-bottom:18px;font-size:13px'>"
+                      f"✅ <b>Планировщик очереди жив</b> — последний проход {_sh['age_sec']} с назад · "
+                      f"проходов {_sh['passes']} · ошибок {_sh['errors']} · "
+                      f"проход {_sh['pass_ms']} мс (макс {_sh['max_pass_ms']} мс)</div>")
+    elif _sh["state"] == "disabled":
+        _sched_box = ("<div style='border:1px solid #4a422c;background:#242018;padding:10px 12px;"
+                      "border-radius:6px;margin-bottom:18px;font-size:13px'>"
+                      "⏸ <b>Фон отключён</b> (VS_SERVER_DISABLE_BACKGROUND) — задачи не запускаются.</div>")
+    else:
+        _why = ("поток планировщика МЁРТВ" if _sh["state"] == "dead"
+                else f"последний проход был {_sh['age_sec']} с назад (порог {_sh['stale_after_sec']:.0f} с)")
+        _sched_box = (f"<div style='border:1px solid #6b2b2b;background:#2a1616;padding:10px 12px;"
+                      f"border-radius:6px;margin-bottom:18px;font-size:13px'>"
+                      f"⚠️ <b>ОЧЕРЕДЬ НЕ ДВИЖЕТСЯ</b> — {esc(_why)}. Задачи копятся в queued.<br>"
+                      f"Проходов {_sh['passes']} · ошибок {_sh['errors']}"
+                      + (f" · последняя: <code>{esc(_sh['last_err'])}</code>" if _sh["last_err"] else "")
+                      + f"<br>Лечение: <code>systemctl restart vsgen</code>, причина — в "
+                        f"<code>journalctl -u vsgen</code>.</div>")
+    urows = "".join(f"<tr><td>{u['id']}</td><td><a href='/admin/user/{u['id']}?token={esc(token)}'>{esc(u['name'])}</a></td><td>{u['role']}</td><td>{u['gtoday']}/{_qstr(u)}</td><td>{u['jobs']}</td><td>{esc(u['created'])}</td></tr>" for u in users)
+    jrows = "".join(f"<tr><td>{j['id']}</td><td>{esc(j['uname'])}</td><td>{esc(j['provider'])}</td><td>{esc(j['path'])[:50]}</td><td>{j['method']}</td><td>{j['status']}</td><td>{j['bytes']}</td><td>{esc(j['ts'])}</td></tr>" for j in jobs)
+    grows = "".join(f"<tr><td><a href='/admin/job/{g['id']}?token={esc(token)}'>{g['id']}</a></td><td>{esc(g['uname'])}</td><td>{esc(g['type'])}</td><td>{esc(g['model'])}</td><td>{esc(g['status'])}</td><td>{esc(g['prompt'])[:60]}</td><td>{esc(g['ts'])}</td></tr>" for g in gens)
+    return HTMLResponse(f"""<!doctype html><meta charset=utf-8>
+<title>VideoStudio — админ</title>
+<style>body{{font-family:'Golos Text',system-ui,sans-serif;margin:0;padding:24px;background:#13100e;color:#f4eee7}}h2{{font-weight:500}}
+table{{border-collapse:collapse;width:100%;margin-bottom:28px;font-size:13px}}
+th,td{{border:1px solid #332c25;padding:5px 8px;text-align:left}}th{{background:#241f1a}}</style>
+<h1 style="font-weight:500">VideoStudio — админ-панель</h1>
+{_sched_box}
+<p style="color:#b1a699;font-size:13px">Воркеров генерации: <b>{GEN_WORKERS}</b> · в очереди сейчас: <b>{JOB_Q.qsize()}</b> · дефолт-квота: <b>{DEFAULT_DAILY_QUOTA}</b>/день &nbsp;|&nbsp; квота: <code>POST /admin/api/users/&lt;id&gt;/quota?quota=N&amp;token=adm_…</code> (0=безлимит)</p>
+<fieldset style="border:1px solid #332c25;padding:12px;margin-bottom:24px;max-width:720px"><legend>➕ Создать партнёра</legend>
+<form method=post action="/admin/api/create_partner" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+<input type=hidden name=token value="{esc(token)}">
+<input name=login placeholder="логин" required style="padding:5px">
+<input name=password placeholder="пароль" required style="padding:5px">
+<input name=quota placeholder="квота/день (пусто=деф, 0=∞)" style="padding:5px;width:210px">
+<button style="padding:6px 14px">создать</button></form>
+<p style="color:#7c7167;font-size:12px;margin:6px 0 0">Создаёт изолированный кабинет (вход через /login). Генерации партнёра используют общие серверные ключи и честную очередь.</p></fieldset>
+<h2>Пользователи ({len(users)})</h2>
+<table><tr><th>id</th><th>имя</th><th>роль</th><th>сегодня/квота</th><th>прокси job'ов</th><th>создан</th></tr>{urows}</table>
+<h2>Генерации ({len(gens)})</h2>
+<table><tr><th>#</th><th>юзер</th><th>тип</th><th>модель</th><th>статус</th><th>промпт</th><th>время</th></tr>{grows}</table>
+<h2>Прокси-активность (последние {len(jobs)})</h2>
+<table><tr><th>#</th><th>юзер</th><th>провайдер</th><th>путь</th><th>метод</th><th>статус</th><th>байт</th><th>время</th></tr>{jrows}</table>
+""")
+
+
+@app.get("/admin/user/{uid}", response_class=HTMLResponse)
+def admin_user_page(uid: int, token: str = ""):
+    c = db()
+    a = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+    if not a or a["role"] != "admin":
+        c.close()
+        return HTMLResponse("<p style='font-family:sans-serif'>Нужен админ-токен.</p>", status_code=401)
+    u = c.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
+    if not u:
+        c.close()
+        return HTMLResponse("<p style='font-family:sans-serif'>Нет такого юзера.</p>", status_code=404)
+    gens = c.execute("SELECT * FROM gen_jobs WHERE user_id=? ORDER BY id DESC LIMIT 500", (uid,)).fetchall()
+    jobs = c.execute("SELECT * FROM jobs WHERE user_id=? ORDER BY id DESC LIMIT 500", (uid,)).fetchall()
+    c.close()
+    ndone = sum(1 for g in gens if g["status"] == "done")
+    nerr = sum(1 for g in gens if g["status"] == "error")
+    def esc(x): return html.escape(str(x))
+    grows = "".join(f"<tr><td><a href='/admin/job/{g['id']}?token={esc(token)}'>{g['id']}</a></td><td>{esc(g['type'])}</td><td>{esc(g['model'])}</td><td>{esc(g['status'])}</td><td>{esc(g['prompt'])[:90]}</td><td>{esc(g['ts'])}</td></tr>" for g in gens)
+    jrows = "".join(f"<tr><td>{j['id']}</td><td>{esc(j['provider'])}</td><td>{esc(j['path'])[:60]}</td><td>{j['method']}</td><td>{j['status']}</td><td>{esc(j['ts'])}</td></tr>" for j in jobs)
+    return HTMLResponse(f"""<!doctype html><meta charset=utf-8>
+<title>Юзер {esc(u['name'])}</title>
+<style>body{{font-family:'Golos Text',system-ui,sans-serif;margin:0;padding:24px;background:#13100e;color:#f4eee7}}h2{{font-weight:500}}
+a{{color:#f97316}}table{{border-collapse:collapse;width:100%;margin-bottom:28px;font-size:13px}}
+th,td{{border:1px solid #332c25;padding:5px 8px;text-align:left}}th{{background:#241f1a}}</style>
+<p><a href="/admin?token={esc(token)}">← ко всем юзерам</a></p>
+<h1 style="font-weight:500">Юзер: {esc(u['name'])} <span style="color:#7c7167;font-weight:400">#{u['id']} · {u['role']} · с {esc(u['created'])}</span></h1>
+<p>Генераций: <b>{len(gens)}</b> (готово {ndone}, ошибок {nerr}) · прокси-вызовов: <b>{len(jobs)}</b></p>
+<h2>Генерации ({len(gens)})</h2>
+<table><tr><th>#</th><th>тип</th><th>модель</th><th>статус</th><th>промпт</th><th>время</th></tr>{grows}</table>
+<h2>Прокси-вызовы ({len(jobs)})</h2>
+<table><tr><th>#</th><th>провайдер</th><th>путь</th><th>метод</th><th>статус</th><th>время</th></tr>{jrows}</table>
+""")
+
+
+@app.get("/admin/job/{jid}", response_class=HTMLResponse)
+def admin_job_page(jid: int, token: str = ""):
+    c = db()
+    a = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+    if not a or a["role"] != "admin":
+        c.close()
+        return HTMLResponse("<p style='font-family:sans-serif'>Нужен админ-токен.</p>", status_code=401)
+    g = c.execute("SELECT g.*, u.name uname FROM gen_jobs g JOIN users u ON u.id=g.user_id WHERE g.id=?", (jid,)).fetchone()
+    c.close()
+    if not g:
+        return HTMLResponse("<p style='font-family:sans-serif'>Нет такого job.</p>", status_code=404)
+    def esc(x): return html.escape(str(x if x is not None else ""))
+    img = ""
+    if g["status"] == "done" and g["result_path"] and os.path.exists(g["result_path"]):
+        src = f"/admin/job/{jid}/image?token={esc(token)}"
+        rp = g["result_path"].lower()
+        if rp.endswith(".mp4"):
+            img = f"<video src='{src}' controls style='max-width:520px;border-radius:8px'></video>"
+        elif rp.endswith(".mp3"):
+            img = f"<audio src='{src}' controls></audio>"
+        else:
+            img = f"<img src='{src}' style='max-width:520px;border:1px solid #332c25;border-radius:8px'>"
+    return HTMLResponse(f"""<!doctype html><meta charset=utf-8>
+<title>Job #{jid}</title>
+<style>body{{font-family:'Golos Text',system-ui,sans-serif;margin:0;padding:24px;background:#13100e;color:#f4eee7;max-width:780px}}h2{{font-weight:500}}
+a{{color:#f97316}}pre{{white-space:pre-wrap;background:#241f1a;border:1px solid #332c25;border-radius:8px;padding:12px;font-size:13px}}
+table.kv{{border-collapse:collapse}}table.kv td{{border:1px solid #332c25;padding:5px 8px;font-size:13px}}</style>
+<p><a href="/admin/user/{g['user_id']}?token={esc(token)}">← {esc(g['uname'])}</a> · <a href="/admin?token={esc(token)}">все юзеры</a></p>
+<h1 style="font-weight:500">Job #{jid}: {esc(g['title']) or '(без названия)'}</h1>
+<table class=kv>
+<tr><td>юзер</td><td>{esc(g['uname'])}</td></tr>
+<tr><td>тип</td><td>{esc(g['type'])}</td></tr>
+<tr><td>статус</td><td>{esc(g['status'])}{(' — ' + esc(g['error'])) if g['error'] else ''}</td></tr>
+<tr><td>настройки</td><td>{esc(g['settings'])}</td></tr>
+<tr><td>промпт</td><td>{esc(g['prompt'])}</td></tr>
+<tr><td>время</td><td>{esc(g['ts'])}</td></tr>
+</table>
+<h2>Текст скрипта</h2>
+<pre>{esc(g['source_text']) or '(не передан)'}</pre>
+<h2>Результат</h2>
+{img or '(нет результата)'}
+""")
+
+
+@app.get("/admin/job/{jid}/image")
+def admin_job_image(jid: int, token: str = ""):
+    c = db()
+    a = c.execute("SELECT * FROM users WHERE token=?", (token,)).fetchone()
+    role_ok = a and a["role"] == "admin"
+    g = c.execute("SELECT * FROM gen_jobs WHERE id=?", (jid,)).fetchone()
+    c.close()
+    if not role_ok:
+        raise HTTPException(401, "admin token required")
+    if not g or not g["result_path"] or not os.path.exists(g["result_path"]):
+        raise HTTPException(404, "no result")
+    return FileResponse(g["result_path"], media_type=_media_for(g["result_path"]))
+
+
+# ============================================================
+# Админ-панель: действия (белый список) и API
+# ------------------------------------------------------------
+# Правило безопасности: имя действия приходит от клиента, но выполняется ТОЛЬКО через
+# _ADM_ACTIONS — произвольная команда, юнит или SQL сюда не попадают. Каждое действие
+# пишется в admin_audit: «почему сервис перезапустился» должно иметь ответ.
+# ============================================================
+ADM_BACKUP_DIR = os.environ.get("VSGEN_BACKUP_DIR", "/root/vsgen_backups")
+
+
+def _adm_user(request: Request, token: str = ""):
+    """Админ по web-сессии; ?token=adm_… оставлен для старых закладок и curl-рецептов."""
+    u = web_user(request)
+    if u and _is_admin_row(u):
+        return u
+    tok = (token or request.query_params.get("token") or "").strip()
+    if tok:
+        c = db()
+        try:
+            r = c.execute("SELECT * FROM users WHERE token=?", (tok,)).fetchone()
+        finally:
+            c.close()
+        if r and _is_admin_row(r) and not _row_disabled(r):
+            return r
+    return None
+
+
+def _adm_job_row(jid):
+    c = db()
+    try:
+        return c.execute("SELECT * FROM queue_tasks WHERE job_id=?", (int(jid),)).fetchone()
+    finally:
+        c.close()
+
+
+def _adm_act_restart_service(u, p):
+    unit = (p.get("unit") or "").strip()
+    if not _adm_unit_ok(unit):
+        raise HTTPException(400, "неизвестный сервис")
+    if unit == "vsgen":
+        # Перезапуск САМОГО себя: обычный systemctl restart убьёт процесс до отправки
+        # ответа, и панель показала бы «ошибка сети» на успешном действии. Поэтому
+        # рестарт откладывается на пару секунд отдельным юнитом.
+        rc, out = _adm_sh(["systemd-run", "--on-active=3", "--collect", "--unit",
+                           "vsgen-admin-restart", "systemctl", "restart", "vsgen"], timeout=10)
+        if rc != 0:
+            # фолбэк без systemd-run: отвязанный процесс переживёт смерть родителя
+            try:
+                subprocess.Popen(["/bin/sh", "-c", "sleep 3; systemctl restart vsgen"],
+                                 start_new_session=True)
+                return {"ok": True, "msg": "Перезапуск vsgen через 3 секунды. "
+                                           "Незавершённые задачи генерации вернутся в очередь."}
+            except Exception as e:
+                raise HTTPException(500, f"не удалось запланировать рестарт: {e}")
+        return {"ok": True, "msg": "Перезапуск vsgen через 3 секунды. Страница переподключится сама. "
+                                   "Незавершённые задачи генерации вернутся в очередь, "
+                                   "рендеры на внешней ноде не пострадают."}
+    rc, out = _adm_sh(["systemctl", "restart", unit], timeout=25)
+    if rc != 0:
+        raise HTTPException(500, f"systemctl restart {unit}: {(out or '').strip()[:200]}")
+    return {"ok": True, "msg": f"{unit} перезапущен"}
+
+
+def _adm_act_pause_queue(u, p):
+    target = (p.get("target") or "all").strip()
+    # Копия нужна и для сохранения будущих/неизвестных полей, и чтобы не мутировать
+    # объект, опубликованный в TTL-кэше, до успешного COMMIT admin_state.
+    st = dict(_queue_pause_state())
+    if target == "all":
+        st["all"] = True
+        msg = "Очередь на паузе: новые задачи не запускаются (идущие продолжают работу)"
+    elif target == "prompt_mine":
+        if u is None:
+            raise HTTPException(403, "нужен пользователь")
+        uid = int(u["id"])
+        st["prompt_uids"] = sorted(set(st["prompt_uids"]) | {uid})
+        msg = "Генерация текстов и промптов в вашем профиле приостановлена"
+    else:
+        st["providers"] = sorted(set(st["providers"]) | {target})
+        msg = f"Провайдер {target} на паузе"
+    _adm_state_set("queue_pause", st)
+    return {"ok": True, "msg": msg}
+
+
+def _adm_act_resume_queue(u, p):
+    """Снятие паузы. `target="all"` снимает и глобальный стоп, и точечные паузы.
+
+    `preserve_providers` — снять глобальный стоп, но оставить перечисленные
+    провайдеры на точечной паузе. Ровно этой операции здесь не было, и 14.08 при
+    откате глобальной паузы её сделали в обход админ-API: в admin_audit осталась
+    строка resume_queue с `preserve_providers`, которую этот код произвести не мог
+    (detail и result здесь зашиты, target идёт через json.dumps). Пока операции нет
+    в API, её будут делать скриптом — а тогда журнал аудита перестаёт быть
+    доказательством того, кто и когда менял состояние очереди.
+    """
+    target = (p.get("target") or "all").strip()
+    st = dict(_queue_pause_state())
+    if target == "all":
+        keep_raw = p.get("preserve_providers") or []
+        if not isinstance(keep_raw, (list, tuple, set)):
+            return {"ok": False, "msg": "preserve_providers должен быть списком провайдеров"}
+        # Оставляем только то, что и так стоит на паузе: «сохранить» — это про
+        # неснятие существующей паузы, а не про её постановку задним числом.
+        keep = [x for x in st["providers"] if str(x).strip() in {str(v).strip() for v in keep_raw}]
+        st["all"] = False
+        st["providers"] = keep
+        if keep:
+            msg = "Глобальная пауза снята; на точечной паузе оставлены: " + ", ".join(keep)
+        elif st["prompt_uids"]:
+            msg = "Глобальная пауза снята; персональные паузы текстов сохранены"
+        else:
+            msg = "Очередь возобновлена полностью"
+    elif target == "prompt_mine":
+        if u is None:
+            raise HTTPException(403, "нужен пользователь")
+        uid = int(u["id"])
+        st["prompt_uids"] = [x for x in st["prompt_uids"] if x != uid]
+        msg = "Генерация текстов и промптов в вашем профиле возобновлена"
+    else:
+        st["providers"] = [x for x in st["providers"] if x != target]
+        msg = f"Провайдер {target} возобновлён"
+    _adm_state_set("queue_pause", st)
+    return {"ok": True, "msg": msg}
+
+
+def _adm_act_cancel_job(u, p):
+    """Отмена задачи любого тенанта. Логика повторяет пользовательскую (job_cancel):
+    статус → убийство процесса → метка в логе, чтобы владелец задачи видел причину."""
+    jid = int(p.get("job_id") or 0)
+    c = db(); c.execute("BEGIN IMMEDIATE")
+    try:
+        t = c.execute("SELECT status FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+        if not t:
+            c.rollback(); raise HTTPException(404, "задача не найдена")
+        if t["status"] not in ("queued", "running"):
+            c.rollback(); raise HTTPException(409, "задача уже завершена")
+        c.execute("UPDATE queue_tasks SET status='cancelled', finished=?, claim_token=NULL, claimed=NULL "
+                  "WHERE job_id=? AND status IN ('queued','running')", (_now(), jid))
+        c.execute("UPDATE gen_jobs SET status='cancelled' WHERE id=?", (jid,))
+        c.execute("UPDATE card_jobs SET status='cancelled', finished=?, error_code='cancelled', "
+                  "last_error='cancelled' WHERE job_id=?", (_now(), jid))
+        c.commit()
+    finally:
+        c.close()
+    CANCELLED.add(jid)
+    with RUNNING_LOCK:
+        proc = RUNNING_PROCS.get(jid)
+    _request_worker_cancel(jid, proc)
+    _log_line(jid, "⏹ отменено администратором")
+    return {"ok": True, "msg": f"Задача #{jid} отменена"}
+
+
+def _adm_act_retry_job(u, p):
+    """Повтор упавшей/отменённой задачи от имени её ВЛАДЕЛЬЦА (не админа):
+    задача должна встать в очередь того тенанта, которому принадлежит проект."""
+    jid = int(p.get("job_id") or 0)
+    t = _adm_job_row(jid)
+    if not t:
+        raise HTTPException(404, "задача не найдена")
+    if t["status"] not in ("error", "cancelled"):
+        raise HTTPException(409, "повтор доступен только для упавшей или отменённой задачи")
+    if t["kind"] == "cards":
+        _retry_card_task(jid, t["tenant_id"])
+        return {"ok": True, "msg": f"Card-задача #{jid} возвращена в очередь"}
+    if t["kind"] in ("prompts", "images", "regen"):
+        conflict = _active_image_mutation(t["tenant_id"], t["project_id"])
+        if conflict:
+            raise HTTPException(
+                409,
+                f"картинки проекта уже меняются задачей #{conflict['job_id']} "
+                f"({conflict['kind']}); повтор не поставлен",
+            )
+    elif _active_task(t["tenant_id"], t["project_id"], t["kind"]):
+        raise HTTPException(409, "такая задача проекта уже в очереди")
+    resumed = _resume_retained_remote_job(t)
+    if resumed:
+        return {"ok": True, "msg": f"Задача #{resumed}: восстановление исходного оплаченного запроса"}
+    try:
+        params = json.loads(t["params"] or "{}")
+    except Exception:
+        params = {}
+    reference_bundle_id = params.pop(_REFERENCE_BUNDLE_PARAM, _REFERENCE_BUNDLE_UNSET)
+    task_failover = _prompt_failover_from_row(t)
+    prompt_snapshot = _PROMPT_FAILOVER_UNSET
+    if t["kind"] == "prompts" and task_failover == _PROMPT_FAILOVER_DISABLED:
+        prompt_snapshot = t["provider"]
+    try:
+        njid = _enqueue(
+            t["uid"], t["tenant_id"], t["project_id"], t["kind"], params,
+            prompt_failover=task_failover,
+            prompt_provider_snapshot=prompt_snapshot,
+            reference_bundle_id=reference_bundle_id,
+        )
+    except (ImageModeContractError, reference_contract.ReferenceContractError) as exc:
+        raise HTTPException(409, f"повреждён контракт исходной задачи: {exc}")
+    if njid is None:
+        raise HTTPException(409, "не поставилась (дубль, заблокированный аккаунт или нет плана сцен)")
+    return {"ok": True, "msg": f"Задача #{jid} поставлена заново как #{njid}"}
+
+
+def _adm_act_requeue_job(u, p):
+    """Вернуть зависшую running-задачу в очередь, не дожидаясь lease.
+
+    Для render это ЕДИНСТВЕННЫЙ способ вмешаться руками: задание живёт на внешней ноде,
+    и если та умерла, задача провисит до конца lease (20 минут) впустую.
+    """
+    jid = int(p.get("job_id") or 0)
+    t = _adm_job_row(jid)
+    if not t:
+        raise HTTPException(404, "задача не найдена")
+    if t["status"] != "running":
+        raise HTTPException(409, "вернуть в очередь можно только выполняющуюся задачу")
+    if t["kind"] != "render":
+        with RUNNING_LOCK:
+            proc = RUNNING_PROCS.get(jid)
+        if proc:
+            _kill_proc(proc)
+    c = db()
+    try:
+        c.execute("UPDATE queue_tasks SET status='queued', started=NULL, claimed=NULL, "
+                  "claim_token=NULL, progress=0, stage=NULL, error=NULL "
+                  "WHERE job_id=? AND status='running'", (jid,))
+        c.execute("UPDATE gen_jobs SET status='queued' WHERE id=?", (jid,))
+        c.execute("UPDATE card_jobs SET status='queued',next_attempt=NULL,error_code=NULL,"
+                  "last_error=NULL WHERE job_id=?", (jid,))
+        c.commit()
+    finally:
+        c.close()
+    _log_line(jid, "♻️ администратор вернул задачу в очередь")
+    return {"ok": True, "msg": f"Задача #{jid} возвращена в очередь"}
+
+
+def _adm_act_set_quota(u, p):
+    uid = int(p.get("uid") or 0)
+    raw = str(p.get("quota") or "").strip()
+    quota = None if raw == "" else max(0, int(raw))
+    c = db()
+    try:
+        c.execute("UPDATE users SET daily_quota=? WHERE id=?", (quota, uid))
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True, "msg": f"Квота юзера #{uid}: " + ("по умолчанию" if quota is None
+                                                          else ("безлимит" if quota == 0 else str(quota)))}
+
+
+def _adm_act_toggle_user(u, p):
+    """Блокировка/разблокировка. Сессии заблокированного гасим сразу — иначе он
+    продолжал бы работать в открытой вкладке."""
+    uid = int(p.get("uid") or 0)
+    if u and uid == u["id"]:
+        raise HTTPException(400, "нельзя заблокировать самого себя")
+    c = db()
+    try:
+        r = c.execute("SELECT name,role,disabled FROM users WHERE id=?", (uid,)).fetchone()
+        if not r:
+            raise HTTPException(404, "нет такого юзера")
+        if (r["role"] or "") == "admin":
+            raise HTTPException(400, "администратора блокировать нельзя")
+        new = 0 if _row_disabled(r) else 1
+        c.execute("UPDATE users SET disabled=? WHERE id=?", (new, uid))
+        if new:
+            c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True, "msg": (f"{r['name']} заблокирован — вход и новые задачи закрыты"
+                                if new else f"{r['name']} разблокирован")}
+
+
+def _adm_act_reset_password(u, p):
+    uid = int(p.get("uid") or 0)
+    pw = str(p.get("password") or "").strip()
+    if len(pw) < 6:
+        raise HTTPException(400, "пароль короче 6 символов")
+    c = db()
+    try:
+        r = c.execute("SELECT name FROM users WHERE id=?", (uid,)).fetchone()
+        if not r:
+            raise HTTPException(404, "нет такого юзера")
+        c.execute("UPDATE users SET password_hash=? WHERE id=?", (hash_password(pw), uid))
+        c.execute("DELETE FROM sessions WHERE user_id=?", (uid,))     # старые сессии больше не действуют
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True, "msg": f"Пароль {r['name']} изменён, активные сессии сброшены"}
+
+
+def _adm_act_backup_db(u, p):
+    """Бэкап БД. Используем штатный backup_db.sh (sqlite3 .backup + ротация) — одна
+    логика бэкапа с ночным cron. Скрипта нет → VACUUM INTO, тоже консистентно при WAL."""
+    script = os.path.join(HERE, "backup_db.sh")
+    if os.path.isfile(script):
+        rc, out = _adm_sh(["/bin/bash", script], timeout=180)
+        if rc != 0:
+            raise HTTPException(500, f"backup_db.sh: {(out or '').strip()[-200:]}")
+        return {"ok": True, "msg": "Бэкап сделан: " + (out or "").strip().splitlines()[-1][:160]}
+    dest_dir = ADM_BACKUP_DIR if os.path.isdir(ADM_BACKUP_DIR) else HERE
+    dest = os.path.join(dest_dir, "vsgen_admin_%s.db" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S"))
+    c = db()
+    try:
+        c.execute("VACUUM INTO ?", (dest,))
+    finally:
+        c.close()
+    return {"ok": True, "msg": f"Бэкап: {dest} ({_adm_bytes(os.path.getsize(dest))})"}
+
+
+def _adm_act_clear_dead_channels(u, p):
+    """Снять метки «канал промптов недоступен» — после того, как лимит подписки истёк
+    или ключ починили, ждать TTL незачем."""
+    with _PROMPT_DEAD_LOCK:
+        n = len(_PROMPT_DEAD) + len(_PROMPT_DEAD_OWN)
+        _PROMPT_DEAD.clear()
+        _PROMPT_DEAD_OWN.clear()
+    return {"ok": True, "msg": f"Снято меток недоступности: {n}"}
+
+
+def _adm_act_wake_credential(u, p):
+    """Разбудить отдыхающий серверный ключ вручную — лимит докупили или ключ заменили,
+    ждать названного провайдером часа незачем.
+
+    slot_id — sha256 слота из панели (секрета в нём нет). Без него будим семейство
+    целиком, без family — все отдыхающие ключи.
+    """
+    slot_id = str(p.get("slot_id") or "").strip()
+    family = str(p.get("family") or "").strip()
+    n = _cred_wake(family=family or None, slot_id=slot_id or None)
+    return {"ok": True, "msg": f"Разбужено ключей: {n}"}
+
+
+def _adm_act_cleanup_logs(u, p):
+    """Чистка job_logs — таблица растёт неограниченно (миллионы строк).
+
+    Без confirm=1 возвращает предпросмотр: сколько строк и какого объёма уйдёт.
+    Место в файле БД SQLite не отдаёт ОС, но переиспользует под новые записи — поэтому
+    честно пишем «перестанет расти», а не «освободится на диске».
+    """
+    days = max(1, int(p.get("days") or 30))
+    cutoff = time.time() - days * 86400
+    c = db()
+    try:
+        n = c.execute("SELECT COUNT(*) FROM job_logs WHERE job_id IN "
+                      "(SELECT job_id FROM queue_tasks WHERE status IN ('done','error','cancelled') "
+                      "AND finished IS NOT NULL AND finished < ?)", (cutoff,)).fetchone()[0]
+        total = c.execute("SELECT COUNT(*) FROM job_logs").fetchone()[0]
+        if not p.get("confirm"):
+            approx = 0
+            try:
+                approx = int(os.path.getsize(DB) * (n / total)) if total else 0
+            except Exception:
+                approx = 0
+            return {"ok": True, "preview": True,
+                    "msg": f"Удалить {n} строк лога из {total} (задачи старше {days} дн). "
+                           f"Освободится внутри БД ≈{_adm_bytes(approx)}."}
+        c.execute("DELETE FROM job_logs WHERE job_id IN "
+                  "(SELECT job_id FROM queue_tasks WHERE status IN ('done','error','cancelled') "
+                  "AND finished IS NOT NULL AND finished < ?)", (cutoff,))
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True, "msg": f"Удалено {n} строк лога (старше {days} дн)"}
+
+
+def _adm_act_cleanup_baks(u, p):
+    """Удаление накопившихся резервных копий main.py.bak.* в каталоге сервера.
+
+    Работает ТОЛЬКО по этой маске и ТОЛЬКО в HERE, самые свежие копии сохраняются:
+    бэкап — последняя линия обороны при неудачном деплое, снести их все нельзя.
+    """
+    keep = max(3, int(p.get("keep") or 5))
+    files = sorted(glob.glob(os.path.join(HERE, "main.py.bak.*")), key=os.path.getmtime, reverse=True)
+    victims = files[keep:]
+    size = sum((os.path.getsize(f) for f in victims), 0)
+    if not victims:
+        return {"ok": True, "msg": f"Нечего удалять: копий {len(files)}, порог {keep}"}
+    if not p.get("confirm"):
+        return {"ok": True, "preview": True,
+                "msg": f"Удалить {len(victims)} старых копий main.py.bak.* ({_adm_bytes(size)}), "
+                       f"оставить {min(keep, len(files))} свежих."}
+    removed = 0
+    for f in victims:
+        try:
+            os.remove(f); removed += 1
+        except Exception:
+            log_exc("admin/cleanup_baks")
+    return {"ok": True, "msg": f"Удалено копий: {removed} ({_adm_bytes(size)})"}
+
+
+_ADM_ACTIONS = {
+    "restart_service": (_adm_act_restart_service, "перезапуск сервиса"),
+    "pause_queue": (_adm_act_pause_queue, "пауза очереди"),
+    "resume_queue": (_adm_act_resume_queue, "снятие паузы"),
+    "cancel_job": (_adm_act_cancel_job, "отмена задачи"),
+    "retry_job": (_adm_act_retry_job, "повтор задачи"),
+    "requeue_job": (_adm_act_requeue_job, "возврат задачи в очередь"),
+    "set_quota": (_adm_act_set_quota, "смена квоты"),
+    "toggle_user": (_adm_act_toggle_user, "блокировка/разблокировка"),
+    "reset_password": (_adm_act_reset_password, "сброс пароля"),
+    "backup_db": (_adm_act_backup_db, "бэкап БД"),
+    "clear_dead_channels": (_adm_act_clear_dead_channels, "снятие меток каналов"),
+    "wake_credential": (_adm_act_wake_credential, "пробуждение серверного ключа"),
+    "cleanup_logs": (_adm_act_cleanup_logs, "чистка логов задач"),
+    "cleanup_baks": (_adm_act_cleanup_baks, "чистка резервных копий"),
+}
+
+
+@app.post("/admin/api/action/{name}")
+async def admin_action(name: str, request: Request):
+    u = _adm_user(request)
+    if not u:
+        raise HTTPException(403, "нужен админ")
+    entry = _ADM_ACTIONS.get(name)
+    if not entry:
+        raise HTTPException(400, "неизвестное действие")
+    fn, title = entry
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = dict(await _form(request)) if request.headers.get("content-type", "").startswith(
+            "application/x-www-form-urlencoded") else {}
+    payload = payload if isinstance(payload, dict) else {}
+    try:
+        res = await run_in_threadpool(fn, u, payload)
+    except HTTPException as e:
+        _adm_audit_write(u, name, json.dumps(payload, ensure_ascii=False)[:180], title, f"отказ: {e.detail}")
+        raise
+    except Exception as e:
+        log_exc("admin/action/" + name)
+        _adm_audit_write(u, name, json.dumps(payload, ensure_ascii=False)[:180], title, f"ошибка: {e}")
+        raise HTTPException(500, f"{type(e).__name__}: {e}")
+    # предпросмотр разрушительного действия — ещё не действие, в аудит не пишем
+    if not res.get("preview"):
+        _adm_audit_write(u, name, json.dumps(payload, ensure_ascii=False)[:180], title, res.get("msg", "ok"))
+    return JSONResponse(res)
+
+
+@app.get("/admin/api/state")
+def admin_state_api(request: Request, tabs: str = "overview", status: str = "", kind: str = "",
+                    uid: str = "", provider: str = "", q: str = "", unit: str = "vsgen",
+                    lines: int = 120, grep: str = "", errhours: int = 24):
+    """Единый снимок для панели. Блоки берутся по запросу вкладки: держать открытой
+    вкладку «Логи» не должно означать du по каталогу тенантов каждые 5 секунд."""
+    u = _adm_user(request)
+    if not u:
+        raise HTTPException(403, "нужен админ")
+    want = {t.strip() for t in (tabs or "").split(",") if t.strip()}
+    out = {"ts": time.time(), "admin": u["name"]}
+
+    def _safe(key, fn):
+        if key not in want:
+            return
+        try:
+            out[key] = fn()
+        except Exception as e:
+            log_exc("admin/state/" + key)
+            out[key] = {"error": f"{type(e).__name__}: {e}"}
+
+    _safe("scheduler", _sched_health)
+    _safe("drift", _adm_code_drift)
+    _safe("services", _adm_services)
+    _safe("resources", _adm_resources)
+    _safe("providers", _adm_provider_load)
+    _safe("counts", _adm_queue_counts)
+    _safe("render", _adm_render_node)
+    _safe("errors", lambda: _adm_errors(hours=max(1, min(168, int(errhours or 24)))))
+    _safe("users", _adm_users)
+    _safe("keys", _adm_keys_state)
+    _safe("audit", lambda: _adm_audit_log(40))
+    _safe("journal", lambda: _adm_journal(unit, lines, grep))
+    _safe("tasks", lambda: _adm_tasks(status=status or "active", kind=kind or None,
+                                      uid=uid or None, provider=provider or None,
+                                      q=q or None, limit=200))
+    pause = _queue_pause_state()
+    out["pause"] = {
+        "all": pause["all"],
+        "providers": pause["providers"],
+        "mine_prompt": _prompt_uid_paused(u["id"]),
+    }
+    return JSONResponse(out)
+
+
+# ── Страница админ-панели ─────────────────────────────────────────────────────
+# Разметка рисуется на клиенте из JSON /admin/api/state: панель должна обновляться
+# живьём (очередь и прогресс меняются каждые секунды), а перезагрузка страницы
+# сбрасывала бы фильтры и прокрутку. Сервер отдаёт только данные.
+_ADM_JS = r"""
+<script>
+var ADM = {tab:'overview', timer:null, busy:false, data:{}, filters:{status:'active',kind:'',provider:'',q:''},
+           journal:{unit:'vsgen',lines:150,grep:''}, errhours:24};
+/* Вход по ?token=adm_… (старые закладки, curl-рецепты из заметок): web-сессии в этом
+   случае нет, и без проброса токена все запросы панели получали бы 403. */
+var ADMTOK = (function(){ try{ return new URLSearchParams(location.search).get('token')||''; }catch(e){ return ''; } })();
+function withTok(url){ return ADMTOK ? (url + (url.indexOf('?')>=0?'&':'?') + 'token=' + encodeURIComponent(ADMTOK)) : url; }
+function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,function(m){
+  return ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[m];});}
+function dur(sec){ if(sec==null) return '—'; sec=Math.max(0,Math.round(sec));
+  if(sec<60) return sec+' с'; if(sec<3600) return Math.round(sec/60)+' мин';
+  if(sec<86400){var h=Math.floor(sec/3600),m=Math.round((sec%3600)/60);return m?h+' ч '+m+' мин':h+' ч';}
+  var d=Math.floor(sec/86400),h2=Math.floor((sec%86400)/3600);return h2?d+' д '+h2+' ч':d+' д';}
+function bts(n){ if(n==null) return '—'; var u=[['ТБ',1099511627776],['ГБ',1073741824],['МБ',1048576],['КБ',1024]];
+  for(var i=0;i<u.length;i++){ if(n>=u[i][1]) return (n/u[i][1]).toFixed(1)+' '+u[i][0]; } return Math.round(n)+' Б';}
+function when(ts){ if(!ts) return '—'; var d=new Date(ts*1000);
+  return d.toLocaleString('ru-RU',{day:'2-digit',month:'2-digit',hour:'2-digit',minute:'2-digit'});}
+function toast(msg,bad){ var t=document.getElementById('admtoast');
+  t.textContent=msg; t.style.borderColor=bad?'var(--error)':'var(--done)';
+  t.style.display='block'; clearTimeout(t._h); t._h=setTimeout(function(){t.style.display='none';},5200);}
+
+/* ---- какие блоки нужны конкретной вкладке: лишние датчики не дёргаем ---- */
+var TABBLOCKS = {
+  overview:'scheduler,drift,services,resources,providers,counts,render,errors',
+  queue:'tasks,providers,counts',
+  users:'users',
+  keys:'keys,providers',
+  logs:'journal',
+  maint:'resources,audit,services,drift',
+  audit:'audit'
+};
+function stateUrl(){
+  var p=['tabs='+encodeURIComponent(TABBLOCKS[ADM.tab]||'scheduler')];
+  if(ADM.tab==='queue'){ p.push('status='+encodeURIComponent(ADM.filters.status));
+    p.push('kind='+encodeURIComponent(ADM.filters.kind)); p.push('provider='+encodeURIComponent(ADM.filters.provider));
+    p.push('q='+encodeURIComponent(ADM.filters.q)); }
+  if(ADM.tab==='logs'){ p.push('unit='+encodeURIComponent(ADM.journal.unit));
+    p.push('lines='+ADM.journal.lines); p.push('grep='+encodeURIComponent(ADM.journal.grep)); }
+  if(ADM.tab==='overview'){ p.push('errhours='+ADM.errhours); }
+  return withTok('/admin/api/state?'+p.join('&'));
+}
+function refresh(){
+  if(ADM.busy) return; ADM.busy=true;
+  fetch(stateUrl(),{credentials:'same-origin'}).then(function(r){
+    if(!r.ok) throw new Error(r.status===403?'нет прав администратора':('HTTP '+r.status));
+    return r.json();
+  }).then(function(d){
+    ADM.busy=false; ADM.data=d; document.getElementById('admconn').textContent='обновлено '+when(d.ts);
+    document.getElementById('admconn').style.color='var(--dim)';
+    render();
+  }).catch(function(e){
+    ADM.busy=false; var c=document.getElementById('admconn');
+    c.textContent='нет связи с сервером ('+e.message+')'; c.style.color='var(--error)';
+  });
+}
+function act(name,payload,okmsg,confirmText){
+  if(confirmText && !confirm(confirmText)) return Promise.resolve(false);
+  return fetch(withTok('/admin/api/action/'+name),{method:'POST',credentials:'same-origin',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(payload||{})})
+    .then(function(r){ return r.json().then(function(d){ if(!r.ok) throw new Error(d.detail||('HTTP '+r.status)); return d;});})
+    .then(function(d){
+      if(d.preview){ if(confirm(d.msg+'\n\nВыполнить?')){ payload.confirm=1; return act(name,payload,okmsg); }
+        return false; }
+      toast(d.msg||okmsg||'Готово'); refresh(); return true;
+    }).catch(function(e){ toast(e.message,true); return false; });
+}
+function setTab(t){ ADM.tab=t;
+  var tabs=document.querySelectorAll('#admtabs .tab');
+  for(var i=0;i<tabs.length;i++) tabs[i].classList.toggle('active', tabs[i].dataset.tab===t);
+  var panes=document.querySelectorAll('.admpane');
+  for(var j=0;j<panes.length;j++) panes[j].classList.toggle('active', panes[j].id==='pane-'+t);
+  ADM.data={}; refresh();
+}
+
+/* ================= РЕНДЕР ================= */
+function render(){
+  var d=ADM.data;
+  if(ADM.tab==='overview') renderOverview(d);
+  else if(ADM.tab==='queue') renderQueue(d);
+  else if(ADM.tab==='users') renderUsers(d);
+  else if(ADM.tab==='keys') renderKeys(d);
+  else if(ADM.tab==='logs') renderLogs(d);
+  else if(ADM.tab==='maint') renderMaint(d);
+  else if(ADM.tab==='audit') renderAudit(d);
+  renderPauseBar(d);
+}
+function renderPauseBar(d){
+  var el=document.getElementById('pausebar'); var p=d.pause||{all:false,providers:[]};
+  var pausedProviders=p.providers||[];
+  if(!p.all && !pausedProviders.length && !p.mine_prompt){ el.style.display='none'; return; }
+  var resumeButton=p.all
+    ? ' <button class="btn btn-sm" style="margin-left:10px" onclick="act(\'resume_queue\',{target:\'all\'})">Возобновить всю очередь</button>'
+    : (p.mine_prompt
+      ? ' <button class="btn btn-sm" style="margin-left:10px" onclick="act(\'resume_queue\',{target:\'prompt_mine\'})">Возобновить тексты в моём профиле</button>'
+      : '');
+  var pausedLabels=[];
+  if(p.mine_prompt) pausedLabels.push('тексты и промпты вашего профиля');
+  if(pausedProviders.length) pausedLabels.push(pausedProviders.map(esc).join(', '));
+  el.style.display='block';
+  el.innerHTML='<div class="admalert warn"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-pause"/></svg> <b>'+(p.all?'Очередь на паузе':'На паузе: '+pausedLabels.join('; '))+
+    '</b> — новые задачи не запускаются. Уже идущие продолжают работу.'+resumeButton+'</div>';
+}
+
+/* ---------- ОБЗОР ---------- */
+function alertsHtml(d){
+  var out=[], s=d.scheduler||{}, r=d.render||{}, dr=d.drift||{}, res=d.resources||{};
+  if(s.state==='dead'||s.state==='stale'){
+    out.push('<div class="admalert bad"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x-circle"/></svg> <b>Очередь не движется</b> — '+
+      (s.state==='dead'?'поток планировщика мёртв':'последний проход '+dur(s.age_sec)+' назад')+
+      '. Задачи копятся в queued.'+(s.last_err?' Последняя ошибка: <code>'+esc(s.last_err)+'</code>':'')+
+      ' <button class="btn btn-sm btn-primary" style="margin-left:8px" onclick="restartVsgen()">Перезапустить vsgen</button></div>');
+  }
+  if(s.state==='disabled') out.push('<div class="admalert warn"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-pause"/></svg> <b>Фон отключён</b> (VS_SERVER_DISABLE_BACKGROUND) — задачи не запускаются.</div>');
+  if(dr.runtime_stale){
+    var f=(dr.runtime||[])[0]||{};
+    out.push('<div class="admalert bad"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> <b>В работе старый код</b> — '+esc(f.file||'main.py')+
+      ' на диске новее запущенного процесса на '+dur(f.older_by)+
+      '. Фиксы из этого файла НЕ применены, пока сервис не перезапущен.'+
+      ' <button class="btn btn-sm btn-primary" style="margin-left:8px" onclick="restartVsgen()">Перезапустить vsgen</button></div>');
+  }
+  if(r.stalled) out.push('<div class="admalert bad"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-film"/></svg> <b>Рендер-нода не забирает задания</b> — в очереди '+r.queued+
+    ', последний опрос '+(r.pulse_age_sec==null?'не зафиксирован после рестарта':dur(r.pulse_age_sec)+' назад')+
+    '. Проверьте пуллер на рендер-боксе.</div>');
+  else if(r.state==='slow') out.push('<div class="admalert warn"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-film"/></svg> Рендер-нода отвечает редко — последний опрос '+dur(r.pulse_age_sec)+' назад.</div>');
+  if(res.disk_total){ var used=res.disk_used/res.disk_total;
+    if(used>0.9) out.push('<div class="admalert bad"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> <b>Диск заполнен на '+Math.round(used*100)+'%</b> — свободно '+bts(res.disk_free)+'. Рендеры и бэкапы упадут.</div>');
+    else if(used>0.8) out.push('<div class="admalert warn"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Диск занят на '+Math.round(used*100)+'% (свободно '+bts(res.disk_free)+').</div>');
+    var fc=res.disk_forecast||{};
+    if(fc.days_left!=null && fc.days_left<14) out.push('<div class="admalert warn"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> При нынешнем росте ('+bts(fc.per_day)+'/сутки) места хватит примерно на '+Math.round(fc.days_left)+' дн.</div>');
+  }
+  var e=d.errors||{};
+  if((e.total||0)>0 && (e.groups||[]).length && e.groups[0].count>=10)
+    out.push('<div class="admalert warn"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Одна ошибка повторилась '+e.groups[0].count+' раз за '+e.hours+' ч: <code>'+esc((e.groups[0].text||'').slice(0,120))+'</code></div>');
+  if(!out.length) out.push('<div class="admalert good"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-check-circle"/></svg> Тревог нет: планировщик жив, код актуален, нода отвечает, места достаточно.</div>');
+  return out.join('');
+}
+function cardsHtml(d){
+  var s=d.scheduler||{}, r=d.render||{}, res=d.resources||{}, c=d.counts||{};
+  var st=c.by_status||{};
+  function card(title,val,sub,color){
+    return '<div class="admcard"><div class="admcard-t">'+title+'</div>'+
+      '<div class="admcard-v" style="color:'+(color||'var(--text)')+'">'+val+'</div>'+
+      '<div class="admcard-s">'+sub+'</div></div>';
+  }
+  var schColor = s.state==='ok'?'var(--done)':(s.state==='disabled'?'var(--warn)':'var(--error)');
+  var schVal = s.state==='ok'?'жив':(s.state==='dead'?'мёртв':(s.state==='stale'?'залип':(s.state==='disabled'?'выключен':'?')));
+  var rnColor = r.state==='ok'?'var(--done)':(r.state==='slow'?'var(--warn)':(r.state==='unknown'?'var(--dim)':'var(--error)'));
+  var rnVal = r.state==='ok'?'на связи':(r.state==='slow'?'редко':(r.state==='unknown'?'нет данных':'не отвечает'));
+  var memUsed = (res.mem_total&&res.mem_avail!=null)?(res.mem_total-res.mem_avail):null;
+  return card('Планировщик', schVal, 'проход '+dur(s.age_sec)+' назад · '+(s.passes||0)+' проходов · ошибок '+(s.errors||0), schColor)+
+    card('Очередь сейчас', (st.running||0)+' / '+(st.queued||0), 'выполняется / ждёт · за час готово '+(c.done_hour||0))+
+    card('Рендер-нода', rnVal, (r.running||[]).length+' в работе · '+r.queued+' в очереди · опрос '+(r.pulse_age_sec==null?'—':dur(r.pulse_age_sec)+' назад'), rnColor)+
+    card('Нагрузка', (res.load?res.load[0]:'—')+' / '+(res.cpus||'?'), 'load 1м / ядер · RAM '+bts(memUsed)+' из '+bts(res.mem_total))+
+    card('Диск', bts(res.disk_free), 'свободно из '+bts(res.disk_total)+' · БД '+bts(res.db_bytes))+
+    card('Материалы', bts(res.tenants_bytes), 'проекты тенантов · логов '+(res.job_logs_rows==null?'—':res.job_logs_rows.toLocaleString('ru-RU'))+' строк');
+}
+function servicesHtml(d){
+  var rows=(d.services||[]).map(function(s){
+    var col = s.state==='active'?'var(--done)':(s.state==='unknown'?'var(--dim)':'var(--error)');
+    var unknown = (s.state==='unknown');
+    var label = unknown ? 'нет данных' : (esc(s.state)+(s.sub?' / '+esc(s.sub):''));
+    return '<div class="admrow" style="grid-template-columns:1.6fr 1fr 1fr 1fr auto">'+
+      '<div><b>'+esc(s.title)+'</b>'+(s.self?' <span class="tag">этот процесс</span>':'')+
+        '<div class=hint>'+esc(s.note||'')+' · <code>'+esc(s.unit)+'</code></div></div>'+
+      '<div style="color:'+col+';font-weight:600">'+label+
+        (unknown?'<div class=hint>systemctl недоступен'+(s.err?(': '+esc(String(s.err).split('\n')[0].slice(0,70))):'')+'</div>':'')+'</div>'+
+      '<div>'+(s.uptime_sec!=null?(dur(s.uptime_sec)+'<div class=hint>работает</div>'):'—')+'</div>'+
+      '<div>'+(s.mem!=null?bts(s.mem):'—')+'<div class=hint>память · рестартов '+(s.restarts||0)+'</div></div>'+
+      '<div><button class="btn btn-sm btn-secondary" onclick="restartUnit(\''+esc(s.unit)+'\','+(s.self?'1':'0')+')">Перезапустить</button></div>'+
+      '</div>';
+  }).join('');
+  return '<div class=panel><div class=panel-title>Сервисы бокса</div><div class=admlist>'+(rows||'<div class=hint>нет данных</div>')+'</div></div>';
+}
+function providersHtml(d){
+  var minePromptPaused=Boolean((d.pause||{}).mine_prompt);
+  var promptControl=minePromptPaused
+    ? '<button class="btn btn-sm" onclick="act(\'resume_queue\',{target:\'prompt_mine\'})">Возобновить тексты в моём профиле</button>'
+    : '<button class="btn btn-sm btn-ghost" onclick="act(\'pause_queue\',{target:\'prompt_mine\'},null,\'Приостановить генерацию текстов и промптов только в моём профиле? Уже идущие задачи продолжат работу.\')">Приостановить тексты в моём профиле</button>';
+  var rows=(d.providers||[]).map(function(p){
+    var lanes=Object.keys(p.lanes||{}).map(function(ln){
+      var l=p.lanes[ln];
+      var bj=l.budget_jobs, bu=l.budget_units;
+      var pctJ = bj?Math.min(100,Math.round(l.running_jobs/bj*100)):0;
+      var pctU = bu?Math.min(100,Math.round(l.running_units/bu*100)):0;
+      var pct = Math.max(pctJ,pctU);
+      var col = pct>=95?'var(--error)':(pct>=70?'var(--warn)':'var(--done)');
+      return '<div style="margin:6px 0">'+
+        '<div style="display:flex;gap:8px;font-size:12px"><span class=muted style="width:52px">'+(ln==='byok'?'свои':'сервер')+'</span>'+
+        '<span>задач '+l.running_jobs+(bj?'/'+bj:'')+'</span>'+
+        (bu?'<span class=muted>· ед. '+l.running_units+'/'+bu+'</span>':'')+
+        (l.queued_jobs?'<span class=muted>· ждёт '+l.queued_jobs+'</span>':'')+'</div>'+
+        '<div class=admbar><i style="width:'+pct+'%;background:'+col+'"></i></div></div>';
+    }).join('');
+    var resv=(p.reserved||[]).map(function(r){
+      return '<div class=hint><svg class="ic" viewBox="0 0 24 24"><use href="#ic-clock"/></svg> копится ёмкость под задачу #'+r.job_id+' ('+r.units+' ед., ждёт '+dur(r.waiting_sec)+')</div>';}).join('');
+    var pool=(p.pool||[]).map(function(s){
+      if(!s.resting) return '<div class=hint>ключ '+esc(s.mask)+' — в строю</div>';
+      return '<div class=hint><svg class="ic" viewBox="0 0 24 24"><use href="#ic-clock"/></svg> ключ '+esc(s.mask)+
+        ' отдыхает до '+esc(s.until_human||'?')+(s.why?' — '+esc(String(s.why).slice(0,90)):'')+
+        ' <button class="btn btn-sm btn-ghost" onclick="act(\'wake_credential\',{slot_id:\''+esc(s.slot_id)+'\'})">Разбудить</button></div>';
+    }).join('');
+    return '<div class="admrow" style="grid-template-columns:1.1fr 2fr auto">'+
+      '<div><b>'+esc(p.provider)+'</b>'+(p.paused?' <span class="tag tag-paid">пауза</span>':'')+
+        '<div class=hint>в работе '+p.running+' · в очереди '+p.queued+'</div></div>'+
+      '<div>'+(lanes||'<span class=hint>нет активных дорожек</span>')+resv+pool+'</div>'+
+      '<div>'+(p.paused
+        ? '<button class="btn btn-sm" onclick="act(\'resume_queue\',{target:\''+esc(p.provider)+'\'})">Возобновить</button>'
+        : '<button class="btn btn-sm btn-ghost" onclick="act(\'pause_queue\',{target:\''+esc(p.provider)+'\'},null,\'Поставить '+esc(p.provider)+' на паузу? Идущие задачи продолжат работу.\')">Пауза</button>')+
+      '</div></div>';
+  }).join('');
+  return '<div class=panel><div class=panel-title style="display:flex;justify-content:space-between;gap:12px;align-items:center"><span>Провайдеры: загрузка ключей и очередей</span>'+promptControl+'</div>'+
+    '<div class=admlist>'+(rows||'<div class=hint>нет данных</div>')+'</div>'+
+    '<div class=hint style="margin-top:10px">«Ед.» — взвешенные единицы бюджета ключа: тяжёлая модель занимает больше, чем лёгкая. Полоса — максимум из загрузки по задачам и по единицам.</div></div>';
+}
+function renderNodeHtml(d){
+  var r=d.render||{};
+  var run=(r.running||[]).map(function(x){
+    return '<div class="admrow" style="grid-template-columns:auto 1.4fr 2fr auto">'+
+      '<div>#'+x.job_id+'</div>'+
+      '<div>'+esc(x.project)+'<div class=hint>'+esc(x.user)+'</div></div>'+
+      '<div>'+esc(x.stage||'—')+'<div class=admbar style="margin-top:5px"><i style="width:'+Math.round(x.progress||0)+'%;background:var(--running)"></i></div></div>'+
+      '<div>'+Math.round(x.progress||0)+'%<div class=hint>молчит '+dur(x.silent_sec)+'</div></div></div>';
+  }).join('');
+  return '<div class=panel><div class=panel-title>Рендер-нода</div>'+
+    '<div class=hint style="margin-bottom:8px">Опрос ручки заданий: '+(r.pulse_age_sec==null?'после рестарта ещё не заходила':dur(r.pulse_age_sec)+' назад')+
+    ' · всего опросов '+(r.polls||0)+(r.peer?(' · адрес '+esc(r.peer)):'')+
+    ' · lease '+dur(r.lease_sec)+' · последний готовый рендер '+(r.last_done_age_sec==null?'—':dur(r.last_done_age_sec)+' назад')+'</div>'+
+    '<div class=admlist>'+(run||'<div class=hint>сейчас ничего не рендерится'+(r.queued?(', в очереди '+r.queued):'')+'</div>')+'</div></div>';
+}
+function throughputHtml(d){
+  var c=d.counts||{}, day=c.day_by_kind||{}, med=c.median_sec||{};
+  var names={tts:'озвучка',prompts:'промпты',cards:'карточка',images:'картинки',video:'видео',render:'рендер',regen:'реген',regen_video:'реген видео'};
+  var kinds=Object.keys(day).sort();
+  var rows=kinds.map(function(k){
+    var v=day[k]||{}, tot=(v.done||0)+(v.error||0)+(v.cancelled||0);
+    var errPct = tot?Math.round((v.error||0)/tot*100):0;
+    return '<div class="admrow" style="grid-template-columns:1fr auto auto auto auto">'+
+      '<div><b>'+esc(names[k]||k)+'</b></div>'+
+      '<div>'+(v.done||0)+'<div class=hint>готово</div></div>'+
+      '<div style="color:'+(v.error?'var(--error)':'var(--dim)')+'">'+(v.error||0)+'<div class=hint>ошибок '+errPct+'%</div></div>'+
+      '<div>'+(v.cancelled||0)+'<div class=hint>отмен</div></div>'+
+      '<div>'+(med[k]?dur(med[k]):'—')+'<div class=hint>медиана</div></div></div>';
+  }).join('');
+  return '<div class=panel><div class=panel-title>Пропускная способность за сутки</div><div class=admlist>'+
+    (rows||'<div class=hint>за сутки задач не было</div>')+'</div></div>';
+}
+function errorsHtml(d){
+  var e=d.errors||{}, rows=(e.groups||[]).map(function(g){
+    return '<div class="admrow" style="grid-template-columns:auto 1fr auto">'+
+      '<div style="font-weight:700;color:var(--error)">'+g.count+'×</div>'+
+      '<div style="min-width:0"><div style="word-break:break-word;font-size:12.5px">'+esc(g.text)+'</div>'+
+      '<div class=hint>'+g.kinds.map(esc).join(', ')+' · последняя '+when(g.last_ts)+'</div></div>'+
+      '<div><button class="btn btn-sm btn-ghost" onclick="qLog('+g.last_job+',\'ошибка\')">Лог #'+g.last_job+'</button></div></div>';
+  }).join('');
+  return '<div class=panel><div class=panel-title>Ошибки за '+(e.hours||24)+' ч — всего '+(e.total||0)+
+    ' <select class=select style="width:auto;display:inline-block;margin-left:8px;padding:4px 26px 4px 8px;font-size:12px" onchange="ADM.errhours=this.value;refresh()">'+
+    [1,6,24,72,168].map(function(h){return '<option value="'+h+'"'+(ADM.errhours==h?' selected':'')+'>'+(h<24?h+' ч':(h/24)+' дн')+'</option>';}).join('')+
+    '</select></div><div class=admlist>'+(rows||'<div class=hint>ошибок нет</div>')+'</div></div>';
+}
+function renderOverview(d){
+  document.getElementById('pane-overview').innerHTML =
+    '<div id=admalerts>'+alertsHtml(d)+'</div>'+
+    '<div class=admcards>'+cardsHtml(d)+'</div>'+
+    servicesHtml(d)+providersHtml(d)+renderNodeHtml(d)+throughputHtml(d)+errorsHtml(d);
+}
+
+/* ---------- ОЧЕРЕДЬ ---------- */
+function taskRow(t){
+  var names={tts:'озвучка',prompts:'промпты',cards:'карточка',images:'картинки',video:'видео',render:'рендер',regen:'реген',regen_video:'реген видео'};
+  var badge={queued:'badge-queued',running:'badge-running',done:'badge-done',error:'badge-error',cancelled:'badge-cancelled'}[t.status]||'badge-queued';
+  var acts='<button class="btn btn-sm btn-ghost" onclick="qLog('+t.job_id+',\''+esc(t.project).replace(/'/g,'')+'\')">Лог</button>';
+  if(t.status==='queued'||t.status==='running')
+    acts+=' <button class="btn btn-sm btn-ghost" onclick="act(\'cancel_job\',{job_id:'+t.job_id+'},null,\'Отменить задачу #'+t.job_id+'?\')">Отменить</button>';
+  if(t.status==='running')
+    acts+=' <button class="btn btn-sm btn-ghost" onclick="act(\'requeue_job\',{job_id:'+t.job_id+'},null,\'Вернуть #'+t.job_id+' в очередь? Текущее выполнение прервётся.\')">В очередь</button>';
+  if(t.status==='error'||t.status==='cancelled')
+    acts+=' <button class="btn btn-sm btn-ghost" onclick="act(\'retry_job\',{job_id:'+t.job_id+'})">Повторить</button>';
+  var prog = (t.status==='running')
+    ? '<div class=admbar style="margin-top:5px"><i style="width:'+Math.round(t.progress||0)+'%;background:var(--running)"></i></div>' : '';
+  var time = t.status==='running' ? ('идёт '+dur(t.run_sec)) : (t.status==='queued' ? ('ждёт '+dur(t.age_sec)) : when(t.finished));
+  return '<div class="admrow'+(t.stuck?' stuck':'')+'" style="grid-template-columns:auto 1fr 1fr 1fr 1.2fr auto">'+
+    '<div class=mono style="font-size:12px">#'+t.job_id+'</div>'+
+    '<div style="min-width:0"><b style="font-size:13px">'+esc(t.project)+'</b><div class=hint>'+esc(t.user)+' · '+esc(t.tenant||'')+'</div></div>'+
+    '<div>'+esc(names[t.kind]||t.kind)+'<div class=hint>'+esc(t.provider||'')+(t.lane==='byok'?' · свой ключ':'')+'</div></div>'+
+    '<div><span class="badge '+badge+'"><span class=dot></span>'+esc(t.status)+'</span>'+
+      (t.stuck?'<div class=hint style="color:var(--warn)">молчит '+dur(t.silent_sec)+' из '+dur(t.lease_sec)+'</div>':'')+'</div>'+
+    '<div style="min-width:0">'+esc(t.stage||'')+prog+
+      (t.error?'<div class=hint style="color:var(--error);word-break:break-word">'+esc(t.error.slice(0,140))+'</div>':'')+
+      '<div class=hint>'+time+'</div></div>'+
+    '<div style="white-space:nowrap">'+acts+'</div></div>';
+}
+function renderQueue(d){
+  var tasks=d.tasks||[], f=ADM.filters;
+  var kinds=['','tts','prompts','cards','images','video','render','regen','regen_video'];
+  var provs=['' ].concat((d.providers||[]).map(function(p){return p.provider;}));
+  var head='<div class=panel><div class="row" style="gap:8px">'+
+    '<select class=select style="width:auto" onchange="ADM.filters.status=this.value;refresh()">'+
+      [['active','активные'],['queued','в очереди'],['running','выполняются'],['error','ошибки'],['done','готовые'],['cancelled','отменённые'],['','все']]
+      .map(function(o){return '<option value="'+o[0]+'"'+(f.status===o[0]?' selected':'')+'>'+o[1]+'</option>';}).join('')+'</select>'+
+    '<select class=select style="width:auto" onchange="ADM.filters.kind=this.value;refresh()">'+
+      kinds.map(function(k){return '<option value="'+k+'"'+(f.kind===k?' selected':'')+'>'+(k||'все виды')+'</option>';}).join('')+'</select>'+
+    '<select class=select style="width:auto" onchange="ADM.filters.provider=this.value;refresh()">'+
+      provs.map(function(p){return '<option value="'+esc(p)+'"'+(f.provider===p?' selected':'')+'>'+(p||'все провайдеры')+'</option>';}).join('')+'</select>'+
+    '<div class=search style="flex:1;min-width:180px"><input placeholder="проект, юзер, ошибка или #id" value="'+esc(f.q)+'" '+
+      'onkeydown="if(event.key===\'Enter\'){ADM.filters.q=this.value;refresh();}"></div>'+
+    '<button class="btn btn-sm btn-secondary" onclick="refresh()">Обновить</button>'+
+    '</div><div class=hint style="margin-top:8px">Показано задач: '+tasks.length+
+    (tasks.filter(function(t){return t.stuck;}).length?(' · подсвечены '+tasks.filter(function(t){return t.stuck;}).length+' молчащих (близки к возврату по lease)'):'')+'</div></div>';
+  document.getElementById('pane-queue').innerHTML = head+
+    '<div class=admlist>'+(tasks.map(taskRow).join('')||'<div class=panel><div class=hint>задач по фильтру нет</div></div>')+'</div>';
+}
+
+/* ---------- ПОЛЬЗОВАТЕЛИ ---------- */
+function renderUsers(d){
+  var rows=(d.users||[]).map(function(u){
+    var q = u.quota==null?'по умолчанию':(u.quota===0?'безлимит':u.quota);
+    return '<div class="admrow'+(u.disabled?' off':'')+'" style="grid-template-columns:auto 1.3fr 1fr 1fr 1fr auto">'+
+      '<div class=mono style="font-size:12px">#'+u.id+'</div>'+
+      '<div><b>'+esc(u.name)+'</b>'+(u.role==='admin'?' <span class=tag>админ</span>':'')+
+        (u.disabled?' <span class="tag tag-paid">заблокирован</span>':'')+
+        '<div class=hint>тенант '+esc(u.tenant)+(u.own_keys.length?(' · свои ключи: '+u.own_keys.map(esc).join(', ')):'')+'</div></div>'+
+      '<div>'+u.running+' / '+u.queued+'<div class=hint>идёт / ждёт</div></div>'+
+      '<div>'+u.day_total+(u.day_error?(' <span style="color:var(--error)">('+u.day_error+' ошибок)</span>'):'')+'<div class=hint>задач за сутки</div></div>'+
+      '<div>'+esc(String(q))+'<div class=hint>квота · был '+(u.last_seen_sec==null?'—':dur(u.last_seen_sec)+' назад')+'</div></div>'+
+      '<div style="white-space:nowrap">'+
+        '<button class="btn btn-sm btn-ghost" onclick="setQuota('+u.id+',\''+esc(u.name)+'\')">Квота</button> '+
+        '<button class="btn btn-sm btn-ghost" onclick="resetPw('+u.id+',\''+esc(u.name)+'\')">Пароль</button>'+
+        (u.role==='admin'?'':' <button class="btn btn-sm '+(u.disabled?'btn-secondary':'btn-ghost')+'" onclick="act(\'toggle_user\',{uid:'+u.id+'},null,\''+
+          (u.disabled?'Разблокировать ':'Заблокировать ')+esc(u.name)+'?\')">'+(u.disabled?'Разблокировать':'Заблокировать')+'</button>')+
+      '</div></div>';
+  }).join('');
+  document.getElementById('pane-users').innerHTML='<div class=panel><div class=panel-title>Пользователи и партнёры</div>'+
+    '<div class=admlist>'+rows+'</div>'+
+    '<div class=hint style="margin-top:10px">Блокировка закрывает вход, API и постановку новых задач; уже запущенные задачи не прерываются. '+
+    'Создание партнёра — на <a href="/admin/legacy" target=_blank>старой странице</a>.</div></div>';
+}
+function setQuota(uid,name){
+  var v=prompt('Дневная квота для '+name+':\n\nпусто — по умолчанию, 0 — безлимит',''); if(v===null) return;
+  act('set_quota',{uid:uid,quota:v});
+}
+function resetPw(uid,name){
+  var v=prompt('Новый пароль для '+name+' (минимум 6 символов).\nВсе его сессии будут сброшены.',''); if(!v) return;
+  act('reset_password',{uid:uid,password:v});
+}
+
+/* ---------- КЛЮЧИ ---------- */
+function renderKeys(d){
+  var k=d.keys||{};
+  var keyRows=(k.keys||[]).map(function(x){
+    return '<div class="admrow" style="grid-template-columns:1.4fr 1fr 1fr">'+
+      '<div><b>'+esc(x.title)+'</b><div class=hint>поле <code>'+esc(x.field)+'</code> · группа '+esc(x.group)+'</div></div>'+
+      '<div style="color:'+(x.present?'var(--done)':'var(--error)')+'">'+(x.present?'задан':'НЕТ КЛЮЧА')+'</div>'+
+      '<div class=mono style="font-size:12px">'+esc(x.mask||'—')+'</div></div>';
+  }).join('');
+  var chRows=(k.channels||[]).map(function(c){
+    return '<div class="admrow" style="grid-template-columns:1.4fr 1fr 1fr">'+
+      '<div><b>'+esc(c.title||c.channel)+'</b><div class=hint>канал <code>'+esc(c.channel)+'</code></div></div>'+
+      '<div style="color:'+(c.has_credential?'var(--done)':'var(--dim)')+'">'+(c.has_credential?'есть серверный доступ':'серверного нет')+'</div>'+
+      '<div style="color:'+(c.dead?'var(--error)':'var(--done)')+'">'+(c.dead?('помечен мёртвым, ещё '+dur(c.dead_for_sec)):'рабочий')+'</div></div>';
+  }).join('');
+  document.getElementById('pane-keys').innerHTML=
+    '<div class=panel><div class=panel-title>Серверные ключи</div><div class=admlist>'+keyRows+'</div>'+
+    '<div class=hint style="margin-top:10px">Значения ключей не показываются нигде — только маска. Лимиты и бюджеты правятся на странице <a href="/server-limits" target=_blank>Серверные ключи — лимиты</a>.</div></div>'+
+    '<div class=panel><div class=panel-title>Каналы промптов</div><div class=admlist>'+chRows+'</div>'+
+    '<div class=row style="margin-top:10px"><button class="btn btn-sm btn-secondary" onclick="act(\'clear_dead_channels\',{})">Снять метки недоступности</button>'+
+    '<span class=hint style="margin-left:10px">Приватных меток (по ключам партнёров): '+(k.own_dead_marks||0)+'</span></div></div>'+
+    providersHtml(d);
+}
+
+/* ---------- ЛОГИ ---------- */
+function renderLogs(d){
+  var j=d.journal||{}, lines=(j.lines||[]);
+  var units=[['vsgen','Кабинет генерации'],['rewrite-server','Rewrite'],['cover-server','Cover'],['caddy','Caddy']];
+  var head='<div class=panel><div class="row" style="gap:8px">'+
+    '<select class=select style="width:auto" onchange="ADM.journal.unit=this.value;refresh()">'+
+      units.map(function(u){return '<option value="'+u[0]+'"'+(ADM.journal.unit===u[0]?' selected':'')+'>'+u[1]+'</option>';}).join('')+'</select>'+
+    '<select class=select style="width:auto" onchange="ADM.journal.lines=this.value;refresh()">'+
+      [50,150,300,600].map(function(n){return '<option value="'+n+'"'+(ADM.journal.lines==n?' selected':'')+'>'+n+' строк</option>';}).join('')+'</select>'+
+    '<div class=search style="flex:1;min-width:180px"><input placeholder="фильтр по подстроке (error, traceback…)" value="'+esc(ADM.journal.grep)+'" '+
+      'onkeydown="if(event.key===\'Enter\'){ADM.journal.grep=this.value;refresh();}"></div>'+
+    '<button class="btn btn-sm btn-secondary" onclick="refresh()">Обновить</button></div></div>';
+  var body = j.error ? '<div class=hint style="color:var(--error)">'+esc(j.error)+'</div>'
+                     : esc(lines.join('\n'))||'<span class=hint>пусто</span>';
+  document.getElementById('pane-logs').innerHTML=head+'<div class=log style="height:min(62vh,620px)">'+body+'</div>';
+  var el=document.querySelector('#pane-logs .log'); if(el) el.scrollTop=el.scrollHeight;
+}
+
+/* ---------- ОБСЛУЖИВАНИЕ ---------- */
+function renderMaint(d){
+  var res=d.resources||{}, dr=ADM.data.drift||{};
+  document.getElementById('pane-maint').innerHTML=
+    '<div class=panel><div class=panel-title>Данные и место</div>'+
+    '<div class=admlist>'+
+      '<div class="admrow" style="grid-template-columns:1.4fr 1fr auto"><div><b>База данных</b><div class=hint>'+esc(String(res.job_logs_rows==null?'—':res.job_logs_rows.toLocaleString("ru-RU")))+' строк лога задач · '+(res.tasks_rows||'—')+' задач</div></div>'+
+        '<div>'+bts(res.db_bytes)+'</div>'+
+        '<div><button class="btn btn-sm btn-secondary" onclick="act(\'backup_db\',{})">Сделать бэкап</button></div></div>'+
+      '<div class="admrow" style="grid-template-columns:1.4fr 1fr auto"><div><b>Логи задач</b><div class=hint>удаляются строки завершённых задач старше 30 дней</div></div>'+
+        '<div>'+(res.job_logs_rows==null?'—':res.job_logs_rows.toLocaleString('ru-RU')+' строк')+'</div>'+
+        '<div><button class="btn btn-sm btn-ghost" onclick="act(\'cleanup_logs\',{days:30})">Почистить</button></div></div>'+
+      '<div class="admrow" style="grid-template-columns:1.4fr 1fr auto"><div><b>Резервные копии main.py</b><div class=hint>в каталоге сервера, кроме 5 свежих</div></div>'+
+        '<div>'+bts(res.server_dir_bytes)+'<div class=hint>весь каталог сервера</div></div>'+
+        '<div><button class="btn btn-sm btn-ghost" onclick="act(\'cleanup_baks\',{keep:5})">Почистить</button></div></div>'+
+      '<div class="admrow" style="grid-template-columns:1.4fr 1fr auto"><div><b>Материалы проектов</b><div class=hint>каталог тенантов'+(res.tenants_bytes==null?' · размер ещё считается':'')+'</div></div>'+
+        '<div>'+bts(res.tenants_bytes)+'</div><div class=hint>чистится через удаление проектов в кабинете</div></div>'+
+    '</div></div>'+
+    '<div class=panel><div class=panel-title>Версия кода в работе</div>'+
+    (dr.runtime_stale
+      ? '<div class="admalert bad"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> В рантайме СТАРЫЙ код: '+esc((dr.runtime[0]||{}).file||'main.py')+' новее процесса на '+dur((dr.runtime[0]||{}).older_by)+'. '+
+        '<button class="btn btn-sm btn-primary" style="margin-left:8px" onclick="restartVsgen()">Перезапустить vsgen</button></div>'
+      : '<div class="admalert good"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-check-circle"/></svg> Процесс работает с актуальным main.py (запущен '+when(dr.proc_started)+').</div>')+
+    ((dr.workers||[]).length
+      ? '<div class=hint style="margin-top:8px">Воркеры, обновлённые после старта сервиса (применяются сразу, рестарт не нужен): '+
+        dr.workers.map(function(w){return esc(w.file);}).join(', ')+'</div>' : '')+
+    '</div>'+
+    '<div class=panel><div class=panel-title>Аварийный стоп</div>'+
+    '<div class=row><button class="btn btn-sm btn-danger" onclick="act(\'pause_queue\',{target:\'all\'},null,\'Остановить выдачу новых задач по всей очереди?\')">Поставить всю очередь на паузу</button>'+
+    '<button class="btn btn-sm btn-secondary" onclick="act(\'resume_queue\',{target:\'all\'})">Возобновить</button></div>'+
+    '<div class=hint style="margin-top:8px">Пауза переживает перезапуск сервиса: аварийный стоп не должен сниматься сам.</div></div>'+
+    auditHtml(d);
+}
+function auditHtml(d){
+  var rows=(d.audit||[]).map(function(a){
+    return '<div class="admrow" style="grid-template-columns:auto 1fr 1.4fr">'+
+      '<div class=hint style="white-space:nowrap">'+when(a.ts)+'</div>'+
+      '<div><b>'+esc(a.action)+'</b><div class=hint>'+esc(a.admin||'')+' · '+esc(a.target||'')+'</div></div>'+
+      '<div class=hint style="word-break:break-word">'+esc(a.result||'')+'</div></div>';
+  }).join('');
+  return '<div class=panel><div class=panel-title>Журнал действий администратора</div><div class=admlist>'+
+    (rows||'<div class=hint>действий пока не было</div>')+'</div></div>';
+}
+function renderAudit(d){ document.getElementById('pane-audit').innerHTML=auditHtml(d); }
+
+/* ---------- действия над сервисами ---------- */
+function restartUnit(unit,isSelf){
+  var q = isSelf
+    ? 'Перезапустить vsgen?\n\nНезавершённые задачи генерации вернутся в очередь и стартуют заново (кредиты на них потратятся повторно).\nРендеры на внешней ноде перезапуск переживут.'
+    : 'Перезапустить '+unit+'?';
+  act('restart_service',{unit:unit},null,q).then(function(ok){ if(ok&&isSelf) waitRestart(); });
+}
+function restartVsgen(){ restartUnit('vsgen',1); }
+function waitRestart(){
+  var c=document.getElementById('admconn');
+  c.textContent='перезапуск… ждём сервис'; c.style.color='var(--warn)';
+  var tries=0;
+  var h=setInterval(function(){
+    tries++;
+    fetch('/healthz',{cache:'no-store'}).then(function(r){
+      if(r.status===200||r.status===503){ clearInterval(h); toast('Сервис поднялся'); refresh(); }
+    }).catch(function(){});
+    if(tries>40){ clearInterval(h); c.textContent='сервис не поднялся за 2 минуты — проверьте журнал'; c.style.color='var(--error)'; }
+  },3000);
+}
+window.addEventListener('DOMContentLoaded',function(){
+  setTab('overview');
+  ADM.timer=setInterval(function(){ if(!document.hidden) refresh(); },5000);
+});
+</script>
+"""
+
+_ADM_CSS = """
+<style>
+.admwrap{max-width:1280px;margin:0 auto;padding:20px 24px}
+.admcards{display:grid;grid-template-columns:repeat(auto-fit,minmax(190px,1fr));gap:10px;margin-bottom:14px}
+.admcard{background:var(--surface);border:1px solid var(--border);border-radius:var(--r);padding:13px 15px}
+.admcard-t{font-size:11.5px;font-weight:600;color:var(--dim);text-transform:uppercase;letter-spacing:.05em}
+.admcard-v{font:700 22px/1.2 var(--disp);margin:6px 0 3px}
+.admcard-s{font-size:11.5px;color:var(--muted);line-height:1.45}
+.admlist{display:flex;flex-direction:column}
+.admrow{display:grid;gap:12px;align-items:center;padding:11px 4px;border-bottom:1px solid var(--border);font-size:13px}
+.admrow:last-child{border-bottom:0}
+.admrow.stuck{background:color-mix(in srgb,var(--warn) 7%,transparent)}
+.admrow.off{opacity:.55}
+.admbar{height:5px;border-radius:3px;background:var(--surface2);overflow:hidden}
+.admbar i{display:block;height:100%;border-radius:3px;transition:width .3s}
+.admalert{border-radius:var(--rs);padding:10px 13px;margin-bottom:8px;font-size:13px;line-height:1.5;border:1px solid}
+.admalert.bad{background:color-mix(in srgb,var(--error) 12%,transparent);border-color:color-mix(in srgb,var(--error) 45%,transparent)}
+.admalert.warn{background:color-mix(in srgb,var(--warn) 12%,transparent);border-color:color-mix(in srgb,var(--warn) 40%,transparent)}
+.admalert.good{background:color-mix(in srgb,var(--done) 10%,transparent);border-color:color-mix(in srgb,var(--done) 35%,transparent)}
+#admtoast{position:fixed;right:18px;bottom:18px;z-index:400;display:none;background:var(--elev);border:1px solid var(--done);
+  border-radius:var(--rs);padding:11px 15px;font-size:13px;max-width:420px;box-shadow:var(--sh-pop)}
+@media (max-width:900px){.admrow{grid-template-columns:1fr!important}}
+</style>
+"""
+
+
+@app.get("/admin", response_class=HTMLResponse)
+def admin_panel(request: Request, token: str = ""):
+    """Админ-панель: весь контур и управление им. Доступ — админская web-сессия
+    (или ?token=adm_… для старых закладок)."""
+    u = _adm_user(request, token)
+    if not u:
+        if web_user(request):
+            return HTMLResponse("<p style='font-family:sans-serif;padding:24px'>Эта страница только для администратора.</p>",
+                                status_code=403)
+        return RedirectResponse("/login", 302)
+    tabs = (("overview", "Обзор"), ("queue", "Очередь"), ("users", "Пользователи"),
+            ("keys", "Ключи"), ("logs", "Логи"), ("maint", "Обслуживание"), ("audit", "Аудит"))
+    tabs_html = "".join(f'<div class="tab" data-tab="{t}" onclick="setTab(\'{t}\')">{html.escape(n)}</div>'
+                        for t, n in tabs)
+    panes_html = "".join(f'<div class="admpane pane" id="pane-{t}"></div>' for t, _ in tabs)
+    body = f"""
+<header class=tb>
+  <b><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> VideoStudio</b><span class=sep>·</span><span class=muted style="font-size:13px">админ-панель</span>
+  <span class=sp></span>
+  <a class=nav-link href="/">Проекты</a><a class=nav-link href="/queue">Очередь</a>
+  <a class=nav-link href="/keys">Ключи</a>
+  <a class=nav-link href="/server-limits">Лимиты</a>
+  <span class=sep>·</span><span class=muted style="font-size:12.5px">{html.escape(u['name'])}</span>
+</header>
+<div class=admwrap>
+  <div class=row style="margin-bottom:12px">
+    <h1 style="margin:0">Панель управления</h1>
+    <span class=sp></span>
+    <span id=admconn class=hint style="margin:0">загрузка…</span>
+    <button class="btn btn-sm btn-secondary" onclick="refresh()">Обновить</button>
+  </div>
+  <div id=pausebar style="display:none"></div>
+  <div class=tabs id=admtabs>{tabs_html}</div>
+  {panes_html}
+</div>
+<div id=admtoast></div>
+{_QLOG_MODAL}
+{_ADM_CSS}
+{_ADM_JS}
+"""
+    return _page("VideoStudio — админ-панель", body)
+
+
+# ============================================================
+# Контур публикаций: вкладка «Каналы».
+# Регистрируется в самом конце — к этому моменту определены все помощники,
+# которые модулю нужны. Сам код живёт в pub_ui.py, здесь только связка.
+# ============================================================
+def _upload_token() -> str:
+    """Свой секрет для ноды заливки — отдельный от рендерного.
+
+    Заводится один раз и живёт в admin_state: рестарт кабинета его не теряет, а нода
+    получает его от владельца один раз при настройке.
+    """
+    c = db()
+    try:
+        row = c.execute("SELECT v FROM admin_state WHERE k='pub_upload_token'").fetchone()
+        if row and row[0]:
+            return row[0]
+        token = "upl_" + secrets.token_urlsafe(24)
+        c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES('pub_upload_token',?,?)",
+                  (token, time.time()))
+        c.commit()
+        log_info("заливка: выписан токен ноды (посмотреть — в админ-панели)")
+        return token
+    finally:
+        c.close()
+
+
+register_upload_routes(app, {
+    "db": db,
+    "_now": _now,
+    "upload_token": _upload_token,
+    "log": log_info,
+})
+
+register_pub_routes(app, {
+    "db": db,
+    "_page": _page,
+    "_header": _header,
+    "_tid": _tid,
+    "_now": _now,
+    "web_user": web_user,
+    "require_web_user": require_web_user,
+})

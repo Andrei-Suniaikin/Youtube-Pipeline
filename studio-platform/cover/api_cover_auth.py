@@ -10,6 +10,7 @@ Per-user API ключи (формат cvr_*), храним в той же БД c
 import hashlib
 import secrets
 import sqlite3
+from contextlib import closing
 import time
 import uuid
 from typing import Optional, List, Dict
@@ -36,7 +37,7 @@ class ApiAuthState:
     @classmethod
     def init_db(cls):
         """Создаёт таблицу api_keys (idempotent)."""
-        with sqlite3.connect(cls.db_path()) as conn:
+        with closing(sqlite3.connect(cls.db_path())) as conn, conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS api_keys (
                     key_id       TEXT PRIMARY KEY,
@@ -81,7 +82,7 @@ def verify_api_key(plain_key: str) -> Optional[Dict]:
     if not plain_key or not plain_key.startswith(KEY_PREFIX):
         return None
     h = _hash(plain_key)
-    with sqlite3.connect(ApiAuthState.db_path()) as conn:
+    with closing(sqlite3.connect(ApiAuthState.db_path())) as conn, conn:
         row = conn.execute(
             "SELECT key_id, user_id, name, status FROM api_keys WHERE key_hash = ?",
             (h,)
@@ -108,7 +109,7 @@ def create_api_key(user_id: str, name: str) -> Dict:
     prefix = plain[:12]  # cvr_xxxxxxxx — 8 chars после префикса видны
     key_id = uuid.uuid4().hex[:12]
     now = time.time()
-    with sqlite3.connect(ApiAuthState.db_path()) as conn:
+    with closing(sqlite3.connect(ApiAuthState.db_path())) as conn, conn:
         conn.execute(
             """INSERT INTO api_keys (key_id, user_id, name, key_hash, prefix, created_at, status)
                VALUES (?, ?, ?, ?, ?, ?, 'active')""",
@@ -125,7 +126,7 @@ def create_api_key(user_id: str, name: str) -> Dict:
 
 def list_api_keys(user_id: str) -> List[Dict]:
     """Все ключи пользователя (без plain)."""
-    with sqlite3.connect(ApiAuthState.db_path()) as conn:
+    with closing(sqlite3.connect(ApiAuthState.db_path())) as conn, conn:
         rows = conn.execute(
             """SELECT key_id, name, prefix, created_at, last_used_at, status
                FROM api_keys WHERE user_id = ? ORDER BY created_at DESC""",
@@ -146,7 +147,7 @@ def list_api_keys(user_id: str) -> List[Dict]:
 
 def revoke_api_key(user_id: str, key_id: str) -> bool:
     """Soft delete: status='revoked'. Возвращает True если что-то изменилось."""
-    with sqlite3.connect(ApiAuthState.db_path()) as conn:
+    with closing(sqlite3.connect(ApiAuthState.db_path())) as conn, conn:
         cursor = conn.execute(
             "UPDATE api_keys SET status = 'revoked' WHERE key_id = ? AND user_id = ? AND status = 'active'",
             (key_id, user_id)

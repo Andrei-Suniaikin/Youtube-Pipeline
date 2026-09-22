@@ -13,7 +13,7 @@ render_puller — агент рендера на GPU-боксе.
   PULLER_WORK    рабочая папка (default /workspace/render_jobs)
   PULLER_POLL    интервал опроса сек (default 8)
 """
-import os, sys, io, time, json, tarfile, subprocess, shutil, re, signal, threading
+import os, sys, io, time, json, tarfile, subprocess, shutil, re, signal, threading, hashlib
 from collections import deque
 import shutil
 import requests
@@ -134,22 +134,55 @@ def post_transcript(jid, claim_token, projdir):
         return False
 
 
+def _sha256_file(path):
+    """sha256 файла, кусками: ролик на два часа в память не кладётся."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def post_done(jid, claim_token, mp4, projdir=None):
+    """Отдать mp4 и СВЕРИТЬ квитанцию: сервер отвечает тем, что у него на диске.
+
+    Заголовки sha256 и Content-Length — единственный способ отличить «доехало целиком»
+    от «оборвалось на 90%»: тело сырое, конца у потока нет, и обрезанный файл выглядит
+    как обычный mp4. Сервер, который этих заголовков не понимает, их просто
+    проигнорирует, поэтому слать их безопасно и на старый кабинет.
+    """
     if projdir:
         post_transcript(jid, claim_token, projdir)
+    size, digest = os.path.getsize(mp4), _sha256_file(mp4)
     with open(mp4, "rb") as f:
         r = requests.post(f"{SERVER}/api/render/{jid}/result?status=done",
-                          headers={**_job_headers(claim_token), "Content-Type": "video/mp4"}, data=f, timeout=1200)
+                          headers={**_job_headers(claim_token), "Content-Type": "video/mp4",
+                                   "Content-Length": str(size), "X-Render-SHA256": digest},
+                          data=f, timeout=1200)
     if r.status_code == 409:
         raise RenderCancelled()
     r.raise_for_status()
+    # Квитанцию читаем, но задачу из-за неё НЕ роняем: mp4 сервером уже принят, и
+    # post_error поверх принятого результата превратил бы готовый ролик в «ошибку».
+    # Расхождение здесь — повод разбираться с сервером, а не терять рендер.
+    try:
+        receipt = r.json()
+    except Exception:
+        receipt = {}
+    if isinstance(receipt, dict) and receipt.get("sha256") and receipt.get("sha256") != digest:
+        _log(f"job {jid}: ⚠️ сервер подтвердил ДРУГОЙ файл "
+             f"(у него {receipt.get('sha256')[:12]}…, у нас {digest[:12]}…)")
 
 
 def post_error(jid, claim_token, msg):
     try:
+        # 480 символов и хэш от них же: сервер считает хэш ровно от того, что получил,
+        # и по совпадению видно, что до него доехал ТОТ текст ошибки, а не обрывок.
+        detail = (msg or "")[:480]
         r = requests.post(f"{SERVER}/api/render/{jid}/result?status=error",
-                          headers=_job_headers(claim_token),
-                          params={"error": (msg or "")[:480]}, timeout=30)
+                          headers={**_job_headers(claim_token),
+                                   "X-Render-Error-SHA256": hashlib.sha256(detail.encode("utf-8")).hexdigest()},
+                          params={"error": detail}, timeout=30)
         if r.status_code == 409:
             _log(f"job {jid}: сервер уже закрыл задачу; локальная ошибка не принята")
             return False
@@ -309,7 +342,13 @@ def worker_loop(widx):
         if not job:
             time.sleep(POLL)
             continue
-        _log(f"[w{widx}] взял job {job['job_id']} '{job.get('name')}' cfg={job['config'].get('quality')}/{job['config'].get('enable_fade')}/{job['config']['render_settings'].get('fast_batch_stitch')}")
+        # narration_files — закреплённый сервером набор основной озвучки. Наш стендовый
+        # рендерер (боевой 02.09) про этот ключ не знает и по-прежнему сканирует каталог,
+        # поэтому единственное доказательство, что закрепление доехало, — вот эта строчка
+        # в логе плюс то, что в материалах лежит ровно столько файлов озвучки.
+        _nf = job["config"].get("narration_files")
+        _log(f"[w{widx}] взял job {job['job_id']} '{job.get('name')}' cfg={job['config'].get('quality')}/{job['config'].get('enable_fade')}/{job['config']['render_settings'].get('fast_batch_stitch')}"
+             + (f" озвучка закреплена: {len(_nf)} файл(ов)" if isinstance(_nf, list) else " озвучка НЕ закреплена (старая задача)"))
         run_job(job, widx)
 
 

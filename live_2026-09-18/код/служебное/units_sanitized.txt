@@ -1,0 +1,198 @@
+### vsgen
+# /etc/systemd/system/vsgen.service
+[Unit]
+Description=VideoStudio Gen Server
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/VideoStudio/server
+Environment=GEN_WORKERS=PLACEHOLDER
+ExecStart=/usr/bin/python3 -m uvicorn main:app --host 127.0.0.1 --port 8800 --log-level warning
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
+
+# /etc/systemd/system/vsgen.service.d/90-launch-retention-hold.conf
+[Service]
+Environment=VS_RETENTION_DAYS=PLACEHOLDER
+
+# /etc/systemd/system/vsgen.service.d/logs.conf
+[Service]
+Environment=VS_JOB_LOGS_RETENTION_DAYS=PLACEHOLDER
+
+# /etc/systemd/system/vsgen.service.d/priority.conf
+[Service]
+Nice=-10
+CPUWeight=400
+IOWeight=300
+
+# /etc/systemd/system/vsgen.service.d/prompt-timeout.conf
+[Service]
+# Cap silent Codex subscription/network tails. The same exact prompt is retried
+# by the worker; normal successful production calls are below this ceiling.
+Environment=VS_SUB_TIMEOUT=PLACEHOLDER
+
+# /etc/systemd/system/vsgen.service.d/puller.conf
+[Service]
+Environment=PULLER_TOKEN=PLACEHOLDER
+
+# /etc/systemd/system/vsgen.service.d/subs.conf
+[Service]
+# Выходы для субтитров: свой туннель плюс оплаченные прокси профилей AdsPower, которые
+# сейчас никем не заняты. Каждый адрес несёт свою квоту YouTube, поэтому очередь
+# расходится, а не упирается в один исчерпанный адрес. Профили активных каналов не
+# берём: спалить их адрес субтитрами значит остановить заливку этого канала.
+Environment=VS_SUBS_PROXIES=PLACEHOLDER
+Environment=VS_SUBS_COOKIES=PLACEHOLDER
+Environment=VS_SUBS_REST=PLACEHOLDER
+
+# /etc/systemd/system/vsgen.service.d/workers.conf
+[Service]
+Environment=GEN_WORKERS=PLACEHOLDER
+### rewrite-server
+# /etc/systemd/system/rewrite-server.service
+[Unit]
+Description=Rewrite Server
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/rewrite-server
+EnvironmentFile=/etc/rewrite.env
+Environment="CLAUDE_MAX_PARALLEL=PLACEHOLDER
+ExecStart=/usr/bin/python3 -m uvicorn server:app --host 127.0.0.1 --port 8899
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+
+# /etc/systemd/system.control/rewrite-server.service.d/50-CPUQuota.conf
+# This is a drop-in unit file extension, created via "systemctl set-property"
+# or an equivalent operation. Do not edit.
+[Service]
+CPUQuota=350%
+
+# /etc/systemd/system.control/rewrite-server.service.d/50-CPUWeight.conf
+# This is a drop-in unit file extension, created via "systemctl set-property"
+# or an equivalent operation. Do not edit.
+[Service]
+CPUWeight=20
+
+# /etc/systemd/system/rewrite-server.service.d/codex.conf
+[Service]
+Environment="REWRITE_CODEX_BIN=PLACEHOLDER
+Environment="REWRITE_CODEX_HOME=PLACEHOLDER
+Environment="REWRITE_CODEX_TIMEOUT=PLACEHOLDER
+Environment="REWRITE_CODEX_CONCURRENCY=PLACEHOLDER
+
+# /etc/systemd/system/rewrite-server.service.d/yield.conf
+[Service]
+CPUWeight=20
+### cover-server
+# /etc/systemd/system/cover-server.service
+[Unit]
+Description=Cover Generator Server (port 8900)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/cover_tool
+
+# Локальные переменные окружения сервиса.
+EnvironmentFile=-/root/cover_tool/.env
+
+ExecStart=/root/cover_tool/venv/bin/uvicorn cover_server:app --host 127.0.0.1 --port 8900
+Restart=always
+RestartSec=5
+
+StandardOutput=append:/root/cover_tool/cover_server.log
+StandardError=append:/root/cover_tool/cover_server.log
+
+[Install]
+WantedBy=multi-user.target
+### vsfix.service
+# /etc/systemd/system/vsfix.service
+[Unit]
+Description=VideoStudio: разбор жалоб кнопки «Пожаловаться»
+After=network-online.target vsgen.service
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/vsfix
+Environment=HOME=PLACEHOLDER
+Environment=CODEX_HOME=PLACEHOLDER
+ExecStart=/usr/bin/python3 /opt/vsfix/vsfix.py --config /etc/vsfix/config.json tick
+TimeoutStartSec=75min
+Nice=5
+### vsfix.timer
+# /etc/systemd/system/vsfix.timer
+[Unit]
+Description=VideoStudio: проверять жалобы раз в минуту
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=60s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+### video-ops-watchdog.service
+# /etc/systemd/system/video-ops-watchdog.service
+[Unit]
+Description=Video Ops watchdog check
+Documentation=file:///opt/video-ops-watchdog/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/video-ops-watchdog
+EnvironmentFile=-/etc/video-ops-watchdog/environment
+ExecStart=/opt/video-ops-watchdog/.venv/bin/python /opt/video-ops-watchdog/watchdog.py check --config /etc/video-ops-watchdog/config.json --state-db /var/lib/video-ops-watchdog/state.db
+TimeoutStartSec=10min
+UMask=0077
+StateDirectory=video-ops-watchdog
+StateDirectoryMode=0700
+
+# The checks need outbound HTTP/SSH, but no writable application or system paths.
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/video-ops-watchdog /opt/video-ops-watchdog /opt/ytcortiez-autobuyer /root/VideoStudio /root/.codex
+ReadWritePaths=/var/lib/video-ops-watchdog
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH
+### video-ops-watchdog.timer
+# /etc/systemd/system/video-ops-watchdog.timer
+[Unit]
+Description=Run Video Ops watchdog check every 15 minutes
+
+[Timer]
+OnCalendar=*-*-* *:00/15:00
+Persistent=true
+AccuracySec=30s
+Unit=video-ops-watchdog.service
+
+[Install]
+WantedBy=timers.target
+

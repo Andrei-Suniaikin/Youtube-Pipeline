@@ -121,7 +121,13 @@ class ProfileLease:
                 check=False,
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            raise ProfileLeaseError(f"profile lease {action} transport failed: {exc}") from exc
+            # Текст исключения subprocess содержит ВЕСЬ argv, а в нём — `--owner-token`
+            # с живым токеном лизы. Он уезжал в лог задачи и в сообщение об ошибке,
+            # которое видит пользователь. Оставляем только класс ошибки; `from None`
+            # обрывает и цепочку, где тот же argv лежит в __cause__ (правка production
+            # 6fcb8b5b, срез live_2026-09-18).
+            raise ProfileLeaseError(
+                f"profile lease {action} transport failed ({type(exc).__name__})") from None
         lines = [line for line in (completed.stdout or "").splitlines() if line.strip()]
         if len(lines) != 1:
             raise ProfileLeaseError(f"profile lease {action} returned invalid framing")

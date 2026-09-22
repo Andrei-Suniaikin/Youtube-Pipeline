@@ -1,0 +1,38 @@
+[Unit]
+Description=Video Ops scheduled review
+Documentation=file:///opt/video-ops-watchdog/deploy/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=/opt/video-ops-watchdog
+EnvironmentFile=-/etc/video-ops-watchdog/environment
+Environment=CODEX_HOME=/root/.codex-server
+ExecStart=/usr/bin/flock --exclusive /root/.codex-server/.auth.json.lifecycle.lock /opt/video-ops-watchdog/.venv/bin/python /opt/video-ops-watchdog/review.py --config /etc/video-ops-watchdog/config.json --state-db /var/lib/video-ops-watchdog/state.db
+TimeoutStartSec=20min
+UMask=0077
+StateDirectory=video-ops-watchdog
+StateDirectoryMode=0700
+
+# The review needs outbound HTTP/SSH, but no writable application or system paths.
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateTmp=true
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=read-only
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/video-ops-watchdog /opt/video-ops-watchdog /opt/ytcortiez-autobuyer /root/VideoStudio
+ReadWritePaths=/root/.codex-server /var/lib/video-ops-watchdog
+LockPersonality=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH
+AmbientCapabilities=CAP_DAC_READ_SEARCH

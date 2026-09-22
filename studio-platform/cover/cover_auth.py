@@ -19,6 +19,7 @@ import uuid
 import hmac
 import hashlib
 import sqlite3
+from contextlib import closing
 import threading
 from typing import Optional, Dict, List
 
@@ -56,7 +57,7 @@ class LicenseManager:
         self._init_db()
 
     def _init_db(self):
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     session_id TEXT PRIMARY KEY,
@@ -133,7 +134,7 @@ class LicenseManager:
     # --------------- Аккаунты ---------------
 
     def has_users(self) -> bool:
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
             return bool(row and row[0] > 0)
 
@@ -146,7 +147,7 @@ class LicenseManager:
         if len(password or "") < 6:
             return (False, "Пароль — минимум 6 символов", "")
         with self._lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 row = conn.execute("SELECT COUNT(*) FROM users").fetchone()
                 if row and row[0] > 0:
                     return (False, "Настройка уже выполнена — войдите по логину/паролю", "")
@@ -164,7 +165,7 @@ class LicenseManager:
         if not username or not password:
             return (False, "Введите логин и пароль", "")
         with self._lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT password_hash, salt, user_id, user_name FROM users WHERE username = ?",
                     (username,)
@@ -192,7 +193,7 @@ class LicenseManager:
         if len(password or "") < 6:
             return (False, "Пароль — минимум 6 символов")
         with self._lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 exists = conn.execute("SELECT 1 FROM users WHERE username = ?", (username,)).fetchone()
                 if exists:
                     return (False, "Такой логин уже есть")
@@ -212,7 +213,7 @@ class LicenseManager:
         if len(new_password or "") < 6:
             return (False, "Пароль — минимум 6 символов")
         with self._lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT password_hash, salt FROM users WHERE username = ?", (username,)
                 ).fetchone()
@@ -236,7 +237,7 @@ class LicenseManager:
         usernames=None — всем аккаунтам. Returns список затронутых логинов."""
         flag = 1 if pending else 0
         with self._lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 if usernames is None:
                     rows = conn.execute("SELECT username FROM users").fetchall()
                     conn.execute("UPDATE users SET pw_reset_pending = ?", (flag,))
@@ -268,7 +269,7 @@ class LicenseManager:
         if len(new_password or "") < 6:
             return (False, "Пароль — минимум 6 символов", "")
         with self._lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 row = conn.execute(
                     "SELECT user_id, user_name, pw_reset_pending FROM users WHERE username = ?",
                     (username,)
@@ -286,7 +287,7 @@ class LicenseManager:
         return (True, self._create_session(user_id, user_name, ip), user_name)
 
     def list_accounts(self) -> List[Dict]:
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             rows = conn.execute(
                 "SELECT username, user_name, user_id, created_at, pw_reset_pending "
                 "FROM users ORDER BY created_at"
@@ -301,7 +302,7 @@ class LicenseManager:
     def delete_account(self, username: str) -> bool:
         """Удаляет аккаунт (и его сессии). Последнего админа удалить нельзя (анти-lockout)."""
         with self._lock:
-            with sqlite3.connect(self.db_path) as conn:
+            with closing(sqlite3.connect(self.db_path)) as conn, conn:
                 row = conn.execute("SELECT user_id FROM users WHERE username = ?", (username,)).fetchone()
                 if not row:
                     return False
@@ -320,7 +321,7 @@ class LicenseManager:
     def _create_session(self, user_id: str, user_name: str, ip: str) -> str:
         session_id = str(uuid.uuid4())
         now = time.time()
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute(
                 "INSERT INTO sessions (session_id, license_key, user_name, ip, created_at, last_ping, user_id) "
                 "VALUES (?, '', ?, ?, ?, ?, ?)",
@@ -333,13 +334,13 @@ class LicenseManager:
         if conn:
             conn.execute("DELETE FROM sessions WHERE last_ping < ?", (cutoff,))
         else:
-            with sqlite3.connect(self.db_path) as c:
+            with closing(sqlite3.connect(self.db_path)) as c, c:
                 c.execute("DELETE FROM sessions WHERE last_ping < ?", (cutoff,))
 
     def ping(self, session_id: str) -> bool:
         now = time.time()
         cutoff = now - SESSION_TIMEOUT
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             # истёкшие чистим и НЕ воскрешаем (UPDATE только свежих) — иначе ping
             # с мёртвым session_id продлевал бы сессию мимо роллинг-TTL
             conn.execute("DELETE FROM sessions WHERE last_ping < ?", (cutoff,))
@@ -350,14 +351,14 @@ class LicenseManager:
             return result.rowcount > 0
 
     def logout(self, session_id: str):
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("DELETE FROM sessions WHERE session_id = ?", (session_id,))
 
     def validate(self, session_id: str) -> Optional[Dict]:
         """Роллинг-валидация: сессия жива, пока есть активность (продление не чаще раза в 30с)."""
         now = time.time()
         cutoff = now - SESSION_TIMEOUT
-        with sqlite3.connect(self.db_path) as conn:
+        with closing(sqlite3.connect(self.db_path)) as conn, conn:
             conn.execute("DELETE FROM sessions WHERE last_ping < ?", (cutoff,))
             row = conn.execute(
                 "SELECT user_name, ip, last_ping, user_id FROM sessions WHERE session_id = ?",

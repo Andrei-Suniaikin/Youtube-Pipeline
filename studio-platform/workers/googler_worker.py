@@ -179,6 +179,17 @@ if env_openai_key:
 
 
 EX_TEMPFAIL = getattr(os, "EX_TEMPFAIL", 75)
+# Контракт кодов выхода для кабинета. Смысл в том, что отказ плана бывает ДВУХ пород:
+# «этот текст вообще не превращается в план» и «этот текст не превращается в план ИМЕННО
+# с этой галочкой проекта». Вторая порода лечится сама: у плана того же текста без
+# «разбора персонажей и мест» (analyze_story) или без «дробления длинных предложений»
+# (split_long_sentences) таких проверок нет вовсе. Отдельный код выхода — единственный
+# способ сказать об этом кабинету, не заставляя его разбирать текст ошибки.
+#   11 — канон разбора персонажей и мест отклонил план (story_bible);
+#   12 — смысловая нарезка длинных предложений не сошлась после всех повторов.
+# Любой другой отказ плана остаётся кодом 1: кабинет ничего выключать не должен.
+EX_PLAN_CANON_CONFLICT = 11
+EX_PLAN_SEMANTIC_EXHAUSTED = 12
 
 
 class ScenePlanError(RuntimeError):
@@ -195,6 +206,33 @@ class ScenePlanTerminalError(ScenePlanError):
 
 class ScenePlanSchemaError(ScenePlanTerminalError):
     """Модель вернула malformed JSON/scene schema; допустим точечный corrective retry."""
+
+
+class ScenePlanCanonConflictError(ScenePlanTerminalError):
+    """План отклонён каноном разбора персонажей и мест (story_bible).
+
+    Одно имя у двух сущностей, каноническое место, не отмеченное в сцене, или entities
+    сцены вне канона. Всё это порождено разбором персонажей: у плана того же текста без
+    разбора таких проверок нет. Сами проверки остаются fail-closed — план с неоднозначным
+    каноном публиковать нельзя. Отдельный класс нужен только затем, чтобы кабинет мог
+    ЯВНО перезапустить промпты с выключенным разбором и записать это в проект, а не
+    молча снять этап картинок.
+    """
+
+
+class ScenePlanCanonSchemaError(ScenePlanSchemaError, ScenePlanCanonConflictError):
+    """Канонический отказ, который ещё можно исправить точечным повтором одной сцены.
+
+    Наследует обе природы намеренно: повторы идут как у любой schema-ошибки, а если они
+    не помогли — код выхода всё равно канонический, и кабинет узнаёт настоящую причину.
+    """
+
+
+class ScenePlanSemanticExhaustedError(ScenePlanSchemaError):
+    """Смысловая нарезка (split_long, semantic v4) не сошлась после всех повторов блока.
+
+    Кабинет может ЯВНО перезапустить промпты без дробления длинных предложений.
+    """
 
 
 class OpenAIKeyError(Exception):
@@ -406,6 +444,11 @@ GPT_MODEL = "gpt-4.1-nano"
 # Сильнее nano для задач, где важна НАДЁЖНОСТЬ (извлечение персонажей + тег entities на сцену):
 # nano мусорит (пере/недо-тегает), mini == 4.1 по качеству тега, но дешевле (~$0.17/ролик). Output мал → дёшево.
 SCENE_GPT_MODEL = "gpt-4.1-mini"
+# 16.09.2026: живой GET https://api.openai.com/v1/models показал, что модели "gpt-image-2.5"
+# не существует — есть "gpt-image-2.5-flare" и "gpt-image-2.5-sunburst"; владелец выбрал
+# sunburst. Cover Studio с 17.09 шлёт ту же модель (cover/cover_core.py, GPT_IMAGE_MODEL). Вынесено в окружение по тому же принципу, что и адрес
+# FastGen в VS_GOOGLER_BASE (04.09): имя модели у провайдера меняется без правки кода.
+GPT_IMAGE_MODEL = os.environ.get("VS_GPT_IMAGE_MODEL") or "gpt-image-2.5-sunburst"
 
 # --- Модели для генерации изображений ---
 # Формат: "backend_model" → описание (API route)
@@ -428,7 +471,8 @@ GOOGLER_AVAILABLE_MODELS = [
     "VEO_BANANA",     # VeoNonStop Nano Banana Pro (image/banana/generate, model_key=GEM_PIX_2 — дефолт API, ключ veo). generate + до 5 refs
     "VEO_BANANA_2",   # VeoNonStop Nano Banana 2 (тот же эндпоинт, model_key=NARWHAL). generate + refs
     "VEO_BANANA_LITE",# VeoNonStop Nano Banana 2 Lite (тот же эндпоинт, model_key=HARBOR_SEAL) — быстрее/дешевле. generate + refs
-    "GPT_IMAGE2",     # OpenAI gpt-image-2 НАПРЯМУЮ (quality=low) — ПЛАТНО ~$0.006/шт с openai-ключа. generate-only
+    "GPT_IMAGE2",     # OpenAI gpt-image-2.5-sunburst НАПРЯМУЮ (quality=low) — ПЛАТНО, цена не
+                      # перепроверена под 2.5 (см. GPT_IMAGE_MODEL). generate-only
 ]
 GOOGLER_MODEL_LABELS = {
     "OPENAI":         "ChatGPT Image",
@@ -442,7 +486,7 @@ GOOGLER_MODEL_LABELS = {
     "VEO_BANANA":     "Nano Banana Pro (Veo)",
     "VEO_BANANA_2":   "Nano Banana 2 (Veo)",
     "VEO_BANANA_LITE":"Nano Banana 2 Lite (Veo)",
-    "GPT_IMAGE2":     "GPT-Image-2 low (💲платно)",
+    "GPT_IMAGE2":     "GPT Image 2.5 low (💲платно)",
 }
 # Кредиты FastGen/recrafter за ОДНУ генерацию — машиночитаемый дубль комментариев выше
 # (GOOGLER_AVAILABLE_MODELS). Это ИСТОЧНИК ИСТИНЫ для взвешенного бюджета серверного ключа
@@ -591,6 +635,85 @@ def _set_last_gen_error(msg) -> None:
 
 def _last_gen_error() -> str:
     return getattr(_GEN_LAST_ERROR, "msg", "")
+
+
+# ── Настоящая причина отказа провайдера (HTTP-код и суть) ────────────────────
+# Отдельно от _GEN_LAST_ERROR НАМЕРЕННО. _GEN_LAST_ERROR — вход ретрай-логики: по нему
+# решают, фатален ли отказ, транзиентен ли, часовая ли это квота. Дописывать туда ещё и
+# отказы транспорта значит менять решения о повторах. А здесь нужна только правда для
+# человека и для журнала вызовов: что именно ответил провайдер и каким кодом.
+# Зачем вообще: до этой правки отказ POST /api/v6/generations доезжал до кабинета
+# обёрткой «<модель>: v6 генерация не удалась», и по ней причину отказа установить
+# нельзя ВООБЩЕ — ни код, ни текст провайдера в неё не входят.
+_GEN_PROVIDER_REFUSAL = threading.local()
+
+
+# Отказы, которые провайдер объясняет машинно, а человеку — никак. Сырой JSON в карточке
+# задачи не отвечает ни на один из трёх вопросов («что упало, потрачены ли деньги, какую
+# кнопку жать»), поэтому знакомые причины переводим на человеческий вместе с лекарством.
+#
+# 21.09.2026, повод: владелец выбрал метод клипов «Flow» и получил
+# «HTTP 403 {"error": "Video generation not allowed for this license", "code":
+# "auth.forbidden"}». Это правда: у лицензии FastGen `video.generate = false`, а квоты
+# video.* нулевые — проверяется бесплатно через /api/v6/usage. Но по такому сообщению
+# нельзя догадаться, что рядом есть рабочий метод на ДРУГОМ провайдере и другом ключе.
+_KNOWN_REFUSALS = (
+    (("video generation not allowed", "auth.forbidden"),
+     "лицензия FastGen не включает генерацию видео — этим методом клипы сделать нельзя. "
+     "Выберите метод «Veo 3.1 — по умолчанию»: он идёт через VeoNonStop и отдельный ключ. "
+     "Денег это не стоило, повтор не поможет."),
+)
+
+
+def _humanize_refusal(msg: str) -> str:
+    """Знакомый отказ провайдера → что это значит и что делать. Незнакомый — как есть."""
+    low = str(msg or "").lower()
+    for needles, human in _KNOWN_REFUSALS:
+        if all(n in low for n in needles):
+            return human
+    return str(msg or "")
+
+
+def _set_provider_refusal(msg) -> None:
+    _GEN_PROVIDER_REFUSAL.msg = " ".join(_humanize_refusal(msg).split())[:300]
+
+
+def _provider_refusal() -> str:
+    return getattr(_GEN_PROVIDER_REFUSAL, "msg", "")
+
+
+def _real_gen_reason() -> str:
+    """Причина отказа словами провайдера. "" — провайдер ничего внятного не сказал."""
+    return _provider_refusal() or _last_gen_error()
+
+
+# Наши обёртки: текст есть, причины в нём нет. Такой текст уступает место ответу
+# провайдера везде, где выбирают, что показать человеку и что записать в журнал.
+_WRAPPER_GEN_PATTERNS = ("генерация не удалась", "кадр не получен", "клип не получен",
+                         "результат пуст", "нет результата",
+                         # видео-ветки: та же обёртка, только другими словами
+                         "video не удалось", "video не удалась")
+
+
+def _is_wrapper_gen_error(msg) -> bool:
+    s = " ".join(str(msg or "").split()).lower()
+    return (not s) or any(p in s for p in _WRAPPER_GEN_PATTERNS)
+
+
+def _gen_failure_error(label: str, fallback: str = "v6 генерация не удалась") -> str:
+    """Текст неудачной генерации: правда провайдера, обёртка — только если правды нет.
+
+    Ровно эта строка печатается в «Попытка N неудачна» и «Все N попыток исчерпаны» и
+    уезжает в кабинет. Пока в ней стояла одна обёртка, причину отказа по логу задачи
+    установить было нельзя: ни HTTP-кода, ни слов провайдера в ней нет.
+
+    `fallback` — прежняя обёртка ЭТОЙ ветки (у картинок и у видео она разная). Менять
+    её нельзя: когда провайдер промолчал, человек должен увидеть ровно тот же текст,
+    что и до правки, иначе мы поменяли смысл строки, не добавив ни одного факта.
+    """
+    why = _real_gen_reason()
+    return f"{label}: {why}" if why else f"{label}: {fallback}"
+
 
 _FATAL_GEN_PATTERNS = ("danger_filter", "safety filter", "safety_filter", "inputisimproper",
                        "policy violation", "prominent_people", "prominent people", "filter_failed",
@@ -2350,6 +2473,14 @@ _PLANNING_ARTIFACT_CACHE_VERSION = "v2"  # v2: complete story analysis, no trunc
 # соединений + TLS-хендшейк на каждый вызов (кэш-промахи, медленно). Сессия с
 # pool_maxsize по числу потоков = keep-alive + реальная параллельность.
 GPT_CHAT_TIMEOUT = (5, 60)  # (connect, read) сек для ЧАТ-вызовов GPT — НЕ 200с image-пути
+# 21.09.2026. Альтернативный OpenAI-совместимый канал ходит не в сам OpenAI, а в провайдера
+# поверх сохранённых веб-аккаунтов: даже однословный ответ там идёт ~10-12 с, а план сцен в
+# наши 60 с на чтение не укладывается вовсе — проверено живым вызовом (ReadTimeout).
+# Это ровно та болезнь, из-за которой 03.09 подняли таймауты картинок: наш собственный
+# таймер снимает вызов, который провайдер ЕЩЁ ВЫПОЛНЯЕТ, и оплаченный ответ выбрасывается.
+# Поднимаем ТОЛЬКО для этого канала и только вверх: у openai/codex/claude свои сроки, и
+# заданный вызывающим больший таймаут не урезается.
+ALT_CHAT_READ_TIMEOUT = int(os.environ.get("VS_ALT_CHAT_READ_TIMEOUT") or 240)
 try:
     from requests.adapters import HTTPAdapter as _HTTPAdapter
     _GPT_SESSION = requests.Session()
@@ -2454,6 +2585,13 @@ class _AltResponse:
             raise requests.HTTPError(f"HTTP {self.status_code}")
 
 
+def _alt_timeout(timeout):
+    """Срок чтения для альт-канала: не короче ALT_CHAT_READ_TIMEOUT, но и не короче заданного."""
+    t = timeout or GPT_CHAT_TIMEOUT
+    conn, read = t if isinstance(t, tuple) else (5, t)
+    return (conn, max(read, ALT_CHAT_READ_TIMEOUT))
+
+
 def _llm_post_ungated(url, headers=None, json=None, timeout=None, **kwargs):
     """Транспорт ЧАТ-вызовов (написание промптов). Сигнатура = requests.post, чтобы места вызова
     не переписывались: меняется только канал доставки, payload и разбор ответа те же.
@@ -2505,7 +2643,7 @@ def _llm_post_ungated(url, headers=None, json=None, timeout=None, **kwargs):
             headers={"Authorization": "Bearer " + prompt_llm.alt_key(),
                      "Content-Type": "application/json"},
             json=body,
-            timeout=(timeout or GPT_CHAT_TIMEOUT),
+            timeout=_alt_timeout(timeout),
         )
         return _alt_shape_json(resp) if rf else resp
 
@@ -3186,7 +3324,7 @@ def _validate_scene_object(scene, chunk_idx: int, chunk_text: str,
         entities = scene.get("entities")
         if (not isinstance(entities, list)
                 or any(not isinstance(name, str) or name not in canon_names for name in entities)):
-            raise ScenePlanSchemaError(f"{label}: нарушена схема entities")
+            raise ScenePlanCanonSchemaError(f"{label}: нарушена схема entities")
     out = dict(scene)
     if visible_text is not None:
         out["visible_text"] = visible_text
@@ -3787,7 +3925,7 @@ Preferred maximum cadence inside SPLIT_REQUIRED units is roughly {float(preferre
                     "INFO",
                 )
                 last_error = exc
-        raise ScenePlanSchemaError(
+        raise ScenePlanSemanticExhaustedError(
             f"{label}: схема не исправлена после {SCENE_SCHEMA_MAX_RETRIES} повторов: {last_error}"
         )
 
@@ -4729,7 +4867,14 @@ This segment contains the sentence(s) shown above. Generate EXACTLY ONE scene th
                     )
                 last_schema_error = exc
 
-        raise ScenePlanSchemaError(
+        # Исчерпание сохраняет природу последнего отказа: если сцену не удалось
+        # согласовать с каноном, кабинет должен узнать об этом по коду выхода.
+        exhausted_class = (
+            ScenePlanCanonSchemaError
+            if isinstance(last_schema_error, ScenePlanCanonConflictError)
+            else ScenePlanSchemaError
+        )
+        raise exhausted_class(
             f"{label}: схема не исправлена после {SCENE_SCHEMA_MAX_RETRIES} "
             f"точечных повторов ({last_schema_error})"
         )
@@ -4924,7 +5069,7 @@ This segment contains the sentence(s) shown above. Generate EXACTLY ONE scene th
             # the missing-tag scene. scene.entities remains model authority.
             _validate_explicit_alias_entity_coverage([scene], canon)
         except ScenePlanTerminalError as exc:
-            raise ScenePlanSchemaError(
+            raise ScenePlanCanonSchemaError(
                 f"часть {chunk_idx + 1}: canonical entity coverage: {exc}"
             ) from exc
         out = [scene]                       # РОВНО одна сцена на чанк → счёт не плывёт
@@ -5870,7 +6015,7 @@ def _consolidate_characters(chars: List[dict], is_char: bool = True) -> List[dic
                 for right in component[position + 1:]
             )
             if has_exact_alias_overlap:
-                raise ScenePlanTerminalError(
+                raise ScenePlanCanonConflictError(
                     "story identity alias неоднозначен: "
                     f"{label!r}; explicit linker decided {link.get('decision')}"
                 )
@@ -6047,7 +6192,7 @@ def _validate_story_bible(bible) -> dict:
                     ) from exc
                 previous_owner = alias_owners.get(alias)
                 if previous_owner is not None and previous_owner != owner:
-                    raise ScenePlanTerminalError(
+                    raise ScenePlanCanonConflictError(
                         "story_bible cache: канонический alias "
                         f"{name!r} неоднозначен между {previous_owner} и {owner}"
                     )
@@ -6473,7 +6618,7 @@ def _validate_explicit_alias_entity_coverage(
         missing = sorted(explicit_ids - provided_ids)
         if missing:
             labels = [display_by_id.get(entity_id, entity_id) for entity_id in missing]
-            raise ScenePlanTerminalError(
+            raise ScenePlanCanonConflictError(
                 f"сцена {index + 1}: явный канонический alias "
                 f"{', '.join(repr(label) for label in labels)} отсутствует в "
                 "scene.entities; требуется replan"
@@ -7151,11 +7296,19 @@ def googler_request_v6(endpoint: str, method: str = "POST", data: Optional[dict]
                 if attempt < _tries - 1:
                     _wait(attempt)
                 continue
-            if sc in (400, 402, 403, 422):  # bad request / нет кредитов / auth / валидация — без ретрая
+            # 401 добавлен к списку «без ретрая»: мёртвый или отозванный ключ шесть раз
+            # подряд отвечает тем же самым, а до правки он уходил в raise_for_status и
+            # приезжал наверх как «HTTPError: 401 Client Error» БЕЗ тела ответа — то есть
+            # без единственного места, где провайдер называет причину.
+            if sc in (400, 401, 402, 403, 422):  # bad request / мёртвый ключ / нет кредитов / auth / валидация
                 try:
-                    return {"_error": response.json()}
+                    detail = json.dumps(response.json(), ensure_ascii=False)
                 except Exception:
-                    return {"_error": response.text[:300]}
+                    detail = response.text
+                # Код ОБЯЗАН быть в тексте: по нему человек понимает, менять ключ (401/403),
+                # пополнять счёт (402) или чинить запрос (400/422). Без кода все эти отказы
+                # выглядят одинаково.
+                return {"_error": f"HTTP {sc}: {str(detail or '').strip()[:300]}"}
             response.raise_for_status()
             j = response.json()
             # 200, НО пустой ответ / без operation id (мягкий троттл провайдера отдаёт {} вместо 429):
@@ -7218,9 +7371,15 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
             # transport reasons stay byte-for-byte unchanged; only an unclassified terminal
             # failure gets a private marker used by the OPENAI image retry bound.
             _set_last_gen_error(_typed_v6_terminal_error(err))
+            _set_provider_refusal(str(err))     # правда провайдера — в лог и в журнал
             print_user(f"❌ [{index}] v6 generation failed: {str(err)[:200]}", "ERROR")
             return None
         else:  # queued / running / unknown
+            if r.get("_error"):
+                # Заказ уже создан и оплачен, поэтому опрос НЕ прерываем. Но причину
+                # запоминаем: мёртвый ключ отвечает отказом на КАЖДЫЙ опрос, и без этого
+                # наверх уезжал голый «таймаут операции» без единого слова почему.
+                _set_provider_refusal(str(r["_error"]))
             el = time.time() - start
             if el - hb >= 15:
                 print_user(f"v6 операция [{index}]: {int(el)}с ({st})...", "PROCESS")
@@ -7561,10 +7720,16 @@ def googler_v6_generate(v6_model: str, prompt: str, aspect_ratio: Optional[str] 
         body["duration_seconds"] = int(duration_seconds)
     resp = googler_request_v6("generations", method="POST", data=body)
     if resp.get("_error"):
-        print_user(f"❌ [{index}] v6 generation отклонён: {str(resp['_error'])[:220]}", "ERROR")
+        # Отказ на СОЗДАНИИ заказа — единственное место, где провайдер называет причину
+        # («HTTP 401: invalid api key»). Дальше она терялась: наверх уходила обёртка
+        # «v6 генерация не удалась», и в карточке с журналом оставалось «rc=3».
+        _set_provider_refusal(str(resp["_error"]))
+        print_user(f"❌ [{index}] v6 generation отклонён: "
+                   f"{_humanize_refusal(str(resp['_error']))[:300]}", "ERROR")
         return None
     gid = resp.get("id")
     if not gid:
+        _set_provider_refusal(f"ответ без id операции: {str(resp)[:160]}")
         print_user(f"❌ [{index}] v6: нет id в ответе ({str(resp)[:160]})", "ERROR")
         return None
     # 03.09.2026: заказ создан и уже оплачен — фиксируем id ДО поллинга. Именно здесь
@@ -10300,6 +10465,9 @@ def _reconcile_authoritative_image_set(project_dir: str, receipt_path: str,
     }
 
 
+# 16.09.2026: размеры сняты под "gpt-image-2" и НЕ перепроверены под GPT_IMAGE_MODEL
+# ("gpt-image-2.5-sunburst") — поддержку размеров новой моделью нечем проверить без
+# платного вызова. Не трогать без реального теста.
 _GPT_IMAGE2_EXACT_SIZES = {
     "landscape": ("1536x864", (1536, 864)),
     "portrait": ("864x1536", (864, 1536)),
@@ -10460,9 +10628,16 @@ def _journal_close_frame(image_data, error: str = "") -> None:
     if image_data and (not path or os.path.exists(path)):
         state["journal"].delivered(state["call_id"], path)
     else:
+        # Порядок «сначала настоящая причина, обёртка — запасной вариант». До правки
+        # первым стоял `error`, и в колонку error журнала вызовов уезжала либо наша
+        # обёртка, либо вовсе «кадр не получен»: ни кода, ни слов провайдера. По таким
+        # строкам причину отказа установить нельзя, а именно за этим журнал и заведён.
+        # Текст исключения (`error`) причину называет и остаётся первым — обёртку он
+        # не содержит; безликие же варианты пропускают вперёд ответ провайдера.
         state["journal"].failed(
             state["call_id"],
-            error or _last_gen_error() or "кадр не получен",
+            (error if not _is_wrapper_gen_error(error) else "")
+            or _real_gen_reason() or error or "кадр не получен",
             ordered=state["ordered"],
         )
 
@@ -10573,6 +10748,14 @@ def _journal_frame_call(function):
     """
     @functools.wraps(function)
     def _wrapped(*args, **kwargs):
+        # Причина ПРЕДЫДУЩЕГО кадра этого же потока не имеет права закрыть нынешнюю
+        # строку журнала. Сброс стоял внутри цикла попыток, а ранние выходы
+        # (_v6_generic_terminal_frame_blocked, _account_limit_hit) возвращают None ДО
+        # цикла: кадр, к провайдеру вообще не ходивший, закрывался убедительным
+        # «HTTP 401: api key expired» от чужого кадра — пул потоков переиспользует
+        # thread-local. Чистим на ВХОДЕ в заявку: одна заявка — одна причина.
+        _set_provider_refusal("")
+        _set_last_gen_error("")
         try:
             result = function(*args, **kwargs)
         except BaseException as exc:
@@ -10874,6 +11057,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             _extra_attempts += 1          # ожидание не должно съедать попытку кадра
             continue
         _set_last_gen_error("")  # чистим перед попыткой (thread-local; пул переиспользует потоки)
+        _set_provider_refusal("")  # причина прошлой попытки не должна выдаваться за нынешнюю
         # Legacy fallback убран — endpoint /api/v2/images возвращает 404 (FastGen его убил)
         pass  # use_legacy_now stays False для всех попыток
         
@@ -10943,7 +11127,10 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                     save_base64_to_file(image_data, output_path)
                     print_user(f"✅ [{index+1}] Изображение через {_lbl} (v6)", "SUCCESS")
                 return (index, image_data)
-            result = {"success": False, "error": f"{_lbl}: v6 генерация не удалась"}
+            # Обёртка «v6 генерация не удалась» больше не побеждает правду провайдера:
+            # именно она печаталась в «Попытка N неудачна» и «Все N попыток исчерпаны»,
+            # и по этим строкам причину восьми боевых отказов установить было нельзя.
+            result = {"success": False, "error": _gen_failure_error(_lbl)}
             api_label = _lbl
 
         elif GOOGLER_MODEL == "WHISK_IMAGEN4":
@@ -11113,15 +11300,17 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             api_label = "Nano Banana (Veo)"
 
         elif GOOGLER_MODEL == "GPT_IMAGE2":
-            # OpenAI gpt-image-2 НАПРЯМУЮ — 💲ПЛАТНО (~$0.006/шт с твоего openai-ключа).
-            # Отдельно от "OPENAI" (тот идёт через recrafter-кредиты). quality=low, output jpeg.
-            api_label = "GPT-Image-2 (💲платно)"
+            # OpenAI GPT_IMAGE_MODEL ("gpt-image-2.5-sunburst") НАПРЯМУЮ — 💲ПЛАТНО
+            # с твоего openai-ключа. Отдельно от "OPENAI" (тот идёт через recrafter-кредиты).
+            # quality=low, output jpeg. Цена ~$0.006/шт снята под старую "gpt-image-2" и
+            # НЕ перепроверена под 2.5 (платного вызова для проверки не делали).
+            api_label = "GPT Image 2.5 (💲платно)"
             gi_size, gi_expected_dimensions = _gpt_image2_size(ar)
-            v_res = {"success": False, "error": "GPT-Image-2: нет ответа"}
+            v_res = {"success": False, "error": "GPT Image 2.5: нет ответа"}
             if not OPENAI_API_KEY or not str(OPENAI_API_KEY).strip():
-                v_res = {"success": False, "error": "GPT-Image-2: нет openai-ключа (~/video_studio_api_keys.json['openai'])", "skip_retry": True}
+                v_res = {"success": False, "error": "GPT Image 2.5: нет openai-ключа (~/video_studio_api_keys.json['openai'])", "skip_retry": True}
             else:
-                gi_body = {"model": "gpt-image-2", "prompt": prompt, "size": gi_size, "quality": "low", "n": 1, "output_format": "jpeg"}
+                gi_body = {"model": GPT_IMAGE_MODEL, "prompt": prompt, "size": gi_size, "quality": "low", "n": 1, "output_format": "jpeg"}
                 try:
                     _gh = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
                     _gr = requests.post("https://api.openai.com/v1/images/generations", headers=_gh, json=gi_body, timeout=180)
@@ -11132,23 +11321,23 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                     else:
                         v_res = {"success": False, "error": f"OpenAI HTTP {_gr.status_code}: {_gr.text[:200]}"}
                 except requests.exceptions.Timeout:
-                    v_res = {"success": False, "error": "GPT-Image-2: таймаут 180с", "skip_retry": attempt >= 1}
+                    v_res = {"success": False, "error": "GPT Image 2.5: таймаут 180с", "skip_retry": attempt >= 1}
                 except Exception as _ge:
-                    v_res = {"success": False, "error": f"GPT-Image-2: {str(_ge)[:200]}"}
+                    v_res = {"success": False, "error": f"GPT Image 2.5: {str(_ge)[:200]}"}
             _gdata = v_res.get("data") if isinstance(v_res, dict) else None
             if _gdata and _gdata[0].get("b64_json"):
                 image_data = _gdata[0]["b64_json"]
                 try:
                     actual_dimensions = _base64_image_size(image_data)
                 except ValueError as exc:
-                    result = {"success": False, "error": f"GPT-Image-2: {exc}",
+                    result = {"success": False, "error": f"GPT Image 2.5: {exc}",
                               "skip_retry": True}
                 else:
                     if actual_dimensions != gi_expected_dimensions:
                         result = {
                             "success": False,
                             "error": (
-                                "GPT-Image-2: неверное разрешение ответа "
+                                "GPT Image 2.5: неверное разрешение ответа "
                                 f"{actual_dimensions[0]}x{actual_dimensions[1]} вместо "
                                 f"{gi_expected_dimensions[0]}x{gi_expected_dimensions[1]}"
                             ),
@@ -11156,19 +11345,19 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                         }
                     elif output_path and not save_base64_to_file(image_data, output_path):
                         result = {"success": False,
-                                  "error": "GPT-Image-2: изображение прошло проверку, но не сохранилось",
+                                  "error": "GPT Image 2.5: изображение прошло проверку, но не сохранилось",
                                   "skip_retry": True}
                     else:
                         print_user(
-                            f"✅ [{index+1}] Изображение через GPT-Image-2 "
+                            f"✅ [{index+1}] Изображение через GPT Image 2.5 "
                             f"{actual_dimensions[0]}x{actual_dimensions[1]} "
-                            "(💲ПЛАТНО ~$0.006)",
+                            "(💲ПЛАТНО, цена не перепроверена под 2.5)",
                             "SUCCESS",
                         )
                         return (index, image_data)
             else:
                 result = {"success": False,
-                          "error": (v_res.get("error") if isinstance(v_res, dict) else "GPT-Image-2: пустой data/b64_json"),
+                          "error": (v_res.get("error") if isinstance(v_res, dict) else "GPT Image 2.5: пустой data/b64_json"),
                           "skip_retry": (v_res.get("skip_retry") if isinstance(v_res, dict) else False)}
 
         elif GOOGLER_MODEL == "OPENAI":
@@ -11800,6 +11989,7 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
 
     for attempt in range(max_attempts):
         _set_last_gen_error("")  # чистим перед попыткой (thread-local)
+        _set_provider_refusal("")
         if max_attempts > 1:
             log(f"🔁 [{total_label}] Попытка {attempt + 1}/{max_attempts} ({api_label})")
         try:
@@ -11824,6 +12014,7 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
                 else:
                     err = (veo_res.get('error') if isinstance(veo_res, dict) else None) or 'No task_id'
                     _set_last_gen_error(err)
+                    _set_provider_refusal(err)   # та же правда — в журнал вызовов
                     log(f"❌ [{total_label}] Ошибка veo: {err}")
                     if isinstance(veo_res, dict) and veo_res.get("skip_retry"):
                         return (index, None)  # нет ключа/auth — не ретраим зря
@@ -11834,7 +12025,10 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
                                                  index=index, timeout=VIDEO_POLL_TIMEOUT)
                 if video_data:
                     return (index, video_data)
-                log(f"❌ [{total_label}] Ошибка {api_label}: v6 video не удалось")
+                # Клип — самый дорогой вызов, и до правки его отказ читался как
+                # «Ошибка flower: v6 video не удалось»: ни кода, ни слов провайдера.
+                log(f"❌ [{total_label}] Ошибка "
+                    f"{_gen_failure_error(api_label, 'v6 video не удалось')}")
         except Exception as e:
             log(f"❌ [{total_label}] Исключение {api_label}: {str(e)[:150]}")
         # Контент-фильтр (DANGER_FILTER и т.п.) детерминирован для того же промпта → GPT смягчает
@@ -11859,7 +12053,12 @@ def generate_video(prompt: str, image_path: str, index: int = 0, use_legacy: boo
                 log(f"⏳ [{total_label}] Пауза {_delay}с перед повтором (cooldown reCAPTCHA)...")
             time.sleep(_delay)
 
-    log(f"❌ [{total_label}] Не удалось запустить генерацию видео после {max_attempts} попыток ({api_label})")
+    # Итоговая строка клипа — аналог «Все N попыток исчерпаны» у картинок: именно её
+    # человек и читает, когда сцена осталась без видео. Причина последней попытки в ней
+    # обязана быть, иначе отказ ключа на клипах по логу не устанавливается вообще.
+    _why = _real_gen_reason()
+    log(f"❌ [{total_label}] Не удалось запустить генерацию видео после {max_attempts} "
+        f"попыток ({api_label})" + (f": {_why}" if _why else ""))
     return (index, None)
 
 
@@ -11883,6 +12082,10 @@ def generate_video_from_prompt_only(prompt: str, aspect_ratio: str = "landscape"
             log(f"📋 [{total_label}] veo task_id: {task_id}")
             return (index, veo_poll_task(task_id, index, timeout=VEO_POLL_TIMEOUT))
         err = (veo_res.get('error') if isinstance(veo_res, dict) else None) or 'No task_id'
+        # Здесь _set_last_gen_error НЕ ставим: в t2v-ветке его читает ретрай-логика
+        # (_is_fatal_gen_error), и подмена её входа поменяла бы решения о повторах.
+        # А журналу и человеку правда нужна — для этого и заведён отдельный слот.
+        _set_provider_refusal(err)
         log(f"❌ [{total_label}] Ошибка veo: {err}")
         return (index, None)
 
@@ -11891,7 +12094,8 @@ def generate_video_from_prompt_only(prompt: str, aspect_ratio: str = "landscape"
     video_data = googler_v6_generate(v6vid, prompt, aspect_ratio=v_ar, index=index, timeout=VIDEO_POLL_TIMEOUT)
     if video_data:
         return (index, video_data)
-    log(f"❌ [{total_label}] Ошибка {api_label}: v6 text→video не удалось")
+    log(f"❌ [{total_label}] Ошибка "
+        f"{_gen_failure_error(api_label, 'v6 text→video не удалось')}")
     return (index, None)
 
 
@@ -11916,6 +12120,7 @@ def _t2v_generate_with_retry(prompt: str, aspect_ratio: str, index: int,
     _soften_rounds = 0  # раундов GPT-смягчения промпта после контент-фильтра (макс 3)
     for attempt in range(max_attempts):
         _set_last_gen_error("")
+        _set_provider_refusal("")
         try:
             _, data = generate_video_from_prompt_only(prompt, aspect_ratio=aspect_ratio, index=index)
         except Exception as e:
@@ -11940,6 +12145,11 @@ def _t2v_generate_with_retry(prompt: str, aspect_ratio: str, index: int,
             _delay = min(60, (VEO_RETRY_DELAY if VIDEO_METHOD == "veo" else RETRY_DELAY) * (attempt + 1))
             log(f"⏳ [{index+1}] Пауза {_delay}с перед повтором t2v (попытка {attempt+1}/{max_attempts})...")
             time.sleep(_delay)
+    # Цикл кончился молча: сцена остаётся без клипа, и до правки в логе на этом месте
+    # не было НИ ОДНОЙ строки с причиной — только отдельные строки попыток выше.
+    _why = _real_gen_reason()
+    log(f"❌ [{index+1}] t2v: клип не получен после {max_attempts} попыток"
+        + (f": {_why}" if _why else ""))
     return (index, None)
 
 
@@ -13909,6 +14119,14 @@ def main():
     except ScenePlanTransientError as e:
         print_error_user_friendly(f"Временный сбой плана сцен: {e}")
         sys.exit(EX_TEMPFAIL)
+    # Обе ветки ниже стоят ПЕРЕД общим ScenePlanTerminalError намеренно: они его подклассы,
+    # и только по ним кабинет умеет выключить виноватую галочку и переставить задачу.
+    except ScenePlanCanonConflictError as e:
+        print_error_user_friendly(f"План сцен отклонён: {e}")
+        sys.exit(EX_PLAN_CANON_CONFLICT)
+    except ScenePlanSemanticExhaustedError as e:
+        print_error_user_friendly(f"План сцен отклонён: {e}")
+        sys.exit(EX_PLAN_SEMANTIC_EXHAUSTED)
     except ScenePlanTerminalError as e:
         print_error_user_friendly(f"План сцен отклонён: {e}")
         sys.exit(1)

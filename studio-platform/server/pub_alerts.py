@@ -11,10 +11,39 @@
   5. на диске меньше 100 ГБ
   6. самая старая задача ждёт дольше 6 часов
 
-Седьмой повод добавлен владельцем 07.09.2026, в ТЗ его нет:
+Седьмой и восьмой поводы добавлены владельцем 07.09.2026, в ТЗ их нет:
 
 7. задача упала с ошибкой — говорится один раз, без повтора и без «починилось»
 8. ключ провайдера исчерпан — отказ про деньги, а не про частоту; говорится сразу
+
+Девятый и десятый — тоже не из ТЗ, добавлены владельцем 16.09.2026, оба читают снимок
+`admin_state.fastgen_usage` (`server/main.py:save_fastgen_usage`, кладут его туда и
+`fastgen_status`, и `dev/alerts.py` перед каждым тиком — чтобы поводы видели свежие
+цифры, даже когда в кабинет никто не заходит):
+
+9. ключ FastGen истекает — состояние, а не событие; повтор и «починилось» по общим
+   правилам ниже
+10. расход картинок близок к часовому лимиту — 07.09.2026 конвейер уже упёрся именно в
+    него (`HTTP 429 … Limit: 6000 successful requests per hour`) и узнали об этом
+    постфактум по логу, а не заранее
+
+Оба читают один и тот же снимок, и у обоих одно правило свежести: если `checked` в
+снимке старше `VS_ALERT_USAGE_STALE_SEC` (по умолчанию 2 часа), оба молчат — судить о
+сроке ключа или о лимите по цифрам многочасовой давности значило бы врать так же, как
+выдуманный процент, который запрещает правило 1. Это же правило защищает и от обратной
+лжи: если тревога уже прозвучала, а снимок потом протух (сеть недоступна), «починилось»
+не отправляется, пока не придут свежие цифры — иначе именно сбой сети выключал бы
+тревогу о ключе (см. `FASTGEN_STATE_KEYS` в `tick`).
+
+Одиннадцатый повод добавлен владельцем 21.09.2026 по просьбе заказчика: новый ключ
+ставит он сам, и от системы ему нужно ровно одно — вовремя узнать, что ключ кончился
+и его пора менять:
+
+11. ключ кончился — либо срок действия уже прошёл, либо провайдер перестал ключ
+    принимать (`key_dead:{family}`). До этого повода исчерпание ключа КАРТИНОК и
+    ОБЛОЖЕК не доходило до телеграма вовсе: §8 читает `credential_cooldown`, а туда
+    пишет только канал промптов, так что оставалось одно §7 «задача упала» — один
+    раз, без повтора и без «починилось»
 
 Три правила подачи, тоже из ТЗ: одно сообщение на случай, повтор не чаще раза в час,
 обязательное сообщение «починилось».
@@ -46,6 +75,15 @@ def _sec(name: str, default: int) -> int:
         return default
 
 
+def _num(name: str, default: float) -> float:
+    """Как `_sec`, но без округления до целых секунд и без минимума в 1 — §9/§10
+    оперируют днями и процентами, а не секундами, и `_sec` для них не подходит."""
+    try:
+        return float(os.environ.get(name) or default)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 STALL_SEC = _sec("VS_ALERT_STALL_SEC", 30 * 60)          # §1
 RESTING_SEC = _sec("VS_ALERT_RESTING_SEC", 60 * 60)      # §2
 UPLOAD_SEC = _sec("VS_ALERT_UPLOAD_SEC", 3 * 3600)       # §3
@@ -59,6 +97,16 @@ FAILED_SEC = _sec("VS_ALERT_FAILED_SEC", 24 * 3600)      # §7
 FAILED_MAX = _sec("VS_ALERT_FAILED_MAX", 5)              # §7
 REPEAT_SEC = _sec("VS_ALERT_REPEAT_SEC", 60 * 60)        # повтор не чаще раза в час
 DISK_MIN_GB = float(os.environ.get("VS_ALERT_DISK_GB") or 100)
+# §9/§10 — не из ТЗ, добавлены владельцем 16.09.2026.
+KEY_EXPIRES_DAYS = _num("VS_ALERT_KEY_EXPIRES_DAYS", 7)          # §9: за сколько дней предупредить
+USAGE_PCT = _num("VS_ALERT_USAGE_PCT", 90)                       # §10: доля часового лимита, в %
+USAGE_STALE_SEC = _sec("VS_ALERT_USAGE_STALE_SEC", 2 * 3600)     # §9/§10: снимок старше — не повод
+# §11 — не из ТЗ, добавлен владельцем 21.09.2026. Сколько отказов подряд считаем
+# доказательством того, что ключ мёртв. Один отказ доказательством не является:
+# статистику мы спрашиваем каждую минуту, и провайдер отвечает 401 в том числе на
+# собственном сбое. Та же дисциплина, что в воркере (`googler_worker.
+# _raise_if_llm_credits_exhausted`): фатально только со второго подтверждения.
+KEY_REFUSE_HITS = _num("VS_ALERT_KEY_REFUSE_HITS", 2)            # §11
 
 GB = 1024 ** 3
 
@@ -92,7 +140,7 @@ class Alert:
         return f"<Alert {self.key}>"
 
 
-# ────────────────────────────── восемь поводов ───────────────────────────────
+# ──────────────────────────── одиннадцать поводов ─────────────────────────────
 
 # Слова, по которым отказ провайдера означает «ключ кончился», а не «слишком часто».
 # Список закрытый и совпадает с тем, по которому воркер останавливает прогон
@@ -163,7 +211,7 @@ def check_providers_resting(c, now, tenant=None) -> list:
             f"Провайдер {family} на паузе",
             f"Ключ {rec.get('mask') or '—'} отдыхает ещё {_human(left)}.\n"
             f"Причина: {(rec.get('why') or 'не записана')[:180]}"
-            + ("\nЗамечено соседним сервисом." if rec.get("shared") else ""),
+            + ("\nЗамечено при заказе текста или обложки." if rec.get("shared") else ""),
             since_hint=(now - RESTING_SEC) if proven else None,
             money="Оплаченные вызовы не теряются: задачи ждут в очереди. "
                   "Теряется только время слота."))
@@ -344,7 +392,7 @@ def check_key_exhausted(c, now, tenant=None) -> list:
             f"Ключ {family} исчерпан",
             f"Ключ {rec.get('mask') or '—'} отвечает отказом, который означает деньги, "
             f"а не троттлинг.\nПровайдер сказал: {why[:180]}"
-            + ("\nЗамечено соседним сервисом." if rec.get("shared") else ""),
+            + ("\nЗамечено при заказе текста или обложки." if rec.get("shared") else ""),
             money=("Пока ключ не пополнен или не заменён, каждая следующая задача этого "
                    "провайдера упрётся в тот же отказ. Уже оплаченное не теряется — "
                    "задачи ждут в очереди.")))
@@ -405,9 +453,243 @@ def check_failed_tasks(c, now, tenant=None) -> list:
     return out
 
 
+def _fastgen_usage_snapshot(c, now):
+    """Снимок `admin_state.fastgen_usage`, если он есть и не протух.
+
+    Общий вход для §9 и §10: один источник данных — одно правило устаревания. Снимок
+    кладёт `main.save_fastgen_usage` (из `fastgen_status` и из `dev/alerts.py`); если
+    его ещё не было (свежий стенд, ни разу не спросили статус моделей) — снимка нет и
+    оба повода молчат, а не выдумывают цифры.
+    """
+    snap = _state_row(c, "fastgen_usage")
+    if not isinstance(snap, dict):
+        return None
+    checked = _f(snap.get("checked"))
+    if not checked or now - checked > USAGE_STALE_SEC:
+        return None
+    return snap
+
+
+def check_key_expiring(c, now, tenant=None) -> list:
+    """§9. Ключ FastGen истекает — не из ТЗ, добавлено владельцем 16.09.2026.
+
+    Состояние, а не событие: пока до истечения меньше `KEY_EXPIRES_DAYS`, повод держится
+    и повторяется по общему правилу раз в час (`REPEAT_SEC`); продление ключа снимает
+    его из `admin_state.fastgen_usage` на следующем снимке, и тогда звучит «починилось»,
+    как у любого другого состояния — своего исключения из `NO_FIXED` ему не нужно.
+
+    Повод только про «ещё работает, но скоро кончится». Как только срок прошёл, новость
+    становится другой — «конвейер встал, нужен новый ключ», — и её несёт §11
+    (`check_key_dead`) со своим `key`. Иначе смерть ключа пришла бы строкой «ВСЁ ЕЩЁ (5)
+    · Ключ FastGen истекает», которую читают как «время ещё есть».
+    """
+    snap = _fastgen_usage_snapshot(c, now)
+    if not snap:
+        return []
+    expires = _f(snap.get("expires"))
+    # Верхняя граница — §11. Про уже истёкший ключ говорит он, и говорит другое:
+    # «кончился, нужен новый». Без границы об одном событии уходило бы два сообщения
+    # с разными заголовками, каждое со своим часовым повтором.
+    if not expires or expires <= now or expires - now > KEY_EXPIRES_DAYS * 86400:
+        return []
+    when = time.strftime("%d.%m.%Y", time.localtime(expires))
+    return [Alert(
+        "fastgen_key_expiring", "Ключ FastGen истекает",
+        f"Действует до {when}, осталось {_human(expires - now)}.\n"
+        f"Что сделать: заранее получить у провайдера новый ключ — когда срок выйдет, "
+        f"картинки и обложки встанут в тот же час.",
+        money="Продлевает ключ владелец у провайдера — система это делать не может.")]
+
+
+def check_usage_near_limit(c, now, tenant=None) -> list:
+    """§10. Расход картинок близок к часовому лимиту — не из ТЗ, добавлено владельцем
+    16.09.2026.
+
+    07.09.2026 конвейер уже упёрся именно в этот лимит — `HTTP 429 … Limit: 6000
+    successful requests per hour` — и узнали об этом постфактум по логу. Порог задан
+    долей от `img_gen_per_hour_limit` (`USAGE_PCT`), а не абсолютным числом: лимит у
+    провайдера может измениться, и абсолютный порог тихо перестал бы срабатывать.
+    """
+    snap = _fastgen_usage_snapshot(c, now)
+    if not snap:
+        return []
+    limits = snap.get("limits") if isinstance(snap.get("limits"), dict) else {}
+    hourly = snap.get("hourly") if isinstance(snap.get("hourly"), dict) else {}
+    limit = _f(limits.get("img_gen_per_hour_limit"))
+    used = hourly.get("image_generation")
+    # Провайдер с 21.09.2026 отдаёт расход словарём {current_usage, window_start}; снимок
+    # старой записи мог остаться в базе. `_f(dict)` дал бы ноль, и тревога молчала бы
+    # даже при исчерпанном лимите (см. main.fastgen_count).
+    if isinstance(used, dict):
+        used = used.get("current_usage")
+    used = _f(used)
+    if limit <= 0 or used / limit * 100 < USAGE_PCT:
+        return []
+    return [Alert(
+        "fastgen_usage_near_limit", "Расход картинок близок к часовому лимиту",
+        f"Израсходовано {int(used)} из {int(limit)} за час.",
+        money="Лимит новый час не переносит остаток — упрёмся в 429, как 07.09.2026.")]
+
+
+# ─────────── §11: ключ кончился (отказ провайдера или вышедший срок) ───────────
+
+def _family_title(family: str) -> str:
+    """Как назвать ключ ЗАКАЗЧИКУ. Он покупает ключ FastGen и слова «googler» не знает.
+
+    §9 говорит «Ключ FastGen», §11 говорил «Ключ googler» — про один и тот же ключ.
+    Получив «Ключ googler кончился», человек пойдёт искать несуществующий ключ Google,
+    тем более что рядом в совете стоит COVER_FAST_GEN_KEY. Внутреннее имя семейства
+    оставляем в скобках: оно нужно тому, кто будет класть ключ в файл.
+    """
+    return f"FastGen (семейство {family})" if family == FASTGEN_FAMILY else family
+
+
+# Заявка на отказ: `{семейство: {code, mask, since, seen, last}}`. Пишет её тот, кто
+# ходит в сеть (`dev/alerts.py:refresh_fastgen_usage`), но пишет через `note_key_refused`
+# ниже — чтобы форма записи лежала рядом с поводом, который её читает, и чтобы сам
+# `pub_alerts` остался без сети и проверялся тестами без интернета.
+KEY_REFUSED_KEY = "fastgen_key_refused"
+
+# Коды, которыми провайдер говорит именно про КЛЮЧ, а не про себя. 5xx и 429 сюда не
+# входят намеренно: первое — беда провайдера, второе на бесплатной статистике означает
+# «слишком часто спрашиваете», а не «платить нечем». Ошибиться здесь дорого в обе
+# стороны: лишний код — ложная тревога раз в час, недостающий — молчание при мёртвом ключе.
+KEY_REFUSED_CODES = (401, 402, 403)
+
+# Снимок `/api/v6/usage` снимается ключом семейства `googler` из общего файла ключей
+# (`dev/alerts.py:refresh_fastgen_usage`): им кабинет делает картинки, и им же по
+# умолчанию работают обложки — `dev/run.sh` отдаёт в `COVER_FAST_GEN_KEY` значение из
+# того же файла. Если на боевой машине обложкам задан ОТДЕЛЬНЫЙ ключ, этот повод про
+# него ничего не знает: у Cover Studio своя база, свой хост (api.fast-gen.ai) и своё
+# окружение, снимка в `admin_state` они не кладут.
+FASTGEN_FAMILY = "googler"
+
+_KEY_DEAD_MONEY = (
+    "Проверка ключа бесплатна — это чтение статистики, 0 кредитов; генерацией «на "
+    "пробу» ключи здесь не проверяются никогда. Само это не пройдёт: пока ключ не "
+    "заменён, каждая следующая задача картинок (и обложек, если они работают этим же "
+    "ключом) упрётся в тот же отказ. Задачи при этом НЕ ждут в очереди, а падают с "
+    "ошибкой, и после замены ключа их надо поднять кнопкой «Повторить» — иначе выпуск "
+    "будет считаться сделанным, а кадров в нём не окажется.")
+
+
+def _key_dead_fix(family: str) -> str:
+    return (f"Что сделать: получить у провайдера новый ключ и положить его в файл "
+            f"ключей, семейство {family}; если у обложек задан свой COVER_FAST_GEN_KEY "
+            f"— обновить и его.")
+
+
+def note_key_refused(c, family, code, now, mask="") -> None:
+    """Провайдер ОТВЕТИЛ и ключ не принял. Одна запись на семейство.
+
+    Значение ключа сюда не попадает никогда — только маска, код ответа и время.
+    `since` хранит начало отказа, а не момент разговора о нём: перезапуск процесса не
+    должен обнулять длительность аварии.
+    """
+    rec = _state_row(c, KEY_REFUSED_KEY)
+    rec = rec if isinstance(rec, dict) else {}
+    was = rec.get(family) if isinstance(rec.get(family), dict) else {}
+    rec[family] = {
+        "code": int(_f(code)),
+        "mask": str(mask or was.get("mask") or ""),
+        "since": _f(was.get("since")) or now,
+        "seen": int(_f(was.get("seen"))) + 1,
+        "last": now,
+    }
+    _state_save(c, KEY_REFUSED_KEY, rec, now)
+
+
+def note_key_accepted(c, family, now) -> None:
+    """Провайдер ответил цифрами — ключ живой, заявку снимаем.
+
+    Снимается ровно здесь и только здесь: единственное доказательство того, что ключ
+    заменили, — принятый провайдером запрос. По таймеру «само рассосётся» было бы
+    обещанием, которого никто не давал.
+    """
+    rec = _state_row(c, KEY_REFUSED_KEY)
+    if not isinstance(rec, dict) or family not in rec:
+        return
+    rec.pop(family, None)
+    _state_save(c, KEY_REFUSED_KEY, rec, now)
+
+
+def check_key_dead(c, now, tenant=None) -> list:
+    """§11. Ключ кончился — нужен новый. Не из ТЗ, добавлено владельцем 21.09.2026.
+
+    Новый ключ ставит заказчик сам; от системы ему нужно ровно одно — узнать, что
+    ключ кончился. Поэтому повод отвечает на три вопроса сразу: какой ключ (ИМЯ
+    семейства, не значение), что с ним случилось и что сделать.
+
+    Почему не §8. §8 читает `admin_state.credential_cooldown`, а туда пишет только
+    канал промптов (`main._PROMPT_CHANNEL_FAMILY`: openai / claude_oauth / codex_home /
+    alt_llm). Ключ картинок и обложек в эту запись не попадает вовсе — значит про него
+    §8 не сработал ни разу, и исчерпание такого ключа доходило до телеграма только как
+    §7 «задача упала»: один раз, без повтора, без «починилось» и без слова «ключ» в
+    заголовке.
+
+    Два источника факта, и оба бесплатные — проверять ключ генерацией нельзя, один
+    кадр FastGen стоит денег (правило проекта про опасный retry):
+
+      • ОТКАЗ. Провайдер ответил кодом из `KEY_REFUSED_CODES` на бесплатную статистику
+        `/api/v6/usage` (`note_key_refused`). Считается со ВТОРОГО отказа подряд —
+        одиночный 401 бывает и сбоем провайдера, а спрашиваем мы раз в минуту.
+      • СРОК. `expires` из снимка `admin_state.fastgen_usage` уже в прошлом.
+
+    Оба источника про один и тот же ключ, поэтому на семейство выходит один Alert:
+    мёртвый ключ, у которого ещё и срок вышел, — одна беда, а не две.
+
+    Повод-состояние: `key` постоянный (`key_dead:{family}`, без даты и без кода внутри
+    — иначе state не узнавал бы его и сообщение уходило бы каждую минуту), повтор раз
+    в час несёт новость «всё ещё не заменили», а «починилось» означает «новый ключ
+    приняли». Поэтому ни в `NO_REPEAT`, ни в `NO_FIXED` его нет.
+    """
+    out = {}
+    raw = _state_row(c, KEY_REFUSED_KEY)
+    # Запись читаем защищаясь: `detect` зовут и тик, и экран «Админ», и упасть на
+    # испорченном JSON значило бы погасить разом все одиннадцать поводов.
+    raw = raw if isinstance(raw, dict) else {}
+    for family, rec in sorted(raw.items()):
+        if not isinstance(rec, dict) or _f(rec.get("seen")) < KEY_REFUSE_HITS:
+            continue
+        # Та же свежесть, что у снимка: пока отказ никто не подтверждает (например,
+        # мёртвый ключ убрали из файла и спрашивать стало нечем), утверждать «ключ не
+        # принимают» мы не вправе. Соврать в обратную сторону не даст `FASTGEN_STATE_KEYS`:
+        # «починилось» без свежих цифр тоже не уйдёт.
+        if now - _f(rec.get("last")) > USAGE_STALE_SEC:
+            continue
+        key = f"key_dead:{family}"
+        out[key] = Alert(
+            key, f"Ключ {_family_title(family)} кончился",
+            # 402 Payment Required — ключ ЖИВОЙ, кончились деньги на счету. Совет
+            # «получите новый ключ» тут вреден: старый именной ключ будет выброшен зря,
+            # а достаточно пополнить баланс.
+            (f"Кончились деньги на счету провайдера (HTTP 402) — ключ рабочий, менять "
+             f"его не надо, нужно пополнить счёт.\n"
+             if int(_f(rec.get("code"))) == 402 else
+             f"Нужен новый ключ: провайдер отвечает отказом HTTP "
+             f"{int(_f(rec.get('code')))} даже на бесплатный запрос статистики.\n")
+            + f"Ключ {rec.get('mask') or '—'}, отказов подряд: "
+            f"{int(_f(rec.get('seen')))}.\n" + _key_dead_fix(family),
+            since_hint=_f(rec.get("since")) or None,
+            money=_KEY_DEAD_MONEY)
+    snap = _fastgen_usage_snapshot(c, now)
+    expires = _f(snap.get("expires")) if snap else 0
+    key = f"key_dead:{FASTGEN_FAMILY}"
+    if expires and expires <= now and key not in out:
+        when = time.strftime("%d.%m.%Y", time.localtime(expires))
+        out[key] = Alert(
+            key, f"Ключ {_family_title(FASTGEN_FAMILY)} кончился",
+            f"Нужен новый ключ: срок действия истёк {when}, "
+            f"{_human(now - expires)} назад.\n" + _key_dead_fix(FASTGEN_FAMILY),
+            since_hint=expires,
+            money=_KEY_DEAD_MONEY)
+    return list(out.values())
+
+
 CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
           check_missed_slots, check_disk, check_oldest_task, check_failed_tasks,
-          check_key_exhausted)
+          check_key_exhausted, check_key_expiring, check_usage_near_limit,
+          check_key_dead)
 
 # Сколько повод должен продержаться, прежде чем о нём говорят. Там, где длительность
 # и есть суть повода (§2), она проверяется здесь; остальные поводы уже содержат свой
@@ -418,6 +700,16 @@ MIN_HOLD = {"provider_resting": RESTING_SEC}
 # «починилось» осмысленны, только когда повод описывает то, что тянется.
 NO_REPEAT = {"failed"}
 NO_FIXED = {"failed"}
+
+# §9/§10/§11 читают один и тот же снимок FastGen. Пока он протух (или его вовсе не
+# было), «пропал из active» значит «нет свежих цифр», а не «починилось» — иначе именно
+# сбой сети (единственная причина устаревания снимка) выключал бы уже прозвучавшую
+# тревогу о ключе. Разбор инцидента 16.09.2026 (review issue 1): тревога прозвучала,
+# снимок перестал обновляться (сеть недоступна), два часа спустя `tick` без этого
+# исключения посылал бы «ПОЧИНИЛОСЬ», хотя ключ не продлён и расход не упал.
+# Сравнение по префиксу, как у NO_REPEAT/NO_FIXED: у §11 в ключе стоит ещё и семейство
+# (`key_dead:googler`), и точное совпадение его бы не поймало.
+FASTGEN_STATE_KEYS = {"fastgen_key_expiring", "fastgen_usage_near_limit", "key_dead"}
 
 
 def detect(c, now=None, tenant=None) -> dict:
@@ -436,10 +728,16 @@ def load_state(c) -> dict:
     return _state_row(c, STATE_KEY) or {}
 
 
-def save_state(c, state, now=None) -> None:
+def _state_save(c, key, value, now=None) -> None:
+    """Запись в `admin_state` одной формой на всех: и память тревог, и заявка на отказ
+    ключа (§11) ложатся одинаково, иначе две похожие записи расходятся молча."""
     c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES(?,?,?)",
-              (STATE_KEY, json.dumps(state, ensure_ascii=False), now or time.time()))
+              (key, json.dumps(value, ensure_ascii=False), now or time.time()))
     c.commit()
+
+
+def save_state(c, state, now=None) -> None:
+    _state_save(c, STATE_KEY, state, now)
 
 
 def tick(c, send, now=None, tenant=None) -> list:
@@ -454,6 +752,9 @@ def tick(c, send, now=None, tenant=None) -> list:
     """
     now = now or time.time()
     active = detect(c, now, tenant)
+    # Снимок FastGen протух (или его нет) — §9/§10 могли исчезнуть из `active` именно
+    # из-за этого, а не потому, что ключ продлили или расход упал. См. FASTGEN_STATE_KEYS.
+    fastgen_stale = _fastgen_usage_snapshot(c, now) is None
     state = load_state(c)
     sent = []
 
@@ -479,7 +780,20 @@ def tick(c, send, now=None, tenant=None) -> list:
         st["n"] = int(st.get("n") or 0) + 1
         sent.append((key, kind, text))
 
+    # Повод мог не «починиться», а ПЕРЕРАСТИ в худший. У §9 («истекает») и §11
+    # («кончился») именно так: в тот тик, когда срок выходит, §9 уходит из active, а §11
+    # появляется. Без этой проверки заказчик получал подряд «ТРЕВОГА · Ключ кончился» и
+    # «ПОЧИНИЛОСЬ · Ключ истекает» — то есть «починилось» ровно в момент поломки. Оба
+    # проверяющих воспроизвели это на живом тике. Пока стоит наследник, предшественник
+    # молча забывается: сказать о нём нечего, о беде уже сказано.
+    _succeeded_by = {"fastgen_key_expiring": f"key_dead:{FASTGEN_FAMILY}"}
     for key in [k for k in state if k not in active]:
+        heir = _succeeded_by.get(key)
+        if heir and heir in active:
+            state.pop(key, None)
+            continue
+        if fastgen_stale and key.split(":")[0] in FASTGEN_STATE_KEYS:
+            continue        # снимок протух — ждём свежих цифр, а не чиним по тишине
         st = state.pop(key)
         if not isinstance(st, dict) or not _f(st.get("sent")):
             continue        # тревога не звучала — «починилось» было бы про что-то новое
