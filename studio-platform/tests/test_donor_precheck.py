@@ -230,16 +230,82 @@ def main() -> int:
         thin = dict(base, chars=900)
         check("обрывок дорожки — отказ", PT.donor_verdict(thin, lim)["reason"], "short_text")
 
-        long_real = dict(base, minutes=150.0)
-        check("измеренные 150 минут — отказ",
-              PT.donor_verdict(long_real, lim)["reason"], "too_long")
-        long_guess = dict(base, minutes=150.0, length_from="оценка по знакам")
-        check("те же 150 минут ОЦЕНКОЙ — не отказ",
-              PT.donor_verdict(long_guess, lim)["verdict"], "warn")
-        check("и это сказано причиной",
-              PT.donor_verdict(long_guess, lim)["reason"], "long_estimate")
-        check("но по настройке отказ возможен",
-              PT.donor_verdict(long_guess, dict(lim, estimate_rejects=1))["verdict"], "reject")
+        # 22.09.2026 (задача «пункт 3»): длиннее потолка — ВСЕГДА предупреждение,
+        # никогда отказ, и объясняем ценой (множитель к 90-минутному), а не словом
+        # «потолок». Мутация-проверка: верни в `donor_verdict` старый `return
+        # out("reject", "too_long", why)` для измеренной длины (или верни
+        # `estimate_rejects` в условие) — первые же две проверки этого блока провалятся
+        # («предупреждение, не отказ» и «оценка не превращается в отказ»).
+        long_real = dict(base, minutes=120.0)
+        v_real = PT.donor_verdict(long_real, lim)
+        check("измеренные 120 минут — предупреждение, не отказ", v_real["verdict"], "warn")
+        check("причина названа", v_real["reason"], "too_long")
+        check("ставить можно", v_real["can_plan"], True)
+        # Стем "потолк", а не полное слово "потолок": у него в русском есть склонения
+        # («потолке», «потолка») — проверка на полное слово пропустила бы мутацию
+        # с «при потолке» (проверено вручную: мутация выжила, пока тут стояло "потолок").
+        check("слова «потолок» (в любом падеже) в тексте больше нет",
+              "потолк" in v_real["why"], False)
+        check("множитель честный: 120/90 ≈ 1,3×", "1,3×" in v_real["why"], True)
+
+        long_guess = dict(base, minutes=120.0, length_from="оценка по знакам")
+        v_guess = PT.donor_verdict(long_guess, lim)
+        check("те же 120 минут ОЦЕНКОЙ — тоже предупреждение, не отказ",
+              v_guess["verdict"], "warn")
+        check("и это сказано причиной", v_guess["reason"], "long_estimate")
+        check("оценка честно помечена в тексте", "оценена" in v_guess["why"], True)
+        check("«потолок» (в любом падеже) и здесь не звучит", "потолк" in v_guess["why"], False)
+
+        for flag in (0, 1):
+            lim_flag = dict(lim, estimate_rejects=flag)
+            check(f"estimate_rejects={flag}: измеренные 120 мин — не отказ",
+                  PT.donor_verdict(long_real, lim_flag)["verdict"], "warn")
+            check(f"estimate_rejects={flag}: оценённые 120 мин — тоже не отказ",
+                  PT.donor_verdict(long_guess, lim_flag)["verdict"], "warn")
+
+        very_long = dict(base, minutes=180.0)
+        check("180 минут при потолке 90 — множитель 2,0×",
+              "2,0×" in PT.donor_verdict(very_long, lim)["why"], True)
+
+        # Граница: РОВНО 90 минут — это ещё не «длиннее», условие в коде строгое (`>`).
+        # Мутация-проверка: смени `minutes > lim["max_minutes"]` на `>=` — эта проверка
+        # начнёт видеть причину "too_long" там, где её быть не должно, и провалится.
+        at_limit = dict(base, minutes=90.0)
+        v_at_limit = PT.donor_verdict(at_limit, lim)
+        check("ровно 90 минут — предупреждения о длине нет",
+              v_at_limit["reason"] not in ("too_long", "long_estimate"), True)
+
+        # Ревью, замечание 1: `max_minutes=0` — тот же смысл «без потолка», что и у
+        # `subs_exits`/`budget_sec`, но множитель цены `minutes / max_minutes` при
+        # таком значении честно не посчитать (деление на ноль). Раньше это валило
+        # `donor_verdict` исключением на любом донора с известной длиной. Мутация-
+        # проверка: убери условие `lim["max_minutes"] > 0` перед делением — эта
+        # проверка упадёт с ZeroDivisionError вместо обычного mismatch.
+        lim_zero = dict(lim, max_minutes=0)
+        v_zero = PT.donor_verdict(long_real, lim_zero)
+        check("max_minutes=0 не роняет donor_verdict исключением",
+              v_zero["verdict"] in ("ok", "warn", "unknown"), True)
+        check("max_minutes=0 не превращается в отказ",
+              v_zero["verdict"] != "reject", True)
+        check("max_minutes=0 — предупреждения о цене длины нет (не с чем сравнивать)",
+              v_zero["reason"] not in ("too_long", "long_estimate"), True)
+
+        # То же для отрицательного значения (мусор в .env, если когда-нибудь пройдёт
+        # мимо `_donor_num`) — на всякий случай проверяем ту же защиту.
+        lim_negative = dict(lim, max_minutes=-5.0)
+        check("отрицательный max_minutes тоже не роняет donor_verdict",
+              PT.donor_verdict(long_real, lim_negative)["verdict"] != "reject", True)
+
+        # AC-3: комментарий у ключа admin_state больше не выдаёт несуществующий экран
+        # настроек за источник правды. Мутация-проверка: верни строку комментария
+        # `# ключ в admin_state: пороги, правленные с экрана` — эта проверка провалится.
+        src_path = os.path.join(BASE, "server", "pub_tags.py")
+        with open(src_path, encoding="utf-8") as fh:
+            src_text = fh.read()
+        check("старая формулировка «правленные с экрана» исчезла",
+              "правленные с экрана" in src_text, False)
+        check("новый комментарий честно говорит про отсутствие экрана",
+              "такого маршрута в server/main.py не существует" in src_text, True)
 
         short = dict(base, minutes=10.0, chars=9000)
         check("короче границы владельца — предупреждение",

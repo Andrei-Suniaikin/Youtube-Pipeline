@@ -208,8 +208,12 @@ SCENARIO = r"""
       {url: 'https://youtu.be/EEE', video_id: 'EEE', title: 'Оценённый', has_subs: true,
        chars: 5000, lang: 'cs', lang_ru: 'Чешский', seconds: 714, minutes: 11.9,
        length_from: 'оценка по знакам', cached: true, verdict: 'warn',
-       reason: 'long_estimate', why: 'выше потолка по оценке', warns: [], can_plan: true,
-       checked: true},
+       // 22.09.2026: длиннее — это цена, а не «потолок» (см. donor_verdict, пункт 3).
+       reason: 'long_estimate',
+       why: 'длиннее обычного (до 90 мин): 12 мин (длина оценена по числу знаков, '
+            + 'точной мы не знаем) — озвучка, кадры и рендер выйдут дороже, чем у '
+            + '90-минутного',
+       warns: [], can_plan: true, checked: true},
     ], donor_summary: {ok: 1, warn: 1, reject: 1, unknown: 2}, timed_out: false,
        wall_sec: 30, donor_note: 'Проверка бесплатна: квоту YouTube Data API не тратит.'};
     const dBox = document.createElement('div');
