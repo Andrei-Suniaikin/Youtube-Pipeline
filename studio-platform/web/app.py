@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import zoneinfo
 import hashlib
@@ -36,6 +37,7 @@ sys.path.insert(0, SERVER)
 
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
+from starlette.concurrency import run_in_threadpool                # noqa: E402
 from pydantic import BaseModel, StrictInt                         # noqa: E402
 
 sys.path.insert(0, HERE)
@@ -57,7 +59,7 @@ from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
 from pub_neighbors import (cover_presets, rewrite_preset_config,  # noqa: E402
                            rewrite_presets, vsgen_presets)
 from pub_tags import (DONOR_UNKNOWN_WHY, add_links, check_donor,   # noqa: E402
-                      donor_facts_blank, donor_limits, donor_verdict,
+                      donor_facts_blank, donor_limits, donor_title, donor_verdict,
                       parse_links, plan_rows)
 import pub_ui                                                    # noqa: E402
 
@@ -687,6 +689,19 @@ def _calendar(c, ch, history_days: int) -> list:
             "phase_title": PHASE_TITLE.get(rel["phase"], "") if rel is not None else "",
             "project_id": (rel["project_id"] if rel is not None else "") or "",
             "blocked_reason": (rel["blocked_reason"] if rel is not None else "") or "",
+            # НОВОЕ (пункт 1 владельца, 22.09.2026): video_id — прямая ссылка на
+            # YouTube после честной публикации (см. `calendarFeed`), project_name —
+            # подпись строки без похода на отдельный экран проекта. `project_name`
+            # заполняется ниже одним запросом на весь календарь, а не здесь построчно:
+            # `row_for` вызывается на каждый слот, и десятки одиночных SELECT'ов ради
+            # имени были бы N+1 там, где хватает одного.
+            "video_id": (rel["video_id"] if rel is not None else "") or "",
+            "project_name": "",
+            # Внутреннее поле — id строки `pub_plan_items` для ленивой дозагрузки
+            # названия донора (`_select_backfill_candidates`/`_backfill_donor_titles_network`).
+            # Наружу не отдаётся: снимается в `ui_channel` перед отправкой ответа
+            # (см. `_strip_internal`).
+            "_plan_item_id": item["id"] if item is not None else None,
         }
 
     out = [row_for(m, by_slot.get(round(m.timestamp())), past) for m, past in moments]
@@ -702,6 +717,20 @@ def _calendar(c, ch, history_days: int) -> list:
             continue
         moment = dt.datetime.fromtimestamp(ts, dt.timezone.utc)
         out.append(row_for(moment, item, is_past=(ts <= time.time()), beyond=True))
+
+    # Имя проекта — одним запросом на весь календарь (join-паттерн как в
+    # `web/app.py:989-993`), а не по строке: строк в ленте может быть сотня, а
+    # различных project_id среди них — единицы.
+    project_ids = sorted({r["project_id"] for r in out if r["project_id"]})
+    if project_ids:
+        marks = ",".join("?" * len(project_ids))
+        names = {row["id"]: (row["name"] or "") for row in c.execute(
+            f"SELECT id, name FROM projects WHERE tenant_id=? AND id IN ({marks})",
+            (ch["tenant_id"], *project_ids))}
+        for r in out:
+            if r["project_id"]:
+                r["project_name"] = names.get(r["project_id"], "") or ""
+
     out.sort(key=lambda r: r["at"])
     return out
 
@@ -2005,22 +2034,189 @@ def _uploads(c, channel_id: int) -> list:
     return rows
 
 
-# «/ui/channels/new», объявленный ниже, и форма заведения канала отвечает 422.
-@app.get("/ui/channels/{channel_id:int}")
-def ui_channel(channel_id: int, history: int = 14):
-    """Канал: карточка, календарь с историей и пропусками, сводка.
+# Ленивая дозагрузка названий доноров при открытии канала (пункт 1 владельца,
+# 22.09.2026). Старые строки плана — добавленные до того, как кабинет стал спрашивать
+# название заранее, или ссылка на мёртвый/закрытый ролик — годами стояли пустыми:
+# показывать название было неоткуда, форма ставила туда голую ссылку.
+#
+# Кап и параллелизм — не оптимизация, а поправка на живой экран (уточнение оркестратора
+# к Algorithm шаг 9): один запрос `donor_title()` живёт до 6 с (таймаут в
+# `server/pub_tags.py:46`), и `history=90` мог отдать в ленте десятки безымянных строк
+# разом. По ОДНОЙ, последовательно, полсотни строк держали бы открытие канала полминуты
+# и дольше. Здесь — не больше `DONOR_TITLE_BACKFILL_CAP` походов за один заход, и все
+# сразу параллельно (`asyncio.gather`), так что худший случай — это время ОДНОГО
+# таймаута, а не суммы всех пяти.
+#
+# Кулдаун — в памяти процесса, НЕ в базе и НЕ в `pub_plan_items.updated`: это поле уже
+# занято возрастом строки в очереди («ждёт»/«давно висит», `web/app.py:292`,
+# `6158-6161`, сортировка `6230`), и молчаливая правка его фоновой дозагрузкой
+# постороннего поля сломала бы те экраны. Плата за простоту — кулдаун обнуляется
+# рестартом процесса; это принято сознательно (Algorithm шаг 10): рестарты редки, а
+# кап 5-на-заход всё равно держит худший случай даже сразу после рестарта.
+DONOR_TITLE_BACKFILL_CAP = 5
+DONOR_TITLE_BACKFILL_COOLDOWN_SEC = float(
+    os.environ.get("VS_DONOR_TITLE_COOLDOWN_SEC", "3600"))
+_donor_title_backfill_cooldown: dict = {}
 
-    `history` — сколько суток прошлого показывать. По умолчанию две недели: этого
-    хватает, чтобы увидеть пропуски, и мало, чтобы лента осталась читаемой.
+
+def _prune_backfill_cooldown(now: float) -> None:
+    """Выбросить из кулдауна записи старше своего же окна (ревью 22.09.2026, Issue 4).
+
+    Раньше запись из словаря уходила только при УДАЧНОЙ дозагрузке — для мёртвой
+    ссылки удачи не будет никогда, и её отметка лежала бы до перезапуска процесса.
+    Опасности в этом не было (объём ограничен числом строк плана), но и смысла копить
+    просроченные записи нет. Зовётся из `_select_backfill_candidates` на КАЖДОМ
+    открытии канала — не только когда у текущего канала находятся кандидаты: строка,
+    исчезнувшая из видимой ленты, иначе никогда больше не дала бы повод почистить свою
+    отметку. Мутация-проверка: убери вызов `_prune_backfill_cooldown` из
+    `_select_backfill_candidates` — словарь кулдауна перестанет уменьшаться сам, и тест
+    в `tests/test_donor_title_links.py` («Issue 4») это поймает.
     """
-    history = max(0, min(90, int(history)))
+    stale = [pid for pid, ts in _donor_title_backfill_cooldown.items()
+             if now - ts >= DONOR_TITLE_BACKFILL_COOLDOWN_SEC]
+    for pid in stale:
+        _donor_title_backfill_cooldown.pop(pid, None)
+
+
+def _select_backfill_candidates(cal: list) -> list:
+    """Отобрать до `DONOR_TITLE_BACKFILL_CAP` строк без названия — чистая функция, без
+    сети и без SQLite (ревью 22.09.2026, Issue 1): раньше отбор кандидатов жил внутри
+    одной `async def`-функции вместе с сетью и записью. Здесь — только просмотр уже
+    готового списка `cal`, дешёвый чистый Python; сеть и запись — отдельными шагами,
+    каждый в своём месте (см. `_backfill_donor_titles_network`/`_write_donor_titles`
+    ниже).
+
+    Кандидаты берутся из `cal` целиком — это уже всё, что человек увидит на экране
+    (`history` ограничен 90 сутками, горизонт мал), отдельного фильтра «видимости» не
+    заводим (Algorithm шаг 9). Строка без ссылки или без `_plan_item_id` (синтетический
+    `missed`/`free` слот) в кандидаты не идёт — дозагружать нечего.
+
+    ВАЖНО (ревью 22.09.2026, Issue 2): эта функция ЗОВЁТСЯ ИЗ `ui_channel` НА ЦИКЛЕ
+    СОБЫТИЙ, а не из `_load_channel_calendar_sync` в пуле потоков, куда она раньше была
+    сложена рядом с остальным SQL. Причина — единственный писатель словаря кулдауна.
+    `_prune_backfill_cooldown` перебирает `_donor_title_backfill_cooldown.items()`;
+    если бы этот перебор шёл в потоке пула, а `_backfill_donor_titles_network` другого
+    ПАРАЛЛЕЛЬНОГО открытия канала писал(а)/удалял(а) ключи в том же словаре на цикле
+    событий, переключение GIL посреди перебора дало бы `RuntimeError: dictionary
+    changed size during iteration` и 500 на открытии канала. На цикле событий
+    переключения потоков нет — весь код между `await`'ами выполняется без вытеснения
+    другим потоком, поэтому и чтение (здесь), и запись (в `_backfill_donor_titles_network`)
+    словаря кулдауна безопасны просто потому, что живут на одном потоке.
+    """
+    now = time.time()
+    # Просроченные отметки кулдауна выметаем на каждом открытии канала (Issue 4), а не
+    # только тогда, когда у ЭТОГО канала находятся кандидаты — иначе строка, которая
+    # исчезла из видимой ленты (утекла за пределы `history`, удалена, донор всё же
+    # получил название другим путём), никогда не попадёт в `_backfill_donor_titles_network`
+    # и её отметка пролежит в памяти до перезапуска процесса, хотя окно кулдауна
+    # давно истекло.
+    _prune_backfill_cooldown(now)
+    candidates = []
+    for row in cal:
+        pid = row.get("_plan_item_id")
+        if not pid or row.get("donor_title") or not row.get("donor_url"):
+            continue
+        last_fail = _donor_title_backfill_cooldown.get(pid)
+        if last_fail is not None and now - last_fail < DONOR_TITLE_BACKFILL_COOLDOWN_SEC:
+            continue                                  # мёртвая ссылка — не долбим её снова
+        candidates.append(row)
+        if len(candidates) >= DONOR_TITLE_BACKFILL_CAP:
+            break
+    return candidates
+
+
+def _write_donor_titles(updates: list) -> None:
+    """Короткая ОТДЕЛЬНАЯ запись дозагруженных названий — своя связь с базой, открытая
+    уже ПОСЛЕ того, как сеть ответила (ревью 22.09.2026, Issue 1). Раньше запись шла
+    через ту же связь `c`, что читала весь остальной ответ `ui_channel`, и эта связь
+    простаивала открытой всё время ожидания сети (до ~6 с на запрос, таймаут
+    `donor_title()` в `server/pub_tags.py:46`) — под WAL терпимо для чтения, но именно
+    открытая-и-ждущая связь была тем, чего Algorithm шаг 9 просил избежать.
+    """
+    c = db()
+    try:
+        for title, pid in updates:
+            c.execute("UPDATE pub_plan_items SET donor_title=? WHERE id=?", (title, pid))
+        c.commit()
+    finally:
+        c.close()
+
+
+async def _backfill_donor_titles_network(cal: list, candidates: list) -> list:
+    """Сетевая часть дозагрузки — единственное, что вправе занимать цикл событий
+    (ревью 22.09.2026, Issue 1): сами походы в oembed уже уходят в пул потоков
+    (`run_in_threadpool` на каждый URL, параллельно через `asyncio.gather`), здесь цикл
+    событий только ждёт их ответа, ни одного вызова SQLite в этой функции нет — запись
+    результата вынесена в `_write_donor_titles` и тоже уходит в пул потоков (`ui_channel`
+    зовёт её через `run_in_threadpool`, а не отсюда: эта функция остаётся только про
+    сеть). Возвращает список `(title, plan_item_id)` для успешных ответов — писать их
+    в базу решает вызывающая сторона, уже своей отдельной короткой связью.
+    """
+    if not candidates:
+        return []
+    now = time.time()
+    fetched = await asyncio.gather(
+        *(run_in_threadpool(donor_title, row["donor_url"]) for row in candidates))
+    updates = []
+    for row, title in zip(candidates, fetched):
+        pid = row["_plan_item_id"]
+        if title:
+            row["donor_title"] = title                # тот же ответ отдаём сразу, без перезахода
+            updates.append((title, pid))
+            _donor_title_backfill_cooldown.pop(pid, None)
+        else:
+            _donor_title_backfill_cooldown[pid] = now
+    return updates
+
+
+def _strip_internal(row: dict) -> dict:
+    """Снять служебные поля (`_plan_item_id`) перед тем, как строка календаря уйдёт наружу."""
+    return {k: v for k, v in row.items() if not k.startswith("_")}
+
+
+def _load_channel_calendar_sync(channel_id: int, history: int):
+    """Открыть канал и построить календарь — целиком в пуле потоков (ревью 22.09.2026,
+    Issue 1). Своя связь с базой открывается и закрывается здесь же, до всякой сети:
+    `ui_channel` вызывает эту функцию через `run_in_threadpool`, так что ни один SQL из
+    неё не выполняется в цикле событий единого процесса (кабинет + пульт + Rewrite +
+    Cover, `web/platform.py`) — там, где под живым писателем (воркеры/кабинет/очередь)
+    связь с `timeout=5` могла бы ждать блокировку и вместе с ней вставали бы все
+    четыре веба разом.
+
+    Возвращает `(ch, cal)`; `ch is None`, если канала нет — `ui_channel` превращает это
+    в 404 уже на цикле событий, без похода в базу второй раз.
+
+    ВАЖНО (ревью 22.09.2026, Issue 2): отбор кандидатов на дозагрузку названий
+    (`_select_backfill_candidates`) сюда НЕ входит — он читает и чистит
+    `_donor_title_backfill_cooldown`, а эта функция выполняется в пуле потоков.
+    Другое параллельное открытие канала в это же время могло бы писать в тот же
+    словарь из `_backfill_donor_titles_network` на цикле событий, и перебор `.items()`
+    в `_prune_backfill_cooldown` поймал бы `RuntimeError: dictionary changed size
+    during iteration`. Отбор кандидатов сделан отдельным шагом на цикле событий
+    (`ui_channel`, между этим вызовом и `_backfill_donor_titles_network`) — весь
+    словарь кулдауна живёт и читается/пишется только там, без гонки между потоками.
+    """
     c = db()
     try:
         ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
                        (channel_id, TENANT)).fetchone()
         if ch is None:
-            raise HTTPException(404, "канал не найден")
+            return None, None
         cal = _calendar(c, ch, history)
+        return ch, cal
+    finally:
+        c.close()
+
+
+def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) -> dict:
+    """Остальная часть ответа `ui_channel` — тоже в пуле потоков (ревью 22.09.2026,
+    Issue 1): своя КОРОТКАЯ связь, открытая уже ПОСЛЕ того, как сеть (дозагрузка
+    названий) отработала, а не висящая всё это время. `cal` к этому моменту уже несёт
+    дозагруженные названия (правились на месте в `_backfill_donor_titles_network`) —
+    здесь их не трогаем, только читаем для `counts`/`by_day` и отдаём наружу.
+    """
+    c = db()
+    try:
         # Ссылки, стоящие без даты: раньше их было видно только числом в плашке — что
         # именно поставлено, посмотреть было негде (жалоба владельца 18.09.2026).
         waiting_rows = [
@@ -2094,7 +2290,10 @@ def ui_channel(channel_id: int, history: int = 14):
                 "preset_rewrite": ch["preset_rewrite"] or "",
                 "preset_cover": ch["preset_cover"] or "",
             },
-            "calendar": cal,
+            # `_strip_internal` снимает служебный `_plan_item_id` — наружу контракт
+            # календаря не меняется (`counts`/`by_day` выше уже посчитаны по `cal`
+            # ДО снятия поля, им оно не мешало).
+            "calendar": [_strip_internal(r) for r in cal],
             "counts": counts,
             "uploads": _uploads(c, channel_id),
             "by_day": by_day,
@@ -2119,37 +2318,150 @@ def ui_channel(channel_id: int, history: int = 14):
         c.close()
 
 
+# «/ui/channels/new», объявленный ниже, и форма заведения канала отвечает 422.
+@app.get("/ui/channels/{channel_id:int}")
+async def ui_channel(channel_id: int, history: int = 14):
+    """Канал: карточка, календарь с историей и пропусками, сводка.
+
+    `history` — сколько суток прошлого показывать. По умолчанию две недели: этого
+    хватает, чтобы увидеть пропуски, и мало, чтобы лента осталась читаемой.
+
+    ВАЖНО (ревью 22.09.2026, Issue 1) — тот же принцип, что и у `def`/`async def` ниже
+    (см. правило у `ui_keys_save`): обработчик остаётся `async def`, но НИ ОДИН вызов
+    SQLite в нём не выполняется прямо в цикле событий. Тело разбито на три шага:
+    `_load_channel_calendar_sync` (пул потоков) → `_backfill_donor_titles_network`
+    (цикл событий ждёт только сеть, сама сеть — тоже в пуле потоков, по URL'у)
+    → `_finish_channel_response_sync` (снова пул потоков, своя короткая связь).
+    Цикл событий здесь занят только awaiting'ом между шагами — ни одна связь с базой не
+    остаётся открытой, пока где-то ждёт сеть.
+
+    Отбор кандидатов на дозагрузку (`_select_backfill_candidates`) выполняется здесь же,
+    на цикле событий, а не в пуле потоков (ревью 22.09.2026, Issue 2) — это чистый
+    Python без SQLite и без сети, а словарь кулдауна `_donor_title_backfill_cooldown`
+    иначе читался/чистился бы из потока пула ОДНОВРЕМЕННО с тем, как другое парал-
+    лельное открытие канала пишет в него же из `_backfill_donor_titles_network` на
+    цикле событий — гонка между потоками за общий словарь. Держа весь доступ к
+    словарю на одном потоке (цикле событий), гонку убираем полностью, а не прячем
+    под снимком.
+    """
+    history = max(0, min(90, int(history)))
+    ch, cal = await run_in_threadpool(_load_channel_calendar_sync, channel_id, history)
+    if ch is None:
+        raise HTTPException(404, "канал не найден")
+    candidates = _select_backfill_candidates(cal)
+    updates = await _backfill_donor_titles_network(cal, candidates)
+    if updates:
+        await run_in_threadpool(_write_donor_titles, updates)
+    return await run_in_threadpool(_finish_channel_response_sync, channel_id, history, ch, cal)
+
+
 class LinksIn(BaseModel):
     channel_id: int
     links: str
     slot: float | None = None
 
 
+# Сколько названий доноров тянуть ОДНОВРЕМЕННО (пункт 1 владельца, 22.09.2026;
+# уточнение оркестратора к Algorithm шаг 9). Поштучно, как раньше писал план ТЗ
+# (`await run_in_threadpool` внутри цикла), пачка в 20+ ссылок держала бы экран
+# добавления по 6 с на ссылку. Пул той же глубины, что и лимит дозагрузки при
+# открытии канала (`DONOR_TITLE_BACKFILL_CAP`) — оба места отвечают на один и тот же
+# вопрос «сколько сетевых походов сразу», и число одно и то же не случайно.
+DONOR_TITLE_PARALLEL_LIMIT = 5
+
+
+async def _fetch_titles(urls: list) -> dict:
+    """Названия доноров пачкой — до `DONOR_TITLE_PARALLEL_LIMIT` походов в oembed разом.
+
+    Один провал не топит пачку: `donor_title()` сама глотает исключения и отдаёт ""
+    (`server/pub_tags.py:27-51`) — здесь этот контракт не переопределяется.
+    """
+    if not urls:
+        return {}
+    gate = asyncio.Semaphore(max(1, DONOR_TITLE_PARALLEL_LIMIT))
+
+    async def fetch_one(u):
+        async with gate:
+            return u, await run_in_threadpool(donor_title, u)
+
+    pairs = await asyncio.gather(*(fetch_one(u) for u in urls))
+    return dict(pairs)
+
+
+def _channel_exists_sync(channel_id: int) -> bool:
+    """Короткая проверка «канал есть» — своя связь, закрытая ДО похода в сеть (ревью
+    22.09.2026, Issue 3): кабинетный `channel_links` (`server/pub_ui.py:1218-1220`,
+    `_load(u, cid)`) сперва читает канал и отвечает «Канал не найден», и только потом
+    тянет `donor_title()`. Здесь порядок был перевёрнут: несуществующий/чужой
+    `channel_id` сначала оплачивал(бы) до `DONOR_TITLE_PARALLEL_LIMIT` походов в oembed
+    (по 6 с каждый) и только после этого получал 404. Мутация-проверка: убери вызов
+    этой функции из `ui_links` (или замени `if not exists: raise` на пропуск) — тест
+    «POST /ui/links на несуществующий канал» перестанет ловить нулевые вызовы
+    `donor_title` и начнёт видеть их до 404.
+    """
+    c = db()
+    try:
+        row = c.execute("SELECT 1 FROM pub_channels_live WHERE id=? AND tenant_id=?",
+                        (channel_id, TENANT)).fetchone()
+        return row is not None
+    finally:
+        c.close()
+
+
+def _apply_links_sync(channel_id: int, urls: list, slot, titles: dict):
+    """Синхронная часть `ui_links` — своя связь, открытая уже ПОСЛЕ сети (ревью
+    22.09.2026, Issue 1: то же правило, что и для `ui_channel` — `add_links` пишет в
+    SQLite и может ждать блокировку под другим писателем в едином процессе
+    (кабинет/воркеры/очередь), а сеть к этому моменту уже отработана и связь ничего не
+    ждёт, кроме диска). Вызывается из `ui_links` через `run_in_threadpool`, так что этот
+    SQL не выполняется в цикле событий. Возвращает `None`, если канала нет — `ui_links`
+    превращает это в 404 уже на цикле событий, не пробрасывая `HTTPException` через
+    поток пула (тот же приём, что у `server/main.py:16612-16621` `_do`/`run_in_threadpool`).
+    """
+    c = db()
+    try:
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
+                       (channel_id, TENANT)).fetchone()
+        if not ch:
+            return None
+        res = add_links(c, TENANT, ch, urls, time.time(), slot=slot, titles=titles)
+        c.commit()
+        return res
+    finally:
+        c.close()
+
+
 @app.post("/ui/links")
-def ui_links(body: LinksIn):
+async def ui_links(body: LinksIn):
     """Старт по ссылке.
 
     В боевой системе форма отправляет на существующий `POST /api/channels/{cid}/links`
-    — семантика та же. Здесь свой адрес только потому, что кабинет целиком поднять
-    без ключей и соседей нельзя.
+    — семантика та же, включая порядок: названия доноров тянутся пулом потоков ДО
+    открытия базы (`server/pub_ui.py:1233-1239`), а не изнутри `add_links`, которая
+    иначе сходила бы в сеть под открытой транзакцией и держала бы базу до шести секунд
+    на ссылку. Провал одной ссылки не роняет пачку — она просто встаёт без названия
+    (`donor_title()` сама возвращает "").
 
-    `titles` передаём обязательно: без него боевая `add_links` пойдёт в YouTube за
-    названиями доноров, а сетевые вызовы в этой оболочке запрещены.
+    ВАЖНО (ревью 22.09.2026, Issue 1): после сети синхронная работа с SQLite
+    (`add_links` + `commit`) тоже не остаётся в цикле событий — она вынесена в
+    `_apply_links_sync` и выполняется через `run_in_threadpool`, тем же приёмом, что и
+    `ui_channel`. `async def` здесь оправдан не тем, что сама функция синхронна, а
+    ровно наоборот: `ui_links` не делает ни одного вызова в свой же процесс (то самое
+    исключение из правила у `ui_keys_save`, `web/app.py:6160-6165` — `async def` опасен
+    только для обработчиков, которые сами ходят по HTTP в себя же).
     """
     urls = parse_links(body.links or "")
     if not urls:
         raise HTTPException(400, "в поле нет ни одной ссылки")
-    c = db()
-    try:
-        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
-                       (body.channel_id, TENANT)).fetchone()
-        if not ch:
-            raise HTTPException(404, "канал не найден")
-        res = add_links(c, TENANT, ch, urls, time.time(), slot=body.slot,
-                        titles={u: "" for u in urls})
-        c.commit()
-    finally:
-        c.close()
+    # Канал проверяем ДО сети (Issue 3 ревью 22.09.2026, тот же порядок, что у
+    # `channel_links` в кабинете) — иначе несуществующий/чужой канал сначала оплачивал
+    # бы до `DONOR_TITLE_PARALLEL_LIMIT` походов в oembed и только потом получал 404.
+    if not await run_in_threadpool(_channel_exists_sync, body.channel_id):
+        raise HTTPException(404, "канал не найден")
+    titles = await _fetch_titles(urls)
+    res = await run_in_threadpool(_apply_links_sync, body.channel_id, urls, body.slot, titles)
+    if res is None:
+        raise HTTPException(404, "канал не найден")
     return {"placed": [str(p) for p in res.get("placed", [])],
             "queued": res.get("queued", 0),
             "skipped": list(res.get("skipped", []))}

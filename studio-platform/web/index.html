@@ -227,6 +227,9 @@
             font-size:11px;font-weight:800;margin-top:1px}
   .cal .what{flex:1;min-width:0}
   .cal.miss .what{color:var(--bad)}
+  .cal.clickable{cursor:pointer}
+  .cal.clickable:hover{background:rgba(255,255,255,.03)}
+  .cal.clickable:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
   .today{height:0;border-top:2px dashed var(--acc);position:relative;margin:0 18px}
   .today span{position:absolute;top:-9px;left:0;background:var(--card);padding:0 9px;
               font-size:11px;color:var(--acc-hi);font-weight:700}
@@ -2081,29 +2084,92 @@ function calendarFeed(d){
   const past = d.calendar.filter(r => r.past).slice().reverse();
   const rows = [];
   let drawn = false;
+  // «Сейчас» — своё время браузера, а не серверное `r.past`: строка календаря может
+  // полежать в ответе секунды и минуты, пока человек листает экран, а честная подпись
+  // «опубликован»/«загружен» (пункт 1 владельца, 22.09.2026) обязана дать тот же ответ,
+  // что дал бы новый запрос в ту же секунду.
+  const nowSec = Date.now() / 1000;
   for (const r of [...future, ...past]){
     if (r.past && !drawn){ rows.push('<div class="today"><span>сейчас</span></div>'); drawn = true; }
     const when_ = new Date(r.at * 1000).toLocaleString('ru-RU',
       {weekday:'short', day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
-    const link = r.project_id ? `#/release/${esc(r.release_id)}` : (r.donor_url || '');
+    // `done` ≠ «опубликовано» (CLAUDE.md, инвариант 22.09.2026 — жалоба владельца):
+    // статус `pub_releases.status='done'` проверяет только расписание, а не то, что
+    // ролик реально вышел на YouTube. Пока собственный слот ещё не наступил, ссылка на
+    // youtu.be была бы обещанием, которое мы не проверяли, — ведём на донора и
+    // подписываем честно: «загружен, выйдет …», не «опубликован». Мутация-проверка:
+    // убери `&& r.at <= nowSec` — тест с future-слотом начнёт видеть youtu.be и
+    // «опубликован» раньше времени и упадёт.
+    const published = r.state === 'done' && r.at <= nowSec;
+    const useYoutube = published && r.video_id;
+    const link = useYoutube ? `https://youtu.be/${esc(r.video_id)}` : (r.donor_url || '');
+    // Куда ведёт ссылка не всегда видно по одному названию (Issue 3 ревью 22.09.2026):
+    // до слота и после него текст-ссылка выглядит одинаково, хотя ведёт в разные
+    // места. `title` — всплывающая подсказка при наведении, тот же приём, что и у
+    // соседних подписей строки, ничего не меняет в видимом тексте самой ссылки.
+    const linkTitle = !link ? '' : (useYoutube
+      ? 'Ссылка на YouTube' : 'Ссылка на донора (оригинал ролика)');
+    // Название — всегда название донора; ссылка донора как подпись — только если
+    // название добыть не удалось (пункт 1 владельца). Мутация-проверка: поменяй
+    // местами `r.donor_title || r.donor_url` — тест на «название-ссылка» перестанет
+    // отличать реальное название от голой ссылки.
     const title = r.donor_title || r.donor_url || (r.state === 'missed'
       ? 'ролика не было' : 'свободен — сюда встанет следующая ссылка');
-    rows.push(`<div class="cal ${r.past ? 'past' : ''} ${r.state === 'missed' ? 'miss' : ''}">
+    // `done` ≠ «опубликовано» касается и подписи БЕЗ `video_id` (Issue 2 ревью
+    // 22.09.2026): расписание могло подтвердиться раньше, чем ролик вообще залит —
+    // тогда до слота нет ни «опубликован», ни «загружен» (заливки ещё не было), и уж
+    // тем более не «вышел» — тот же обман, что и с youtu.be раньше времени. Мутация-
+    // проверка: убери ветку `r.video_id ? … : 'готов, выйдет …'` (верни `CAL_TITLE.done`)
+    // — строка `done` с будущим слотом и без `video_id` снова станет говорить «вышел».
+    const statusText = r.state === 'done'
+      ? (published ? 'опубликован'
+         : (r.video_id ? `загружен, выйдет ${when_}` : `готов, выйдет ${when_}`))
+      : CAL_TITLE[r.state];
+    // Клик по строке — только когда есть куда вести (пункт 1, «честно показать»):
+    // `planned` без `project_id` не кликается вовсе, а не ведёт в никуда. Мутация-
+    // проверка: замени условие на `!!r.release_id` — строка без проекта, но с чужим
+    // release_id, снова станет ложно кликабельной.
+    const clickable = !!r.project_id;
+    rows.push(`<div class="cal ${r.past ? 'past' : ''} ${r.state === 'missed' ? 'miss' : ''} ${clickable ? 'clickable' : ''}"
+        ${clickable ? `data-project="${esc(r.project_id)}" tabindex="0" role="link"
+          aria-label="Открыть проект${r.project_name ? ' ' + esc(r.project_name) : ''}"` : ''}>
       <time>${when_}</time>
       <div class="dot ${CAL_CLS[r.state]}">${CAL_DOT[r.state]}</div>
       <div class="what">
-        ${link ? `<a href="${esc(link)}" ${r.project_id ? '' : 'target=_blank rel=noopener'}
+        ${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" title="${esc(linkTitle)}"
             style="font-weight:600">${esc(title)}</a>`
                : `<span style="font-weight:${r.state === 'free' ? '400' : '600'}">${esc(title)}</span>`}
         <div class="muted" style="font-size:12.5px">
-          ${esc(CAL_TITLE[r.state])}${r.phase_title ? ' · ' + esc(r.phase_title) : ''}
+          ${esc(statusText)}${r.phase_title ? ' · ' + esc(r.phase_title) : ''}
+          ${r.project_name ? ' · ' + esc(r.project_name) : ''}
           ${r.beyond_horizon ? ' · за горизонтом канала' : ''}
         </div>
         ${r.blocked_reason ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : ''}
       </div></div>`);
   }
   if (!drawn) rows.push('<div class="today"><span>сейчас</span></div>');
-  return $(`<div class="card">${rows.join('')}</div>`);
+  const card = $(`<div class="card">${rows.join('')}</div>`);
+  // Клик по строке ведёт в проект (замена безусловной `#/release/<id>`, пункт 1) —
+  // тем же паттерном доступности, что у `.chcard` (tabindex/role/Enter/Space,
+  // :756). Клик по самой ссылке названия — своё дело ссылки, строка его не перехватывает.
+  card.querySelectorAll('.cal.clickable').forEach(el => {
+    const go = () => { location.hash = '#/project/' + el.dataset.project; };
+    el.onclick = ev => { if (ev.target.closest('a')) return; go(); };
+    // Issue 1 ревью 22.09.2026: keydown на ссылке названия всплывает до строки —
+    // если не отсеять его так же, как отсеивает onclick, Enter/Space на самой
+    // ссылке уводили бы в проект вместо перехода по ссылке (донор/YouTube), и с
+    // клавиатуры ссылку было бы не открыть вовсе. Реагируем только на события,
+    // цель которых — сама строка (единственный фокусируемый узел без вложенных
+    // ссылок), а не всплывшие от `<a>` внутри неё. Мутация-проверка: замени
+    // условие обратно на голое `ev.key === 'Enter' || ev.key === ' '` без
+    // `ev.target === el` — тест с Enter на самой ссылке снова начнёт уводить
+    // в проект вместо открытия ссылки.
+    el.onkeydown = ev => {
+      if (ev.target !== el) return;
+      if (ev.key === 'Enter' || ev.key === ' '){ ev.preventDefault(); go(); }
+    };
+  });
+  return card;
 }
 
 

@@ -29,6 +29,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -132,7 +133,10 @@ def main() -> int:
           sorted(r["at"] for r in past_rows))
 
     print("\nby_day и counts — из настоящего ответа GET /ui/channels/{id} (без сети)")
-    d = pult.ui_channel(cid, history=90)
+    # Фаза 3 (22.09.2026): `ui_channel` стала `async def` — дозагрузка названий
+    # доноров тянется пулом потоков (`_backfill_donor_titles`), а `def` не умеет
+    # `await`. Вызов той же самой функции, просто через `asyncio.run`.
+    d = asyncio.run(pult.ui_channel(cid, history=90))
     resp_early = [r for r in d["calendar"] if r["at"] < created - 1]
     check("в ответе ручки тоже нет рядов раньше created", resp_early, [])
     # Пропуски ПОСЛЕ created — законные (слот прошёл, ролика нет), их и должно быть

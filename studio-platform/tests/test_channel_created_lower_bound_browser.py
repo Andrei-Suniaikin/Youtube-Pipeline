@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -77,8 +78,11 @@ _c.commit()
 _c.close()
 
 # Настоящий вызов ручки — как её вызвал бы GET /ui/channels/{id}?history=14, тем же
-# кодом, что и в бою (`web/app.py:ui_channel`), только без HTTP-слоя.
-D = pult.ui_channel(CID, history=14)
+# кодом, что и в бою (`web/app.py:ui_channel`), только без HTTP-слоя. Фаза 3
+# (22.09.2026) сделала `ui_channel` `async def` (дозагрузка названий доноров пулом
+# потоков) — вызов через `asyncio.run`, канал только что заведён и без единой ссылки
+# в плане, так что дозагрузке всё равно нечего тянуть, сети это не касается.
+D = asyncio.run(pult.ui_channel(CID, history=14))
 
 MISSED_ROWS = [r for r in D["calendar"] if r["state"] == "missed"]
 # Мутация-проверка (уровень данных, работает и без Chrome в окружении): убери
