@@ -1163,18 +1163,52 @@ function langOptionsHtml(langs, cur){
   </select>`;
 }
 
+// До 22.09.2026 плашка была одна: побеждал own_openai, затем own_claude, затем
+// серверный ключ — своя подписка Codex/Claude, заданная вместе с OpenAI, была бы не
+// видна и не снимаема. Теперь три плашки независимы: у каждой свой булев признак и своя
+// ссылка «снять», ничьё наличие не прячет состояние двух других. Правка 22.09.2026
+// (ревью, Issue 1): «независимо» не значит «молча» — если своего нет, а сервер
+// отвечает за провайдер (видно по *_source, не по own_*), плашка обязана сказать, что
+// текст всё равно делается — серверным. own_*/server_openai/server_claude сами по себе
+// это не говорят: для Codex отдельного булева server_codex вообще нет — «что сработает»
+// надёжно знают только *_source (user/server/none).
+// Правка 22.09.2026 (ревью итерация 2, Issue 1): подпись «Текст:» вернулась — общим
+// заголовком над тремя плашками, как было в прежней однострочной версии, а подсказка
+// «?» стоит рядом с ней, а не отдельной строкой под плашками.
+// Правка 22.09.2026 (ревью итерация 2, Issue 2): claude_source === 'server' бывает и
+// без настоящей серверной подписки (OAuth) — тогда сервер тянет Claude обычным ключом
+// API. Различить эти два случая можно по server_claude (он и есть признак «серверный
+// OAuth есть», `web/app.py:_rewrite_keys`): без него пишем нейтральное «серверный ключ
+// владельца», как у OpenAI, а не «серверная подписка», которой на деле нет.
 function rewriteRowHtml(rw){
-  const state = !rw.ok
-    ? `<span class="note bad">${esc(rw.why || 'рерайт не ответил')}</span>`
-    : rw.own_openai ? '<span class="pill s-done">ваш ключ OpenAI</span>'
-    : rw.own_claude ? '<span class="pill s-done">ваша подписка Claude</span>'
-    : (rw.server_openai || rw.server_claude)
-      ? '<span class="pill s-idle">серверный ключ владельца</span>'
-      : '<span class="pill s-error">ключа нет — текст делать нечем</span>';
-  return `<div class="secbody"><div class="note muted">Текст: ${state}${
-    rw.own_openai ? ' <a href="#" id="rw-drop">снять свой</a>' : ''}${hintDot(
-    'Ключ для текста добавляется той же кнопкой ниже — провайдер '
-    + '«OpenAI · текст».')}</div></div>`;
+  if (!rw.ok)
+    return `<div class="secbody"><div class="note muted">Текст: <span class="note bad">${
+      esc(rw.why || 'рерайт не ответил')}</span></div></div>`;
+  const sources = [rw.source, rw.claude_source, rw.codex_source];
+  const nothing = sources.every(s => !s || s === 'none');
+  const claudeServerText = rw.server_claude
+    ? 'серверная подписка Claude владельца' : 'серверный ключ владельца';
+  const line = (own, source, doneText, serverText, idleText, dropId, dropText) => {
+    if (own) return `<div class="note muted"><span class="pill s-done">${esc(doneText)
+      }</span> <a href="#" id="${dropId}">${esc(dropText)}</a></div>`;
+    if (source === 'server') return `<div class="note muted"><span class="pill s-idle">${
+      esc(serverText)}</span></div>`;
+    return `<div class="note muted"><span class="pill s-idle">${esc(idleText)}</span></div>`;
+  };
+  return `<div class="secbody">
+    <div class="note muted">Текст:${hintDot(
+      'Ключ для текста и свои подписки Codex/Claude добавляются той же кнопкой ниже — '
+      + 'провайдеры «OpenAI · текст», «Своя подписка Codex», «Своя подписка Claude».')}</div>
+    ${nothing ? '<div class="note muted"><span class="pill s-error">'
+      + 'ключа нет — текст делать нечем</span></div>' : ''}
+    ${line(rw.own_openai, rw.source, 'ваш ключ OpenAI', 'серверный ключ владельца',
+      'свой ключ OpenAI не задан', 'rw-drop', 'снять свой')}
+    ${line(rw.own_codex, rw.codex_source, 'ваша подписка Codex',
+      'серверная подписка Codex владельца', 'своя подписка Codex не задана',
+      'rw-drop-codex', 'снять свою')}
+    ${line(rw.own_claude, rw.claude_source, 'ваша подписка Claude', claudeServerText,
+      'своя подписка Claude не задана', 'rw-drop-claude', 'снять свою')}
+  </div>`;
 }
 
 /* Карточка своих ключей. Одна и та же на экране ключей и в профиле (20.09.2026):
@@ -1272,6 +1306,29 @@ function subFormHtml(provider, forLabel){
       <span class="note bad" id="sf-err" style="margin:0"></span></div>`;
 }
 
+// Текст «чего не хватает» для пустой формы subFormHtml — общий для админского блока
+// подписок (textSubsCard) и своей подписки в «Моих ключах» (wireKeys), чтобы не
+// разойтись при первой правке (ревью 22.09.2026, Issue 4).
+function subEmptyText(provider){
+  return provider === 'codex' ? 'вставьте содержимое auth.json' : 'вставьте токен';
+}
+
+// Подключить filepicker внутри уже вставленной разметки subFormHtml: файл целиком —
+// в #sf-secret, имя — в #sf-fname, сам инпут сбрасывается, чтобы повторный выбор того
+// же файла тоже сработал. Общий для textSubsCard и wireKeys (Issue 4) — нет filepicker'а
+// только у формы Claude (там обычное password-поле, #sf-file отсутствует).
+function wireSubFile(container){
+  const file = container.querySelector('#sf-file');
+  if (!file) return;
+  file.onchange = async () => {
+    const f = file.files[0];
+    if (!f) return;
+    container.querySelector('#sf-secret').value = await f.text();
+    container.querySelector('#sf-fname').textContent = f.name;
+    file.value = '';
+  };
+}
+
 async function textSubsCard(){
   const card = $(`<div class="card" id="subs-card" style="margin-bottom:16px"></div>`)
     .firstElementChild;
@@ -1343,21 +1400,13 @@ async function textSubsCard(){
         + subFormHtml(provider, item ? item.label : '');
       const secret = form.querySelector('#sf-secret');
       const err = form.querySelector('#sf-err');
-      const file = form.querySelector('#sf-file');
-      if (file) file.onchange = async () => {
-        const f = file.files[0];
-        if (!f) return;
-        secret.value = await f.text();
-        form.querySelector('#sf-fname').textContent = f.name;
-        file.value = '';
-      };
+      wireSubFile(form);
       form.querySelector('#sf-no').onclick = () => { form.hidden = true; form.innerHTML = ''; };
       const ok = form.querySelector('#sf-ok');
       ok.onclick = async () => {
         err.textContent = '';
         if (!secret.value.trim()){
-          err.textContent = provider === 'codex' ? 'вставьте содержимое auth.json'
-                                                : 'вставьте токен';
+          err.textContent = subEmptyText(provider);
           return secret.focus();
         }
         ok.disabled = true;
@@ -5811,6 +5860,24 @@ async function wireKeys(root, d){
       });
   };
 
+  // Своя подписка Codex/Claude (22.09.2026) — хранилище то же (rewrite/server.py),
+  // поэтому и снятие тем же путём: пустое значение соответствующего поля.
+  const wireSubDrop = (id, field, question) => {
+    const a = root.querySelector(id);
+    if (!a) return;
+    a.onclick = ev => {
+      ev.preventDefault();
+      confirmInline(a, question, async () => {
+        try{ await post('/ui/keys/rewrite', {[field]: ''}); await render(); }
+        catch(e){ toast(e.message); }
+      });
+    };
+  };
+  wireSubDrop('#rw-drop-codex', 'codex_auth',
+    'Снять свою подписку Codex? Текст станет писаться на серверной, если она задана.');
+  wireSubDrop('#rw-drop-claude', 'oauth_token',
+    'Снять свою подписку Claude? Текст станет писаться на серверной, если она задана.');
+
   root.querySelectorAll('a.dropkey').forEach(a => a.onclick = ev => {
     ev.preventDefault();
     // Ключ снимается сразу и без отмены — спросить обязаны, но не попапом.
@@ -5826,26 +5893,64 @@ async function wireKeys(root, d){
     // Форма ключа — в окне (18.09.2026): в строке карточки она жила криво и мешала
     // читать сам список. Провайдеры спрашиваем у кабинета, как и раньше.
     const ref = await api('/ui/keys/families');
-    modal('Добавить ключ', `
+    // Обычное поле ключа — как и было; для своих подписок Codex/Claude (22.09.2026) его
+    // на лету подменяет subFormHtml (та же разметка, что в админском блоке подписок).
+    const normalField = `<div class="fldrow"><label>Ключ</label>
+        <input id="kval" type="password" autocomplete="off" style="flex:1;min-width:0"></div>`;
+    const m = modal('Добавить ключ', `
       <div class="fldrow"><span class="lh"><label for="kfam">Провайдер</label>${
         hintDot((ref.note || '')
         + ' Значение нигде не показывается: в списке видно только хвост.')}</span>
         <select id="kfam">${ref.families.map(f =>
           `<option value="${esc(f.key)}">${esc(f.title)}</option>`).join('')}
-          <option value="__rewrite">OpenAI · текст</option></select></div>
-      <div class="fldrow"><label>Ключ</label>
-        <input id="kval" type="password" autocomplete="off" style="flex:1;min-width:0"></div>
+          <option value="__rewrite">OpenAI · текст</option>
+          <option value="__rewrite_codex">Своя подписка Codex</option>
+          <option value="__rewrite_claude">Своя подписка Claude</option></select></div>
+      <div id="kval-wrap">${normalField}</div>
 `,
       {ok: 'Сохранить', onOk: async (box, close) => {
+        const fam = box.querySelector('#kfam').value;
+        // Своя подписка Codex/Claude — своим путём: не генерик /ui/keys {add:}, второго
+        // места хранения секрета не заводим, значение уходит только в рерайт.
+        if (fam === '__rewrite_codex' || fam === '__rewrite_claude'){
+          const provider = fam === '__rewrite_codex' ? 'codex' : 'claude';
+          const secret = box.querySelector('#sf-secret');
+          const val = (secret.value || '').trim();
+          if (!val) throw new Error(subEmptyText(provider));
+          await post('/ui/keys/rewrite', fam === '__rewrite_codex'
+            ? {codex_auth: val} : {oauth_token: val});
+          secret.value = '';
+          close();
+          await render();
+          return;
+        }
         const val = box.querySelector('#kval').value.trim();
         if (!val) throw new Error('Ключ пустой.');
-        const fam = box.querySelector('#kfam').value;
         // Ключ рерайта хранит сам Rewrite: второго места хранения секрета не заводим.
         if (fam === '__rewrite') await post('/ui/keys/rewrite', {openai_api_key: val});
         else await post('/ui/keys', {add: {[fam]: [val]}});
         close();
         await render();
       }});
+
+    // Подмена поля ключа на форму своей подписки — и обратно. Собственная строка кнопок
+    // subFormHtml (`#sf-ok`/`#sf-no`) дублирует футер самого modal(), поэтому прячется:
+    // сохранение и отмена — только через него. Пересобираем обычное поле, только когда
+    // реально уходим с формы подписки — иначе переключение между обычными провайдерами
+    // (например OpenAI · текст → другой обычный ключ) молча стирало бы уже вписанное
+    // значение #kval (ревью 22.09.2026, Issue 3).
+    const wrap = m.body.querySelector('#kval-wrap');
+    m.body.querySelector('#kfam').onchange = ev => {
+      const fam = ev.target.value;
+      if (fam !== '__rewrite_codex' && fam !== '__rewrite_claude'){
+        if (!wrap.querySelector('#kval')) wrap.innerHTML = normalField;
+        return;
+      }
+      wrap.innerHTML = subFormHtml(fam === '__rewrite_codex' ? 'codex' : 'claude', 'own');
+      const ownRow = wrap.querySelector('#sf-ok').closest('.row');
+      if (ownRow) ownRow.hidden = true;
+      wireSubFile(wrap);
+    };
   };
 }
 

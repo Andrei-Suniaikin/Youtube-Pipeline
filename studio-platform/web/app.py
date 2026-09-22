@@ -1725,25 +1725,57 @@ def _rewrite_keys(sid: str) -> dict:
     return {"ok": True,
             "own_openai": bool(body.get("own_openai_key_set")),
             "own_claude": bool(body.get("own_claude_token_set")),
+            "own_codex": bool(body.get("own_codex_auth_set")),
             "server_openai": bool(body.get("openai_configured")),
             "server_claude": bool(body.get("claude_configured")),
             "source": body.get("openai_key_source") or "",
-            "claude_source": body.get("claude_key_source") or ""}
+            "claude_source": body.get("claude_key_source") or "",
+            "codex_source": body.get("codex_key_source") or ""}
 
 
 class RewriteKeyIn(BaseModel):
-    openai_api_key: str = ""      # пусто = снять свой ключ, снова заработает серверный
+    # None = поле не трогать (не было в запросе), "" = снять свою подписку/ключ —
+    # тот же приём, что уже используется в SubscriptionEditIn (partial update).
+    openai_api_key: Optional[str] = None
+    codex_auth: Optional[str] = None
+    oauth_token: Optional[str] = None
 
 
 @app.post("/ui/keys/rewrite")
 def ui_keys_rewrite(body: RewriteKeyIn, request: Request):
-    """Записать свой ключ OpenAI для текста. Хранит его Rewrite, пульт только передаёт:
-    второго места хранения секрета заводить нельзя."""
+    """Записать свои ключ OpenAI / подписку Codex / подписку Claude для текста.
+
+    Хранит их Rewrite, пульт только передаёт: второго места хранения секрета заводить
+    нельзя. Присланное поле (даже пустой строкой) — сигнал «сохранить/снять»,
+    отсутствующее — «не трогать»."""
     sid = getattr(request.state, "sid", "")
-    code, out = _rw("/settings/keys", sid, {"openai_api_key": body.openai_api_key})
+    fields: dict = {}
+    if body.openai_api_key is not None:
+        fields["openai_api_key"] = body.openai_api_key
+    if body.codex_auth is not None:
+        fields["codex_auth"] = body.codex_auth
+    if body.oauth_token is not None:
+        token = body.oauth_token
+        if token.strip():
+            subs = _text_subs()
+            try:
+                token = subs.normalize_claude_token(token)
+            except subs.SubscriptionError as exc:
+                raise HTTPException(422, str(exc))
+        fields["oauth_token"] = token
+    if not fields:
+        return {"ok": True, "set": {}}
+    code, out = _rw("/settings/keys", sid, fields)
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
-    return {"ok": True, "set": bool(body.openai_api_key.strip())}
+    result = {}
+    if "openai_api_key" in fields:
+        result["openai"] = bool(fields["openai_api_key"].strip())
+    if "codex_auth" in fields:
+        result["codex"] = bool(fields["codex_auth"].strip())
+    if "oauth_token" in fields:
+        result["claude"] = bool(fields["oauth_token"].strip())
+    return {"ok": True, "set": result}
 
 
 # ─────────────────── подписки для текста: Codex и Claude (22.09.2026) ───────────────────
