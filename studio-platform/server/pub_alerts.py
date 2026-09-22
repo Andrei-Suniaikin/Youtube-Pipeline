@@ -516,7 +516,13 @@ def check_usage_near_limit(c, now, tenant=None) -> list:
     limits = snap.get("limits") if isinstance(snap.get("limits"), dict) else {}
     hourly = snap.get("hourly") if isinstance(snap.get("hourly"), dict) else {}
     limit = _f(limits.get("img_gen_per_hour_limit"))
-    used = _f(hourly.get("image_generation"))
+    used = hourly.get("image_generation")
+    # Провайдер с 21.09.2026 отдаёт расход словарём {current_usage, window_start}; снимок
+    # старой записи мог остаться в базе. `_f(dict)` дал бы ноль, и тревога молчала бы
+    # даже при исчерпанном лимите (см. main.fastgen_count).
+    if isinstance(used, dict):
+        used = used.get("current_usage")
+    used = _f(used)
     if limit <= 0 or used / limit * 100 < USAGE_PCT:
         return []
     return [Alert(

@@ -4,41 +4,43 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Golos+Text:wght@400..800&family=IBM+Plex+Mono:wght@400;500&display=swap">
 <style>
-  /* Тёмная тема с фиолетовым акцентом. Правила, по которым она собрана, а не просто
-     подобрана на глаз:
-
-     — три уровня глубины и не больше: фон, поверхность, приподнятая поверхность.
-       Больше уровней в тёмной теме читаются как грязь, а не как иерархия;
-     — фиолетовый только для действия и текущего места. Состояния (готово, идёт,
-       ошибка) остаются своими цветами: если акцент раскрасить всё, статус перестаёт
-       быть заметным, а он здесь важнее красоты;
-     — на тёмном чистый белый текст «звенит», поэтому основной — чуть приглушённый,
-       а белый оставлен заголовкам и активным элементам;
-     — состояния на тёмном строятся как цветной текст на его же полупрозрачной
-       заливке: так они читаются и не спорят с фоном. */
+  /* Облик «Монтажная» (выбор владельца 22.09.2026): пульт как монтажный стол.
+     Графитовые панели без оттенка, хром отступает; цвет появляется только там, где он
+     значит состояние, — как цвет клипа на дорожке. Действие — светлая «кость» без
+     оттенка: её нельзя спутать ни с одним состоянием. Состояния различимы и без
+     цвета: готово — тихий тон с ✓, идёт — бегущая штриховка, ждёт — неподвижная
+     штриховка в контуре, ошибка — единственная сплошная яркая заливка с «!»,
+     не начато — пустой контур. */
   :root{
-    --bg:#0d0b12;            /* почти чёрный с фиолетовым подтоном */
-    --card:#16131d;          /* поверхность */
-    --card-2:#1d1929;        /* приподнятая: строки таблиц при наведении, поля ввода */
-    --line:#2a2438;
-    --line-2:#3a3150;
-    --ink:#eceaf2;           /* основной текст */
-    --ink-hi:#ffffff;        /* заголовки и активное */
-    --muted:#9d96b5;
-    --acc:#8b5cf6;           /* фиолетовый: действие и текущее место */
-    --acc-hi:#a78bfa;
-    --acc-dim:rgba(139,92,246,.16);
-    --ok:#4ade80;    --ok-bg:rgba(74,222,128,.13);
-    --run:#60a5fa;   --run-bg:rgba(96,165,250,.14);
-    --wait:#fbbf24;  --wait-bg:rgba(251,191,36,.14);
-    --bad:#f87171;   --bad-bg:rgba(248,113,113,.14);
-    --off:#7c748f;   --off-bg:rgba(124,116,143,.15);
+    --bg:#26272b;            /* зазор между панелями */
+    --card:#2f3035;          /* панель */
+    --card-2:#383a3f;        /* приподнятое: наведение, всплывающее */
+    --well:#212226;          /* колодец поля ввода */
+    --strip:#2a2b30;         /* полоса заголовка панели */
+    --line:#393b40;
+    --line-2:#4b4d53;
+    --ink:#dcdde0;           /* основной текст */
+    --ink-hi:#f4f4f5;        /* заголовки и активное */
+    --muted:#a3a5ac;         /* 5.35:1 на панели */
+    --acc:#e6e2d8;           /* кость: действие и текущее место */
+    --acc-hi:#f4f2ec;
+    --acc-dim:rgba(230,226,216,.13);
+    --on-acc:#1b1c1f;
+    --ok:#8ddba6;   --ok-bg:rgba(141,219,166,.14);
+    --run:#93c6f6;  --run-bg:rgba(147,198,246,.14);  --run-clip:#35698f;
+    --wait:#efc063; --wait-bg:rgba(239,192,99,.14);
+    --bad:#ff9483;  --bad-bg:rgba(255,148,131,.15);  --bad-clip:#e8604d;
+    --off:#a9abb2;  --off-bg:rgba(169,171,178,.12);
     --surface:var(--card); --border:var(--line);
-    --r:12px;
+    --r:4px;
+    --mono:"IBM Plex Mono",ui-monospace,"SF Mono",Menlo,monospace;
   }
   *{box-sizing:border-box}
-  ::selection{background:var(--acc);color:#fff}
+  ::selection{background:var(--acc);color:var(--on-acc)}
   body{margin:0;background:var(--bg);color:var(--ink);
        font:15px/1.55 -apple-system,BlinkMacSystemFont,"SF Pro Display","Segoe UI",
             Inter,Roboto,system-ui,sans-serif;
@@ -60,7 +62,7 @@
             border-bottom:2px solid transparent;white-space:nowrap;transition:color .15s}
   nav a.tab:hover{color:var(--ink)}
   nav a.tab.on{color:var(--ink-hi);border-bottom-color:var(--acc)}
-  nav span.soon{padding:15px 13px;color:#5a5470;cursor:not-allowed;white-space:nowrap}
+  nav span.soon{padding:15px 13px;color:var(--off);cursor:not-allowed;white-space:nowrap}
   nav span.soon::after{content:" скоро";font-size:11px;opacity:.8}
   /* Имя человека — вход в профиль (20.09.2026), отдельной вкладки «Профиль» больше нет:
      поэтому `margin-left:auto` переехал сюда с неё. Вертикальные отступы сняты со span и
@@ -88,7 +90,7 @@
                                           box-shadow:0 0 0 3px var(--acc-dim)}
   textarea{width:100%;min-height:120px;resize:vertical;
            font-family:ui-monospace,"SF Mono",Menlo,monospace;font-size:13px}
-  button{background:var(--acc);color:#fff;border:0;border-radius:9px;padding:9px 16px;
+  button{background:var(--acc);color:var(--on-acc);border:0;border-radius:9px;padding:9px 16px;
          cursor:pointer;font-weight:650;letter-spacing:-.01em;transition:background .15s}
   button:hover{background:var(--acc-hi)}
   button.ghost{background:transparent;color:var(--ink);border:1px solid var(--line-2)}
@@ -315,18 +317,24 @@
 
   /* Месяцы рядом, а не в столбик: канал с расписанием на квартал должен читаться
      одним взглядом, без прокрутки. */
-  #months{display:grid;grid-template-columns:repeat(auto-fill,minmax(268px,1fr));gap:20px}
+  #months{display:grid;grid-template-columns:repeat(auto-fill,minmax(268px,1fr));gap:20px;
+          padding:12px 14px 14px}
   .mname{font-weight:650;margin-bottom:8px;text-transform:capitalize;font-size:13px}
   .dow,.grid7{display:grid;grid-template-columns:repeat(7,1fr);gap:3px}
   .dow span{font-size:10px;color:var(--muted);text-align:center;padding-bottom:3px}
   .day{position:relative;height:34px;border:1px solid var(--line);border-radius:6px;
        padding:3px 5px;font-size:11px}
-  .day.out{opacity:.32;border-style:dashed}
-  .day.miss{border-color:rgba(248,113,113,.45)}
+  /* Дня без выхода нет в расписании — у него нет рамки, но число читается: прежняя
+     прозрачность .32 давала 1.78:1, и дату было не разобрать. */
+  .day.out{border-color:transparent}
+  .day.out .n{color:#9a9ca3}
+  .day.miss{border-color:rgba(255,148,131,.45)}
+  .day.blocked{border-color:var(--bad)}
   .day .n{color:var(--muted)}
   .day .cnt{position:absolute;top:2px;right:4px;font-weight:700;font-size:11px;
             color:var(--ok)}
-  .day .cnt.work{color:var(--acc-hi)}
+  .day .cnt.run{color:var(--run)}
+  .day .cnt.plan{color:var(--wait)}
   .day .cnt.bad{color:var(--bad)}
   /* .fields — сетка полей формы (пресет, настройки проекта/канала). Боковой отступ
      18px и нижний 16px — в тон заголовку .sec (пункт 7 ТЗ, отступы): без него поля
@@ -390,7 +398,7 @@
   .pitem .pline .facts{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
                        white-space:nowrap;margin:0}
   .pitem .body{min-width:0}
-  .pitem .pacts{white-space:nowrap;align-self:center;display:flex;gap:6px}
+  .pitem .pacts{white-space:nowrap;align-self:center;display:flex;gap:2px}
   #paidline{margin-top:6px}
 
   /* Тосты: ошибка действия видна там, где смотрит глаз, и не перекрывает работу.
@@ -462,7 +470,7 @@
   .filepick:focus-within .pickbtn{border-color:var(--acc);box-shadow:0 0 0 3px var(--acc-dim)}
   .modes{display:flex;gap:7px;margin-bottom:14px;flex-wrap:wrap}
   .modes button{background:transparent;color:var(--muted);border:1px solid var(--line-2)}
-  .modes button.on{background:var(--acc);color:#fff;border-color:var(--acc)}
+  .modes button.on{background:var(--acc);color:var(--on-acc);border-color:var(--acc)}
 
   /* Виды пресетов — один раскрывающийся список вместо одиннадцати кнопок в строке.
      Строкой они занимали всю ширину шапки и читались как одиннадцать действий, хотя
@@ -486,6 +494,282 @@
   .fldrow>label:first-child{min-width:175px;color:var(--muted);font-size:12.5px;font-weight:550}
 
   @media (max-width:640px){ .grid{grid-template-columns:1fr 1fr} .ev time{flex-basis:76px} }
+  /* ═══════════ Облик «Монтажная» — компоненты ═══════════
+     Стоит последним, чтобы при равной специфичности выигрывать у базовых правил выше.
+     Базовые правила оставлены как есть: они описывают раскладку, а здесь — облик. */
+  body{font:14px/1.5 "Golos Text",-apple-system,"Segoe UI",system-ui,sans-serif;
+       font-weight:420;letter-spacing:0;font-feature-settings:"tnum" 1}
+  a{color:var(--ink-hi);text-decoration:underline;text-decoration-color:rgba(244,244,245,.28);
+    text-underline-offset:3px;text-decoration-thickness:1px}
+  a:hover{color:var(--ink-hi);text-decoration-color:var(--ink-hi)}
+  :focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+  ::-webkit-scrollbar-thumb{background:var(--line-2);border-radius:2px}
+
+  /* шапка: верхняя строка монтажки, тёмная и тихая */
+  header{background:#1e1f22;backdrop-filter:none;border-bottom:1px solid #17181a}
+  nav,main{max-width:1240px}
+  nav .brand{font-size:15px;font-weight:700;letter-spacing:-.01em;padding:11px 0;margin-right:26px}
+  nav .brand b{color:var(--muted)}
+  nav a.tab{padding:11px 12px;font-size:13.5px;font-weight:500;color:var(--muted);
+            text-decoration:none;border-bottom-width:2px}
+  nav a.tab.on{color:var(--ink-hi);border-bottom-color:var(--acc)}
+  nav .who{font-size:13.5px}
+  nav .who a{text-decoration:none}
+
+  main{padding:22px 20px 70px}
+  h1{font-size:23px;line-height:1.2;font-weight:650;letter-spacing:-.015em}
+  .sub{font-size:13px;margin-bottom:14px}
+  .back{font-size:13px;text-decoration:none;margin-bottom:10px}
+  .mono,textarea{font-family:var(--mono)}
+  .mono{font-size:11.5px}
+
+  /* панели: без рамок, тоном; заголовок — полоса, как у панели монтажки */
+  .card{background:var(--card);border:0;border-radius:var(--r)}
+  .sec{background:var(--strip);border-bottom:0;padding:8px 14px;font-size:12.5px;
+       font-weight:600;color:var(--ink);letter-spacing:0;border-radius:var(--r) var(--r) 0 0}
+  .card > .sec:not(:first-child){border-radius:0}
+  .sec.stage-head{padding:6px 8px 6px 14px}
+  .secbody{padding:12px 14px 14px}
+  .fields{padding:12px 14px 14px;gap:16px 18px}
+
+  /* таблицы: заголовки строчными, линии едва заметны */
+  th{text-transform:none;letter-spacing:0;font-size:12px;font-weight:500;color:var(--muted);
+     padding:8px 14px;border-bottom:1px solid var(--line)}
+  td{padding:9px 14px;border-bottom:1px solid rgba(255,255,255,.045)}
+  tr.row:hover,tr[data-job]:hover{background:#34363b}
+  td.muted{font-size:13px}
+  td.st + td.muted{white-space:nowrap}      /* время создания в очереди — одной строкой */
+
+  /* кнопки: действие — кость, остальное — контур */
+  button{border-radius:var(--r);padding:7px 14px;font-weight:600;font-size:13.5px;letter-spacing:0}
+  button:hover{background:var(--acc-hi)}
+  button:disabled{opacity:1;background:transparent;color:#7d7f86;
+                  box-shadow:inset 0 0 0 1px var(--line-2);cursor:not-allowed}
+  button.ghost{background:transparent;color:var(--ink);border:0;
+               box-shadow:inset 0 0 0 1px var(--line-2)}
+  button.ghost:hover{background:var(--card-2);color:var(--ink-hi)}
+  button.ghost:disabled{color:#7d7f86;box-shadow:none;background:transparent}
+  button.small{padding:5px 11px;font-size:12.5px;border-radius:var(--r)}
+  input[type=checkbox],input[type=radio]{accent-color:var(--acc)}
+  select,input,textarea{background:var(--well);border:1px solid var(--line);border-radius:3px;
+                        padding:7px 10px;font-size:13.5px}
+  select:focus,input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-dim)}
+  .fld label{font-size:12px}
+
+  /* Значки-кнопки — как IconButton в MUI (просьба владельца 22.09.2026: «иконки вместо
+     слов, как в муи нативные»): круглые, без рамки, подсветка кругом по наведению.
+     Слово — в `title` и `aria-label`; необратимое краснеет на наведении. */
+  .iconbtn{width:32px;height:32px;border:0;border-radius:50%;background:transparent;
+           color:var(--muted);box-shadow:none;padding:0}
+  .iconbtn svg{width:20px;height:20px}
+  .iconbtn + .iconbtn{margin-left:2px}
+  .iconbtn:hover{background:rgba(255,255,255,.08);color:var(--ink-hi)}
+  .iconbtn.bad:hover{background:var(--bad-bg);color:var(--bad);border-color:transparent}
+  .iconbtn:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
+  .iconbtn:disabled{background:transparent;box-shadow:none;opacity:.4}
+
+  /* теги состояния: прямоугольник с тоном, слово внутри */
+  .pill{border-radius:3px;padding:2px 8px;font-size:12px;font-weight:600;letter-spacing:0}
+  .s-done{background:var(--ok-bg);color:var(--ok)}
+  .s-running{background:var(--run-bg);color:var(--run)}
+  .s-queued{background:var(--wait-bg);color:var(--wait)}
+  .s-error{background:var(--bad-bg);color:var(--bad)}
+  .s-idle{background:var(--off-bg);color:var(--off)}
+  .s-off{border:1px dashed var(--line-2)}
+
+  /* Клипы на дорожке. В списке проектов колонка «Готово» — дорожка из клипов одной
+     ширины. Порядок заметности — от того, что требует внимания: идёт (яркая бегущая
+     штриховка) и ждёт (штриховка в янтарном контуре) громче всего, готово — тихий тон
+     с ✓, не начато — пустой контур. Сплошной яркой заливки у «готово» нет нарочно:
+     иначе список из двадцати проектов становился морем зелёного и тянул взгляд туда,
+     где делать нечего. */
+  tr.row td:nth-child(3){white-space:nowrap}
+  tr.row td:nth-child(3) .note{white-space:normal}
+  tr.row td:nth-child(3) .pill{min-width:112px;margin:0 1px 2px 0;padding:3px 8px;
+        border-radius:2px;font-weight:550;text-align:left;vertical-align:top}
+  tr.row td:nth-child(3) .pill.s-done::before{content:"✓ ";font-weight:700}
+  tr.row td:nth-child(3) .pill.s-idle{background:transparent;color:var(--muted);
+        box-shadow:inset 0 0 0 1px var(--line-2)}
+  tr.row td:nth-child(3) .pill.s-running{background:var(--run-clip);color:#eef5fc;
+        background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.14) 0 5px,transparent 5px 10px);
+        background-size:28px 28px;animation:clip-run 1.2s linear infinite}
+  tr.row td:nth-child(3) .pill.s-queued{color:var(--wait);background-color:transparent;
+        background-image:repeating-linear-gradient(135deg,rgba(239,192,99,.2) 0 3px,transparent 3px 7px);
+        box-shadow:inset 0 0 0 1px var(--wait)}
+  tr.row td:nth-child(3) .pill.s-error{background:var(--bad-clip);color:#210b07}
+  tr.row td:nth-child(3) .pill.s-error::before{content:"! ";font-weight:800}
+  @keyframes clip-run{to{background-position:28px 0}}
+
+  /* Тонкая полоса этапов (выпуски, строки очереди) — та же азбука. */
+  .segs{gap:2px}
+  .segs i{height:7px;border-radius:1px;background:transparent;box-shadow:inset 0 0 0 1px var(--line-2)}
+  .segs i.done{background:rgba(141,219,166,.5);box-shadow:none}
+  .segs i.running{background:var(--run);box-shadow:none;
+        background-image:repeating-linear-gradient(135deg,rgba(0,0,0,.28) 0 3px,transparent 3px 6px);
+        background-size:17px 17px;animation:clip-run-s 1s linear infinite}
+  .segs i.queued{background-color:transparent;opacity:1;box-shadow:inset 0 0 0 1px var(--wait);
+        background-image:repeating-linear-gradient(135deg,rgba(239,192,99,.45) 0 2px,transparent 2px 4px)}
+  .segs i.error{background:var(--bad-clip);box-shadow:none;height:9px;margin-top:-1px}
+  .segs i.off{background:transparent;border:0;box-shadow:inset 0 0 0 1px var(--line-2)}
+  @keyframes clip-run-s{to{background-position:17px 0}}
+
+  /* Шапка проекта: дорожка во всю ширину, клипы подписаны своими этапами (из `title`),
+     над ней — линейка, на границе сделанного стоит плейхед. Это и есть главное место
+     облика: где стоит проект, читается словами, а не шестью безымянными чёрточками. */
+  .head > div:first-child{flex:1 1 auto;min-width:0}
+  .head .segs{max-width:none !important;margin-top:12px !important;gap:2px;position:relative;
+        padding-top:9px;
+        background:repeating-linear-gradient(90deg,var(--line-2) 0 1px,transparent 1px 10px) 0 0/100% 4px no-repeat,
+                   repeating-linear-gradient(90deg,#65676e 0 1px,transparent 1px 50px) 0 0/100% 7px no-repeat}
+  .head .segs i{height:26px;position:relative;overflow:visible;border-radius:2px;
+        font-style:normal;font-size:12px;line-height:26px;font-weight:550;padding:0 9px;
+        color:#8e9097;white-space:nowrap;text-overflow:ellipsis;margin-top:0}
+  .head .segs i::after{content:attr(title);display:block;overflow:hidden;text-overflow:ellipsis}
+  .head .segs i.done{background:var(--ok-bg);color:var(--ok);box-shadow:inset 3px 0 0 var(--ok)}
+  .head .segs i.done::after{content:"✓ " attr(title)}
+  .head .segs i.running{background-color:var(--run-clip);color:#eef5fc;
+        background-image:repeating-linear-gradient(135deg,rgba(255,255,255,.13) 0 6px,transparent 6px 12px);
+        background-size:34px 34px;animation:clip-run-l 1.4s linear infinite;box-shadow:inset 3px 0 0 var(--run)}
+  .head .segs i.queued{background-color:transparent;color:var(--wait);
+        background-image:repeating-linear-gradient(135deg,rgba(239,192,99,.2) 0 4px,transparent 4px 9px);
+        box-shadow:inset 0 0 0 1px var(--wait)}
+  .head .segs i.error{background:var(--bad-clip);color:#210b07;box-shadow:none}
+  .head .segs i.error::after{content:"! " attr(title);font-weight:700}
+  @keyframes clip-run-l{to{background-position:34px 0}}
+  /* плейхед: левый край первого несделанного клипа */
+  .head .segs i:not(.done):not(:not(.done) ~ i)::before{content:"";position:absolute;left:-2px;
+        top:-12px;bottom:-4px;width:2px;background:var(--acc);border-radius:1px;z-index:2}
+  .head .segs + .note{font-size:12.5px;font-weight:550;margin-top:6px}
+
+  /* строки-этапы и точки: квадратная метка вместо круга */
+  .stage{padding:9px 14px;border-bottom:1px solid rgba(255,255,255,.045);gap:12px}
+  .stage .dot,.cal .dot{border-radius:3px;flex-basis:20px;height:20px;font-size:11px}
+  .stage .name{font-weight:600}
+  .stage .note,.stage .facts{margin-top:1px;line-height:1.4}
+  .facts{font-size:13px}
+  .note{font-size:12.5px}
+  .pitem:hover{background:#313237}
+
+  /* Плашка «задачи никто не выполняет» — янтарная, с полосой слева: она про деньги и
+     время (поставленное не пойдёт), и тише обычной панели ей быть нельзя. */
+  .card.alert-wait{background:#332d22;box-shadow:inset 3px 0 0 var(--wait)}
+  .card.alert-wait .stage{border-bottom:0;padding:11px 16px}
+  .card.alert-wait .dot{display:none}
+  .card.alert-wait .name{color:var(--wait)}
+  .card.alert-wait .facts{color:var(--ink);max-width:96ch}
+
+  /* вкладки проекта: переключатель страниц, как внизу монтажки */
+  .subtabs{border-bottom:0;background:#232428;border-radius:var(--r);padding:3px;gap:2px;
+           margin-bottom:12px;display:inline-flex;flex-wrap:wrap}
+  .subtabs a{border:0;margin:0;padding:6px 13px;border-radius:3px;font-size:13px;font-weight:500;
+             text-decoration:none;display:inline-flex;align-items:center}
+  .subtabs a:hover{background:#2c2d32}
+  .subtabs a.on{background:var(--card-2);color:var(--ink-hi);box-shadow:inset 0 -2px 0 var(--acc)}
+  .subtabs .cnt{border:0;background:rgba(255,255,255,.06);color:var(--muted);min-width:18px;
+                padding:0 5px;margin-left:7px;height:17px;border-radius:2px;font-weight:500;
+                font-size:11.5px;vertical-align:baseline}
+  .subtabs a.on .cnt{background:rgba(255,255,255,.1);border:0;color:var(--ink)}
+
+  /* Выбор режима — сегмент, а не кнопки: выбранный пункт светлее соседей, но НЕ цвета
+     «кости». Кость — цвет платного действия («Начать», «Получить текст»), и режим,
+     закрашенный ею, выглядел бы как уже нажатый заказ. */
+  .modes{gap:0;background:var(--well);border-radius:var(--r);padding:3px;display:inline-flex}
+  .modes button{border:0;background:transparent;color:var(--muted);padding:6px 14px;font-size:13px;
+                box-shadow:none}
+  .modes button:hover{background:var(--card-2);color:var(--ink)}
+  .modes button.on{background:var(--card-2);color:var(--ink-hi);border:0;
+                   box-shadow:inset 0 0 0 1px var(--line-2),inset 0 -2px 0 var(--ink)}
+  .langs{border:0;background:var(--well);border-radius:var(--r);padding:8px;gap:4px}
+  .langs label{border:0;border-radius:3px;padding:3px 9px 3px 6px;font-size:12.5px;
+               background:rgba(255,255,255,.04)}
+  .langs label:hover{background:rgba(255,255,255,.08)}
+  .langs label.on{background:var(--acc-dim);color:var(--ink-hi);box-shadow:inset 0 0 0 1px var(--acc)}
+
+  /* пакетный запуск: у каждого этапа своя колонка, без рамки */
+  .bcard{border:0 !important;border-radius:3px !important;background:#2a2b30;padding:10px 12px !important}
+
+  /* Нативные части (галочки, списки, плеер, подсказка поля) — тёмные: без этого
+     браузер рисовал белую пустую галочку почти как отмеченную «кость». */
+  :root{color-scheme:dark}
+  ::placeholder{color:#94969d;opacity:1}            /* 5.4:1 на колодце поля */
+  select{max-width:100%}
+  /* Фокус с клавиатуры у галочек и переключателей: базовое `input:focus{outline:0}`
+     гасило общее кольцо, и по списку языков Tab шёл вслепую. */
+  input[type=checkbox]:focus-visible,input[type=radio]:focus-visible{
+    outline:2px solid var(--acc);outline-offset:2px;box-shadow:none}
+  /* Недоступное поле (значение из пресета канала, запертая группа) — не как редактируемое. */
+  select:disabled,input:disabled,textarea:disabled{background:transparent;color:var(--muted);
+    border-style:dashed;cursor:not-allowed;opacity:1}
+  button.ghost:disabled{box-shadow:inset 0 0 0 1px var(--line)}
+  .iconbtn:disabled,.iconbtn:disabled:hover{background:transparent;color:#7d7f86;opacity:1}
+  td.when{white-space:nowrap}
+  .rel-below{display:block;margin:6px 0 0;white-space:nowrap}
+  #pf-open::after{content:" ▾";opacity:.7}
+  #pf-open[aria-expanded="true"]::after{content:" ▴"}
+  /* Кнопка в полосе заголовка панели: полоса держит её в себе (плавающая кнопка
+     вылезала в первую строку и сбивала её значки) и ставит по центру высоты. */
+  .card > .sec{display:flow-root}
+  .sec > [style*="float:right"]{margin:-4px 0}
+  .sec.grp{background:transparent;color:var(--muted);padding-top:12px;border-radius:0}
+  .thumb:focus-within .again,.thumb .again:focus-visible{opacity:1}
+  .thumb:has(video) .again{top:3px;bottom:auto}
+  dialog.lb .lbbar{color:var(--ink)}
+  .chcard.paused{opacity:1}
+  .chcard.paused h3{color:var(--muted)}
+  .chcard:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
+  #statusbtns{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}
+  .grid > div{padding:14px 18px}
+  .grid .k{padding:0;border:0}
+  /* фаза выпуска: ошибка — единственная сплошная заливка с «!» */
+  .pill.clip.s-error{background:var(--bad-clip);color:#210b07}
+  .pill.clip.s-error::before{content:"! ";font-weight:800}
+  /* «не участвует» — средней чертой, а не пустым контуром: иначе опубликованный выпуск
+     с пропущенным шагом читался как недоделанный */
+  .segs i.off{box-shadow:none;background:linear-gradient(var(--line-2),var(--line-2)) center/100% 1px no-repeat}
+
+  /* всплывающее */
+  .inline-ask,.qbox,.pf-menu{background:var(--card-2);border-color:var(--line-2);border-radius:var(--r);
+        box-shadow:0 14px 34px -12px rgba(0,0,0,.6)}
+  .inline-ask button.ghost:hover,.pf-menu button.ghost:hover{background:rgba(255,255,255,.08)}
+  .q{border-color:var(--line-2);width:15px;height:15px;font-size:10px}
+  .q:hover,.q:focus-visible{background:var(--acc-dim);border-color:var(--acc)}
+  .pf-item.on{color:var(--ink-hi);background:var(--acc-dim);border-color:var(--acc)}
+  .err{border-radius:var(--r);border:0;box-shadow:inset 3px 0 0 var(--bad)}
+  .bar{background:var(--well);border-radius:1px;height:4px}
+  .bar i{background:#8a8c93}
+  .pl{border:0;border-radius:var(--r);background:var(--well)}
+  .pl button{background:var(--ink)}
+  .pl button:hover{background:var(--ink-hi)}
+  .pl button i{border-left-color:var(--on-acc)}
+  .pl button.on i{background:linear-gradient(to right,var(--on-acc) 0 3px,transparent 3px 7px,var(--on-acc) 7px 10px)}
+  .pl .bar{background:rgba(255,255,255,.1)}
+  .pl .bar i{background:var(--ink)}
+  .thumb img{border-radius:2px}
+  .thumb .again{background:rgba(30,31,34,.88);border-radius:2px}
+  .thumb .again:hover{background:var(--acc);color:var(--on-acc)}
+  .chcard{border:0;border-left:3px solid var(--off);border-radius:var(--r)}
+  .chcard:hover{background:#33353a}
+  .grid .k,.res h3{text-transform:none;letter-spacing:0;font-size:12px;font-weight:500}
+  .grid div{border-right-color:rgba(255,255,255,.045)}
+  .grid{border-bottom-color:rgba(255,255,255,.045)}
+  #toasts .toast{background:var(--card-2);border:0;border-left:3px solid var(--acc);border-radius:var(--r)}
+  #toasts .toast.bad{border-left-color:var(--bad)}
+  #toasts .toast.ok{border-left-color:var(--ok)}
+  #toasts .toast.warn{border-left-color:var(--wait)}
+  dialog.modal{border:0;border-radius:var(--r);background:var(--card);color:var(--ink)}
+  .login{border:0;border-radius:6px}
+  .login .logo b{color:var(--muted)}
+
+  @media (prefers-reduced-motion:reduce){
+    .segs i.running,.head .segs i.running,tr.row td:nth-child(3) .pill.s-running{animation:none}
+  }
+  @media (max-width:640px){
+    main{padding:16px 16px 60px}
+    /* таблица шире телефона листается внутри своей панели, а не тащит страницу вбок */
+    .card:has(> table){overflow-x:auto}
+    .head{flex-wrap:wrap}
+    .head .segs i{font-size:10.5px;padding:0 5px}
+  }
 </style>
 </head>
 <body>
@@ -527,26 +811,39 @@ const DOT = {done:'✓', running:'◐', queued:'·', partial:'◑', cancelled:'�
    наведении и гаснет вместе с ней у `disabled`. Значок без подписи понятен не всем,
    поэтому рисуется он только вместе с `title` (см. `actions()`). */
 const ICON = {
+  // Значки — из набора Material Icons (Apache 2.0), как в MUI: владелец попросил
+  // «иконки вместо слов, как в муи нативные» (22.09.2026). Одна азбука на весь пульт.
   // перечёркнутый круг — «отменить то, что сейчас идёт»
-  cancel: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"'
-        + ' aria-hidden="true"><circle cx="8" cy="8" r="5.6"/>'
-        + '<path d="M4.1 11.9 11.9 4.1" stroke-linecap="round"/></svg>',
+  cancel: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zM4 12c0-4.42 3.58-8 8-8 1.85 0 3.55.63 4.9 1.69L5.69 16.9A7.9 7.9 0 0 1 4 12zm8 8c-1.85 0-3.55-.63-4.9-1.69L18.31 7.1A7.9 7.9 0 0 1 20 12c0 4.42-3.58 8-8 8z"/></svg>',
   // стрелка по кругу — «повторить то, что упало»
-  retry: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"'
-       + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-       + '<path d="M13.2 8a5.2 5.2 0 1 1-1.52-3.68"/><path d="M13.4 2.4v3.3h-3.3"/></svg>',
-  // корзина — «убрать из очереди»
-  remove: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"'
-        + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-        + '<path d="M3 4.4h10M6.4 4.4V3.1h3.2v1.3M4.4 4.4l.6 8.2h6l.6-8.2"/>'
-        + '<path d="M6.7 7v3.3M9.3 7v3.3"/></svg>',
+  retry: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M17.65 6.35A7.96 7.96 0 0 0 12 4a8 8 0 1 0 7.73 10h-2.08A6 6 0 1 1 12 6c1.66 0 3.14.69 4.22 1.78L13 11h7V4l-2.35 2.35z"/></svg>',
+  // корзина — «убрать», «удалить»
+  remove: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M6 19c0 1.1.9 2 2 2h8c1.1 0 2-.9 2-2V7H6v12zM8 9h8v10H8V9zm7.5-5-1-1h-5l-1 1H5v2h14V4h-3.5z"/></svg>',
   // стрелка из рамки — «открыть отдельным экраном»
-  open: '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"'
-      + ' stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
-      + '<path d="M9.4 2.8h3.8v3.8"/><path d="M13.2 2.8 7.7 8.3"/>'
-      + '<path d="M12.2 9.8v2.9a.9.9 0 0 1-.9.9H3.7a.9.9 0 0 1-.9-.9V5.1a.9.9 0'
-      + ' 0 1 .9-.9h2.9"/></svg>',
+  open: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M19 19H5V5h7V3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14c1.1 0 2-.9 2-2v-7h-2v7zM14 3v2h3.59l-9.83 9.83 1.41 1.41L19 6.41V10h2V3h-7z"/></svg>',
+  // карандаш — «править»
+  edit: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M3 17.25V21h3.75L17.81 9.94l-3.75-3.75L3 17.25zM5.92 19H5v-.92l9.06-9.06.92.92L5.92 19zM20.71 5.63l-2.34-2.34a1 1 0 0 0-1.41 0l-1.83 1.83 3.75 3.75 1.83-1.83a1 1 0 0 0 0-1.41z"/></svg>',
+  // два листа — «сделать копию»
+  copy: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>',
+  // звенья — «скопировать идентификатор» (не путать с копией пресета)
+  link: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>',
 };
+
+// Кнопка-значок. Слово обязательно: в `title` для мыши и в `aria-label` для читалки —
+// значок без подписи понятен не всем. `what` уточняет, над чем действие («Удалить
+// «Базовый»»), иначе читалка в списке слышала бы двадцать одинаковых «Удалить».
+function iconBtn(cls, icon, title, what, attrs){
+  const label = what ? `${title} «${what}»` : title;
+  return `<button type="button" class="iconbtn ${cls}" title="${esc(title)}"
+    aria-label="${esc(label)}" ${attrs || ''}>${ICON[icon]}</button>`;
+}
 
 function esc(s){ return String(s ?? '').replace(/[&<>"]/g, c =>
   ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
@@ -685,7 +982,7 @@ async function viewReleases(){
       <td>${esc(r.channel)}<div class="muted">${esc(r.lang)}</div></td>
       <td>${when(r.slot_at)}</td>
       <td>
-        <span class="pill s-${r.status === 'done' ? 'done'
+        <span class="pill clip s-${r.status === 'done' ? 'done'
           : r.status === 'blocked' ? 'error'
           : r.status === 'running' ? 'running' : 'queued'}">${esc(r.phase_title)}</span>
         <div class="muted" style="margin-top:4px">шаг ${r.phase_index + 1} из ${r.phase_total}</div>
@@ -851,7 +1148,7 @@ function ownKeysCard(d, opts){
       </tr></thead><tbody>${d.own_keys.map(o2 => `<tr>
         <td>${esc(o2.user)}</td><td>${esc(o2.family)}</td>
         <td>${(o2.items || []).map(i => `<span class="mono"
-          style="margin-right:8px">${esc(i.mask)}${o2.mine ? ` <a href="#"
+          style="margin-right:8px;white-space:nowrap">${esc(i.mask)}${o2.mine ? ` <a href="#"
           class="dropkey" data-f="${esc(o2.family)}" data-i="${i.index}"
           title="снять этот ключ">×</a>` : ''}</span>`).join('') || o2.count}</td>
         <td>${o2.pooled
@@ -957,6 +1254,11 @@ async function viewKeys(){
 const CAL_TITLE = {done:'вышел', running:'в работе', blocked:'остановлен',
                    planned:'запланирован', missed:'пропуск', free:'свободен'};
 const CAL_DOT   = {done:'✓', running:'◐', blocked:'!', planned:'·', missed:'✗', free:'○'};
+// Статус канала словами — как их называет кабинет (pub_ui.STATUS_TITLES); на карточке
+// стояло сырое «active». И действие, которое переводит в статус, — глаголом: кнопки
+// «пауза» / «в архиве» рядом со скрытым текущим статусом читались как состояние.
+const CH_STATUS = {active: 'работает', paused: 'пауза', archived: 'в архиве', problem: 'проблема'};
+const CH_VERB = {active: 'Возобновить', paused: 'Поставить на паузу', archived: 'Убрать в архив'};
 const CAL_CLS   = {done:'s-done', running:'s-running', blocked:'s-error',
                    planned:'s-queued', missed:'s-error', free:'s-idle'};
 
@@ -1063,7 +1365,8 @@ async function viewChannels(){
                  : c.status === 'paused' ? 'paused'
                  : c.status === 'problem' ? 'problem' : '';
   const grid = $(`<div class="chgrid">${d.channels.map(c => `
-    <div class="chcard ${cls(c)}" data-id="${c.id}">
+    <div class="chcard ${cls(c)}" data-id="${c.id}" tabindex="0" role="link"
+      aria-label="Канал ${esc(c.name)}">
       <h3>${esc(c.name)}</h3>
       <div class="meta">${esc(c.handle || '—')} · ${esc(c.lang)}</div>
       <div class="meta" style="margin-top:7px">
@@ -1074,12 +1377,15 @@ async function viewChannels(){
       <div style="margin-top:9px;display:flex;gap:7px;flex-wrap:wrap">
         <span class="pill ${
           c.status === 'active' ? 's-done' : c.status === 'problem' ? 's-error' : 's-idle'
-        }">${esc(c.status)}</span>
+        }">${esc(CH_STATUS[c.status] || c.status)}</span>
         ${c.has_uc ? '' : '<span class="pill s-error">ID пустой</span>'}
       </div>
     </div>`).join('')}</div>`);
-  grid.querySelectorAll('.chcard').forEach(el =>
-    el.onclick = () => location.hash = '#/channel/' + el.dataset.id);
+  grid.querySelectorAll('.chcard').forEach(el => {
+    const go = () => location.hash = '#/channel/' + el.dataset.id;
+    el.onclick = go;
+    el.onkeydown = ev => { if (ev.key === 'Enter' || ev.key === ' '){ ev.preventDefault(); go(); } };
+  });
   app.append(grid);
 }
 
@@ -1108,12 +1414,25 @@ function monthGrid(byDay, tz){
       const b = byDay[key];
       const done = b ? b.done : 0;
       const bad = b ? b.missed : 0;
-      const work = b ? (b.running + b.planned) : 0;
-      cells.push(`<div class="day ${b ? '' : 'out'} ${bad ? 'miss' : ''}">
-        <span class="n">${dnum}</span>
-        ${done ? `<span class="cnt">${done}</span>` : ''}
-        ${!done && work ? '<span class="cnt work">·</span>' : ''}
-        ${!done && !work && bad ? '<span class="cnt bad">—</span>' : ''}</div>`);
+      // Остановленный выход (`blocked`) сервер присылал всегда, а сетка его не читала:
+      // остановленный день выглядел как свободный, хотя под сеткой горело «остановлен: 2».
+      // «Идёт» и «запланировано» стояли одной точкой цвета действия — теперь у каждого
+      // свой знак и цвет состояния, как в строках под сеткой (CAL_CLS). Проверка облика
+      // 22.09.2026.
+      const stop = b ? (b.blocked || 0) : 0;
+      const run = b ? (b.running || 0) : 0;
+      const plan = b ? (b.planned || 0) : 0;
+      const said = b ? [done && `вышло: ${done}`, stop && `остановлено: ${stop}`,
+        run && `идёт: ${run}`, plan && `запланировано: ${plan}`,
+        bad && `пропущено: ${bad}`].filter(Boolean).join(', ') : '';
+      const mark = done ? `<span class="cnt">${done}</span>`
+        : stop ? '<span class="cnt bad">!</span>'
+        : run ? '<span class="cnt run">◐</span>'
+        : plan ? '<span class="cnt plan">·</span>'
+        : bad ? '<span class="cnt bad">—</span>' : '';
+      cells.push(`<div class="day ${b ? '' : 'out'} ${bad ? 'miss' : ''} ${
+        stop ? 'blocked' : ''}"${said ? ` title="${esc(said)}"` : ''}>
+        <span class="n">${dnum}</span>${mark}</div>`);
     }
     out.push(`<div class="mon"><div class="mname">${new Date(Date.UTC(y, mm - 1, 1))
       .toLocaleString('ru-RU', {month: 'long', year: 'numeric', timeZone: 'UTC'})}</div>
@@ -1415,7 +1734,7 @@ async function viewChannel(id){
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/channels">← ко всем каналам</a>
     <h1>${esc(c.name)}</h1>
-    <p class="sub">${esc(c.handle || '')} · ${esc(c.lang)} · ${esc(c.niche || '')}</p>
+    <p class="sub">${[c.handle, c.lang, c.niche].filter(Boolean).map(esc).join(' · ')}</p>
     ${c.uc ? '' : `<span class="pill s-error">ID пустой — выпуски на этом канале
       не заводятся. Вписать во вкладке «Настройки» ниже — один раз</span>`}`));
 
@@ -1510,7 +1829,7 @@ function schedulerCard(sch){
   const calm = /не денется|не потеряется/.test(sch.why || '') ? ''
     : `<div class="note muted">Поставленное не потеряется: оно стоит в очереди и
           начнётся само, как только появится исполнитель.</div>`;
-  return $(`<div class="card" style="margin-bottom:16px">
+  return $(`<div class="card alert-wait" style="margin-bottom:16px">
     <div class="stage">
       <div class="dot s-queued">⏸</div>
       <div class="body">
@@ -1895,7 +2214,7 @@ async function viewQueue(){
               Math.round(r.progress * 100)}%"></i></div>` : ''}
             ${whyHtml(r)}
             ${jobLogBtnHtml(r.service, r.id, r.state)}</td>
-        <td class="muted">${when(r.created)}</td>
+        <td class="muted when">${when(r.created)}</td>
         <td class="acts">${actions(r)}</td>
       </tr>`).join('')}</tbody></table></div>`);
   app.append(card);
@@ -2360,7 +2679,7 @@ function pultBatchCardHtml(kind, title){
        <div class="note muted" style="margin-top:6px">Пусто — у каждого проекта берётся
          превью его донора. Заполнено — один и тот же референс уедет всем отмеченным,
          и такие строки в отчёте помечены.</div>`;
-  return `<div data-pult="${kind}" style="flex:1 1 260px;min-width:260px;
+  return `<div data-pult="${kind}" class="bcard" style="flex:1 1 260px;min-width:260px;
       border:1px solid var(--line);border-radius:10px;padding:12px">
     <div style="font-weight:600;margin-bottom:8px">${esc(title)}</div>
     <div class="note muted" style="margin:0 0 8px">${about}</div>
@@ -2576,7 +2895,7 @@ async function viewProjects(){
           const k = batchFields[kind] || {title: kind, fields: []};
           const main = (k.fields || [])[0];
           const extra = (k.fields || []).slice(1);
-          return `<div style="flex:1 1 220px;min-width:220px;border:1px solid var(--line);
+          return `<div class="bcard" style="flex:1 1 220px;min-width:220px;border:1px solid var(--line);
                     border-radius:10px;padding:12px">
             <div style="font-weight:600;margin-bottom:8px">${esc(k.title)}</div>
             ${main ? fieldSelectHtml(kind, main) : ''}
@@ -2621,7 +2940,7 @@ async function viewProjects(){
           ${p.waiting ? `<div class="note bad">${esc(p.waiting)}</div>` : ''}</td>
       <td><a href="#/release/${encodeURIComponent(p.release_id)}">открыть выпуск</a></td>
       <td class="muted">${when(p.updated)}${p.plan_item_id
-        ? `<button class="ghost small rel-del" onclick="event.stopPropagation()"
+        ? `<button class="ghost small rel-del rel-below" onclick="event.stopPropagation()"
              data-plan="${p.plan_item_id}" style="margin-left:8px">Убрать</button>` : ''}</td>
     </tr>`
       : `<tr class="row" data-id="${esc(p.id)}">
@@ -2640,7 +2959,7 @@ async function viewProjects(){
         ? `<a href="#/release/${encodeURIComponent(p.release_id)}">${esc(
             p.phase_title || p.phase)}</a>` : '<span class="muted">—</span>'}</td>
       <td class="muted">${when(p.updated)}${p.plan_item_id
-        ? `<button class="ghost small rel-del" onclick="event.stopPropagation()"
+        ? `<button class="ghost small rel-del rel-below" onclick="event.stopPropagation()"
              data-plan="${p.plan_item_id}" style="margin-left:8px">Убрать выпуск</button>` : ''}</td>
     </tr>`).join('')}</tbody></table></div>`);
   card.querySelectorAll('tr.row').forEach(tr => tr.onclick = () => {
@@ -3255,7 +3574,7 @@ function jobRowHtml(j){
           `${esc(a.name)}: <b>${esc(a.value)}</b>`).join(' · ')}</div>
         <div class="note muted">Это снимок момента запуска — правка пресета
           его не меняет.</div></details>` : ''}</td>
-    <td class="muted">${when(j.created)}</td>
+    <td class="muted when">${when(j.created)}</td>
     <td style="white-space:nowrap">${actions({service: 'vsgen', id: j.id,
                                               state: j.state, status: j.status})}
       <button class="ghost small jlog-toggle" data-job="${j.id}">лог</button></td>
@@ -3860,7 +4179,7 @@ function scenJobRowHtml(j){
     <td>${j.kind === 'generation' ? 'с нуля' : 'рерайт'}</td>
     <td>${(Array.isArray(j.langs) ? j.langs : [j.langs]).map(esc).join(', ') || '—'}</td>
     <td class="jl-state">${jobListStateCellHtml(j, 'rewrite')}</td>
-    <td class="muted">${when(j.created)}</td>
+    <td class="muted when">${when(j.created)}</td>
   </tr>`;
 }
 // Список «задачи текста проекта»: источник — `GET /ui/text?project_id=` (связь
@@ -4561,7 +4880,7 @@ function coverJobRowHtml(j){
     <td><div style="font-weight:600">${esc(j.title)}</div>
         <div class="muted mono" style="font-size:11px">${esc(j.id)}</div></td>
     <td class="jl-state">${jobListStateCellHtml(j, 'cover')}</td>
-    <td class="muted">${when(j.created)}</td>
+    <td class="muted when">${when(j.created)}</td>
   </tr>`;
 }
 // Тот же приём, что у «Сценария» (см. комментарии там, включая review-feedback-F4
@@ -5211,9 +5530,12 @@ async function wireChannelEdit(root, c, chp){
   const inherited = new Set((chp && chp.inherited) || []);
   const own = (chp && chp.own) || {};
 
-  root.querySelector('#statusbtns').innerHTML = ref.statuses
+  root.querySelector('#statusbtns').innerHTML =
+    `<span class="pill ${c.status === 'active' ? 's-done' : 's-idle'}">${
+      esc(CH_STATUS[c.status] || c.status)}</span>` + ref.statuses
     .filter(s => s.key !== c.status)
-    .map(s => `<button class="ghost chst" data-s="${s.key}">${esc(s.title)}</button>`)
+    .map(s => `<button class="ghost small chst" data-s="${s.key}">${
+      esc(CH_VERB[s.key] || s.title)}</button>`)
     .join('');
   root.querySelectorAll('button.chst').forEach(b => b.onclick = async () => {
     b.disabled = true;
@@ -5576,7 +5898,7 @@ async function viewText(){
             ${j.detail ? `<div class="muted" style="margin-top:4px">${esc(j.detail)}</div>` : ''}
             ${j.progress != null ? `<div class="bar"><i style="width:${
               Math.round(j.progress * 100)}%"></i></div>` : ''}</td>
-        <td class="muted">${when(j.created)}</td>
+        <td class="muted when">${when(j.created)}</td>
         <td style="white-space:nowrap">${actions({service:'rewrite', id:j.id,
                                                   state:j.state, status:j.status})}</td>
       </tr>`).join('')}</tbody></table>`
@@ -5756,7 +6078,7 @@ async function viewCovers(){
             ${j.progress != null ? `<div class="bar"><i style="width:${
               Math.round(j.progress * 100)}%"></i></div>` : ''}</td>
         <td>${j.results || '—'}</td>
-        <td class="muted">${when(j.created)}</td>
+        <td class="muted when">${when(j.created)}</td>
         <td style="white-space:nowrap">${actions({service:'cover', id:j.id,
                                                   state:j.state, status:j.status})}</td>
       </tr>`).join('')}</tbody></table>`
@@ -6116,7 +6438,8 @@ async function viewLimits(){
         `${esc(k)}: <b>${esc(String(v))}</b>${
           d.bounds[k] ? ` <span class="muted">(${d.bounds[k][0]}–${d.bounds[k][1]})</span>` : ''}`
       ).join(' · ') || '—'}</td></tr>`).join('')}</tbody></table>
-    <div class="note muted">Правка — в файле ключей, блок «_concurrency».</div></div>`));
+    <div class="secbody"><div class="note muted">Правка — в файле ключей, блок
+       «_concurrency».</div></div></div>`));
 }
 
 /* ─────────────────────────── редактор пресета ─────────────────────────── */
@@ -7076,13 +7399,13 @@ async function viewPresets(){
       </div>
       <div class="pacts">
         ${g.service === 'vsgen'
-          ? `<button class="ghost small pedit" data-key="${esc(i.key)}">Править</button>`
-          : `<button class="ghost small pform" data-svc="${esc(g.service)}"
-               data-name="${esc(i.name)}">Править</button>`}
-        <button class="ghost small pcopy" data-svc="${esc(g.service)}"
-          data-name="${esc(i.name)}">Копия</button>
-        <button class="ghost small pdel" data-svc="${esc(g.service)}"
-          data-name="${esc(i.name)}">Удалить</button>
+          ? iconBtn('pedit', 'edit', 'Править', i.name, `data-key="${esc(i.key)}"`)
+          : iconBtn('pform', 'edit', 'Править', i.name,
+                    `data-svc="${esc(g.service)}" data-name="${esc(i.name)}"`)}
+        ${iconBtn('pcopy', 'copy', 'Копия', i.name,
+                  `data-svc="${esc(g.service)}" data-name="${esc(i.name)}"`)}
+        ${iconBtn('bad pdel', 'remove', 'Удалить', i.name,
+                  `data-svc="${esc(g.service)}" data-name="${esc(i.name)}"`)}
       </div></div>`;
   };
 
@@ -7114,19 +7437,19 @@ async function viewPresets(){
     const filtered = F.q || F.types.length > 0;
     let html = '';
     if (!filtered || whole.length){
-      html += '<div class="sec">Целые</div>';
+      html += '<div class="sec grp">Целые</div>';
       html += whole.length ? whole.map(i => presetItemHtml({service: 'vsgen'}, i)).join('')
                            : '<div class="empty">Целых пресетов нет.</div>';
     }
     if (!filtered || partial.length){
-      html += '<div class="sec">Частичные</div>';
+      html += '<div class="sec grp">Частичные</div>';
       if (!partial.length){
         html += '<div class="empty">Частичных пресетов нет.</div>';
       } else {
         for (const [code, title] of PART_TITLES){
           const arr = partial.filter(i => i.scope === code);
           if (!arr.length) continue;
-          html += `<div class="sec" style="border-top:1px solid var(--line);
+          html += `<div class="sec part" style="border-top:1px solid var(--line);
             font-size:12px;color:var(--muted)">${esc(title)}</div>`;
           html += arr.map(i => presetItemHtml({service: 'vsgen'}, i)).join('');
         }
@@ -7262,7 +7585,7 @@ async function viewPresets(){
         style="float:right;font-weight:400;text-transform:none;letter-spacing:0"
         >Завести</button>` : ''}</div>
     ${lum.ok
-      ? (lum.templates.length ? lum.templates.map(t => `<div class="stage">
+      ? (lum.templates.length ? lum.templates.map(t => `<div class="stage pitem">
           <div class="dot s-done">♪</div>
           <div class="body">
             <div class="name">${esc(t.name || t.id)}</div>
@@ -7270,11 +7593,12 @@ async function viewPresets(){
               t.voice_id ? ' · голос ' + esc(t.voice_id) : ''}</div>
             <div class="note muted mono" style="font-size:11px">${esc(t.id)}</div>
           </div>
-          <div style="white-space:nowrap;align-self:center">
-            <button class="ghost lum-copy" data-id="${esc(t.id)}">Копировать id</button>
-            <button class="ghost lum-edit" data-id="${esc(t.id)}">Править</button>
-            <button class="ghost lum-del" data-id="${esc(t.id)}"
-              data-name="${esc(t.name || t.id)}">Удалить</button>
+          <div class="pacts">
+            ${iconBtn('lum-copy', 'link', 'Копировать id', t.name || t.id,
+                      `data-id="${esc(t.id)}"`)}
+            ${iconBtn('lum-edit', 'edit', 'Править', t.name || t.id, `data-id="${esc(t.id)}"`)}
+            ${iconBtn('bad lum-del', 'remove', 'Удалить', t.name || t.id,
+                      `data-id="${esc(t.id)}" data-name="${esc(t.name || t.id)}"`)}
           </div></div>`).join('')
         : '<div class="empty">Шаблонов нет — заведите первый.</div>')
       : `<div class="secbody"><div class="note bad">${esc(lum.why || 'Lumean не ответил')}</div>
@@ -7305,7 +7629,7 @@ async function viewPresets(){
       <button class="ghost small" id="chp-new"
         style="float:right;font-weight:400;text-transform:none;letter-spacing:0"
         >Завести</button></div>
-    ${chp.presets.length ? chp.presets.map(p => `<div class="stage" data-chp="${p.id}">
+    ${chp.presets.length ? chp.presets.map(p => `<div class="stage pitem" data-chp="${p.id}">
       <div class="dot ${p.channels.length ? 's-done' : 's-idle'}"
         >${p.channels.length ? '✓' : '·'}</div>
       <div class="body">
@@ -7317,10 +7641,10 @@ async function viewPresets(){
               `<a href="#/channel/${ch.id}">${esc(ch.name)}</a>`).join(', ')
           : 'ни один канал на нём не бежит'}</div>
       </div>
-      <div style="white-space:nowrap;align-self:center">
-        <button class="ghost chp-edit" data-id="${p.id}">Править</button>
-        <button class="ghost chp-del" data-id="${p.id}"
-          data-name="${esc(p.name)}">Удалить</button>
+      <div class="pacts">
+        ${iconBtn('chp-edit', 'edit', 'Править', p.name, `data-id="${p.id}"`)}
+        ${iconBtn('bad chp-del', 'remove', 'Удалить', p.name,
+                  `data-id="${p.id}" data-name="${esc(p.name)}"`)}
       </div></div>`).join('')
       : '<div class="empty">Пресетов каналов нет.</div>'}
     <div class="secbody"><div class="note muted">${esc(chp.note || '')}</div></div>
@@ -7348,7 +7672,8 @@ function wirePresets(root){
       const box = document.createElement('div');
       box.className = 'note bad';
       box.textContent = e.message;
-      b.parentElement.appendChild(box);
+      const body = b.closest('.pitem') && b.closest('.pitem').querySelector('.body');
+      (body || b.parentElement).appendChild(box);
     }
   };
   root.querySelectorAll('button.pedit').forEach(b => b.onclick =

@@ -102,6 +102,16 @@ usage2["current_usage"] = {"hourly_usage": {"image_generation": 999}, "active_th
 main.save_fastgen_usage(c, usage2, NOW1 + 100)
 row2 = c.execute("SELECT v, updated FROM admin_state WHERE k='fastgen_usage'").fetchone()
 R["snap2"] = json.loads(row2[0])
+# Форма ответа провайдера с 21.09.2026: расход — словарём, а не числом.
+usage3 = dict(USAGE_RAW)
+usage3["current_usage"] = {"hourly_usage": {"image_generation": {"current_usage": 6000,
+                                                                 "window_start": NOW1}},
+                           "active_threads": {"image_threads": {"current_usage": 7}}}
+main.save_fastgen_usage(c, usage3, NOW1 + 200)
+R["snap_dict"] = json.loads(c.execute(
+    "SELECT v FROM admin_state WHERE k='fastgen_usage'").fetchone()[0])
+main.save_fastgen_usage(c, usage2, NOW1 + 100)
+row2 = c.execute("SELECT v, updated FROM admin_state WHERE k='fastgen_usage'").fetchone()
 R["rowcount_after_upsert"] = c.execute(
     "SELECT COUNT(*) FROM admin_state WHERE k='fastgen_usage'").fetchone()[0]
 
@@ -414,6 +424,9 @@ def main() -> int:
 
     check("повторная запись — upsert, а не вторая строка", r["rowcount_after_upsert"], 1)
     check("upsert заменяет цифры", r["snap2"]["hourly"]["image_generation"], 999)
+    check("новая форма провайдера ({current_usage, window_start}) пишется числом",
+          r["snap_dict"]["hourly"]["image_generation"], 6000)
+    check("и потоки тоже", r["snap_dict"]["threads"]["image_threads"], 7)
 
     check("обрывок ответа провайдера не роняет запись (лимиты — «нет данных», не крах)",
           r["snap3"]["limits"], {})
@@ -554,6 +567,14 @@ def main() -> int:
         check("остаток посчитан на сервере (серверные часы — источник правды)",
               isinstance(fg.get("expires_in_sec"), int), True)
         check("израсходовано картинок — из hourly.image_generation", fg.get("images_used"), 5400)
+        # Снимок, записанный до нормализации, — словарём: экран обязан показать число.
+        snap_old = dict(snap, hourly={"image_generation": {"current_usage": 6000,
+                                                             "window_start": now}})
+        set_admin_state("fastgen_usage", snap_old)
+        code, body_old = me.go("/ui/keys")
+        check("снимок старой формы — всё равно число, а не [object Object]",
+              (body_old.get("fastgen") or {}).get("images_used"), 6000)
+        set_admin_state("fastgen_usage", snap)
         check("лимит картинок — из limits.img_gen_per_hour_limit", fg.get("images_limit"), 6000)
         check("занято потоков — из threads.image_threads", fg.get("threads_used"), 4)
         check("лимит потоков — из limits.img_generation_threads_allowed",

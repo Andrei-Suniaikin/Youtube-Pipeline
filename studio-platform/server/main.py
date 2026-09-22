@@ -17101,6 +17101,21 @@ def _fg_classify(score):
     return ("down", "лежит")
 
 
+def fastgen_count(v):
+    """Число расхода FastGen в любой из двух форм ответа провайдера.
+
+    До 21.09.2026 `hourly_usage.image_generation` был числом; теперь это
+    `{"current_usage": N, "window_start": ts}`. Читатели ждали число и получали словарь:
+    экран ключей печатал «[object Object] из 6000», а тревога «расход близок к лимиту»
+    приводила словарь к нулю и молчала — в том числе при 6000 из 6000 (найдено
+    проверкой облика 22.09.2026). Нормализуем при записи и терпим при чтении: снимок
+    старой формы мог остаться в базе.
+    """
+    if isinstance(v, dict):
+        v = v.get("current_usage")
+    return v
+
+
 def save_fastgen_usage(c, usage: dict, now) -> None:
     """Снимок расхода ключа FastGen в `admin_state.fastgen_usage` (пункт 8 ТЗ,
     батч 16.09.2026).
@@ -17120,6 +17135,8 @@ def save_fastgen_usage(c, usage: dict, now) -> None:
     cur = u.get("current_usage") if isinstance(u.get("current_usage"), dict) else {}
     hourly = cur.get("hourly_usage") if isinstance(cur.get("hourly_usage"), dict) else {}
     threads = cur.get("active_threads") if isinstance(cur.get("active_threads"), dict) else {}
+    hourly = {k: fastgen_count(v) for k, v in hourly.items()}
+    threads = {k: fastgen_count(v) for k, v in threads.items()}
     snap = {
         "checked": now,
         "limits": limits,

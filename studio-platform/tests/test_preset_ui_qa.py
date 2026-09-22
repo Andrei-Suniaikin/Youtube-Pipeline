@@ -85,8 +85,11 @@ def main() -> int:
     print("\nСписок пресетов (viewPresets): «Целые»/«Частичные», частичные — по частям")
     vsgen_body = function_body(index_html, "  const vsgenBodyHtml = items => {")
     check("vsgenBodyHtml() найдена", bool(vsgen_body), True)
-    check("заголовок «Целые»", "<div class=\"sec\">Целые</div>" in vsgen_body, True)
-    check("заголовок «Частичные»", "<div class=\"sec\">Частичные</div>" in vsgen_body, True)
+    # Класс роли (`sec grp`, облик 22.09.2026) допустим: проверяется, что заголовок есть.
+    check("заголовок «Целые»",
+          re.search(r'<div class="sec[^"]*">Целые</div>', vsgen_body) is not None, True)
+    check("заголовок «Частичные»",
+          re.search(r'<div class="sec[^"]*">Частичные</div>', vsgen_body) is not None, True)
     check("частичные разбиваются подзаголовками по PART_TITLES (не одним общим списком)",
           "for (const [code, title] of PART_TITLES)" in vsgen_body, True)
     check("деление идёт по полю scope (whole = full, остальное — частичные)",

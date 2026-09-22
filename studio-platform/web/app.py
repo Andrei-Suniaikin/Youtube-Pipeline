@@ -1578,6 +1578,11 @@ def ui_paid_texts_collect_state():
     return _collect_snapshot()
 
 
+def _fg_count(v):
+    """Расход FastGen числом в любой форме ответа (см. main.fastgen_count)."""
+    return v.get("current_usage") if isinstance(v, dict) else v
+
+
 @app.get("/ui/keys")
 def ui_keys(request: Request):
     """Честная картина по ключам вместо «свободных слотов» (ТЗ §12).
@@ -1683,9 +1688,11 @@ def ui_keys(request: Request):
                     # Оставшееся считаем здесь, а не в браузере: серверные часы —
                     # источник правды, как и у «отдыхающих ключей» выше (left_sec).
                     "expires_in_sec": (int(float(expires) - now) if expires else None),
-                    "images_used": hourly.get("image_generation"),
+                    # Число в любой форме ответа провайдера (см. main.fastgen_count):
+                    # словарь печатался на экране как «[object Object] из 6000».
+                    "images_used": _fg_count(hourly.get("image_generation")),
                     "images_limit": limits.get("img_gen_per_hour_limit"),
-                    "threads_used": threads.get("image_threads"),
+                    "threads_used": _fg_count(threads.get("image_threads")),
                     "threads_limit": limits.get("img_generation_threads_allowed"),
                 }
     finally:

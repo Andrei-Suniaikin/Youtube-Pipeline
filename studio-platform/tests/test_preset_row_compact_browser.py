@@ -63,8 +63,11 @@ SCENARIO = r"""
   out.польский = lines(row('Польский'));
   out.пустой = lines(row('Пустой'));
   out.анна = lines(row('Голос Анна'));
-  out.кнопки_маленькие = [...row('Польский').querySelectorAll('.pacts button')]
-    .every(b => b.classList.contains('small'));
+  // Действия — значками, как IconButton в MUI (владелец 22.09.2026): слова на кнопке
+  // нет, но оно есть в подсказке и для читалки — вместе с именем пресета.
+  out.значки = [...row('Польский').querySelectorAll('.pacts button')].map(b => ({
+    значок: !!b.querySelector('svg') && b.classList.contains('iconbtn'),
+    текст: b.textContent.trim(), подсказка: b.title, читалке: b.getAttribute('aria-label')}));
   } catch (e) { out.errs.push(String(e && e.stack || e)); }
   document.documentElement.setAttribute('data-result', JSON.stringify(out));
 })();
@@ -85,7 +88,12 @@ def main() -> int:
           res.get("анна"), ["Голос Анна",
                             "напрямую каналы не ссылаются — используется через целые "
                             "пресеты (2)"])
-    check("кнопки строки — маленькие", res.get("кнопки_маленькие"), True)
+    check("действия — значками, слово в подсказке и для читалки, с именем пресета",
+          res.get("значки"),
+          [{"значок": True, "текст": "", "подсказка": "Править", "читалке": "Править «Польский»"},
+           {"значок": True, "текст": "", "подсказка": "Копия", "читалке": "Копия «Польский»"},
+           {"значок": True, "текст": "", "подсказка": "Удалить",
+            "читалке": "Удалить «Польский»"}])
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

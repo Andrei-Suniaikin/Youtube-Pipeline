@@ -319,6 +319,16 @@ def main() -> int:
     check("83% — ниже порога, повода нет", keys(c), [])
     fg_snapshot(NOW, NOW + 30 * 24 * HOUR, limit=6000, used=5400)
     check("90% — повод есть", keys(c), ["fastgen_usage_near_limit"])
+    # Снимок, где расход словарём (форма провайдера с 21.09.2026, записанная до
+    # нормализации): раньше `_f(dict)` давал ноль и тревога молчала при 6000 из 6000.
+    snap = {"checked": NOW, "expires": NOW + 30 * 24 * HOUR, "window": "per_hour",
+            "limits": {"img_gen_per_hour_limit": 6000},
+            "hourly": {"image_generation": {"current_usage": 6000, "window_start": NOW}},
+            "threads": {}}
+    c.execute("INSERT OR REPLACE INTO admin_state VALUES('fastgen_usage',?,0)",
+              (json.dumps(snap, ensure_ascii=False),))
+    check("расход словарём — тревога всё равно есть", keys(c), ["fastgen_usage_near_limit"])
+    fg_snapshot(NOW, NOW + 30 * 24 * HOUR, limit=6000, used=5400)
     check("в тексте — сколько из скольки за час",
           "5400 из 6000" in A.detect(c, NOW)["fastgen_usage_near_limit"].text, True)
 
