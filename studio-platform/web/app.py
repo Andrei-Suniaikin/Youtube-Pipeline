@@ -599,7 +599,7 @@ def ui_channels():
 
 # ─────────────────────────── календарь канала ───────────────────────────
 
-def past_slots(schedule: dict, tz_name: str, days: int, now=None) -> list:
+def past_slots(schedule: dict, tz_name: str, days: int, now=None, created=None) -> list:
     """Слоты канала за прошедшие `days` суток, по возрастанию.
 
     Зеркало `channel_slots.upcoming_slots()`, которое умеет только вперёд:
@@ -610,6 +610,12 @@ def past_slots(schedule: dict, tz_name: str, days: int, now=None) -> list:
     Разбор расписания, часовой пояс и обработка несуществующего времени в ночь перевода
     часов берутся из тех же функций, что и у прямого прохода: расписание не должно
     читаться двумя способами.
+
+    `created` (unix-секунды, `pub_channels.created`) — нижняя граница: канала ещё не
+    было, и слот до его завода не пропуск, а выдумка. Владелец 22.09.2026: свежий канал
+    показывал «пропущено» за годы истории, которых у него никогда не было. Проверка —
+    по точному времени момента, а не по суткам: канал, заведённый в 14:00, не должен
+    получить «пропуск» на 09:00 того же дня.
     """
     plan = normalize_schedule(schedule)
     zone = _zone(tz_name)
@@ -622,7 +628,7 @@ def past_slots(schedule: dict, tz_name: str, days: int, now=None) -> list:
             point = _localize(day, hh, mm, zone)
             if point is None:
                 continue                      # этого времени в эту дату не существует
-            if point <= moment:
+            if point <= moment and (created is None or point.timestamp() >= created):
                 out.append(point)
     return sorted(out)
 
@@ -655,7 +661,10 @@ def _calendar(c, ch, history_days: int) -> list:
 
     horizon = int(ch["horizon_days"] or 3)
     tz = ch["tz"] or "Europe/Warsaw"
-    moments = ([(m, True) for m in past_slots(schedule, tz, history_days)]
+    # Нижняя граница — момент завода канала (пункт 2 владельца, 22.09.2026): раньше
+    # `created` слотов не бывает, значит и «пропусков» там быть не может.
+    moments = ([(m, True) for m in past_slots(schedule, tz, history_days,
+                                              created=ch["created"])]
                + [(m, False) for m in upcoming_slots(schedule, tz, horizon)])
 
     def row_for(moment, item, is_past, beyond=False):
