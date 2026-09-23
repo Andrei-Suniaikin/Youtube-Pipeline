@@ -28,7 +28,12 @@ NAMES = re.compile(r"\bRewrite\b|\bCover\b")
 # Модули сервера, чьи строки доходят до экрана: подсказки полей пресета, тревоги,
 # причины забора текстов и журнал выпуска.
 SERVER_MODULES = ("web/app.py", "server/preset_fields.py", "server/pub_alerts.py",
-                  "server/pub_services.py")
+                  "server/pub_services.py", "server/self_setup.py")
+# 23.09.2026: файлы выкатки тоже говорят с человеком — владелец споткнулся ровно о них
+# («что это за приколы такие, есть одна студия»). Это не Python-модули, поэтому строки
+# в них ищем построчно, пропуская комментарии.
+DEPLOY_FILES = ("deploy/make_admin.py", "deploy/start-studio.sh", "deploy/update.sh",
+                "deploy/ПЕРЕДАЧА.md")
 FAILS = []
 
 
@@ -52,6 +57,23 @@ def page_hits() -> list:
         m = WORDS.search(line) or NAMES.search(line)
         if m:
             hits.append(f"{n}: {line.strip()[:80]}")
+    return hits
+
+
+def deploy_hits() -> list:
+    """Что увидит человек, читающий вывод скриптов выкатки и памятку."""
+    hits = []
+    for name in DEPLOY_FILES:
+        path = os.path.join(BASE, name)
+        if not os.path.exists(path):
+            continue
+        for n, line in enumerate(open(path, encoding="utf-8"), 1):
+            bare = line.strip()
+            # Комментарий — разговор разработчиков между собой, человеку он не виден.
+            if bare.startswith("#") or bare.startswith("//"):
+                continue
+            if WORDS.search(line) or NAMES.search(line):
+                hits.append(f"{name}:{n}: {bare[:80]}")
     return hits
 
 
@@ -83,6 +105,7 @@ def main() -> int:
     print("Проверка: одна студия — без «Cover/Rewrite Studio», «соседа» и «кабинета»")
     check("на экране пульта таких слов нет", page_hits(), [])
     check("в сообщениях сервера тоже", server_hits(), [])
+    check("и в том, что печатает выкатка", deploy_hits(), [])
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

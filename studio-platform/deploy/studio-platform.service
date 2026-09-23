@@ -7,7 +7,7 @@
 # Секреты в юните не пишутся: они живут в /srv/studio/studio.env (0600) и в файле
 # ключей /srv/studio/keys/video_studio_api_keys.json (0600).
 [Unit]
-Description=Единая Studio-платформа (пульт + кабинет + рерайт + обложки)
+Description=Единая студия: пульт, сервер, тексты, обложки
 After=network-online.target
 Wants=network-online.target
 
