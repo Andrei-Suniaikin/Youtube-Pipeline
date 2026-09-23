@@ -45,16 +45,28 @@ def register_upload_routes(app, ctx):
     token_of = ctx["upload_token"]          # общий секрет ноды заливки
     log = ctx.get("log") or (lambda *a: None)
 
+    def _same_secret(got: str, want: str) -> bool:
+        """Сравнение секретов постоянного времени, устойчивое к мусору в заголовке.
+
+        23.09.2026, найдено на боевой выкатке: `secrets.compare_digest` на строках с
+        не-ASCII бросает TypeError, и нода, приславшая мятый заголовок, получала 500
+        «внутренняя ошибка» вместо честного «не пущу». Пятисотка тут вреднее отказа:
+        она выглядит как поломка сервера и уводит разбор не туда.
+        """
+        if not want or not got:
+            return False
+        try:
+            return secrets.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
+        except (UnicodeError, TypeError):                          # noqa: BLE001
+            return False
+
     def _auth(request: Request) -> None:
-        want = token_of()
-        got = request.headers.get("X-Upload-Token", "")
-        if not want or not secrets.compare_digest(got, want):
+        if not _same_secret(request.headers.get("X-Upload-Token", ""), token_of()):
             raise HTTPException(401, "нужен токен ноды заливки")
 
     def _own(request: Request, rel) -> None:
-        got = request.headers.get("X-Upload-Claim", "")
-        want = rel["claim_token"] or ""
-        if not want or not secrets.compare_digest(got, want):
+        if not _same_secret(request.headers.get("X-Upload-Claim", ""),
+                            rel["claim_token"] or ""):
             raise HTTPException(403, "чужой или устаревший клейм")
 
     def _release(c, release_id: str):
