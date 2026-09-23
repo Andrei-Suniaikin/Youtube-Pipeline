@@ -1623,6 +1623,77 @@ def _fg_count(v):
     return v.get("current_usage") if isinstance(v, dict) else v
 
 
+# Каналы промптов картинок (пункт 4 ТЗ 22.09.2026). Тот же порядок, что у кабинетной
+# формы «Мои ключи» (`server/main.py:786` PROMPT_CHANNEL_ORDER) — второй нумерации не
+# заводим. `_PROMPT_CHANNEL_FAMILY` ниже — только запасной путь (см. `_prompt_state`):
+# семейство credential'а в `users.keys`, которым каждый канал пишет, на случай, если
+# кабинет не загружен в этот процесс вовсе.
+_PROMPT_CHANNELS = ("openai", "claude", "altclaude", "codex")
+_PROMPT_CHANNEL_FAMILY = {"openai": "openai", "claude": "claude_oauth",
+                          "codex": "codex_auth", "altclaude": "alt_llm"}
+
+
+def _prompt_state(request: Request) -> dict:
+    """Раздел `prompt` ответа /ui/keys: выбранный канал и «задан/не задан» — только
+    для вошедшего человека, без единого значения ключа наружу.
+
+    «Задан/не задан» и выбранный канал СЧИТАЕТ КАБИНЕТ (ревью 22.09.2026, Issue 4):
+    `main._own_prompt_channels(u)`/`main._selected_prompt_channel(u)` через
+    `sys.modules.get("main")` — тем же приёмом, что уже пользуется `ui_key_families`.
+    Своей второй нумерации на пульте нет НАМЕРЕННО: у кабинета own_set не совпадает с
+    «любое непустое значение в users.keys» буквально — копия серверного ключа своей
+    не считается, а `codex_auth`, который не похож на JSON auth.json, тоже. Устаревший
+    выбор канала (свой credential уже снят) кабинет отдаёт как «Авто» (`selected=""`),
+    а не «залипший» канал. Обе функции — чистые: берут `u` (полную строку `users`,
+    как её кладёт `web/pult_auth.who`) и файл ключей сервера, в базу второй раз не ходят.
+
+    Кабинет не загружен в этот процесс (пульт запущен отдельно) или вызов упал —
+    откат на прямое чтение `request.state.user["keys"]`/`["key_opts"]`: те же JSON-поля
+    сессии, что уже разбирает цикл `own` чуть ниже (список «свои ключи пользователей»).
+    `key_opts["_prompt"]["provider"]` — тот же зарезервированный ключ, которым кабинет
+    хранит выбор канала (`server/main.py:2043`, `_OWN_PROMPT_CHANNEL_OPT`).
+    """
+    u = getattr(request.state, "user", None)
+    mod = sys.modules.get("main")
+    if mod is not None and u is not None and hasattr(mod, "_own_prompt_channels"):
+        try:
+            own_channels = set(mod._own_prompt_channels(u))
+            selected = mod._selected_prompt_channel(u) or ""
+        except Exception:                                         # noqa: BLE001
+            pass                          # кабинет упал — ниже честный запасной путь
+        else:
+            if selected not in _PROMPT_CHANNELS:
+                selected = ""
+            return {"selected": selected,
+                    "channels": {ch: {"own_set": ch in own_channels}
+                                for ch in _PROMPT_CHANNELS}}
+    own, opts = {}, {}
+    if u is not None:
+        try:
+            own = json.loads(u["keys"] or "{}")
+        except Exception:                                         # noqa: BLE001
+            own = {}
+        try:
+            opts = json.loads(u["key_opts"] or "{}")
+        except Exception:                                         # noqa: BLE001
+            opts = {}
+    if not isinstance(own, dict):
+        own = {}
+    if not isinstance(opts, dict):
+        opts = {}
+    raw = opts.get("_prompt")
+    selected = (str((raw or {}).get("provider") or "").strip().lower()
+               if isinstance(raw, dict) else "")
+    if selected not in _PROMPT_CHANNELS:
+        selected = ""
+    channels = {}
+    for ch in _PROMPT_CHANNELS:
+        val = own.get(_PROMPT_CHANNEL_FAMILY[ch])
+        items = val if isinstance(val, (list, tuple)) else ([val] if val else [])
+        channels[ch] = {"own_set": bool([v for v in items if v])}
+    return {"selected": selected, "channels": channels}
+
+
 @app.get("/ui/keys")
 def ui_keys(request: Request):
     """Честная картина по ключам вместо «свободных слотов» (ТЗ §12).
@@ -1634,6 +1705,9 @@ def ui_keys(request: Request):
       курсор раздачи      — provider_rr_cursor: кому выдали последним
       FastGen             — admin_state.fastgen_usage: снимок расхода и срока ключа
                             (пункт 8 ТЗ), нет снимка — «данных пока нет»
+      канал промптов       — users.keys/key_opts этого человека: выбранный канал и
+                            «задан/не задан» по каждому из четырёх (пункт 4 ТЗ 22.09),
+                            см. `_prompt_state` — значения ключей и здесь не идут
 
     Чего отсюда НЕ видно и почему: текущая занятость слотов живёт в памяти кабинета
     (SERVER_CREDENTIAL_POOL._loads), а не в базе. Показывать её выдуманной нельзя —
@@ -1745,6 +1819,7 @@ def ui_keys(request: Request):
         "busy": busy,
         "fastgen": fastgen,
         "rewrite": _rewrite_keys(getattr(request.state, "sid", "")),
+        "prompt": _prompt_state(request),
         "unavailable": [],
     }
 
@@ -3332,6 +3407,29 @@ def _rw(path: str, sid: str, payload=None, method=None, raw=None, ctype=None,
         return 502, f"рерайт не отвечает: {type(exc).__name__}"
 
 
+def _default_text_model(sid: str) -> str:
+    """Модель текста по умолчанию — одна на все места, где раньше был зашит
+    `"gpt-4.1-nano"` (пункт 4 ТЗ 22.09.2026).
+
+    Спрашивает список у Rewrite (`GET /models`) и берёт модель, помеченную сервером
+    `default: true` — сегодня этот флаг ставят только Codex-модели
+    (`rewrite/server.py:2356`), у OpenAI/Claude его пока не бывает. Нет ответа, пустой
+    список или ни одна модель не помечена по умолчанию — тот же случай: используем
+    единственный оставшийся литерал `TEXT_MODEL_FALLBACK`, который раньше был
+    рассыпан по четырём местам.
+    """
+    try:
+        code, models = _rw("/models", sid)
+    except Exception:                                             # noqa: BLE001
+        return TEXT_MODEL_FALLBACK
+    if code != 200 or not isinstance(models, list):
+        return TEXT_MODEL_FALLBACK
+    for item in models:
+        if isinstance(item, dict) and item.get("default") and item.get("value"):
+            return str(item["value"])
+    return TEXT_MODEL_FALLBACK
+
+
 # ─────────────── задачи Rewrite/Cover, поставленные из проекта ───────────────
 # Связь хранится в `project_service_jobs` (схема — в кабинете рядом с `projects`).
 # Сам сервис про проект не знает; пульт записывает связь сразу после того, как
@@ -4133,7 +4231,7 @@ def ui_text_create(body: TextIn, request: Request):
         code, out = _rw("/jobs/generation", sid, {
             "preset_name": body.preset, "topic": body.source,
             "languages": [{"code": x, "display": x} for x in langs],
-            "model": body.model or "gpt-4.1-nano"})
+            "model": body.model or _default_text_model(sid)})
         if code >= 400:
             raise HTTPException(_pass_code(code), out)
         _link_project_jobs(pid, "rewrite", out)
@@ -4185,7 +4283,7 @@ def ui_text_create(body: TextIn, request: Request):
     code, out = _rw("/jobs/rewrite", sid, {
         "files": [stored],
         "languages": [{"code": x, "display": x} for x in langs],
-        "model": body.model or "gpt-4.1-nano"})
+        "model": body.model or _default_text_model(sid)})
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
     _link_project_jobs(pid, "rewrite", out)
@@ -5250,15 +5348,30 @@ def _neighbour_preset_options(service: str, sid: str, request) -> dict:
 # Умолчания нового пресета соседа: ровно то, что он подставил бы сам, если поле не
 # прислать. Держим их здесь, чтобы форма заведения не показывала пустоту там, где у
 # сервиса есть осмысленное значение.
+#
+# У "rewrite" нарочно нет своего "model": статический модуль-level словарь не знает
+# sid текущего человека, а модель по умолчанию — его личная (пункт 4 ТЗ 22.09.2026,
+# `_default_text_model`). Подставляет её `_neighbour_preset_defaults` — единственный
+# потребитель этого словаря для сервиса "rewrite" (форма нового пресета и его
+# заведение), а не сам словарь.
 NEIGHBOUR_PRESET_DEFAULTS = {
     "cover": {"seed_n_variants": 3, "prompt_template": "", "use_auto_style": True,
               "simple_mode": False, "fallback_mode": "auto", "aspect_ratio": "16:9",
               "max_generation_retries": 5, "analysis_provider": "openai",
               "analysis_model": "gpt-4.1-mini"},
-    "rewrite": {"model": "gpt-4.1-nano", "chunk": 3500, "threads": 1, "address": "",
+    "rewrite": {"chunk": 3500, "threads": 1, "address": "",
                 "preserve_paragraphs": True, "safe_text": False, "languages": []},
     "rewrite_gen": {"content": "", "target_length_words": ""},
 }
+
+
+def _neighbour_preset_defaults(service: str, sid: str) -> dict:
+    """Умолчания нового пресета соседа, с моделью текста по умолчанию ЭТОГО человека
+    вместо статического литерала — см. комментарий у `NEIGHBOUR_PRESET_DEFAULTS`."""
+    cfg = dict(NEIGHBOUR_PRESET_DEFAULTS.get(service) or {})
+    if service == "rewrite":
+        cfg["model"] = _default_text_model(sid)
+    return cfg
 
 
 def _neighbour_preset_fields(service: str, cfg: dict, options: dict) -> list:
@@ -5747,7 +5860,7 @@ def ui_neighbour_preset_new_form(service: str, request: Request):
     if service not in NEIGHBOUR_PRESET_FIELDS:
         raise HTTPException(404, f"у сервиса «{service}» своих пресетов нет")
     sid = getattr(request.state, "sid", "")
-    cfg = dict(NEIGHBOUR_PRESET_DEFAULTS.get(service) or {})
+    cfg = _neighbour_preset_defaults(service, sid)
     return {"service": service, "name": "",
             "fields": _neighbour_preset_fields(
                 service, cfg, _neighbour_preset_options(service, sid, request))}
@@ -5776,7 +5889,7 @@ def ui_neighbour_preset_create(service: str, body: NeighbourPresetNew, request: 
         # Бриф заводится своей ручкой сразу с текстом: пустой бриф Rewrite не примет.
         _rewrite_gen_write(name, body.values or {}, sid, create=True)
         return {"ok": True, "name": name}
-    cfg = dict(NEIGHBOUR_PRESET_DEFAULTS.get(service) or {})
+    cfg = _neighbour_preset_defaults(service, sid)
     if service == "cover":
         cfg["name"] = name          # у Cover имя лежит и внутри самого пресета
     store[name] = cfg
@@ -6333,9 +6446,29 @@ def ui_channel_set_uc(cid: int, body: ChannelUCIn):
 
 # ─────────────────────────── свои ключи: добавить и убрать ───────────────────────────
 
+class PromptChannelIn(BaseModel):
+    """Поля `prompt` в теле POST /ui/keys — 1:1 с именами формы кабинета
+    (`server/main.py`, блок `prompts_block` → обработчик `/api/my/keys/web`).
+    Отсутствующее поле (None) — не трогать; пустая строка/«-» для большинства полей
+    разбирает сам кабинет его же соглашением «пусто = не менять, «-» = очистить» —
+    здесь не дублируем. Исключение — `alt_llm_base` и `alt_llm_model`: для этих двух
+    полей кабинет (`server/main.py:17783-17788`) понимает «поле пришло, но пустое»
+    как «очистить», а не «не менять», поэтому пульт (`ui_keys_save`) отсекает их
+    сам до пересылки, если после `strip()` пусто, и не полагается на соглашение
+    кабинета."""
+    channel: Optional[str] = None            # "" сбрасывает выбор на «Авто»
+    claude_oauth: Optional[str] = None
+    codex_auth: Optional[str] = None
+    prompt_key_openai: Optional[str] = None
+    alt_llm: Optional[str] = None
+    alt_llm_base: Optional[str] = None
+    alt_llm_model: Optional[str] = None
+
+
 class KeysIn(BaseModel):
     add: dict = {}
     drop: dict = {}
+    prompt: Optional[PromptChannelIn] = None
 
 
 # ВАЖНО, и уже дважды укусило: обработчик, который ходит по HTTP в свой же процесс,
@@ -6346,7 +6479,7 @@ class KeysIn(BaseModel):
 # сохранение ключей: запись при этом проходила, а ответ не возвращался.
 @app.post("/ui/keys")
 def ui_keys_save(body: KeysIn, request: Request):
-    """Добавить или убрать свой ключ провайдера.
+    """Добавить или убрать свой ключ провайдера, включая канал промптов картинок.
 
     Разбор формы делает кабинет своим же `/api/my/keys/web` — тем самым, что и его
     страница. Логика там нетривиальная: ключи правятся по одному, каждый несёт свой
@@ -6354,8 +6487,17 @@ def ui_keys_save(body: KeysIn, request: Request):
     стать credential'ом. Вторая её реализация здесь была бы вторым набором правил
     для тех же денег.
 
-    Тело: {"add": {"googler": ["ключ", …]}, "drop": {"googler": [0, 2]}}.
+    Тело: {"add": {"googler": ["ключ", …]}, "drop": {"googler": [0, 2]},
+    "prompt": {"channel": "claude", "claude_oauth": "sk-ant-oat…"}}.
     Индексы в `drop` — позиции в списке ключей провайдера, как их отдаёт `/ui/keys`.
+    `prompt.*` уходит теми же семью именами полей, что и кабинетная форма — второго
+    хранилища секретов пульт не заводит, второй проверки тоже: недоступный канал или
+    негодный codex-auth кабинет уже отклоняет сам (`bad_prompt_channel`/`bad_codex_auth`
+    ниже), пульт лишь пробрасывает. Одно исключение — `claude_oauth`: кабинет здесь
+    только склеивает переносы строк (`server/main.py:17793`), а отличить токен
+    подписки (`sk-ant-oat…`) от платного API-ключа (`sk-ant-api…`) не проверяет никто.
+    Та же нормализация, что уже стоит у `/ui/keys/rewrite` (ревью 22.09.2026, Issue 3):
+    непустой и не «-» токен идёт через `normalize_claude_token`, а не сырым.
     """
     fields = []
     for family, values in (body.add or {}).items():
@@ -6365,6 +6507,37 @@ def ui_keys_save(body: KeysIn, request: Request):
     for family, idx in (body.drop or {}).items():
         for i in (idx if isinstance(idx, list) else [idx]):
             fields.append((f"drop_{family}", str(int(i))))
+    if body.prompt is not None:
+        claude_oauth = body.prompt.claude_oauth
+        # Мутация: убрать этот блок (пересылать claude_oauth сырым) — тест
+        # `test_prompt_channel.py` про ключ API Anthropic в поле подписки промптов
+        # ловит: `sk-ant-api…` доехал бы до кабинета и сохранился бы как «подписка».
+        if claude_oauth is not None and claude_oauth.strip() and claude_oauth.strip() != "-":
+            subs = _text_subs()
+            try:
+                claude_oauth = subs.normalize_claude_token(claude_oauth)
+            except subs.SubscriptionError as exc:
+                raise HTTPException(422, str(exc))
+        # Мутация: убрать этот `if val.strip()` для двух полей ниже (пересылать
+        # пустые alt_llm_base/alt_llm_model как есть) — тест `test_prompt_channel.py`
+        # про пустой адрес и модель альтернативного API ловит: кабинет
+        # (`server/main.py:17783-17788`) для этих двух полей понимает «поле есть, но
+        # пусто» как «очистить», а не «не менять», и стёр бы сохранённые значения.
+        for form_name, val in (
+            ("prompt_channel", body.prompt.channel),
+            ("claude_oauth", claude_oauth),
+            ("codex_auth", body.prompt.codex_auth),
+            ("prompt_key_openai", body.prompt.prompt_key_openai),
+            ("alt_llm", body.prompt.alt_llm),
+        ):
+            if val is not None:
+                fields.append((form_name, val))
+        for form_name, val in (
+            ("alt_llm_base", body.prompt.alt_llm_base),
+            ("alt_llm_model", body.prompt.alt_llm_model),
+        ):
+            if val is not None and val.strip():
+                fields.append((form_name, val))
     if not fields:
         raise HTTPException(400, "нечего сохранять: ни одного ключа не добавлено и не снято")
 
@@ -6952,10 +7125,11 @@ BATCH_PULT_MAX = int(os.environ.get("VS_BATCH_PULT_MAX", "20") or 20)
 # превратились бы в час ожидания с выжженными выходами на сдачу.
 BATCH_SUBS_BUDGET = float(os.environ.get("VS_BATCH_SUBS_BUDGET_SEC", "150") or 150)
 BATCH_SUBS_EXITS = int(os.environ.get("VS_BATCH_SUBS_EXITS", "3") or 3)
-# Чем рерайтить, когда не сказано НИГДЕ: ни в карточке, ни в пресете проекта. То же
-# умолчание, что у одиночного экрана текста (`ui_text_rewrite`). В отпечаток платного
-# вызова оно не попадает намеренно — движок в этом случае кладёт туда пустую модель,
-# и подставить сюда своё значение значило бы развести отпечатки на ровном месте.
+# Последний литерал модели текста (пункт 4 ТЗ 22.09.2026) — используется только внутри
+# `_default_text_model`, когда у Rewrite нет ни ответа, ни модели с флагом `default`.
+# Сюда же (в отпечаток платного вызова, `_parts["model"]` у `_batch_text_plan`) он
+# НЕ попадает намеренно — движок в этом случае кладёт туда пустую модель, и
+# подставлять здесь своё значение значило бы развести отпечатки на ровном месте.
 TEXT_MODEL_FALLBACK = "gpt-4.1-nano"
 
 
@@ -7350,8 +7524,17 @@ class BatchTextIn(BaseModel):
 
 def _batch_text_plan(c, sid: str, mod, pid: str, *, where: str, repl_url: str,
                      repl_text: str, langs_asked: list, model: str,
-                     one_at_a_time: bool, net: bool, deadline: float) -> dict:
+                     one_at_a_time: bool, net: bool, deadline: float,
+                     default_model_fn=None) -> dict:
     """Что уедет по одному проекту. Ничего не заказывает и денег не тратит.
+
+    `default_model_fn` — необязательный вызов без аргументов, отдающий модель по
+    умолчанию (обёртка над `_default_text_model(sid)` с кэшем на весь запрос пачки,
+    см. `ui_projects_batch_text`, ревью 22.09.2026 Issue 6): без него, до этой
+    правки, до `BATCH_PULT_MAX` проектов без своей модели в пресете каждый спрашивал
+    Rewrite заново — на зависшем соседе это съедало `BATCH_SUBS_BUDGET` ещё до
+    заказов. Не передан — читается прямо здесь, как раньше (сухой прогон одного
+    проекта тоже так делает, второй раз спрашивать некому).
 
     Сухой прогон — это ровно этот проход с `net=False`: он читает проект, кэш
     расшифровок и журнал оплат, но в сеть за субтитрами не идёт. Поэтому про
@@ -7453,7 +7636,13 @@ def _batch_text_plan(c, sid: str, mod, pid: str, *, where: str, repl_url: str,
     preset = (rel["preset_rewrite"] if rel is not None else "") or ""
     preset_model = str((rewrite_preset_config(TENANT, preset) or {}).get("model") or "")
     item["preset"] = preset
-    item["_model"] = model or preset_model or TEXT_MODEL_FALLBACK
+    # Умолчание тянем сетью только на настоящем прогоне (`net`): сухой прогон обязан
+    # не трогать соседа вовсе (см. проверку «соседа не трогали» батч-теста) — `_model`
+    # там всё равно вырезается из ответа (`ui_projects_batch_text`) и ни на что не
+    # влияет, кроме превью, которое этого похода не стоит.
+    item["_model"] = model or preset_model or (
+        (default_model_fn() if default_model_fn else _default_text_model(sid))
+        if net else TEXT_MODEL_FALLBACK)
     item["chars"] = len(text)
     item["_text"] = text
     # Ключи — как у движка (`pub_services.do_source_ready`), см. `_batch_langs_left`:
@@ -7578,6 +7767,18 @@ def ui_projects_batch_text(body: BatchTextIn, request: Request):
     # проекту отдельно (`_batch_text_plan`), потому что пресеты у них разные.
     model = (body.model or "").strip()
 
+    # Модель по умолчанию — один поход к Rewrite на всю пачку, а не на каждый проект
+    # без своей модели в пресете (ревью 22.09.2026, Issue 6): читается лениво, при
+    # первой реальной потребности, и дальше кэшируется на весь этот запрос. Сухой
+    # прогон резолвер вообще не зовёт — `_batch_text_plan` при `net=False` в него
+    # не заходит.
+    _default_model_cache: dict = {}
+
+    def _default_model_once() -> str:
+        if "v" not in _default_model_cache:
+            _default_model_cache["v"] = _default_text_model(sid)
+        return _default_model_cache["v"]
+
     mod = sys.modules.get("main")
     items, c = [], db()
     try:
@@ -7594,7 +7795,8 @@ def ui_projects_batch_text(body: BatchTextIn, request: Request):
                                         repl_text=repl_text, langs_asked=langs_asked,
                                         model=model,
                                         one_at_a_time=bool(body.one_at_a_time),
-                                        net=not body.dry_run, deadline=deadline)
+                                        net=not body.dry_run, deadline=deadline,
+                                        default_model_fn=_default_model_once)
                 if item["action"] == "order" and not body.dry_run:
                     _batch_text_order(c, sid, item)
             except HTTPException as exc:

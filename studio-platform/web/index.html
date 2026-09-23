@@ -1251,6 +1251,176 @@ function ownKeysCard(d, opts){
   return card;
 }
 
+/* ────────────────── промпты для картинок: канал (пункт 4 ТЗ 22.09.2026) ──────────────────
+   Тот же выбор, что у кабинета в «Мои ключи» (server/main.py, prompts_block): один
+   выпадающий список канала и под ним — поле ровно его credential'а (OpenAI = ключ,
+   Claude = OAuth-токен подписки, Codex = содержимое auth.json, alt-Claude = ключ + свои
+   адрес/модель). Пишет и хранит кабинет тем же POST /api/my/keys/web — второго места
+   хранения секрета пульт не заводит; значения сюда не приходят вовсе, только
+   «задан/не задан» на канал (см. `_prompt_state` в web/app.py). Серверные подписки из
+   «Подписок для текста» (textSubsCard) сюда не подключены намеренно — разные деньги,
+   разное хранилище (Rewrite `/settings/keys` там, `users.keys` кабинета здесь) — даже
+   если подписи «Codex (подписка)» похожи, «задан/не задан» у них независимы.
+   Порядок каналов — тот же, что у кабинета (`server/main.py:786` PROMPT_CHANNEL_ORDER =
+   openai/claude/altclaude/codex): ревью 22.09.2026, Issue 5 — было `codex` перед
+   `altclaude`, расходилось с кабинетом при совпадающем комментарии «тот же порядок».
+   Подписи (PROMPT_CHANNEL_TITLE ниже) — НЕ те же, что `server/main.py:778`
+   PROMPT_PROVIDERS, а намеренно свои и короче: кабинетные («GPT API — ключ OpenAI»,
+   «Codex токен — подписка ChatGPT», «Claude токен — подписка Claude (Sonnet 5)»,
+   «Альтернативный Claude API — свой адрес и ключ») рассчитаны на отдельную страницу
+   «Мои ключи»; здесь тот же выбор — один из под-пунктов внутри карточки «Ключи» пульта,
+   рядом с полем credential'а конкретного канала, и длинная подпись там дублировала бы
+   то, что уже видно строкой ниже. Ревью 22.09.2026 итерация 2, Issue 2 — комментарий
+   ошибочно утверждал, что подписи тоже совпадают; это неверно и здесь исправлено. */
+const PROMPT_CHANNEL_ORDER = ['openai', 'claude', 'altclaude', 'codex'];
+const PROMPT_CHANNEL_TITLE = {openai: 'OpenAI', claude: 'Claude (подписка)',
+                              altclaude: 'Альтернативный Claude API', codex: 'Codex (подписка)'};
+// Отдельная папка для входа Codex, которым пишутся ПРОМПТЫ КАРТИНОК — НЕ та же
+// `~/codex-studio`, что у подписки для ТЕКСТА (subFormHtml/textSubsCard, обе живут в
+// «Моих ключах», но это разные хранилища кабинета и рерайта). Codex сам обновляет
+// вход и глушит прежний: один и тот же auth.json/одна и та же папка в двух местах
+// выбивали бы друг друга при каждом обновлении — для промптов это даже важнее, чем
+// для текста, потому что заметить тихую потерю входа тут некому (ревью 22.09.2026,
+// Issue 2).
+const PROMPT_CODEX_HOME = '~/codex-studio-prompts';
+const PROMPT_CODEX_WARNING = 'Не вставляйте сюда тот же <code>auth.json</code>, что уже '
+  + 'отдан в «Мои ключи → Своя подписка Codex»: это для ТЕКСТА, а это поле — для '
+  + 'ПРОМПТОВ КАРТИНОК, разные хранилища. Общий вход из одной папки будет выбивать '
+  + 'сам себя при каждом обновлении.';
+
+// OpenAI и alt-Claude — своя простая разметка (у `subFormHtml` аналога для них нет:
+// она про подписки Codex/Claude). Claude и Codex рисует `promptSubPaneHtml` ниже.
+function promptChannelFieldHtml(ch, stateText){
+  const state = `<div class="note muted">Сейчас: ${esc(stateText)} · пусто = не менять · `
+    + `«-» = очистить.</div>`;
+  if (ch === 'altclaude') return `
+    <label for="pf-altclaude">Ключ альтернативного Claude API</label>
+    <input id="pf-altclaude" type="password" autocomplete="new-password" spellcheck="false"
+      placeholder="sk-ant-…">
+    ${state}
+    <label for="pf-altclaude-base" style="display:block;margin-top:8px">Адрес API (необязательно)</label>
+    <input id="pf-altclaude-base" spellcheck="false" placeholder="https://…">
+    <label for="pf-altclaude-model" style="display:block;margin-top:8px">Модель (необязательно)</label>
+    <input id="pf-altclaude-model" spellcheck="false" placeholder="claude-…">
+    <div class="note muted">Адрес и модель: пусто — не отправляется вовсе (сохранённое
+      значение не меняется); «-» — очистить и вернуться на серверное умолчание.</div>`;
+  return `<label for="pf-openai">OpenAI-ключ</label>
+    <input id="pf-openai" type="password" autocomplete="new-password" spellcheck="false"
+      placeholder="sk-proj-…">
+    ${state}`;
+}
+
+// Claude/Codex — общая разметка `subFormHtml`/`subEmptyText` (не дублируем: FR-16,
+// ревью 22.09.2026 Issue 2). `codexHome`/`warnSeparateAuth` — те же параметры, что
+// принимает теперь `subFormHtml`, только со своими (не текстовыми) значениями.
+function promptSubPaneHtml(ch, stateText){
+  const opts = ch === 'codex'
+    ? {codexHome: PROMPT_CODEX_HOME, warnSeparateAuth: PROMPT_CODEX_WARNING} : {};
+  const note = `<div class="note muted">Сейчас: ${esc(stateText)} · пусто = не менять · `
+    + `«-» = очистить. Чтобы задать/заменить — ${esc(subEmptyText(ch))}.</div>`;
+  // `forLabel` — любая непустая строка: прячет поле «Название» (оно тут не нужно,
+  // канал один на человека) тем же условием, что и своя подписка в «Моих ключах»
+  // (`subFormHtml(fam, 'own')`, `wireKeys`).
+  return note + subFormHtml(ch, 'prompt', opts);
+}
+
+// Карточка канала — рядом со «Своими ключами» (не внутри неё): своя карточка проще
+// свернуть/найти на экране и не путает список провайдеров с четырьмя каналами промптов.
+function promptChannelCard(d){
+  const p = d.prompt || {selected: '', channels: {}};
+  // «Свой не задан», не просто «не задан» (ревью 22.09.2026, Issue 5): канал может
+  // при этом работать на СЕРВЕРНОМ ключе — «не задан» звучало бы как «канал недоступен».
+  const stateOf = ch => ((p.channels || {})[ch] || {}).own_set ? 'свой ключ задан' : 'свой не задан';
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Промпты для картинок${hintDot(
+      'Каким каналом писать промпты для картинок: OpenAI, подписка Claude, подписка '
+      + 'Codex или альтернативный Claude API. Свой ключ/подписка канала — расход идёт '
+      + 'на вашу подписку; канал не выбран — решает сервер. Это ОТДЕЛЬНО от «Подписок '
+      + 'для текста» ниже: разные деньги, разное хранилище.')}</div>
+    <div class="secbody">
+      <div class="fld"><label for="pchan">Канал</label>
+        <select id="pchan">
+          <option value=""${p.selected ? '' : ' selected'}>Авто — решает сервер</option>
+          ${PROMPT_CHANNEL_ORDER.map(ch => `<option value="${ch}"${
+            p.selected === ch ? ' selected' : ''}>${esc(PROMPT_CHANNEL_TITLE[ch])} · ${
+            esc(stateOf(ch))}</option>`).join('')}
+        </select>
+      </div>
+      <div class="fld" id="pchan-fields" style="margin-top:10px"></div>
+      <div class="secbody" style="padding:12px 0 0;display:flex;gap:10px;align-items:center">
+        <button id="pchan-save">Сохранить</button>
+        <span class="note bad" id="pchan-err" style="margin:0"></span>
+      </div>
+    </div>
+  </div>`);
+  wirePromptChannel(card, d);
+  return card;
+}
+
+function wirePromptChannel(card, d){
+  const p = d.prompt || {selected: '', channels: {}};
+  const stateOf = ch => ((p.channels || {})[ch] || {}).own_set ? 'свой ключ задан' : 'свой не задан';
+  const sel = card.querySelector('#pchan');
+  // ОДНА обёртка — в неё перерисовывается форма только выбранного канала, тем же
+  // приёмом, что модалка «Добавить ключ» (`wireKeys`, `#kval-wrap`). Так в карточке
+  // никогда не бывает больше одного набора `#sf-*` разом: Claude и Codex делят те же
+  // id (`#sf-secret` и т. д.), и держать оба в DOM одновременно (даже скрытым через
+  // display:none, как было раньше у четырёх панелей) — это дублирующиеся id на
+  // странице (ревью 22.09.2026, Issue 2).
+  const wrap = card.querySelector('#pchan-fields');
+  const renderPane = ch => {
+    if (!ch){ wrap.innerHTML = ''; return; }
+    if (ch === 'openai' || ch === 'altclaude'){
+      wrap.innerHTML = promptChannelFieldHtml(ch, stateOf(ch));
+      return;
+    }
+    wrap.innerHTML = promptSubPaneHtml(ch, stateOf(ch));
+    // Собственная строка кнопок `subFormHtml` (`#sf-ok`/`#sf-no`) дублирует кнопку
+    // «Сохранить» самой карточки — прячется тем же приёмом, что у формы своей
+    // подписки в «Моих ключах» (`wireKeys`, `#kval-wrap`, `ownRow.hidden = true`).
+    const ok = wrap.querySelector('#sf-ok');
+    if (ok){ const row = ok.closest('.row'); if (row) row.hidden = true; }
+    wireSubFile(wrap);
+  };
+  renderPane(sel.value);
+  sel.onchange = () => renderPane(sel.value);
+  const err = card.querySelector('#pchan-err');
+  card.querySelector('#pchan-save').onclick = async () => {
+    err.textContent = '';
+    const ch = sel.value;
+    const prompt = {channel: ch};
+    if (ch === 'openai')
+      prompt.prompt_key_openai = (wrap.querySelector('#pf-openai').value || '').trim();
+    else if (ch === 'claude')
+      prompt.claude_oauth = (wrap.querySelector('#sf-secret').value || '').trim();
+    else if (ch === 'codex')
+      prompt.codex_auth = (wrap.querySelector('#sf-secret').value || '').trim();
+    else if (ch === 'altclaude'){
+      prompt.alt_llm = (wrap.querySelector('#pf-altclaude').value || '').trim();
+      // Issue 1 (Critical, ревью 22.09.2026): адрес/модель отправляются ТОЛЬКО
+      // непустыми. Кабинет отличает «поле есть, но пусто» (= очистить) от «поля не
+      // было» (= не менять) именно у этих двух полей и только у них
+      // (`server/main.py:17783-17788`: `if _v == "-" or (_fld in d and not _v): pop`);
+      // у остальных пяти полей формы пустая строка безопасна как есть. Раньше JS слал
+      // сюда `''` всегда — любое сохранение карточки на alt-Claude молча стирало
+      // сохранённые адрес и модель, даже если человек их не трогал вовсе.
+      // Мутация: вернуть безусловное `prompt.alt_llm_base = base` (как было) — тест
+      // браузера, что «пусто не отправляется вовсе», ловит.
+      const base = (wrap.querySelector('#pf-altclaude-base').value || '').trim();
+      const model = (wrap.querySelector('#pf-altclaude-model').value || '').trim();
+      if (base) prompt.alt_llm_base = base;
+      if (model) prompt.alt_llm_model = model;
+    }
+    card.querySelector('#pchan-save').disabled = true;
+    try{
+      await post('/ui/keys', {prompt});
+      toast('Канал промптов сохранён', 'ok');
+      await render();
+    }catch(e){ err.textContent = e.message; }
+    finally{ const btn = card.querySelector('#pchan-save'); if (btn) btn.disabled = false; }
+  };
+}
+
 /* ─────────────── подписки для текста: Codex и Claude (22.09.2026) ───────────────
    Владелец: «сделаем, чтобы мы могли пользоваться подпиской кодекса или клода для
    написания текста». Раньше подписку меняли только по SSH: `codex login` на сервере,
@@ -1276,20 +1446,28 @@ function subStateText(it){
   }
 }
 
-function subFormHtml(provider, forLabel){
+function subFormHtml(provider, forLabel, opts){
   const codex = provider === 'codex';
+  // opts — необязательный третий параметр (ревью 22.09.2026, Issue 2): по умолчанию
+  // `{}`, так что оба старых вызова с двумя аргументами (textSubsCard, wireKeys)
+  // рисуют байт-в-байт то же самое, что и раньше. Канал промптов картинок
+  // (`promptSubPaneHtml`) передаёт свою папку CODEX_HOME и предупреждение не путать
+  // её со входом для текста.
+  opts = opts || {};
+  const codexHome = opts.codexHome || '~/codex-studio';
   return `
     ${forLabel ? '' : `<div class="fld"><label>Название</label>
       <input id="sf-label" maxlength="60" style="width:min(340px,100%)"
         placeholder="${codex ? 'Например: ChatGPT Pro, основной' : 'Например: Claude Max, резерв'}"></div>`}
     ${codex ? `<ol class="note">
         <li>На своём компьютере войдите в <b>отдельную папку</b>:
-          <code>CODEX_HOME=~/codex-studio codex login</code> — аккаунтом ChatGPT с подпиской.</li>
-        <li>Вставьте сюда файл <code>~/codex-studio/auth.json</code> целиком или выберите его.</li>
+          <code>CODEX_HOME=${esc(codexHome)} codex login</code> — аккаунтом ChatGPT с подпиской.</li>
+        <li>Вставьте сюда файл <code>${esc(codexHome)}/auth.json</code> целиком или выберите его.</li>
       </ol>
       <div class="note muted">Почему отдельная папка: Codex сам обновляет вход, и старый
         при этом перестаёт действовать. Один и тот же вход на сервере и на вашем
         компьютере выбивал бы друг друга.</div>
+      ${opts.warnSeparateAuth ? `<div class="note bad">${opts.warnSeparateAuth}</div>` : ''}
       <textarea id="sf-secret" rows="6" spellcheck="false" autocomplete="off"
         placeholder='{"auth_mode": "chatgpt", "tokens": { … } }'></textarea>
       <div class="row"><label class="filepick"><span class="pickbtn">Выбрать auth.json</span>
@@ -1544,6 +1722,7 @@ async function viewKeys(){
   </div>`));
 
   app.append(ownKeysCard(d));
+  app.append(promptChannelCard(d));
 
   if (d.unavailable && d.unavailable.length){
     app.append($(`<div class="card">
