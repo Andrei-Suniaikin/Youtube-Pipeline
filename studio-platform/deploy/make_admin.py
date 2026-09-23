@@ -80,8 +80,12 @@ def main() -> int:
             return 0
         user = A.create_user(c, args.login, pw, hash_password, role="admin",
                              tenants_dir=args.tenants_dir or "")
-        print(f"готово: администратор «{user['login']}», тенант {user['tenant_id']}")
-        print("этот тенант надо указать в REWRITE_ADMIN_USER_ID и COVER_ADMIN_USER_ID")
+        print(f"готово: администратор «{user['login']}», номер учётной записи "
+              f"{user['tenant_id']}")
+        print("можно заходить в студию этим логином и паролем")
+        # Служебные имена переменных окружения сюда не печатаются намеренно: для
+        # человека есть одна студия и одна база, а внутренние модули текста и обложек
+        # — наша кухня, её видеть незачем (решение владельца 22.09.2026).
         return 0
     except A.AccountError as exc:
         print(f"не вышло: {exc}", file=sys.stderr)
