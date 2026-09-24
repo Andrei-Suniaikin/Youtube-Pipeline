@@ -6670,6 +6670,52 @@ def ui_channel_edit(cid: int, body: dict):
     return {"ok": True}
 
 
+@app.delete("/ui/channels/{cid:int}")
+def ui_channel_delete(cid: int, request: Request):
+    """Удалить канал насовсем (решение владельца 24.09.2026).
+
+    Удаляется только канал, за которым НЕТ истории: ни выпусков, ни заливок. Причина
+    не в осторожности вообще, а в устройстве базы: внешних ключей здесь нет, и
+    выпуски с заливками остались бы висеть с номером удалённого канала. Номера же
+    выдаются заново, и однажды такая запись нашлась бы у другого канала — это ровно
+    «ролик на чужом канале», худшая ловушка этой системы.
+
+    Ссылки плана — другое дело: это ещё не работа, а намерение, и они уходят вместе
+    с каналом. Канал с историей не удаляется, а убирается в архив: там он перестаёт
+    работать, но прошлое остаётся связанным.
+    """
+    _require_admin(request)
+    c = db()
+    try:
+        ch = c.execute("SELECT id, name FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (cid, TENANT)).fetchone()
+        if ch is None:
+            raise HTTPException(404, "канала нет — возможно, его уже удалили")
+        history = []
+        for table, what in (("pub_releases", "выпусков"),
+                            ("pub_upload_jobs", "заливок")):
+            n = c.execute(f"SELECT COUNT(*) FROM {table} WHERE channel_id=? AND tenant_id=?",
+                          (cid, TENANT)).fetchone()[0]
+            if n:
+                history.append(f"{what}: {n}")
+        if history:
+            raise HTTPException(400,
+                f"у канала есть история ({', '.join(history)}) — удалить нельзя, иначе "
+                f"она останется висеть на номере удалённого канала и однажды найдётся у "
+                f"другого. Уберите канал в архив: он перестанет работать, прошлое уцелеет")
+        plan = c.execute("SELECT COUNT(*) FROM pub_plan_items WHERE channel_id=? "
+                         "AND tenant_id=?", (cid, TENANT)).fetchone()[0]
+        c.execute("DELETE FROM pub_plan_items WHERE channel_id=? AND tenant_id=?",
+                  (cid, TENANT))
+        c.execute("DELETE FROM pub_channel_tags WHERE channel_id=?", (cid,))
+        c.execute("DELETE FROM pub_channels WHERE id=? AND tenant_id=?", (cid, TENANT))
+        c.commit()
+    finally:
+        c.close()
+    _audit(f"канал «{ch['name']}» удалён, вместе с ним ссылок плана: {plan}")
+    return {"ok": True, "deleted": ch["name"], "plan_items": plan}
+
+
 @app.post("/ui/channels/{cid:int}/status")
 def ui_channel_status(cid: int, body: dict):
     """Включить, поставить на паузу, убрать в архив."""
@@ -8926,6 +8972,35 @@ class AccountEditIn(BaseModel):
     role: str | None = None
     password: str | None = None
     quota: str | None = None
+
+
+@app.delete("/ui/accounts/{uid:int}")
+def ui_account_delete(uid: int, request: Request):
+    """Удалить учётную запись. За человеком с работой — только блокировка."""
+    me = _require_admin(request)
+    c = db()
+    try:
+        row = c.execute("SELECT tenant_id FROM users WHERE id=?", (uid,)).fetchone()
+        tenant = str((row["tenant_id"] if row else None) or uid)
+        # Считаем работу человека там, где она живёт. Каналы и проекты — то, из-за
+        # чего удаление опасно: строки остались бы без владельца, а номера учётных
+        # записей переиспользуются.
+        owns = []
+        for table, what in (("pub_channels", "каналов"), ("projects", "проектов")):
+            try:
+                n = c.execute(f"SELECT COUNT(*) FROM {table} WHERE tenant_id=?",
+                              (tenant,)).fetchone()[0]
+            except sqlite3.Error:
+                n = 0
+            if n:
+                owns.append(f"{what}: {n}")
+        done = accounts.delete_user(c, uid, actor_id=me["id"], owns=", ".join(owns))
+    except accounts.AccountError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        c.close()
+    _audit(f"учётная запись «{done['name']}» удалена, это сделал {me['name']}")
+    return {"ok": True, "deleted": done["name"]}
 
 
 @app.post("/ui/accounts/{uid:int}")

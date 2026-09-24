@@ -73,8 +73,14 @@
            color:var(--muted);white-space:nowrap}
   /* Размер имени — как у остальных вкладок (15px, из body): оно теперь такая же
      вкладка. Мелким остаётся только «выйти» — это не раздел, а действие. */
-  nav .who a.out{color:var(--muted);text-decoration:none;font-size:13px}
-  nav .who a.out:hover{color:var(--ink)}
+  /* «Выйти» — значок, а не слово (владелец 24.09.2026): это действие, и в ряду
+     разделов слово читалось как ещё один раздел. Ровняется по центру строки, как
+     имя рядом. */
+  nav .who a.out{color:var(--muted);text-decoration:none;display:inline-flex;
+                 align-items:center;justify-content:center;width:30px;height:30px;
+                 border-radius:8px;margin-left:4px}
+  nav .who a.out svg{width:18px;height:18px;display:block}
+  nav .who a.out:hover{color:var(--ink);background:rgba(255,255,255,.06)}
 
   main{max-width:1180px;margin:0 auto;padding:26px 20px 70px}
   h1{font-size:26px;margin:0 0 5px;font-weight:750;letter-spacing:-.02em;color:var(--ink-hi)}
@@ -271,8 +277,13 @@
      а не стоит под каждым полем постоянной строкой: сплошной текст под формой человек
      перестаёт читать целиком, и вместе с ним перестаёт видеть предупреждения про деньги
      и необратимое. Те остаются открытым текстом и под знак вопроса не убираются. */
+  /* Знак подсказки скакал относительно текста в заголовках (жалоба владельца
+     24.09.2026): при разных размерах шрифта `vertical-align:1px` смещал кружок
+     по-разному. Ровняем по середине строчных букв — тогда он стоит одинаково и у
+     заголовка экрана, и в полосе карточки. */
   .q{display:inline-flex;align-items:center;justify-content:center;
-     width:16px;height:16px;padding:0;margin-left:6px;vertical-align:1px;
+     width:16px;height:16px;padding:0;margin-left:6px;vertical-align:middle;
+     position:relative;top:-1px;
      background:transparent;border:1px solid var(--line-2);border-radius:50%;
      color:var(--muted);font-size:11px;font-weight:700;line-height:1;cursor:help;
      transition:color .12s,border-color .12s,background .12s}
@@ -407,10 +418,18 @@
   .pitem .body{min-width:0}
   .pitem .pacts{white-space:nowrap;align-self:center;display:flex;gap:2px}
   #paidline{margin-top:6px}
+  /* Счёт и знак подсказки в полосе свёрнутой карточки: без отступов название, «?» и
+     счёт слипались в одно слово (жалоба владельца 24.09.2026). */
+  .sec .refcount{margin:0 0 0 9px;font-weight:400;display:inline}
+  .sec .q{margin-left:7px}
   /* Подписки для текста (22.09.2026): форма добавления встаёт в саму карточку, под
      полосой заголовка, — отдельного экрана на одно поле не нужно. */
-  .subform{border-bottom:1px solid var(--line);display:grid;gap:10px}
-  .subform[hidden]{display:none}
+  .subform,.srvkey-form{border-bottom:1px solid var(--line);display:grid;gap:10px}
+  .subform[hidden],.srvkey-form[hidden]{display:none}
+  /* Форма замены ключа живёт внутри карточки и раньше начиналась у самой рамки
+     (жалоба владельца 24.09.2026): `hidden` снимался, а отступы `secbody` перебивались
+     собственным `display:grid`. Задаём их явно. */
+  .srvkey-form{padding:12px 14px 14px}
   .subform ol{margin:0;padding-left:20px;line-height:1.55}
   .subform code{font-family:var(--mono);font-size:12px;background:var(--well);
                 padding:1px 5px;border-radius:var(--r-xs)}
@@ -744,6 +763,20 @@
   .langs{border:0;background:var(--well);border-radius:var(--r);padding:8px;gap:4px}
   .langs label{border:0;border-radius:var(--r-xs);padding:3px 9px 3px 6px;font-size:12.5px;
                background:rgba(255,255,255,.04)}
+  /* Дни недели — не языки: их ровно семь, они короткие и стоят в ряд. Круглая плашка
+     съедала края у понедельника и воскресенья (жалоба владельца 24.09.2026), поэтому
+     у ряда дней свой вид: прямоугольные равные ячейки без общего колодца. */
+  .langs.days{background:transparent;padding:0;gap:6px;flex-wrap:wrap}
+  .langs.days label{border-radius:var(--r-xs);padding:6px 12px;min-width:46px;
+                    justify-content:center;background:var(--well);
+                    box-shadow:inset 0 0 0 1px var(--line)}
+  .langs.days label:hover{background:var(--card-2)}
+  .langs.days label.on{background:var(--acc-dim);color:var(--ink-hi);
+                       box-shadow:inset 0 0 0 1px var(--acc)}
+  /* Сама галочка внутри дня не нужна: выбранный день виден заливкой, а квадратик
+     только сужает ячейку. Для читалки и клавиатуры поле остаётся на месте. */
+  .langs.days input{position:absolute;opacity:0;width:1px;height:1px}
+  .langs.days label{position:relative}
   .langs label:hover{background:rgba(255,255,255,.08)}
   .langs label.on{background:var(--acc-dim);color:var(--ink-hi);box-shadow:inset 0 0 0 1px var(--acc)}
 
@@ -802,6 +835,10 @@
   .chcard.paused h3{color:var(--muted)}
   .chcard:focus-visible{outline:2px solid var(--acc);outline-offset:2px}
   #statusbtns{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap}
+  /* Плашка статуса стоит в одном ряду с кнопками и была заметно ниже них (жалоба
+     владельца 24.09.2026). Ровняем по высоте самих кнопок, а не по строке текста. */
+  #statusbtns .pill{display:inline-flex;align-items:center;min-height:30px;
+                    padding:0 12px;border-radius:var(--r-sm)}
   .grid > div{padding:14px 18px}
   .grid .k{padding:0;border:0}
   /* фаза выпуска: ошибка — единственная сплошная заливка с «!» */
@@ -917,6 +954,9 @@ const ICON = {
   // два листа — «сделать копию»
   copy: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
       + '<path d="M16 1H4c-1.1 0-2 .9-2 2v14h2V3h12V1zm3 4H8c-1.1 0-2 .9-2 2v14c0 1.1.9 2 2 2h11c1.1 0 2-.9 2-2V7c0-1.1-.9-2-2-2zm0 16H8V7h11v14z"/></svg>',
+  // дверь со стрелкой — «выйти»
+  exit: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M17 7l-1.41 1.41L18.17 11H8v2h10.17l-2.58 2.59L17 17l5-5zM4 5h8V3H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h8v-2H4V5z"/></svg>',
   // стрелка вниз — «развернуть» (повёрнутая — «свернуть»)
   expand: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
       + '<path d="M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z"/></svg>',
@@ -3304,7 +3344,8 @@ function showWho(){
   el.innerHTML = ME
     ? `<a class="tab" href="#/profile" id="tab-profile"
           title="Профиль: ключи, люди, система">${esc(ME.name)}</a>
-       <a href="#" class="out" id="out">выйти</a>` : '';
+       <a href="#" class="out" id="out" title="Выйти" aria-label="Выйти">${ICON.exit}</a>`
+    : '';
   const out = document.getElementById('out');
   if (out) out.onclick = async e => {
     e.preventDefault();
@@ -6584,12 +6625,29 @@ async function wireChannelEdit(root, c, chp){
     .filter(s => s.key !== c.status)
     .map(s => `<button class="ghost small chst" data-s="${s.key}">${
       esc(CH_VERB[s.key] || s.title)}</button>`)
-    .join('');
+    .join('')
+    + iconBtn('bad', 'remove', 'Удалить канал', c.name, 'id="chdel"');
   root.querySelectorAll('button.chst').forEach(b => b.onclick = async () => {
     b.disabled = true;
     try{ await post(`/ui/channels/${c.id}/status`, {status: b.dataset.s}); await render(); }
     catch(e){ b.disabled = false; toast(e.message); }
   });
+
+  // Удалить канал — решение владельца 24.09.2026. Стоит отдельно от статусов и
+  // спрашивает окном: у канала с историей сервер откажет и объяснит, почему архив
+  // здесь честнее удаления.
+  const del = root.querySelector('#chdel');
+  if (del) del.onclick = () => confirmModal('Удалить канал',
+    `Удалить «${c.name}» насовсем? Ссылки, поставленные в план и ещё не пущенные в `
+    + 'работу, удалятся вместе с ним. Выпуски и заливки не трогаются: если они есть, '
+    + 'удаление не пройдёт — такой канал убирают в архив.',
+    async () => {
+      try{
+        const out = await api(`/ui/channels/${c.id}`, {method: 'DELETE'});
+        toast(`Канал «${out.deleted}» удалён`, 'ok');
+        location.hash = '#/channels';
+      }catch(e){ toast(e.message); }
+    });
 
   // Форма строится сразу при открытии вкладки (доработка §5, Дополнение 16.09):
   // кнопки «Настроить» и промежуточного состояния «свёрнуто» больше нет.
@@ -6659,7 +6717,7 @@ async function wireChannelEdit(root, c, chp){
         ${langOptionsHtml(ref.languages || [], c.lang_raw ?? c.lang ?? '')}
         <input id="f-niche" value="${esc(c.niche || '')}" style="width:180px"${off('niche')}></div>
       <div class="fldrow"><label>Дни</label>
-        <span class="langs" style="max-height:none;border:0;padding:0">${
+        <span class="langs days" style="max-height:none;border:0;padding:0">${
           ref.days.filter(x => x !== ref.any_day).map(dk =>
             `<label data-day="${dk}" class="${picked.has(dk) ? 'on' : ''}"><input
               type="checkbox" ${picked.has(dk) ? 'checked' : ''}${off('schedule')}>${
@@ -8803,7 +8861,10 @@ async function viewPresets(){
     catch(e){ toast('Скопировать не вышло — id виден в строке шаблона'); }
   });
   lumCard.querySelectorAll('.lum-del').forEach(b => b.onclick = () =>
-    confirmInline(b, `Удалить «${b.dataset.name}» в Lumean? Это правда удалит его у провайдера.`,
+    // Удаление спрашивается окном по центру с затемнением (владелец 24.09.2026):
+    // врезка в строке уезжала вместе со списком и терялась среди соседних пресетов.
+    confirmModal('Удалить шаблон озвучки',
+      `Удалить «${b.dataset.name}» в Lumean? Это правда удалит его у провайдера.`,
       async () => {
         try{ await api(`/ui/lumean/templates/${encodeURIComponent(b.dataset.id)}`,
                        {method: 'DELETE'}); await render(); }
@@ -8841,7 +8902,7 @@ async function viewPresets(){
   chpCard.querySelectorAll('.chp-edit').forEach(b => b.onclick =
     () => channelPresetModal(Number(b.dataset.id)));
   chpCard.querySelectorAll('.chp-del').forEach(b => b.onclick = () =>
-    confirmInline(b, `Удалить «${b.dataset.name}»?`, async () => {
+    confirmModal('Удалить пресет канала', `Удалить «${b.dataset.name}»?`, async () => {
       try{ await api(`/ui/channel-presets/${b.dataset.id}`, {method: 'DELETE'}); await render(); }
       catch(e){ toast(e.message); }
     }));
@@ -8875,7 +8936,8 @@ function wirePresets(root){
   root.querySelectorAll('button.pdel').forEach(b => b.onclick = () => {
     // В одном списке теперь бывают одноимённые строки (ссылка из производства и сам
     // пресет обложки), поэтому вопрос называет, ЧТО удаляется.
-    confirmInline(b, `Удалить ${b.dataset.kind || 'пресет'} «${b.dataset.name}»?`, () =>
+    confirmModal('Удалить пресет',
+      `Удалить ${b.dataset.kind || 'пресет'} «${b.dataset.name}»?`, () =>
       ask(b, () => api(`/ui/presets/${encodeURIComponent(b.dataset.svc)}/${
         encodeURIComponent(b.dataset.name)}`, {method: 'DELETE'})));
   });
@@ -9319,7 +9381,9 @@ async function accountsCard(){
           >Пароль</button>
         ${u.id === d.me ? '' : `<button class="ghost ublock" data-id="${u.id}"
           data-name="${esc(u.name)}" data-to="${u.disabled ? '0' : '1'}"
-          >${u.disabled ? 'Вернуть' : 'Заблокировать'}</button>`}
+          >${u.disabled ? 'Вернуть' : 'Заблокировать'}</button>
+        ${iconBtn('bad udel', 'remove', 'Удалить учётную запись', u.name,
+                  `data-id="${u.id}" data-name="${esc(u.name)}"`)}`}
       </td>
     </tr>`).join('')}</tbody></table>
 
@@ -9379,6 +9443,16 @@ async function accountsCard(){
 
   card.querySelectorAll('select.urole').forEach(sel => sel.onchange = () =>
     act(() => post(`/ui/accounts/${sel.dataset.id}`, {role: sel.value})));
+
+  // Удаление учётной записи — решение владельца 24.09.2026. Спрашиваем окном и
+  // говорим, чем это отличается от блокировки: за человеком может числиться работа,
+  // и тогда сервер откажет — это не поломка, а защита.
+  card.querySelectorAll('button.udel').forEach(b => b.onclick = () =>
+    confirmModal('Удалить учётную запись',
+      `Удалить «${b.dataset.name}» насовсем? Войти этим логином станет нельзя. `
+      + 'Если за человеком числятся каналы или проекты, удаление не пройдёт — '
+      + 'для этого есть блокировка.',
+      () => act(() => api(`/ui/accounts/${b.dataset.id}`, {method: 'DELETE'}))));
 
   card.querySelectorAll('input.uquota').forEach(inp => inp.onchange = () =>
     act(() => post(`/ui/accounts/${inp.dataset.id}`, {quota: inp.value})));
