@@ -76,12 +76,6 @@
   /* «Выйти» — значок, а не слово (владелец 24.09.2026): это действие, и в ряду
      разделов слово читалось как ещё один раздел. Ровняется по центру строки, как
      имя рядом. */
-  /* Логотип студии в шапке и на вкладке браузера. Адрес подставляется из JS: пульт
-     живёт и в корне, и под префиксом /studio, а путь к картинке должен совпадать с
-     тем, откуда открыта страница. */
-  nav .brand img{width:26px;height:26px;border-radius:6px;margin-right:8px;
-                 vertical-align:-7px}
-  nav .brand img[src=""]{display:none}
   nav .who a.out{color:var(--muted);text-decoration:none;display:inline-flex;
                  align-items:center;justify-content:center;width:30px;height:30px;
                  border-radius:8px;margin-left:4px}
@@ -907,8 +901,7 @@
 
 <header>
   <nav>
-    <span class="brand"><img src="" alt="" id="brand-logo" width="26" height="26"
-      >Studio<b>.</b></span>
+    <span class="brand">Studio<b>.</b></span>
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
@@ -1026,11 +1019,10 @@ class NeedLogin extends Error {}
 // префиксом, и при запуске пульта отдельно.
 const API = (location.pathname.match(/^\/studio(?=\/|$)/) || [''])[0];
 
-// Логотип и значок вкладки. Ставятся здесь, а не в разметке, по той же причине, что и
-// адреса запросов: страница открывается и в корне, и под префиксом.
+// Значок вкладки браузера. Ставится здесь, а не в разметке, по той же причине, что и
+// адреса запросов: страница открывается и в корне, и под префиксом. В шапке логотипа
+// нет — владелец убрал его 24.09.2026, оставив только вкладку.
 (function brandMarks(){
-  const logo = document.getElementById('brand-logo');
-  if (logo) logo.src = API + '/static/logo-180.png';
   for (const [rel, href] of [['icon', '/static/favicon-64.png'],
                              ['apple-touch-icon', '/static/logo-180.png']]){
     const link = document.createElement('link');
@@ -9683,6 +9675,11 @@ async function viewAdmin(){
       : '<div class="empty">Ни один из двенадцати поводов не выполнен.</div>'}
     ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
        ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
+  </div>`);
+  app.append(alertsWrap);
+
+  /* ── пороги: своя карточка ── */
+  const limitsWrap = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec" style="border-bottom:0">Пороги ${hintDot(
       'После скольких минут ожидания или какого остатка места повод считается верным. '
       + 'Правка действует со следующего прохода — перезапускать ничего не надо. '
@@ -9701,8 +9698,11 @@ async function viewAdmin(){
           : `${limShow(th)} ${LIM_UNIT[th.unit]}`}</td></tr>`).join('')}
     </tbody></table>
   </div>`);
-  app.append(alertsWrap);
-  wireLimits(alertsWrap);
+  app.append(limitsWrap);
+  wireLimits(limitsWrap);
+  foldRefCard(limitsWrap.querySelector('.card') || limitsWrap, 'admin:limits',
+              `${(a.thresholds || []).length} ${plural((a.thresholds || []).length,
+                 'порог', 'порога', 'порогов')}`);
   // Разделы админки сворачиваются, как в профиле (владелец 24.09.2026): за нужным не
   // надо листать. Горящие тревоги остаются развёрнутыми сами — их прятать нельзя.
   // Карточку берём ту самую, а не «первую на экране»: выше уже стоят справочники.

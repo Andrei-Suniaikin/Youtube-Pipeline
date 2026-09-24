@@ -94,6 +94,16 @@ def value(key):
 
 
 def main() -> int:
+    print("Пороги живут отдельной карточкой")
+    # 24.09.2026: они были внутри карточки тревог, а та сворачивается. На тихой студии
+    # тревоги свёрнуты — и таблица порогов пропадала вместе с ними: владелец не мог их
+    # изменить вовсе. Своя карточка не зависит от того, горит что-то или нет.
+    page = open(os.path.join(BASE, "web", "index.html"), encoding="utf-8").read()
+    check("карточка порогов заведена", "const limitsWrap" in page, True)
+    check("таблица порогов идёт ПОСЛЕ карточки тревог",
+          page.index("const limitsWrap") > page.index("app.append(alertsWrap)"), True)
+    check("и сворачивается своим ключом", "'admin:limits'" in page, True)
+
     print("Пока не правили — берётся то, что на машине")
     check("порог из окружения", value("STALL_SEC")["value"], 1200.0)
     check("он же помечен как не свой", value("STALL_SEC")["own"], False)
