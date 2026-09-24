@@ -150,6 +150,88 @@ def _migrate_channel_uc_optional(c: sqlite3.Connection) -> None:
         raise
 
 
+def _migrate_profiles_host_serial(c: sqlite3.Connection) -> None:
+    """Заменить `UNIQUE(tenant_id,serial)` на `UNIQUE(tenant_id,default_host_id,serial)`
+    на базах, заведённых до описи AdsPower по машинам (task-spec.md §6.2).
+
+    Один и тот же серийный номер профиля существует на нескольких машинах отдельными
+    профилями AdsPower — старое ограничение это запрещало. Техника пересборки — та же,
+    что и `_migrate_channel_uc_optional` выше: SQLite не умеет менять ограничение
+    существующей таблицы через ALTER, поэтому таблица пересобирается целиком в одной
+    транзакции, список колонок берётся из PRAGMA table_info динамически (колонки §6.1
+    уже добавлены к этому моменту через ALTER TABLE ADD COLUMN в ensure_pub_schema,
+    поэтому переносятся вместе с остальными без отдельного упоминания здесь), индексы —
+    из sqlite_master, счётчик AUTOINCREMENT — восстанавливается, а не пересчитывается
+    заново (иначе удалённый когда-то профиль с максимальным id отдал бы свой номер
+    новому — тот же прецедент, что и у каналов).
+
+    Идемпотентность: сверяется текст CREATE TABLE из sqlite_master — если новая форма
+    ограничения уже там, пересборка пропускается.
+    """
+    row = c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND tbl_name='pub_profiles'"
+    ).fetchone()
+    if row is None or row[0] is None:
+        return   # таблицы ещё нет — её создаст CREATE TABLE IF NOT EXISTS уже в новой форме
+    if "UNIQUE(tenant_id,default_host_id,serial)" in row[0]:
+        return   # уже новая форма — мигрировать нечего
+
+    def col_def(r) -> str:
+        cid, name, ctype, notnull, dflt_value, pk = r
+        parts = [f'"{name}"']
+        if ctype:
+            parts.append(ctype)
+        if pk:
+            parts.append("PRIMARY KEY AUTOINCREMENT")
+        if notnull:
+            parts.append("NOT NULL")
+        if dflt_value is not None:
+            parts.append(f"DEFAULT {dflt_value}")
+        return " ".join(parts)
+
+    cols = c.execute("PRAGMA table_info(pub_profiles)").fetchall()
+    col_names = [r[1] for r in cols]
+    cols_csv = ",".join(f'"{n}"' for n in col_names)
+    create_sql = ("CREATE TABLE pub_profiles_new(" + ", ".join(col_def(r) for r in cols) +
+                  ", UNIQUE(tenant_id,default_host_id,serial))")
+    idx_sql = [r[0] for r in c.execute(
+        "SELECT sql FROM sqlite_master WHERE type='index' AND tbl_name='pub_profiles' "
+        "AND sql IS NOT NULL").fetchall()]
+
+    # Тот же приём, что и у каналов: INSERT...SELECT копирует id как обычные значения, не
+    # через AUTOINCREMENT-счётчик, поэтому sqlite_sequence после пересборки чинится
+    # отдельно — иначе удалённый когда-то профиль с максимальным id отдал бы номер новому.
+    old_seq_row = c.execute(
+        "SELECT seq FROM sqlite_sequence WHERE name='pub_profiles'").fetchone()
+    old_seq = old_seq_row[0] if old_seq_row else None
+
+    in_tx = c.in_transaction
+    if not in_tx:
+        c.execute("BEGIN")
+    try:
+        c.execute(create_sql)
+        c.execute(f"INSERT INTO pub_profiles_new({cols_csv}) "
+                  f"SELECT {cols_csv} FROM pub_profiles")
+        c.execute("DROP TABLE pub_profiles")
+        c.execute("ALTER TABLE pub_profiles_new RENAME TO pub_profiles")
+        for sql in idx_sql:
+            c.execute(sql)
+        seqs = [r[0] for r in c.execute(
+            "SELECT seq FROM sqlite_sequence WHERE name='pub_profiles'").fetchall()]
+        max_id = c.execute("SELECT MAX(id) FROM pub_profiles").fetchone()[0]
+        want = max([v for v in [old_seq, max_id, *seqs] if v is not None], default=None)
+        c.execute("DELETE FROM sqlite_sequence WHERE name IN ('pub_profiles', 'pub_profiles_new')")
+        if want is not None:
+            c.execute("INSERT INTO sqlite_sequence(name, seq) VALUES ('pub_profiles', ?)",
+                      (want,))
+        if not in_tx:
+            c.commit()
+    except Exception:
+        if not in_tx:
+            c.rollback()
+        raise
+
+
 def ensure_pub_schema(c: sqlite3.Connection) -> None:
     """Создать таблицы контура. Идемпотентно: повторный вызов ничего не меняет."""
     # === Контур публикаций: каналы → план → выпуски ===
@@ -160,11 +242,39 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
               "code TEXT NOT NULL, title TEXT, adspower_url TEXT, "
               "status TEXT NOT NULL DEFAULT 'active', note TEXT, created REAL NOT NULL, "
               "UNIQUE(tenant_id,code))")
+    # Опись AdsPower (task-spec.md §6.1): серийный номер профиля не уникален глобально —
+    # один и тот же serial существует как разные профили на разных машинах, поэтому
+    # уникальность — по паре (машина, serial), не по одному serial. Новые семь колонок
+    # (adspower_user_id/group_name/remark/last_open_time/active_now/last_seen/
+    # missing_since) — только то, что разрешает читать белый список §6.3; username,
+    # password и прочие поля ответа AdsPower сюда не попадают никогда.
     c.execute("CREATE TABLE IF NOT EXISTS pub_profiles("
               "id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, "
               "serial TEXT NOT NULL, title TEXT, default_host_id INTEGER, "
               "status TEXT NOT NULL DEFAULT 'active', note TEXT, created REAL NOT NULL, "
-              "UNIQUE(tenant_id,serial))")
+              "adspower_user_id TEXT, group_name TEXT, remark TEXT, last_open_time TEXT, "
+              "active_now INTEGER NOT NULL DEFAULT 0, last_seen REAL, missing_since REAL, "
+              "UNIQUE(tenant_id,default_host_id,serial))")
+    # Существующие базы: колонки могли не существовать до этой описи. ADD COLUMN на уже
+    # актуальной базе падает молча (except) — проверяется живым SELECT в тестах, не
+    # молчанием. Порядок важен: колонки добавляются ДО пересборки ограничения ниже —
+    # `_migrate_profiles_host_serial` берёт список колонок из PRAGMA table_info
+    # динамически, и добавленные здесь колонки попадут в пересобранную таблицу сами,
+    # без отдельного упоминания в теле миграции.
+    for _col, _sql in (
+        ("adspower_user_id", "TEXT"),
+        ("group_name", "TEXT"),
+        ("remark", "TEXT"),
+        ("last_open_time", "TEXT"),
+        ("active_now", "INTEGER NOT NULL DEFAULT 0"),
+        ("last_seen", "REAL"),
+        ("missing_since", "REAL"),
+    ):
+        try:
+            c.execute(f"ALTER TABLE pub_profiles ADD COLUMN {_col} {_sql}")
+        except Exception:
+            pass
+    _migrate_profiles_host_serial(c)
     # Канал. UC уникален во всей системе и не меняется после создания: неверный UC
     # означает ролик на чужом канале (прецедент был). Формат UC проверяется в Python,
     # уникальность — здесь. Расписание и переопределения — JSON, как projects.settings.
