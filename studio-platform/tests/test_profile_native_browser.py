@@ -90,6 +90,19 @@ SCENARIO = r"""
     out.nameIsTheLink = !!document.querySelector('#who a#tab-profile');
     out.onProfile = document.getElementById('tab-profile').classList.contains('on');
 
+    // ── 1a. Разделы свёрнуты: за нужным не надо листать ──────────────────────
+    const cardBy = re => [...app.querySelectorAll('.card')]
+      .find(c => c.querySelector('.sec') && re.test(c.querySelector('.sec').textContent));
+    const keysCard = cardBy(/Ключи провайдеров/);
+    out.разделыСвёрнуты = [...app.querySelectorAll('.card')]
+      .filter(c => c.querySelector('.sec .iconbtn.fold'))
+      .every(c => c.classList.contains('folded'));
+    out.счётВЗаголовке = (keysCard.querySelector('.sec .refcount') || {}).textContent || '';
+    keysCard.querySelector('.sec .iconbtn.fold').click();
+    await sleep(60);
+    out.послеРаскрытия = !keysCard.classList.contains('folded');
+    out.соседОстался = cardBy(/Люди/).classList.contains('folded');
+
     // ── 2. Ключи работают здесь же ───────────────────────────────────────────
     out.keyBtnInProfile = !!app.querySelector('#addkey');
     out.keysScreenLink = !!app.querySelector('a[href="#/keys"]');
@@ -162,6 +175,12 @@ def main() -> int:
     check("на профиле имя подсвечено", res.get("onProfile"), True)
     check("на экране ключей — тоже (это тот же раздел)", res.get("onKeys"), True)
     check("на чужом разделе подсветка снята", res.get("offElsewhere"), True)
+
+    print("\nРазделы свёрнуты, за нужным не надо листать")
+    check("всё свёрнуто при открытии", res.get("разделыСвёрнуты"), True)
+    check("в полосе заголовка — счёт", res.get("счётВЗаголовке"), "своих ключей нет")
+    check("нажатие раскрывает", res.get("послеРаскрытия"), True)
+    check("соседний раздел остаётся свёрнутым", res.get("соседОстался"), True)
 
     print("\nКлючи — прямо в профиле")
     check("кнопка «Добавить ключ» на экране профиля", res.get("keyBtnInProfile"), True)

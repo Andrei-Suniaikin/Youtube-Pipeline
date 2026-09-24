@@ -407,6 +407,8 @@
   .pitem .body{min-width:0}
   .pitem .pacts{white-space:nowrap;align-self:center;display:flex;gap:2px}
   #paidline{margin-top:6px}
+  /* Счёт в полосе свёрнутой карточки: «52 профиля» рядом с названием, но тише его. */
+  .sec .refcount{margin:0 0 0 9px;font-weight:400;display:inline}
   /* Подписки для текста (22.09.2026): форма добавления встаёт в саму карточку, под
      полосой заголовка, — отдельного экрана на одно поле не нужно. */
   .subform{border-bottom:1px solid var(--line);display:grid;gap:10px}
@@ -7483,11 +7485,24 @@ async function viewProfile(){
   // на #/keys, с той же кнопкой «Добавить ключ». Сам экран #/keys остался живым адресом
   // — на нём очередь провайдеров, отдыхающие ключи и FastGen; туда ведёт ссылка в
   // заголовке карточки, и чужие закладки не ломаются.
+  // Разделы профиля сворачиваются (владелец 24.09.2026: «за нужным отделом много
+  // листать»). Свёрнуты по умолчанию: человек приходит сюда за одним разделом, а не
+  // читать всё подряд. Что открыл — остаётся открытым до конца сессии.
+  const fold = (card, key, summary) => {
+    if (card) foldRefCard(card, 'profile:' + key, summary || '');
+    return card;
+  };
   try{
-    app.append(ownKeysCard(await api('/ui/keys'), {
+    const d = await api('/ui/keys');
+    const wrap = ownKeysCard(d, {
       title: 'Ключи провайдеров', more: true,
       note: 'Ключи принадлежат человеку, а не системе: свой ключ тратит свои деньги, '
-          + 'серверный — деньги владельца.'}));
+          + 'серверный — деньги владельца.'});
+    app.append(wrap);
+    const own = (d.own_keys || []).length;
+    fold(wrap.querySelector('.card'), 'keys',
+         own ? `${own} ${plural(own, 'свой ключ', 'своих ключа', 'своих ключей')}`
+             : 'своих ключей нет');
   }catch(e){
     // Истёкшая сессия — дело роутера, он покажет вход; всё остальное не повод терять
     // весь профиль: люди и система человеку всё равно нужны, а про ключи скажем прямо.
@@ -7499,14 +7514,23 @@ async function viewProfile(){
   }
   // Подписки для текста — рядом с ключами: заказчик меняет их отсюда, а не по SSH.
   if (me.role === 'admin'){
-    app.append(await serverKeysCard());
-    app.append(await textSubsCard());
+    const srv = await serverKeysCard();
+    app.append(srv);
+    fold(srv, 'srvkeys', 'общие ключи владельца');
+    const subs = await textSubsCard();
+    app.append(subs);
+    fold(subs, 'subs', 'Codex и Claude');
   }
 
   // Раздел людей появляется только у администратора: проверка стоит на сервере,
   // а не на прятании кнопки — запрос может прислать кто угодно.
   const people = await accountsCard();
-  if (people) app.append(people);
+  if (people){
+    app.append(people);
+    const many = people.querySelectorAll('tbody tr').length;
+    fold(people.querySelector('.card') || people, 'people',
+         many ? `${many} ${plural(many, 'человек', 'человека', 'человек')}` : '');
+  }
 
   // «Система» — только ссылки: тревоги, диск и лимиты не место для действий. Внизу,
   // потому что это переход в другой экран, а не работа на этом.
