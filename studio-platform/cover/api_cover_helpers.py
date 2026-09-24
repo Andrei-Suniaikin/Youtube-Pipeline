@@ -189,7 +189,25 @@ def _provider_from_job(job) -> str:
     return provider
 
 
-def _key_requirements(mode: str, generation_provider: str, simple_mode: bool):
+def analysis_by_subscription(preset_data) -> bool:
+    """Выбрана ли для анализа превью подписка, а не ключ провайдера.
+
+    24.09.2026, решение владельца: подписки доступны там же, где OpenAI. Когда анализ
+    идёт подпиской, ключ OpenAI задаче не нужен вовсе — и требовать его значит не
+    пускать в работу то, что прекрасно сработало бы.
+    """
+    if isinstance(preset_data, str):
+        try:
+            preset_data = json.loads(preset_data or "{}")
+        except Exception:                                          # noqa: BLE001
+            preset_data = {}
+    data = preset_data if isinstance(preset_data, dict) else {}
+    chosen = str(data.get("analysis_provider") or data.get("analysis") or "")
+    return chosen.split("|", 1)[0].strip().lower() in ("codex", "claude")
+
+
+def _key_requirements(mode: str, generation_provider: str, simple_mode: bool,
+                      analysis_subscription: bool = False):
     mode = (mode or "url").strip().lower()
     provider = canonical_generation_provider(generation_provider or "flow")
     if simple_mode:
@@ -199,7 +217,7 @@ def _key_requirements(mode: str, generation_provider: str, simple_mode: bool):
         )
     generation_family = provider_credential_family(provider)
     families = []
-    if mode != "seed":
+    if mode != "seed" and not analysis_subscription:
         families.append("openai")
     families.append(generation_family)
     return provider, generation_family, tuple(dict.fromkeys(families))
@@ -210,10 +228,11 @@ def resolve_server_keys(
     generation_provider: str,
     *,
     simple_mode: bool = False,
+    analysis_subscription: bool = False,
 ) -> tuple:
     """Preflight-compatible `(openai_key, generation_key)` from server env."""
     _, credential_family, families = _key_requirements(
-        mode, generation_provider, simple_mode
+        mode, generation_provider, simple_mode, analysis_subscription
     )
     for family in families:
         if not configured_server_keys(family):
@@ -233,6 +252,7 @@ def resolve_server_keys_for_job(job) -> tuple:
         getattr(job, "mode", "url") or "url",
         _provider_from_job(job),
         simple_mode=bool((data or {}).get("simple_mode", False)),
+        analysis_subscription=analysis_by_subscription(data),
     )
 
 
@@ -247,6 +267,7 @@ def acquire_server_keys_for_job(job) -> ServerKeyLease:
         getattr(job, "mode", "url") or "url",
         provider,
         bool((data or {}).get("simple_mode", False)),
+        analysis_by_subscription(data),
     )
     assignments = _SERVER_CREDENTIAL_POOL.acquire(families)
     try:

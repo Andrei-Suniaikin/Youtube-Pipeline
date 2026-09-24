@@ -17,6 +17,7 @@ Endpoints:
   GET    /api/v1/jobs/{id}/files/{lang_code}    — скачать результат (text/plain)
   POST   /api/v1/jobs/{id}/retry?full=false     — повторить (full=true → с нуля)
 """
+import base64
 import json
 from job_idempotency import identity as create_identity, bind as bind_create, lookup as lookup_create, IdempotencyError, file_hash, snapshot_inputs
 import os
@@ -35,6 +36,8 @@ from api_auth import get_api_user
 from job_queue import Job, JobQueue, JobStatus, JobType
 from rewrite_core import (
     LANGUAGES,
+    call_codex_subscription,
+    call_claude_subscription,
     lang_name_to_code,
     ADMIN_USER_ID,
     get_allowed_openai_models,
@@ -240,6 +243,16 @@ class ApiJobCreate(BaseModel):
         except (TypeError, ValueError):
             raise ValueError("max_threads must be an integer")
         return max(1, min(API_MAX_THREADS_PER_JOB, parsed))
+
+
+class ApiChatOnce(BaseModel):
+    """Один вызов модели для части студии, у которой своих кредиталов нет."""
+
+    provider: str = "codex"
+    model: str = ""
+    messages: List[Dict[str, Any]] = Field(default_factory=list)
+    # Картинки — base64 PNG, как их собирают обложки (`image_to_base64`).
+    images: List[str] = Field(default_factory=list)
 
 
 class ApiFileUploadResponse(BaseModel):
@@ -650,6 +663,53 @@ def build_api_router(
                 if model and not any(item["value"] == model for item in base):
                     base.append({"value": model, "label": model})
         return base
+
+    @router.post("/chat-once", summary="Один вызов модели: текст или зрение")
+    def chat_once_api(body: ApiChatOnce, user: Dict = Depends(get_api_user)) -> Dict:
+        """Одноразовый вызов подпиской или ключом — для частей студии, у которых своих
+        кредиталов нет (обложки).
+
+        Почему так, а не «пусть обложки ходят к подписке сами»: распорядитель кредиталов
+        в системе один. Здесь пулы, аренда, лимиты и замок вокруг файла входа Codex —
+        второй распорядитель той же подписки означал бы потерянный одноразовый токен
+        обновления и разлогиненную подписку.
+
+        Картинки принимает только Codex: у подписки Claude вход — одна строка, инструменты
+        ей запрещены, и передать изображение нечем (проверено по коду 24.09.2026).
+        """
+        uid = _api_user_id(user)
+        provider = (body.provider or "").strip().lower()
+        if provider not in ("codex", "claude"):
+            raise HTTPException(status_code=400, detail="provider: codex или claude")
+        images: List[bytes] = []
+        for item in body.images or []:
+            try:
+                images.append(base64.b64decode(item, validate=True))
+            except Exception:                                      # noqa: BLE001
+                raise HTTPException(status_code=400, detail="картинка не разобрана")
+        if images and provider != "codex":
+            raise HTTPException(
+                status_code=400,
+                detail="подписка Claude не принимает изображения — выберите Codex "
+                       "или ключ провайдера")
+        if credential_source(provider, uid) == "none":
+            raise HTTPException(status_code=503,
+                                detail=f"подписка {provider} не задана")
+        messages = [{"role": str(m.get("role") or "user"),
+                     "content": str(m.get("content") or "")} for m in body.messages]
+        if not messages:
+            raise HTTPException(status_code=400, detail="нечего спрашивать")
+        if provider == "codex":
+            ok, text = call_codex_subscription(
+                messages=messages, model=body.model or "gpt-5.1-codex-max",
+                task_info="chat-once", images=images or None)
+        else:
+            ok, text = call_claude_subscription(
+                messages, None, "chat-once", body.model or "", "")
+        if not ok:
+            # Причину отдаём как есть: она уже очищена от секретов на стороне вызова.
+            raise HTTPException(status_code=502, detail=str(text)[:400])
+        return {"ok": True, "text": text}
 
     # ----- 1.1 POST /files -----
     @router.post(

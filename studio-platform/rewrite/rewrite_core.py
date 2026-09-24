@@ -9146,8 +9146,16 @@ def call_codex_subscription(
     task_info: str = "",
     _credential_leased: bool = False,
     _codex_home_override: str = "",
+    images: Optional[List[bytes]] = None,
 ) -> Tuple[bool, str]:
-    """Вызвать GPT через авторизованный Codex CLI, не читая его auth.json."""
+    """Вызвать GPT через авторизованный Codex CLI, не читая его auth.json.
+
+    `images` — картинки для задач со зрением (анализ обложки). CLI принимает их
+    флагом `-i`, это проверено живым вызовом 24.09.2026: картинка с надписью
+    «STUDIO 42» была прочитана. Файлы кладутся внутрь той же временной изоляции,
+    что и весь вызов, и исчезают вместе с ней. Без картинок путь остаётся прежним
+    до последнего флага — текстовые задачи не должны почувствовать разницы.
+    """
     if not _credential_leased:
         try:
             alt = alt_route_for("codex")
@@ -9233,8 +9241,15 @@ def call_codex_subscription(
                 actual_model,
                 "-o",
                 output_path,
-                "-",
             ]
+            # Картинки — файлами рядом, внутри изоляции: CLI берёт их флагом `-i`.
+            # Их содержимое в лог не попадает, только количество.
+            for number, blob in enumerate(images or [], 1):
+                image_path = os.path.join(work_dir, f"image-{number}.png")
+                with open(image_path, "wb") as fh:
+                    fh.write(blob)
+                cmd += ["-i", image_path]
+            cmd.append("-")
             cmd = _wrap_codex_linux_sandbox(
                 cmd,
                 isolation_root,

@@ -626,6 +626,62 @@ def _alt_chat_route():
     return (base, key, model)
 
 
+# ─────────────── подписки Codex и Claude: вызов через сервис текста ───────────────
+#
+# Решение владельца 24.09.2026: подписки должны быть доступны везде, где есть OpenAI.
+# У обложек своих кредиталов нет и заводиться не должно: распорядитель подписок в
+# системе один — сервис текста. Там пулы, аренда, лимиты и замок вокруг файла входа
+# Codex; второй распорядитель той же подписки означал бы потерянный одноразовый токен
+# обновления и разлогиненную подписку. Поэтому обложки просят вызов, а не делают его.
+SUBSCRIPTION_PROVIDERS = ("codex", "claude")
+SUBSCRIPTION_TIMEOUT = float(os.environ.get("COVER_SUBSCRIPTION_TIMEOUT", "300"))
+
+
+def _subscription_call(provider: str, messages: list, model: str = "",
+                       images: list | None = None) -> str:
+    """Один вызов подпиской. Картинки принимает только Codex — так устроен его CLI."""
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    base = (os.environ.get("VS_REWRITE_BASE") or "http://127.0.0.1:8899").rstrip("/")
+    key = os.environ.get("COVER_TEXT_SERVICE_KEY") or ""
+    if not key:
+        raise RuntimeError(
+            "не задан ключ доступа к сервису текста (COVER_TEXT_SERVICE_KEY): "
+            "подписками распоряжается он, а не обложки")
+    payload = {"provider": provider, "model": model or "",
+               "messages": messages, "images": images or []}
+    req = urllib.request.Request(
+        base + "/api/v1/chat-once",
+        data=_json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Bearer {key}"})
+    try:
+        with urllib.request.urlopen(req, timeout=SUBSCRIPTION_TIMEOUT) as resp:
+            body = _json.loads(resp.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = str((_json.loads(exc.read() or b"{}") or {}).get("detail") or "")
+        except Exception:                                          # noqa: BLE001
+            pass
+        raise RuntimeError(f"подписка {provider}: {detail or exc.reason}")
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"сервис текста не ответил: {exc.reason}")
+    text = str((body or {}).get("text") or "")
+    if not text.strip():
+        raise RuntimeError(f"подписка {provider} вернула пустой ответ")
+    return text
+
+
+def _subscription_vision(images_list, prompt: str, provider: str, model: str) -> str:
+    """Анализ картинки подпиской. Картинки уходят теми же PNG-base64, что и в OpenAI."""
+    blobs = [image_to_base64(im, "PNG") for im in images_list]
+    return _subscription_call(provider, [{"role": "user", "content": prompt}],
+                              model=model, images=blobs)
+
+
 def _call_openai_vision(image, prompt: str, api_key: str, model: str) -> str:
     """Вызов OpenAI (GPT-4o и др.) с картинкой. Возвращает текст ответа.
     image — одна PIL.Image ИЛИ список картинок (vS: 2-image сверка оригинал↔результат)."""
@@ -658,6 +714,15 @@ def _call_vision(
     """Анализ картинки через OpenAI (Gemini SDK удалён в v1.0.3).
     provider="google" сохранён для backward-compat — auto-fallback на OpenAI."""
     provider = (provider or "openai").strip().lower()
+    if provider in SUBSCRIPTION_PROVIDERS:
+        images = list(image) if isinstance(image, (list, tuple)) else [image]
+        if provider == "claude":
+            # Не притворяемся, что справились: у подписки Claude вход — одна строка,
+            # инструменты ей запрещены, передать картинку нечем.
+            raise RuntimeError(
+                "подписка Claude не умеет смотреть картинки — для анализа превью "
+                "выберите Codex или ключ провайдера")
+        return _subscription_vision(images, prompt, provider, model)
     if provider == "google" or provider == "gemini":
         global _GOOGLE_PROVIDER_WARNED
         if not _GOOGLE_PROVIDER_WARNED:
@@ -814,13 +879,23 @@ def generate_scene_from_title(
     return parsed
 
 
-def adapt_text(original_text: str, target_language: str, api_key: str, video_title: str = "") -> str:
-    """Адаптация текста обложки на целевой язык через GPT. video_title — название ролика для контекста."""
+def adapt_text(original_text: str, target_language: str, api_key: str, video_title: str = "",
+               provider: str = "") -> str:
+    """Адаптация текста обложки на целевой язык через GPT. video_title — название ролика для контекста.
+
+    `provider` — подписка (codex или claude), когда человек выбрал её вместо ключа.
+    Здесь картинок нет, поэтому обе подписки годятся одинаково.
+    """
     if not original_text or not original_text.strip():
         return ""
     system_template = _active_prompts().get("adapt_text_system_template") or get_default_prompt("adapt_text_system_template")
     video_title_val = (video_title or "").strip() or "(not provided)"
     system_content = system_template.replace("{video_title}", video_title_val).replace("{target_language}", target_language)
+    if (provider or "").strip().lower() in SUBSCRIPTION_PROVIDERS:
+        return _subscription_call(provider.strip().lower(), [
+            {"role": "system", "content": system_content},
+            {"role": "user", "content": original_text},
+        ]).strip()
     client, _model, used_key = _chat_route(api_key, GPT_MODEL)
     with _provider_semaphore_for_key("openai", used_key):
         resp = client.chat.completions.create(

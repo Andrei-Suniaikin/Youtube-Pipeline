@@ -100,6 +100,23 @@ def _new_key(mod, name: str, tenant: str) -> str:
     raise RuntimeError(f"в ответе нет самого ключа, только {sorted(made or {})}")
 
 
+def _share_text_key(c, name: str) -> None:
+    """Обложкам нужен тот же ключ к сервису текста: подписками распоряжается он один.
+
+    Кладём ключ в окружение процесса, а не в файл: части студии живут в одном процессе,
+    и второго места хранения секрета заводить незачем.
+    """
+    if name != "rewrite":
+        return
+    import os
+
+    import pub_remote
+
+    key = pub_remote.get_key(c, "rewrite")
+    if key:
+        os.environ["COVER_TEXT_SERVICE_KEY"] = key
+
+
 def ensure_internal_access(db: Callable, log: Callable = print) -> dict:
     """Доделать всё, чего не хватает для работы. Возвращает короткий отчёт для журнала.
 
@@ -127,12 +144,14 @@ def ensure_internal_access(db: Callable, log: Callable = print) -> dict:
                 continue
             if pub_remote.get_key(c, name):
                 skipped.append(title)
+                _share_text_key(c, name)
                 continue
             try:
                 pub_remote.set_key(c, name, _new_key(mod, name, who["tenant"]), time.time())
                 c.commit()
                 done.append(title)
                 log(f"[студия] {title}: доступ выдан")
+                _share_text_key(c, name)
             except Exception as exc:                               # noqa: BLE001
                 failed.append(title)
                 log(f"[студия] {title}: доступ не выдан — {type(exc).__name__}: {exc}")

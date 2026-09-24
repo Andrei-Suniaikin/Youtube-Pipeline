@@ -5616,9 +5616,14 @@ def _neighbour_preset_options(service: str, sid: str, request) -> dict:
                 for o in _cover_options(is_admin)]
         # Анализ превью и поведение при неудачной подстановке текста: значения те же,
         # что принимает сам Cover (`cover/api_cover.py`), подписи — человеческие.
+        # Codex здесь наравне с ключом: его CLI принимает картинку флагом `-i`
+        # (проверено живым вызовом 24.09.2026). Подписки Claude в этом списке НЕТ и
+        # быть не должно: она картинки не принимает, а предлагать неработающее —
+        # это ровно та ложь интерфейса, которую мы убираем. Google мёртв с v1.0.3 и
+        # молча мигрируется в OpenAI, поэтому его тоже не предлагаем.
         analysis = [{"value": "openai|gpt-4.1-mini", "title": "OpenAI · gpt-4.1-mini"},
                     {"value": "openai|gpt-4o", "title": "OpenAI · gpt-4o"},
-                    {"value": "google|gemini-2.0-flash", "title": "Google · gemini-2.0-flash"}]
+                    {"value": "codex|", "title": "Codex · подписка ChatGPT"}]
         fallback = [{"value": "auto", "title": "как решит сервис"},
                     {"value": "always_overlay", "title": "всегда накладывать текст"},
                     {"value": "never_overlay", "title": "никогда не накладывать"}]

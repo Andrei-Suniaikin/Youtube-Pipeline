@@ -129,12 +129,20 @@ def main() -> int:
     check("пароль модулю выдан случайный и длинный",
           len(text.license_mgr.passwords[0]) >= 20, True)
 
+    print("Обложкам достаётся тот же ключ к сервису текста")
+    # Подписками распоряжается одно место, и обложки просят вызов у него. Без ключа
+    # они получали бы честный отказ на каждом анализе превью.
+    check("ключ роздан", os.environ.get("COVER_TEXT_SERVICE_KEY"), "текст-ключ-1")
+
     print("Повторный запуск ничего не портит")
     before = keys(path)
+    os.environ.pop("COVER_TEXT_SERVICE_KEY", None)
     report2 = self_setup.ensure_internal_access(db, quiet)
     check("второй раз — нечего делать", report2["выдано"], [])
     check("…и всё на месте", sorted(report2["было"]), ["обложки", "тексты"])
     check("ключи не переписаны", keys(path), before)
+    check("а обложкам ключ роздан снова — он живёт в памяти процесса",
+          os.environ.get("COVER_TEXT_SERVICE_KEY"), "текст-ключ-1")
     check("вторая учётка не заводится", text.license_mgr.users, ["GeiAndrei"])
 
     print("Пароль человека не трогается никогда")
