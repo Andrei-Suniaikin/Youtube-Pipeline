@@ -1891,6 +1891,74 @@ def ui_keys_rewrite(body: RewriteKeyIn, request: Request):
     return {"ok": True, "set": result}
 
 
+# ─────────────── серверные ключи владельца: правка из студии (24.09.2026) ───────────────
+#
+# Владелец: «сделаем так чтобы серверные ключи админ тоже мог менять из интерфейса без
+# надобности в ssh». До этого ключ FastGen, озвучки или обложек менялся только правкой
+# файла на боевой машине — заказчику это недоступно, а срок ключа FastGen истекает.
+#
+# Хранилище одно и прежнее: файл ключей владельца (`server/server_keys.py`). Сервер
+# перечитывает его сам при изменении, пул раздачи спрашивает значения на каждой выдаче —
+# поэтому перезапуск не нужен. Значение ключа наружу не отдаётся никогда.
+
+
+def _server_keys():
+    import server_keys
+    return server_keys
+
+
+def _audit(what: str) -> None:
+    """Короткая запись в журнал службы: кто и что менял. Значений секретов тут нет."""
+    print(f"[ключи] {what}", flush=True)
+
+
+def _require_keys_admin(request) -> dict:
+    """Серверные ключи — деньги владельца, поэтому только администратор."""
+    user = getattr(request.state, "user", None)
+    role = (user["role"] if user is not None and "role" in user.keys() else "") or ""
+    if role != "admin":
+        raise HTTPException(403, "серверные ключи меняет только администратор")
+    return {"id": user["id"], "name": user["name"]}
+
+
+@app.get("/ui/keys/server")
+def ui_server_keys(request: Request):
+    _require_keys_admin(request)
+    sk = _server_keys()
+    exists, warn = sk.file_state()
+    return {"items": sk.listing(), "file_exists": exists, "warning": warn}
+
+
+class ServerKeyIn(BaseModel):
+    family: str = ""
+    value: str = ""
+
+
+@app.post("/ui/keys/server")
+def ui_server_key_set(body: ServerKeyIn, request: Request):
+    who = _require_keys_admin(request)
+    sk = _server_keys()
+    try:
+        item = sk.set_value(body.family, body.value)
+    except sk.KeyError_ as exc:
+        raise HTTPException(400, str(exc))
+    # В журнал — имя семейства и кто менял. Значение не пишем никогда.
+    _audit(f"серверный ключ {body.family}: заменил {who['name']}")
+    return {"ok": True, "item": item}
+
+
+@app.delete("/ui/keys/server/{family}")
+def ui_server_key_drop(family: str, request: Request):
+    who = _require_keys_admin(request)
+    sk = _server_keys()
+    try:
+        item = sk.drop(family)
+    except sk.KeyError_ as exc:
+        raise HTTPException(400, str(exc))
+    _audit(f"серверный ключ {family}: убрал {who['name']}")
+    return {"ok": True, "item": item}
+
+
 # ─────────────────── подписки для текста: Codex и Claude (22.09.2026) ───────────────────
 #
 # Раньше сменить подписку, которой пишется текст, можно было только по SSH: `codex login`,

@@ -1533,6 +1533,100 @@ function wireSubFile(container){
   };
 }
 
+/* ────────── серверные ключи владельца: правка со страницы (24.09.2026) ──────────
+   Владелец: «сделаем так чтобы серверные ключи админ тоже мог менять из интерфейса без
+   надобности в ssh». Ключи лежат там же, где и раньше, — файлом у владельца; студия
+   только правит его. Значение обратно не приходит никогда: видно «задан», хвост и
+   сколько ключей в семействе. */
+async function serverKeysCard(){
+  const card = $(`<div class="card" id="srvkeys-card" style="margin-bottom:16px"></div>`)
+    .firstElementChild;
+  const draw = async () => {
+    let d;
+    try{ d = await api('/ui/keys/server'); }
+    catch(e){
+      if (e instanceof NeedLogin) throw e;
+      card.innerHTML = `<div class="sec">Ключи провайдеров (общие)</div><div class="secbody">
+        <div class="note bad">Список прочитать не удалось: ${esc(e.message)}</div></div>`;
+      return;
+    }
+    const items = Array.isArray(d.items) ? d.items : [];
+    card.innerHTML = `
+      <div class="sec">Ключи провайдеров (общие) ${hintDot(
+        'Ключи владельца: ими работают все, у кого нет своего ключа. Меняются прямо '
+        + 'здесь — новый ключ действует со следующей задачи, перезапускать ничего не '
+        + 'надо. Само значение ключа нигде не показывается.')}</div>
+      ${d.warning ? `<div class="secbody" style="padding-bottom:0">
+        <div class="note bad">${esc(d.warning)}</div></div>` : ''}
+      ${items.map(it => `<div class="stage pitem srvkey" data-family="${esc(it.family)}">
+        <div class="dot ${it.set ? 's-done' : 's-idle'}">${it.set ? '✓' : '·'}</div>
+        <div class="body">
+          <div class="pline"><span class="name">${esc(it.title)}</span>
+            ${it.set ? `<span class="facts mono">${esc(it.tail)}</span>` : ''}
+            ${it.pooled ? `<span class="pill ptag">ключей ${it.count}</span>` : ''}</div>
+          <div class="note muted">${it.set
+            ? (it.pooled ? 'работают по кругу; «Заменить» меняет основной'
+                         : 'задан')
+            : 'не задан — задачи этого провайдера упадут «нет ключа»'}</div>
+        </div>
+        <div class="pacts">
+          ${iconBtn('srvkey-set', 'key', it.set ? 'Заменить ключ' : 'Задать ключ', it.title)}
+          ${it.set ? iconBtn('bad srvkey-drop', 'remove', 'Убрать ключ', it.title) : ''}
+        </div></div>`).join('')}
+      <div class="secbody" style="padding-top:8px"><div class="note muted">Свой ключ
+        человека перекрывает общий: у кого он задан, задачи идут на него.</div></div>
+      <div class="secbody srvkey-form" id="srvkey-form" hidden></div>`;
+
+    const form = card.querySelector('#srvkey-form');
+    const openForm = it => {
+      form.hidden = false;
+      form.innerHTML = `
+        <div class="name" style="font-weight:600">${esc(it.title)}</div>
+        <div class="note muted">Вставьте новый ключ. Старый сохранится в файле ключей
+          с пометкой даты — на случай, если новый окажется чужим.</div>
+        <input id="sk-val" class="secret" type="password" autocomplete="off"
+          spellcheck="false" placeholder="ключ провайдера"
+          style="width:min(460px,100%);font-family:var(--mono);font-size:12px">
+        <div class="row" style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          <button id="sk-ok">Сохранить</button>
+          <button class="ghost" id="sk-no">Отмена</button>
+          <span class="note bad" id="sk-err" style="margin:0"></span></div>`;
+      const val = form.querySelector('#sk-val');
+      const err = form.querySelector('#sk-err');
+      const ok = form.querySelector('#sk-ok');
+      form.querySelector('#sk-no').onclick = () => { form.hidden = true; form.innerHTML = ''; };
+      ok.onclick = async () => {
+        err.textContent = '';
+        if (!val.value.trim()){ err.textContent = 'вставьте ключ'; return val.focus(); }
+        ok.disabled = true;
+        try{
+          await post('/ui/keys/server', {family: it.family, value: val.value});
+          val.value = '';                       // в странице секрет не задерживается
+          toast(`Ключ «${it.title}» заменён — действует со следующей задачи`, 'ok');
+          await draw();
+        }catch(e){ err.textContent = e.message; }
+        finally{ ok.disabled = false; }
+      };
+      val.focus();
+    };
+    const byFamily = f => items.find(i => i.family === f);
+    card.querySelectorAll('.srvkey-set').forEach(b => b.onclick = () =>
+      openForm(byFamily(b.closest('.srvkey').dataset.family)));
+    card.querySelectorAll('.srvkey-drop').forEach(b => b.onclick = () => {
+      const it = byFamily(b.closest('.srvkey').dataset.family);
+      confirmModal('Убрать ключ', `Убрать общий ключ «${it.title}»? Задачи этого `
+        + 'провайдера будут падать «нет ключа» у всех, у кого нет своего.',
+        async () => {
+          try{ await api(`/ui/keys/server/${encodeURIComponent(it.family)}`,
+                         {method: 'DELETE'}); await draw(); }
+          catch(e){ toast(e.message); }
+        });
+    });
+  };
+  await draw();
+  return card;
+}
+
 async function textSubsCard(){
   const card = $(`<div class="card" id="subs-card" style="margin-bottom:16px"></div>`)
     .firstElementChild;
@@ -1694,7 +1788,10 @@ async function viewKeys(){
 
   // Серверные подписки общие на всех — блок видит и меняет только администратор
   // (проверка на сервере; здесь — лишь чтобы не показывать пустой отказ).
-  if (ME && ME.role === 'admin') app.append(await textSubsCard());
+  if (ME && ME.role === 'admin'){
+    app.append(await serverKeysCard());
+    app.append(await textSubsCard());
+  }
 
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Очередь по провайдерам</div>
@@ -7342,7 +7439,10 @@ async function viewProfile(){
         ${esc(e.message)}. Денег это не стоило — карточка только читает.</div></div></div>`));
   }
   // Подписки для текста — рядом с ключами: заказчик меняет их отсюда, а не по SSH.
-  if (me.role === 'admin') app.append(await textSubsCard());
+  if (me.role === 'admin'){
+    app.append(await serverKeysCard());
+    app.append(await textSubsCard());
+  }
 
   // Раздел людей появляется только у администратора: проверка стоит на сервере,
   // а не на прятании кнопки — запрос может прислать кто угодно.
