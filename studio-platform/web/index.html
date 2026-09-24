@@ -76,6 +76,12 @@
   /* «Выйти» — значок, а не слово (владелец 24.09.2026): это действие, и в ряду
      разделов слово читалось как ещё один раздел. Ровняется по центру строки, как
      имя рядом. */
+  /* Логотип студии в шапке и на вкладке браузера. Адрес подставляется из JS: пульт
+     живёт и в корне, и под префиксом /studio, а путь к картинке должен совпадать с
+     тем, откуда открыта страница. */
+  nav .brand img{width:26px;height:26px;border-radius:6px;margin-right:8px;
+                 vertical-align:-7px}
+  nav .brand img[src=""]{display:none}
   nav .who a.out{color:var(--muted);text-decoration:none;display:inline-flex;
                  align-items:center;justify-content:center;width:30px;height:30px;
                  border-radius:8px;margin-left:4px}
@@ -421,7 +427,10 @@
   /* Счёт и знак подсказки в полосе свёрнутой карточки: «52 профиля» рядом с названием,
      но тише его; без отступов название, «?» и счёт слипались в одно слово (жалоба
      владельца 24.09.2026). */
-  .sec .refcount{margin:0 0 0 9px;font-weight:400;display:inline}
+  /* Сворачивание превращает полосу заголовка в `.sec.stage-head`, а у неё своё правило
+     `.note{margin:0}` — оно и съедало отступ счёта. Поэтому правило счёта не менее
+     точное, иначе «Тревоги в телеграм» и «горит 2» слипались в одно слово. */
+  .sec .refcount,.sec.stage-head .refcount{margin:0 0 0 9px;font-weight:400;display:inline}
   .sec .q{margin-left:7px}
   /* Подписки для текста (22.09.2026): форма добавления встаёт в саму карточку, под
      полосой заголовка, — отдельного экрана на одно поле не нужно. */
@@ -898,7 +907,8 @@
 
 <header>
   <nav>
-    <span class="brand">Studio<b>.</b></span>
+    <span class="brand"><img src="" alt="" id="brand-logo" width="26" height="26"
+      >Studio<b>.</b></span>
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
@@ -1015,6 +1025,20 @@ class NeedLogin extends Error {}
 // База берётся из адреса страницы, а не из настройки: одна сборка годится и под
 // префиксом, и при запуске пульта отдельно.
 const API = (location.pathname.match(/^\/studio(?=\/|$)/) || [''])[0];
+
+// Логотип и значок вкладки. Ставятся здесь, а не в разметке, по той же причине, что и
+// адреса запросов: страница открывается и в корне, и под префиксом.
+(function brandMarks(){
+  const logo = document.getElementById('brand-logo');
+  if (logo) logo.src = API + '/static/logo-180.png';
+  for (const [rel, href] of [['icon', '/static/favicon-64.png'],
+                             ['apple-touch-icon', '/static/logo-180.png']]){
+    const link = document.createElement('link');
+    link.rel = rel;
+    link.href = API + href;
+    document.head.append(link);
+  }
+})();
 
 async function api(path, opts){
   const r = await fetch(API + path, opts);
@@ -7598,6 +7622,43 @@ async function viewProfile(){
       <a href="#/limits">Серверные лимиты</a></div></div>`));
 }
 
+/* Порог хранится в своей мере (секунды, гигабайты, штуки), а правится в человеческой:
+   получасовые и часовые пороги удобнее задавать минутами, а не секундами. */
+const LIM_DIV = {sec: 60, gb: 1, days: 1, pct: 1, count: 1};
+const LIM_UNIT = {sec: 'мин', gb: 'ГБ', days: 'дн', pct: '%', count: 'шт'};
+function limShow(th){
+  const v = th.value / (LIM_DIV[th.unit] || 1);
+  return Math.round(v * 100) / 100;
+}
+
+function wireLimits(card){
+  if (!card || !(ME && ME.role === 'admin')) return;
+  const send = async (key, value, el) => {
+    el.disabled = true;
+    try{
+      await post('/ui/alerts/thresholds', {key, value});
+      toast('Порог сохранён — подействует со следующего прохода', 'ok');
+      await render();
+    }catch(e){ toast(e.message); el.disabled = false; }
+  };
+  card.querySelectorAll('input.limval').forEach(inp => {
+    // По уходу из поля, а не по каждой набранной цифре: иначе «30» успело бы
+    // сохраниться как «3» — и порог полчаса стал бы тремя минутами.
+    inp.onchange = () => {
+      const row = inp.closest('tr');
+      const unit = (a => a)(inp.nextElementSibling ? inp.nextElementSibling.textContent : '');
+      const key = row.dataset.lim;
+      const mul = Object.entries(LIM_UNIT).find(([, u]) => u === unit.trim());
+      const div = mul ? LIM_DIV[mul[0]] : 1;
+      const value = Number(inp.value);
+      if (!Number.isFinite(value)) { toast('порог — это число'); return; }
+      send(key, value * div, inp);
+    };
+  });
+  card.querySelectorAll('button.limreset').forEach(b => b.onclick = () =>
+    send(b.closest('tr').dataset.lim, null, b));
+}
+
 /* ─────────────────────────── серверные лимиты ─────────────────────────── */
 
 async function viewLimits(){
@@ -9593,7 +9654,7 @@ async function viewAdmin(){
 
   /* ── тревоги ── */
   const t = a.transport;
-  app.append($(`<div class="card" style="margin-bottom:16px">
+  const alertsWrap = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Тревоги в телеграм</div>
     <div class="stage">
       <div class="dot ${t.configured && !t.loop_off ? 's-done' : 's-error'}">${
@@ -9622,22 +9683,42 @@ async function viewAdmin(){
       : '<div class="empty">Ни один из двенадцати поводов не выполнен.</div>'}
     ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
        ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
-    <div class="sec" style="border-bottom:0">Пороги</div>
+    <div class="sec" style="border-bottom:0">Пороги ${hintDot(
+      'После скольких минут ожидания или какого остатка места повод считается верным. '
+      + 'Правка действует со следующего прохода — перезапускать ничего не надо. '
+      + '«Как на машине» возвращает значение из настроек сервера.')}</div>
     <table><tbody>
-      ${a.thresholds.map(th => `<tr><td>${esc(th.what)}</td>
-        <td style="text-align:right;width:120px">${dur(th.value)}</td></tr>`).join('')}
-      <tr><td>свободного места меньше</td>
-        <td style="text-align:right">${a.disk_min_gb} ГБ</td></tr>
+      ${(a.thresholds || []).map(th => `<tr data-lim="${esc(th.key)}">
+        <td>${esc(th.what)}${th.own
+          ? ' <span class="pill s-idle" style="font-size:10.5px">своё</span>' : ''}</td>
+        <td style="text-align:right;width:230px">${ME && ME.role === 'admin'
+          ? `<input class="limval" type="number" step="any" min="${th.min / LIM_DIV[th.unit]}"
+               max="${th.max / LIM_DIV[th.unit]}" value="${limShow(th)}"
+               style="width:90px;text-align:right"> <span class="muted"
+               >${LIM_UNIT[th.unit]}</span>
+             ${th.own ? `<button class="ghost small limreset" title="вернуть как на машине"
+                >как на машине</button>` : ''}`
+          : `${limShow(th)} ${LIM_UNIT[th.unit]}`}</td></tr>`).join('')}
     </tbody></table>
-  </div>`));
+  </div>`);
+  app.append(alertsWrap);
+  wireLimits(alertsWrap);
+  // Разделы админки сворачиваются, как в профиле (владелец 24.09.2026): за нужным не
+  // надо листать. Горящие тревоги остаются развёрнутыми сами — их прятать нельзя.
+  // Карточку берём ту самую, а не «первую на экране»: выше уже стоят справочники.
+  const alertsCard = alertsWrap.querySelector('.card') || alertsWrap;
+  foldRefCard(alertsCard, 'admin:alerts',
+    (a.active || []).length ? `горит ${(a.active || []).length}` : 'тихо');
+  if ((a.active || []).length) alertsCard.classList.remove('folded');
 
   /* ── выходы субтитров ── */
   app.append(subsExitsCard(se));
+  foldRefCard(app.lastElementChild, 'admin:subs', '');
 
   /* ── диск ── */
   const sp = d.space || {};
   const low = sp.free_gb != null && sp.free_gb < a.disk_min_gb;
-  app.append($(`<div class="card">
+  const diskCardWrap = $(`<div class="card">
     <div class="sec">Диск</div>
     <div class="stage">
       <div class="dot ${low ? 's-error' : 's-done'}">${low ? '!' : '✓'}</div>
@@ -9714,10 +9795,13 @@ async function viewAdmin(){
       убрать. Зелёным — пять артефактов выпуска: они остаются всегда.
       Всего ${size(d.total)}, освободится ${size(d.freeable)}.</div></div>`
       : '<div class="empty">Проектов на диске нет.</div>'}
-  </div>`));
+  </div>`);
+  app.append(diskCardWrap);
+  foldRefCard(diskCardWrap.querySelector('.card') || diskCardWrap, 'admin:disk',
+              sp.free_gb != null ? `свободно ${Math.round(sp.free_gb)} ГБ` : '');
 
   /* ── вышел ли ролик на самом деле ── */
-  app.append($(`<div class="card" style="margin-top:16px">
+  const publicCardWrap = $(`<div class="card" style="margin-top:16px">
     <div class="sec">Выход в свет ${hintDot(pb.how)}</div>
     <div class="stage">
       <div class="dot ${pb.key_set ? 's-done' : 's-idle'}">${pb.key_set ? '✓' : '?'}</div>
@@ -9750,7 +9834,10 @@ async function viewAdmin(){
           ${x.blocked ? `<div class="note bad">${esc(x.blocked)}</div>` : ''}
         </div></div>`).join('')}` : ''}
     <div class="secbody"><div class="note muted">${esc(pb.blind_spot)}</div></div>
-  </div>`));
+  </div>`);
+  app.append(publicCardWrap);
+  foldRefCard(publicCardWrap.querySelector('.card') || publicCardWrap, 'admin:public',
+              (pb.due || []).length ? `ждут проверки: ${(pb.due || []).length}` : '');
 
   // Раздел людей появляется только у администратора: обычному он не показывается
   // и не отвечает — проверка стоит на сервере, а не на прятании кнопки.

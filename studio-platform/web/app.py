@@ -528,6 +528,28 @@ def index():
                         headers={"Cache-Control": "no-cache"})
 
 
+# Картинки оболочки — логотип и значок вкладки. Отдаём поимённо, а не каталогом:
+# каталог целиком открывал бы наружу всё, что туда когда-нибудь положат.
+_STATIC = {
+    "logo-512.png": "image/png",
+    "logo-180.png": "image/png",
+    "favicon-64.png": "image/png",
+}
+
+
+@app.get("/static/{name}")
+def ui_static(name: str):
+    kind = _STATIC.get(name)
+    if kind is None:
+        raise HTTPException(404, "нет такого файла")
+    path = os.path.join(HERE, "static", name)
+    if not os.path.exists(path):
+        raise HTTPException(404, "нет такого файла")
+    # Картинки не меняются день ото дня, но и кэшировать их навсегда незачем: сутки.
+    return FileResponse(path, media_type=kind,
+                        headers={"Cache-Control": "public, max-age=86400"})
+
+
 @app.get("/ui/releases")
 def ui_releases(channel: int | None = None, phase: str | None = None,
                 status: str | None = None):
@@ -2827,16 +2849,41 @@ def ui_alerts():
                       "loop_off": os.environ.get("VS_ALERTS", "").strip() == "0",
                       "how": "нужны токен бота и адрес чата — их выдаёт @BotFather; "
                              "порядок описан в инструкции к системе"},
-        "thresholds": [
-            {"what": "очередь не пустая, но ничего не завершается",
-             "value": pub_alerts.STALL_SEC},
-            {"what": "провайдер на паузе", "value": pub_alerts.RESTING_SEC},
-            {"what": "есть готовые ролики, но заливки нет", "value": pub_alerts.UPLOAD_SEC},
-            {"what": "самая старая задача ждёт", "value": pub_alerts.OLDEST_SEC},
-            {"what": "повтор одного и того же повода", "value": pub_alerts.REPEAT_SEC},
-        ],
+        # Пороги правятся с экрана (владелец 24.09.2026), поэтому отдаём не только
+        # значение, но и чем оно задано и в каких границах его принимают.
+        "thresholds": _alert_limits()["limits"],
         "disk_min_gb": pub_alerts.DISK_MIN_GB,
     }
+
+
+def _alert_limits() -> dict:
+    c = db()
+    try:
+        pub_alerts.load_limits(c)
+        return pub_alerts.limits_state(c)
+    finally:
+        c.close()
+
+
+class AlertLimitIn(BaseModel):
+    key: str = ""
+    value: float | None = None      # None — вернуть то, что задано на машине
+
+
+@app.post("/ui/alerts/thresholds")
+def ui_alert_threshold(body: AlertLimitIn, request: Request):
+    """Поправить порог тревоги. Действует со следующего прохода, без перезапуска."""
+    who = _require_admin(request)
+    c = db()
+    try:
+        out = pub_alerts.set_limit(c, body.key, body.value)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        c.close()
+    _audit(f"порог {body.key} = {body.value if body.value is not None else 'как на машине'}"
+           f", это сделал {who['name']}")
+    return out
 
 
 @app.get("/ui/disk")

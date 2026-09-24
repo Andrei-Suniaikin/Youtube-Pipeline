@@ -115,7 +115,13 @@ SCENARIO = r"""
   window.api = async () => ({statuses: [{key: 'active', title: 'работает'},
     {key: 'paused', title: 'пауза'}, {key: 'archived', title: 'в архиве'}], fields: []});
   try { await wireChannelEdit(root, {id: 1, status: 'active'}, {}); } catch (e) {}
-  out.статус_канала = [...root.querySelectorAll('#statusbtns > *')].map(x => x.textContent.trim());
+  // В строке статусов, кроме плашки и глаголов, стоит удаление — значком, без подписи
+  // (24.09.2026). Слова собираем отдельно от значков, иначе пустая строка выглядела бы
+  // как потерянная кнопка.
+  out.статус_канала = [...root.querySelectorAll('#statusbtns > *')]
+    .filter(x => !x.classList.contains('iconbtn')).map(x => x.textContent.trim());
+  out.статус_значки = [...root.querySelectorAll('#statusbtns > .iconbtn')]
+    .map(x => x.getAttribute('title'));
   } catch (e) { out.errs.push(String(e && e.stack || e)); }
   document.documentElement.setAttribute('data-result', JSON.stringify(out));
 })();
@@ -160,6 +166,8 @@ def main() -> int:
           {"панель": "10px", "кнопка": "7px", "поле": "7px"})
     check("каналы: заголовок и обе кнопки — одной строкой", res.get("каналы_шапка"),
           [True, True, True])
+    check("удаление канала — значком в той же строке", res.get("статус_значки"),
+          ["Удалить канал"])
     check("статус канала виден, переходы — глаголами", res.get("статус_канала"),
           ["работает", "Поставить на паузу", "Убрать в архив"])
     print()

@@ -109,6 +109,90 @@ USAGE_STALE_SEC = _sec("VS_ALERT_USAGE_STALE_SEC", 2 * 3600)     # §9/§10: с�
 # _raise_if_llm_credits_exhausted`): фатально только со второго подтверждения.
 KEY_REFUSE_HITS = _num("VS_ALERT_KEY_REFUSE_HITS", 2)            # §11
 
+# ─────────────── пороги: правятся с экрана, а не только из окружения ───────────────
+#
+# Решение владельца 24.09.2026: «добавить возможность админу это всё эдитить». До этого
+# порог менялся только переменной окружения, то есть по SSH и с перезапуском службы.
+#
+# Порядок старшинства: правка с экрана → переменная окружения → умолчание в коде.
+# Значение из окружения остаётся запасным: снял правку — вернулось то, что на машине.
+# Применяются пороги в `detect()`, один раз за проход: его зовут и процесс тревог, и
+# экран «Админ», и оба должны видеть одно и то же.
+ALERT_LIMITS_KEY = "alert_thresholds"
+
+# имя → как назвать человеку, в чём измеряется, разумные границы.
+# «sec» правится в МИНУТАХ: пороги тут получасовые и часовые, секунды человеку незачем.
+LIMITS = {
+    "STALL_SEC": ("очередь не пустая, но ничего не завершается", "sec", 60, 24 * 3600),
+    "RESTING_SEC": ("провайдер на паузе", "sec", 60, 24 * 3600),
+    "UPLOAD_SEC": ("есть готовые ролики, но заливки нет", "sec", 60, 48 * 3600),
+    "OLDEST_SEC": ("самая старая задача ждёт", "sec", 60, 72 * 3600),
+    "REPEAT_SEC": ("повтор одного и того же повода", "sec", 300, 24 * 3600),
+    "FAILED_SEC": ("про какие падения говорим: за последние", "sec", 3600, 7 * 86400),
+    "DISK_MIN_GB": ("свободного места меньше", "gb", 1, 5000),
+    "KEY_EXPIRES_DAYS": ("предупредить о сроке ключа за", "days", 1, 90),
+    "USAGE_PCT": ("расход ключа близок к лимиту, в %", "pct", 50, 100),
+    "KEY_REFUSE_HITS": ("отказов подряд, чтобы счесть ключ мёртвым", "count", 1, 10),
+    "FAILED_MAX": ("сколько падений называть поимённо", "count", 1, 50),
+}
+# Значения «как на этой машине»: до первой правки с экрана они и работают.
+_DEFAULTS = {name: (int(globals()[name]) if LIMITS[name][1] == "count"
+                    else float(globals()[name])) for name in LIMITS}
+
+
+def limits_state(c) -> dict:
+    """Действующие пороги и чем они заданы — для экрана «Админ»."""
+    try:
+        saved = _state_row(c, ALERT_LIMITS_KEY) or {}
+    except Exception:                                              # noqa: BLE001
+        saved = {}
+    saved = saved if isinstance(saved, dict) else {}
+    out = []
+    for name, (title, unit, lo, hi) in LIMITS.items():
+        own = saved.get(name)
+        out.append({"key": name, "what": title, "unit": unit,
+                    "value": float(own) if isinstance(own, (int, float)) else _DEFAULTS[name],
+                    "default": _DEFAULTS[name], "min": lo, "max": hi,
+                    "own": isinstance(own, (int, float))})
+    return {"limits": out}
+
+
+def load_limits(c) -> None:
+    """Применить правки с экрана к модулю. Зовётся в начале каждого прохода `detect`."""
+    try:
+        saved = _state_row(c, ALERT_LIMITS_KEY) or {}
+    except Exception:                                              # noqa: BLE001
+        saved = {}
+    for name in LIMITS:
+        value = saved.get(name) if isinstance(saved, dict) else None
+        value = float(value) if isinstance(value, (int, float)) else _DEFAULTS[name]
+        # Счётные пороги остаются целыми: FAILED_MAX режет список (`rows[:FAILED_MAX]`),
+        # а дробным числом срез не сделать.
+        globals()[name] = int(value) if LIMITS[name][1] == "count" else value
+
+
+def set_limit(c, name: str, value, now=None) -> dict:
+    """Поправить один порог. `value=None` — вернуть то, что задано на машине."""
+    if name not in LIMITS:
+        raise ValueError("такого порога нет")
+    saved = _state_row(c, ALERT_LIMITS_KEY) or {}
+    saved = dict(saved) if isinstance(saved, dict) else {}
+    if value is None:
+        saved.pop(name, None)
+    else:
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            raise ValueError("порог — это число")
+        _title, _unit, lo, hi = LIMITS[name]
+        if not (lo <= value <= hi):
+            raise ValueError(f"допустимо от {lo:g} до {hi:g}")
+        saved[name] = value
+    _state_save(c, ALERT_LIMITS_KEY, saved, now)
+    load_limits(c)
+    return limits_state(c)
+
+
 GB = 1024 ** 3
 
 # Фазы, после которых выпуск уже не «пропущенный слот»: Studio его приняла.
@@ -771,6 +855,9 @@ FASTGEN_STATE_KEYS = {"fastgen_key_expiring", "fastgen_usage_near_limit", "key_d
 def detect(c, now=None, tenant=None) -> dict:
     """Все поводы, верные прямо сейчас: key → Alert. Ничего не пишет и не отправляет."""
     now = now or time.time()
+    # Пороги, поправленные с экрана, вступают в силу со следующего прохода — без
+    # перезапуска службы и без правки окружения.
+    load_limits(c)
     found = {}
     for fn in CHECKS:
         for a in fn(c, now, tenant):
