@@ -137,6 +137,36 @@ def set_disabled(c, uid: int, disabled: bool, actor_id=None) -> dict:
     return {"id": r["id"], "name": r["name"], "disabled": disabled}
 
 
+def delete_user(c, uid: int, actor_id=None, owns=None) -> dict:
+    """Удалить учётную запись насовсем (решение владельца 24.09.2026).
+
+    Запреты те же, что у блокировки, плюс один свой: у человека, за которым числятся
+    каналы или проекты, учётку удалять нельзя. Внешних ключей в базе нет, и такие
+    строки остались бы висеть с несуществующим владельцем, а номера учётных записей
+    переиспользуются — то есть чужая работа однажды нашлась бы у нового человека.
+    Для этого случая есть блокировка: доступ закрыт, данные на месте.
+
+    `owns` — сколько всего числится за человеком; считает вызывающая сторона, потому
+    что живёт это в других таблицах.
+    """
+    r = c.execute("SELECT id, name, role FROM users WHERE id=?", (int(uid),)).fetchone()
+    if not r:
+        raise AccountError("нет такой учётной записи")
+    if actor_id is not None and int(uid) == int(actor_id):
+        raise AccountError("нельзя удалить самого себя")
+    if (r["role"] or "") == "admin" and admin_count(c, exclude_id=uid) == 0:
+        raise AccountError("это последний администратор — удалить его значит оставить "
+                           "систему без управления")
+    if owns:
+        raise AccountError(
+            f"за этим человеком числится работа ({owns}) — удалить нельзя, иначе она "
+            f"останется без владельца. Заблокируйте: доступ закроется, данные уцелеют")
+    c.execute("DELETE FROM sessions WHERE user_id=?", (int(uid),))
+    c.execute("DELETE FROM users WHERE id=?", (int(uid),))
+    c.commit()
+    return {"id": r["id"], "name": r["name"], "deleted": True}
+
+
 def set_role(c, uid: int, role: str, actor_id=None) -> dict:
     if role not in ROLES:
         raise AccountError(f"роль бывает только {' или '.join(ROLES)}")
