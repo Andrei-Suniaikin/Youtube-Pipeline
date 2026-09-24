@@ -13,20 +13,19 @@
 [Unit]
 Description=Studio: тревоги конвейера в телеграм
 # Смысла ходить в базу до кабинета нет: он её и создаёт.
-After=network-online.target vsgen.service
+After=network-online.target studio-platform.service
 Wants=network-online.target
 
 [Service]
 Type=oneshot
-User=studio
-WorkingDirectory=/srv/studio/studio-platform
-# Токен и chat_id лежат в .env рядом с кодом и в git не попадают (см. .gitignore).
+WorkingDirectory=/srv/studio/app
+# Токен и адрес чата лежат в настройках студии (0600) и в git не попадают.
 # EnvironmentFile с минусом: отсутствие файла не должно ронять юнит — тревоги просто
 # не будут отправляться, и это видно на экране «Админ».
-EnvironmentFile=-/srv/studio/studio-platform/.env
-Environment=VS_DEV_DB=/srv/studio/vsgen.db
-Environment=VS_TENANTS_DIR=/data/tenants
-ExecStart=/srv/studio/studio-platform/.venv/bin/python dev/alerts.py --once
+EnvironmentFile=-/srv/studio/studio.env
+Environment=VS_DEV_DB=/srv/studio/data/vsgen.db
+Environment=VS_TENANTS_DIR=/srv/studio/data/tenants
+ExecStart=/srv/studio/.venv/bin/python dev/alerts.py --once
 # Один проход не должен висеть дольше собственного интервала.
 TimeoutStartSec=120
 
@@ -36,7 +35,6 @@ PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadWritePaths=/srv/studio
-ReadOnlyPaths=/data/tenants
 
 [Install]
 WantedBy=multi-user.target
