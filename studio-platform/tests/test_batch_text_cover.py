@@ -68,6 +68,7 @@ class Fake:
     """Соседи, записанные на бумажке: что у них просили и что они ответили."""
 
     def __init__(self):
+        self.models = []        # ответ /models: default-модель резолвера (пункт 4 ТЗ)
         self.rw = []            # (путь, тело/файл); путь «/jobs/rewrite» — это ЗАКАЗ
         self.cover = []         # (путь, тело)
         self.subs = {}          # ссылка → расшифровка
@@ -81,6 +82,18 @@ class Fake:
         self.presets = {}       # имя пресета рерайта → его настройки
 
     def _rw(self, path, sid, payload=None, method=None, raw=None, ctype=None, extra=None):
+        if path == "/models":
+            # Список моделей — читает только `_default_text_model` (пункт 4 ТЗ
+            # 22.09.2026), когда ни в карточке, ни в пресете модели нет. Пустой список
+            # (умолчание `self.models`) ⇒ резолвер сам откатится на TEXT_MODEL_FALLBACK —
+            # поведение этого файла по умолчанию не меняется. Отдельный сценарий ниже
+            # («модель по умолчанию рерайта») подкладывает сюда флаг `default`, чтобы
+            # проверить, что четвёртое место и правда СПРАШИВАЕТ /models, а не просто
+            # структурно упоминает резолвер в исходнике. Отдельная ветка ДО общей: иначе
+            # список считался бы заказом текста и сдвигал бы «job_id» всех заказов после
+            # себя.
+            self.rw.append((path, None))
+            return 200, self.models
         if path == "/upload":
             body = raw.decode("utf-8", "replace")
             text = body.split("\r\n\r\n", 1)[1].rsplit("\r\n--", 1)[0]
@@ -287,6 +300,67 @@ def main() -> int:
               all(bool(r[1].get("key")) for r in rw_orders(fake)), True)
         check("модели нет нигде — уехало умолчание экрана текста",
               rw_orders(fake)[0][1]["payload"]["model"], pult.TEXT_MODEL_FALLBACK)
+
+        # ── 2б. Модель по умолчанию рерайта — четвёртое место (_batch_text_plan) ──
+        # Отдельно от проверки выше («нет нигде — литерал»): там у /models пустой
+        # ответ, и что с резолвером, что без него итог один — TEXT_MODEL_FALLBACK, а
+        # значит она НЕ отличила бы резолвер от захардкоженного литерала поведенчески
+        # (только структурная проверка в test_prompt_channel.py это ловит). Здесь у
+        # /models ЕСТЬ модель с флагом `default`, и заказ обязан унести именно её —
+        # это единственная поведенческая проверка того, что сайт 4 и правда СПРАШИВАЕТ
+        # /models на настоящем прогоне, а не просто содержит вызов в исходнике.
+        # Мутация: в `_batch_text_plan` заменить `_default_text_model(sid) if net else
+        # TEXT_MODEL_FALLBACK` на просто `TEXT_MODEL_FALLBACK` — эта проверка ловит.
+        make_project(c, "t-model-default", "Модель по умолчанию рерайта", channel=901,
+                     donor=DONOR, tenants=tenants)
+        fake.models = [{"value": "codex:gpt-5.7-glow", "label": "glow", "default": True}]
+        out = pult.ui_projects_batch_text(
+            pult.BatchTextIn(pids=["t-model-default"]), Req())
+        check("модель по умолчанию рерайта — заказ поставлен",
+              out["projects"][0]["action"], "ordered")
+        check("уехала модель, помеченная /models как default, а не литерал",
+              rw_orders(fake)[-1][1]["payload"]["model"], "codex:gpt-5.7-glow")
+
+        # ── 2в. Резолвер модели по умолчанию — один поход на всю пачку, не на проект
+        #        (ревью 22.09.2026, Issue 6) ──────────────────────────────────────
+        # До правки `_batch_text_plan` спрашивал `_default_text_model(sid)` (⇒ `/models`
+        # соседа) на КАЖДОМ проекте без своей модели в пресете — до `BATCH_PULT_MAX`
+        # раз за один запрос кнопки. Два проекта без пресета в одном запросе — минимальный
+        # случай, который это ловит: было бы два обращения к /models, стало одно.
+        # Мутация: в `ui_projects_batch_text` вернуть прямой вызов `_default_text_model(sid)`
+        # вместо `default_model_fn=_default_model_once` (или убрать кэш `_default_model_once`
+        # внутри него) — эта проверка ловит: /models был бы спрошен дважды, не один раз.
+        make_project(c, "t-model-a", "Без пресета, модель A", channel=901,
+                     donor=DONOR, tenants=tenants)
+        make_project(c, "t-model-b", "Без пресета, модель B", channel=901,
+                     donor=DONOR, tenants=tenants)
+        fake.models = [{"value": "codex:gpt-5.7-glow", "label": "glow", "default": True}]
+        models_calls_before = len([r for r in fake.rw if r[0] == "/models"])
+        out = pult.ui_projects_batch_text(
+            pult.BatchTextIn(pids=["t-model-a", "t-model-b"]), Req())
+        models_calls_after = len([r for r in fake.rw if r[0] == "/models"])
+        by26 = {i["id"]: i for i in out["projects"]}
+        check("оба проекта пачки без своего пресета — заказ поставлен",
+              [by26["t-model-a"]["action"], by26["t-model-b"]["action"]],
+              ["ordered", "ordered"])
+        check("/models за весь запрос пачки спрошен РОВНО один раз, не по разу на проект",
+              models_calls_after - models_calls_before, 1)
+        check("обоим проектам ушла одна и та же модель по умолчанию",
+              {o[1]["payload"]["model"] for o in rw_orders(fake)[-2:]},
+              {"codex:gpt-5.7-glow"})
+
+        # Сухой прогон резолвер вообще не зовёт (Edge case «не платить за просмотр»):
+        # ни один из проектов без модели в пресете не должен спросить /models.
+        make_project(c, "t-model-dry", "Сухой прогон без пресета", channel=901,
+                     donor=DONOR, tenants=tenants)
+        models_calls_before = len([r for r in fake.rw if r[0] == "/models"])
+        pult.ui_projects_batch_text(
+            pult.BatchTextIn(pids=["t-model-dry"], dry_run=True), Req())
+        models_calls_after = len([r for r in fake.rw if r[0] == "/models"])
+        check("сухой прогон не спрашивает /models вовсе",
+              models_calls_after - models_calls_before, 0)
+
+        fake.models = []   # вернуть фикстуру к пустому /models для всех проверок ниже
 
         # ── 3. Повторное нажатие ─────────────────────────────────────────────
         was = len(rw_orders(fake))

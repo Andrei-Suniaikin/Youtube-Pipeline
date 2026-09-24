@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Тревоги: одиннадцать поводов и три правила подачи.
+"""Тревоги: двенадцать поводов и три правила подачи.
 
 Сети здесь нет вообще: `pub_alerts` отправку не делает, а транспорт подменён списком.
 Поэтому тест гоняется где угодно, включая машину без телеграма и без интернета.
@@ -22,6 +22,8 @@ sys.path.insert(0, os.path.join(BASE, "server"))
 # Пороги фиксируем ДО импорта: модуль читает их один раз, как и в бою.
 os.environ.setdefault("VS_ALERT_DISK_GB", "0")     # диск в тесте не повод
 os.environ.setdefault("VS_TENANTS_DIR", BASE)
+# §12 читает подписки рерайта с диска — в тесте их нет, а не подписки разработчика.
+os.environ["REWRITE_SUBSCRIPTIONS_DIR"] = os.path.join(BASE, "tests", ".no-subscriptions")
 import pub_alerts as A                                            # noqa: E402
 
 NOW = 1_800_000_000.0

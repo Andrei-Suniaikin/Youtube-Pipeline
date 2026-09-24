@@ -227,6 +227,9 @@
             font-size:11px;font-weight:800;margin-top:1px}
   .cal .what{flex:1;min-width:0}
   .cal.miss .what{color:var(--bad)}
+  .cal.clickable{cursor:pointer}
+  .cal.clickable:hover{background:rgba(255,255,255,.03)}
+  .cal.clickable:focus-visible{outline:2px solid var(--acc);outline-offset:-2px}
   .today{height:0;border-top:2px dashed var(--acc);position:relative;margin:0 18px}
   .today span{position:absolute;top:-9px;left:0;background:var(--card);padding:0 9px;
               font-size:11px;color:var(--acc-hi);font-weight:700}
@@ -404,6 +407,17 @@
   .pitem .body{min-width:0}
   .pitem .pacts{white-space:nowrap;align-self:center;display:flex;gap:2px}
   #paidline{margin-top:6px}
+  /* Подписки для текста (22.09.2026): форма добавления встаёт в саму карточку, под
+     полосой заголовка, — отдельного экрана на одно поле не нужно. */
+  .subform{border-bottom:1px solid var(--line);display:grid;gap:10px}
+  .subform[hidden]{display:none}
+  .subform ol{margin:0;padding-left:20px;line-height:1.55}
+  .subform code{font-family:var(--mono);font-size:12px;background:var(--well);
+                padding:1px 5px;border-radius:var(--r-xs)}
+  .subform textarea{width:100%;font-size:12px;min-height:110px}
+  .subform .row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+  .subform input.secret{width:min(460px,100%);font-family:var(--mono);font-size:12px}
+  .subrow .ptag{font-size:11px;padding:1px 7px;font-weight:500}
 
   /* Тосты: ошибка действия видна там, где смотрит глаз, и не перекрывает работу.
      Раньше это был alert() — он останавливает страницу и требует нажать «ОК». */
@@ -557,6 +571,9 @@
   input[type=checkbox],input[type=radio]{accent-color:var(--acc)}
   select,input,textarea{background:var(--well);border:1px solid var(--line);border-radius:var(--r-sm);
                         padding:7px 10px;font-size:13.5px}
+  /* Своя стрелка у списка прижималась к правой рамке (жалоба владельца 24.09.2026).
+     Браузер рисует её у края содержимого, поэтому отодвигаем само содержимое. */
+  select{padding-right:26px}
   select:focus,input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-dim)}
   .fld label{font-size:12px}
 
@@ -566,7 +583,26 @@
   .iconbtn{width:32px;height:32px;border:0;border-radius:50%;background:transparent;
            color:var(--muted);box-shadow:none;padding:0}
   .iconbtn svg{width:20px;height:20px}
+  /* Два листа у «копии» заполняют квадрат целиком и рядом с корзиной выглядят крупнее,
+     хотя размер тот же (жалоба владельца 24.09.2026). Уравниваем зрительно, а не по
+     числу: у остальных значков внутри есть воздух. */
+  .iconbtn.pcopy svg{width:18px;height:18px}
   .iconbtn + .iconbtn{margin-left:2px}
+  /* Пока экран грузится, человек не должен гадать, нажалось ли (жалоба владельца
+     24.09.2026: «тыкаю на вкладку каналы и сижу на старой с мыслью что ничего не
+     произошло»). Полоса сверху и приглушённый старый экран: вкладка уже подсвечена,
+     а содержимое ещё старое — без этого переход выглядит как «не сработало».
+     Появляется не сразу: быстрый переход не должен мигать. */
+  #busy{position:fixed;top:0;left:0;right:0;height:2px;z-index:60;background:var(--line);
+        overflow:hidden}
+  #busy[hidden]{display:none}
+  #busy i{display:block;height:100%;width:40%;background:var(--acc);
+          animation:busy-slide 1.1s ease-in-out infinite}
+  @keyframes busy-slide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
+  body.loading #app{opacity:.45;transition:opacity .12s}
+  /* Клики по старому экрану во время загрузки уводили бы не туда: он вот-вот исчезнет. */
+  body.loading #app{pointer-events:none}
+  @media (prefers-reduced-motion:reduce){ #busy i{animation:none;width:100%} }
   .iconbtn:hover{background:rgba(255,255,255,.08);color:var(--ink-hi)}
   .iconbtn.bad:hover{background:var(--bad-bg);color:var(--bad);border-color:transparent}
   .iconbtn:focus-visible{outline:2px solid var(--acc);outline-offset:1px}
@@ -813,6 +849,7 @@
   </nav>
 </header>
 
+<div id="busy" hidden aria-hidden="true"><i></i></div>
 <main id="app"><div class="empty">загрузка…</div></main>
 
 <script>
@@ -861,6 +898,14 @@ const ICON = {
   expand: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
       + '<path d="M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z"/></svg>',
   // звенья — «скопировать идентификатор» (не путать с копией пресета)
+  // ключ — «заменить вход» подписки
+  key: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M12.65 10A5.99 5.99 0 0 0 7 6c-3.31 0-6 2.69-6 6s2.69 6 6 6a5.99 5.99 0 0 0 5.65-4H17v4h4v-4h2v-4H12.65zM7 14c-1.1 0-2-.9-2-2s.9-2 2-2 2 .9 2 2-.9 2-2 2z"/></svg>',
+  // две черты — «на паузу», треугольник — «вернуть в работу»
+  pause: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>',
+  play: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+      + '<path d="M8 5v14l11-7z"/></svg>',
   link: '<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
       + '<path d="M3.9 12c0-1.71 1.39-3.1 3.1-3.1h4V7H7c-2.76 0-5 2.24-5 5s2.24 5 5 5h4v-1.9H7c-1.71 0-3.1-1.39-3.1-3.1zM8 13h8v-2H8v2zm9-6h-4v1.9h4c1.71 0 3.1 1.39 3.1 3.1s-1.39 3.1-3.1 3.1h-4V17h4c2.76 0 5-2.24 5-5s-2.24-5-5-5z"/></svg>',
 };
@@ -1144,18 +1189,52 @@ function langOptionsHtml(langs, cur){
   </select>`;
 }
 
+// До 22.09.2026 плашка была одна: побеждал own_openai, затем own_claude, затем
+// серверный ключ — своя подписка Codex/Claude, заданная вместе с OpenAI, была бы не
+// видна и не снимаема. Теперь три плашки независимы: у каждой свой булев признак и своя
+// ссылка «снять», ничьё наличие не прячет состояние двух других. Правка 22.09.2026
+// (ревью, Issue 1): «независимо» не значит «молча» — если своего нет, а сервер
+// отвечает за провайдер (видно по *_source, не по own_*), плашка обязана сказать, что
+// текст всё равно делается — серверным. own_*/server_openai/server_claude сами по себе
+// это не говорят: для Codex отдельного булева server_codex вообще нет — «что сработает»
+// надёжно знают только *_source (user/server/none).
+// Правка 22.09.2026 (ревью итерация 2, Issue 1): подпись «Текст:» вернулась — общим
+// заголовком над тремя плашками, как было в прежней однострочной версии, а подсказка
+// «?» стоит рядом с ней, а не отдельной строкой под плашками.
+// Правка 22.09.2026 (ревью итерация 2, Issue 2): claude_source === 'server' бывает и
+// без настоящей серверной подписки (OAuth) — тогда сервер тянет Claude обычным ключом
+// API. Различить эти два случая можно по server_claude (он и есть признак «серверный
+// OAuth есть», `web/app.py:_rewrite_keys`): без него пишем нейтральное «серверный ключ
+// владельца», как у OpenAI, а не «серверная подписка», которой на деле нет.
 function rewriteRowHtml(rw){
-  const state = !rw.ok
-    ? `<span class="note bad">${esc(rw.why || 'рерайт не ответил')}</span>`
-    : rw.own_openai ? '<span class="pill s-done">ваш ключ OpenAI</span>'
-    : rw.own_claude ? '<span class="pill s-done">ваша подписка Claude</span>'
-    : (rw.server_openai || rw.server_claude)
-      ? '<span class="pill s-idle">серверный ключ владельца</span>'
-      : '<span class="pill s-error">ключа нет — текст делать нечем</span>';
-  return `<div class="secbody"><div class="note muted">Текст: ${state}${
-    rw.own_openai ? ' <a href="#" id="rw-drop">снять свой</a>' : ''}${hintDot(
-    'Ключ для текста добавляется той же кнопкой ниже — провайдер '
-    + '«OpenAI · текст».')}</div></div>`;
+  if (!rw.ok)
+    return `<div class="secbody"><div class="note muted">Текст: <span class="note bad">${
+      esc(rw.why || 'рерайт не ответил')}</span></div></div>`;
+  const sources = [rw.source, rw.claude_source, rw.codex_source];
+  const nothing = sources.every(s => !s || s === 'none');
+  const claudeServerText = rw.server_claude
+    ? 'серверная подписка Claude владельца' : 'серверный ключ владельца';
+  const line = (own, source, doneText, serverText, idleText, dropId, dropText) => {
+    if (own) return `<div class="note muted"><span class="pill s-done">${esc(doneText)
+      }</span> <a href="#" id="${dropId}">${esc(dropText)}</a></div>`;
+    if (source === 'server') return `<div class="note muted"><span class="pill s-idle">${
+      esc(serverText)}</span></div>`;
+    return `<div class="note muted"><span class="pill s-idle">${esc(idleText)}</span></div>`;
+  };
+  return `<div class="secbody">
+    <div class="note muted">Текст:${hintDot(
+      'Ключ для текста и свои подписки Codex/Claude добавляются той же кнопкой ниже — '
+      + 'провайдеры «OpenAI · текст», «Своя подписка Codex», «Своя подписка Claude».')}</div>
+    ${nothing ? '<div class="note muted"><span class="pill s-error">'
+      + 'ключа нет — текст делать нечем</span></div>' : ''}
+    ${line(rw.own_openai, rw.source, 'ваш ключ OpenAI', 'серверный ключ владельца',
+      'свой ключ OpenAI не задан', 'rw-drop', 'снять свой')}
+    ${line(rw.own_codex, rw.codex_source, 'ваша подписка Codex',
+      'серверная подписка Codex владельца', 'своя подписка Codex не задана',
+      'rw-drop-codex', 'снять свою')}
+    ${line(rw.own_claude, rw.claude_source, 'ваша подписка Claude', claudeServerText,
+      'своя подписка Claude не задана', 'rw-drop-claude', 'снять свою')}
+  </div>`;
 }
 
 /* Карточка своих ключей. Одна и та же на экране ключей и в профиле (20.09.2026):
@@ -1195,6 +1274,402 @@ function ownKeysCard(d, opts){
   return card;
 }
 
+/* ────────────────── промпты для картинок: канал (пункт 4 ТЗ 22.09.2026) ──────────────────
+   Тот же выбор, что у кабинета в «Мои ключи» (server/main.py, prompts_block): один
+   выпадающий список канала и под ним — поле ровно его credential'а (OpenAI = ключ,
+   Claude = OAuth-токен подписки, Codex = содержимое auth.json, alt-Claude = ключ + свои
+   адрес/модель). Пишет и хранит кабинет тем же POST /api/my/keys/web — второго места
+   хранения секрета пульт не заводит; значения сюда не приходят вовсе, только
+   «задан/не задан» на канал (см. `_prompt_state` в web/app.py). Серверные подписки из
+   «Подписок для текста» (textSubsCard) сюда не подключены намеренно — разные деньги,
+   разное хранилище (Rewrite `/settings/keys` там, `users.keys` кабинета здесь) — даже
+   если подписи «Codex (подписка)» похожи, «задан/не задан» у них независимы.
+   Порядок каналов — тот же, что у кабинета (`server/main.py:786` PROMPT_CHANNEL_ORDER =
+   openai/claude/altclaude/codex): ревью 22.09.2026, Issue 5 — было `codex` перед
+   `altclaude`, расходилось с кабинетом при совпадающем комментарии «тот же порядок».
+   Подписи (PROMPT_CHANNEL_TITLE ниже) — НЕ те же, что `server/main.py:778`
+   PROMPT_PROVIDERS, а намеренно свои и короче: кабинетные («GPT API — ключ OpenAI»,
+   «Codex токен — подписка ChatGPT», «Claude токен — подписка Claude (Sonnet 5)»,
+   «Альтернативный Claude API — свой адрес и ключ») рассчитаны на отдельную страницу
+   «Мои ключи»; здесь тот же выбор — один из под-пунктов внутри карточки «Ключи» пульта,
+   рядом с полем credential'а конкретного канала, и длинная подпись там дублировала бы
+   то, что уже видно строкой ниже. Ревью 22.09.2026 итерация 2, Issue 2 — комментарий
+   ошибочно утверждал, что подписи тоже совпадают; это неверно и здесь исправлено. */
+const PROMPT_CHANNEL_ORDER = ['openai', 'claude', 'altclaude', 'codex'];
+const PROMPT_CHANNEL_TITLE = {openai: 'OpenAI', claude: 'Claude (подписка)',
+                              altclaude: 'Альтернативный Claude API', codex: 'Codex (подписка)'};
+// Отдельная папка для входа Codex, которым пишутся ПРОМПТЫ КАРТИНОК — НЕ та же
+// `~/codex-studio`, что у подписки для ТЕКСТА (subFormHtml/textSubsCard, обе живут в
+// «Моих ключах», но это разные хранилища кабинета и рерайта). Codex сам обновляет
+// вход и глушит прежний: один и тот же auth.json/одна и та же папка в двух местах
+// выбивали бы друг друга при каждом обновлении — для промптов это даже важнее, чем
+// для текста, потому что заметить тихую потерю входа тут некому (ревью 22.09.2026,
+// Issue 2).
+const PROMPT_CODEX_HOME = '~/codex-studio-prompts';
+const PROMPT_CODEX_WARNING = 'Не вставляйте сюда тот же <code>auth.json</code>, что уже '
+  + 'отдан в «Мои ключи → Своя подписка Codex»: это для ТЕКСТА, а это поле — для '
+  + 'ПРОМПТОВ КАРТИНОК, разные хранилища. Общий вход из одной папки будет выбивать '
+  + 'сам себя при каждом обновлении.';
+
+// OpenAI и alt-Claude — своя простая разметка (у `subFormHtml` аналога для них нет:
+// она про подписки Codex/Claude). Claude и Codex рисует `promptSubPaneHtml` ниже.
+function promptChannelFieldHtml(ch, stateText){
+  const state = `<div class="note muted">Сейчас: ${esc(stateText)} · пусто = не менять · `
+    + `«-» = очистить.</div>`;
+  if (ch === 'altclaude') return `
+    <label for="pf-altclaude">Ключ альтернативного Claude API</label>
+    <input id="pf-altclaude" type="password" autocomplete="new-password" spellcheck="false"
+      placeholder="sk-ant-…">
+    ${state}
+    <label for="pf-altclaude-base" style="display:block;margin-top:8px">Адрес API (необязательно)</label>
+    <input id="pf-altclaude-base" spellcheck="false" placeholder="https://…">
+    <label for="pf-altclaude-model" style="display:block;margin-top:8px">Модель (необязательно)</label>
+    <input id="pf-altclaude-model" spellcheck="false" placeholder="claude-…">
+    <div class="note muted">Адрес и модель: пусто — не отправляется вовсе (сохранённое
+      значение не меняется); «-» — очистить и вернуться на серверное умолчание.</div>`;
+  return `<label for="pf-openai">OpenAI-ключ</label>
+    <input id="pf-openai" type="password" autocomplete="new-password" spellcheck="false"
+      placeholder="sk-proj-…">
+    ${state}`;
+}
+
+// Claude/Codex — общая разметка `subFormHtml`/`subEmptyText` (не дублируем: FR-16,
+// ревью 22.09.2026 Issue 2). `codexHome`/`warnSeparateAuth` — те же параметры, что
+// принимает теперь `subFormHtml`, только со своими (не текстовыми) значениями.
+function promptSubPaneHtml(ch, stateText){
+  const opts = ch === 'codex'
+    ? {codexHome: PROMPT_CODEX_HOME, warnSeparateAuth: PROMPT_CODEX_WARNING} : {};
+  const note = `<div class="note muted">Сейчас: ${esc(stateText)} · пусто = не менять · `
+    + `«-» = очистить. Чтобы задать/заменить — ${esc(subEmptyText(ch))}.</div>`;
+  // `forLabel` — любая непустая строка: прячет поле «Название» (оно тут не нужно,
+  // канал один на человека) тем же условием, что и своя подписка в «Моих ключах»
+  // (`subFormHtml(fam, 'own')`, `wireKeys`).
+  return note + subFormHtml(ch, 'prompt', opts);
+}
+
+// Карточка канала — рядом со «Своими ключами» (не внутри неё): своя карточка проще
+// свернуть/найти на экране и не путает список провайдеров с четырьмя каналами промптов.
+function promptChannelCard(d){
+  const p = d.prompt || {selected: '', channels: {}};
+  // «Свой не задан», не просто «не задан» (ревью 22.09.2026, Issue 5): канал может
+  // при этом работать на СЕРВЕРНОМ ключе — «не задан» звучало бы как «канал недоступен».
+  const stateOf = ch => ((p.channels || {})[ch] || {}).own_set ? 'свой ключ задан' : 'свой не задан';
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Промпты для картинок${hintDot(
+      'Каким каналом писать промпты для картинок: OpenAI, подписка Claude, подписка '
+      + 'Codex или альтернативный Claude API. Свой ключ/подписка канала — расход идёт '
+      + 'на вашу подписку; канал не выбран — решает сервер. Это ОТДЕЛЬНО от «Подписок '
+      + 'для текста» ниже: разные деньги, разное хранилище.')}</div>
+    <div class="secbody">
+      <div class="fld"><label for="pchan">Канал</label>
+        <select id="pchan">
+          <option value=""${p.selected ? '' : ' selected'}>Авто — решает сервер</option>
+          ${PROMPT_CHANNEL_ORDER.map(ch => `<option value="${ch}"${
+            p.selected === ch ? ' selected' : ''}>${esc(PROMPT_CHANNEL_TITLE[ch])} · ${
+            esc(stateOf(ch))}</option>`).join('')}
+        </select>
+      </div>
+      <div class="fld" id="pchan-fields" style="margin-top:10px"></div>
+      <div class="secbody" style="padding:12px 0 0;display:flex;gap:10px;align-items:center">
+        <button id="pchan-save">Сохранить</button>
+        <span class="note bad" id="pchan-err" style="margin:0"></span>
+      </div>
+    </div>
+  </div>`);
+  wirePromptChannel(card, d);
+  return card;
+}
+
+function wirePromptChannel(card, d){
+  const p = d.prompt || {selected: '', channels: {}};
+  const stateOf = ch => ((p.channels || {})[ch] || {}).own_set ? 'свой ключ задан' : 'свой не задан';
+  const sel = card.querySelector('#pchan');
+  // ОДНА обёртка — в неё перерисовывается форма только выбранного канала, тем же
+  // приёмом, что модалка «Добавить ключ» (`wireKeys`, `#kval-wrap`). Так в карточке
+  // никогда не бывает больше одного набора `#sf-*` разом: Claude и Codex делят те же
+  // id (`#sf-secret` и т. д.), и держать оба в DOM одновременно (даже скрытым через
+  // display:none, как было раньше у четырёх панелей) — это дублирующиеся id на
+  // странице (ревью 22.09.2026, Issue 2).
+  const wrap = card.querySelector('#pchan-fields');
+  const renderPane = ch => {
+    if (!ch){ wrap.innerHTML = ''; return; }
+    if (ch === 'openai' || ch === 'altclaude'){
+      wrap.innerHTML = promptChannelFieldHtml(ch, stateOf(ch));
+      return;
+    }
+    wrap.innerHTML = promptSubPaneHtml(ch, stateOf(ch));
+    // Собственная строка кнопок `subFormHtml` (`#sf-ok`/`#sf-no`) дублирует кнопку
+    // «Сохранить» самой карточки — прячется тем же приёмом, что у формы своей
+    // подписки в «Моих ключах» (`wireKeys`, `#kval-wrap`, `ownRow.hidden = true`).
+    const ok = wrap.querySelector('#sf-ok');
+    if (ok){ const row = ok.closest('.row'); if (row) row.hidden = true; }
+    wireSubFile(wrap);
+  };
+  renderPane(sel.value);
+  sel.onchange = () => renderPane(sel.value);
+  const err = card.querySelector('#pchan-err');
+  card.querySelector('#pchan-save').onclick = async () => {
+    err.textContent = '';
+    const ch = sel.value;
+    const prompt = {channel: ch};
+    if (ch === 'openai')
+      prompt.prompt_key_openai = (wrap.querySelector('#pf-openai').value || '').trim();
+    else if (ch === 'claude')
+      prompt.claude_oauth = (wrap.querySelector('#sf-secret').value || '').trim();
+    else if (ch === 'codex')
+      prompt.codex_auth = (wrap.querySelector('#sf-secret').value || '').trim();
+    else if (ch === 'altclaude'){
+      prompt.alt_llm = (wrap.querySelector('#pf-altclaude').value || '').trim();
+      // Issue 1 (Critical, ревью 22.09.2026): адрес/модель отправляются ТОЛЬКО
+      // непустыми. Кабинет отличает «поле есть, но пусто» (= очистить) от «поля не
+      // было» (= не менять) именно у этих двух полей и только у них
+      // (`server/main.py:17783-17788`: `if _v == "-" or (_fld in d and not _v): pop`);
+      // у остальных пяти полей формы пустая строка безопасна как есть. Раньше JS слал
+      // сюда `''` всегда — любое сохранение карточки на alt-Claude молча стирало
+      // сохранённые адрес и модель, даже если человек их не трогал вовсе.
+      // Мутация: вернуть безусловное `prompt.alt_llm_base = base` (как было) — тест
+      // браузера, что «пусто не отправляется вовсе», ловит.
+      const base = (wrap.querySelector('#pf-altclaude-base').value || '').trim();
+      const model = (wrap.querySelector('#pf-altclaude-model').value || '').trim();
+      if (base) prompt.alt_llm_base = base;
+      if (model) prompt.alt_llm_model = model;
+    }
+    card.querySelector('#pchan-save').disabled = true;
+    try{
+      await post('/ui/keys', {prompt});
+      toast('Канал промптов сохранён', 'ok');
+      await render();
+    }catch(e){ err.textContent = e.message; }
+    finally{ const btn = card.querySelector('#pchan-save'); if (btn) btn.disabled = false; }
+  };
+}
+
+/* ─────────────── подписки для текста: Codex и Claude (22.09.2026) ───────────────
+   Владелец: «сделаем, чтобы мы могли пользоваться подпиской кодекса или клода для
+   написания текста». Раньше подписку меняли только по SSH: `codex login` на сервере,
+   правка /etc/rewrite.env и перезапуск. Теперь — здесь, администратором.
+   Значение входа сюда обратно не приходит никогда: только имя, хвост и состояние. */
+const SUB_PROVIDER = {codex: 'Codex', claude: 'Claude'};
+const SUB_DOT = {ok: ['s-done', '✓'], new: ['s-idle', '·'], limit: ['s-queued', '⏳'],
+                 dead: ['s-error', '!'], paused: ['s-idle', '‖']};
+
+function subStateText(it){
+  const t = ts => new Date(ts * 1000).toLocaleTimeString('ru-RU',
+    {hour: '2-digit', minute: '2-digit'});
+  switch (it.state){
+    case 'ok': return `работает${it.last_ok ? ' · последний вызов ' + when(it.last_ok) : ''}`;
+    case 'limit': return it.until
+      ? `упёрлась в лимит подписки — проснётся в ${t(it.until)}`
+      // Codex времени сброса не называет — выдумывать час не будем.
+      : 'упёрлась в лимит подписки — ждёт сброса окна; Codex не говорит, когда';
+    case 'dead': return `вход протух ${when(it.since)} — вынута из раздачи, `
+      + 'текст её не берёт. Замените вход';
+    case 'paused': return 'на паузе — задачи текста её не берут';
+    default: return 'добавлена, ещё не работала';
+  }
+}
+
+function subFormHtml(provider, forLabel, opts){
+  const codex = provider === 'codex';
+  // opts — необязательный третий параметр (ревью 22.09.2026, Issue 2): по умолчанию
+  // `{}`, так что оба старых вызова с двумя аргументами (textSubsCard, wireKeys)
+  // рисуют байт-в-байт то же самое, что и раньше. Канал промптов картинок
+  // (`promptSubPaneHtml`) передаёт свою папку CODEX_HOME и предупреждение не путать
+  // её со входом для текста.
+  opts = opts || {};
+  const codexHome = opts.codexHome || '~/codex-studio';
+  return `
+    ${forLabel ? '' : `<div class="fld"><label>Название</label>
+      <input id="sf-label" maxlength="60" style="width:min(340px,100%)"
+        placeholder="${codex ? 'Например: ChatGPT Pro, основной' : 'Например: Claude Max, резерв'}"></div>`}
+    ${codex ? `<ol class="note">
+        <li>На своём компьютере войдите в <b>отдельную папку</b>:
+          <code>CODEX_HOME=${esc(codexHome)} codex login</code> — аккаунтом ChatGPT с подпиской.</li>
+        <li>Вставьте сюда файл <code>${esc(codexHome)}/auth.json</code> целиком или выберите его.</li>
+      </ol>
+      <div class="note muted">Почему отдельная папка: Codex сам обновляет вход, и старый
+        при этом перестаёт действовать. Один и тот же вход на сервере и на вашем
+        компьютере выбивал бы друг друга.</div>
+      ${opts.warnSeparateAuth ? `<div class="note bad">${opts.warnSeparateAuth}</div>` : ''}
+      <textarea id="sf-secret" rows="6" spellcheck="false" autocomplete="off"
+        placeholder='{"auth_mode": "chatgpt", "tokens": { … } }'></textarea>
+      <div class="row"><label class="filepick"><span class="pickbtn">Выбрать auth.json</span>
+        <input id="sf-file" type="file" accept=".json,application/json"></label>
+        <span class="muted" id="sf-fname" style="font-size:12.5px"></span></div>`
+    : `<ol class="note">
+        <li>На своём компьютере выполните <code>claude setup-token</code> и войдите
+          аккаунтом Claude с подпиской.</li>
+        <li>Вставьте напечатанный токен — он начинается с <code>sk-ant-oat</code>.</li>
+      </ol>
+      <input id="sf-secret" class="secret" type="password" autocomplete="off"
+        spellcheck="false" placeholder="sk-ant-oat01-…">`}
+    <div class="note muted">Вход хранится на сервере закрыто. Показать его обратно
+      нельзя — только заменить или удалить.</div>
+    <div class="row"><button id="sf-ok">${forLabel ? 'Заменить вход' : 'Добавить'}</button>
+      <button class="ghost" id="sf-no">Отмена</button>
+      <span class="note bad" id="sf-err" style="margin:0"></span></div>`;
+}
+
+// Текст «чего не хватает» для пустой формы subFormHtml — общий для админского блока
+// подписок (textSubsCard) и своей подписки в «Моих ключах» (wireKeys), чтобы не
+// разойтись при первой правке (ревью 22.09.2026, Issue 4).
+function subEmptyText(provider){
+  return provider === 'codex' ? 'вставьте содержимое auth.json' : 'вставьте токен';
+}
+
+// Подключить filepicker внутри уже вставленной разметки subFormHtml: файл целиком —
+// в #sf-secret, имя — в #sf-fname, сам инпут сбрасывается, чтобы повторный выбор того
+// же файла тоже сработал. Общий для textSubsCard и wireKeys (Issue 4) — нет filepicker'а
+// только у формы Claude (там обычное password-поле, #sf-file отсутствует).
+function wireSubFile(container){
+  const file = container.querySelector('#sf-file');
+  if (!file) return;
+  file.onchange = async () => {
+    const f = file.files[0];
+    if (!f) return;
+    container.querySelector('#sf-secret').value = await f.text();
+    container.querySelector('#sf-fname').textContent = f.name;
+    file.value = '';
+  };
+}
+
+async function textSubsCard(){
+  const card = $(`<div class="card" id="subs-card" style="margin-bottom:16px"></div>`)
+    .firstElementChild;
+  const draw = async () => {
+    let d;
+    try{ d = await api('/ui/subscriptions'); }
+    catch(e){
+      if (e instanceof NeedLogin) throw e;
+      card.innerHTML = `<div class="sec">Подписки для текста</div><div class="secbody">
+        <div class="note bad">Список подписок прочитать не удалось: ${esc(e.message)}</div></div>`;
+      return;
+    }
+    // Неполный ответ не должен ронять весь экран ключей: блок рисуется из того, что есть.
+    d.items = Array.isArray(d.items) ? d.items : [];
+    const env = d.env || {};
+    const envParts = ['codex', 'claude'].filter(p => (env[p] || []).length).map(p =>
+      `${SUB_PROVIDER[p]} — ${env[p].length} (${env[p].map(x => esc(x.tail)).join(', ')})`);
+    const pool = d.pool || {};
+    const busy = ['codex', 'claude'].filter(p => pool[p] && pool[p].credentials).map(p =>
+      `${SUB_PROVIDER[p]} ${pool[p].in_use} из ${pool[p].capacity}`);
+    card.innerHTML = `
+      <div class="sec stage-head"><span class="grow">Подписки для текста ${hintDot(
+        'Подписки ChatGPT (Codex) и Claude, которыми студия пишет сценарии. Добавленная '
+        + 'здесь начинает работать со следующей задачи — без перезапуска. Задачи '
+        + 'раздаются по кругу; подписка с протухшим входом вынимается сама.')}</span>
+        <button class="ghost small" id="sub-add-codex">Добавить Codex</button>
+        <button class="ghost small" id="sub-add-claude">Добавить Claude</button></div>
+      <div class="secbody subform" id="sub-form" hidden></div>
+      ${d.items.length ? d.items.map(it => {
+        const [cls, mark] = SUB_DOT[it.state] || SUB_DOT.new;
+        const paused = it.state === 'paused', dead = it.state === 'dead';
+        return `<div class="stage pitem subrow" data-sub="${esc(it.id)}"
+            data-provider="${esc(it.provider)}" data-state="${esc(it.state)}">
+          <div class="dot ${cls}">${mark}</div>
+          <div class="body">
+            <div class="pline"><span class="name">${esc(it.label)}</span>
+              <span class="pill ptag">${esc(SUB_PROVIDER[it.provider])}</span>
+              <span class="facts mono">${esc(it.tail)}</span></div>
+            <div class="note ${dead ? 'bad' : it.state === 'limit' ? 'warn' : 'muted'}">${
+              esc(subStateText(it))}</div>
+            ${dead && it.note ? `<div class="note muted">${esc(it.note)}</div>` : ''}
+          </div>
+          <div class="pacts">
+            ${iconBtn('sub-replace', 'key', 'Заменить вход', it.label)}
+            ${paused || dead
+              ? iconBtn('sub-resume', 'play', dead ? 'Вернуть в работу без замены'
+                                                   : 'Вернуть в работу', it.label)
+              : iconBtn('sub-pause', 'pause', 'Поставить на паузу', it.label)}
+            ${iconBtn('sub-rename', 'edit', 'Переименовать', it.label)}
+            ${iconBtn('sub-drop', 'remove', 'Удалить', it.label)}
+          </div></div>`;
+      }).join('') : `<div class="empty">Своих подписок студии пока нет${
+        envParts.length ? ' — текст пишут подписки из настроек сервера' : ''}.</div>`}
+      ${envParts.length || busy.length || env.known === false ? `<div class="secbody"
+          style="padding-top:8px">
+        ${envParts.length ? `<div class="note muted">Из файла настроек сервера:
+          ${envParts.join(' · ')}. Их меняют на сервере, здесь только видно.</div>` : ''}
+        ${busy.length ? `<div class="note muted">Пишут текст прямо сейчас: ${
+          busy.join(' · ')}.</div>` : ''}
+        ${env.known === false ? `<div class="note muted">Подписки из настроек сервера
+          отсюда не видно: сервис текста не поднят в этом процессе.</div>` : ''}
+      </div>` : ''}`;
+
+    const form = card.querySelector('#sub-form');
+    const openForm = (provider, item) => {
+      form.hidden = false;
+      form.innerHTML = `<div class="name" style="font-weight:600">${item
+        ? `Новый вход для «${esc(item.label)}»` : `Новая подписка ${SUB_PROVIDER[provider]}`}</div>`
+        + subFormHtml(provider, item ? item.label : '');
+      const secret = form.querySelector('#sf-secret');
+      const err = form.querySelector('#sf-err');
+      wireSubFile(form);
+      form.querySelector('#sf-no').onclick = () => { form.hidden = true; form.innerHTML = ''; };
+      const ok = form.querySelector('#sf-ok');
+      ok.onclick = async () => {
+        err.textContent = '';
+        if (!secret.value.trim()){
+          err.textContent = subEmptyText(provider);
+          return secret.focus();
+        }
+        ok.disabled = true;
+        try{
+          if (item) await post(`/ui/subscriptions/${item.id}`, {secret: secret.value});
+          else await post('/ui/subscriptions', {provider, secret: secret.value,
+            label: form.querySelector('#sf-label').value});
+          // Секрет не держим в странице ни мгновения дольше нужного.
+          secret.value = '';
+          toast(item ? `Вход «${item.label}» заменён` : 'Подписка добавлена — работает '
+                + 'со следующей задачи текста', 'ok');
+          await draw();
+        }catch(e){ err.textContent = e.message; }
+        finally{ ok.disabled = false; }
+      };
+      (form.querySelector('#sf-label') || secret).focus();
+    };
+    card.querySelector('#sub-add-codex').onclick = () => openForm('codex');
+    card.querySelector('#sub-add-claude').onclick = () => openForm('claude');
+
+    const byId = id => d.items.find(i => i.id === id);
+    const rowItem = b => byId(b.closest('.subrow').dataset.sub);
+    card.querySelectorAll('.sub-replace').forEach(b => b.onclick = () => {
+      const it = rowItem(b); openForm(it.provider, it);
+    });
+    const act = async (b, payload, done) => {
+      b.disabled = true;
+      try{ await post(`/ui/subscriptions/${rowItem(b).id}`, payload); if (done) toast(done, 'ok');
+           await draw(); }
+      catch(e){ toast(e.message); b.disabled = false; }
+    };
+    card.querySelectorAll('.sub-pause').forEach(b => b.onclick = () =>
+      act(b, {paused: true}));
+    card.querySelectorAll('.sub-resume').forEach(b => b.onclick = () =>
+      act(b, {paused: false}));
+    card.querySelectorAll('.sub-rename').forEach(b => b.onclick = () => {
+      const it = rowItem(b);
+      const m = modal('Переименовать подписку', `<div class="fld"><label>Название</label>
+        <input id="rn" maxlength="60" value="${esc(it.label)}"></div>`,
+        {onOk: async (body, close) => {
+          await post(`/ui/subscriptions/${it.id}`, {label: body.querySelector('#rn').value});
+          close(); await draw();
+        }});
+      m.body.querySelector('#rn').select();
+    });
+    card.querySelectorAll('.sub-drop').forEach(b => b.onclick = () => {
+      const it = rowItem(b);
+      confirmModal('Удалить подписку', `Удалить «${it.label}»? Задачи текста перестанут `
+        + 'её брать, а вход будет стёрт с сервера. Вернуть можно только добавив заново.',
+        async () => {
+          try{ await api(`/ui/subscriptions/${it.id}`, {method: 'DELETE'}); await draw(); }
+          catch(e){ toast(e.message); }
+        });
+    });
+  };
+  await draw();
+  return card;
+}
+
 async function viewKeys(){
   // Ключи живут в профиле: это про человека, а не про производство. Вкладки в топбаре
   // у них больше нет — обратный путь должен быть виден со страницы.
@@ -1216,6 +1691,10 @@ async function viewKeys(){
         </div></div>`).join('')
       : '<div class="empty">Сейчас никто не работает — все потоки свободны.</div>'}
   </div>`));
+
+  // Серверные подписки общие на всех — блок видит и меняет только администратор
+  // (проверка на сервере; здесь — лишь чтобы не показывать пустой отказ).
+  if (ME && ME.role === 'admin') app.append(await textSubsCard());
 
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Очередь по провайдерам</div>
@@ -1266,6 +1745,7 @@ async function viewKeys(){
   </div>`));
 
   app.append(ownKeysCard(d));
+  app.append(promptChannelCard(d));
 
   if (d.unavailable && d.unavailable.length){
     app.append($(`<div class="card">
@@ -1291,6 +1771,173 @@ const CH_VERB = {active: 'Возобновить', paused: 'Поставить �
 const CAL_CLS   = {done:'s-done', running:'s-running', blocked:'s-error',
                    planned:'s-queued', missed:'s-error', free:'s-idle'};
 
+/* ───────────────── машины заливки и профили AdsPower (§6.4 ТЗ) ─────────────────
+   Опись — только по кнопке (ФТ §5.5): ничего здесь не опрашивается само, ни по
+   таймеру, ни при открытии экрана. Обе карточки живут на «Каналах», не отдельным
+   пунктом меню (docs/00_SCREEN_MAP.md), потому что справочники нужны прежде всего
+   форме канала (`f-host`/`f-prof` в `wireChannelEdit`). */
+
+const HOST_STATUS_TITLE = {active: 'работает', disabled: 'убрана'};
+
+function hostRowHtml(h){
+  const active = h.status === 'active';
+  const label = esc(h.title || h.code);
+  return `<div class="stage pitem" data-host="${h.id}">
+    <div class="dot ${active ? 's-done' : 's-idle'}">${active ? '✓' : '–'}</div>
+    <div class="body">
+      <div class="pline"><span class="name">${label}</span>
+        <span class="pill mono">${esc(h.code)}</span>
+        <span class="pill ${active ? 's-done' : 's-idle'}">${
+          esc(HOST_STATUS_TITLE[h.status] || h.status)}</span></div>
+      <div class="facts mono">${h.adspower_url ? esc(h.adspower_url)
+        : '— адрес AdsPower не задан —'}</div>
+      <div class="note muted">профилей: ${h.profiles_count ?? 0} · опись: ${
+        h.last_refresh ? esc(when(h.last_refresh)) : 'ещё не проводилась'}${
+        h.note ? ' · ' + esc(h.note) : ''}</div>
+    </div>
+    <div class="pacts">
+      ${iconBtn('host-refresh', 'retry', 'Обновить список профилей', h.title || h.code,
+                `data-id="${h.id}" data-name="${esc(h.title || h.code)}"`)}
+      ${iconBtn('host-edit', 'edit', 'Править', h.title || h.code, `data-id="${h.id}"`)}
+      ${iconBtn('host-status', active ? 'pause' : 'play', active ? 'Убрать' : 'Включить',
+                h.title || h.code, `data-id="${h.id}" data-to="${active ? 'disabled' : 'active'}"`)}
+    </div></div>`;
+}
+
+function profileRowHtml(p){
+  const hostLabel = p.host ? esc(p.host.title || p.host.code) : 'машина неизвестна';
+  const facts = [p.group_name, p.remark].filter(Boolean).map(esc).join(' · ');
+  return `<div class="stage pitem">
+    <div class="dot ${p.active_now ? 's-done' : 's-idle'}">${p.active_now ? '●' : '·'}</div>
+    <div class="body">
+      <div class="pline"><span class="name">${esc(p.title || p.serial)}</span>
+        <span class="facts mono">№${esc(p.serial)}</span>
+        <span class="pill">${hostLabel}</span>
+        ${p.active_now ? '<span class="pill s-done">открыт сейчас</span>' : ''}
+        ${p.missing_since ? '<span class="pill s-error">на машине больше нет</span>' : ''}</div>
+      ${facts ? `<div class="note muted">${facts}</div>` : ''}
+    </div></div>`;
+}
+
+// Окно добавления/правки машины — тем же приёмом, что `channelPresetModal`.
+function hostModal(id, hosts, onSaved){
+  const creating = id == null;
+  const cur = creating ? {} : (hosts.find(h => h.id === id) || {});
+  modal(creating ? 'Новая машина заливки' : `Машина «${cur.title || cur.code}»`, `
+    <div class="fldrow"><label for="h-code">Код</label>
+      <input id="h-code" value="${esc(cur.code || '')}" style="width:200px"
+        placeholder="minsk"></div>
+    <div class="fldrow"><label for="h-title">Название</label>
+      <input id="h-title" value="${esc(cur.title || '')}" style="width:300px"></div>
+    <div class="fldrow"><label for="h-url">Адрес AdsPower</label>
+      <input id="h-url" value="${esc(cur.adspower_url || '')}" style="width:300px"
+        placeholder="http://127.0.0.1:50325"></div>
+    <div class="fldrow"><label for="h-note">Заметка</label>
+      <input id="h-note" value="${esc(cur.note || '')}" style="width:100%"></div>`,
+    {ok: creating ? 'Добавить' : 'Сохранить', onOk: async (box, close) => {
+      const payload = {
+        code: box.querySelector('#h-code').value,
+        title: box.querySelector('#h-title').value,
+        adspower_url: box.querySelector('#h-url').value,
+        note: box.querySelector('#h-note').value,
+      };
+      if (creating) await post('/ui/hosts', payload);
+      else await post(`/ui/hosts/${id}`, payload);
+      close();
+      await onSaved();
+    }});
+}
+
+// Опись одной машины — общая для кнопки у строки машины и для «Обновить все» на
+// карточке профилей: второй запрос к той же машине сервер и так отклонит (ФТ §5.13),
+// но здесь опись машин запускается заведомо по одной, последовательно (§7, Фаза 4).
+async function refreshHost(id, name){
+  try{
+    const r = await post(`/ui/hosts/${id}/refresh-profiles`);
+    toast(`«${name}»: найдено ${r.found} · новых ${r.new} · вернулось ${r.reappeared} `
+        + `· пропало ${r.missing_now} · открыто сейчас ${r.active_now}`, 'ok');
+    return {ok: true, r};
+  }catch(e){
+    // Честная ошибка (ФТ §5.9/§9): старые данные не трогаем, список не пустеет,
+    // просто говорим словами, что не вышло.
+    toast(`«${name}»: ${e.message}`);
+    return {ok: false, error: e.message};
+  }
+}
+
+async function paintHostsProfiles(container){
+  container.innerHTML = '';
+  const rerender = () => paintHostsProfiles(container);
+
+  let hosts = [], hostsErr = null;
+  try{ hosts = (await api('/ui/hosts')).hosts || []; }
+  catch(e){ hostsErr = e.message; }
+
+  const hostsCard = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec stage-head"><span class="grow">Машины заливки ${hintDot(
+      'Куда установлен AdsPower и откуда идёт заливка на YouTube. «Обновить список '
+      + 'профилей» читает у машины все профили и кто из них занят сейчас — только по '
+      + 'этой кнопке, само по себе ничего не опрашивается.')}</span>
+      <button class="ghost small" id="host-new">Добавить машину</button></div>
+    ${hostsErr
+      ? `<div class="secbody"><div class="note bad">Список машин прочитать не удалось: ${
+          esc(hostsErr)}</div></div>`
+      : (hosts.length ? hosts.map(hostRowHtml).join('')
+                       : '<div class="empty">Машин пока нет — добавьте первую.</div>')}
+  </div>`).firstElementChild;
+  container.append(hostsCard);
+
+  hostsCard.querySelector('#host-new').onclick = () => hostModal(null, hosts, rerender);
+  hostsCard.querySelectorAll('button.host-edit').forEach(b => b.onclick =
+    () => hostModal(Number(b.dataset.id), hosts, rerender));
+  hostsCard.querySelectorAll('button.host-status').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    try{ await post(`/ui/hosts/${b.dataset.id}/status`, {status: b.dataset.to}); await rerender(); }
+    catch(e){ b.disabled = false; toast(e.message); }
+  });
+  hostsCard.querySelectorAll('button.host-refresh').forEach(b => b.onclick = async () => {
+    b.disabled = true;
+    const res = await refreshHost(Number(b.dataset.id), b.dataset.name);
+    if (res.ok) await rerender();
+    else b.disabled = false;
+  });
+
+  let profiles = [], profErr = null;
+  try{ profiles = (await api('/ui/profiles')).profiles || []; }
+  catch(e){ profErr = e.message; }
+
+  const profilesCard = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec stage-head"><span class="grow">Профили AdsPower ${hintDot(
+      'Все профили со всех машин сразу: где живёт номер, занят ли он сейчас и не '
+      + 'пропал ли он с машины при последней описи.')}</span>
+      <button class="ghost small" id="prof-refresh-all">Обновить все</button></div>
+    ${profErr
+      ? `<div class="secbody"><div class="note bad">Список профилей прочитать не удалось: ${
+          esc(profErr)}</div></div>`
+      : (profiles.length ? profiles.map(profileRowHtml).join('')
+                         : '<div class="empty">Профилей нет — опросите машину выше.</div>')}
+  </div>`).firstElementChild;
+  container.append(profilesCard);
+
+  // Опись всех активных машин по очереди, одна за другой (не параллельно — предел
+  // 1 запрос/сек у каждой машины свой, но сервер и так отклонил бы одновременный
+  // повторный запуск описи, а параллельность здесь ничего не даёт, кроме риска). Отказ
+  // одной машины не останавливает остальные — у каждой свой тост с итогом или ошибкой.
+  profilesCard.querySelector('#prof-refresh-all').onclick = async () => {
+    const btn = profilesCard.querySelector('#prof-refresh-all');
+    btn.disabled = true;
+    for (const h of hosts.filter(x => x.status === 'active'))
+      await refreshHost(h.id, h.title || h.code);
+    await rerender();
+  };
+}
+
+async function hostsProfilesSection(){
+  const wrap = document.createElement('div');
+  await paintHostsProfiles(wrap);
+  return wrap;
+}
+
 async function viewChannels(){
   const d = await api('/ui/channels');
   app.innerHTML = '';
@@ -1303,6 +1950,11 @@ async function viewChannels(){
       <button class="ghost small" id="impch">Перенести списком</button>
       <button class="small" id="newch">Новый канал</button></div></div>`);
   app.append(bar);
+
+  // Машины заливки и профили AdsPower (§6.4 ТЗ, опись профилей) — справочники, на
+  // которые ссылается канал ниже в форме настроек (`f-host`/`f-prof`). Раздел «Каналы»
+  // им и владеет по `docs/00_SCREEN_MAP.md` — отдельного пункта меню не заводится.
+  app.append(await hostsProfilesSection());
 
   bar.querySelector('#impch').onclick = () => {
     if (document.getElementById('imp-form')) return;
@@ -1806,29 +2458,92 @@ function calendarFeed(d){
   const past = d.calendar.filter(r => r.past).slice().reverse();
   const rows = [];
   let drawn = false;
+  // «Сейчас» — своё время браузера, а не серверное `r.past`: строка календаря может
+  // полежать в ответе секунды и минуты, пока человек листает экран, а честная подпись
+  // «опубликован»/«загружен» (пункт 1 владельца, 22.09.2026) обязана дать тот же ответ,
+  // что дал бы новый запрос в ту же секунду.
+  const nowSec = Date.now() / 1000;
   for (const r of [...future, ...past]){
     if (r.past && !drawn){ rows.push('<div class="today"><span>сейчас</span></div>'); drawn = true; }
     const when_ = new Date(r.at * 1000).toLocaleString('ru-RU',
       {weekday:'short', day:'2-digit', month:'2-digit', hour:'2-digit', minute:'2-digit'});
-    const link = r.project_id ? `#/release/${esc(r.release_id)}` : (r.donor_url || '');
+    // `done` ≠ «опубликовано» (CLAUDE.md, инвариант 22.09.2026 — жалоба владельца):
+    // статус `pub_releases.status='done'` проверяет только расписание, а не то, что
+    // ролик реально вышел на YouTube. Пока собственный слот ещё не наступил, ссылка на
+    // youtu.be была бы обещанием, которое мы не проверяли, — ведём на донора и
+    // подписываем честно: «загружен, выйдет …», не «опубликован». Мутация-проверка:
+    // убери `&& r.at <= nowSec` — тест с future-слотом начнёт видеть youtu.be и
+    // «опубликован» раньше времени и упадёт.
+    const published = r.state === 'done' && r.at <= nowSec;
+    const useYoutube = published && r.video_id;
+    const link = useYoutube ? `https://youtu.be/${esc(r.video_id)}` : (r.donor_url || '');
+    // Куда ведёт ссылка не всегда видно по одному названию (Issue 3 ревью 22.09.2026):
+    // до слота и после него текст-ссылка выглядит одинаково, хотя ведёт в разные
+    // места. `title` — всплывающая подсказка при наведении, тот же приём, что и у
+    // соседних подписей строки, ничего не меняет в видимом тексте самой ссылки.
+    const linkTitle = !link ? '' : (useYoutube
+      ? 'Ссылка на YouTube' : 'Ссылка на донора (оригинал ролика)');
+    // Название — всегда название донора; ссылка донора как подпись — только если
+    // название добыть не удалось (пункт 1 владельца). Мутация-проверка: поменяй
+    // местами `r.donor_title || r.donor_url` — тест на «название-ссылка» перестанет
+    // отличать реальное название от голой ссылки.
     const title = r.donor_title || r.donor_url || (r.state === 'missed'
       ? 'ролика не было' : 'свободен — сюда встанет следующая ссылка');
-    rows.push(`<div class="cal ${r.past ? 'past' : ''} ${r.state === 'missed' ? 'miss' : ''}">
+    // `done` ≠ «опубликовано» касается и подписи БЕЗ `video_id` (Issue 2 ревью
+    // 22.09.2026): расписание могло подтвердиться раньше, чем ролик вообще залит —
+    // тогда до слота нет ни «опубликован», ни «загружен» (заливки ещё не было), и уж
+    // тем более не «вышел» — тот же обман, что и с youtu.be раньше времени. Мутация-
+    // проверка: убери ветку `r.video_id ? … : 'готов, выйдет …'` (верни `CAL_TITLE.done`)
+    // — строка `done` с будущим слотом и без `video_id` снова станет говорить «вышел».
+    const statusText = r.state === 'done'
+      ? (published ? 'опубликован'
+         : (r.video_id ? `загружен, выйдет ${when_}` : `готов, выйдет ${when_}`))
+      : CAL_TITLE[r.state];
+    // Клик по строке — только когда есть куда вести (пункт 1, «честно показать»):
+    // `planned` без `project_id` не кликается вовсе, а не ведёт в никуда. Мутация-
+    // проверка: замени условие на `!!r.release_id` — строка без проекта, но с чужим
+    // release_id, снова станет ложно кликабельной.
+    const clickable = !!r.project_id;
+    rows.push(`<div class="cal ${r.past ? 'past' : ''} ${r.state === 'missed' ? 'miss' : ''} ${clickable ? 'clickable' : ''}"
+        ${clickable ? `data-project="${esc(r.project_id)}" tabindex="0" role="link"
+          aria-label="Открыть проект${r.project_name ? ' ' + esc(r.project_name) : ''}"` : ''}>
       <time>${when_}</time>
       <div class="dot ${CAL_CLS[r.state]}">${CAL_DOT[r.state]}</div>
       <div class="what">
-        ${link ? `<a href="${esc(link)}" ${r.project_id ? '' : 'target=_blank rel=noopener'}
+        ${link ? `<a href="${esc(link)}" target="_blank" rel="noopener" title="${esc(linkTitle)}"
             style="font-weight:600">${esc(title)}</a>`
                : `<span style="font-weight:${r.state === 'free' ? '400' : '600'}">${esc(title)}</span>`}
         <div class="muted" style="font-size:12.5px">
-          ${esc(CAL_TITLE[r.state])}${r.phase_title ? ' · ' + esc(r.phase_title) : ''}
+          ${esc(statusText)}${r.phase_title ? ' · ' + esc(r.phase_title) : ''}
+          ${r.project_name ? ' · ' + esc(r.project_name) : ''}
           ${r.beyond_horizon ? ' · за горизонтом канала' : ''}
         </div>
         ${r.blocked_reason ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : ''}
       </div></div>`);
   }
   if (!drawn) rows.push('<div class="today"><span>сейчас</span></div>');
-  return $(`<div class="card">${rows.join('')}</div>`);
+  const card = $(`<div class="card">${rows.join('')}</div>`);
+  // Клик по строке ведёт в проект (замена безусловной `#/release/<id>`, пункт 1) —
+  // тем же паттерном доступности, что у `.chcard` (tabindex/role/Enter/Space,
+  // :756). Клик по самой ссылке названия — своё дело ссылки, строка его не перехватывает.
+  card.querySelectorAll('.cal.clickable').forEach(el => {
+    const go = () => { location.hash = '#/project/' + el.dataset.project; };
+    el.onclick = ev => { if (ev.target.closest('a')) return; go(); };
+    // Issue 1 ревью 22.09.2026: keydown на ссылке названия всплывает до строки —
+    // если не отсеять его так же, как отсеивает onclick, Enter/Space на самой
+    // ссылке уводили бы в проект вместо перехода по ссылке (донор/YouTube), и с
+    // клавиатуры ссылку было бы не открыть вовсе. Реагируем только на события,
+    // цель которых — сама строка (единственный фокусируемый узел без вложенных
+    // ссылок), а не всплывшие от `<a>` внутри неё. Мутация-проверка: замени
+    // условие обратно на голое `ev.key === 'Enter' || ev.key === ' '` без
+    // `ev.target === el` — тест с Enter на самой ссылке снова начнёт уводить
+    // в проект вместо открытия ссылки.
+    el.onkeydown = ev => {
+      if (ev.target !== el) return;
+      if (ev.key === 'Enter' || ev.key === ' '){ ev.preventDefault(); go(); }
+    };
+  });
+  return card;
 }
 
 
@@ -5585,6 +6300,24 @@ async function wireKeys(root, d){
       });
   };
 
+  // Своя подписка Codex/Claude (22.09.2026) — хранилище то же (rewrite/server.py),
+  // поэтому и снятие тем же путём: пустое значение соответствующего поля.
+  const wireSubDrop = (id, field, question) => {
+    const a = root.querySelector(id);
+    if (!a) return;
+    a.onclick = ev => {
+      ev.preventDefault();
+      confirmInline(a, question, async () => {
+        try{ await post('/ui/keys/rewrite', {[field]: ''}); await render(); }
+        catch(e){ toast(e.message); }
+      });
+    };
+  };
+  wireSubDrop('#rw-drop-codex', 'codex_auth',
+    'Снять свою подписку Codex? Текст станет писаться на серверной, если она задана.');
+  wireSubDrop('#rw-drop-claude', 'oauth_token',
+    'Снять свою подписку Claude? Текст станет писаться на серверной, если она задана.');
+
   root.querySelectorAll('a.dropkey').forEach(a => a.onclick = ev => {
     ev.preventDefault();
     // Ключ снимается сразу и без отмены — спросить обязаны, но не попапом.
@@ -5600,26 +6333,64 @@ async function wireKeys(root, d){
     // Форма ключа — в окне (18.09.2026): в строке карточки она жила криво и мешала
     // читать сам список. Провайдеры спрашиваем у кабинета, как и раньше.
     const ref = await api('/ui/keys/families');
-    modal('Добавить ключ', `
+    // Обычное поле ключа — как и было; для своих подписок Codex/Claude (22.09.2026) его
+    // на лету подменяет subFormHtml (та же разметка, что в админском блоке подписок).
+    const normalField = `<div class="fldrow"><label>Ключ</label>
+        <input id="kval" type="password" autocomplete="off" style="flex:1;min-width:0"></div>`;
+    const m = modal('Добавить ключ', `
       <div class="fldrow"><span class="lh"><label for="kfam">Провайдер</label>${
         hintDot((ref.note || '')
         + ' Значение нигде не показывается: в списке видно только хвост.')}</span>
         <select id="kfam">${ref.families.map(f =>
           `<option value="${esc(f.key)}">${esc(f.title)}</option>`).join('')}
-          <option value="__rewrite">OpenAI · текст</option></select></div>
-      <div class="fldrow"><label>Ключ</label>
-        <input id="kval" type="password" autocomplete="off" style="flex:1;min-width:0"></div>
+          <option value="__rewrite">OpenAI · текст</option>
+          <option value="__rewrite_codex">Своя подписка Codex</option>
+          <option value="__rewrite_claude">Своя подписка Claude</option></select></div>
+      <div id="kval-wrap">${normalField}</div>
 `,
       {ok: 'Сохранить', onOk: async (box, close) => {
+        const fam = box.querySelector('#kfam').value;
+        // Своя подписка Codex/Claude — своим путём: не генерик /ui/keys {add:}, второго
+        // места хранения секрета не заводим, значение уходит только в рерайт.
+        if (fam === '__rewrite_codex' || fam === '__rewrite_claude'){
+          const provider = fam === '__rewrite_codex' ? 'codex' : 'claude';
+          const secret = box.querySelector('#sf-secret');
+          const val = (secret.value || '').trim();
+          if (!val) throw new Error(subEmptyText(provider));
+          await post('/ui/keys/rewrite', fam === '__rewrite_codex'
+            ? {codex_auth: val} : {oauth_token: val});
+          secret.value = '';
+          close();
+          await render();
+          return;
+        }
         const val = box.querySelector('#kval').value.trim();
         if (!val) throw new Error('Ключ пустой.');
-        const fam = box.querySelector('#kfam').value;
         // Ключ рерайта хранит сам Rewrite: второго места хранения секрета не заводим.
         if (fam === '__rewrite') await post('/ui/keys/rewrite', {openai_api_key: val});
         else await post('/ui/keys', {add: {[fam]: [val]}});
         close();
         await render();
       }});
+
+    // Подмена поля ключа на форму своей подписки — и обратно. Собственная строка кнопок
+    // subFormHtml (`#sf-ok`/`#sf-no`) дублирует футер самого modal(), поэтому прячется:
+    // сохранение и отмена — только через него. Пересобираем обычное поле, только когда
+    // реально уходим с формы подписки — иначе переключение между обычными провайдерами
+    // (например OpenAI · текст → другой обычный ключ) молча стирало бы уже вписанное
+    // значение #kval (ревью 22.09.2026, Issue 3).
+    const wrap = m.body.querySelector('#kval-wrap');
+    m.body.querySelector('#kfam').onchange = ev => {
+      const fam = ev.target.value;
+      if (fam !== '__rewrite_codex' && fam !== '__rewrite_claude'){
+        if (!wrap.querySelector('#kval')) wrap.innerHTML = normalField;
+        return;
+      }
+      wrap.innerHTML = subFormHtml(fam === '__rewrite_codex' ? 'codex' : 'claude', 'own');
+      const ownRow = wrap.querySelector('#sf-ok').closest('.row');
+      if (ownRow) ownRow.hidden = true;
+      wireSubFile(wrap);
+    };
   };
 }
 
@@ -5640,7 +6411,11 @@ const CHANNEL_FIELD_TITLE = {tz: 'часовой пояс', schedule: 'расп�
 
 async function wireChannelEdit(root, c, chp){
   const box = root.querySelector('#editbox');
-  const ref = await api('/ui/channels/new');
+  // `channel_id` (§6.4 ТЗ) — иначе список профилей режется по `missing_since IS NULL`
+  // и текущий профиль канала, если он пропал с машины, вообще пропадает из <select>:
+  // сохранение формы тогда тихо стирает `profile_id` (index.html:6318 → 6396,
+  // pub_ui.py:207 — ловушка из брифа).
+  const ref = await api('/ui/channels/new?channel_id=' + encodeURIComponent(c.id));
   // Пресет канала (18.09.2026): привязка живая — пока канал на пресете, перекрытые
   // поля приходят из него, и править их в канале нельзя. Иначе форма показала бы
   // унаследованное значение и сохранила его как собственное значение канала.
@@ -5695,6 +6470,15 @@ async function wireChannelEdit(root, c, chp){
            <input id="f-uc" placeholder="UCK8sQmJBp8GCxrOtXWBpyEA" style="width:300px"></div>
          <div class="note muted">Задайте, когда узнаете, — сохранить можно один раз,
            потом изменить будет нельзя.</div>`;
+    // Профиль, помеченный `missing` (§6.4 ТЗ), остаётся в списке, пока он выбран у
+    // этого канала — просто с честной пометкой, а не пропадает молча.
+    const profItems = (ref.profiles || []).map(p => ({
+      value: p.id,
+      title: (p.title || '') + (p.host_code ? ` · ${p.host_code}` : '')
+        + (p.missing ? ' (нет на машине)' : ''),
+    }));
+    const curProfileMissing = (ref.profiles || []).some(p =>
+      String(p.id) === String(c.profile_id ?? '') && p.missing);
     const chpOptions = ((chp && chp.all) || []).map(p =>
       `<option value="${p.id}"${String(p.id) === String(chp.id || '') ? ' selected' : ''}
         >${esc(p.name)}</option>`).join('');
@@ -5739,8 +6523,10 @@ async function wireChannelEdit(root, c, chp){
           ${c.deferred ? 'checked' : ''}${off('deferred')}> копить</label>
         <input id="f-deflim" type="number" min="1" max="200"
           value="${c.deferred_limit ?? 5}" style="width:80px"${off('deferred_limit')}> шт</div>
-      ${sel('f-prof', ref.profiles.map(p => ({value: p.id, title: p.title})),
-            c.profile_id, 'Профиль AdsPower')}
+      ${sel('f-prof', profItems, c.profile_id, 'Профиль AdsPower')}
+      ${curProfileMissing ? `<div class="note bad">Текущий профиль пропал с машины
+        при последней описи. Сохранение формы его не сотрёт — но стоит завести
+        профиль заново на машине или выбрать другой.</div>` : ''}
       ${sel('f-host', ref.hosts.map(h => ({value: h.id, title: h.title})),
             c.host_id, 'Машина заливки', 'host_id')}
       ${sel('f-pv', ref.presets.vsgen.map(p => ({value: p.id, title: p.name})),
@@ -6555,6 +7341,8 @@ async function viewProfile(){
       <div class="secbody"><div class="note bad">Состояние ключей прочитать не удалось:
         ${esc(e.message)}. Денег это не стоило — карточка только читает.</div></div></div>`));
   }
+  // Подписки для текста — рядом с ключами: заказчик меняет их отсюда, а не по SSH.
+  if (me.role === 'admin') app.append(await textSubsCard());
 
   // Раздел людей появляется только у администратора: проверка стоит на сервере,
   // а не на прятании кнопки — запрос может прислать кто угодно.
@@ -7552,7 +8340,7 @@ async function viewPresets(){
      run: () => channelPresetModal(null)},
     {title: 'Шаблон озвучки Lumean',
      hint: 'голос и настройки на стороне Lumean',
-     run: () => lumeanTemplateModal(null, (lum && lum.fields) || null)},
+     run: () => { location.hash = '#/lumean/new'; }},
   ]);
 
   if (d.broken.length){
@@ -7847,9 +8635,10 @@ async function viewPresets(){
   </div>`);
   app.append(lumCard);
   const lumNew = lumCard.querySelector('#lum-new');
-  if (lumNew) lumNew.onclick = () => lumeanTemplateModal(null, lum.fields);
+  // Заводится и правится шаблон своей страницей, как обычный пресет (22.09.2026).
+  if (lumNew) lumNew.onclick = () => { location.hash = '#/lumean/new'; };
   lumCard.querySelectorAll('.lum-edit').forEach(b => b.onclick =
-    () => lumeanTemplateModal(b.dataset.id, null));
+    () => { location.hash = '#/lumean/' + encodeURIComponent(b.dataset.id); });
   lumCard.querySelectorAll('.lum-copy').forEach(b => b.onclick = async () => {
     try{ await navigator.clipboard.writeText(b.dataset.id); toast('id скопирован', 'ok'); }
     catch(e){ toast('Скопировать не вышло — id виден в строке шаблона'); }
@@ -7936,13 +8725,9 @@ function wirePresets(root){
 // Окно шаблона озвучки Lumean. Поля описывает сервер (те же имена, что у провайдера),
 // здесь только отрисовка. Создание возвращает id — показываем его и предлагаем
 // скопировать: именно он вписывается в карту «язык → шаблон» пресета.
-async function lumeanTemplateModal(id, fields, opts){
-  const creating = !id;
-  let d = {fields: fields || [], used_by: []};
-  if (!creating){
-    try{ d = await api(`/ui/lumean/templates/${encodeURIComponent(id)}/form`); }
-    catch(e){ toast(e.message); return; }
-  }
+// Форма шаблона озвучки — одна на окно и на страницу: поля описывает сервер, здесь
+// только отрисовка.
+function lumeanFormHtml(d){
   const fieldHtml = f => {
     const fid = 'lt-' + f.key;
     if (f.kind === 'switch')
@@ -7973,14 +8758,32 @@ async function lumeanTemplateModal(id, fields, opts){
     ? `<div class="note muted">На него ссылаются: ${d.used_by.map(esc).join(', ')}.
        Правка изменит их озвучку со следующего запуска.</div>`
     : '';
-  modal(creating ? 'Новый шаблон озвучки' : 'Шаблон озвучки Lumean',
-    `<div class="fields" style="padding:0">${(d.fields || []).map(fieldHtml).join('')}</div>
+  return `<div class="fields" style="padding:0">${(d.fields || []).map(fieldHtml).join('')}</div>
      <div class="note muted">Шаблон живёт в аккаунте Lumean: заведённый здесь виден и
        на сайте Lumean, удаление удаляет его там же. Формат вывода задаём мы — студия
-       собирает ролик из mp3.</div>${used}`,
+       собирает ролик из mp3.</div>${used}`;
+}
+
+function lumeanValues(box){
+  const values = {};
+  box.querySelectorAll('[data-lt]').forEach(el => { values[el.dataset.lt] = el.value; });
+  return values;
+}
+
+// Окно шаблона осталось ровно в одном месте — в форме пресета, у карты голосов
+// («Завести шаблон» и сразу подставить его id). Там уход на отдельную страницу стёр
+// бы всё, что человек успел набрать в пресете. Со списка пресетов шаблон заводится и
+// правится страницей `#/lumean/…` — как обычный пресет (владелец 22.09.2026).
+async function lumeanTemplateModal(id, fields, opts){
+  const creating = !id;
+  let d = {fields: fields || [], used_by: []};
+  if (!creating){
+    try{ d = await api(`/ui/lumean/templates/${encodeURIComponent(id)}/form`); }
+    catch(e){ toast(e.message); return; }
+  }
+  modal(creating ? 'Новый шаблон озвучки' : 'Шаблон озвучки Lumean', lumeanFormHtml(d),
     {ok: creating ? 'Завести' : 'Сохранить', onOk: async (box, close) => {
-      const values = {};
-      box.querySelectorAll('[data-lt]').forEach(el => { values[el.dataset.lt] = el.value; });
+      const values = lumeanValues(box);
       if (creating){
         const out = await post('/ui/lumean/templates', {values});
         close();
@@ -8001,6 +8804,74 @@ async function lumeanTemplateModal(id, fields, opts){
       // пресета: она стёрла бы незаписанные правки. Зовущий решает сам.
       if (!opts || opts.reload !== false) await render();
     }});
+}
+
+// Страница шаблона озвучки Lumean (22.09.2026). Владелец: «когда хочешь создать пресет
+// для Lumean — попап, а для обычного пресета нас на страницу перекидывает; давай и для
+// Lumean сделаем отдельной страничкой, просто перенесём попап». Форма та же, что была
+// в окне, — `lumeanFormHtml`; меняется только место.
+async function viewLumeanTemplate(id){
+  const creating = id === 'new';
+  let d;
+  if (creating){
+    const lum = await api('/ui/lumean/templates');
+    d = lum.ok ? {fields: lum.fields || [], used_by: []} : {why: lum.why || 'Lumean не ответил'};
+  }else{
+    d = await api(`/ui/lumean/templates/${encodeURIComponent(id)}/form`);
+  }
+  const nameField = (d.fields || []).find(f => f.key === 'name');
+  const title = creating ? 'Новый шаблон озвучки Lumean'
+                         : ((nameField && nameField.value) || id);
+  app.innerHTML = '';
+  const head = $(`<a class="back" href="#/presets">← ко всем пресетам</a>
+    <h1>${esc(title)}</h1>
+    <p class="sub">${creating ? 'Голос и настройки на стороне Lumean. Заведённый шаблон '
+      + 'выбирается в пресете, в карте голосов.' : `Шаблон озвучки Lumean · id
+      <span class="mono">${esc(id)}</span> ${iconBtn('lum-copy', 'link', 'Копировать id',
+      title, `data-id="${esc(id)}"`)}`}</p>`);
+  app.append(head);
+  const copy = head.querySelector('.lum-copy');
+  if (copy) copy.onclick = async () => {
+    try{ await navigator.clipboard.writeText(id); toast('id скопирован', 'ok'); }
+    catch(e){ toast('Скопировать не вышло — id виден в строке выше'); }
+  };
+  if (d.why){
+    app.append($(`<div class="card"><div class="secbody">
+      <div class="note bad">${esc(d.why)}</div>
+      <div class="note muted">Шаблоны заводятся ключом Lumean из профиля: без него
+        завести шаблон нечем.</div></div></div>`));
+    return;
+  }
+  // Сторож набранного — как у формы пресета: уход по ссылке, вкладке или «назад»
+  // спрашивает, прежде чем стереть незаписанное.
+  let touched = false;
+  const guardHash = location.hash;
+  const panel = inlinePanel(app, 'Настройки шаблона', lumeanFormHtml(d), {
+    ok: creating ? 'Завести' : 'Сохранить',
+    onOk: async box => {
+      const values = lumeanValues(box);
+      if (creating){
+        const out = await post('/ui/lumean/templates', {values});
+        touched = false; LEAVE_GUARD = null;
+        // id нужен человеку сразу: именно он идёт в карту голосов пресета. Страница
+        // заведённого показывает его с кнопкой копирования.
+        toast(`Шаблон заведён, id: ${out.id}`, 'ok');
+        try{ navigator.clipboard.writeText(out.id).catch(() => {}); }catch(e){}
+        location.hash = '#/lumean/' + encodeURIComponent(out.id);
+      }else{
+        await post(`/ui/lumean/templates/${encodeURIComponent(id)}`, {values});
+        touched = false; LEAVE_GUARD = null;
+        toast('Шаблон обновлён у провайдера', 'ok');
+        await render();
+      }
+    }});
+  panel.el.addEventListener('input', () => {
+    touched = true;
+    LEAVE_GUARD = {hash: guardHash, keep: h => h === guardHash,
+                   dirty: () => touched && panel.el.isConnected,
+                   what: creating ? 'Шаблон ещё не заведён — набранное нигде не записано.'
+                                  : 'Правка шаблона не сохранена.'};
+  });
 }
 
 // Окно пресета канала: те же настройки, что у канала, кроме языка. Пустое поле — «в
@@ -8487,7 +9358,7 @@ async function viewAdmin(){
             ? `сказано ${when(x.said_at)}${x.times > 1 ? `, раз: ${x.times}` : ''}`
             : 'ещё не сказано'}</div>
         </div></div>`).join('')
-      : '<div class="empty">Ни один из одиннадцати поводов не выполнен.</div>'}
+      : '<div class="empty">Ни один из двенадцати поводов не выполнен.</div>'}
     ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
        ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
     <div class="sec" style="border-bottom:0">Пороги</div>
@@ -8651,6 +9522,9 @@ const ROUTES = [
   // число, поэтому «new» ни с чьим адресом не столкнётся.
   ['presets',  h => h.startsWith('#/preset/'),     h  => viewPreset(
                                                           decodeURIComponent(h.split('/')[2]))],
+  // Шаблон озвучки Lumean — своя страница, как у пресета (22.09.2026).
+  ['presets',  h => h.startsWith('#/lumean/'),     h  => viewLumeanTemplate(
+                                                          decodeURIComponent(h.split('/')[2]))],
   ['profile',  h => h === '#/admin',              () => viewAdmin()],
   ['channels', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
   ['channels', h => h === '#/new',                () => viewNew()],
@@ -8722,12 +9596,29 @@ async function render(){
     const tab = document.getElementById('tab-' + id);
     if (tab) tab.classList.toggle('on', hit[0] === id);
   }
+  // Полоса появляется, только если экран думает дольше мгновения: на быстром переходе
+  // мигание раздражает сильнее, чем помогает.
+  const slow = setTimeout(busyOn, 120);
   try{ await hit[2](h); }
   catch(e){
     // Сессия могла истечь посреди работы: это не ошибка экрана, а «войдите снова».
     if (e instanceof NeedLogin){ ME = null; return viewLogin(''); }
     fail(e);
   }
+  finally{ clearTimeout(slow); busyOff(); }
+}
+
+// Показать, что экран грузится. Вынесено отдельными функциями: тем же индикатором
+// пользуются долгие действия внутри экранов, а не только смена адреса.
+function busyOn(){
+  const bar = document.getElementById('busy');
+  if (bar) bar.hidden = false;
+  document.body.classList.add('loading');
+}
+function busyOff(){
+  const bar = document.getElementById('busy');
+  if (bar) bar.hidden = true;
+  document.body.classList.remove('loading');
 }
 addEventListener('hashchange', render);
 render();

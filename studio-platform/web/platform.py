@@ -104,8 +104,10 @@ class StripPrefix:
 
 PARTS = (
     ("/studio", pult.app, "пульт"),
-    ("/rewrite", rewrite.app, "Rewrite Studio"),
-    ("/cover", cover.app, "Cover Studio"),
+    # Названия — те, что видит человек: одна студия, внутри части. Прежние имена
+    # отдельных сервисов ушли вместе с самими сервисами (решение владельца 22.09.2026).
+    ("/rewrite", rewrite.app, "тексты"),
+    ("/cover", cover.app, "обложки"),
     ("", cabinet.app, "кабинет"),          # корень монтируется последним
 )
 
@@ -125,6 +127,21 @@ async def lifespan(_app):
                 # Падение одного сервиса не должно уносить остальные: платформа
                 # поднимется без него, и это будет видно, а не выяснится потом.
                 print(f"[платформа] {title}: startup не прошёл — {type(exc).__name__}: {exc}")
+        # Внутренние доступы студия выдаёт себе сама — человек про них не знает и
+        # руками ничего не заводит (решение владельца 23.09.2026). Идемпотентно: на
+        # уже настроенной студии ничего не делает.
+        try:
+            import self_setup
+            cabinet = sys.modules.get("main")
+            if cabinet is not None and hasattr(cabinet, "db"):
+                report = self_setup.ensure_internal_access(cabinet.db)
+                if not report.get("ok") and report.get("why"):
+                    print(f"[платформа] внутренние доступы отложены: {report['why']}")
+        except Exception as exc:                                   # noqa: BLE001
+            # Самонастройка не имеет права ронять запуск: без неё студия поднимется
+            # и честно скажет об отказе на первой же задаче, а с упавшим запуском —
+            # не скажет ничего.
+            print(f"[платформа] самонастройка не прошла — {type(exc).__name__}: {exc}")
         yield
 
 

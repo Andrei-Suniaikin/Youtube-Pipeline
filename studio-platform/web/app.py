@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import zoneinfo
 import hashlib
@@ -22,6 +23,7 @@ import re
 import secrets
 import sqlite3
 import sys
+from typing import Optional
 import threading
 import time
 import urllib.error
@@ -35,6 +37,7 @@ sys.path.insert(0, SERVER)
 
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile  # noqa: E402
 from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
+from starlette.concurrency import run_in_threadpool                # noqa: E402
 from pydantic import BaseModel, StrictInt                         # noqa: E402
 
 sys.path.insert(0, HERE)
@@ -56,7 +59,7 @@ from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
 from pub_neighbors import (cover_presets, rewrite_preset_config,  # noqa: E402
                            rewrite_presets, vsgen_presets)
 from pub_tags import (DONOR_UNKNOWN_WHY, add_links, check_donor,   # noqa: E402
-                      donor_facts_blank, donor_limits, donor_verdict,
+                      donor_facts_blank, donor_limits, donor_title, donor_verdict,
                       parse_links, plan_rows)
 import pub_ui                                                    # noqa: E402
 
@@ -598,7 +601,7 @@ def ui_channels():
 
 # ─────────────────────────── календарь канала ───────────────────────────
 
-def past_slots(schedule: dict, tz_name: str, days: int, now=None) -> list:
+def past_slots(schedule: dict, tz_name: str, days: int, now=None, created=None) -> list:
     """Слоты канала за прошедшие `days` суток, по возрастанию.
 
     Зеркало `channel_slots.upcoming_slots()`, которое умеет только вперёд:
@@ -609,6 +612,12 @@ def past_slots(schedule: dict, tz_name: str, days: int, now=None) -> list:
     Разбор расписания, часовой пояс и обработка несуществующего времени в ночь перевода
     часов берутся из тех же функций, что и у прямого прохода: расписание не должно
     читаться двумя способами.
+
+    `created` (unix-секунды, `pub_channels.created`) — нижняя граница: канала ещё не
+    было, и слот до его завода не пропуск, а выдумка. Владелец 22.09.2026: свежий канал
+    показывал «пропущено» за годы истории, которых у него никогда не было. Проверка —
+    по точному времени момента, а не по суткам: канал, заведённый в 14:00, не должен
+    получить «пропуск» на 09:00 того же дня.
     """
     plan = normalize_schedule(schedule)
     zone = _zone(tz_name)
@@ -621,7 +630,7 @@ def past_slots(schedule: dict, tz_name: str, days: int, now=None) -> list:
             point = _localize(day, hh, mm, zone)
             if point is None:
                 continue                      # этого времени в эту дату не существует
-            if point <= moment:
+            if point <= moment and (created is None or point.timestamp() >= created):
                 out.append(point)
     return sorted(out)
 
@@ -654,7 +663,10 @@ def _calendar(c, ch, history_days: int) -> list:
 
     horizon = int(ch["horizon_days"] or 3)
     tz = ch["tz"] or "Europe/Warsaw"
-    moments = ([(m, True) for m in past_slots(schedule, tz, history_days)]
+    # Нижняя граница — момент завода канала (пункт 2 владельца, 22.09.2026): раньше
+    # `created` слотов не бывает, значит и «пропусков» там быть не может.
+    moments = ([(m, True) for m in past_slots(schedule, tz, history_days,
+                                              created=ch["created"])]
                + [(m, False) for m in upcoming_slots(schedule, tz, horizon)])
 
     def row_for(moment, item, is_past, beyond=False):
@@ -677,6 +689,19 @@ def _calendar(c, ch, history_days: int) -> list:
             "phase_title": PHASE_TITLE.get(rel["phase"], "") if rel is not None else "",
             "project_id": (rel["project_id"] if rel is not None else "") or "",
             "blocked_reason": (rel["blocked_reason"] if rel is not None else "") or "",
+            # НОВОЕ (пункт 1 владельца, 22.09.2026): video_id — прямая ссылка на
+            # YouTube после честной публикации (см. `calendarFeed`), project_name —
+            # подпись строки без похода на отдельный экран проекта. `project_name`
+            # заполняется ниже одним запросом на весь календарь, а не здесь построчно:
+            # `row_for` вызывается на каждый слот, и десятки одиночных SELECT'ов ради
+            # имени были бы N+1 там, где хватает одного.
+            "video_id": (rel["video_id"] if rel is not None else "") or "",
+            "project_name": "",
+            # Внутреннее поле — id строки `pub_plan_items` для ленивой дозагрузки
+            # названия донора (`_select_backfill_candidates`/`_backfill_donor_titles_network`).
+            # Наружу не отдаётся: снимается в `ui_channel` перед отправкой ответа
+            # (см. `_strip_internal`).
+            "_plan_item_id": item["id"] if item is not None else None,
         }
 
     out = [row_for(m, by_slot.get(round(m.timestamp())), past) for m, past in moments]
@@ -692,6 +717,20 @@ def _calendar(c, ch, history_days: int) -> list:
             continue
         moment = dt.datetime.fromtimestamp(ts, dt.timezone.utc)
         out.append(row_for(moment, item, is_past=(ts <= time.time()), beyond=True))
+
+    # Имя проекта — одним запросом на весь календарь (join-паттерн как в
+    # `web/app.py:989-993`), а не по строке: строк в ленте может быть сотня, а
+    # различных project_id среди них — единицы.
+    project_ids = sorted({r["project_id"] for r in out if r["project_id"]})
+    if project_ids:
+        marks = ",".join("?" * len(project_ids))
+        names = {row["id"]: (row["name"] or "") for row in c.execute(
+            f"SELECT id, name FROM projects WHERE tenant_id=? AND id IN ({marks})",
+            (ch["tenant_id"], *project_ids))}
+        for r in out:
+            if r["project_id"]:
+                r["project_name"] = names.get(r["project_id"], "") or ""
+
     out.sort(key=lambda r: r["at"])
     return out
 
@@ -1584,6 +1623,77 @@ def _fg_count(v):
     return v.get("current_usage") if isinstance(v, dict) else v
 
 
+# Каналы промптов картинок (пункт 4 ТЗ 22.09.2026). Тот же порядок, что у кабинетной
+# формы «Мои ключи» (`server/main.py:786` PROMPT_CHANNEL_ORDER) — второй нумерации не
+# заводим. `_PROMPT_CHANNEL_FAMILY` ниже — только запасной путь (см. `_prompt_state`):
+# семейство credential'а в `users.keys`, которым каждый канал пишет, на случай, если
+# кабинет не загружен в этот процесс вовсе.
+_PROMPT_CHANNELS = ("openai", "claude", "altclaude", "codex")
+_PROMPT_CHANNEL_FAMILY = {"openai": "openai", "claude": "claude_oauth",
+                          "codex": "codex_auth", "altclaude": "alt_llm"}
+
+
+def _prompt_state(request: Request) -> dict:
+    """Раздел `prompt` ответа /ui/keys: выбранный канал и «задан/не задан» — только
+    для вошедшего человека, без единого значения ключа наружу.
+
+    «Задан/не задан» и выбранный канал СЧИТАЕТ КАБИНЕТ (ревью 22.09.2026, Issue 4):
+    `main._own_prompt_channels(u)`/`main._selected_prompt_channel(u)` через
+    `sys.modules.get("main")` — тем же приёмом, что уже пользуется `ui_key_families`.
+    Своей второй нумерации на пульте нет НАМЕРЕННО: у кабинета own_set не совпадает с
+    «любое непустое значение в users.keys» буквально — копия серверного ключа своей
+    не считается, а `codex_auth`, который не похож на JSON auth.json, тоже. Устаревший
+    выбор канала (свой credential уже снят) кабинет отдаёт как «Авто» (`selected=""`),
+    а не «залипший» канал. Обе функции — чистые: берут `u` (полную строку `users`,
+    как её кладёт `web/pult_auth.who`) и файл ключей сервера, в базу второй раз не ходят.
+
+    Кабинет не загружен в этот процесс (пульт запущен отдельно) или вызов упал —
+    откат на прямое чтение `request.state.user["keys"]`/`["key_opts"]`: те же JSON-поля
+    сессии, что уже разбирает цикл `own` чуть ниже (список «свои ключи пользователей»).
+    `key_opts["_prompt"]["provider"]` — тот же зарезервированный ключ, которым кабинет
+    хранит выбор канала (`server/main.py:2043`, `_OWN_PROMPT_CHANNEL_OPT`).
+    """
+    u = getattr(request.state, "user", None)
+    mod = sys.modules.get("main")
+    if mod is not None and u is not None and hasattr(mod, "_own_prompt_channels"):
+        try:
+            own_channels = set(mod._own_prompt_channels(u))
+            selected = mod._selected_prompt_channel(u) or ""
+        except Exception:                                         # noqa: BLE001
+            pass                          # кабинет упал — ниже честный запасной путь
+        else:
+            if selected not in _PROMPT_CHANNELS:
+                selected = ""
+            return {"selected": selected,
+                    "channels": {ch: {"own_set": ch in own_channels}
+                                for ch in _PROMPT_CHANNELS}}
+    own, opts = {}, {}
+    if u is not None:
+        try:
+            own = json.loads(u["keys"] or "{}")
+        except Exception:                                         # noqa: BLE001
+            own = {}
+        try:
+            opts = json.loads(u["key_opts"] or "{}")
+        except Exception:                                         # noqa: BLE001
+            opts = {}
+    if not isinstance(own, dict):
+        own = {}
+    if not isinstance(opts, dict):
+        opts = {}
+    raw = opts.get("_prompt")
+    selected = (str((raw or {}).get("provider") or "").strip().lower()
+               if isinstance(raw, dict) else "")
+    if selected not in _PROMPT_CHANNELS:
+        selected = ""
+    channels = {}
+    for ch in _PROMPT_CHANNELS:
+        val = own.get(_PROMPT_CHANNEL_FAMILY[ch])
+        items = val if isinstance(val, (list, tuple)) else ([val] if val else [])
+        channels[ch] = {"own_set": bool([v for v in items if v])}
+    return {"selected": selected, "channels": channels}
+
+
 @app.get("/ui/keys")
 def ui_keys(request: Request):
     """Честная картина по ключам вместо «свободных слотов» (ТЗ §12).
@@ -1595,6 +1705,9 @@ def ui_keys(request: Request):
       курсор раздачи      — provider_rr_cursor: кому выдали последним
       FastGen             — admin_state.fastgen_usage: снимок расхода и срока ключа
                             (пункт 8 ТЗ), нет снимка — «данных пока нет»
+      канал промптов       — users.keys/key_opts этого человека: выбранный канал и
+                            «задан/не задан» по каждому из четырёх (пункт 4 ТЗ 22.09),
+                            см. `_prompt_state` — значения ключей и здесь не идут
 
     Чего отсюда НЕ видно и почему: текущая занятость слотов живёт в памяти кабинета
     (SERVER_CREDENTIAL_POOL._loads), а не в базе. Показывать её выдуманной нельзя —
@@ -1706,6 +1819,7 @@ def ui_keys(request: Request):
         "busy": busy,
         "fastgen": fastgen,
         "rewrite": _rewrite_keys(getattr(request.state, "sid", "")),
+        "prompt": _prompt_state(request),
         "unavailable": [],
     }
 
@@ -1724,25 +1838,177 @@ def _rewrite_keys(sid: str) -> dict:
     return {"ok": True,
             "own_openai": bool(body.get("own_openai_key_set")),
             "own_claude": bool(body.get("own_claude_token_set")),
+            "own_codex": bool(body.get("own_codex_auth_set")),
             "server_openai": bool(body.get("openai_configured")),
             "server_claude": bool(body.get("claude_configured")),
             "source": body.get("openai_key_source") or "",
-            "claude_source": body.get("claude_key_source") or ""}
+            "claude_source": body.get("claude_key_source") or "",
+            "codex_source": body.get("codex_key_source") or ""}
 
 
 class RewriteKeyIn(BaseModel):
-    openai_api_key: str = ""      # пусто = снять свой ключ, снова заработает серверный
+    # None = поле не трогать (не было в запросе), "" = снять свою подписку/ключ —
+    # тот же приём, что уже используется в SubscriptionEditIn (partial update).
+    openai_api_key: Optional[str] = None
+    codex_auth: Optional[str] = None
+    oauth_token: Optional[str] = None
 
 
 @app.post("/ui/keys/rewrite")
 def ui_keys_rewrite(body: RewriteKeyIn, request: Request):
-    """Записать свой ключ OpenAI для текста. Хранит его Rewrite, пульт только передаёт:
-    второго места хранения секрета заводить нельзя."""
+    """Записать свои ключ OpenAI / подписку Codex / подписку Claude для текста.
+
+    Хранит их Rewrite, пульт только передаёт: второго места хранения секрета заводить
+    нельзя. Присланное поле (даже пустой строкой) — сигнал «сохранить/снять»,
+    отсутствующее — «не трогать»."""
     sid = getattr(request.state, "sid", "")
-    code, out = _rw("/settings/keys", sid, {"openai_api_key": body.openai_api_key})
+    fields: dict = {}
+    if body.openai_api_key is not None:
+        fields["openai_api_key"] = body.openai_api_key
+    if body.codex_auth is not None:
+        fields["codex_auth"] = body.codex_auth
+    if body.oauth_token is not None:
+        token = body.oauth_token
+        if token.strip():
+            subs = _text_subs()
+            try:
+                token = subs.normalize_claude_token(token)
+            except subs.SubscriptionError as exc:
+                raise HTTPException(422, str(exc))
+        fields["oauth_token"] = token
+    if not fields:
+        return {"ok": True, "set": {}}
+    code, out = _rw("/settings/keys", sid, fields)
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
-    return {"ok": True, "set": bool(body.openai_api_key.strip())}
+    result = {}
+    if "openai_api_key" in fields:
+        result["openai"] = bool(fields["openai_api_key"].strip())
+    if "codex_auth" in fields:
+        result["codex"] = bool(fields["codex_auth"].strip())
+    if "oauth_token" in fields:
+        result["claude"] = bool(fields["oauth_token"].strip())
+    return {"ok": True, "set": result}
+
+
+# ─────────────────── подписки для текста: Codex и Claude (22.09.2026) ───────────────────
+#
+# Раньше сменить подписку, которой пишется текст, можно было только по SSH: `codex login`,
+# правка /etc/rewrite.env и перезапуск сервиса. Теперь это делает администратор здесь.
+# Хранит подписки модуль рерайта (`rewrite/subscriptions.py`) — второго места хранения
+# секрета не заводим, пульт только передаёт. Значение наружу не уходит никогда: в ответе
+# имя, хвост и состояние.
+
+def _text_subs():
+    rw = os.path.join(BASE, "rewrite")
+    if rw not in sys.path:
+        sys.path.append(rw)
+    import subscriptions                                           # noqa: E402
+    return subscriptions
+
+
+def _require_subs_admin(request) -> dict:
+    """Серверные подписки общие на всех — менять их может только администратор.
+    Свои подписки человека живут в «Моих ключах» и сюда не относятся."""
+    user = getattr(request.state, "user", None)
+    role = (user["role"] if user is not None and "role" in user.keys() else "") or ""
+    if role != "admin":
+        raise HTTPException(403, "серверные подписки меняет только администратор")
+    return {"id": user["id"], "name": user["name"]}
+
+
+def _subs_env_part() -> dict:
+    """Подписки, заданные на сервере файлом окружения: их видно, но менять их здесь
+    нельзя — они живут в /etc/rewrite.env. Рерайт не поднят — честно «неизвестно»."""
+    core = sys.modules.get("rewrite_core")
+    if core is None:
+        return {"known": False, "codex": [], "claude": []}
+    subs = _text_subs()
+    try:
+        managed_homes = set(subs.codex_homes())
+        managed_tokens = set(subs.claude_tokens())
+        homes = [h for h in core.get_server_codex_homes() if h not in managed_homes]
+        tokens = [t for t in core.get_server_claude_oauth_tokens()
+                  if t not in managed_tokens]
+    except Exception:                                              # noqa: BLE001
+        return {"known": False, "codex": [], "claude": []}
+    return {"known": True,
+            # Путь каталога — не секрет, а человеку нужен ответ «какой это вход».
+            "codex": [{"tail": os.path.basename(h.rstrip("/")) or h} for h in homes],
+            "claude": [{"tail": f"…{t[-4:]}"} for t in tokens]}
+
+
+def _subs_pool() -> dict:
+    """Сколько вызовов текста идёт прямо сейчас — из самого пула, а не выдуманное."""
+    core = sys.modules.get("rewrite_core")
+    out = {}
+    for provider in ("codex", "claude"):
+        try:
+            out[provider] = core.get_server_credential_pool(provider).stats() if core else None
+        except Exception:                                          # noqa: BLE001
+            out[provider] = None
+    return out
+
+
+@app.get("/ui/subscriptions")
+def ui_subscriptions(request: Request):
+    _require_subs_admin(request)
+    return {"items": _text_subs().listing(), "env": _subs_env_part(),
+            "pool": _subs_pool(), "now": time.time()}
+
+
+class SubscriptionIn(BaseModel):
+    provider: str = ""
+    secret: str = ""
+    label: str = ""
+
+
+class SubscriptionEditIn(BaseModel):
+    label: Optional[str] = None
+    paused: Optional[bool] = None
+    secret: str = ""               # не пусто — новый вход в ту же запись («Заменить»)
+
+
+def _subs_call(fn, *args):
+    subs = _text_subs()
+    try:
+        return fn(*args)
+    except subs.SubscriptionError as exc:
+        raise HTTPException(400, str(exc))
+    except KeyError:
+        raise HTTPException(404, "такой подписки нет — возможно, её уже удалили")
+
+
+@app.post("/ui/subscriptions")
+def ui_subscription_add(body: SubscriptionIn, request: Request):
+    who = _require_subs_admin(request)
+    subs = _text_subs()
+    item = _subs_call(subs.add, body.provider, body.secret, body.label, who["name"])
+    return {"ok": True, "item": item}
+
+
+@app.post("/ui/subscriptions/{sid}")
+def ui_subscription_edit(sid: str, body: SubscriptionEditIn, request: Request):
+    who = _require_subs_admin(request)
+    subs = _text_subs()
+    item = None
+    if body.secret.strip():
+        item = _subs_call(subs.replace, sid, body.secret, who["name"])
+    if body.label is not None:
+        item = _subs_call(subs.rename, sid, body.label)
+    if body.paused is not None:
+        item = _subs_call(subs.set_paused, sid, body.paused)
+    if item is None:
+        raise HTTPException(400, "нечего менять")
+    return {"ok": True, "item": item}
+
+
+@app.delete("/ui/subscriptions/{sid}")
+def ui_subscription_remove(sid: str, request: Request):
+    _require_subs_admin(request)
+    subs = _text_subs()
+    _subs_call(subs.remove, sid)
+    return {"ok": True}
 
 
 def _pool_load() -> list:
@@ -1843,22 +2109,189 @@ def _uploads(c, channel_id: int) -> list:
     return rows
 
 
-# «/ui/channels/new», объявленный ниже, и форма заведения канала отвечает 422.
-@app.get("/ui/channels/{channel_id:int}")
-def ui_channel(channel_id: int, history: int = 14):
-    """Канал: карточка, календарь с историей и пропусками, сводка.
+# Ленивая дозагрузка названий доноров при открытии канала (пункт 1 владельца,
+# 22.09.2026). Старые строки плана — добавленные до того, как кабинет стал спрашивать
+# название заранее, или ссылка на мёртвый/закрытый ролик — годами стояли пустыми:
+# показывать название было неоткуда, форма ставила туда голую ссылку.
+#
+# Кап и параллелизм — не оптимизация, а поправка на живой экран (уточнение оркестратора
+# к Algorithm шаг 9): один запрос `donor_title()` живёт до 6 с (таймаут в
+# `server/pub_tags.py:46`), и `history=90` мог отдать в ленте десятки безымянных строк
+# разом. По ОДНОЙ, последовательно, полсотни строк держали бы открытие канала полминуты
+# и дольше. Здесь — не больше `DONOR_TITLE_BACKFILL_CAP` походов за один заход, и все
+# сразу параллельно (`asyncio.gather`), так что худший случай — это время ОДНОГО
+# таймаута, а не суммы всех пяти.
+#
+# Кулдаун — в памяти процесса, НЕ в базе и НЕ в `pub_plan_items.updated`: это поле уже
+# занято возрастом строки в очереди («ждёт»/«давно висит», `web/app.py:292`,
+# `6158-6161`, сортировка `6230`), и молчаливая правка его фоновой дозагрузкой
+# постороннего поля сломала бы те экраны. Плата за простоту — кулдаун обнуляется
+# рестартом процесса; это принято сознательно (Algorithm шаг 10): рестарты редки, а
+# кап 5-на-заход всё равно держит худший случай даже сразу после рестарта.
+DONOR_TITLE_BACKFILL_CAP = 5
+DONOR_TITLE_BACKFILL_COOLDOWN_SEC = float(
+    os.environ.get("VS_DONOR_TITLE_COOLDOWN_SEC", "3600"))
+_donor_title_backfill_cooldown: dict = {}
 
-    `history` — сколько суток прошлого показывать. По умолчанию две недели: этого
-    хватает, чтобы увидеть пропуски, и мало, чтобы лента осталась читаемой.
+
+def _prune_backfill_cooldown(now: float) -> None:
+    """Выбросить из кулдауна записи старше своего же окна (ревью 22.09.2026, Issue 4).
+
+    Раньше запись из словаря уходила только при УДАЧНОЙ дозагрузке — для мёртвой
+    ссылки удачи не будет никогда, и её отметка лежала бы до перезапуска процесса.
+    Опасности в этом не было (объём ограничен числом строк плана), но и смысла копить
+    просроченные записи нет. Зовётся из `_select_backfill_candidates` на КАЖДОМ
+    открытии канала — не только когда у текущего канала находятся кандидаты: строка,
+    исчезнувшая из видимой ленты, иначе никогда больше не дала бы повод почистить свою
+    отметку. Мутация-проверка: убери вызов `_prune_backfill_cooldown` из
+    `_select_backfill_candidates` — словарь кулдауна перестанет уменьшаться сам, и тест
+    в `tests/test_donor_title_links.py` («Issue 4») это поймает.
     """
-    history = max(0, min(90, int(history)))
+    stale = [pid for pid, ts in _donor_title_backfill_cooldown.items()
+             if now - ts >= DONOR_TITLE_BACKFILL_COOLDOWN_SEC]
+    for pid in stale:
+        _donor_title_backfill_cooldown.pop(pid, None)
+
+
+def _select_backfill_candidates(cal: list) -> list:
+    """Отобрать до `DONOR_TITLE_BACKFILL_CAP` строк без названия — чистая функция, без
+    сети и без SQLite (ревью 22.09.2026, Issue 1): раньше отбор кандидатов жил внутри
+    одной `async def`-функции вместе с сетью и записью. Здесь — только просмотр уже
+    готового списка `cal`, дешёвый чистый Python; сеть и запись — отдельными шагами,
+    каждый в своём месте (см. `_backfill_donor_titles_network`/`_write_donor_titles`
+    ниже).
+
+    Кандидаты берутся из `cal` целиком — это уже всё, что человек увидит на экране
+    (`history` ограничен 90 сутками, горизонт мал), отдельного фильтра «видимости» не
+    заводим (Algorithm шаг 9). Строка без ссылки или без `_plan_item_id` (синтетический
+    `missed`/`free` слот) в кандидаты не идёт — дозагружать нечего.
+
+    ВАЖНО (ревью 22.09.2026, Issue 2): эта функция ЗОВЁТСЯ ИЗ `ui_channel` НА ЦИКЛЕ
+    СОБЫТИЙ, а не из `_load_channel_calendar_sync` в пуле потоков, куда она раньше была
+    сложена рядом с остальным SQL. Причина — единственный писатель словаря кулдауна.
+    `_prune_backfill_cooldown` перебирает `_donor_title_backfill_cooldown.items()`;
+    если бы этот перебор шёл в потоке пула, а `_backfill_donor_titles_network` другого
+    ПАРАЛЛЕЛЬНОГО открытия канала писал(а)/удалял(а) ключи в том же словаре на цикле
+    событий, переключение GIL посреди перебора дало бы `RuntimeError: dictionary
+    changed size during iteration` и 500 на открытии канала. На цикле событий
+    переключения потоков нет — весь код между `await`'ами выполняется без вытеснения
+    другим потоком, поэтому и чтение (здесь), и запись (в `_backfill_donor_titles_network`)
+    словаря кулдауна безопасны просто потому, что живут на одном потоке.
+    """
+    now = time.time()
+    # Просроченные отметки кулдауна выметаем на каждом открытии канала (Issue 4), а не
+    # только тогда, когда у ЭТОГО канала находятся кандидаты — иначе строка, которая
+    # исчезла из видимой ленты (утекла за пределы `history`, удалена, донор всё же
+    # получил название другим путём), никогда не попадёт в `_backfill_donor_titles_network`
+    # и её отметка пролежит в памяти до перезапуска процесса, хотя окно кулдауна
+    # давно истекло.
+    _prune_backfill_cooldown(now)
+    candidates = []
+    for row in cal:
+        pid = row.get("_plan_item_id")
+        if not pid or row.get("donor_title") or not row.get("donor_url"):
+            continue
+        last_fail = _donor_title_backfill_cooldown.get(pid)
+        if last_fail is not None and now - last_fail < DONOR_TITLE_BACKFILL_COOLDOWN_SEC:
+            continue                                  # мёртвая ссылка — не долбим её снова
+        candidates.append(row)
+        if len(candidates) >= DONOR_TITLE_BACKFILL_CAP:
+            break
+    return candidates
+
+
+def _write_donor_titles(updates: list) -> None:
+    """Короткая ОТДЕЛЬНАЯ запись дозагруженных названий — своя связь с базой, открытая
+    уже ПОСЛЕ того, как сеть ответила (ревью 22.09.2026, Issue 1). Раньше запись шла
+    через ту же связь `c`, что читала весь остальной ответ `ui_channel`, и эта связь
+    простаивала открытой всё время ожидания сети (до ~6 с на запрос, таймаут
+    `donor_title()` в `server/pub_tags.py:46`) — под WAL терпимо для чтения, но именно
+    открытая-и-ждущая связь была тем, чего Algorithm шаг 9 просил избежать.
+    """
+    c = db()
+    try:
+        for title, pid in updates:
+            c.execute("UPDATE pub_plan_items SET donor_title=? WHERE id=?", (title, pid))
+        c.commit()
+    finally:
+        c.close()
+
+
+async def _backfill_donor_titles_network(cal: list, candidates: list) -> list:
+    """Сетевая часть дозагрузки — единственное, что вправе занимать цикл событий
+    (ревью 22.09.2026, Issue 1): сами походы в oembed уже уходят в пул потоков
+    (`run_in_threadpool` на каждый URL, параллельно через `asyncio.gather`), здесь цикл
+    событий только ждёт их ответа, ни одного вызова SQLite в этой функции нет — запись
+    результата вынесена в `_write_donor_titles` и тоже уходит в пул потоков (`ui_channel`
+    зовёт её через `run_in_threadpool`, а не отсюда: эта функция остаётся только про
+    сеть). Возвращает список `(title, plan_item_id)` для успешных ответов — писать их
+    в базу решает вызывающая сторона, уже своей отдельной короткой связью.
+    """
+    if not candidates:
+        return []
+    now = time.time()
+    fetched = await asyncio.gather(
+        *(run_in_threadpool(donor_title, row["donor_url"]) for row in candidates))
+    updates = []
+    for row, title in zip(candidates, fetched):
+        pid = row["_plan_item_id"]
+        if title:
+            row["donor_title"] = title                # тот же ответ отдаём сразу, без перезахода
+            updates.append((title, pid))
+            _donor_title_backfill_cooldown.pop(pid, None)
+        else:
+            _donor_title_backfill_cooldown[pid] = now
+    return updates
+
+
+def _strip_internal(row: dict) -> dict:
+    """Снять служебные поля (`_plan_item_id`) перед тем, как строка календаря уйдёт наружу."""
+    return {k: v for k, v in row.items() if not k.startswith("_")}
+
+
+def _load_channel_calendar_sync(channel_id: int, history: int):
+    """Открыть канал и построить календарь — целиком в пуле потоков (ревью 22.09.2026,
+    Issue 1). Своя связь с базой открывается и закрывается здесь же, до всякой сети:
+    `ui_channel` вызывает эту функцию через `run_in_threadpool`, так что ни один SQL из
+    неё не выполняется в цикле событий единого процесса (кабинет + пульт + Rewrite +
+    Cover, `web/platform.py`) — там, где под живым писателем (воркеры/кабинет/очередь)
+    связь с `timeout=5` могла бы ждать блокировку и вместе с ней вставали бы все
+    четыре веба разом.
+
+    Возвращает `(ch, cal)`; `ch is None`, если канала нет — `ui_channel` превращает это
+    в 404 уже на цикле событий, без похода в базу второй раз.
+
+    ВАЖНО (ревью 22.09.2026, Issue 2): отбор кандидатов на дозагрузку названий
+    (`_select_backfill_candidates`) сюда НЕ входит — он читает и чистит
+    `_donor_title_backfill_cooldown`, а эта функция выполняется в пуле потоков.
+    Другое параллельное открытие канала в это же время могло бы писать в тот же
+    словарь из `_backfill_donor_titles_network` на цикле событий, и перебор `.items()`
+    в `_prune_backfill_cooldown` поймал бы `RuntimeError: dictionary changed size
+    during iteration`. Отбор кандидатов сделан отдельным шагом на цикле событий
+    (`ui_channel`, между этим вызовом и `_backfill_donor_titles_network`) — весь
+    словарь кулдауна живёт и читается/пишется только там, без гонки между потоками.
+    """
     c = db()
     try:
         ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
                        (channel_id, TENANT)).fetchone()
         if ch is None:
-            raise HTTPException(404, "канал не найден")
+            return None, None
         cal = _calendar(c, ch, history)
+        return ch, cal
+    finally:
+        c.close()
+
+
+def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) -> dict:
+    """Остальная часть ответа `ui_channel` — тоже в пуле потоков (ревью 22.09.2026,
+    Issue 1): своя КОРОТКАЯ связь, открытая уже ПОСЛЕ того, как сеть (дозагрузка
+    названий) отработала, а не висящая всё это время. `cal` к этому моменту уже несёт
+    дозагруженные названия (правились на месте в `_backfill_donor_titles_network`) —
+    здесь их не трогаем, только читаем для `counts`/`by_day` и отдаём наружу.
+    """
+    c = db()
+    try:
         # Ссылки, стоящие без даты: раньше их было видно только числом в плашке — что
         # именно поставлено, посмотреть было негде (жалоба владельца 18.09.2026).
         waiting_rows = [
@@ -1932,7 +2365,10 @@ def ui_channel(channel_id: int, history: int = 14):
                 "preset_rewrite": ch["preset_rewrite"] or "",
                 "preset_cover": ch["preset_cover"] or "",
             },
-            "calendar": cal,
+            # `_strip_internal` снимает служебный `_plan_item_id` — наружу контракт
+            # календаря не меняется (`counts`/`by_day` выше уже посчитаны по `cal`
+            # ДО снятия поля, им оно не мешало).
+            "calendar": [_strip_internal(r) for r in cal],
             "counts": counts,
             "uploads": _uploads(c, channel_id),
             "by_day": by_day,
@@ -1957,37 +2393,150 @@ def ui_channel(channel_id: int, history: int = 14):
         c.close()
 
 
+# «/ui/channels/new», объявленный ниже, и форма заведения канала отвечает 422.
+@app.get("/ui/channels/{channel_id:int}")
+async def ui_channel(channel_id: int, history: int = 14):
+    """Канал: карточка, календарь с историей и пропусками, сводка.
+
+    `history` — сколько суток прошлого показывать. По умолчанию две недели: этого
+    хватает, чтобы увидеть пропуски, и мало, чтобы лента осталась читаемой.
+
+    ВАЖНО (ревью 22.09.2026, Issue 1) — тот же принцип, что и у `def`/`async def` ниже
+    (см. правило у `ui_keys_save`): обработчик остаётся `async def`, но НИ ОДИН вызов
+    SQLite в нём не выполняется прямо в цикле событий. Тело разбито на три шага:
+    `_load_channel_calendar_sync` (пул потоков) → `_backfill_donor_titles_network`
+    (цикл событий ждёт только сеть, сама сеть — тоже в пуле потоков, по URL'у)
+    → `_finish_channel_response_sync` (снова пул потоков, своя короткая связь).
+    Цикл событий здесь занят только awaiting'ом между шагами — ни одна связь с базой не
+    остаётся открытой, пока где-то ждёт сеть.
+
+    Отбор кандидатов на дозагрузку (`_select_backfill_candidates`) выполняется здесь же,
+    на цикле событий, а не в пуле потоков (ревью 22.09.2026, Issue 2) — это чистый
+    Python без SQLite и без сети, а словарь кулдауна `_donor_title_backfill_cooldown`
+    иначе читался/чистился бы из потока пула ОДНОВРЕМЕННО с тем, как другое парал-
+    лельное открытие канала пишет в него же из `_backfill_donor_titles_network` на
+    цикле событий — гонка между потоками за общий словарь. Держа весь доступ к
+    словарю на одном потоке (цикле событий), гонку убираем полностью, а не прячем
+    под снимком.
+    """
+    history = max(0, min(90, int(history)))
+    ch, cal = await run_in_threadpool(_load_channel_calendar_sync, channel_id, history)
+    if ch is None:
+        raise HTTPException(404, "канал не найден")
+    candidates = _select_backfill_candidates(cal)
+    updates = await _backfill_donor_titles_network(cal, candidates)
+    if updates:
+        await run_in_threadpool(_write_donor_titles, updates)
+    return await run_in_threadpool(_finish_channel_response_sync, channel_id, history, ch, cal)
+
+
 class LinksIn(BaseModel):
     channel_id: int
     links: str
     slot: float | None = None
 
 
+# Сколько названий доноров тянуть ОДНОВРЕМЕННО (пункт 1 владельца, 22.09.2026;
+# уточнение оркестратора к Algorithm шаг 9). Поштучно, как раньше писал план ТЗ
+# (`await run_in_threadpool` внутри цикла), пачка в 20+ ссылок держала бы экран
+# добавления по 6 с на ссылку. Пул той же глубины, что и лимит дозагрузки при
+# открытии канала (`DONOR_TITLE_BACKFILL_CAP`) — оба места отвечают на один и тот же
+# вопрос «сколько сетевых походов сразу», и число одно и то же не случайно.
+DONOR_TITLE_PARALLEL_LIMIT = 5
+
+
+async def _fetch_titles(urls: list) -> dict:
+    """Названия доноров пачкой — до `DONOR_TITLE_PARALLEL_LIMIT` походов в oembed разом.
+
+    Один провал не топит пачку: `donor_title()` сама глотает исключения и отдаёт ""
+    (`server/pub_tags.py:27-51`) — здесь этот контракт не переопределяется.
+    """
+    if not urls:
+        return {}
+    gate = asyncio.Semaphore(max(1, DONOR_TITLE_PARALLEL_LIMIT))
+
+    async def fetch_one(u):
+        async with gate:
+            return u, await run_in_threadpool(donor_title, u)
+
+    pairs = await asyncio.gather(*(fetch_one(u) for u in urls))
+    return dict(pairs)
+
+
+def _channel_exists_sync(channel_id: int) -> bool:
+    """Короткая проверка «канал есть» — своя связь, закрытая ДО похода в сеть (ревью
+    22.09.2026, Issue 3): кабинетный `channel_links` (`server/pub_ui.py:1218-1220`,
+    `_load(u, cid)`) сперва читает канал и отвечает «Канал не найден», и только потом
+    тянет `donor_title()`. Здесь порядок был перевёрнут: несуществующий/чужой
+    `channel_id` сначала оплачивал(бы) до `DONOR_TITLE_PARALLEL_LIMIT` походов в oembed
+    (по 6 с каждый) и только после этого получал 404. Мутация-проверка: убери вызов
+    этой функции из `ui_links` (или замени `if not exists: raise` на пропуск) — тест
+    «POST /ui/links на несуществующий канал» перестанет ловить нулевые вызовы
+    `donor_title` и начнёт видеть их до 404.
+    """
+    c = db()
+    try:
+        row = c.execute("SELECT 1 FROM pub_channels_live WHERE id=? AND tenant_id=?",
+                        (channel_id, TENANT)).fetchone()
+        return row is not None
+    finally:
+        c.close()
+
+
+def _apply_links_sync(channel_id: int, urls: list, slot, titles: dict):
+    """Синхронная часть `ui_links` — своя связь, открытая уже ПОСЛЕ сети (ревью
+    22.09.2026, Issue 1: то же правило, что и для `ui_channel` — `add_links` пишет в
+    SQLite и может ждать блокировку под другим писателем в едином процессе
+    (кабинет/воркеры/очередь), а сеть к этому моменту уже отработана и связь ничего не
+    ждёт, кроме диска). Вызывается из `ui_links` через `run_in_threadpool`, так что этот
+    SQL не выполняется в цикле событий. Возвращает `None`, если канала нет — `ui_links`
+    превращает это в 404 уже на цикле событий, не пробрасывая `HTTPException` через
+    поток пула (тот же приём, что у `server/main.py:16612-16621` `_do`/`run_in_threadpool`).
+    """
+    c = db()
+    try:
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
+                       (channel_id, TENANT)).fetchone()
+        if not ch:
+            return None
+        res = add_links(c, TENANT, ch, urls, time.time(), slot=slot, titles=titles)
+        c.commit()
+        return res
+    finally:
+        c.close()
+
+
 @app.post("/ui/links")
-def ui_links(body: LinksIn):
+async def ui_links(body: LinksIn):
     """Старт по ссылке.
 
     В боевой системе форма отправляет на существующий `POST /api/channels/{cid}/links`
-    — семантика та же. Здесь свой адрес только потому, что кабинет целиком поднять
-    без ключей и соседей нельзя.
+    — семантика та же, включая порядок: названия доноров тянутся пулом потоков ДО
+    открытия базы (`server/pub_ui.py:1233-1239`), а не изнутри `add_links`, которая
+    иначе сходила бы в сеть под открытой транзакцией и держала бы базу до шести секунд
+    на ссылку. Провал одной ссылки не роняет пачку — она просто встаёт без названия
+    (`donor_title()` сама возвращает "").
 
-    `titles` передаём обязательно: без него боевая `add_links` пойдёт в YouTube за
-    названиями доноров, а сетевые вызовы в этой оболочке запрещены.
+    ВАЖНО (ревью 22.09.2026, Issue 1): после сети синхронная работа с SQLite
+    (`add_links` + `commit`) тоже не остаётся в цикле событий — она вынесена в
+    `_apply_links_sync` и выполняется через `run_in_threadpool`, тем же приёмом, что и
+    `ui_channel`. `async def` здесь оправдан не тем, что сама функция синхронна, а
+    ровно наоборот: `ui_links` не делает ни одного вызова в свой же процесс (то самое
+    исключение из правила у `ui_keys_save`, `web/app.py:6160-6165` — `async def` опасен
+    только для обработчиков, которые сами ходят по HTTP в себя же).
     """
     urls = parse_links(body.links or "")
     if not urls:
         raise HTTPException(400, "в поле нет ни одной ссылки")
-    c = db()
-    try:
-        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=? AND tenant_id=?",
-                       (body.channel_id, TENANT)).fetchone()
-        if not ch:
-            raise HTTPException(404, "канал не найден")
-        res = add_links(c, TENANT, ch, urls, time.time(), slot=body.slot,
-                        titles={u: "" for u in urls})
-        c.commit()
-    finally:
-        c.close()
+    # Канал проверяем ДО сети (Issue 3 ревью 22.09.2026, тот же порядок, что у
+    # `channel_links` в кабинете) — иначе несуществующий/чужой канал сначала оплачивал
+    # бы до `DONOR_TITLE_PARALLEL_LIMIT` походов в oembed и только потом получал 404.
+    if not await run_in_threadpool(_channel_exists_sync, body.channel_id):
+        raise HTTPException(404, "канал не найден")
+    titles = await _fetch_titles(urls)
+    res = await run_in_threadpool(_apply_links_sync, body.channel_id, urls, body.slot, titles)
+    if res is None:
+        raise HTTPException(404, "канал не найден")
     return {"placed": [str(p) for p in res.get("placed", [])],
             "queued": res.get("queued", 0),
             "skipped": list(res.get("skipped", []))}
@@ -2858,6 +3407,29 @@ def _rw(path: str, sid: str, payload=None, method=None, raw=None, ctype=None,
         return 502, f"рерайт не отвечает: {type(exc).__name__}"
 
 
+def _default_text_model(sid: str) -> str:
+    """Модель текста по умолчанию — одна на все места, где раньше был зашит
+    `"gpt-4.1-nano"` (пункт 4 ТЗ 22.09.2026).
+
+    Спрашивает список у Rewrite (`GET /models`) и берёт модель, помеченную сервером
+    `default: true` — сегодня этот флаг ставят только Codex-модели
+    (`rewrite/server.py:2356`), у OpenAI/Claude его пока не бывает. Нет ответа, пустой
+    список или ни одна модель не помечена по умолчанию — тот же случай: используем
+    единственный оставшийся литерал `TEXT_MODEL_FALLBACK`, который раньше был
+    рассыпан по четырём местам.
+    """
+    try:
+        code, models = _rw("/models", sid)
+    except Exception:                                             # noqa: BLE001
+        return TEXT_MODEL_FALLBACK
+    if code != 200 or not isinstance(models, list):
+        return TEXT_MODEL_FALLBACK
+    for item in models:
+        if isinstance(item, dict) and item.get("default") and item.get("value"):
+            return str(item["value"])
+    return TEXT_MODEL_FALLBACK
+
+
 # ─────────────── задачи Rewrite/Cover, поставленные из проекта ───────────────
 # Связь хранится в `project_service_jobs` (схема — в кабинете рядом с `projects`).
 # Сам сервис про проект не знает; пульт записывает связь сразу после того, как
@@ -3659,7 +4231,7 @@ def ui_text_create(body: TextIn, request: Request):
         code, out = _rw("/jobs/generation", sid, {
             "preset_name": body.preset, "topic": body.source,
             "languages": [{"code": x, "display": x} for x in langs],
-            "model": body.model or "gpt-4.1-nano"})
+            "model": body.model or _default_text_model(sid)})
         if code >= 400:
             raise HTTPException(_pass_code(code), out)
         _link_project_jobs(pid, "rewrite", out)
@@ -3711,7 +4283,7 @@ def ui_text_create(body: TextIn, request: Request):
     code, out = _rw("/jobs/rewrite", sid, {
         "files": [stored],
         "languages": [{"code": x, "display": x} for x in langs],
-        "model": body.model or "gpt-4.1-nano"})
+        "model": body.model or _default_text_model(sid)})
     if code >= 400:
         raise HTTPException(_pass_code(code), out)
     _link_project_jobs(pid, "rewrite", out)
@@ -4776,15 +5348,30 @@ def _neighbour_preset_options(service: str, sid: str, request) -> dict:
 # Умолчания нового пресета соседа: ровно то, что он подставил бы сам, если поле не
 # прислать. Держим их здесь, чтобы форма заведения не показывала пустоту там, где у
 # сервиса есть осмысленное значение.
+#
+# У "rewrite" нарочно нет своего "model": статический модуль-level словарь не знает
+# sid текущего человека, а модель по умолчанию — его личная (пункт 4 ТЗ 22.09.2026,
+# `_default_text_model`). Подставляет её `_neighbour_preset_defaults` — единственный
+# потребитель этого словаря для сервиса "rewrite" (форма нового пресета и его
+# заведение), а не сам словарь.
 NEIGHBOUR_PRESET_DEFAULTS = {
     "cover": {"seed_n_variants": 3, "prompt_template": "", "use_auto_style": True,
               "simple_mode": False, "fallback_mode": "auto", "aspect_ratio": "16:9",
               "max_generation_retries": 5, "analysis_provider": "openai",
               "analysis_model": "gpt-4.1-mini"},
-    "rewrite": {"model": "gpt-4.1-nano", "chunk": 3500, "threads": 1, "address": "",
+    "rewrite": {"chunk": 3500, "threads": 1, "address": "",
                 "preserve_paragraphs": True, "safe_text": False, "languages": []},
     "rewrite_gen": {"content": "", "target_length_words": ""},
 }
+
+
+def _neighbour_preset_defaults(service: str, sid: str) -> dict:
+    """Умолчания нового пресета соседа, с моделью текста по умолчанию ЭТОГО человека
+    вместо статического литерала — см. комментарий у `NEIGHBOUR_PRESET_DEFAULTS`."""
+    cfg = dict(NEIGHBOUR_PRESET_DEFAULTS.get(service) or {})
+    if service == "rewrite":
+        cfg["model"] = _default_text_model(sid)
+    return cfg
 
 
 def _neighbour_preset_fields(service: str, cfg: dict, options: dict) -> list:
@@ -5273,7 +5860,7 @@ def ui_neighbour_preset_new_form(service: str, request: Request):
     if service not in NEIGHBOUR_PRESET_FIELDS:
         raise HTTPException(404, f"у сервиса «{service}» своих пресетов нет")
     sid = getattr(request.state, "sid", "")
-    cfg = dict(NEIGHBOUR_PRESET_DEFAULTS.get(service) or {})
+    cfg = _neighbour_preset_defaults(service, sid)
     return {"service": service, "name": "",
             "fields": _neighbour_preset_fields(
                 service, cfg, _neighbour_preset_options(service, sid, request))}
@@ -5302,7 +5889,7 @@ def ui_neighbour_preset_create(service: str, body: NeighbourPresetNew, request: 
         # Бриф заводится своей ручкой сразу с текстом: пустой бриф Rewrite не примет.
         _rewrite_gen_write(name, body.values or {}, sid, create=True)
         return {"ok": True, "name": name}
-    cfg = dict(NEIGHBOUR_PRESET_DEFAULTS.get(service) or {})
+    cfg = _neighbour_preset_defaults(service, sid)
     if service == "cover":
         cfg["name"] = name          # у Cover имя лежит и внутри самого пресета
     store[name] = cfg
@@ -5859,9 +6446,29 @@ def ui_channel_set_uc(cid: int, body: ChannelUCIn):
 
 # ─────────────────────────── свои ключи: добавить и убрать ───────────────────────────
 
+class PromptChannelIn(BaseModel):
+    """Поля `prompt` в теле POST /ui/keys — 1:1 с именами формы кабинета
+    (`server/main.py`, блок `prompts_block` → обработчик `/api/my/keys/web`).
+    Отсутствующее поле (None) — не трогать; пустая строка/«-» для большинства полей
+    разбирает сам кабинет его же соглашением «пусто = не менять, «-» = очистить» —
+    здесь не дублируем. Исключение — `alt_llm_base` и `alt_llm_model`: для этих двух
+    полей кабинет (`server/main.py:17783-17788`) понимает «поле пришло, но пустое»
+    как «очистить», а не «не менять», поэтому пульт (`ui_keys_save`) отсекает их
+    сам до пересылки, если после `strip()` пусто, и не полагается на соглашение
+    кабинета."""
+    channel: Optional[str] = None            # "" сбрасывает выбор на «Авто»
+    claude_oauth: Optional[str] = None
+    codex_auth: Optional[str] = None
+    prompt_key_openai: Optional[str] = None
+    alt_llm: Optional[str] = None
+    alt_llm_base: Optional[str] = None
+    alt_llm_model: Optional[str] = None
+
+
 class KeysIn(BaseModel):
     add: dict = {}
     drop: dict = {}
+    prompt: Optional[PromptChannelIn] = None
 
 
 # ВАЖНО, и уже дважды укусило: обработчик, который ходит по HTTP в свой же процесс,
@@ -5872,7 +6479,7 @@ class KeysIn(BaseModel):
 # сохранение ключей: запись при этом проходила, а ответ не возвращался.
 @app.post("/ui/keys")
 def ui_keys_save(body: KeysIn, request: Request):
-    """Добавить или убрать свой ключ провайдера.
+    """Добавить или убрать свой ключ провайдера, включая канал промптов картинок.
 
     Разбор формы делает кабинет своим же `/api/my/keys/web` — тем самым, что и его
     страница. Логика там нетривиальная: ключи правятся по одному, каждый несёт свой
@@ -5880,8 +6487,17 @@ def ui_keys_save(body: KeysIn, request: Request):
     стать credential'ом. Вторая её реализация здесь была бы вторым набором правил
     для тех же денег.
 
-    Тело: {"add": {"googler": ["ключ", …]}, "drop": {"googler": [0, 2]}}.
+    Тело: {"add": {"googler": ["ключ", …]}, "drop": {"googler": [0, 2]},
+    "prompt": {"channel": "claude", "claude_oauth": "sk-ant-oat…"}}.
     Индексы в `drop` — позиции в списке ключей провайдера, как их отдаёт `/ui/keys`.
+    `prompt.*` уходит теми же семью именами полей, что и кабинетная форма — второго
+    хранилища секретов пульт не заводит, второй проверки тоже: недоступный канал или
+    негодный codex-auth кабинет уже отклоняет сам (`bad_prompt_channel`/`bad_codex_auth`
+    ниже), пульт лишь пробрасывает. Одно исключение — `claude_oauth`: кабинет здесь
+    только склеивает переносы строк (`server/main.py:17793`), а отличить токен
+    подписки (`sk-ant-oat…`) от платного API-ключа (`sk-ant-api…`) не проверяет никто.
+    Та же нормализация, что уже стоит у `/ui/keys/rewrite` (ревью 22.09.2026, Issue 3):
+    непустой и не «-» токен идёт через `normalize_claude_token`, а не сырым.
     """
     fields = []
     for family, values in (body.add or {}).items():
@@ -5891,6 +6507,37 @@ def ui_keys_save(body: KeysIn, request: Request):
     for family, idx in (body.drop or {}).items():
         for i in (idx if isinstance(idx, list) else [idx]):
             fields.append((f"drop_{family}", str(int(i))))
+    if body.prompt is not None:
+        claude_oauth = body.prompt.claude_oauth
+        # Мутация: убрать этот блок (пересылать claude_oauth сырым) — тест
+        # `test_prompt_channel.py` про ключ API Anthropic в поле подписки промптов
+        # ловит: `sk-ant-api…` доехал бы до кабинета и сохранился бы как «подписка».
+        if claude_oauth is not None and claude_oauth.strip() and claude_oauth.strip() != "-":
+            subs = _text_subs()
+            try:
+                claude_oauth = subs.normalize_claude_token(claude_oauth)
+            except subs.SubscriptionError as exc:
+                raise HTTPException(422, str(exc))
+        # Мутация: убрать этот `if val.strip()` для двух полей ниже (пересылать
+        # пустые alt_llm_base/alt_llm_model как есть) — тест `test_prompt_channel.py`
+        # про пустой адрес и модель альтернативного API ловит: кабинет
+        # (`server/main.py:17783-17788`) для этих двух полей понимает «поле есть, но
+        # пусто» как «очистить», а не «не менять», и стёр бы сохранённые значения.
+        for form_name, val in (
+            ("prompt_channel", body.prompt.channel),
+            ("claude_oauth", claude_oauth),
+            ("codex_auth", body.prompt.codex_auth),
+            ("prompt_key_openai", body.prompt.prompt_key_openai),
+            ("alt_llm", body.prompt.alt_llm),
+        ):
+            if val is not None:
+                fields.append((form_name, val))
+        for form_name, val in (
+            ("alt_llm_base", body.prompt.alt_llm_base),
+            ("alt_llm_model", body.prompt.alt_llm_model),
+        ):
+            if val is not None and val.strip():
+                fields.append((form_name, val))
     if not fields:
         raise HTTPException(400, "нечего сохранять: ни одного ключа не добавлено и не снято")
 
@@ -6478,10 +7125,11 @@ BATCH_PULT_MAX = int(os.environ.get("VS_BATCH_PULT_MAX", "20") or 20)
 # превратились бы в час ожидания с выжженными выходами на сдачу.
 BATCH_SUBS_BUDGET = float(os.environ.get("VS_BATCH_SUBS_BUDGET_SEC", "150") or 150)
 BATCH_SUBS_EXITS = int(os.environ.get("VS_BATCH_SUBS_EXITS", "3") or 3)
-# Чем рерайтить, когда не сказано НИГДЕ: ни в карточке, ни в пресете проекта. То же
-# умолчание, что у одиночного экрана текста (`ui_text_rewrite`). В отпечаток платного
-# вызова оно не попадает намеренно — движок в этом случае кладёт туда пустую модель,
-# и подставить сюда своё значение значило бы развести отпечатки на ровном месте.
+# Последний литерал модели текста (пункт 4 ТЗ 22.09.2026) — используется только внутри
+# `_default_text_model`, когда у Rewrite нет ни ответа, ни модели с флагом `default`.
+# Сюда же (в отпечаток платного вызова, `_parts["model"]` у `_batch_text_plan`) он
+# НЕ попадает намеренно — движок в этом случае кладёт туда пустую модель, и
+# подставлять здесь своё значение значило бы развести отпечатки на ровном месте.
 TEXT_MODEL_FALLBACK = "gpt-4.1-nano"
 
 
@@ -6876,8 +7524,17 @@ class BatchTextIn(BaseModel):
 
 def _batch_text_plan(c, sid: str, mod, pid: str, *, where: str, repl_url: str,
                      repl_text: str, langs_asked: list, model: str,
-                     one_at_a_time: bool, net: bool, deadline: float) -> dict:
+                     one_at_a_time: bool, net: bool, deadline: float,
+                     default_model_fn=None) -> dict:
     """Что уедет по одному проекту. Ничего не заказывает и денег не тратит.
+
+    `default_model_fn` — необязательный вызов без аргументов, отдающий модель по
+    умолчанию (обёртка над `_default_text_model(sid)` с кэшем на весь запрос пачки,
+    см. `ui_projects_batch_text`, ревью 22.09.2026 Issue 6): без него, до этой
+    правки, до `BATCH_PULT_MAX` проектов без своей модели в пресете каждый спрашивал
+    Rewrite заново — на зависшем соседе это съедало `BATCH_SUBS_BUDGET` ещё до
+    заказов. Не передан — читается прямо здесь, как раньше (сухой прогон одного
+    проекта тоже так делает, второй раз спрашивать некому).
 
     Сухой прогон — это ровно этот проход с `net=False`: он читает проект, кэш
     расшифровок и журнал оплат, но в сеть за субтитрами не идёт. Поэтому про
@@ -6979,7 +7636,13 @@ def _batch_text_plan(c, sid: str, mod, pid: str, *, where: str, repl_url: str,
     preset = (rel["preset_rewrite"] if rel is not None else "") or ""
     preset_model = str((rewrite_preset_config(TENANT, preset) or {}).get("model") or "")
     item["preset"] = preset
-    item["_model"] = model or preset_model or TEXT_MODEL_FALLBACK
+    # Умолчание тянем сетью только на настоящем прогоне (`net`): сухой прогон обязан
+    # не трогать соседа вовсе (см. проверку «соседа не трогали» батч-теста) — `_model`
+    # там всё равно вырезается из ответа (`ui_projects_batch_text`) и ни на что не
+    # влияет, кроме превью, которое этого похода не стоит.
+    item["_model"] = model or preset_model or (
+        (default_model_fn() if default_model_fn else _default_text_model(sid))
+        if net else TEXT_MODEL_FALLBACK)
     item["chars"] = len(text)
     item["_text"] = text
     # Ключи — как у движка (`pub_services.do_source_ready`), см. `_batch_langs_left`:
@@ -7104,6 +7767,18 @@ def ui_projects_batch_text(body: BatchTextIn, request: Request):
     # проекту отдельно (`_batch_text_plan`), потому что пресеты у них разные.
     model = (body.model or "").strip()
 
+    # Модель по умолчанию — один поход к Rewrite на всю пачку, а не на каждый проект
+    # без своей модели в пресете (ревью 22.09.2026, Issue 6): читается лениво, при
+    # первой реальной потребности, и дальше кэшируется на весь этот запрос. Сухой
+    # прогон резолвер вообще не зовёт — `_batch_text_plan` при `net=False` в него
+    # не заходит.
+    _default_model_cache: dict = {}
+
+    def _default_model_once() -> str:
+        if "v" not in _default_model_cache:
+            _default_model_cache["v"] = _default_text_model(sid)
+        return _default_model_cache["v"]
+
     mod = sys.modules.get("main")
     items, c = [], db()
     try:
@@ -7120,7 +7795,8 @@ def ui_projects_batch_text(body: BatchTextIn, request: Request):
                                         repl_text=repl_text, langs_asked=langs_asked,
                                         model=model,
                                         one_at_a_time=bool(body.one_at_a_time),
-                                        net=not body.dry_run, deadline=deadline)
+                                        net=not body.dry_run, deadline=deadline,
+                                        default_model_fn=_default_model_once)
                 if item["action"] == "order" and not body.dry_run:
                     _batch_text_order(c, sid, item)
             except HTTPException as exc:

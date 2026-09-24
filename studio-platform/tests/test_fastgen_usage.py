@@ -489,17 +489,18 @@ def main() -> int:
 
     print("\nШапка модуля и строка «ни один из N поводов» обновлены (пункт §3.2)")
     pub_alerts_src = open(os.path.join(BASE, "server", "pub_alerts.py"), encoding="utf-8").read()
-    check("докстрока pub_alerts.py говорит про одиннадцать поводов",
-          "одиннадцать поводов" in pub_alerts_src, True)
+    # 22.09.2026: двенадцатый — §12, подписка для текста разлогинилась.
+    check("докстрока pub_alerts.py говорит про двенадцать поводов",
+          "двенадцать поводов" in pub_alerts_src, True)
     dev_alerts_src = open(os.path.join(BASE, "dev", "alerts.py"), encoding="utf-8").read()
-    check("dev/alerts.py:show() считает одиннадцать поводов",
-          "ни один из одиннадцати поводов" in dev_alerts_src, True)
+    check("dev/alerts.py:show() считает двенадцать поводов",
+          "ни один из двенадцати поводов" in dev_alerts_src, True)
     index_html_src = open(os.path.join(BASE, "web", "index.html"), encoding="utf-8").read()
-    check("web/index.html:viewAdmin() тоже про одиннадцать поводов",
-          "Ни один из одиннадцати поводов не выполнен." in index_html_src, True)
+    check("web/index.html:viewAdmin() тоже про двенадцать поводов",
+          "Ни один из двенадцати поводов не выполнен." in index_html_src, True)
     test_alerts_src = open(os.path.join(BASE, "tests", "test_alerts.py"), encoding="utf-8").read()
     check("докстрока tests/test_alerts.py тоже обновлена",
-          "одиннадцать поводов" in test_alerts_src, True)
+          "двенадцать поводов" in test_alerts_src, True)
 
     print("\nReview issue 2 — экран ключей не подставляет 0 вместо неизвестного расхода")
     check("images_used больше не подставляет 0 по умолчанию",

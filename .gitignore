@@ -34,3 +34,5 @@ studio-platform/rewrite/job_logs/
 # состояние миграции личности: журнал переносов и бэкапы баз — не код
 studio-platform/dev/identity_migration.json
 studio-platform/dev/backup/
+# подписки для текста, добавленные на экране «Ключи»: секреты (auth.json, токены)
+studio-platform/rewrite/.text-subscriptions/

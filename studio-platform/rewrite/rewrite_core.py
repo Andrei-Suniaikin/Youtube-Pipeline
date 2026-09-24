@@ -160,7 +160,8 @@ def get_server_claude_oauth_tokens() -> List[str]:
     scalar = (os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") or "").strip()
     if scalar and scalar not in values:
         values.append(scalar)
-    return _normalize_oauth_tokens(values)
+    # 22.09.2026: и те, что администратор добавил на экране «Ключи».
+    return _normalize_oauth_tokens(values + _managed_subscriptions("claude"))
 
 
 def get_server_anthropic_keys() -> List[str]:
@@ -418,6 +419,10 @@ def get_server_codex_homes() -> List[str]:
     scalar = (os.environ.get("REWRITE_CODEX_HOME") or "").strip()
     if scalar and scalar not in values:
         values.append(scalar)
+    # 22.09.2026: и те, что администратор добавил на экране «Ключи».
+    for home in _managed_subscriptions("codex"):
+        if home not in values:
+            values.append(home)
     if not values:
         default_home = os.path.join(os.path.expanduser("~"), ".codex")
         if os.path.isfile(os.path.join(default_home, "auth.json")):
@@ -673,6 +678,41 @@ def get_user_codex_homes(user_id: str = "") -> List[str]:
 # исчерпанное окно, тот записал время сброса в /var/lib/claude_limits/state.json,
 # а видят все — иначе один ждёт, второй в это время долбит тот же токен.
 # Модуль намеренно необязательный: нет его — работаем как раньше, только вслепую.
+# 22.09.2026: подписки для текста, которые администратор добавляет на экране «Ключи»
+# (без SSH и перезапуска). Модуль лежит рядом; нет его — пул живёт одним ENV, как раньше.
+try:
+    import subscriptions as _text_subs
+except ImportError:                                 # noqa: BLE001
+    _text_subs = None
+
+
+def _managed_subscriptions(provider: str) -> List[str]:
+    if _text_subs is None:
+        return []
+    try:
+        return (_text_subs.codex_homes() if provider == "codex"
+                else _text_subs.claude_tokens())
+    except Exception:                               # noqa: BLE001
+        return []
+
+
+def _note_subscription(provider: str, value: str, outcome: str,
+                       until: float = 0.0, detail: str = "") -> None:
+    """Чем кончился вызов подпиской — в её состояние на экране «Ключи» и в тревоги."""
+    if _text_subs is not None and value:
+        _text_subs.note(provider, value, outcome, until=until, detail=detail)
+
+
+def _note_codex_result(codex_home: str, ok: bool, message: Any) -> None:
+    text = str(message or "")
+    if ok:
+        _note_subscription("codex", codex_home, "ok")
+    elif text.startswith("CODEX_AUTH"):
+        _note_subscription("codex", codex_home, "auth", detail=text)
+    elif text.startswith("CODEX_LIMIT"):
+        _note_subscription("codex", codex_home, "limit")
+
+
 try:
     import claude_limits as _shared_limits
 except Exception:                                   # noqa: BLE001
@@ -9134,7 +9174,7 @@ def call_codex_subscription(
         except (CredentialPoolExhausted, RuntimeError) as exc:
             return False, str(exc)
         with lease as codex_home:
-            return call_codex_subscription(
+            result = call_codex_subscription(
                 messages=messages,
                 model=model,
                 log_queue=log_queue,
@@ -9142,6 +9182,8 @@ def call_codex_subscription(
                 _credential_leased=True,
                 _codex_home_override=codex_home,
             )
+        _note_codex_result(codex_home, result[0], result[-1])
+        return result
     codex_bin_setting = os.environ.get("REWRITE_CODEX_BIN", "codex")
     codex_bin = shutil.which(codex_bin_setting)
     if not codex_bin and os.path.isfile(codex_bin_setting):
@@ -9332,7 +9374,7 @@ def call_codex_conversation(
         except (CredentialPoolExhausted, RuntimeError) as exc:
             return False, [], str(exc)
         with lease as codex_home:
-            return call_codex_conversation(
+            result = call_codex_conversation(
                 turn_prompts=turn_prompts,
                 system_prompt=system_prompt,
                 model=model,
@@ -9344,6 +9386,8 @@ def call_codex_conversation(
                 _credential_leased=True,
                 _codex_home_override=codex_home,
             )
+        _note_codex_result(codex_home, result[0], result[-1])
+        return result
     if not turn_prompts:
         return False, [], "no turn_prompts"
 
@@ -9607,6 +9651,7 @@ def call_api_universal(
         if ok:
             if hasattr(pool, "clear_limit"):
                 pool.clear_limit(server_token)
+            _note_subscription("claude", server_token, "ok")
             return True, resp
         text = str(resp)
         if text.startswith(SUBSCRIPTION_LIMIT_PREFIX):
@@ -9616,6 +9661,7 @@ def call_api_universal(
             reset_ts = reset_ts or (time.time() + _LIMIT_DEFAULT_WAIT_SEC)
             if hasattr(pool, "mark_limited"):
                 pool.mark_limited(server_token, reset_ts)
+            _note_subscription("claude", server_token, "limit", until=reset_ts)
             log_msg(log_queue,
                     f"    ⏳ окно подписки исчерпано, ключ отдыхает до "
                     f"{time.strftime('%H:%M', time.localtime(reset_ts))} — джоб будет отложен")
@@ -9624,6 +9670,7 @@ def call_api_universal(
             # Протухший токен ждать бессмысленно: короткий бан, дальше решает ротация.
             if hasattr(pool, "mark_limited"):
                 pool.mark_limited(server_token, time.time() + 300)
+            _note_subscription("claude", server_token, "auth", detail=text)
         return False, text
     elif provider == "claude":
         return call_claude_api(messages, api_key, model, log_queue, task_info, use_caching=True)

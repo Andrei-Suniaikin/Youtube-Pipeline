@@ -1,0 +1,30 @@
+# Единая студия: один процесс, внутри пульт, кабинет, рерайт и обложки.
+# Ставится рядом с боевыми vsgen / rewrite-server / cover-server и их не трогает.
+#
+#   cp deploy/studio-platform.service /etc/systemd/system/
+#   systemctl daemon-reload && systemctl enable --now studio-platform
+#
+# Секреты в юните не пишутся: они живут в /srv/studio/studio.env (0600) и в файле
+# ключей /srv/studio/keys/video_studio_api_keys.json (0600).
+[Unit]
+Description=Единая студия: пульт, сервер, тексты, обложки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/studio/app
+# Файл появляется при первой настройке; без него служба поднимается на умолчаниях.
+EnvironmentFile=-/srv/studio/studio.env
+ExecStart=/srv/studio/start-studio.sh
+Restart=always
+RestartSec=10
+# Кабинет держит много одновременных файлов (сборка, кадры, очередь). Системного
+# умолчания 1024 не хватает: стенд уже падал с «Too many open files».
+LimitNOFILE=65535
+# Рендер и заливка идут на других машинах, здесь — веб и очередь. Уступаем процессор
+# боевым сервисам, чтобы параллельная работа не замедлила их.
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
