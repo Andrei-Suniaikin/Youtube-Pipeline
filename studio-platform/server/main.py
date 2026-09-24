@@ -14981,17 +14981,31 @@ RENDER_LEASE_SEC = int(os.environ.get("RENDER_LEASE_SEC", "1200"))  # без а�
 _RENDER_POLL = {"ts": 0.0, "polls": 0, "peer": ""}
 
 
+def _same_secret(got: str, want: str) -> bool:
+    """Сравнение секретов постоянного времени, устойчивое к мусору в заголовке.
+
+    24.09.2026: `secrets.compare_digest` на строках с не-ASCII бросает TypeError, и нода,
+    приславшая мятый заголовок (или владелец, задавший токен кириллицей), получала 500
+    «внутренняя ошибка» вместо честного «не пущу». Пятисотка тут вреднее отказа: она
+    выглядит как поломка сервера и уводит разбор не туда. То же исправлено у заливки.
+    """
+    if not want or not got:
+        return False
+    try:
+        return secrets.compare_digest(got.encode("utf-8"), want.encode("utf-8"))
+    except (UnicodeError, TypeError):                              # noqa: BLE001
+        return False
+
+
 def _require_puller(request: Request):
-    tok = request.headers.get("X-Puller-Token", "")
-    if not PULLER_TOKEN or not secrets.compare_digest(tok, PULLER_TOKEN):
+    if not _same_secret(request.headers.get("X-Puller-Token", ""), PULLER_TOKEN):
         raise HTTPException(403, "puller auth")
 
 
 def _require_render_claim(request: Request, task):
     """Не принимать heartbeat/result от устаревшего владельца после lease-reclaim."""
-    got = request.headers.get("X-Render-Claim", "")
     want = (task["claim_token"] or "") if task and "claim_token" in task.keys() else ""
-    if not got or not want or not secrets.compare_digest(got, want):
+    if not _same_secret(request.headers.get("X-Render-Claim", ""), want):
         raise HTTPException(409, "render lease устарела")
 
 
@@ -15170,6 +15184,73 @@ def _render_config_from_params(p):
     if "narration_files" in p:
         cfg["narration_files"] = p["narration_files"]
     return cfg
+
+
+# Пульс машины рендера отдельно от выдачи работ. Нода шлёт его раз в 30 секунд, и
+# нам он нужен не ради красоты: в нём видно место на диске, сколько роликов лежит
+# неотданными и какие версии пуллера и рендерера там стоят. Боевая нода эту ручку
+# зовёт с 18.09; у нас её не было, и в её журнале раз в полминуты капала ошибка —
+# то есть на настоящую поломку смотрели бы сквозь шум из ложных.
+RENDER_HEALTH_KEY = "render_node_health"
+
+
+@app.post("/api/render/node-health")
+async def render_node_health(request: Request):
+    """Пульс машины рендера: место, очередь на отдачу, версии. Ничего не запускает."""
+    _require_puller(request)
+    try:
+        said = await request.json()
+    except Exception:                                              # noqa: BLE001
+        said = {}
+    if not isinstance(said, dict):
+        said = {}
+    host = str(said.get("host") or request.headers.get("X-Render-Host") or "render")[:40]
+    now = time.time()
+
+    def _num(v):
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    free_bytes = _num(said.get("free_bytes"))
+    row = {
+        "at": now,
+        "free_gb": round(free_bytes / (1024 ** 3), 2) if free_bytes is not None else None,
+        # Сколько готового лежит неотданным и сколько из этого просрочено: ролик,
+        # который нода собрала, но не смогла отдать, — это потерянные деньги и время,
+        # и видно это только отсюда.
+        "outbox_gb": (round(_num(said.get("outbox_retained_bytes")) / (1024 ** 3), 2)
+                      if _num(said.get("outbox_retained_bytes")) is not None else None),
+        "outbox_attention": int(_num(said.get("outbox_attention")) or 0),
+        "outbox_stuck": int(_num(said.get("outbox_stuck")) or 0),
+        "active_jobs": int(_num(said.get("active_jobs")) or 0),
+        # Версии — хвостами: полный хэш на экране не нужен, а «та ли версия стоит»
+        # по хвосту видно сразу.
+        "puller": str(said.get("puller_sha256") or "")[:12],
+        "worker": str(said.get("worker_sha256") or "")[:12],
+    }
+    c = db()
+    try:
+        prev = c.execute("SELECT v FROM admin_state WHERE k=?",
+                         (RENDER_HEALTH_KEY,)).fetchone()
+        try:
+            state = json.loads((prev[0] if prev else "") or "{}")
+        except Exception:                                          # noqa: BLE001
+            state = {}
+        if not isinstance(state, dict):
+            state = {}
+        state[host] = row
+        c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES(?,?,?)",
+                  (RENDER_HEALTH_KEY, json.dumps(state, ensure_ascii=False), now))
+        # Тот же снимок места, что кладёт выдача работ: тревога «мало места» должна
+        # знать про машину рендера, даже когда очередь пуста и claim молчит.
+        if row["free_gb"] is not None:
+            note_node_disk(c, host, "render", row["free_gb"], None)
+        c.commit()
+    finally:
+        c.close()
+    return {"ok": True}
 
 
 @app.post("/api/render/claim")
