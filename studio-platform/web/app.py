@@ -1891,6 +1891,183 @@ def ui_keys_rewrite(body: RewriteKeyIn, request: Request):
     return {"ok": True, "set": result}
 
 
+# ───────────── машины заливки и профили AdsPower: опись со всех машин ─────────────
+#
+# Владелец: «откуда у нас сейчас берутся профиля AdsPower в софте, я бы хотел чтобы они
+# просто напрямую подтягивались», список — «со всех машин сразу». Раньше номера профилей
+# переписывали руками, а формы для машин в пульте не было вовсе.
+#
+# Опись идёт ТОЛЬКО по кнопке. Машина держит около одного запроса в секунду, и лимит
+# общий с идущими заливками: фоновый опрос отнимал бы его у настоящей работы.
+
+
+def _adspower():
+    import pub_adspower
+    return pub_adspower
+
+
+def _host_row(r, counts, seen) -> dict:
+    return {"id": r["id"], "code": r["code"], "title": r["title"] or r["code"],
+            "adspower_url": r["adspower_url"] or "", "status": r["status"],
+            "note": r["note"] or "", "created": r["created"],
+            "profiles_count": counts.get(r["id"], 0),
+            "last_refresh": seen.get(r["id"])}
+
+
+@app.get("/ui/hosts")
+def ui_hosts():
+    """Машины заливки. Убранные показываются тоже: строка машины — это не мусор,
+    а место, к которому привязаны профили и каналы."""
+    c = db()
+    try:
+        counts, seen = {}, {}
+        for r in c.execute("SELECT default_host_id h, COUNT(*) n, MAX(last_seen) s "
+                           "FROM pub_profiles WHERE tenant_id=? GROUP BY default_host_id",
+                           (TENANT,)):
+            if r["h"] is not None:
+                counts[r["h"]] = r["n"]
+                seen[r["h"]] = r["s"]
+        hosts = [_host_row(r, counts, seen) for r in c.execute(
+            "SELECT * FROM pub_hosts WHERE tenant_id=? ORDER BY code", (TENANT,))]
+    finally:
+        c.close()
+    return {"hosts": hosts}
+
+
+class HostIn(BaseModel):
+    code: str = ""
+    title: str = ""
+    adspower_url: str = ""
+    note: str = ""
+
+
+def _clean_host(body: HostIn) -> tuple:
+    code = " ".join((body.code or "").split())[:40]
+    if not code:
+        raise HTTPException(400, "у машины должно быть короткое имя, например minsk")
+    url = (body.adspower_url or "").strip()[:200]
+    if url and not url.startswith(("http://", "https://")):
+        raise HTTPException(400, "адрес AdsPower начинается с http:// или https://")
+    return code, " ".join((body.title or "").split())[:80], url, (body.note or "").strip()[:200]
+
+
+@app.post("/ui/hosts")
+def ui_host_add(body: HostIn):
+    code, title, url, note = _clean_host(body)
+    c = db()
+    try:
+        if c.execute("SELECT 1 FROM pub_hosts WHERE tenant_id=? AND code=?",
+                     (TENANT, code)).fetchone():
+            raise HTTPException(400, f"машина «{code}» уже заведена")
+        cur = c.execute("INSERT INTO pub_hosts(tenant_id,code,title,adspower_url,note,"
+                        "status,created) VALUES(?,?,?,?,?,'active',?)",
+                        (TENANT, code, title, url, note, time.time()))
+        c.commit()
+        return {"ok": True, "id": cur.lastrowid, "code": code}
+    finally:
+        c.close()
+
+
+@app.post("/ui/hosts/{host_id}")
+def ui_host_save(host_id: int, body: HostIn):
+    code, title, url, note = _clean_host(body)
+    c = db()
+    try:
+        row = c.execute("SELECT * FROM pub_hosts WHERE tenant_id=? AND id=?",
+                        (TENANT, host_id)).fetchone()
+        if row is None:
+            raise HTTPException(404, "такой машины нет")
+        clash = c.execute("SELECT 1 FROM pub_hosts WHERE tenant_id=? AND code=? AND id<>?",
+                          (TENANT, code, host_id)).fetchone()
+        if clash:
+            raise HTTPException(400, f"машина «{code}» уже заведена")
+        c.execute("UPDATE pub_hosts SET code=?, title=?, adspower_url=?, note=? WHERE id=?",
+                  (code, title, url, note, host_id))
+        c.commit()
+        return {"id": host_id, "code": code, "title": title, "adspower_url": url,
+                "note": note, "status": row["status"]}
+    finally:
+        c.close()
+
+
+class HostStatusIn(BaseModel):
+    status: str = ""
+
+
+@app.post("/ui/hosts/{host_id}/status")
+def ui_host_status(host_id: int, body: HostStatusIn):
+    """Убрать машину из работы или вернуть. Строка не удаляется: к ней привязаны
+    профили и каналы, и удаление превратило бы их в ссылки в никуда."""
+    status = (body.status or "").strip()
+    if status not in ("active", "disabled"):
+        raise HTTPException(400, "машина бывает в работе или убрана")
+    c = db()
+    try:
+        if not c.execute("SELECT 1 FROM pub_hosts WHERE tenant_id=? AND id=?",
+                         (TENANT, host_id)).fetchone():
+            raise HTTPException(404, "такой машины нет")
+        c.execute("UPDATE pub_hosts SET status=? WHERE id=?", (status, host_id))
+        c.commit()
+        return {"ok": True, "status": status}
+    finally:
+        c.close()
+
+
+@app.post("/ui/hosts/{host_id}/refresh-profiles")
+def ui_host_refresh_profiles(host_id: int):
+    """Опись одной машины: спросить AdsPower и слить в справочник.
+
+    Неполная опись не трогает справочник ни строкой: пустой ответ и обрыв связи — это
+    сбой, а не «профилей больше нет».
+    """
+    ads = _adspower()
+    c = db()
+    try:
+        row = c.execute("SELECT * FROM pub_hosts WHERE tenant_id=? AND id=?",
+                        (TENANT, host_id)).fetchone()
+        if row is None:
+            raise HTTPException(404, "такой машины нет")
+        url = (row["adspower_url"] or "").strip()
+        if not url:
+            raise HTTPException(400, "у машины не задан адрес AdsPower — спрашивать некого")
+        try:
+            found = ads.fetch_host_profiles(url)
+        except ads.AdsPowerError as exc:
+            raise HTTPException(502, f"AdsPower: {exc}")
+        summary = ads.merge_host_profiles(c, TENANT, host_id, found)
+        c.commit()
+    finally:
+        c.close()
+    out = {"ok": True, "host_id": host_id, "at": time.time()}
+    for field in ("pages", "found", "new", "reappeared", "missing_now", "active_now"):
+        out[field] = getattr(summary, field)
+    return out
+
+
+@app.get("/ui/profiles")
+def ui_profiles():
+    """Общий список профилей со всех машин — владелец просил именно так."""
+    c = db()
+    try:
+        rows = c.execute(
+            "SELECT p.*, h.code host_code, h.title host_title FROM pub_profiles p "
+            "LEFT JOIN pub_hosts h ON h.id=p.default_host_id "
+            "WHERE p.tenant_id=? ORDER BY h.code, CAST(p.serial AS INTEGER), p.serial",
+            (TENANT,)).fetchall()
+    finally:
+        c.close()
+    return {"profiles": [{
+        "id": r["id"], "serial": r["serial"], "title": r["title"] or "",
+        "group_name": r["group_name"] or "", "remark": r["remark"] or "",
+        "last_open_time": r["last_open_time"] or "", "status": r["status"],
+        "active_now": bool(r["active_now"]), "missing_since": r["missing_since"],
+        "last_seen": r["last_seen"],
+        "host": ({"id": r["default_host_id"], "code": r["host_code"] or "",
+                  "title": r["host_title"] or r["host_code"] or ""}
+                 if r["default_host_id"] is not None else None),
+    } for r in rows]}
+
+
 # ─────────────── серверные ключи владельца: правка из студии (24.09.2026) ───────────────
 #
 # Владелец: «сделаем так чтобы серверные ключи админ тоже мог менять из интерфейса без
@@ -6370,15 +6547,39 @@ def ui_channel_preset_attach(cid: int, body: ChannelPresetPick):
 
 
 @app.get("/ui/channels/new")
-def ui_channel_new():
-    """Из чего выбирать при заведении канала: пресеты, машины, профили, часовые пояса."""
+def ui_channel_new(channel_id: int | None = None):
+    """Из чего выбирать при заведении канала: пресеты, машины, профили, часовые пояса.
+
+    `channel_id` — для формы УЖЕ настроенного канала. Профиль, который пропал с машины
+    (или машину убрали), в общий список не попадает: предлагать его новым каналам
+    нечестно. Но у канала, который на него настроен, он обязан остаться видимым и
+    выбранным, иначе форма молча сохранила бы «профиль не выбран» — и канал остался бы
+    без заливки, никому об этом не сказав.
+    """
     c = db()
     try:
         profiles = [{"id": r["id"], "title": r["title"] or r["serial"],
-                     "serial": r["serial"]}
-                    for r in c.execute("SELECT id, serial, title FROM pub_profiles "
-                                       "WHERE tenant_id=? AND status='active' "
-                                       "ORDER BY serial", (TENANT,))]
+                     "serial": r["serial"], "host_code": r["host_code"] or "",
+                     "missing": False}
+                    for r in c.execute(
+                        "SELECT p.id, p.serial, p.title, h.code host_code "
+                        "FROM pub_profiles p LEFT JOIN pub_hosts h ON h.id=p.default_host_id "
+                        "WHERE p.tenant_id=? AND p.status='active' AND p.missing_since IS NULL "
+                        "AND (h.id IS NULL OR h.status='active') "
+                        "ORDER BY h.code, CAST(p.serial AS INTEGER), p.serial", (TENANT,))]
+        if channel_id is not None:
+            known = {p["id"] for p in profiles}
+            cur = c.execute(
+                "SELECT p.id, p.serial, p.title, h.code host_code, p.missing_since, "
+                "p.status, h.status host_status FROM pub_channels ch "
+                "JOIN pub_profiles p ON p.id=ch.profile_id "
+                "LEFT JOIN pub_hosts h ON h.id=p.default_host_id "
+                "WHERE ch.tenant_id=? AND ch.id=?", (TENANT, channel_id)).fetchone()
+            if cur is not None and cur["id"] not in known:
+                profiles.append({
+                    "id": cur["id"], "title": cur["title"] or cur["serial"],
+                    "serial": cur["serial"], "host_code": cur["host_code"] or "",
+                    "missing": True, "current": True})
         hosts = [{"id": r["id"], "title": r["title"] or r["code"], "code": r["code"]}
                  for r in c.execute("SELECT id, code, title FROM pub_hosts "
                                     "WHERE tenant_id=? AND status='active' "
