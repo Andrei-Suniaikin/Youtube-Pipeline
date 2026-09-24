@@ -51,8 +51,10 @@ SCENARIO = r"""
     };
     addEventListener('hashchange', render);
     const bar = () => document.getElementById('busy');
+    const spin = () => document.getElementById('busy-spin');
     const state = () => ({
       видна: bar() ? !bar().hidden : null,
+      колесо: spin() ? !spin().hidden : null,
       погашен: document.body.classList.contains('loading'),
     });
 
@@ -91,19 +93,22 @@ def main() -> int:
 
     print("Быстрый переход")
     check("полоса не мигает", (res.get("быстро") or {}).get("видна"), False)
+    check("колесо не мигает", (res.get("быстро") or {}).get("колесо"), False)
     check("экран не гасится", (res.get("быстро") or {}).get("погашен"), False)
-    check("после — тоже чисто", res.get("послеБыстрого"), {"видна": False, "погашен": False})
+    check("после — тоже чисто", res.get("послеБыстрого"),
+          {"видна": False, "колесо": False, "погашен": False})
 
     print("Медленный экран")
     check("полоса видна", (res.get("вГрузке") or {}).get("видна"), True)
+    check("колесо видно прямо на странице", (res.get("вГрузке") or {}).get("колесо"), True)
     check("старое приглушено", (res.get("вГрузке") or {}).get("погашен"), True)
     check("по старому экрану не нажать", res.get("кликиПерехвачены"), "none")
     check("после отрисовки всё снято", res.get("послеЗагрузки"),
-          {"видна": False, "погашен": False})
+          {"видна": False, "колесо": False, "погашен": False})
 
     print("Экран отказал")
-    check("полоса снялась и тут", res.get("послеОшибки"),
-          {"видна": False, "погашен": False})
+    check("полоса и колесо снялись и тут", res.get("послеОшибки"),
+          {"видна": False, "колесо": False, "погашен": False})
 
     print()
     if FAILS:
