@@ -2006,6 +2006,8 @@ async function paintHostsProfiles(container){
                        : '<div class="empty">Машин пока нет — добавьте первую.</div>')}
   </div>`).firstElementChild;
   container.append(hostsCard);
+  foldRefCard(hostsCard, 'hosts', hosts.length
+    ? `${hosts.length} ${plural(hosts.length, 'машина', 'машины', 'машин')}` : '');
 
   hostsCard.querySelector('#host-new').onclick = () => hostModal(null, hosts, rerender);
   hostsCard.querySelectorAll('button.host-edit').forEach(b => b.onclick =
@@ -2038,6 +2040,8 @@ async function paintHostsProfiles(container){
                          : '<div class="empty">Профилей нет — опросите машину выше.</div>')}
   </div>`).firstElementChild;
   container.append(profilesCard);
+  foldRefCard(profilesCard, 'profiles', profiles.length
+    ? `${profiles.length} ${plural(profiles.length, 'профиль', 'профиля', 'профилей')}` : '');
 
   // Опись всех активных машин по очереди, одна за другой (не параллельно — предел
   // 1 запрос/сек у каждой машины свой, но сервер и так отклонил бы одновременный
@@ -2058,6 +2062,43 @@ async function hostsProfilesSection(){
   return wrap;
 }
 
+/* Справочники длинные — профилей на машине полсотни, и развёрнутыми они заслоняют всё
+   остальное (жалоба владельца 24.09.2026). Поэтому карточки сворачиваются, а в полосе
+   заголовка остаётся счёт: «52 профиля» видно и свёрнутым. Открытое состояние помнится
+   на время сессии — перерисовка после описи не должна закрывать то, что человек открыл. */
+const REF_FOLD_OPEN = {};
+
+function foldRefCard(card, key, summary){
+  const sec = card.querySelector('.sec');
+  if (!sec) return;
+  const open = !!REF_FOLD_OPEN[key];
+  sec.classList.add('stage-head');
+  if (!sec.querySelector('.grow')){
+    const grow = document.createElement('span');
+    grow.className = 'grow';
+    while (sec.firstChild) grow.append(sec.firstChild);
+    sec.append(grow);
+  }
+  if (summary){
+    const count = document.createElement('span');
+    count.className = 'note muted refcount';
+    count.textContent = summary;
+    sec.querySelector('.grow').append(count);
+  }
+  const btn = $(iconBtn('fold', 'expand', open ? 'Свернуть' : 'Развернуть', '',
+                        `aria-expanded="${open ? 'true' : 'false'}"`)).firstElementChild;
+  sec.append(btn);
+  card.classList.toggle('folded', !open);
+  btn.onclick = () => {
+    const now = card.classList.contains('folded');
+    REF_FOLD_OPEN[key] = now;
+    card.classList.toggle('folded', !now);
+    btn.setAttribute('aria-expanded', now ? 'true' : 'false');
+    btn.title = now ? 'Свернуть' : 'Развернуть';
+    btn.setAttribute('aria-label', now ? 'Свернуть' : 'Развернуть');
+  };
+}
+
 async function viewChannels(){
   const d = await api('/ui/channels');
   app.innerHTML = '';
@@ -2070,11 +2111,6 @@ async function viewChannels(){
       <button class="ghost small" id="impch">Перенести списком</button>
       <button class="small" id="newch">Новый канал</button></div></div>`);
   app.append(bar);
-
-  // Машины заливки и профили AdsPower (§6.4 ТЗ, опись профилей) — справочники, на
-  // которые ссылается канал ниже в форме настроек (`f-host`/`f-prof`). Раздел «Каналы»
-  // им и владеет по `docs/00_SCREEN_MAP.md` — отдельного пункта меню не заводится.
-  app.append(await hostsProfilesSection());
 
   bar.querySelector('#impch').onclick = () => {
     if (document.getElementById('imp-form')) return;
@@ -9452,6 +9488,11 @@ async function viewAdmin(){
     <h1>Админ ${hintDot(
       'Состояние системы: что мешает работе и сколько осталось места.')}</h1>
     <p class="sub"><a href="#/limits">Серверные лимиты →</a></p>`));
+
+  // Машины заливки и профили AdsPower — настройка, а не ежедневная работа (владелец
+  // 24.09.2026: «машина для заливки которая должна быть в админке»). На экране каналов
+  // они заслоняли собой сами каналы, ради которых человек туда и заходит.
+  app.append(await hostsProfilesSection());
 
   /* ── тревоги ── */
   const t = a.transport;

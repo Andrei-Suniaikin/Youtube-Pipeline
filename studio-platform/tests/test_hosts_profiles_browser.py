@@ -187,8 +187,21 @@ SCENARIO = r"""
     .find(c => c.querySelector('.sec') && re.test(txt(c.querySelector('.sec'))));
 
   // ── 1. Список машин, включая disabled ───────────────────────────────────
-  await go('#/channels');
+  // 24.09.2026: справочники переехали на экран «Админ» — на «Каналах» они заслоняли
+  // сами каналы (владелец: «машина для заливки которая должна быть в админке»). Сам
+  // экран «Админ» тянет ещё четыре сводки, к этому тесту отношения не имеющие, поэтому
+  // рисуем здесь только сами карточки; ИХ МЕСТО на экране проверяется отдельно, по
+  // исходнику (см. питонью часть).
+  app.innerHTML = '';
+  app.append(await hostsProfilesSection());
+  await sleep(150);
   let hostsCard = cardByTitle(/Машины заливки/);
+  // Карточки длинные, поэтому свёрнуты: разворачиваем, иначе строк не видно.
+  const unfold = card => {
+    const b = card.querySelector('.sec .iconbtn.fold');
+    if (b && card.classList.contains('folded')) b.click();
+  };
+  unfold(hostsCard);
   out.hostsCardFound = !!hostsCard;
   const hostRows = () => [...hostsCard.querySelectorAll('.pitem')];
   out.hostRowsCount = hostRows().length;
@@ -201,6 +214,7 @@ SCENARIO = r"""
   // ── 2. Общий список профилей: метки ──────────────────────────────────────
   let profCard = cardByTitle(/Профили AdsPower/);
   out.profCardFound = !!profCard;
+  unfold(profCard);
   const profRows = () => [...profCard.querySelectorAll('.pitem')];
   out.profRowsCount = profRows().length;
   const activeRow = profRows().find(r => /№46/.test(txt(r)));
@@ -223,6 +237,7 @@ SCENARIO = r"""
   await sleep(250);
   out.addSent = out.sent.find(s => s[0] === 'POST' && s[1] === '/ui/hosts');
   hostsCard = cardByTitle(/Машины заливки/);
+  unfold(hostsCard);
   out.hostCountAfterAdd = hostRows.length;                 // подстраховка ниже точнее
   out.newHostShown = [...hostsCard.querySelectorAll('.pitem')]
     .some(r => /Вторая гданьская/.test(txt(r)));
@@ -239,6 +254,7 @@ SCENARIO = r"""
   await sleep(250);
   out.editSent = out.sent.find(s => s[0] === 'POST' && s[1] === '/ui/hosts/1');
   hostsCard = cardByTitle(/Машины заливки/);
+  unfold(hostsCard);
   out.editShown = [...hostsCard.querySelectorAll('.pitem')]
     .some(r => /Минская машина \(правка\)/.test(txt(r)));
 
@@ -251,6 +267,7 @@ SCENARIO = r"""
   await sleep(250);
   out.statusSent = out.sent.find(s => s[0] === 'POST' && s[1] === '/ui/hosts/1/status');
   hostsCard = cardByTitle(/Машины заливки/);
+  unfold(hostsCard);
   out.hostStillThereAfterDisable = [...hostsCard.querySelectorAll('.pitem')]
     .some(r => /Минская машина/.test(txt(r)));
   out.statusTextAfterDisable = txt([...hostsCard.querySelectorAll('.pitem')]
@@ -261,6 +278,7 @@ SCENARIO = r"""
     .querySelector('button.host-status').click();
   await sleep(250);
   hostsCard = cardByTitle(/Машины заливки/);
+  unfold(hostsCard);
 
   // ── 6. «Обновить список профилей» у одной машины — успех и отказ ────────
   const minskRow3 = () => [...hostsCard.querySelectorAll('.pitem')]
@@ -274,12 +292,14 @@ SCENARIO = r"""
   FAIL_HOST_IDS.add(1);
   const profRowsBefore = profRows().length;
   hostsCard = cardByTitle(/Машины заливки/);
+  unfold(hostsCard);
   [...hostsCard.querySelectorAll('.pitem')]
     .find(r => /Минская машина/.test(txt(r)))
     .querySelector('button.host-refresh').click();
   await sleep(250);
   out.refreshFailToast = txt(document.querySelector('.toast:not(.ok)'));
   profCard = cardByTitle(/Профили AdsPower/);
+  unfold(profCard);
   out.profilesKeptAfterFailedRefresh = profRows().length === profRowsBefore
     && profRows().length > 0;
   FAIL_HOST_IDS.delete(1);
@@ -294,7 +314,8 @@ SCENARIO = r"""
 
   // ── 8. Честная ошибка вместо пустого списка ──────────────────────────────
   hostsFail = true; profilesFail = true;
-  await render();
+  app.innerHTML = '';
+  app.append(await hostsProfilesSection());
   await sleep(200);
   hostsCard = cardByTitle(/Машины заливки/);
   profCard = cardByTitle(/Профили AdsPower/);
@@ -324,6 +345,16 @@ SCENARIO = r"""
 
 
 def main() -> int:
+    print("Место на экране")
+    src = open(os.path.join(os.path.dirname(HERE), "web", "index.html"),
+               encoding="utf-8").read()
+    admin = src.split("async function viewAdmin(")[1][:4000]
+    channels = src.split("async function viewChannels(")[1][:4000]
+    check("справочники рисуются на экране «Админ»",
+          "hostsProfilesSection()" in admin, True)
+    check("и убраны с экрана «Каналы» — там нужны сами каналы",
+          "hostsProfilesSection()" in channels, False)
+
     res = browser_harness.run_scenario(SCENARIO, budget_ms=40000)
     for e in res.get("errs") or []:
         print("  ошибка на странице:", e)
