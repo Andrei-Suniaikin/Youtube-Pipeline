@@ -69,6 +69,7 @@ import accounts                                                  # noqa: E402
 import pub_calls                                                 # noqa: E402
 import pub_retention                                             # noqa: E402
 import pub_verify                                                # noqa: E402
+import pub_stats                                                 # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
 
 load_env()
@@ -2655,6 +2656,9 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             "waiting_without_slot": waiting,
             "waiting_items": waiting_rows,
             "history_days": history,
+            # Публичная статистика канала — из своих снимков, а не из живого запроса:
+            # страница канала открывается часто, а числа обновляются раз в сутки.
+            "stats": pub_stats.channel_state(c, channel_id),
         }
     finally:
         c.close()
@@ -6722,6 +6726,37 @@ def ui_channel_edit(cid: int, body: dict):
     return {"ok": True}
 
 
+@app.get("/ui/channels/stats")
+def ui_channels_stats():
+    """Статистика по всем каналам: последние числа и прирост.
+
+    Отвечает из своих снимков и в сеть не ходит: страница открывается часто, а YouTube
+    обновляет публичные счётчики раз в сутки и с задержкой. За свежестью — отдельная
+    кнопка ниже, у которой есть цена в единицах общего ключа.
+    """
+    c = db()
+    try:
+        return pub_stats.overview(c, TENANT)
+    finally:
+        c.close()
+
+
+@app.post("/ui/channels/stats/refresh")
+def ui_channels_stats_refresh():
+    """Снять статистику прямо сейчас.
+
+    Стоит одну единицу общего ключа на каждые пятьдесят каналов, поэтому чаще раза в
+    десять минут не ходит: снимок суточный, и десять нажатий подряд не сделают числа
+    свежее — только выедят кошелёк, из которого живёт проверка публикаций.
+    """
+    c = db()
+    try:
+        out = pub_stats.collect_if_stale(c, TENANT)
+        return {"run": out, "state": pub_stats.overview(c, TENANT)}
+    finally:
+        c.close()
+
+
 @app.delete("/ui/channels/{cid:int}")
 def ui_channel_delete(cid: int, request: Request):
     """Удалить канал насовсем (решение владельца 24.09.2026).
@@ -6760,6 +6795,9 @@ def ui_channel_delete(cid: int, request: Request):
         c.execute("DELETE FROM pub_plan_items WHERE channel_id=? AND tenant_id=?",
                   (cid, TENANT))
         c.execute("DELETE FROM pub_channel_tags WHERE channel_id=?", (cid,))
+        # Снимки статистики — по той же причине, что и всё остальное выше: ряд без
+        # канала прилипнет к новому каналу с тем же номером и покажет чужой прирост.
+        pub_stats.forget_channel(c, cid)
         c.execute("DELETE FROM pub_channels WHERE id=? AND tenant_id=?", (cid, TENANT))
         c.commit()
     finally:

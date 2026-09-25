@@ -192,6 +192,13 @@
   .facts{color:var(--muted);font-size:13.5px;margin-top:3px}
   .note{margin-top:4px;font-size:13px;color:var(--muted)}
   .note.bad{color:var(--bad)}
+  /* Канал в цифрах: три числа в ряд, на узком экране — в столбик. */
+  .statgrid{display:flex;gap:38px;flex-wrap:wrap}
+  .statgrid>div{min-width:170px}
+  .statnum{font-size:26px;line-height:1.15;letter-spacing:-.01em}
+  .delta{font-weight:600}
+  .delta.up{color:var(--ok)}
+  .delta.down{color:var(--bad)}
   /* Предупреждение при успехе (рерайт отдаёт «текст короче цели»): работа сделана,
      но смотреть на неё стоит. Красный тут соврал бы про отказ, серый — промолчал. */
   .note.warn{color:var(--wait)}
@@ -2156,8 +2163,28 @@ function foldRefCard(card, key, summary){
   };
 }
 
+/* Строка с подписчиками на плитке канала. Снимка нет — строки нет: пустое место
+   честнее прочерка, который выглядит как «ноль подписчиков». */
+function tileStats(st){
+  if (!st || !st.day) return '';
+  const d7 = (st.delta || {})['7'] || {};
+  const subs = st.hidden ? 'подписчики скрыты' : `${bigNum(st.subs)} подписчиков`;
+  const up = (d7.subs === null || d7.subs === undefined) ? ''
+    : ` · <span class="delta ${d7.subs > 0 ? 'up' : d7.subs < 0 ? 'down' : ''}">${
+        d7.subs > 0 ? '+' : d7.subs < 0 ? '−' : ''}${bigNum(Math.abs(d7.subs))}</span>
+        <span class="muted">за неделю</span>`;
+  return `<div class="meta" style="margin-top:7px">${subs}${up}</div>`;
+}
+
 async function viewChannels(){
   const d = await api('/ui/channels');
+  // Статистика — отдельным запросом и молча: она читается из своих снимков, в сеть не
+  // ходит, и её отсутствие не имеет права оставить человека без списка каналов.
+  let stats = {};
+  try{
+    const s = await api('/ui/channels/stats');
+    for (const row of (s.channels || [])) stats[row.id] = row;
+  }catch(e){ stats = {}; }
   app.innerHTML = '';
   // Кнопки — в строке заголовка, как на «Проектах» и «Пресетах» (владелец 22.09.2026:
   // «перенести в один ряд с тайтлом и сэкономить место на красивые отступы»).
@@ -2270,6 +2297,7 @@ async function viewChannels(){
       </div>
       <div class="meta">готовим за ${c.lead_days} дн ·
         ${c.has_profile ? 'профиль есть' : '<span style="color:var(--bad)">профиля нет</span>'}</div>
+      ${tileStats(stats[c.id])}
       <div style="margin-top:9px;display:flex;gap:7px;flex-wrap:wrap">
         <span class="pill ${
           c.status === 'active' ? 's-done' : c.status === 'problem' ? 's-error' : 's-idle'
@@ -2341,6 +2369,7 @@ function monthGrid(byDay, tz){
 }
 
 async function channelReleases(id, d){
+  app.append(channelStatsCard(id, d.stats || {}));
   app.append(monthGrid(d.by_day || {}, d.tz || ''));
 
   const counts = Object.entries(d.counts)
@@ -2656,6 +2685,93 @@ async function viewChannel(id){
     <div id="editbox" class="secbody"></div></div>`);
   app.append(head);
   wireChannelEdit(head, c, d.channel_preset || {});
+}
+
+
+/* ────────── канал в цифрах: подписчики, просмотры, ролики (25.09.2026) ──────────
+
+   YouTube отдаёт только «сколько сейчас» — прироста в его ответе нет вовсе. Всё, что
+   здесь написано словами «за 7 дней», взято из наших собственных ежедневных снимков,
+   и поэтому у молодого канала прирост честно неизвестен, а не равен нулю: ноль значил
+   бы «не изменилось», а это разные вещи.
+
+   Чего тут нет и не будет: времени просмотра, CTR обложки, удержания, дохода. Они не
+   публичны, их отдаёт только Analytics API по согласию владельца канала. Показать
+   вместо них просмотры и назвать это аналитикой — врать экраном.                     */
+
+function bigNum(v){
+  if (v === null || v === undefined) return '—';
+  return Number(v).toLocaleString('ru-RU');
+}
+
+function deltaText(v, span){
+  // «Не знаем» и «не изменилось» выглядят по-разному. Первое — короткий ряд наблюдений,
+  // и об этом надо сказать, а не нарисовать ноль.
+  if (v === null || v === undefined)
+    return `<span class="muted">за ${span} дн — ещё наблюдаем</span>`;
+  if (!v) return `<span class="muted">без изменений за ${span} дн</span>`;
+  const cls = v > 0 ? 'up' : 'down';
+  return `<span class="delta ${cls}">${v > 0 ? '+' : '−'}${bigNum(Math.abs(v))}</span>
+    <span class="muted">за ${span} дн</span>`;
+}
+
+function sparkline(series, field){
+  const pts = series.filter(r => r[field] !== null && r[field] !== undefined);
+  if (pts.length < 3) return '';        // две точки — не линия, а обещание линии
+  const vals = pts.map(r => Number(r[field]));
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const w = 96, h = 26, pad = 2;
+  const x = i => pad + i * (w - 2 * pad) / (vals.length - 1);
+  // Плоский ряд (всё выросло на ноль) делит на ноль — держим линию посередине.
+  const y = v => hi === lo ? h / 2
+    : h - pad - (v - lo) * (h - 2 * pad) / (hi - lo);
+  const dpath = vals.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true"
+    style="vertical-align:middle;margin-left:6px"><path d="${dpath}" fill="none"
+    stroke="var(--run)" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
+}
+
+function channelStatsCard(id, st){
+  const has = !!st.day;
+  const rows = has ? `
+    <div class="statgrid">
+      <div><div class="statnum">${st.hidden ? '<span class="muted">скрыты</span>'
+        : bigNum(st.subs)}</div>
+        <div class="meta">подписчиков ${st.hidden ? '' : sparkline(st.series || [], 'subs')}</div>
+        <div class="meta">${deltaText(st.hidden ? null : (st.delta['7'] || {}).subs, 7)}</div></div>
+      <div><div class="statnum">${bigNum(st.views)}</div>
+        <div class="meta">просмотров ${sparkline(st.series || [], 'views')}</div>
+        <div class="meta">${deltaText((st.delta['7'] || {}).views, 7)}</div></div>
+      <div><div class="statnum">${bigNum(st.videos)}</div>
+        <div class="meta">роликов на канале</div>
+        <div class="meta">${deltaText((st.delta['28'] || {}).videos, 28)}</div></div>
+    </div>
+    <div class="note muted" style="margin-top:10px">Снимок ${esc(st.day)}. Это публичные
+      числа YouTube: время просмотра, CTR и удержание публичными не бывают.</div>`
+    : `<div class="empty">${st.key
+        ? 'Снимков ещё нет — первый появится ближайшей ночью либо по кнопке справа.'
+        : 'Нет ключа YouTube Data API — спрашивать числа нечем. Ключ бесплатный, ' +
+          'заводится в Google Cloud; класть в настройки студии.'}</div>`;
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Канал в цифрах ${hintDot(
+      'Подписчики, просмотры и число роликов — публичные счётчики YouTube. ' +
+      'Прирост считается по нашим ежедневным снимкам, поэтому у нового канала ' +
+      'он появляется не сразу.')}
+      <button class="ghost small" id="refresh" style="float:right;margin-top:-4px"
+        ${st.key ? '' : 'disabled'}>Обновить</button></div>
+    <div class="secbody" id="body">${rows}</div></div>`);
+  card.querySelector('#refresh').onclick = async () => {
+    const b = card.querySelector('#refresh');
+    b.disabled = true;
+    try{
+      const out = await post('/ui/channels/stats/refresh', {});
+      const run = out.run || {};
+      toast(run.why || `Обновлено каналов: ${run.saved}`, run.why ? '' : 'ok');
+      if (!run.why) await render();
+    }catch(e){ toast(e.message); }
+    finally{ b.disabled = false; }
+  };
+  return card;
 }
 
 function calendarFeed(d){

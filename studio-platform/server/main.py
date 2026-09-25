@@ -51,6 +51,7 @@ import pub_calls
 from pub_calls import ensure_calls_schema, node_disk, note_node_disk
 from pub_calls_api import register_calls_routes
 from pub_schema import ensure_pub_schema
+import pub_stats
 from pub_ui import register_pub_routes
 from pub_engine import tick as pub_tick
 from pub_services import PubServices
@@ -2671,6 +2672,10 @@ def init_db():
               "ON queue_pause_audit(id DESC)")
     ensure_pub_schema(c)   # контур публикаций: каналы → план → выпуски
     ensure_calls_schema(c)  # журнал платных вызовов: строка на ОДИН вызов провайдера
+    # Снимки статистики каналов. Заводятся здесь, а не при первом обращении: страница
+    # канала открывается часто, и CREATE TABLE на каждом открытии брал бы блокировку
+    # записи ради таблицы, которая уже есть.
+    pub_stats.ensure_stats_schema(c)
     c.execute("CREATE TABLE IF NOT EXISTS admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL)")
     c.commit()
     if not c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():
