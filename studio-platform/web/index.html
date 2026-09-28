@@ -192,6 +192,9 @@
   .facts{color:var(--muted);font-size:13.5px;margin-top:3px}
   .note{margin-top:4px;font-size:13px;color:var(--muted)}
   .note.bad{color:var(--bad)}
+  /* Строка чисел под названием канала. */
+  .topline{margin:-4px 0 14px;font-size:14px;color:var(--fg)}
+  .topline .sep{margin:0 10px;color:var(--off)}
   /* Канал в цифрах: три числа в ряд, на узком экране — в столбик. */
   .statgrid{display:flex;gap:38px;flex-wrap:wrap}
   .statgrid>div{min-width:170px}
@@ -2487,7 +2490,7 @@ async function channelReleases(id, d){
     return;
   }
   app.append(calendarFeed(d));
-  if ((d.uploads || []).length) app.append(uploadsCard(d.uploads));
+  if ((d.uploads || []).length) app.append(uploadsCard(d.uploads, d.video_stats));
   app.append($(`<div class="note muted" style="margin-top:10px">
     <a href="#/releases">Все выпуски по всем каналам →</a></div>`));
 }
@@ -2620,7 +2623,20 @@ function donorsHtml(out){
 // «файл ушёл в форму» повторная заливка запрещена навсегда — второй заход создаст на
 // канале дубль. Разрешено только найти начатый ролик и довести его, и это делает сам
 // заливщик. Экран показывает состояние, а не предлагает недопустимое действие.
-function uploadsCard(rows){
+/* Просмотры ролика приписываются к строке заливки по идентификатору. Числа нет —
+   строки нет: у только что залитого ролика просмотров ещё не спрашивали, и «0
+   просмотров» было бы неправдой, а не отсутствием данных. */
+function videoViews(st){
+  if (!st || st.views === null || st.views === undefined) return '';
+  const grew = (st.delta === null || st.delta === undefined) ? ''
+    : ` <span class="delta ${st.delta > 0 ? 'up' : ''}">${
+        st.delta > 0 ? '+' + bigNum(st.delta) : bigNum(st.delta)}</span>
+        <span class="muted">за неделю</span>`;
+  return `<b>${bigNum(st.views)}</b> ${plural(st.views, 'просмотр', 'просмотра',
+    'просмотров')}${grew}`;
+}
+
+function uploadsCard(rows, byVideo){
   return $(`<div class="card" style="margin-top:16px">
     <div class="sec">Заливка на YouTube ${hintDot('Вердикт читается из состояния строки '
       + 'в YouTube Studio, а не из текста на странице: для запланированного ролика '
@@ -2638,6 +2654,8 @@ function uploadsCard(rows){
         <div class="upsteps">${u.phases.map(f =>
           `<span class="upstep ${f.done ? 'on' : ''}" title="${esc(f.title)}"></span>`).join('')}
           <span class="muted" style="font-size:12px">${esc(u.phase_title)}</span></div>
+        ${videoViews((byVideo || {})[u.video_id])
+          ? `<div class="facts">${videoViews((byVideo || {})[u.video_id])}</div>` : ''}
         <div class="facts">${[
             u.verdict_title && ('вердикт: ' + u.verdict_title),
             u.video_id && ('ролик ' + u.video_id),
@@ -2661,6 +2679,7 @@ async function viewChannel(id){
     <p class="sub">${[c.handle, c.lang, c.niche].filter(Boolean).map(esc).join(' · ')}</p>
     ${c.uc ? '' : `<span class="pill s-error">ID пустой — выпуски на этом канале
       не заводятся. Вписать во вкладке «Настройки» ниже — один раз</span>`}`));
+  app.append(channelTopLine(d));
 
   // Две вкладки: «Ролики» — то, чем занимаются каждый день, «Настройки» — то, что
   // трогают раз в месяц. Ролики первыми: канал открывают, чтобы посмотреть выпуски,
@@ -2925,6 +2944,46 @@ function channelStatsTab(id, d){
       await render();
     }catch(e){ toast(e.message); upd.disabled = false; }
   };
+}
+
+
+/* ────────── строка сверху: подписчики, просмотры, часы просмотра ──────────
+
+   Владелец 28.09.2026: «надо чтобы на страницу канала сверху выводились просмотры,
+   подписчики и часы просмотра».
+
+   Три числа приходят из РАЗНЫХ мест, и это видно в поведении строки. Подписчики и
+   просмотры — публичные, их даёт ключ студии. Часы просмотра публичными не бывают
+   вовсе: их отдаёт только владелец канала своим согласием, поэтому у неподключённого
+   канала на этом месте не ноль и не прочерк, а приглашение подключить.
+
+   Нет ни одного числа — строки нет совсем: пустая полоса из трёх прочерков занимает
+   место и не отвечает ни на один вопрос.                                            */
+
+function channelTopLine(d){
+  const st = d.stats || {}, an = d.analytics || {};
+  const deep = (an.totals || {}).now || {};
+  const parts = [];
+  if (st.day && !st.hidden && st.subs !== null && st.subs !== undefined)
+    parts.push(`<b>${bigNum(st.subs)}</b> ${plural(st.subs, 'подписчик', 'подписчика',
+      'подписчиков')}`);
+  else if (st.day && st.hidden)
+    parts.push(`<span class="muted">подписчики скрыты владельцем канала</span>`);
+  if (st.day && st.views !== null && st.views !== undefined)
+    parts.push(`<b>${bigNum(st.views)}</b> ${plural(st.views, 'просмотр', 'просмотра',
+      'просмотров')}`);
+  const haveHours = deep.minutes !== null && deep.minutes !== undefined;
+  if (haveHours)
+    parts.push(`<b>${hours(deep.minutes)}</b> ч просмотра
+      <span class="muted">за 28 дн</span>`);
+  else
+    parts.push(`<a href="#/channel/${encodeURIComponent(d.channel.id)}/statistika"
+      class="muted">часы просмотра — подключить →</a>`);
+  // Прячем строку, только если показывать НЕЧЕГО: ни публичного снимка, ни часов.
+  // Раньше здесь пряталось и то, что есть: у канала без ключа студии, но с подключённой
+  // подробной статистикой, часы просмотра пропадали вместе со строкой.
+  if (!st.day && !haveHours) return $('<div></div>');
+  return $(`<div class="topline">${parts.join('<span class="sep">·</span>')}</div>`);
 }
 
 function calendarFeed(d){

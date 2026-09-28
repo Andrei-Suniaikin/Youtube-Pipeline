@@ -2641,6 +2641,9 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             "calendar": [_strip_internal(r) for r in cal],
             "counts": counts,
             "uploads": _uploads(c, channel_id),
+            # Просмотры по каждому нашему ролику: экран подмешивает их к заливкам по
+            # идентификатору, а не строит второй список.
+            "video_stats": pub_stats.videos_of_channel(c, channel_id),
             "by_day": by_day,
             "tz": tzname,
             "channel_preset": {
@@ -6843,6 +6846,10 @@ def ui_channels_stats_refresh():
     c = db()
     try:
         out = pub_stats.collect_if_stale(c, TENANT)
+        # Ролики — тем же нажатием: спрашивать «обновить статистику» и получать только
+        # половину значило бы заставлять человека искать вторую кнопку.
+        if not out.get("fresh"):
+            out["videos"] = pub_stats.collect_videos(c, TENANT)
         return {"run": out, "state": pub_stats.overview(c, TENANT)}
     finally:
         c.close()
@@ -6889,6 +6896,7 @@ def ui_channel_delete(cid: int, request: Request):
         # Снимки статистики — по той же причине, что и всё остальное выше: ряд без
         # канала прилипнет к новому каналу с тем же номером и покажет чужой прирост.
         pub_stats.forget_channel(c, cid)
+        pub_stats.forget_channel_videos(c, cid)
         # Подробная статистика и само согласие — по той же причине: ряд без канала
         # прилипнет к новому каналу с тем же номером, а забытый токен останется лежать
         # рабочим доступом к чужим числам.

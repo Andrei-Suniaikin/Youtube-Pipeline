@@ -81,6 +81,11 @@ def main() -> int:
                 print(f"  YouTube не знает канала: {miss['name']} ({miss['uc']})")
             if out["why"]:
                 print(f"причина остановки: {out['why']}")
+            vids = pub_stats.collect_videos(c, TENANT, log=lambda s: print(s))
+            print(f"ролики: спрошено {vids['asked']}, записано {vids['saved']}, "
+                  f"единиц {vids['units']}, разрежено старых точек {vids['thinned']}")
+            for gone in vids["missing"][:10]:
+                print(f"  ролик не виден ключом (удалён или закрыт): {gone}")
             # Подробная статистика подключённых каналов — тем же проходом. Отдельный
             # таймер заводить незачем: оба забирают суточные числа, и оба должны
             # состояться, даже если один из них отказал.

@@ -2678,6 +2678,7 @@ def init_db():
     # записи ради таблицы, которая уже есть.
     pub_stats.ensure_stats_schema(c)
     pub_analytics.ensure_analytics_schema(c)   # посуточная статистика подключённых каналов
+    pub_stats.ensure_video_schema(c)          # просмотры по нашим роликам
     c.execute("CREATE TABLE IF NOT EXISTS admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL)")
     c.commit()
     if not c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():

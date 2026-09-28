@@ -364,3 +364,178 @@ def channel_state(c: sqlite3.Connection, channel_id: int, now=None,
             "subs": _diff(cur, was, "subs"), "views": _diff(cur, was, "views"),
             "videos": _diff(cur, was, "videos"), "since": was.get("day") or ""}
     return out
+
+
+# ───────────────────────── просмотры по каждому ролику ─────────────────────────
+#
+# Владелец 28.09.2026: «нам ещё интересна стата по каждому ролику, а именно просмотры».
+#
+# Берутся тем же ключом и той же ценой: `videos.list` — одна единица за полсотни роликов.
+# Спрашиваем только СВОИ ролики: те, что студия сама залила и у которых знает
+# идентификатор. Чужие ролики канала нас не касаются, а спрашивать «все ролики канала»
+# значило бы платить за перебор плейлиста ради чисел, которые никто не смотрит.
+
+VIDEOS_API = "https://www.googleapis.com/youtube/v3/videos"
+VIDEO_CONSUMER = "videos"
+VIDEO_COST = pub_calls.QUOTA_COSTS["videos.list"]
+
+# Сколько суток подряд держим посуточный ряд по ролику. Дальше — разрежаем до одной
+# точки в неделю: свежий ролик смотрят каждый день, а у полугодовалого важна кривая, а
+# не каждые её сутки. Без разрежения сто каналов за год дают миллионы строк ни за чем.
+VIDEO_DENSE_DAYS = 90
+
+
+def ensure_video_schema(c: sqlite3.Connection) -> None:
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS pub_video_stats("
+        "video_id TEXT NOT NULL, "
+        "day TEXT NOT NULL, "
+        "channel_id INTEGER, "
+        "views INTEGER, likes INTEGER, comments INTEGER, "
+        "taken REAL NOT NULL, "
+        "PRIMARY KEY(video_id, day))")
+    c.execute("CREATE INDEX IF NOT EXISTS idx_video_stats_channel "
+              "ON pub_video_stats(channel_id, day)")
+
+
+def forget_channel_videos(c: sqlite3.Connection, channel_id: int) -> None:
+    """Ряды роликов удалённого канала — та же ловушка переиспользуемых номеров."""
+    ensure_video_schema(c)
+    c.execute("DELETE FROM pub_video_stats WHERE channel_id=?", (int(channel_id),))
+
+
+def _our_videos(c: sqlite3.Connection, tenant=None) -> list:
+    """Наши залитые ролики: (video_id, channel_id). Без повторов."""
+    sql = ("SELECT DISTINCT u.video_id, u.channel_id FROM pub_upload_jobs u "
+           "WHERE u.video_id IS NOT NULL AND u.video_id<>''")
+    args: list = []
+    if tenant:
+        sql += " AND u.tenant_id=?"
+        args.append(tenant)
+    return list(c.execute(sql + " ORDER BY u.channel_id, u.video_id", args).fetchall())
+
+
+def _thin_out(c: sqlite3.Connection, now: float) -> int:
+    """Разредить старые точки: дальше `VIDEO_DENSE_DAYS` оставляем по одной в неделю.
+
+    Считаем номер недели прямо из даты строки, без дат в Python: так разрежение не
+    зависит от часового пояса машины, а значит одинаково на стенде и в бою.
+    """
+    edge = _shift(day_of(now), VIDEO_DENSE_DAYS)
+    cur = c.execute(
+        "DELETE FROM pub_video_stats WHERE day < ? AND day NOT IN ("
+        "  SELECT MIN(day) FROM pub_video_stats WHERE day < ? "
+        "  GROUP BY video_id, strftime('%Y-%W', day))", (edge, edge))
+    return cur.rowcount or 0
+
+
+def collect_videos(c: sqlite3.Connection, tenant=None, key=None, fetch=None,
+                   now=None, log=None) -> dict:
+    """Снять просмотры по нашим роликам. Пачками по полсотни, как и каналы."""
+    now = time.time() if now is None else now
+    fetch = fetch or _fetch
+    ensure_video_schema(c)
+    out = {"asked": 0, "saved": 0, "missing": [], "units": 0, "calls": 0,
+           "thinned": 0, "why": ""}
+
+    key = pub_verify.api_key(c) if key is None else key
+    rows = _our_videos(c, tenant)
+    if not rows:
+        out["why"] = "студия ещё ничего не заливала — про какие ролики спрашивать, неясно"
+        return out
+    if not key:
+        out["why"] = ("нет ключа YouTube Data API: положить в admin_state.youtube_api_key "
+                      "или в VS_YT_API_KEY")
+        return out
+
+    by_id = {}
+    for row in rows:
+        by_id.setdefault((row["video_id"] or "").strip(), row["channel_id"])
+    ids = [x for x in by_id if x]
+    day = day_of(now)
+    for start in range(0, len(ids), BATCH):
+        batch = ids[start:start + BATCH]
+        allow = pub_calls.quota_allow(c, VIDEO_CONSUMER, VIDEO_COST, now=now)
+        if not allow.get("ok"):
+            out["why"] = allow.get("why") or "квота исчерпана"
+            break
+        url = VIDEOS_API + "?" + urllib.parse.urlencode(
+            {"part": "statistics", "id": ",".join(batch), "maxResults": BATCH,
+             "key": key})
+        try:
+            data = fetch(url)
+        except Exception as exc:                                   # noqa: BLE001
+            raw = ""
+            code = getattr(exc, "code", 0)
+            try:
+                raw = exc.read().decode("utf-8", "replace")        # type: ignore[attr-defined]
+            except Exception:                                      # noqa: BLE001
+                raw = str(exc)
+            kind = pub_verify.quota_kind(code, raw)
+            if kind:
+                wait = pub_calls.quota_block(c, raw[:300], kind=kind, now=now)
+                out["why"] = pub_calls.quota_why(wait)
+            else:
+                out["why"] = f"YouTube не ответил: {str(raw)[:200]}"
+            break
+        pub_calls.quota_spend(c, VIDEO_CONSUMER, VIDEO_COST, now=now)
+        out["units"] += VIDEO_COST
+        out["calls"] += 1
+        out["asked"] += len(batch)
+
+        seen = set()
+        for item in (data.get("items") or []):
+            vid = (item.get("id") or "").strip()
+            seen.add(vid)
+            st = item.get("statistics") or {}
+            c.execute(
+                "INSERT INTO pub_video_stats(video_id,day,channel_id,views,likes,"
+                "comments,taken) VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(video_id,day) DO UPDATE SET views=excluded.views, "
+                "likes=excluded.likes, comments=excluded.comments, taken=excluded.taken",
+                (vid, day, by_id.get(vid), _int(st.get("viewCount")),
+                 _int(st.get("likeCount")), _int(st.get("commentCount")), now))
+            out["saved"] += 1
+        for vid in batch:
+            if vid not in seen:
+                # Ролик удалён, скрыт или сделан приватным. Это про сам ролик, а не про
+                # сбой, и владельцу это надо видеть поимённо.
+                out["missing"].append(vid)
+    out["thinned"] = _thin_out(c, now)
+    c.commit()
+    if log and out["why"]:
+        log(f"[videos] {out['why']}")
+    return out
+
+
+def videos_of_channel(c: sqlite3.Connection, channel_id: int, now=None,
+                      span: int = 7) -> dict:
+    """Просмотры по роликам канала: последнее число и прирост за неделю.
+
+    Ключ ответа — идентификатор ролика: экран подмешивает эти числа к своему списку
+    заливок, а не строит список заново.
+    """
+    now = time.time() if now is None else now
+    ensure_video_schema(c)
+    today = day_of(now)
+    rows = c.execute(
+        "SELECT video_id, day, views, likes, comments FROM pub_video_stats "
+        "WHERE channel_id=? AND day<=? ORDER BY video_id, day",
+        (int(channel_id), today)).fetchall()
+    last, past = {}, {}
+    edge = _shift(today, span)
+    for r in rows:
+        last[r["video_id"]] = dict(r)
+        if r["day"] <= edge:
+            past[r["video_id"]] = dict(r)
+    out = {}
+    for vid, cur in last.items():
+        was = past.get(vid) or {}
+        grew = None
+        if was and was.get("day") != cur.get("day") \
+                and cur.get("views") is not None and was.get("views") is not None:
+            grew = int(cur["views"]) - int(was["views"])
+        out[vid] = {"views": cur.get("views"), "likes": cur.get("likes"),
+                    "comments": cur.get("comments"), "day": cur.get("day"),
+                    "delta": grew, "since": was.get("day") or ""}
+    return out
