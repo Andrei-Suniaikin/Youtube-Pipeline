@@ -99,16 +99,20 @@ SCENARIO = r"""
     const card = () => [...document.querySelectorAll('.card')]
       .find(el => (el.textContent || '').includes('Канал в цифрах'));
 
-    location.hash = '#/channel/1/roliki';
+    location.hash = '#/channel/1/statistika';
     await sleep(400);
     out.карточка = (card() || {}).textContent || '';
     out.искра = !!(card() || document.body).querySelector('svg');
+    // Публичные числа идут ПЕРВЫМИ на вкладке: они есть всегда, а подробные — только
+    // у подключённого канала. Обратный порядок показывал бы сначала «подключите».
     out.порядок = (() => {
       const cards = [...document.querySelectorAll('.card')].map(e => e.textContent || '');
       const i = cards.findIndex(t => t.includes('Канал в цифрах'));
-      const j = cards.findIndex(t => t.includes('Поставить ролики'));
+      const j = cards.findIndex(t => t.includes('Подробная статистика'));
       return i >= 0 && j >= 0 && i < j;
     })();
+    out.вкладкаЕсть = [...document.querySelectorAll('.subtabs a')]
+      .some(a => (a.textContent || '').trim() === 'Статистика');
 
     // Молодой канал: ряда ещё нет, прироста не знаем.
     stats = Object.assign({}, stats, {
@@ -120,7 +124,7 @@ SCENARIO = r"""
                {day: '2026-09-25', subs: 12340, views: 1204880}]});
     location.hash = '#/channels';
     await sleep(200);
-    location.hash = '#/channel/1/roliki';
+    location.hash = '#/channel/1/statistika';
     await sleep(400);
     out.молодой = (card() || {}).textContent || '';
     out.молодойБезИскры = !(card() || document.createElement('div')).querySelector('svg');
@@ -129,7 +133,7 @@ SCENARIO = r"""
     stats = Object.assign({}, stats, {hidden: true, subs: null});
     location.hash = '#/channels';
     await sleep(200);
-    location.hash = '#/channel/1/roliki';
+    location.hash = '#/channel/1/statistika';
     await sleep(400);
     out.скрытые = (card() || {}).textContent || '';
 
@@ -137,7 +141,7 @@ SCENARIO = r"""
     stats = {key: false, day: '', delta: {}, series: []};
     location.hash = '#/channels';
     await sleep(200);
-    location.hash = '#/channel/1/roliki';
+    location.hash = '#/channel/1/statistika';
     await sleep(400);
     out.безКлюча = (card() || {}).textContent || '';
     out.кнопкаЗаперта = !!(card() || document.body)
@@ -150,7 +154,7 @@ SCENARIO = r"""
 
     // Статистика упала — список каналов обязан остаться.
     listBoom = true;
-    location.hash = '#/channel/1/roliki';
+    location.hash = '#/channel/1/statistika';
     await sleep(200);
     location.hash = '#/channels';
     await sleep(500);
@@ -179,7 +183,8 @@ def main() -> int:
     has("сказано, что это публичные числа", card, "публичные")
     has("и чего в них нет", card, "CTR")
     check("график ряда нарисован", res.get("искра"), True)
-    check("цифры идут выше работы со ссылками", res.get("порядок"), True)
+    check("публичные числа идут выше подробных", res.get("порядок"), True)
+    check("вкладка «Статистика» заведена", res.get("вкладкаЕсть"), True)
 
     print("Молодой канал: «не знаем» вместо нуля")
     young = res.get("молодой") or ""

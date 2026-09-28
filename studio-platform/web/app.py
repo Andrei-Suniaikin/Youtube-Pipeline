@@ -70,6 +70,8 @@ import pub_calls                                                 # noqa: E402
 import pub_retention                                             # noqa: E402
 import pub_verify                                                # noqa: E402
 import pub_stats                                                 # noqa: E402
+import pub_analytics                                              # noqa: E402
+import channel_oauth                                              # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
 
 load_env()
@@ -2659,6 +2661,9 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             # Публичная статистика канала — из своих снимков, а не из живого запроса:
             # страница канала открывается часто, а числа обновляются раз в сутки.
             "stats": pub_stats.channel_state(c, channel_id),
+            # Подробная статистика — из своих же записей. Токен наружу не уходит:
+            # `channel_state` отдаёт только «подключено», хвост и состояние.
+            "analytics": pub_analytics.channel_state(c, channel_id),
         }
     finally:
         c.close()
@@ -6726,6 +6731,92 @@ def ui_channel_edit(cid: int, body: dict):
     return {"ok": True}
 
 
+class ChannelTokenIn(BaseModel):
+    token: str = ""
+
+
+@app.post("/ui/channels/{cid:int}/analytics")
+def ui_channel_analytics_connect(cid: int, body: ChannelTokenIn, request: Request):
+    """Подключить канал к подробной статистике вставленным токеном.
+
+    Три шага в одном нажатии, и порядок важен: запомнить → ПРОВЕРИТЬ, что токен именно
+    от этого канала → забрать прошлое. Проверка живым запросом обязательна: у заказчика
+    каждый канал на своём гугл-аккаунте, токены вставляются руками сотню раз подряд, и
+    «вставил не в ту строку» — не гипотеза, а вопрос времени. Без проверки чужие числа
+    молча легли бы в карточку этого канала.
+
+    Не сошлось — токен НЕ остаётся лежать: полуподключённый канал хуже неподключённого,
+    он выглядит рабочим.
+    """
+    _require_admin(request)
+    c = db()
+    try:
+        ch = c.execute("SELECT id, uc, name FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (cid, TENANT)).fetchone()
+        if ch is None:
+            raise HTTPException(404, "канала нет")
+        if not (ch["uc"] or "").strip():
+            raise HTTPException(400, "у канала не заполнен ID YouTube — без него нельзя "
+                                     "проверить, что токен от этого канала")
+        if not channel_oauth.client_ready():
+            raise HTTPException(400, "не заданы реквизиты приложения Google — впишите их "
+                                     "на странице «Ключи», иначе обновить доступ нечем")
+        try:
+            channel_oauth.set_token(cid, body.token)
+        except channel_oauth.OAuthError as exc:
+            raise HTTPException(400, str(exc))
+        check = pub_analytics.verify(cid, ch["uc"])
+        if not check["ok"]:
+            channel_oauth.drop(cid)
+            raise HTTPException(400, check["why"])
+        got = pub_analytics.collect_channel(c, cid, ch["uc"])
+        _audit(f'статистика канала «{ch["name"]}» подключена')
+        return {"access": channel_oauth.state(cid), "loaded_days": got["days"],
+                "why": got["why"],
+                "analytics": pub_analytics.channel_state(c, cid)}
+    finally:
+        c.close()
+
+
+@app.delete("/ui/channels/{cid:int}/analytics")
+def ui_channel_analytics_off(cid: int, request: Request):
+    """Отключить канал от подробной статистики.
+
+    Согласие забываем, УЖЕ СОБРАННОЕ оставляем: это наши записи, а не заимствованный
+    доступ, и терять историю канала из-за смены токена незачем.
+    """
+    _require_admin(request)
+    c = db()
+    try:
+        ch = c.execute("SELECT name FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (cid, TENANT)).fetchone()
+        if ch is None:
+            raise HTTPException(404, "канала нет")
+        channel_oauth.drop(cid)
+        _audit(f'статистика канала «{ch["name"]}» отключена')
+        return {"access": channel_oauth.state(cid)}
+    finally:
+        c.close()
+
+
+@app.post("/ui/channels/{cid:int}/analytics/refresh")
+def ui_channel_analytics_refresh(cid: int, request: Request):
+    """Забрать свежие сутки прямо сейчас, не дожидаясь ночного прохода."""
+    _require_admin(request)
+    c = db()
+    try:
+        ch = c.execute("SELECT uc FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (cid, TENANT)).fetchone()
+        if ch is None:
+            raise HTTPException(404, "канала нет")
+        got = pub_analytics.collect_channel(c, cid, ch["uc"])
+        if got["why"]:
+            raise HTTPException(400, got["why"])
+        return {"days": got["days"], "analytics": pub_analytics.channel_state(c, cid)}
+    finally:
+        c.close()
+
+
 @app.get("/ui/channels/stats")
 def ui_channels_stats():
     """Статистика по всем каналам: последние числа и прирост.
@@ -6798,6 +6889,11 @@ def ui_channel_delete(cid: int, request: Request):
         # Снимки статистики — по той же причине, что и всё остальное выше: ряд без
         # канала прилипнет к новому каналу с тем же номером и покажет чужой прирост.
         pub_stats.forget_channel(c, cid)
+        # Подробная статистика и само согласие — по той же причине: ряд без канала
+        # прилипнет к новому каналу с тем же номером, а забытый токен останется лежать
+        # рабочим доступом к чужим числам.
+        pub_analytics.forget_channel(c, cid)
+        channel_oauth.drop(cid)
         c.execute("DELETE FROM pub_channels WHERE id=? AND tenant_id=?", (cid, TENANT))
         c.commit()
     finally:

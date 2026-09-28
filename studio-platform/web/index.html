@@ -2369,7 +2369,6 @@ function monthGrid(byDay, tz){
 }
 
 async function channelReleases(id, d){
-  app.append(channelStatsCard(id, d.stats || {}));
   app.append(monthGrid(d.by_day || {}, d.tz || ''));
 
   const counts = Object.entries(d.counts)
@@ -2670,11 +2669,14 @@ async function viewChannel(id){
   const tabs = $(`<div class="subtabs">
     <a href="#/channel/${encodeURIComponent(id)}/roliki"
        class="${tab === 'roliki' ? 'on' : ''}">Ролики</a>
+    <a href="#/channel/${encodeURIComponent(id)}/statistika"
+       class="${tab === 'statistika' ? 'on' : ''}">Статистика</a>
     <a href="#/channel/${encodeURIComponent(id)}/nastroyki"
        class="${tab === 'nastroyki' ? 'on' : ''}">Настройки</a></div>`);
   app.append(tabs);
 
   if (tab === 'roliki'){ await channelReleases(id, d); return; }
+  if (tab === 'statistika'){ channelStatsTab(id, d); return; }
 
   // Сводка убрана (доработка §5, Дополнение 16.09): расписание, часовой пояс,
   // горизонт, «заранее», машина и профиль — те же поля, что и в форме ниже, а
@@ -2772,6 +2774,157 @@ function channelStatsCard(id, st){
     finally{ b.disabled = false; }
   };
   return card;
+}
+
+
+/* ────────── вкладка «Статистика»: публичные числа и подробные ──────────
+
+   Владелец 28.09.2026: «в канале сделать вкладку стату, по дефолту отображать то, что
+   без ключа, а если ключ есть — показывать подробную».
+
+   Сверху всегда публичное: подписчики, просмотры, ролики. Ниже — либо подробное (время
+   просмотра, досмотренность, подписчики), либо объяснение, как его включить. Пустой
+   таблицы «пока нет данных» тут нет ни в одном состоянии: человеку либо показывают
+   числа, либо говорят, чего именно не хватает и что с этим сделать.                 */
+
+function hours(minutes){
+  if (minutes === null || minutes === undefined) return '—';
+  const h = Number(minutes) / 60;
+  return h >= 100 ? bigNum(Math.round(h)) : h.toFixed(1).replace('.', ',');
+}
+
+function mmss(sec){
+  if (sec === null || sec === undefined) return '—';
+  const s = Math.round(Number(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function since(now_, was_, fmt){
+  /* Число рядом с тем же числом за прошлый такой же отрезок. Без сравнения «за 28 дней
+     столько-то» не отвечает на единственный вопрос, который задают: лучше или хуже. */
+  if (now_ === null || now_ === undefined) return '<span class="muted">—</span>';
+  if (was_ === null || was_ === undefined || !was_)
+    return `<span class="muted">не с чем сравнить</span>`;
+  const diff = Number(now_) - Number(was_);
+  if (!diff) return '<span class="muted">как в прошлый раз</span>';
+  const pct = Math.round(diff / Math.abs(Number(was_)) * 100);
+  return `<span class="delta ${diff > 0 ? 'up' : 'down'}">${diff > 0 ? '+' : '−'}${
+    fmt(Math.abs(diff))}</span> <span class="muted">(${diff > 0 ? '+' : '−'}${
+    Math.abs(pct)}% к прошлым 28 дн)</span>`;
+}
+
+function analyticsHowTo(id){
+  return `<div class="note muted" style="margin-top:12px;line-height:1.7">
+    Токен берётся <b>внутри того профиля AdsPower, где залогинен этот канал</b> — из
+    обычного браузера гугл-аккаунт канала входить не должен.
+    <br>1. Открыть в профиле служебную страницу Google OAuth Playground.
+    <br>2. В настройках (шестерёнка) включить «Use your own OAuth credentials» и вписать
+    наши идентификатор и секрет приложения — те, что заданы на странице «Ключи».
+    <br>3. Запросить доступ <code>yt-analytics.readonly</code>, на экране
+    «приложение не проверено» развернуть «Дополнительно» и продолжить.
+    <br>4. Обменять код и скопировать <b>refresh token</b> — это и есть строка ниже.
+    <br>Токен хранится закрыто и наружу не показывается: видно только последние четыре
+    знака.</div>`;
+}
+
+function analyticsNumbers(a){
+  const now_ = (a.totals || {}).now || {}, was = (a.totals || {}).was || {};
+  const ctrKnown = now_.impressions !== null && now_.impressions !== undefined;
+  return `
+    <div class="statgrid">
+      <div><div class="statnum">${bigNum(now_.views)}</div>
+        <div class="meta">просмотров за 28 дн</div>
+        <div class="meta">${since(now_.views, was.views, bigNum)}</div></div>
+      <div><div class="statnum">${hours(now_.minutes)}</div>
+        <div class="meta">часов просмотра</div>
+        <div class="meta">${since(now_.minutes, was.minutes, v => hours(v))}</div></div>
+      <div><div class="statnum">${now_.avg_pct === null || now_.avg_pct === undefined
+          ? '—' : Math.round(now_.avg_pct) + '%'}</div>
+        <div class="meta">досмотрено, средняя ${mmss(now_.avg_sec)}</div>
+        <div class="meta">${since(now_.avg_pct, was.avg_pct, v => Math.round(v) + '%')}</div></div>
+      <div><div class="statnum">${now_.subs_net > 0 ? '+' : ''}${bigNum(now_.subs_net)}</div>
+        <div class="meta">подписчиков за 28 дн</div>
+        <div class="meta">${bigNum(now_.subs_gained)} пришло, ${
+          bigNum(now_.subs_lost)} ушло</div></div>
+    </div>
+    <div class="note muted" style="margin-top:12px">
+      ${ctrKnown
+        ? `Показов превью: <b>${bigNum(now_.impressions)}</b>`
+        : `Показы превью и CTR обложки этим путём не приходят — их отдаёт другой сервис
+           Google, суточными выгрузками. Пока не подключено.`}
+      · отрезок ${esc(now_.from || '')} — ${esc(now_.to || '')}
+    </div>`;
+}
+
+function channelStatsTab(id, d){
+  app.append(channelStatsCard(id, d.stats || {}));
+  const a = d.analytics || {};
+  const acc = a.access || {};
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Подробная статистика ${hintDot(
+      'Время просмотра, досмотренность и подписчики. Эти числа YouTube отдаёт только ' +
+      'владельцу канала, поэтому канал подключается отдельно — своим токеном.')}
+      ${acc.connected ? `<button class="ghost small" id="off"
+        style="float:right;margin-top:-4px">Отключить</button>
+        <button class="ghost small" id="upd"
+        style="float:right;margin-top:-4px;margin-right:8px">Обновить</button>` : ''}</div>
+    <div class="secbody" id="body"></div></div>`);
+  const body = card.querySelector('#body');
+
+  if (acc.connected && a.days){
+    body.innerHTML = analyticsNumbers(a) +
+      `<div class="note muted" style="margin-top:8px">История с ${esc(a.first)} —
+       ${a.days} ${plural(a.days, 'день', 'дня', 'дней')} наблюдений.
+       ${acc.state === 'dead' ? '<b style="color:var(--bad)">Доступ перестал работать: ' +
+         esc(acc.error || '') + ' — нужен новый токен.</b>' : ''}</div>`;
+  } else if (acc.connected){
+    body.innerHTML = `<div class="empty">Канал подключён, но чисел ещё нет.
+      ${acc.error ? esc(acc.error) : 'Нажмите «Обновить» — первая выгрузка забирает год.'}</div>`;
+  } else {
+    body.innerHTML = `
+      <div class="note muted">Без подключения видно только то, что выше: это публичные
+        счётчики YouTube. Время просмотра, досмотренность и приход подписчиков публичными
+        не бывают — их отдаёт лишь владелец канала, своим согласием.</div>
+      ${acc.client === false ? `<div class="note bad" style="margin-top:10px">
+        Сначала впишите идентификатор и секрет приложения Google на странице
+        «Ключи» — без них токен обновлять нечем.</div>` : ''}
+      <div style="margin-top:12px">
+        <input id="tok" style="width:100%;font-family:var(--mono);font-size:12px"
+          placeholder="refresh token из OAuth Playground" autocomplete="off"></div>
+      <div style="margin-top:10px"><button id="on" class="small">Подключить</button></div>
+      ${analyticsHowTo(id)}`;
+  }
+  app.append(card);
+
+  const on = card.querySelector('#on');
+  if (on) on.onclick = async () => {
+    on.disabled = true;
+    try{
+      const out = await post(`/ui/channels/${encodeURIComponent(id)}/analytics`,
+                             {token: card.querySelector('#tok').value});
+      toast(`Подключено, забрано дней: ${out.loaded_days}`, 'ok');
+      await render();
+    }catch(e){ toast(e.message); on.disabled = false; }
+  };
+  const off = card.querySelector('#off');
+  if (off) off.onclick = () => confirmModal('Отключить подробную статистику?',
+    'Согласие будет забыто. Уже собранные числа останутся — их не теряем.',
+    async () => {
+      try{
+        await api(`/ui/channels/${encodeURIComponent(id)}/analytics`, {method: 'DELETE'});
+        toast('Отключено', 'ok');
+        await render();
+      }catch(e){ toast(e.message); }
+    });
+  const upd = card.querySelector('#upd');
+  if (upd) upd.onclick = async () => {
+    upd.disabled = true;
+    try{
+      const out = await post(`/ui/channels/${encodeURIComponent(id)}/analytics/refresh`, {});
+      toast(`Обновлено суток: ${out.days}`, 'ok');
+      await render();
+    }catch(e){ toast(e.message); upd.disabled = false; }
+  };
 }
 
 function calendarFeed(d){

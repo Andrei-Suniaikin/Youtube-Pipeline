@@ -52,6 +52,7 @@ from pub_calls import ensure_calls_schema, node_disk, note_node_disk
 from pub_calls_api import register_calls_routes
 from pub_schema import ensure_pub_schema
 import pub_stats
+import pub_analytics
 from pub_ui import register_pub_routes
 from pub_engine import tick as pub_tick
 from pub_services import PubServices
@@ -2676,6 +2677,7 @@ def init_db():
     # канала открывается часто, и CREATE TABLE на каждом открытии брал бы блокировку
     # записи ради таблицы, которая уже есть.
     pub_stats.ensure_stats_schema(c)
+    pub_analytics.ensure_analytics_schema(c)   # посуточная статистика подключённых каналов
     c.execute("CREATE TABLE IF NOT EXISTS admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL)")
     c.commit()
     if not c.execute("SELECT 1 FROM users WHERE role='admin'").fetchone():

@@ -26,6 +26,7 @@ from pub_env import load_env                                      # noqa: E402
 load_env()
 
 import pub_stats                                                  # noqa: E402
+import pub_analytics                                              # noqa: E402
 
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
 TENANT = os.environ.get("VS_DEV_TENANT") or None
@@ -80,6 +81,14 @@ def main() -> int:
                 print(f"  YouTube не знает канала: {miss['name']} ({miss['uc']})")
             if out["why"]:
                 print(f"причина остановки: {out['why']}")
+            # Подробная статистика подключённых каналов — тем же проходом. Отдельный
+            # таймер заводить незачем: оба забирают суточные числа, и оба должны
+            # состояться, даже если один из них отказал.
+            deep = pub_analytics.collect(c, TENANT, log=lambda s: print(s))
+            print(f"подробная статистика: каналов {deep['channels']}, "
+                  f"суток {deep['days']}, без подключения {deep['skipped']}")
+            for bad in deep["problems"]:
+                print(f"  {bad['name']}: {bad['why']}")
         show(c)
     finally:
         c.close()

@@ -36,3 +36,6 @@ studio-platform/dev/identity_migration.json
 studio-platform/dev/backup/
 # подписки для текста, добавленные на экране «Ключи»: секреты (auth.json, токены)
 studio-platform/rewrite/.text-subscriptions/
+# согласия владельцев каналов на подробную статистику: refresh-токены, 0600.
+# Каталог заводится рядом с базой, поэтому на стенде он оказывается внутри репозитория.
+.channel-tokens/
