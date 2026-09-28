@@ -97,6 +97,14 @@ FAILED_SEC = _sec("VS_ALERT_FAILED_SEC", 24 * 3600)      # §7
 # читать. Про остальные говорим одной строкой: важен факт, а разбирают их на экране.
 FAILED_MAX = _sec("VS_ALERT_FAILED_MAX", 5)              # §7
 REPEAT_SEC = _sec("VS_ALERT_REPEAT_SEC", 60 * 60)        # повтор не чаще раза в час
+# Поводы про ключи повторяются реже остальных (жалоба владельца 28.09.2026: «очень
+# много раз долбит прилажка»). Причина не в настройке, а в природе повода: очередь
+# встала — это чинится за минуты, и напомнить через час осмысленно. Ключ истекает
+# через шесть дней или расход подошёл к лимиту — это не чинится за час НИКАК: нужно
+# купить продление или дождаться сброса. Час между напоминаниями об одном и том же
+# сроке не добавляет ни одного нового сведения, зато к третьему разу тревоги
+# перестают читать — и пропускают ту, которая про очередь.
+KEY_REPEAT_SEC = _sec("VS_ALERT_KEY_REPEAT_SEC", 24 * 3600)
 DISK_MIN_GB = float(os.environ.get("VS_ALERT_DISK_GB") or 100)
 # §9/§10 — не из ТЗ, добавлены владельцем 16.09.2026.
 KEY_EXPIRES_DAYS = _num("VS_ALERT_KEY_EXPIRES_DAYS", 7)          # §9: за сколько дней предупредить
@@ -128,6 +136,7 @@ LIMITS = {
     "UPLOAD_SEC": ("есть готовые ролики, но заливки нет", "sec", 60, 48 * 3600),
     "OLDEST_SEC": ("самая старая задача ждёт", "sec", 60, 72 * 3600),
     "REPEAT_SEC": ("повтор одного и того же повода", "sec", 300, 24 * 3600),
+    "KEY_REPEAT_SEC": ("повтор поводов про ключи", "sec", 300, 7 * 86400),
     "FAILED_SEC": ("про какие падения говорим: за последние", "sec", 3600, 7 * 86400),
     "DISK_MIN_GB": ("свободного места меньше", "gb", 1, 5000),
     "KEY_EXPIRES_DAYS": ("предупредить о сроке ключа за", "days", 1, 90),
@@ -851,6 +860,24 @@ NO_FIXED = {"failed"}
 # (`key_dead:googler`), и точное совпадение его бы не поймало.
 FASTGEN_STATE_KEYS = {"fastgen_key_expiring", "fastgen_usage_near_limit", "key_dead"}
 
+# Поводы про ключи и подписки: им свой, редкий повтор (`KEY_REPEAT_SEC`). Сравнение
+# по префиксу до двоеточия — как у NO_REPEAT: у половины из них в ключе стоит ещё и
+# семейство или номер подписки.
+#
+# Почему именно эти шесть, а не «всё, где в названии есть key». `key_exhausted` и
+# `key_dead` — про ключ, который уже не работает: до продления ничего не изменится,
+# сколько ни напоминай. `provider_resting` — та же порода: провайдер отдыхает по
+# своему расписанию, и час напоминаний его не разбудит. Очередь, заливка и место на
+# диске сюда НЕ входят намеренно: они чинятся быстро, и там частое напоминание — это
+# и есть польза.
+KEY_ALERT_KEYS = {"fastgen_key_expiring", "fastgen_usage_near_limit", "key_dead",
+                  "key_exhausted", "text_sub_dead", "provider_resting"}
+
+
+def repeat_after(key: str) -> float:
+    """Через сколько повторять этот повод. Первое сообщение задержки не знает."""
+    return KEY_REPEAT_SEC if key.split(":")[0] in KEY_ALERT_KEYS else REPEAT_SEC
+
 
 def detect(c, now=None, tenant=None) -> dict:
     """Все поводы, верные прямо сейчас: key → Alert. Ничего не пишет и не отправляет."""
@@ -913,7 +940,8 @@ def tick(c, send, now=None, tenant=None) -> list:
         if held < MIN_HOLD.get(key.split(":")[0], 0):
             continue
         last_sent = _f(st.get("sent"))
-        if last_sent and (key.split(":")[0] in NO_REPEAT or now - last_sent < REPEAT_SEC):
+        if last_sent and (key.split(":")[0] in NO_REPEAT
+                          or now - last_sent < repeat_after(key)):
             continue
         kind = "repeat" if last_sent else "alarm"
         text = _format(alert, kind, held, int(st.get("n") or 0) + 1)
