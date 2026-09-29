@@ -43,6 +43,7 @@ from pub_env import load_env, mask                                # noqa: E402
 load_env()
 
 import pub_alerts as A                                            # noqa: E402
+import pub_digest as D                                            # noqa: E402
 from pub_alerts_tg import Telegram                                # noqa: E402
 
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
@@ -236,11 +237,18 @@ def main() -> int:
             # цифры только тогда, когда кто-то параллельно открывал кабинет.
             refresh_fastgen_usage(c, time.time())
             sent = A.tick(c, tg.send, tenant=TENANT)
+            # Ежедневная сводка живёт на том же таймере, что и тревоги: своего процесса
+            # ей не заводим — это была бы вторая сирота вдобавок к той, которую уже
+            # пришлось учить следить за родителем. По умолчанию она ВЫКЛЮЧЕНА, и тогда
+            # этот вызов ничего не делает и в сеть не ходит.
+            digest = D.daily_tick(c, tg.send, TENANT, now=time.time())
             stamp = time.strftime("%H:%M:%S")
             if sent:
                 for key, kind, _text in sent:
                     print(f"{stamp}  {kind:<6} {key}")
-            else:
+            if digest["sent"]:
+                print(f"{stamp}  сводка отправлена")
+            if not sent and not digest["sent"]:
                 print(f"{stamp}  тихо")
             if not args.loop:
                 return 0

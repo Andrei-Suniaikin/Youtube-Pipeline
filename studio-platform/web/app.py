@@ -70,6 +70,7 @@ import pub_calls                                                 # noqa: E402
 import pub_retention                                             # noqa: E402
 import pub_verify                                                # noqa: E402
 import pub_stats                                                 # noqa: E402
+import pub_digest                                                # noqa: E402
 import pub_analytics                                              # noqa: E402
 import channel_oauth                                              # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
@@ -2944,6 +2945,58 @@ def ui_alert_threshold(body: AlertLimitIn, request: Request):
         c.close()
     _audit(f"порог {body.key} = {body.value if body.value is not None else 'как на машине'}"
            f", это сделал {who['name']}")
+    return out
+
+
+@app.get("/ui/digest")
+def ui_digest():
+    """Ежедневная сводка в формате заказчика — одной страницей.
+
+    Готовый текст отдаётся вместе с числами намеренно: отчёт заказчику уходит именно
+    текстом, и он обязан быть тем же самым, что уходит в телеграм. Собирай экран этот
+    текст сам из чисел — два представления разошлись бы при первой же правке, и никто
+    бы этого не заметил до тех пор, пока заказчик не сверит два отчёта.
+    """
+    c = db()
+    try:
+        data = pub_digest.collect(c, TENANT)
+        return {"digest": data, "text": pub_digest.render(data),
+                "settings": pub_digest.settings(c)}
+    finally:
+        c.close()
+
+
+class DigestSettingsIn(BaseModel):
+    telegram: bool | None = None
+    hour: int | None = None
+
+
+@app.post("/ui/digest/settings")
+def ui_digest_settings(body: DigestSettingsIn, request: Request):
+    """Включить или выключить суточную рассылку сводки, задать час отправки.
+
+    Только администратору: рассылка идёт в общий чат владельца, и включать её за него
+    посторонний не должен. По умолчанию она выключена и таковой остаётся, пока сюда не
+    придёт явное `telegram: true`.
+
+    Свой отказ, а не общий `_require_admin`: тот говорит про учётные записи, и человек,
+    нажавший галочку на экране сводки, прочёл бы ответ про совершенно другое место и
+    пошёл бы искать несуществующую беду.
+    """
+    user = getattr(request.state, "user", None)
+    role = (user["role"] if user is not None and "role" in user.keys() else "") or ""
+    if role != "admin":
+        raise HTTPException(403, "рассылку сводки включает и выключает администратор")
+    who = {"id": user["id"], "name": user["name"]}
+    c = db()
+    try:
+        out = pub_digest.set_settings(c, telegram=body.telegram, hour=body.hour)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        c.close()
+    _audit(f"рассылка сводки: {'включена' if out['telegram'] else 'выключена'}, "
+           f"час {out['hour']}, это сделал {who['name']}")
     return out
 
 
