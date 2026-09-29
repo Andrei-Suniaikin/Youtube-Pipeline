@@ -31,6 +31,7 @@ from channel_slots import (
     parse_time,
     upcoming_slots,
 )
+from channel_supply import channel_supply, supply_facts
 from pub_log import read as read_log
 from pub_neighbors import (
     COVER_URL,
@@ -665,7 +666,28 @@ def tile_menu(row, back: str) -> str:
             f'<div class=pub-menu-body>{"".join(пункты)}</div></details>')
 
 
-def channel_tile(row, state, back: str = "/channels") -> str:
+def supply_line(supply: dict) -> str:
+    """Строка запаса для плитки и для карточки канала.
+
+    Цвет берётся не от «мало/много», а от того, знаем ли мы ответ. «Не знаем» серое и
+    никогда не красное: у канала без расписания запас не кончился — его не с чем
+    сравнивать, и красный цвет послал бы владельца чинить то, что не сломано.
+    """
+    if supply is None:
+        return ""
+    if not supply["known"]:
+        цвет = "muted"
+    elif supply["covered"] == 0:
+        цвет = "pub-err"
+    elif supply["days"] < 2:
+        цвет = "pub-warn"
+    else:
+        цвет = "muted"
+    return (f'<div class="{цвет}" style="font-size:12px;margin-top:3px">'
+            f'{e(supply["text"])}</div>')
+
+
+def channel_tile(row, state, back: str = "/channels", supply: dict = None) -> str:
     # Плитка не вправе падать из-за незнакомой пометки состояния: канал со сбоем
     # приходит как "error", а таблица цветов знала только "err" — и весь список каналов
     # отдавал пятисотую, стоило одному выпуску уйти в разбор.
@@ -685,6 +707,7 @@ def channel_tile(row, state, back: str = "/channels") -> str:
 <div class=muted style="font-size:12.5px;margin-top:5px">{e(' · '.join(bits) + метка) or '—'}</div>
 <div class=pub-bar><i style="width:{pct}%;background:{fill}"></i></div>
 <div class="{color}" style="font-size:12px;margin-top:5px">{e(state['text'])}</div>
+{supply_line(supply)}
 </div>"""
 
 
@@ -784,6 +807,7 @@ def register_pub_routes(app, ctx):
         taken = plan_by_channel(c, tid, now - 86400, now + 92 * 86400)
         troubles = troubles_by_channel(c, tid)
         work = work_by_channel(c, tid)      # что реально происходит на каждом канале
+        supply = supply_facts(c, tid, now)  # чем канал будет выходить дальше
         langs = c.execute(
             "SELECT lang, COUNT(*) n FROM pub_channels WHERE tenant_id=? AND status!='archived'"
             " AND lang IS NOT NULL AND lang!='' GROUP BY lang ORDER BY n DESC", (tid,)).fetchall()
@@ -798,7 +822,8 @@ def register_pub_routes(app, ctx):
         back = "/channels" + (f"?{request.url.query}" if request.url.query else "")
         tiles = "".join(channel_tile(r, channel_state(r, taken.get(r["id"], set()),
                                                       troubles.get(r["id"], ""),
-                                                      work=work.get(r["id"])), back)
+                                                      work=work.get(r["id"])), back,
+                                     channel_supply(r, supply.get(r["id"]), now))
                         for r in rows)
         if not tiles:
             tiles = ('<div class=card><span class=muted>'
@@ -875,6 +900,8 @@ def register_pub_routes(app, ctx):
         rels = releases_by_item(c, row["id"])
         stages = release_stages(c, row["id"])
         ups = upload_jobs_by_release(c, row["id"])
+        now_ts = _now()
+        supply = channel_supply(row, supply_facts(c, tid, now_ts).get(row["id"]), now_ts)
         c.close()
 
         # 04.09.2026: спрашиваем по общему идентификатору, а не по логину. Логин
@@ -950,8 +977,15 @@ def register_pub_routes(app, ctx):
                     f'<button class="btn btn-ghost btn-sm">Поставить</button></form></td></tr>')
 
         waiting = [r for r in rows_plan if not r["slot_at"]]
-        wait_html = (f'<p class=hint style="margin:10px 0 0">Ждут свободного места: {len(waiting)} '
-                     f'{plural(len(waiting), "ссылка", "ссылки", "ссылок")}.</p>') if waiting else ""
+        wait_html = (
+            f'<p class=hint style="margin:10px 0 0">Ждут свободного места: {len(waiting)} '
+            f'{plural(len(waiting), "ссылка", "ссылки", "ссылок")}. '
+            f'Каждая встанет сама, как только выход освободится.</p>') if waiting else ""
+        # Запас — над таблицей, а не под ней: это ответ на вопрос «когда вставлять
+        # следующие», и он нужен раньше, чем разбор того, что уже стоит.
+        supply_row = supply_line(supply)
+        supply_html = (f'<div style="margin:-2px 0 8px">{supply_row}</div>'
+                       if supply_row else "")
 
         st = row["status"] or "active"
         acts = []
@@ -972,6 +1006,7 @@ def register_pub_routes(app, ctx):
 {pause_block(u, tid)}
 <div class=panel style="margin-top:10px">
 <div class=panel-title>Ролики канала</div>
+{supply_html}
 <table class=pub-tab>
 <tr><th style="width:130px">Когда</th><th>Ролик</th><th style="width:125px">Этапы</th>
 <th style="width:205px">Что с ним</th><th></th></tr>
