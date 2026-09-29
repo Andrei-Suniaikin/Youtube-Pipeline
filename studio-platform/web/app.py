@@ -664,12 +664,25 @@ def _calendar(c, ch, history_days: int) -> list:
     """Прошлое и будущее канала одной лентой.
 
     Состояния слота:
-      done      выпуск дошёл до конца
+      public    поздняя проверка подтвердила: ролик виден публично (фаза `published`)
+      done      расписание подтверждено, выход ещё НЕ подтверждён
       running   выпуск в работе
       blocked   выпуск остановлен
       planned   ссылка стоит, работа ещё не начиналась
       missed    время прошло, а ролика не было — ПРОПУСК, его и требует показывать ТЗ
       free      будущий слот свободен, сюда и ложится следующая ссылка
+
+    Почему `public` — отдельное состояние, а не оттенок `done`. Закон проекта:
+    `status='done'` означает ровно «Studio показала SCHEDULED на нужном канале в
+    нужное время», и больше ничего. Это ЗАМЫСЕЛ, а не факт: ролик может остаться
+    приватным, стать доступным только по ссылке или быть удалённым — расписание об
+    этом не знает. Пока оба случая назывались одним словом, экран сообщал о выходе,
+    которого никто не проверял. Разводить их по времени слота («слот прошёл — значит
+    вышел») нельзя по той же причине: часы идут независимо от YouTube.
+
+    Факт добывает только `pub_verify` (`videos.list`, part=status) и записывает
+    фазой `published`. Поэтому `public` читается из фазы, а не из статуса: статус
+    закрыт движком ещё на `scheduled` и выше уже не поднимается.
     """
     try:
         schedule = json.loads(ch["schedule"] or "{}")
@@ -696,7 +709,13 @@ def _calendar(c, ch, history_days: int) -> list:
 
     def row_for(moment, item, is_past, beyond=False):
         rel = rels.get(item["id"]) if item else None
-        if rel is not None:
+        if rel is not None and (rel["phase"] or "") == "published":
+            # Фаза старше статуса: только её поднимает поздняя проверка, и только
+            # она означает «ролик виден публично». Статус к этому моменту давно
+            # `done` — если решать по нему, подтверждённый и неподтверждённый выход
+            # снова сольются в одно слово.
+            state = "public"
+        elif rel is not None:
             state = {"done": "done", "blocked": "blocked"}.get(rel["status"] or "", "running")
         elif item is not None:
             state = "planned"
@@ -2632,8 +2651,12 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             zone = dt.timezone.utc
         for row in cal:
             day = dt.datetime.fromtimestamp(row["at"], zone).strftime("%Y-%m-%d")
-            box = by_day.setdefault(day, {"done": 0, "running": 0, "missed": 0,
-                                          "planned": 0, "free": 0, "blocked": 0})
+            # `public` заводится наравне с остальными, а не «по факту появления»:
+            # сетка месяца читает ключи напрямую, и отсутствующий ключ она показала
+            # бы как ноль подтверждённых выходов — то есть как «не вышло ничего».
+            box = by_day.setdefault(day, {"public": 0, "done": 0, "running": 0,
+                                          "missed": 0, "planned": 0, "free": 0,
+                                          "blocked": 0})
             box[row["state"]] = box.get(row["state"], 0) + 1
         return {
             "channel": {

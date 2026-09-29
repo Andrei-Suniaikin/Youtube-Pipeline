@@ -34,11 +34,13 @@ SCENARIO = r"""
 (async () => {
   const out = {errs: []};
   try {
-  const z = {done: 0, running: 0, missed: 0, planned: 0, free: 0, blocked: 0};
+  const z = {public: 0, done: 0, running: 0, missed: 0, planned: 0, free: 0,
+             blocked: 0};
   const byDay = {
-    '2026-09-01': {...z, done: 1}, '2026-09-02': {...z, blocked: 1},
+    '2026-09-01': {...z, public: 1}, '2026-09-02': {...z, blocked: 1},
     '2026-09-03': {...z, running: 1}, '2026-09-04': {...z, planned: 1},
-    '2026-09-05': {...z, missed: 1}, '2026-09-06': {...z, free: 1}};
+    '2026-09-05': {...z, missed: 1}, '2026-09-06': {...z, free: 1},
+    '2026-09-08': {...z, done: 1}};
   const box = monthGrid(byDay, 'Europe/Warsaw');
   document.getElementById('app').append(box);
   const cell = n => [...box.querySelectorAll('.day')].find(
@@ -46,7 +48,7 @@ SCENARIO = r"""
   const look = n => { const c = cell(n), m = c.querySelector('.cnt');
     return {cls: c.className.replace(/\s+/g, ' ').trim(), mark: m ? m.textContent : '',
             markCls: m ? m.className : '', title: c.getAttribute('title') || ''}; };
-  for (const n of [1, 2, 3, 4, 5, 6, 7]) out['d' + n] = look(n);
+  for (const n of [1, 2, 3, 4, 5, 6, 7, 8]) out['d' + n] = look(n);
   const c7 = cell(7);
   out.out_n_color = getComputedStyle(c7.querySelector('.n')).color;
   out.out_opacity = getComputedStyle(c7).opacity;
@@ -64,7 +66,16 @@ def main() -> int:
         print(f"  ПРОПУЩЕНО: {res['error']}")
         return 2
     check("ошибок нет", res.get("errs"), [])
-    check("вышел — число опубликованных", (res.get("d1") or {}).get("mark"), "1")
+    check("вышел — число подтверждённых выходов", (res.get("d1") or {}).get("mark"), "1")
+    # 29.09.2026: подтверждённый выход (`public`) и просто подтверждённое расписание
+    # (`done`) — разные вещи. Раньше сетка считала «вышло» по `done`, и месяц выглядел
+    # выпущенным ещё до того, как хоть один ролик проверили. Мутация-проверка: верни
+    # в `monthGrid` первым числом `b.done` — эти две строки поймают разницу первыми.
+    check("а назначенный, но не подтверждённый — свой знак",
+          ((res.get("d8") or {}).get("mark"), (res.get("d8") or {}).get("markCls")),
+          ("1→", "cnt plan"))
+    check("и подсказка у него другая", (res.get("d8") or {}).get("title"),
+          "назначено, выход не подтверждён: 1")
     d2 = res.get("d2") or {}
     check("остановлен — красная рамка", "blocked" in d2.get("cls", ""), True)
     check("и «!»", (d2.get("mark"), d2.get("markCls")), ("!", "cnt bad"))

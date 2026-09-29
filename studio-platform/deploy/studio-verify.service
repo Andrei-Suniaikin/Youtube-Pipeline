@@ -1,0 +1,58 @@
+# Поздняя проверка: ролик, у которого расписание подтверждено, действительно вышел.
+#
+# Третье состояние выпуска («вышел публично») до этого таймера не подтверждал никто:
+# механизм был написан и оттестирован, но запускался только руками. Сто каналов руками
+# не обойти, поэтому в `deploy/ПЕРЕДАЧА.md` это честно стояло в списке «чего система
+# не делает сама».
+#
+# Почему таймером, а не потоком внутри кабинета: проход обязан состояться и в день,
+# когда кабинет перезапускали, а его собственное падение не должно уносить интерфейс.
+# Type=oneshot плюс таймер с Persistent=true даёт и то и другое, и вдобавок журнал
+# каждого прохода в journalctl.
+#
+# Слово `--run`, а не `--once` как у соседей: так этот ключ назван в самом сценарии с
+# первого дня (`dev/verify_public.py`), и второе имя для одного действия — лишний
+# способ ошибиться. Смысл тот же: один проход и выход.
+#
+#   sudo cp deploy/studio-verify.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now studio-verify.timer
+#   systemctl list-timers studio-verify.timer
+#   journalctl -u studio-verify -n 50
+
+[Unit]
+Description=Studio: подтверждение выхода роликов по расписанию
+# Смысла ходить в базу до кабинета нет: он её и создаёт.
+After=network-online.target studio-platform.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/studio/app
+# Ключ YouTube Data API живёт в настройках студии (0600) и в git не попадает.
+# Минус у EnvironmentFile: отсутствие файла не должно ронять юнит само по себе —
+# проверка тогда честно скажет, чего ей не хватает.
+EnvironmentFile=-/srv/studio/studio.env
+Environment=VS_DEV_DB=/srv/studio/data/vsgen.db
+Environment=VS_TENANTS_DIR=/srv/studio/data/tenants
+ExecStart=/srv/studio/.venv/bin/python dev/verify_public.py --run
+# Красный юнит здесь означает ровно одно: ждали ролики, а ключа YouTube Data API не
+# было (`dev/verify_public.py` возвращает 1 только в этом случае). Проход, которому
+# нечего было проверять, завершается нулём и при пустом ключе — иначе `systemctl
+# --failed` показывал бы поломку в сутки, когда ни один слот не наступил.
+#
+# Полторы сотни вопросов по секунде — это минуты; пятнадцать их перекрывают с запасом,
+# а таймаут в сети (`pub_verify.TIMEOUT`, 15 с) не даёт пройти дольше. Оборванный на
+# полуслове проход ничего не портит: запись фиксируется одним коммитом в конце, и
+# следующий проход просто спросит тех же роликов заново.
+TimeoutStartSec=900
+
+# Проверке нужны своя база и googleapis.com — больше ничего.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/studio
+
+[Install]
+WantedBy=multi-user.target
