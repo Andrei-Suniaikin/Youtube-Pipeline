@@ -147,13 +147,26 @@ def register_upload_routes(app, ctx):
                     f"жду, пока освободится, профиль не трогаю"), ""
         return "", ""
 
-    def _remember_block(c, r, why: str, now: float) -> None:
+    def _remember_block(c, r, why: str, unknown: str, now: float) -> None:
         """Запомнить или снять «задание стоит из-за чужого профиля».
 
         В журнал пишем только на переломе состояния. Нода опрашивает кабинет несколько
         раз в минуту, и строка на каждый опрос превратила бы журнал выпуска в ленту
         одинаковых сообщений, в которой не найти, что было до того.
+
+        Состояния ТРИ, и третье — не оттенок второго (разбор 30.09.2026). «Занят
+        посторонним», «точно свободен» и «спросить не смогли» — разные вещи. Снимать
+        пометку и писать «профиль освободился» можно ТОЛЬКО когда мы знаем, что он
+        свободен. Раньше сюда приходила одна строка «занят», и любое незнание —
+        упавший AdsPower, машина не опрошена, профиль не сверён — выглядело как
+        освобождение: пометка снималась, в журнал шло «профиль освободился», а тревога
+        уходила владельцу как «ПОЧИНИЛОСЬ». То есть обрыв связи с машиной сам себя
+        объявлял починкой ровно в ту минуту, когда посторонний держал профиль.
         """
+        if not why and unknown:
+            # Не знаем. Прежнее знание не трогаем: ни пометку, ни журнал. Задание при
+            # этом выдаётся (решение владельца: незнание заливку не останавливает).
+            return
         if why:
             if r["blocked_since"] is None:
                 c.execute("UPDATE pub_upload_jobs SET blocked_since=?, blocked_why=?, "
@@ -287,7 +300,7 @@ def register_upload_routes(app, ctx):
                 # заливка держит его открытым в том же AdsPower, и без этой проверки мы
                 # приняли бы себя за постороннего и объявили тревогу на ровном месте.
                 busy_why, why_unknown = ("", "") if ours else _profile_verdict(r, hosts)
-                _remember_block(c, r, busy_why, now)
+                _remember_block(c, r, busy_why, why_unknown, now)
                 if busy_why or ours or r["uc"] in busy_channels:
                     continue
                 if task is None:
@@ -313,8 +326,13 @@ def register_upload_routes(app, ctx):
 
             token = "upc_" + secrets.token_urlsafe(18)
             done = c.execute(
+                # Пометку ожидания снимаем вместе с выдачей: она означает «стоит из-за
+                # чужого профиля», а выданное задание уже не стоит. Оставленная на
+                # работающем задании, она врала бы на экране и всплыла бы тревогой, если
+                # задание когда-нибудь вернётся в очередь.
                 "UPDATE pub_upload_jobs SET status='running', claim_token=?, claimed=?, "
-                "host=?, worker=?, lease_until=?, updated=? WHERE id=? AND status='queued'",
+                "host=?, worker=?, lease_until=?, blocked_since=NULL, blocked_why=NULL, "
+                "updated=? WHERE id=? AND status='queued'",
                 (token, now, host, worker, now + UPLOAD_LEASE_SEC, now, task["id"]))
             if done.rowcount != 1:
                 c.commit()                        # кто-то успел раньше — пусть спросит снова

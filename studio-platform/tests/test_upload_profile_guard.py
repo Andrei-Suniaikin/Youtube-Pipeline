@@ -244,6 +244,23 @@ def seed():
 
 # ─────────────────────────── проверки ───────────────────────────
 
+def revive(release_id="rel-a", keep_mark=False):
+    """Вернуть задание в очередь, не пересобирая стенд: seed() одноразовый.
+
+    Нужно проверкам, которые идут после того, как задание уже ушло в работу: свой
+    отдельный стенд для каждой из них означал бы три копии одних и тех же вставок,
+    которые разойдутся при первой же правке схемы.
+    """
+    # Остальные задания уводим из очереди: если на том же профиле висит НАША идущая
+    # заливка, ворота справедливо сочтут профиль своим, и сцена «держит посторонний»
+    # просто не наступит — проверка будет зелёной, ничего не проверив.
+    run("UPDATE pub_upload_jobs SET status='done' WHERE release_id<>?", (release_id,))
+    keep = "" if keep_mark else ", blocked_since=NULL, blocked_why=NULL"
+    run(f"UPDATE pub_upload_jobs SET status='queued', host=NULL, worker=NULL, "
+        f"lease_until=NULL, claim_token=NULL{keep} WHERE release_id=?", (release_id,))
+    run("UPDATE pub_releases SET status='pending' WHERE release_id=?", (release_id,))
+
+
 def main() -> int:
     prof = seed()
 
@@ -450,6 +467,50 @@ def main() -> int:
     check_true("состояния заведены отдельной таблицей", "const PROFILE_BUSY" in page)
     for word in ("занят", "свободен", "не знаем"):
         check_true(f"на карточке есть «{word}»", f"title: '{word}'" in page)
+
+    print("Молчание AdsPower не выдаётся за освобождение")
+    # Разбор 30.09.2026. Раньше в учёт приходила ОДНА строка «занят», и любое незнание —
+    # упавший AdsPower, неопрошенная машина, несверённый профиль — выглядело как
+    # освобождение: пометка снималась, в журнал шло «профиль освободился», а тревога
+    # уходила владельцу как «ПОЧИНИЛОСЬ». То есть обрыв связи объявлял сам себя
+    # починкой ровно в ту минуту, когда посторонний держал профиль.
+    revive("rel-a")
+    forget_answers()
+    open_now({"u46"})
+    claim()
+    check_true("посторонний держит — пометка стоит",
+               job("rel-a")["blocked_since"] is not None)
+    said_before = journal("rel-a")
+
+    ADS.silent = True
+    forget_answers()
+    try:
+        claim()
+    finally:
+        ADS.silent = False
+    tail = journal("rel-a")[len(said_before):]
+    check("«освободился» при молчании в журнал не писали", "освободил" in tail, False)
+    check_true("зато сказано, что спросить не удалось",
+               "проверить не удалось" in tail)
+    given = job("rel-a")
+    check_true("и задание всё-таки выдано: незнание заливку не останавливает",
+               given["status"] == "running")
+    # Пометка означает «стоит из-за чужого профиля». Выданное задание не стоит, и
+    # оставленная пометка врала бы на экране, а вернувшись в очередь — и тревогой.
+    check("на выданном задании пометки ожидания нет", given["blocked_since"], None)
+
+    print("А честный ответ «свободен» пометку снимает и говорит об этом")
+    revive("rel-a")
+    forget_answers()
+    open_now({"u46"})
+    claim()                                   # снова придержали
+    said_before = journal("rel-a")
+    forget_answers()
+    open_now(set())                           # посторонний закрыл профиль
+    claim()
+    check("пометка снята", job("rel-a")["blocked_since"], None)
+    check("и это сказано в журнале",
+          "освободил" in journal("rel-a")[len(said_before):], True)
 
     print()
     if FAILS:
