@@ -37,6 +37,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from starlette.concurrency import run_in_threadpool
 
 import pub_adspower
+import pub_artifact
 from pub_log import add as log_line, add_lines
 
 # Сколько ждать вестей от ноды, прежде чем считать заливку зависшей.
@@ -167,6 +168,40 @@ def register_upload_routes(app, ctx):
             log_line(c, r["release_id"], "заливка",
                      "профиль освободился — задание снова можно выдавать", now=now)
 
+    # ── ворота: ролик должен быть ТЕМ САМЫМ, который допустили ──
+
+    def _stale_reason(c, row) -> str:
+        """Чем ролик перестал быть принятой версией. Всё в порядке — пустая строка.
+
+        Сверка идёт по опознанию, записанному в момент допуска (`pub_artifact`), а не
+        по пути: путь у рендера постоянный, и пересобранный проект подменяет файл, не
+        меняя в задании ни строчки. Читается при этом два мегабайта с краёв, а не весь
+        ролик, — иначе каждая выдача задания упиралась бы в диск на минуты.
+
+        У заданий, допущенных до появления опознания, сверять не с чем; молчим, а не
+        объявляем их пересобранными: остановить исправный выпуск здесь так же плохо,
+        как пропустить пересобранный, — готовый ролик встанет и будет ждать человека.
+        """
+        saved = pub_artifact.load(row["video_passport"])
+        if not saved:
+            return ""
+        fresh = pub_artifact.passport(c, row["release_id"], row["video_path"])
+        return pub_artifact.mismatch(saved, fresh)
+
+    def _refuse_stale(c, row, why: str, now: float, was: str) -> str:
+        """Снять задание с заливки и сказать человеку, почему. Возвращает текст отказа.
+
+        Клейм НЕ обнуляем: нода могла держать это задание и доводить мастер до конца,
+        и её поздний вердикт обязан доехать — по нему видно, ушёл ролик или нет.
+        Статус `error` заодно защищает саму причину: поздний НЕуспех от ноды ложится
+        как «already_error» и не перетирает объяснение (см. `upload_result`).
+        """
+        text = pub_artifact.refusal(why)
+        c.execute("UPDATE pub_upload_jobs SET status='error', error=?, finished=?, "
+                  "updated=? WHERE id=? AND status=?", (text, now, now, row["id"], was))
+        log_line(c, row["release_id"], "заливка", text, level="error", now=now)
+        return text
+
     # ── взять задание ──
     @app.post("/api/upload/claim")
     async def upload_claim(request: Request):
@@ -256,6 +291,14 @@ def register_upload_routes(app, ctx):
                 if busy_why or ours or r["uc"] in busy_channels:
                     continue
                 if task is None:
+                    # Сверяем ровно того кандидата, которого собираемся выдать: чтение
+                    # файла идёт внутри `BEGIN IMMEDIATE`, а замок держит запись всей
+                    # базы. Проверять так все задания очереди значило бы упереть кабинет
+                    # в диск на каждом опросе ноды.
+                    stale = _stale_reason(c, r)
+                    if stale:
+                        _refuse_stale(c, r, stale, now, "queued")
+                        continue
                     task = r
                     unknown_why = why_unknown
                     # Со следующего задания этот профиль и этот канал заняты нами.
@@ -340,6 +383,17 @@ def register_upload_routes(app, ctx):
                 raise HTTPException(404, "нет такого задания")
             _own(request, rel)
             path = rel["video_path"] if kind == "video" else (rel["cover_path"] or "")
+            if kind == "video":
+                # Последние ворота перед тем, как байты уйдут с сервера. Ворота на
+                # выдаче задания стоят раньше, но между ними и этой секундой рендер
+                # успевает закончиться и переписать файл: отдать его уже нельзя —
+                # обратно из YouTube ролик не вернуть.
+                stale = _stale_reason(c, rel)
+                if stale:
+                    now = _now()
+                    text = _refuse_stale(c, rel, stale, now, "running")
+                    c.commit()
+                    raise HTTPException(409, text)
         finally:
             c.close()
         if not path or not os.path.exists(path):

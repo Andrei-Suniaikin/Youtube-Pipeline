@@ -430,7 +430,9 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
     Что делаем и чего НЕ делаем:
 
     * фазу не откатываем — работа, которая уже сделана и оплачена, остаётся сделанной.
-      Движок продолжит с того шага, где остановился;
+      Движок продолжит с того шага, где остановился. Единственное исключение —
+      аннулирование допуска заливки ниже: там прежняя приёмка ролика уже
+      недействительна, и продолжать с неё значит залить не ту версию;
     * попытки обнуляем: человек посмотрел и решил, что причина устранена, — считать
       ему старые провалы значит через два тика снова уронить выпуск в разбор.
       `keep_attempts=True` оставляет счётчик, если возврат делается вслепую;
@@ -450,8 +452,37 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
         return {"ok": False,
                 "why": "загрузка уже начиналась — повтор запрещён навсегда, "
                        "нужен разбор вручную"}
+    # Допуск ролика в очередь привязан к конкретной версии проекта и файла, и мёртвое
+    # задание заливки означает, что прежняя приёмка недействительна: файл пересобрали
+    # либо выпуск сняли в разбор ещё до выдачи. Оставить выпуск на фазе «комплект отдан»
+    # нельзя — вперёд из неё ведёт только «идёт заливка», а задания больше нет, и выпуск
+    # тем же тиком уехал бы обратно в разбор. Поэтому допуск аннулируем целиком: задание
+    # убираем, фазу возвращаем на «обложка готова», и движок соберёт комплект заново,
+    # заново опознав файл.
+    #
+    # Делаем это, только когда доказано, что ничего не отправлено и задание никто не
+    # держит: `reached_irreversible` выше уже сказал, что в YouTube ничего не ушло, а
+    # здесь проверяем, что нода не сидит на задании прямо сейчас (нет клейма, статус не
+    # «running»). Иначе снос задания оборвал бы связь с живой заливкой: её поздний
+    # вердикт получил бы «нет такого задания», и ролик на канале остался бы для нас
+    # невидимым — а это прямая дорога ко второму ролику.
+    #
+    # Цена решения: комплект собирается заново целиком, то есть название ролика второй
+    # раз просится у модели — это оплачиваемый вызов. Он копеечный и он один, а
+    # собирать комплект наполовину (взять старое название к новому файлу) значит
+    # отправить на канал ролик с описанием от версии, которой больше нет.
+    phase = rel["phase"] or "created"
+    job = c.execute("SELECT id, status, claim_token, video_id FROM pub_upload_jobs "
+                    "WHERE release_id=?", (release_id,)).fetchone()
+    annul = bool(job and phase in ("upload_pending", "upload_running")
+                 and (job["status"] or "") != "running"
+                 and not job["claim_token"] and not job["video_id"])
+    if annul:
+        phase = "cover_ready"
     fields = {"status": "pending", "blocked_reason": None,
-              "deadline": now + PHASE_DEADLINES.get(rel["phase"], DEFAULT_DEADLINE)}
+              "deadline": now + PHASE_DEADLINES.get(phase, DEFAULT_DEADLINE)}
+    if annul:
+        fields["phase"] = phase
     if not keep_attempts:
         fields["attempts"] = 0
     # guard=False сознательно: охрана `_set` пропускает только живые выпуски
@@ -459,13 +490,20 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
     # возвращаем только из «blocked» и только не из необратимой фазы.
     if not _set(c, release_id, now, guard=False, **fields):
         return {"ok": False, "why": "выпуск не обновился — возможно, он удалён"}
+    if annul:
+        # Задание удаляем, а не помечаем: это работа, а не история. История остаётся
+        # в журнале выпуска — там видно и что допускали, и почему допуск отменён.
+        c.execute("DELETE FROM pub_upload_jobs WHERE id=?", (job["id"],))
+        log_line(c, release_id, "заливка",
+                 "прежняя приёмка отменена вместе с заданием: ролик опознаем заново "
+                 "и соберём комплект с нуля", now=now)
     c.execute("UPDATE pub_plan_items SET status='running', updated=? WHERE id=? "
               "AND status='error'", (now, rel["plan_item_id"]))
     log_line(c, release_id, "движок",
-             f"возвращён в работу с фазы «{rel['phase']}»"
+             f"возвращён в работу с фазы «{phase}»"
              + ("" if keep_attempts else ", счётчик попыток обнулён"), now=now)
     log_phase(c, release_id, "revived", now, payload={"from_phase": rel["phase"]})
-    return {"ok": True, "phase": rel["phase"]}
+    return {"ok": True, "phase": phase}
 
 
 def quarantine(c, rel, now: float, reason: str) -> None:
