@@ -45,6 +45,15 @@
 Пустое значение здесь всегда означает «не знаем» и никогда — «ноль»: у выпуска может
 не быть рендера в нашей очереди (ролик пришёл другим путём), и это не повод считать
 его версию совпавшей или несовпавшей.
+
+Отдельно про ПРОПАВШУЮ строку рендера. Пересборка — это ИЗМЕНЕНИЕ: другой номер
+рендера либо другая квитанция у прежнего. А строка очереди исчезает и без всякой
+пересборки: кнопка «Убрать завершённые задачи» в кабинете (`server/main.py`, ручка
+/api/queue/clear) удаляет строки завершённых задач, то же делают чистка хранения и
+восстановление базы. Отсутствие строки — «не знаем», и объявлять по нему принятый
+ролик пересобранным нельзя: уборка мусора оператором убивала бы готовые выпуски.
+Когда строки нет, за ролик ручается отпечаток файла — он сверяется первым, и если
+сошёлся, на диске лежат те самые байты, которые допустили.
 """
 
 from __future__ import annotations
@@ -91,6 +100,27 @@ def file_mark(path: str) -> dict:
     return {"size": size, "edges": digest.hexdigest(), "mtime": mtime}
 
 
+def status_text(status) -> str:
+    """Состояние рендера словами человека. Пустое — «не записано», а не «ошибка»."""
+    words = {"queued": "стоит в очереди", "running": "идёт", "error": "ошибка",
+             "canceled": "отменён", "cancelled": "отменён", "done": "готов"}
+    s = str(status or "").strip()
+    if not s:
+        return "состояние не записано"
+    return words.get(s, f"состояние «{s}»")
+
+
+def row_seen(mark: dict) -> bool:
+    """Была ли строка рендера видна, когда снимали это опознание.
+
+    Ключ `row` появился 29.09.2026. У опознаний, записанных до него, о строке судим
+    по статусу: непустым он бывает только там, где строку нашли.
+    """
+    if "row" in mark:
+        return bool(mark["row"])
+    return bool(mark.get("status"))
+
+
 def build_mark(c, release_id: str) -> dict:
     """Версия сборки выпуска: номер рендера и его квитанция.
 
@@ -101,14 +131,19 @@ def build_mark(c, release_id: str) -> dict:
         "SELECT remote_job_id FROM pub_release_jobs WHERE release_id=? "
         "AND service='vsgen' AND kind='render'", (release_id,)).fetchone()
     job = (row["remote_job_id"] if row and row["remote_job_id"] else "")
-    mark = {"job": str(job or ""), "status": "", "out": "", "sha256": "", "size": None}
+    mark = {"job": str(job or ""), "row": False, "status": "", "out": "",
+            "sha256": "", "size": None}
     if not mark["job"]:
         return mark
     task = c.execute(
         "SELECT status, output_rel, render_sha256, render_size FROM queue_tasks "
         "WHERE job_id=? AND kind='render'", (mark["job"],)).fetchone()
     if task is None:
+        # Строки рендера в очереди нет. Это не «пересобрали»: строку сносит кнопка
+        # «Убрать завершённые задачи», чистка хранения, восстановление базы. `row`
+        # остаётся ложью, чтобы сверка не приняла пустой статус за «рендер идёт заново».
         return mark
+    mark["row"] = True
     mark["status"] = task["status"] or ""
     mark["out"] = task["output_rel"] or ""
     mark["sha256"] = task["render_sha256"] or ""
@@ -143,6 +178,11 @@ def mismatch(saved: dict, fresh: dict) -> str:
 
     Опознания нет вовсе (задание допущено до этой проверки) — молчим: объявить старое
     задание пересобранным значило бы остановить выпуски, с которыми всё в порядке.
+
+    Так же и со строкой рендера: её ОТСУТСТВИЕ ничего не говорит о версии ролика, а
+    вот другая строка — говорит. Отказ здесь стоит дорого (готовый выпуск встанет
+    и будет ждать человека), поэтому причина обязана называть то, что мы видим:
+    пропавшую строку нельзя выдавать за перезапуск рендера.
     """
     if not saved:
         return ""
@@ -162,16 +202,27 @@ def mismatch(saved: dict, fresh: dict) -> str:
         return ("проект пересобран после приёмки: ролик принимали от рендера "
                 f"№{old_build.get('job') or 'неизвестно'}, а сейчас у выпуска рендер "
                 f"№{new_build.get('job') or 'неизвестно'}")
-    if old_build.get("job"):
+    if not old_build.get("job"):
+        return ""                       # рендера в нашей очереди нет — сверять не с чем
+    if row_seen(old_build) and row_seen(new_build):
         if new_build.get("status") != "done":
-            return (f"рендер №{old_build['job']} запущен заново — принятой версии "
-                    "ролика сейчас нет")
+            return (f"рендер №{old_build['job']} больше не готов "
+                    f"({status_text(new_build.get('status'))}) — принятой версии ролика "
+                    "у выпуска сейчас нет")
         if old_build.get("sha256") != new_build.get("sha256") \
                 or old_build.get("size") != new_build.get("size") \
                 or old_build.get("out") != new_build.get("out"):
             return (f"проект пересобран после приёмки: рендер №{old_build['job']} "
                     "переделан, квитанция другая")
-    return ""
+        return ""
+    # Строки рендера в очереди не видно. Это «не знаем», а не «пересобрали»: её сносит
+    # уборка списка завершённых задач. За ролик тогда ручается отпечаток файла — он
+    # сверен выше и сошёлся, значит на диске те самые байты, которые допустили.
+    if old_file and new_file:
+        return ""
+    return ("не удалось подтвердить версию ролика: строки рендера "
+            f"№{old_build['job']} в очереди больше нет, а отпечатка файла с приёмки "
+            "нет тоже")
 
 
 def refusal(why: str) -> str:

@@ -23,7 +23,16 @@
      лежит на месте целым, отпечаток сходится, но он больше не последняя версия;
   3. рендер запущен заново и ещё идёт — принятой версии сейчас нет вовсе.
 
-Отдельно закреплены две вещи, которые легко сломать «улучшением»:
+Отдельно закреплены четыре вещи, которые легко сломать «улучшением»:
+
+  * **убранная строка очереди — не пересборка.** Кнопка «Убрать завершённые задачи»
+    (`server/main.py`, /api/queue/clear) удаляет строки завершённых рендеров. Пока
+    отсутствие строки читалось как «рендер запущен заново», уборка списка убивала все
+    стоящие в очереди заливки с ложной причиной. Отсутствие — «не знаем»; ручается
+    отпечаток файла;
+  * **отпечаток идёт ветвью хвоста.** У боевого ролика мегабайты, и края читаются
+    двумя кусками. Проверки на файлах по 4 КБ эту ветку не исполняют вовсе: чтение
+    забирает такой файл целиком. Поэтому здесь есть ролик БОЛЬШЕ окна края;
 
   * **время записи файла в сверке не участвует.** Восстановление из бэкапа и обычный
     `cp` переставляют mtime, не трогая байты. Ложная тревога здесь дороже: готовый
@@ -205,6 +214,27 @@ def write_video(pid, jid, body: bytes) -> str:
     return path
 
 
+def write_sparse_video(pid, jid, head: bytes, tail: bytes, size: int,
+                       mid: bytes = b"") -> str:
+    """Многомегабайтный ролик дёшево: края настоящие, середина — дыра в файле.
+
+    Гонять мегабайты через память незачем, а размер важен: пока файл короче окна края,
+    чтение забирает его целиком и боевая ветка хвоста не исполняется вовсе.
+    """
+    folder = os.path.join(TMP, "projects", pid, "render")
+    os.makedirs(folder, exist_ok=True)
+    path = os.path.join(folder, f"{jid}.mp4")
+    with open(path, "wb") as f:
+        f.write(head)
+        f.truncate(size)
+        if mid:
+            f.seek((size - len(mid)) // 2)
+            f.write(mid)
+        f.seek(size - len(tail))
+        f.write(tail)
+    return path
+
+
 def render_receipt(jid, pid, path, status="done"):
     """Квитанция рендера: то, что пишет приём результата, — путь, SHA и размер."""
     import hashlib
@@ -245,6 +275,25 @@ def make_release(n: int, body: bytes):
     path = write_video(pid, jid, body)
     render_receipt(jid, pid, path)
     return {"rid": rid, "pid": pid, "jid": jid, "path": path, "uc": uc}
+
+
+def make_big_release(n: int, mark: str, size: int, mid: bytes = b""):
+    """Выпуск с роликом больше окна края: отпечаток обязан пойти ветвью хвоста."""
+    rel = make_release(n, body_of(mark, 4096))
+    path = write_sparse_video(rel["pid"], rel["jid"], f"[{mark}-начало]".encode("utf-8"),
+                              f"[{mark}-конец]".encode("utf-8"), size, mid)
+    render_receipt(rel["jid"], rel["pid"], path)       # квитанция под нынешний файл
+    return rel
+
+
+def clear_queue_row(jid):
+    """То же, что кнопка «Убрать завершённые задачи»: строка завершённой задачи уходит.
+
+    Условие один в один с ручкой /api/queue/clear (`server/main.py`): активные задачи
+    она не трогает, файлы проектов не удаляет — убирает только запись из списка.
+    """
+    run("DELETE FROM queue_tasks WHERE job_id=? AND status NOT IN ('queued','running')",
+        (jid,))
 
 
 def rel_of(rid):
@@ -392,8 +441,21 @@ def main() -> int:
     run("UPDATE queue_tasks SET status='running', render_sha256=NULL, render_size=NULL "
         "WHERE job_id=?", (e["jid"],))
     check("задание не выдано", claim(), None)
-    check_true("причина про идущий заново рендер",
-               "запущен заново" in (job(e["rid"])["error"] or ""))
+    why = job(e["rid"])["error"] or ""
+    check_true("причина называет рендер", f"№{e['jid']}" in why)
+    check_true("и говорит, что принятой версии нет", "принятой версии ролика" in why)
+    # Причина обязана называть то состояние, которое ВИДНО в очереди, а не догадку:
+    # «запущен заново» про рендер, упавший с ошибкой, — неправда.
+    check_true("и называет нынешнее состояние рендера", "идёт" in why)
+
+    print("Рендер упал с ошибкой — так и сказано, без догадок про перезапуск")
+    n = make_release(11, body_of("одиннадцать", 4096))
+    admit(n["rid"])
+    run("UPDATE queue_tasks SET status='error' WHERE job_id=?", (n["jid"],))
+    check("задание не выдано", claim(), None)
+    why = job(n["rid"])["error"] or ""
+    check_true("сказано про ошибку рендера", "ошибка" in why)
+    check_true("и не выдумано, что рендер идёт заново", "запущен заново" not in why)
 
     print("Файл переписан ПОСЛЕ выдачи задания — байты не уходят")
     f = make_release(5, body_of("пять", 4096))
@@ -465,6 +527,115 @@ def main() -> int:
     check("и фаза не откатилась", sql(
         "SELECT phase FROM pub_releases WHERE release_id=?", (m["rid"],))[0]["phase"],
         "upload_pending")
+
+    print("Уборка списка завершённых задач не отменяет приёмку")
+    p1 = make_release(12, body_of("двенадцать", 4096))
+    admit(p1["rid"])
+    before = open(p1["path"], "rb").read()
+    clear_queue_row(p1["jid"])
+    check("строка рендера действительно убрана", sql(
+        "SELECT job_id FROM queue_tasks WHERE job_id=?", (p1["jid"],)), [])
+    task = claim()
+    check("задание выдано — ролик на месте и тот же",
+          (task or {}).get("release_id"), p1["rid"])
+    got = fetch(p1["rid"], (task or {}).get("claim_token"))
+    check("и байты отданы", got.status_code, 200)
+    check("именно те самые", got.content, before)
+    check("задание не снято с заливки", job(p1["rid"])["status"], "running")
+    check_true("и в журнале нет выдумки про пересборку",
+               "пересобран" not in journal(p1["rid"]))
+    park(p1["rid"])
+
+    print("Строку убрали, а файл подменили — отказ, но причина именно про файл")
+    p2 = make_release(13, body_of("тринадцать", 4096))
+    admit(p2["rid"])
+    clear_queue_row(p2["jid"])
+    write_video(p2["pid"], p2["jid"], body_of("тринадцать-заново", 9000))
+    check("задание не выдано", claim(), None)
+    why = job(p2["rid"])["error"] or ""
+    check_true("причина про файл", "файл пересобран после приёмки" in why)
+    check_true("и ни слова про рендер, о котором мы ничего не знаем",
+               "рендер" not in why)
+
+    print("Опознание в одиночку: пропавшая строка рендера — это «не знаем»")
+    same_file = {"size": 100, "edges": "края", "mtime": 1}
+    kept = {"build": {"job": "7", "row": True, "status": "done", "out": "render/7.mp4",
+                      "sha256": "abc", "size": 100}, "file": same_file}
+    gone = {"build": {"job": "7", "row": False, "status": "", "out": "", "sha256": "",
+                      "size": None}, "file": dict(same_file)}
+    check("строки нет, а отпечаток сошёлся — молчим",
+          pub_artifact.mismatch(kept, gone), "")
+    # Опознания, записанные до 29.09.2026, ключа `row` не содержат вовсе, и читать их
+    # надо так же: иначе выкатка снесла бы всё, что уже стоит в очереди.
+    old_style = {"build": {k: v for k, v in kept["build"].items() if k != "row"},
+                 "file": same_file}
+    check("опознание старого образца читается так же",
+          pub_artifact.mismatch(old_style, gone), "")
+    # …и сверять их по-прежнему надо целиком: строка рендера на месте, но квитанция
+    # другая — это пересборка, и старый образец опознания не повод её пропустить.
+    redone = {"build": {"job": "7", "row": True, "status": "done",
+                        "out": "render/7.mp4", "sha256": "другой", "size": 100},
+              "file": dict(same_file)}
+    check_true("у старого образца квитанция всё так же сверяется",
+               "квитанция другая" in pub_artifact.mismatch(old_style, redone))
+    blind = {"build": dict(kept["build"]), "file": {}}
+    why = pub_artifact.mismatch(blind, gone)
+    check_true("а без отпечатка сказано честно: подтвердить нечем",
+               "не удалось подтвердить версию" in why)
+    check_true("и это не объявлено пересборкой", "пересобран" not in why)
+
+    print("Ролик больше окна края: хвост читается, подмена в конце видна")
+    BIG = 3 << 20
+    check_true("проверяем именно ветку хвоста", BIG > pub_artifact.EDGE_BYTES)
+    q1 = make_big_release(14, "четырнадцать", BIG)
+    check("ролик нужной длины", os.path.getsize(q1["path"]), BIG)
+    admit(q1["rid"])
+    check("запомнен размер многомегабайтного ролика",
+          pub_artifact.load(job(q1["rid"])["video_passport"])["file"]["size"], BIG)
+    # Подмена в самом конце: длина та же, начало то же. Заметить это можно только
+    # чтением хвоста. Квитанцию рендера не трогаем — молчаливая подмена файла её и
+    # не меняет, ровно на этом и держится смысл отпечатка.
+    write_sparse_video(q1["pid"], q1["jid"], "[четырнадцать-начало]".encode("utf-8"),
+                       "[четырнадцать-КОНЕЦ!]".encode("utf-8"), BIG)
+    check("длина не изменилась", os.path.getsize(q1["path"]), BIG)
+    check("задание не выдано", claim(), None)
+    check_true("причина про подменённое содержимое",
+               "содержимое другое" in (job(q1["rid"])["error"] or ""))
+
+    print("Подмена внутри окна хвоста, но не в самых последних байтах — тоже видна")
+    q2 = make_big_release(15, "пятнадцать", BIG)
+    admit(q2["rid"])
+    with open(q2["path"], "r+b") as f:
+        f.seek(BIG - pub_artifact.EDGE_BYTES + 4096)   # в хвосте, далеко от конца
+        f.write("подменённый кадр".encode("utf-8"))
+    check("длина не изменилась", os.path.getsize(q2["path"]), BIG)
+    check("задание не выдано", claim(), None)
+    check_true("причина про подменённое содержимое",
+               "содержимое другое" in (job(q2["rid"])["error"] or ""))
+
+    print("И начало у большого ролика читается по-прежнему")
+    q3 = make_big_release(16, "шестнадцать", BIG)
+    admit(q3["rid"])
+    with open(q3["path"], "r+b") as f:
+        f.seek(0)
+        f.write("ДРУГОЕ НАЧАЛО".encode("utf-8"))
+    check("длина не изменилась", os.path.getsize(q3["path"]), BIG)
+    check("задание не выдано", claim(), None)
+    check_true("причина про подменённое содержимое",
+               "содержимое другое" in (job(q3["rid"])["error"] or ""))
+
+    print("Середину большого ролика отпечаток не читает — осознанный размен")
+    # Это не недосмотр: сверка идёт на каждой выдаче задания и на каждой отдаче байтов,
+    # и чтение всего ролика упиралось бы в диск на минуты. Пересборку, которая
+    # переписывает файл целиком, ловят и края, и версия сборки.
+    q4 = make_big_release(17, "семнадцать", BIG)
+    admit(q4["rid"])
+    with open(q4["path"], "r+b") as f:
+        f.seek(BIG // 2)                               # ровно между окнами края
+        f.write("правка в середине".encode("utf-8"))
+    check("длина не изменилась", os.path.getsize(q4["path"]), BIG)
+    check("задание выдано: края те же", (claim() or {}).get("release_id"), q4["rid"])
+    park(q4["rid"])
 
     print()
     if FAILS:
