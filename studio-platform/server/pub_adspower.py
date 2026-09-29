@@ -408,20 +408,11 @@ def merge_host_profiles(c: sqlite3.Connection, tenant_id: str, host_id: int,
                 c.execute("UPDATE pub_profiles SET missing_since=? WHERE id=?", (at, pid))
                 missing_now += 1
 
-        c.execute(
-            "UPDATE pub_profiles SET active_now=0 WHERE tenant_id=? AND default_host_id=?",
-            (tenant_id, host_id))
-        active_ids = [uid for uid in fetch.active_user_ids if uid]
-        if active_ids:
-            placeholders = ",".join("?" * len(active_ids))
-            c.execute(
-                "UPDATE pub_profiles SET active_now=1 WHERE tenant_id=? AND "
-                f"default_host_id=? AND adspower_user_id IN ({placeholders})",
-                (tenant_id, host_id, *active_ids))
-        active_now_count = c.execute(
-            "SELECT COUNT(*) FROM pub_profiles "
-            "WHERE tenant_id=? AND default_host_id=? AND active_now=1",
-            (tenant_id, host_id)).fetchone()[0]
+        # Занятость ложится в справочник ровно тем же кодом, что и у ворот выдачи
+        # (`save_active` ниже): одно знание — одно место записи, иначе два пути со
+        # временем разойдутся и экран начнёт спорить сам с собой.
+        active_now_count = save_active(
+            c, host_id, HostActivity(True, fetch.active_user_ids, "", at), tenant_id)
 
         if not in_tx:
             c.commit()
@@ -433,3 +424,132 @@ def merge_host_profiles(c: sqlite3.Connection, tenant_id: str, host_id: int,
     return MergeSummary(host_id=host_id, pages=fetch.pages, found=found, new=new,
                          reappeared=reappeared, missing_now=missing_now,
                          active_now=active_now_count, at=at)
+
+
+# ══════ Ворота выдачи заливки: кто открыт прямо сейчас (решение владельца 29.09.2026) ══════
+#
+# Требование ТЗ (день 1, п.3): «исключительное владение профилем всеми заливщиками И
+# операторским входом». Распределитель заданий (`server/pub_upload_api.py`) до этого
+# считал занятыми только те профили, которые занял он сам, и не видел ни старый конвейер
+# gen, ни конвейер манхвы, ни человека, открывшего профиль руками. Два браузера в одном
+# профиле рвут куки и ломают идущую заливку — а заливщик, увидев уже запущенный профиль,
+# ещё и «присоединяется без рестарта» (`upload/upload_worker.py`, ветка `browser/active`),
+# то есть садится прямо в чужое окно.
+#
+# Отвечает на вопрос `browser/local-active` тот же модуль, что и опись, — но ответ живёт
+# секунды, а спрашивают его на КАЖДЫЙ опрос ноды (несколько раз в минуту, на каждое
+# рабочее место). Поэтому здесь свой кэш поверх общего ограничителя частоты.
+
+# Свежий ответ годен десять секунд: дольше держать нельзя (за это время человек успеет
+# открыть профиль руками), чаще спрашивать незачем — нода опрашивает кабинет чаще.
+ACTIVE_TTL_OK = 10.0
+# Неудачу помним ДОЛЬШЕ удачи, и это не опечатка. Пока AdsPower не отвечает, каждая
+# попытка стоит целого таймаута, а ответа всё равно нет; повторять её на каждой выдаче
+# значит добавлять пять секунд к каждому заданию ради того же самого «не знаю».
+ACTIVE_TTL_BAD = 60.0
+# Ждём ответа недолго: это ворота выдачи, а не опись. Молчание AdsPower заливку не
+# останавливает (см. `HostActivity.known`), поэтому долгое ожидание не купило бы ничего.
+ACTIVE_TIMEOUT = 5.0
+# Сколько времени записанная занятость профиля считается свежей на экране «Админ».
+# Старше — это уже «не знаем», а не «свободен»: профиль мог открыть кто угодно.
+ACTIVE_FRESH_SEC = 15 * 60
+
+
+@dataclass(frozen=True)
+class HostActivity:
+    """Что известно про занятость профилей ОДНОЙ машины прямо сейчас.
+
+    `known=False` — это «не знаем», и оно НЕ равно «свободно». Перепутав эти два
+    состояния, мы одним обрывом сети остановили бы заливку на всех каналах разом
+    (если считать молчание занятостью) либо начали бы лезть в чужие открытые профили
+    (если считать молчание свободой). Поэтому решение о том, что делать с незнанием,
+    принимает вызывающая сторона, а не этот модуль: здесь только честный ответ.
+
+    `why` — человеческими словами, почему не знаем; пусто, когда знаем.
+    `at` — время ответа по стенным часам (`time.time`), чтобы его можно было записать
+    в базу и показать на экране; для сроков кэша берётся монотонный счётчик отдельно.
+    """
+
+    known: bool
+    user_ids: frozenset[str]
+    why: str
+    at: float
+
+
+_ACTIVE_LOCK = threading.Lock()
+_ACTIVE_CACHE: dict[str, tuple[HostActivity, float]] = {}
+
+
+def _reset_active_cache_for_tests() -> None:
+    """Только для тестов: забыть кэшированные ответы `local-active`."""
+    with _ACTIVE_LOCK:
+        _ACTIVE_CACHE.clear()
+
+
+def active_profiles(adspower_url: str, *, timeout: float = ACTIVE_TIMEOUT,
+                     ttl_ok: float = ACTIVE_TTL_OK, ttl_bad: float = ACTIVE_TTL_BAD,
+                     min_interval: float = MIN_INTERVAL,
+                     sleep: Callable[[float], None] = time.sleep,
+                     clock: Callable[[], float] = time.monotonic) -> HostActivity:
+    """Кто открыт на этой машине прямо сейчас. Не бросает исключений НИКОГДА.
+
+    Отказ AdsPower — это не ошибка вызывающей стороны и не повод останавливать выдачу
+    заданий, поэтому он возвращается значением (`known=False`), а не исключением: с
+    исключением любой вызывающий рано или поздно завернёт вызов в `except` и молча
+    решит, что профиль свободен.
+
+    Сеть трогается не чаще, чем раз в `ttl_ok` секунд на машину (и не чаще раза в
+    секунду — этим занимается общий `_PACE_LIMITER`, тот же, что у описи: предел
+    AdsPower общий на все наши запросы к ней).
+    """
+    url = (adspower_url or "").strip().rstrip("/")
+    if not url:
+        # Машину завели, адрес не вписали — спрашивать некого. Это именно «не знаем»:
+        # профиль вполне может быть открыт, просто нам нечем это увидеть.
+        return HostActivity(False, frozenset(), "у машины не задан адрес AdsPower", 0.0)
+    with _ACTIVE_LOCK:
+        hit = _ACTIVE_CACHE.get(url)
+        if hit is not None:
+            got, at = hit
+            if clock() - at < (ttl_ok if got.known else ttl_bad):
+                return got
+    # Сеть — ВНЕ лока: иначе один не отвечающий AdsPower задерживал бы вопросы про все
+    # остальные машины на весь свой таймаут. Два потока могут спросить одну машину
+    # одновременно — это не беда, ограничитель частоты разведёт их по секундам.
+    _PACE_LIMITER.wait(url, min_interval, sleep, clock)
+    try:
+        got = HostActivity(True, _call_local_active(url, timeout=timeout), "", time.time())
+    except AdsPowerError as exc:
+        got = HostActivity(False, frozenset(), str(exc), time.time())
+    with _ACTIVE_LOCK:
+        _ACTIVE_CACHE[url] = (got, clock())
+    return got
+
+
+def save_active(c: sqlite3.Connection, host_id: int, activity: HostActivity,
+                 tenant_id: str | None = None) -> int:
+    """Записать занятость профилей машины в справочник и вернуть, сколько занято.
+
+    Пишется только ДОСТОВЕРНОЕ знание: при `known=False` не трогается ни одна строка —
+    иначе молчание AdsPower обнуляло бы `active_now` и экран показывал бы «свободен»
+    там, где на самом деле «не знаем».
+
+    `active_at` — когда это знание получено. Без него экран не может отличить «сейчас
+    свободен» от «был свободен утром»: `active_now=0` выглядит одинаково в обоих
+    случаях, а решения по ним разные.
+    """
+    if not activity.known:
+        return 0
+    where, args = ("", ())
+    if tenant_id is not None:
+        where, args = (" AND tenant_id=?", (tenant_id,))
+    c.execute(f"UPDATE pub_profiles SET active_now=0, active_at=? "
+              f"WHERE default_host_id=?{where}", (activity.at, host_id) + args)
+    ids = [uid for uid in activity.user_ids if uid]
+    if ids:
+        holes = ",".join("?" * len(ids))
+        c.execute(f"UPDATE pub_profiles SET active_now=1, active_at=? "
+                  f"WHERE default_host_id=?{where} AND adspower_user_id IN ({holes})",
+                  (activity.at, host_id) + args + tuple(ids))
+    return c.execute(f"SELECT COUNT(*) FROM pub_profiles WHERE default_host_id=?{where} "
+                     f"AND active_now=1", (host_id,) + args).fetchone()[0]

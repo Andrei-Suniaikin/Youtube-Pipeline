@@ -17,6 +17,13 @@
    кабинета, 502), нода спросит снова и получит своё же задание, а не второе.
 4. **Вердикт разбирается по evidence, а не по коду возврата.** «Стоит в расписании» ставится
    только при совпадении канала, video ID, времени и признака SCHEDULED.
+5. **Профиль, открытый ПОСТОРОННИМ, тоже занят.** Пункт 2 знает только про наши заливки,
+   а на той же минской машине живут старый конвейер gen, конвейер манхвы и человек,
+   который открывает профиль руками. Перед выдачей спрашиваем у AdsPower этой машины,
+   кто открыт прямо сейчас (`pub_adspower.active_profiles`), и чужой профиль пропускаем:
+   задание остаётся в очереди, профиль не трогаем. Молчание AdsPower — это НЕ занятость:
+   при нём выдаём как раньше и говорим об этом в журнале, иначе один обрыв сети
+   остановил бы заливку сразу на всех каналах.
 """
 
 from __future__ import annotations
@@ -27,7 +34,9 @@ import secrets
 
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
+from starlette.concurrency import run_in_threadpool
 
+import pub_adspower
 from pub_log import add as log_line, add_lines
 
 # Сколько ждать вестей от ноды, прежде чем считать заливку зависшей.
@@ -73,6 +82,91 @@ def register_upload_routes(app, ctx):
         return c.execute("SELECT * FROM pub_upload_jobs WHERE release_id=?",
                          (release_id,)).fetchone()
 
+    # ── ворота: профиль, открытый посторонним, не выдаём ──
+
+    def _host_targets(c) -> list:
+        """Машины, чьи задания ждут в очереди: [(id, адрес AdsPower, имя для человека)].
+
+        Только чтение базы, без сети — чтобы спрашивать машины можно было отдельно и в
+        другом потоке (см. `_ask_hosts`).
+
+        Машина берётся от ПРОФИЛЯ (`pub_profiles.default_host_id`), а не от имени, которое
+        нода назвала о себе в запросе: имя в запросе — свободная строка из переменной
+        окружения ноды, она ни с чем не связана, а профиль физически живёт там, где его
+        завели, и спрашивать надо именно тот AdsPower.
+        """
+        rows = c.execute(
+            "SELECT DISTINCT p.default_host_id hid, h.adspower_url url, h.title htitle, "
+            "h.code hcode FROM pub_upload_jobs u JOIN pub_profiles p ON p.id=u.profile_id "
+            "LEFT JOIN pub_hosts h ON h.id=p.default_host_id "
+            "WHERE u.status='queued' AND p.default_host_id IS NOT NULL").fetchall()
+        return [(r["hid"], r["url"] or "",
+                 (r["htitle"] or r["hcode"] or "").strip() or f"№{r['hid']}") for r in rows]
+
+    def _ask_hosts(targets) -> dict:
+        """Спросить машины про занятость: id машины → (имя, ответ). Только сеть, без базы.
+
+        Зовётся ДО `BEGIN IMMEDIATE` и в отдельном потоке. Два запрета сразу: внутри
+        транзакции сеть трогать нельзя (`BEGIN IMMEDIATE` держит запись всей базы, и один
+        молчащий AdsPower заморозил бы на свой таймаут весь кабинет), и в потоке цикла
+        событий тоже нельзя — там то же ожидание встало бы поперёк всех остальных ручек.
+        Сами запросы вдобавок кэшируются на секунды (`pub_adspower.active_profiles`):
+        нода опрашивает кабинет чаще, чем меняется ответ, а предел запросов у машины
+        общий с идущими заливками.
+        """
+        return {hid: (name, pub_adspower.active_profiles(url))
+                for hid, url, name in targets}
+
+    def _profile_verdict(r, hosts) -> tuple:
+        """Одно задание глазами AdsPower: (занят посторонним — почему, не знаем — почему).
+
+        Обе строки пустые — профиль точно свободен. Вторая заполнена — мы НЕ знаем, и
+        это не то же самое, что «свободен»: по решению владельца незнание заливку не
+        останавливает, но и молчать о нём нельзя.
+        """
+        if r["profile_id"] is None:
+            return "", "у канала не выбран профиль AdsPower"
+        shown = r["ads_serial"] or r["profile_id"]
+        if r["ads_host"] is None:
+            return "", f"профиль {shown} не привязан к машине — спрашивать некого"
+        uid = (r["ads_uid"] or "").strip()
+        if not uid:
+            return "", (f"профиль {shown} ещё не сверен с AdsPower — нажмите "
+                        f"«Обновить список профилей» у машины")
+        known = hosts.get(r["ads_host"])
+        if known is None:
+            # Задание завелось между опросом машин и началом транзакции. Следующий
+            # опрос ноды (через считанные секунды) спросит уже и про него.
+            return "", f"профиль {shown}: занятость этой машины в этот раз не спрашивали"
+        hname, act = known
+        if not act.known:
+            return "", f"AdsPower машины «{hname}» не ответил: {act.why}"
+        if uid in act.user_ids:
+            return (f"профиль {shown} сейчас открыт на машине «{hname}» не нами: "
+                    f"жду, пока освободится, профиль не трогаю"), ""
+        return "", ""
+
+    def _remember_block(c, r, why: str, now: float) -> None:
+        """Запомнить или снять «задание стоит из-за чужого профиля».
+
+        В журнал пишем только на переломе состояния. Нода опрашивает кабинет несколько
+        раз в минуту, и строка на каждый опрос превратила бы журнал выпуска в ленту
+        одинаковых сообщений, в которой не найти, что было до того.
+        """
+        if why:
+            if r["blocked_since"] is None:
+                c.execute("UPDATE pub_upload_jobs SET blocked_since=?, blocked_why=?, "
+                          "updated=? WHERE id=?", (now, why[:400], now, r["id"]))
+                log_line(c, r["release_id"], "заливка", why, level="warn", now=now)
+            elif (r["blocked_why"] or "") != why:
+                c.execute("UPDATE pub_upload_jobs SET blocked_why=? WHERE id=?",
+                          (why[:400], r["id"]))
+        elif r["blocked_since"] is not None:
+            c.execute("UPDATE pub_upload_jobs SET blocked_since=NULL, blocked_why=NULL, "
+                      "updated=? WHERE id=?", (now, r["id"]))
+            log_line(c, r["release_id"], "заливка",
+                     "профиль освободился — задание снова можно выдавать", now=now)
+
     # ── взять задание ──
     @app.post("/api/upload/claim")
     async def upload_claim(request: Request):
@@ -104,7 +198,16 @@ def register_upload_routes(app, ctx):
 
         c = db()
         try:
+            # Спрашиваем AdsPower ДО транзакции и вне цикла событий — см. `_ask_hosts`.
+            targets = _host_targets(c)
+            hosts = await run_in_threadpool(_ask_hosts, targets) if targets else {}
             c.execute("BEGIN IMMEDIATE")
+            # Живое знание о занятости ложится в справочник (`pub_profiles.active_now` и
+            # `active_at`) — из него экран «Админ» и рисует «занят / свободен / не знаем».
+            # Без этой записи карточка профилей знала бы только о ручной описи, то есть
+            # почти всегда честно отвечала бы «не знаем». Молчащая машина не пишет ничего.
+            for _hid, (_hname, _act) in hosts.items():
+                pub_adspower.save_active(c, _hid, _act)
             # (3) Повторный запрос той же ноды — возвращаем её же задание с тем же токеном.
             mine = c.execute(
                 "SELECT * FROM pub_upload_jobs WHERE status='running' AND host=? AND worker=? "
@@ -121,10 +224,17 @@ def register_upload_routes(app, ctx):
             # Только задания ЖИВЫХ выпусков: отменённый или карантинный выпуск мог оставить
             # своё задание в очереди — заливать его значит заливать ролик без хозяина.
             rows = c.execute(
-                "SELECT u.* FROM pub_upload_jobs u JOIN pub_releases r "
+                "SELECT u.*, p.serial ads_serial, p.adspower_user_id ads_uid, "
+                "p.default_host_id ads_host FROM pub_upload_jobs u JOIN pub_releases r "
                 "ON r.release_id=u.release_id AND r.status IN ('pending','running') "
+                "LEFT JOIN pub_profiles p ON p.id=u.profile_id "
                 "WHERE u.status='queued' ORDER BY u.slot_at, u.id").fetchall()
             task = None
+            unknown_why = ""
+            # Перебираем ВСЕ задания, даже найдя подходящее: пометка «стоит из-за чужого
+            # профиля» должна быть верна у каждого, иначе задание, которое давно
+            # освободилось, но до которого очередь не дошла, поднимет ложную тревогу
+            # через полчаса.
             for r in rows:
                 # Задание могло состариться в очереди: запланировать прошедший момент
                 # нельзя, отсеиваем ДО того, как нода начнёт качать файл.
@@ -137,9 +247,23 @@ def register_upload_routes(app, ctx):
                              "задание состарилось в очереди — время выхода прошло",
                              level="error", now=now)
                     continue
-                if r["profile_id"] not in busy_profiles and r["uc"] not in busy_channels:
+                ours = r["profile_id"] in busy_profiles
+                # (5) Чужим считаем профиль, только если он НЕ занят нами: наша же идущая
+                # заливка держит его открытым в том же AdsPower, и без этой проверки мы
+                # приняли бы себя за постороннего и объявили тревогу на ровном месте.
+                busy_why, why_unknown = ("", "") if ours else _profile_verdict(r, hosts)
+                _remember_block(c, r, busy_why, now)
+                if busy_why or ours or r["uc"] in busy_channels:
+                    continue
+                if task is None:
                     task = r
-                    break
+                    unknown_why = why_unknown
+                    # Со следующего задания этот профиль и этот канал заняты нами.
+                    # Пустой профиль в множество не кладём: иначе два задания без
+                    # выбранного профиля стали бы мешать друг другу, чего раньше не было.
+                    if r["profile_id"] is not None:
+                        busy_profiles.add(r["profile_id"])
+                    busy_channels.add(r["uc"])
             if task is None:
                 c.commit()
                 return JSONResponse({"task": None})
@@ -157,6 +281,13 @@ def register_upload_routes(app, ctx):
             log_line(c, fresh["release_id"], "заливка",
                      f"выдал задание машине {host}, место {worker}, профиль "
                      f"{fresh['profile_id']}, выход {fresh['schedule_iso'] or 'сразу'}", now=now)
+            if unknown_why:
+                # Выдали, НЕ проверив занятость. Молчать об этом нельзя: если в профиль
+                # в этот момент кто-то зашёл руками, разбираться с порванными куками
+                # будут по этой строке журнала.
+                log_line(c, fresh["release_id"], "заливка",
+                         f"занятость профиля проверить не удалось ({unknown_why}) — "
+                         f"задание выдано без проверки", level="warn", now=now)
             c.commit()          # запись журнала после commit иначе теряется при закрытии
             log(f"заливка: выдал задание {fresh['release_id']} → {host}/{worker}, "
                 f"профиль {fresh['profile_id']}")

@@ -2069,9 +2069,30 @@ def ui_host_refresh_profiles(host_id: int):
     return out
 
 
+def _profile_busy(row, now: float) -> tuple:
+    """Занятость одного профиля тремя состояниями: занят / свободен / не знаем.
+
+    «Не знаем» — отдельное состояние, а не «свободен», и это главное здесь. Сведения о
+    занятости живут секунды: их приносит либо опись машины, либо ворота выдачи заливки
+    (`pub_upload_api`), и обе пишут `active_at` — когда это стало известно. Показать
+    вчерашнее «свободен» как сегодняшнее значит позвать человека открыть профиль,
+    в котором прямо сейчас идёт чужая заливка.
+    """
+    if row["missing_since"] is not None:
+        return "unknown", "профиль пропал с машины при последней описи"
+    at = row["active_at"]
+    if not at:
+        return "unknown", "занятость ещё не спрашивали — нажмите «Обновить все»"
+    old = now - float(at)
+    if old > _adspower().ACTIVE_FRESH_SEC:
+        return "unknown", f"сведениям {int(old // 60)} мин — это уже не «сейчас»"
+    return ("busy" if row["active_now"] else "free"), ""
+
+
 @app.get("/ui/profiles")
 def ui_profiles():
     """Общий список профилей со всех машин — владелец просил именно так."""
+    now = time.time()
     c = db()
     try:
         rows = c.execute(
@@ -2081,16 +2102,21 @@ def ui_profiles():
             (TENANT,)).fetchall()
     finally:
         c.close()
-    return {"profiles": [{
-        "id": r["id"], "serial": r["serial"], "title": r["title"] or "",
-        "group_name": r["group_name"] or "", "remark": r["remark"] or "",
-        "last_open_time": r["last_open_time"] or "", "status": r["status"],
-        "active_now": bool(r["active_now"]), "missing_since": r["missing_since"],
-        "last_seen": r["last_seen"],
-        "host": ({"id": r["default_host_id"], "code": r["host_code"] or "",
-                  "title": r["host_title"] or r["host_code"] or ""}
-                 if r["default_host_id"] is not None else None),
-    } for r in rows]}
+    out = []
+    for r in rows:
+        busy, why = _profile_busy(r, now)
+        out.append({
+            "id": r["id"], "serial": r["serial"], "title": r["title"] or "",
+            "group_name": r["group_name"] or "", "remark": r["remark"] or "",
+            "last_open_time": r["last_open_time"] or "", "status": r["status"],
+            "active_now": bool(r["active_now"]), "missing_since": r["missing_since"],
+            "last_seen": r["last_seen"], "active_at": r["active_at"],
+            "busy": busy, "busy_why": why,
+            "host": ({"id": r["default_host_id"], "code": r["host_code"] or "",
+                      "title": r["host_title"] or r["host_code"] or ""}
+                     if r["default_host_id"] is not None else None),
+        })
+    return {"profiles": out}
 
 
 # ─────────────── серверные ключи владельца: правка из студии (24.09.2026) ───────────────

@@ -1991,17 +1991,30 @@ function hostRowHtml(h){
     </div></div>`;
 }
 
+// Занятость профиля тремя состояниями. «Не знаем» намеренно не выглядит как
+// «свободен» (пунктир, а не заливка): человек, увидевший «свободен», откроет профиль
+// руками — и если на самом деле там идёт чужая заливка, порвёт ей куки. Состояние
+// считает сервер по `active_at` (когда занятость стала известна), а не браузер.
+const PROFILE_BUSY = {
+  busy: {dot: 's-running', mark: '●', pill: 's-running', title: 'занят'},
+  free: {dot: 's-idle', mark: '·', pill: 's-idle', title: 'свободен'},
+  unknown: {dot: 's-off', mark: '?', pill: 's-off', title: 'не знаем'},
+};
+
 function profileRowHtml(p){
   const hostLabel = p.host ? esc(p.host.title || p.host.code) : 'машина неизвестна';
   const facts = [p.group_name, p.remark].filter(Boolean).map(esc).join(' · ');
+  const st = PROFILE_BUSY[p.busy] || PROFILE_BUSY.unknown;
+  const why = p.busy === 'unknown' && p.busy_why ? esc(p.busy_why) : '';
   return `<div class="stage pitem">
-    <div class="dot ${p.active_now ? 's-done' : 's-idle'}">${p.active_now ? '●' : '·'}</div>
+    <div class="dot ${st.dot}">${st.mark}</div>
     <div class="body">
       <div class="pline"><span class="name">${esc(p.title || p.serial)}</span>
         <span class="facts mono">№${esc(p.serial)}</span>
         <span class="pill">${hostLabel}</span>
-        ${p.active_now ? '<span class="pill s-done">открыт сейчас</span>' : ''}
+        <span class="pill ${st.pill}" title="${why}">${st.title}</span>
         ${p.missing_since ? '<span class="pill s-error">на машине больше нет</span>' : ''}</div>
+      ${why ? `<div class="note muted">${why}</div>` : ''}
       ${facts ? `<div class="note muted">${facts}</div>` : ''}
     </div></div>`;
 }
@@ -2098,7 +2111,8 @@ async function paintHostsProfiles(container){
   const profilesCard = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec stage-head"><span class="grow">Профили AdsPower ${hintDot(
       'Все профили со всех машин сразу: где живёт номер, занят ли он сейчас и не '
-      + 'пропал ли он с машины при последней описи.')}</span>
+      + 'пропал ли он с машины при последней описи. «Не знаем» — это не «свободен»: '
+      + 'значит, свежих сведений о занятости нет, и открывать профиль руками опасно.')}</span>
       <button class="ghost small" id="prof-refresh-all">Обновить все</button></div>
     ${profErr
       ? `<div class="secbody"><div class="note bad">Список профилей прочитать не удалось: ${
@@ -10000,7 +10014,7 @@ async function viewAdmin(){
             ? `сказано ${when(x.said_at)}${x.times > 1 ? `, раз: ${x.times}` : ''}`
             : 'ещё не сказано'}</div>
         </div></div>`).join('')
-      : '<div class="empty">Ни один из двенадцати поводов не выполнен.</div>'}
+      : '<div class="empty">Ни один из тринадцати поводов не выполнен.</div>'}
     ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
        ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
   </div>`);
