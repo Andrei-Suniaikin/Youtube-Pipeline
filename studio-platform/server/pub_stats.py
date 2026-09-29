@@ -178,8 +178,9 @@ def collect(c: sqlite3.Connection, tenant=None, key=None, fetch=None,
     if not key:
         # Не ошибка сбора, а отсутствие настройки: ключ бесплатный, заводится в Google
         # Cloud. Говорим это словами, а не пустой таблицей с нулями.
-        out["why"] = ("нет ключа YouTube Data API: положить в admin_state.youtube_api_key "
-                      "или в VS_YT_API_KEY")
+        out["why"] = ("нет ключа YouTube Data API: вставить на экране «Ключи», "
+                      "строка «YouTube Data API» — или задать переменной "
+                      "VS_YT_API_KEY на сервере")
         out["quota"] = pub_calls.quota_state(c, now=now)
         return out
 
@@ -357,7 +358,8 @@ def channel_state(c: sqlite3.Connection, channel_id: int, now=None,
            "key": bool(pub_verify.api_key(c)), "delta": {},
            "series": series(c, channel_id)}
     for n in spans:
-        was = (_rows_at(c, [int(channel_id)], _shift(today, n)) or {}).get(int(channel_id)) or {}
+        back = _rows_at(c, [int(channel_id)], _shift(today, n)) or {}
+        was = back.get(int(channel_id)) or {}
         if was.get("day") == out["day"]:
             was = {}
         out["delta"][str(n)] = {
@@ -444,8 +446,9 @@ def collect_videos(c: sqlite3.Connection, tenant=None, key=None, fetch=None,
         out["why"] = "студия ещё ничего не заливала — про какие ролики спрашивать, неясно"
         return out
     if not key:
-        out["why"] = ("нет ключа YouTube Data API: положить в admin_state.youtube_api_key "
-                      "или в VS_YT_API_KEY")
+        out["why"] = ("нет ключа YouTube Data API: вставить на экране «Ключи», "
+                      "строка «YouTube Data API» — или задать переменной "
+                      "VS_YT_API_KEY на сервере")
         return out
 
     by_id = {}

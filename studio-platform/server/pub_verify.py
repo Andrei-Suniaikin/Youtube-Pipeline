@@ -72,15 +72,38 @@ RATE_REASONS = ("ratelimitexceeded", "userratelimitexceeded")
 
 
 def api_key(c) -> str:
-    """Ключ YouTube Data API. Окружение старше базы: так же, как везде в проекте."""
+    """Ключ YouTube Data API. Одно место на всю студию — его зовут все потребители.
+
+    Старшинство: окружение → файл ключей (его правит администратор на экране «Ключи»)
+    → `admin_state`. Порядок не произвольный.
+
+    Окружение первое, как везде в проекте: им машину чинят, когда экран недоступен.
+    Файл ключей ВЫШЕ `admin_state` потому, что именно в него пишет форма: будь наоборот,
+    владелец вставил бы новый ключ, увидел «сохранено» и не понял, почему ничего не
+    изменилось, — старое значение из базы продолжало бы побеждать.
+    `admin_state` остаётся последним и поддерживается ради тех установок, где ключ уже
+    лежит там: молча перестать его видеть значило бы погасить проверку публикаций.
+    """
     env = (os.environ.get("VS_YT_API_KEY") or "").strip()
     if env:
         return env
+    try:
+        import server_keys
+        value = str(_load_keys(server_keys).get(KEY_STATE) or "").strip()
+        if value:
+            return value
+    except Exception:                                              # noqa: BLE001
+        pass          # файла ключей нет или он испорчен — спрашиваем базу, как раньше
     try:
         row = c.execute("SELECT v FROM admin_state WHERE k=?", (KEY_STATE,)).fetchone()
     except Exception:                                              # noqa: BLE001
         return ""
     return (row[0] or "").strip() if row else ""
+
+
+def _load_keys(server_keys):
+    """Отдельной функцией — чтобы тест мог подменить чтение файла, не трогая диск."""
+    return server_keys._load()                                     # noqa: SLF001
 
 
 def _fetch(url: str) -> dict:
@@ -303,8 +326,9 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
         return out
     if not key:
         out["unknown"] = len(rows)
-        out["why"] = ("нет ключа YouTube Data API: положить в admin_state.youtube_api_key "
-                      "или VS_YT_API_KEY")
+        out["why"] = ("нет ключа YouTube Data API: вставить на экране «Ключи», "
+                      "строка «YouTube Data API» — или задать переменной "
+                      "VS_YT_API_KEY на сервере")
         return out
 
     for idx, rel in enumerate(rows):

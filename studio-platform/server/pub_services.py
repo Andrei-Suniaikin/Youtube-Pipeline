@@ -990,7 +990,7 @@ class PubServices:
         if not key:
             raise ResourceDown("проверка публикации",
                                "нет ключа YouTube Data API "
-                               "(admin_state.youtube_api_key или VS_YT_API_KEY)")
+                               "(вставить на экране «Ключи»)")
         res = pub_verify.check(rel["video_id"] or "", key)
         if res["state"] == pub_verify.PUBLIC:
             return {"video_id": rel["video_id"] or "",
