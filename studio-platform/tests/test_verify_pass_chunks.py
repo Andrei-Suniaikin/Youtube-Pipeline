@@ -220,6 +220,36 @@ def main() -> int:
         check(f"{V.ASK_LIMIT} вопросов по {V.TIMEOUT} с влезают в {m.group(1)} с",
               V.ASK_LIMIT * V.TIMEOUT <= int(m.group(1)), True)
 
+    print("Предел вопросов не может быть нулевым")
+    # Ноль в настройке (или отрицательное число, или опечатка) остановил бы подтверждение
+    # выхода НАВСЕГДА, и проход при этом отчитывался бы как успешный: ни одной ошибки,
+    # просто «проверено 0». Такую поломку не замечают месяцами.
+    import importlib
+    for value, ожидаем in (("0", 1), ("-5", 1), ("3", 3), ("", 50)):
+        os.environ["VS_PUBLIC_ASK_LIMIT"] = value
+        try:
+            importlib.reload(V)
+            check(f"VS_PUBLIC_ASK_LIMIT={value or 'пусто'} → {ожидаем}",
+                  V.ASK_LIMIT, ожидаем)
+        finally:
+            os.environ.pop("VS_PUBLIC_ASK_LIMIT", None)
+    importlib.reload(V)
+
+    print("Подтверждённый выход снимает прежнюю причину блокировки")
+    # Путь реален: ролик увидели «только по ссылке» (причина записана), владелец открыл
+    # его публично, следующий проход подтвердил выход. Оставленная причина стояла бы на
+    # экране рядом с зелёным «вышел публично» — экран противоречил бы сам себе.
+    c, _path = fresh(count=1)
+    c.execute("UPDATE pub_releases SET blocked_reason=? WHERE release_id='r0'",
+              ("ролик доступен только по ссылке, а должен быть публичным",))
+    c.commit()
+    V.run(c, now=NOW, fetch=lambda url: public(url), key="ключ")
+    row = c.execute("SELECT phase, blocked_reason FROM pub_releases "
+                    "WHERE release_id='r0'").fetchone()
+    c.close()
+    check("фаза поднята", row["phase"], "published")
+    check("прежняя причина снята", row["blocked_reason"], None)
+
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

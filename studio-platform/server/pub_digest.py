@@ -332,6 +332,21 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None) -> 
         if kind == "delayed":
             delayed_by_channel.setdefault(item["channel_id"], why)
 
+    # Чем подтверждать нечего — говорим ВСЕГДА, а не только когда осталось «не знаем».
+    # После перестановки порядка (сохранённый ответ выше отсутствия ключа) отсутствие
+    # ключа перестало попадать в причины, если каждый сегодняшний выход уже закрыт
+    # сохранённым ответом. Сводка при этом выглядела бы полной, хотя подтверждать новые
+    # выходы нечем: завтрашние числа молча поехали бы.
+    if not have_key:
+        gap = ("ключа YouTube Data API нет — новые выходы подтверждать нечем, "
+               "показаны только уже полученные ответы")
+        if gap not in today["why"]:
+            today["why"].append(gap)
+    elif quota:
+        gap = pub_calls.quota_why(quota)
+        if gap and gap not in today["why"]:
+            today["why"].append(gap)
+
     # ── блокеры и приёмка за сутки ──
     accepted_ids = _accepted_at(c, since, until)
     accepted_by_channel: dict = {}

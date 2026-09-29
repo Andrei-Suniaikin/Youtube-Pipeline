@@ -75,7 +75,11 @@ STALE_RECHECK_SEC = int(float(os.environ.get("VS_PUBLIC_STALE_RECHECK_SEC")
 #
 # Остаток не теряется: следующий проход через полчаса спросит тех, до кого не дошли, —
 # ровно в том же порядке (сначала самый старый слот).
-ASK_LIMIT = int(float(os.environ.get("VS_PUBLIC_ASK_LIMIT") or 50))
+# Не меньше одного вопроса за проход. Ноль в настройке (или отрицательное число,
+# или опечатка вроде «0 50») остановил бы подтверждение выхода НАВСЕГДА, и при этом
+# проход отчитывался бы как успешный: ни одной ошибки, просто «проверено 0». Такую
+# поломку не замечают месяцами — поэтому предел снизу жёсткий.
+ASK_LIMIT = max(1, int(float(os.environ.get("VS_PUBLIC_ASK_LIMIT") or 50)))
 
 PUBLIC = "public"          # подтверждено: ролик публичный
 UNLISTED = "unlisted"      # вышел, но по ссылке — это дефект, а не успех
@@ -452,8 +456,13 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
         _note(c, rid, payload, now)
 
         if res["state"] == PUBLIC:
-            c.execute("UPDATE pub_releases SET phase='published', updated=? WHERE id=?",
-                      (now, rel["id"]))
+            # Причину блокировки снимаем вместе с подтверждением. Путь реален: ролик
+            # сперва увидели «только по ссылке» (причина записана), владелец открыл его
+            # публично, следующий проход подтвердил выход. Оставленная причина осталась
+            # бы на экране рядом с зелёным «вышел публично» — экран противоречил бы сам
+            # себе ровно той же монетой, какой врал до этой работы, только наоборот.
+            c.execute("UPDATE pub_releases SET phase='published', blocked_reason=NULL, "
+                      "updated=? WHERE id=?", (now, rel["id"]))
             pub_log.add(c, rid, "публикация",
                         f"подтверждено: ролик {rel['video_id']} публичный"
                         + (f", вышел {res.get('published_at')}"
