@@ -226,6 +226,13 @@
   .ev time{color:var(--muted);flex:0 0 112px;font-variant-numeric:tabular-nums}
   .ev .step{flex:0 0 112px;color:var(--muted)}
   .empty{padding:44px 18px;text-align:center;color:var(--muted)}
+  .empty .why{color:var(--ink);font-size:14.5px}
+  .empty .means{margin-top:5px;font-size:13px;max-width:52ch;
+                margin-left:auto;margin-right:auto}
+  .empty .act{margin-top:13px;font-size:13.5px}
+  /* «Не знаем» не имеет права выглядеть как «пусто»: свой цвет и своя рамка. */
+  .empty.unknown{background:var(--bad-bg);border-radius:9px}
+  .empty.unknown .why{color:var(--bad);font-weight:600}
 
   .chgrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(258px,1fr));gap:13px}
   .chcard{background:var(--card);border:1px solid var(--line);border-left:3px solid var(--off);
@@ -1149,6 +1156,41 @@ function fail(e){
     <p class="muted">Обновите страницу. Если не помогло — сервис недоступен.</p>`));
 }
 
+/* ───── пустое место говорит, чего не хватает (владелец 30.09.2026: «да, делаем») ─────
+
+   Пустой список молчит одинаково в двух совершенно разных случаях: когда заводить ещё
+   нечего и когда спросить не удалось. Человек, который видит экран впервые, эти случаи
+   не различает и идёт спрашивать — а «заведите первый» поверх неудачной загрузки это
+   уже не молчание, а прямая ложь.
+
+   Поэтому пустое место отвечает на три вопроса: почему пусто, что это значит и что
+   нажать. Третье — ссылкой прямо туда, где это чинится, а не описанием пути словами.
+
+   Это тот же `.empty`, что был на экранах, а не пятый способ показать пустоту: класс и
+   место остаются, меняется только содержимое. `data-empty` стоит здесь для того, чтобы
+   «пусто» и «не знаем» различались машинно: иначе проверить, что неудачная загрузка не
+   выдана за пустой список, можно только вчитываясь в слова глазами.                  */
+
+function emptyBox(o){
+  // Ссылки нет ровно там, где чинится кнопкой в этой же карточке: вторая дорога к той
+  // же кнопке — лишний выбор, а не помощь. Тогда действие остаётся словами.
+  const act = o.href
+    ? `<div class="act"><a href="${esc(o.href)}"${o.id ? ` id="${esc(o.id)}"` : ''}
+         >${esc(o.act)} →</a></div>`
+    : (o.act ? `<div class="act muted">${esc(o.act)}</div>` : '');
+  return `<div class="empty${o.unknown ? ' unknown' : ''}"
+    data-empty="${o.unknown ? 'unknown' : 'none'}"><div class="why">${esc(o.why)}</div>
+    ${o.means ? `<div class="means muted">${esc(o.means)}</div>` : ''}${act}</div>`;
+}
+
+/* «Спросить не удалось» — не пустой список. Отдельная дверь в `emptyBox`, чтобы
+   вызывающая сторона не могла случайно предложить «завести первый» поверх отказа:
+   заводить поверх незнания нечего, и действие здесь всегда одно — спросить снова. */
+function emptyUnknown(what, means, act){
+  return emptyBox({unknown: true, why: what, means: means,
+                   act: act || 'Обновите страницу — спросим заново.'});
+}
+
 /* ───────────── одинаковые причины — одной строкой (30.09.2026) ─────────────
 
    Когда падает общий ключ или ложится провайдер, экран показывает сорок строк с одной
@@ -1294,9 +1336,25 @@ async function viewReleases(){
   bind('#f-ch','channel'); bind('#f-ph','phase'); bind('#f-st','status');
 
   if (!data.releases.length){
-    app.append($(`<div class="card"><div class="empty">
-      Выпусков нет. Вставьте ссылку на донора — она встанет в ближайший свободный выход канала.
-    </div></div>`));
+    // «Ни одного выпуска не было» и «под эти отборы ничего не подошло» — разные вещи, и
+    // предлагать завести первый выпуск там, где их сто, но все не под отбор, значит
+    // отправить человека делать лишнюю работу.
+    const filtered = Object.values(FILTERS).some(Boolean);
+    app.append($(`<div class="card">${filtered
+      ? emptyBox({why: 'Под выбранные отборы ни один выпуск не подошёл.',
+          means: 'Выпуски в студии есть — просто не эти.',
+          href: '#/releases', id: 'r-clear', act: 'Снять отборы'})
+      : emptyBox({why: 'Выпусков пока нет — ни одной донорской ссылки не поставлено.',
+          means: 'Выпуск заводится ссылкой: она встанет в ближайший свободный выход '
+               + 'канала, и дальше конвейер ведёт её сам.',
+          href: '#/new', act: 'Новый выпуск по ссылке'})
+    }</div>`));
+    const clr = app.querySelector('#r-clear');
+    if (clr) clr.onclick = ev => {
+      ev.preventDefault();
+      for (const k of Object.keys(FILTERS)) FILTERS[k] = '';
+      render();
+    };
     return;
   }
 
@@ -2120,7 +2178,9 @@ async function viewKeys(){
               ? ` · потоков занято ${esc(fg.threads_used != null ? fg.threads_used : 'нет данных')} из ${esc(fg.threads_limit)}` : ''}</div>
           <div class="note muted">снято ${esc(when(fg.checked))}</div>
         </div></div>`
-      : '<div class="empty">Данных пока нет.</div>'}
+      : emptyUnknown('Про FastGen мы пока ничего не спрашивали.',
+          'Срок действия и расход картинок неизвестны — это не «лимит свободен».',
+          'Ответ появится сам при первом заказе кадров.')}
   </div>`));
 
   app.append(ownKeysCard(d));
@@ -2499,8 +2559,18 @@ async function viewChannels(){
   };
 
   if (!d.channels.length){
-    app.append($(`<div class="card"><div class="empty">Каналов нет.
-      Заведите первый — кнопка выше.</div></div>`));
+    // Ссылка ведёт к той же кнопке в шапке: у заведения канала своего адреса нет, форма
+    // раскрывается на месте. «Кнопка выше» словами заставляла её искать глазами.
+    app.append($(`<div class="card">${emptyBox({
+      why: 'Каналов ещё нет — студии не для кого работать.',
+      means: 'Канал — это расписание выходов, пресет и профиль заливки. Без него '
+           + 'ссылку на донора поставить некуда.',
+      href: '#/channels', id: 'ch-first', act: 'Завести первый канал'})}</div>`));
+    const first = app.querySelector('#ch-first');
+    if (first) first.onclick = ev => {
+      ev.preventDefault();
+      bar.querySelector('#newch').click();
+    };
     return;
   }
   const cls = c => c.status === 'active' ? 'active'
@@ -2901,8 +2971,12 @@ async function channelReleases(id, d){
   };
 
   if (!d.calendar.length){
-    app.append($(`<div class="card"><div class="empty">
-      Расписание не задано — выходов нет, и ссылке некуда встать.</div></div>`));
+    app.append($(`<div class="card">${emptyBox({
+      why: 'Расписание не задано — выходов у канала нет.',
+      means: 'Поставить ссылку можно и сейчас, но даты она не получит и из очереди '
+           + 'не выйдет: очередь раскладывает ссылки по выходам расписания.',
+      href: `#/channel/${encodeURIComponent(id)}/nastroyki`,
+      act: 'Задать расписание'})}</div>`));
     return;
   }
   app.append(calendarFeed(d));
@@ -4244,7 +4318,33 @@ async function viewQueue(){
     <span style="opacity:.75">Это не «задач нет», а «спросить не удалось».</span></div>`));
 
   if (!d.rows.length){
-    app.append($(`<div class="card"><div class="empty">Задач нет.</div></div>`));
+    // Пустых мест здесь три, и различать их обязательно. Часть строк приходит от
+    // хранилищ текстов и обложек: если хоть одно не ответило, мы НЕ ЗНАЕМ, есть ли за
+    // ним задачи, и называть это «задач нет» — врать экраном. Второй случай — отборы:
+    // задачи есть, просто не эти, и чинится это снятием отборов, а не заведением
+    // работы. И только третий — настоящая пустота, у которой своё действие.
+    const filtered = Object.values(QFILTER).some(Boolean);
+    app.append($(`<div class="card">${
+      down.length
+        ? emptyUnknown('Список неполный: часть хранилищ не ответила.',
+            'Сколько задач за ними — мы не знаем. Это не «задач нет».')
+        : filtered
+        ? emptyBox({why: 'Под выбранные отборы ни одна задача не подошла.',
+            means: 'Задачи в студии есть — просто не эти.',
+            href: '#/queue', id: 'q-clear', act: 'Снять отборы'})
+        : emptyBox({why: 'Очередь пуста — прямо сейчас ничего не делается.',
+            means: 'Так и должно быть, когда всё сделано: работа появляется, как '
+                 + 'только на канал поставлены ссылки на доноров.',
+            href: '#/channels', act: 'Поставить ролики на канал'})
+    }</div>`));
+    // Отборы живут в памяти страницы, а адрес у них один и тот же — на переход по
+    // ссылке браузер события не пришлёт. Поэтому снимаем их руками.
+    const clr = app.querySelector('#q-clear');
+    if (clr) clr.onclick = ev => {
+      ev.preventDefault();
+      for (const k of Object.keys(QFILTER)) QFILTER[k] = '';
+      render();
+    };
     return;
   }
 
@@ -5011,8 +5111,17 @@ async function viewProjects(){
   };
 
   if (!d.projects.length){
-    app.append($(`<div class="card"><div class="empty">Проектов нет.
-      Заведите первый — кнопка выше.</div></div>`));
+    app.append($(`<div class="card">${emptyBox({
+      why: 'Проектов нет — ни один ролик пока не собирается.',
+      means: 'Проект — это одна папка ролика: сценарий, озвучка, кадры и рендер. '
+           + 'Обычно он заводится сам, когда на канал поставлена ссылка.',
+      href: '#/projects', id: 'pr-first', act: 'Собрать проект руками'})}</div>`));
+    const first = app.querySelector('#pr-first');
+    if (first) first.onclick = ev => {
+      ev.preventDefault();
+      const b = document.getElementById('newp');
+      if (b) b.click();
+    };
     return;
   }
   const mark = (ok, txt) => `<span class="pill ${ok ? 's-done' : 's-idle'}">${txt}</span>`;
@@ -9949,7 +10058,10 @@ async function viewPresets(){
     if (!filtered || whole.length){
       cards.push({title: 'Целые пресеты', html: whole.length
         ? whole.map(i => presetItemHtml({service: i.service}, i)).join('')
-        : '<div class="empty">Целых пресетов нет.</div>'});
+        : emptyBox({why: 'Целых пресетов нет.',
+            means: 'Пресет — это настройки озвучки, кадров и монтажа одним набором. '
+                 + 'Без него выпуску нечем делать ролик.',
+            href: '#/preset/new', act: 'Завести первый пресет'})});
     }
     for (const [code, title] of PART_TITLES){
       const arr = items.filter(i => i.scope === code);
@@ -10033,7 +10145,9 @@ async function viewPresets(){
             ? `<div class="stage"><div class="dot s-error">!</div><div class="body">
                  <div class="name">Список не получен — ${esc(g.error)}</div></div></div>`
             : (items.length ? items.map(i => presetItemHtml(g, i)).join('')
-               : '<div class="empty">Пресетов нет.</div>')}];
+               : emptyBox({why: 'Пресетов нет.',
+                   means: 'Этот вид настроек пока ни разу не заводили.',
+                   href: '#/preset/new', act: 'Завести первый пресет'}))}];
       for (const b of blocks){
         shown++;
         const card = $(`<div class="card ptype" style="margin-bottom:16px">
@@ -10156,7 +10270,9 @@ async function viewPresets(){
         ${iconBtn('bad chp-del', 'remove', 'Удалить', p.name,
                   `data-id="${p.id}" data-name="${esc(p.name)}"`)}
       </div></div>`).join('')
-      : '<div class="empty">Пресетов каналов нет.</div>'}
+      : emptyBox({why: 'Пресетов каналов нет.',
+          means: 'Пресет канала задаёт, чем канал озвучивает и рисует по умолчанию, '
+               + 'чтобы не выбирать это каждому выпуску. Заводится кнопкой выше.'})}
     <div class="secbody"><div class="note muted">${esc(chp.note || '')}</div></div>
   </div>`);
   app.append(chpCard);
