@@ -613,6 +613,33 @@
          background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%239a9ca3'%3E%3Cpath d='M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z'/%3E%3C/svg%3E");
          background-repeat:no-repeat;background-position:right 9px center;
          background-size:15px 15px}
+  /* ── длинный список: та же строка, но с поиском (владелец 30.09.2026) ──
+     Родной <select> остаётся на месте и остаётся источником правды — он просто не виден.
+     Поэтому весь код, который читает .value и слушает change, продолжает работать, а
+     сорок три места вызова трогать не пришлось. */
+  .sfind{position:relative;display:inline-block;vertical-align:middle}
+  .sfind > select{position:absolute;inset:0;opacity:0;pointer-events:none}
+  .sfind > button{width:100%;text-align:left;font:inherit;color:var(--fg);
+                  background:var(--card);border:1px solid var(--line);
+                  border-radius:var(--r-sm);padding:8px 30px 8px 10px;cursor:pointer;
+                  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+                  background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%239a9ca3'%3E%3Cpath d='M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z'/%3E%3C/svg%3E");
+                  background-repeat:no-repeat;background-position:right 9px center;
+                  background-size:15px 15px}
+  .sfind > button:focus{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-dim);
+                        outline:none}
+  .sfind > button[disabled]{opacity:.55;cursor:default}
+  .sfind-pop{position:fixed;z-index:80;background:var(--card);border:1px solid var(--line);
+             border-radius:var(--r);box-shadow:0 12px 34px rgba(0,0,0,.45);
+             padding:8px;display:flex;flex-direction:column;gap:6px}
+  .sfind-pop input{width:100%;padding:7px 9px}
+  .sfind-list{overflow:auto;max-height:260px;margin:0;padding:0;list-style:none}
+  .sfind-list li{padding:7px 9px;border-radius:var(--r-xs);cursor:pointer;
+                 white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sfind-list li.on{background:var(--acc-dim)}
+  .sfind-list li.cur{font-weight:600}
+  .sfind-list li[aria-disabled="true"]{opacity:.5;cursor:default}
+  .sfind-none{padding:7px 9px;color:var(--off);font-size:13px}
   /* Множественный выбор рисуется списком, а не строкой: стрелка ему не нужна. */
   select[multiple]{background-image:none;padding-right:10px}
   select:focus,input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-dim)}
@@ -3019,6 +3046,195 @@ function channelTopLine(d){
   // подробной статистикой, часы просмотра пропадали вместе со строкой.
   if (!st.day && !haveHours) return $('<div></div>');
   return $(`<div class="topline">${parts.join('<span class="sep">·</span>')}</div>`);
+}
+
+
+/* ────────── длинные списки ищутся, а не листаются (владелец 30.09.2026) ──────────
+
+   «Пробегись по дропдаунам и, если там больше 5 айтемов, сделай ещё быстрый поиск».
+
+   Устройство выбрано так, чтобы НИЧЕГО не переписывать в сорока трёх местах, где эти
+   списки заводятся и читаются. Родной <select> остаётся в странице и остаётся
+   источником правды: он просто становится невидимым, а поверх него рисуется кнопка со
+   списком и полем поиска. Любой существующий код, который делает `.value`, ставит
+   `.value` или слушает `change`, продолжает работать слово в слово.
+
+   Почему не «заменить select на свой компонент»: пятьдесят два профиля AdsPower, пресеты,
+   голоса и модели живут в разных экранах, и каждая замена — это шанс потерять обработчик.
+   Обёртка ничего не отнимает.
+
+   Что сознательно НЕ трогаем:
+     • списки с множественным выбором — они рисуются столбиком, там и так всё видно;
+     • списки короче порога — поиск по трём строкам мешает, а не помогает;
+     • выключенные списки — искать в том, чего нельзя выбрать, незачем.                */
+
+const SFIND_FROM = 6;          // «больше пяти» — то есть с шестого пункта
+
+function sfindLabel(sel){
+  const one = sel.selectedOptions && sel.selectedOptions[0];
+  return one ? one.textContent.trim() : '';
+}
+
+function sfindClose(){
+  const pop = document.getElementById('sfind-pop');
+  if (!pop) return;
+  const owner = pop._owner;
+  pop.remove();
+  if (owner){
+    owner.setAttribute('aria-expanded', 'false');
+    owner.focus();
+  }
+}
+
+function sfindOpen(box){
+  sfindClose();
+  const sel = box.querySelector('select');
+  const btn = box.querySelector('button');
+  // Подпись освежаем ПЕРЕД показом списка: значение могли поставить программно, а такая
+  // запись события `change` не шлёт, и кнопка осталась бы с прежним именем. Человек
+  // открыл бы список и увидел выбранным одно, а на кнопке — другое.
+  btn.textContent = sfindLabel(sel) || '— не выбрано —';
+  const opts = [...sel.options];
+  const pop = document.createElement('div');
+  pop.className = 'sfind-pop';
+  pop.id = 'sfind-pop';
+  pop._owner = btn;
+  pop.innerHTML = `<input type="search" autocomplete="off" spellcheck="false"
+      placeholder="поиск — начните печатать" aria-label="Поиск по списку">
+    <ul class="sfind-list" role="listbox"></ul>`;
+  const find = pop.querySelector('input');
+  const list = pop.querySelector('ul');
+
+  let shown = [];
+  const draw = () => {
+    const q = find.value.trim().toLowerCase();
+    shown = opts.filter(o => !q || o.textContent.toLowerCase().includes(q));
+    if (!shown.length){
+      list.innerHTML = `<li class="sfind-none" role="presentation">ничего не нашлось</li>`;
+      return;
+    }
+    list.innerHTML = shown.map((o, i) => `<li role="option" data-i="${i}"
+      aria-selected="${o.selected ? 'true' : 'false'}"
+      ${o.disabled ? 'aria-disabled="true"' : ''}
+      class="${o.selected ? 'cur' : ''}">${esc(o.textContent)}</li>`).join('');
+    // Подсвечен либо выбранный, либо первый подходящий: стрелка вниз должна вести
+    // откуда-то, а не из пустоты.
+    const at = Math.max(0, shown.findIndex(o => o.selected));
+    mark(q ? 0 : at);
+  };
+  const mark = i => {
+    [...list.children].forEach((li, n) => li.classList.toggle('on', n === i));
+    const on = list.children[i];
+    if (on && on.scrollIntoView) on.scrollIntoView({block: 'nearest'});
+  };
+  const active = () => [...list.children].findIndex(li => li.classList.contains('on'));
+  const take = i => {
+    const opt = shown[i];
+    if (!opt || opt.disabled) return;
+    if (sel.value !== opt.value){
+      sel.value = opt.value;
+      // Ровно то событие, которого ждут уже написанные обработчики. Без него выбор
+      //бы  менялся на экране и никуда не доходил.
+      sel.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+    btn.textContent = sfindLabel(sel) || '— не выбрано —';
+    sfindClose();
+  };
+
+  find.addEventListener('input', draw);
+  find.addEventListener('keydown', ev => {
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp'){
+      ev.preventDefault();
+      const n = list.children.length;
+      if (!n) return;
+      const step = ev.key === 'ArrowDown' ? 1 : -1;
+      mark((active() + step + n) % n);
+    } else if (ev.key === 'Enter'){
+      ev.preventDefault();
+      take(active());
+    } else if (ev.key === 'Escape'){
+      ev.preventDefault();
+      sfindClose();
+    }
+  });
+  list.addEventListener('click', ev => {
+    const li = ev.target.closest('li[data-i]');
+    if (li) take(Number(li.dataset.i));
+  });
+
+  document.body.append(pop);
+  const r = btn.getBoundingClientRect();
+  pop.style.width = Math.max(r.width, 240) + 'px';
+  pop.style.left = Math.min(r.left, innerWidth - pop.offsetWidth - 8) + 'px';
+  // Не помещается снизу — открываем вверх: список из полусотни строк иначе уезжает за
+  // нижний край, и человек ищет его прокруткой всей страницы.
+  const below = innerHeight - r.bottom;
+  pop.style.top = (below > 300 || below > r.top ? r.bottom + 4
+                   : Math.max(8, r.top - pop.offsetHeight - 4)) + 'px';
+  draw();
+  find.focus();
+  btn.setAttribute('aria-expanded', 'true');
+}
+
+function wireSearchableSelects(root){
+  const where = root && root.querySelectorAll ? root : document;
+  for (const sel of where.querySelectorAll('select:not([data-sfind])')){
+    if (sel.multiple || sel.options.length < SFIND_FROM){ continue; }
+    sel.setAttribute('data-sfind', '1');
+    const box = document.createElement('div');
+    box.className = 'sfind';
+    // Ширину задаёт сам список: у большинства она проставлена стилем на месте объявления
+    // («width:230px», «min-width:280px»), и обёртка обязана её унаследовать, иначе
+    // аккуратно расставленные поля разъедутся.
+    // Ширину меряем, а не угадываем по строке стиля: у половины списков она задана
+    // классом (`.fld select{width:100%}`), инлайна там нет вовсе, и обёртка сжалась бы
+    // по содержимому — поля в карточках разъехались бы. Меряем ДО того, как спрячем
+    // список: спрятанный уже ничего не покажет.
+    const wide = sel.parentNode.clientWidth
+                 && sel.offsetWidth >= sel.parentNode.clientWidth - 2;
+    box.style.display = wide ? 'block' : 'inline-block';
+    box.style.width = wide ? '100%' : (sel.style.width || '');
+    box.style.minWidth = sel.style.minWidth || '';
+    box.style.marginTop = sel.style.marginTop || '';
+    box.style.marginBottom = sel.style.marginBottom || '';
+    sel.parentNode.insertBefore(box, sel);
+    box.append(sel);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('aria-haspopup', 'listbox');
+    btn.setAttribute('aria-expanded', 'false');
+    btn.textContent = sfindLabel(sel) || '— не выбрано —';
+    btn.disabled = sel.disabled;
+    btn.onclick = () => { btn.disabled ? null : sfindOpen(box); };
+    box.append(btn);
+    // Значение меняют и снаружи — формой, сбросом, соседним полем. `change` при этом
+    // приходит не всегда (программная запись .value его не шлёт), поэтому подпись
+    // освежаем и по событию, и при каждом открытии списка.
+    sel.addEventListener('change', () => {
+      btn.textContent = sfindLabel(sel) || '— не выбрано —';
+      btn.disabled = sel.disabled;
+    });
+  }
+}
+
+// Экраны дорисовываются частями и после ответов сервера, поэтому одного вызова после
+// render() не хватит: наблюдатель ловит и то, что появилось позже.
+const SFIND_WATCH = new MutationObserver(list => {
+  for (const m of list){
+    for (const node of m.addedNodes){
+      if (node.nodeType === 1) wireSearchableSelects(node);
+    }
+  }
+});
+
+function sfindWatch(){
+  const app = document.getElementById('app');
+  if (app) SFIND_WATCH.observe(app, {childList: true, subtree: true});
+  addEventListener('click', ev => {
+    const pop = document.getElementById('sfind-pop');
+    if (pop && !pop.contains(ev.target) && !ev.target.closest('.sfind')) sfindClose();
+  }, true);
+  addEventListener('keydown', ev => { if (ev.key === 'Escape') sfindClose(); });
 }
 
 function calendarFeed(d){
@@ -10504,6 +10720,7 @@ function busyOff(){
   if (spin) spin.hidden = true;
   document.body.classList.remove('loading');
 }
+sfindWatch();                      // длинные списки получают поиск сами
 addEventListener('hashchange', render);
 render();
 </script>
