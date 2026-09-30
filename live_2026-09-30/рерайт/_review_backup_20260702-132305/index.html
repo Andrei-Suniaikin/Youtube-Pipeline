@@ -1,0 +1,2085 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rewrite Studio</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Inter', system-ui, -apple-system, sans-serif; background: #111827; color: #f3f4f6; min-height: 100vh; }
+  .hidden { display: none !important; }
+  .flex { display: flex; } .flex-col { flex-direction: column; } .flex-1 { flex: 1; }
+  .items-center { align-items: center; } .justify-center { justify-content: center; } .justify-between { justify-content: space-between; }
+  .flex-wrap { flex-wrap: wrap; }
+  .gap-1 { gap: 0.25rem; } .gap-2 { gap: 0.5rem; } .gap-3 { gap: 0.75rem; } .gap-4 { gap: 1rem; }
+  .grid { display: grid; } .grid-cols-2 { grid-template-columns: repeat(2, 1fr); } .grid-cols-3 { grid-template-columns: repeat(3, 1fr); } .col-span-2 { grid-column: span 2; } .col-span-3 { grid-column: span 3; }
+  .space-y-1 > * + * { margin-top: 0.25rem; } .space-y-2 > * + * { margin-top: 0.5rem; } .space-y-3 > * + * { margin-top: 0.75rem; } .space-y-4 > * + * { margin-top: 1rem; }
+  .overflow-auto { overflow: auto; } .overflow-x-auto { overflow-x: auto; } .overflow-y-auto { overflow-y: auto; }
+  .w-full { width: 100%; } .w-8 { width: 2rem; } .w-16 { width: 4rem; } .w-20 { width: 5rem; } .w-24 { width: 6rem; } .w-28 { width: 7rem; } .w-32 { width: 8rem; } .w-40 { width: 10rem; }
+  .max-w-md { max-width: 28rem; } .max-w-2xl { max-width: 42rem; } .max-w-6xl { max-width: 72rem; } .max-w-xs { max-width: 20rem; }
+  .max-h-64 { max-height: 16rem; } .max-h-80 { max-height: 20rem; } .h-48 { height: 12rem; } .h-64 { height: 16rem; } .min-h-screen { min-height: 100vh; }
+  .mx-auto { margin-left: auto; margin-right: auto; }
+  .p-2 { padding: 0.5rem; } .p-3 { padding: 0.75rem; } .p-4 { padding: 1rem; } .p-6 { padding: 1.5rem; } .p-8 { padding: 2rem; }
+  .px-1 { padding-left: 0.25rem; padding-right: 0.25rem; } .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; }
+  .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; } .px-4 { padding-left: 1rem; padding-right: 1rem; } .px-6 { padding-left: 1.5rem; padding-right: 1.5rem; }
+  .py-0\.5 { padding-top: 0.125rem; padding-bottom: 0.125rem; } .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; }
+  .py-1\.5 { padding-top: 0.375rem; padding-bottom: 0.375rem; } .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; }
+  .py-2\.5 { padding-top: 0.625rem; padding-bottom: 0.625rem; } .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+  .mb-1 { margin-bottom: 0.25rem; } .mb-2 { margin-bottom: 0.5rem; } .mb-3 { margin-bottom: 0.75rem; } .mb-4 { margin-bottom: 1rem; } .mb-6 { margin-bottom: 1.5rem; }
+  .mt-2 { margin-top: 0.5rem; } .mt-3 { margin-top: 0.75rem; } .ml-2 { margin-left: 0.5rem; } .mr-2 { margin-right: 0.5rem; }
+  .text-xs { font-size: 0.75rem; } .text-sm { font-size: 0.875rem; } .text-lg { font-size: 1.125rem; } .text-xl { font-size: 1.25rem; } .text-2xl { font-size: 1.5rem; }
+  .font-medium { font-weight: 500; } .font-semibold { font-weight: 600; } .font-bold { font-weight: 700; } .font-mono { font-family: 'Consolas', 'Monaco', monospace; }
+  .text-center { text-align: center; } .text-left { text-align: left; } .tracking-widest { letter-spacing: 0.1em; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .text-gray-100 { color: #f3f4f6; } .text-gray-300 { color: #d1d5db; } .text-gray-400 { color: #9ca3af; } .text-gray-500 { color: #6b7280; }
+  .text-white { color: #fff; } .text-red-400 { color: #f87171; } .text-green-400 { color: #4ade80; } .text-blue-400 { color: #60a5fa; } .text-yellow-400 { color: #facc15; }
+  .bg-gray-700 { background: #374151; } .bg-gray-800 { background: #1f2937; } .bg-gray-900 { background: #111827; }
+  .bg-blue-600 { background: #2563eb; } .bg-blue-700 { background: #1d4ed8; }
+  .bg-indigo-600 { background: #4f46e5; } .bg-indigo-700 { background: #4338ca; }
+  .bg-green-600 { background: #16a34a; } .bg-green-700 { background: #15803d; }
+  .bg-teal-600 { background: #0d9488; } .bg-teal-700 { background: #0f766e; }
+  .bg-red-600 { background: #dc2626; } .bg-red-700 { background: #b91c1c; }
+  .bg-yellow-600 { background: #ca8a04; } .bg-yellow-700 { background: #a16207; }
+  .bg-purple-600 { background: #9333ea; } .bg-purple-700 { background: #7e22ce; }
+  .bg-gray-600 { background: #4b5563; }
+  .border { border-width: 1px; } .border-2 { border-width: 2px; } .border-b { border-bottom-width: 1px; }
+  .border-gray-600 { border-color: #4b5563; } .border-gray-700 { border-color: #374151; } .border-dashed { border-style: dashed; }
+  .rounded { border-radius: 0.25rem; } .rounded-lg { border-radius: 0.5rem; } .rounded-xl { border-radius: 0.75rem; }
+  .cursor-pointer { cursor: pointer; } .resize-y { resize: vertical; }
+  .transition { transition: all 0.15s ease; }
+  button:hover { opacity: 0.9; } button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .shadow-2xl { box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+  input, select, textarea { color: #f3f4f6; outline: none; }
+  input:focus, select:focus, textarea:focus { border-color: #3b82f6; }
+  select { appearance: auto; }
+  table { border-collapse: collapse; width: 100%; }
+  th { font-weight: 500; color: #9ca3af; }
+  .sticky { position: sticky; } .top-0 { top: 0; }
+  .tab-btn { background: none; border: none; color: #9ca3af; cursor: pointer; border-bottom: 2px solid transparent; }
+  .tab-btn.active { border-bottom-color: #3b82f6; color: #3b82f6; }
+  .tab-btn:hover { color: #d1d5db; }
+  .log-area { font-family: 'Consolas', 'Monaco', monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  .job-row { cursor: pointer; }
+  .job-row:hover { background-color: rgba(59,130,246,0.1); }
+  .job-row.selected { background-color: rgba(59,130,246,0.2); }
+  .job-badges { display:flex; gap:4px; flex-wrap:wrap; margin-top:2px; }
+  .job-badge { font-size:10px; background:rgba(59,130,246,0.15); color:#93c5fd; border-radius:4px; padding:0 5px; line-height:16px; }
+  .job-badge.dim { background:rgba(148,163,184,0.12); color:#94a3b8; }
+  .job-cb { cursor:pointer; vertical-align:middle; }
+  input[type="number"]::-webkit-inner-spin-button { opacity: 1; }
+  .lang-table { max-height: 400px; overflow-y: auto; }
+  .drag-over { border-color: #3b82f6 !important; background-color: rgba(59,130,246,0.1) !important; }
+  .card { background: #1f2937; border-radius: 0.5rem; border: 1px solid #374151; padding: 1rem; }
+  .btn { border: none; cursor: pointer; font-weight: 600; border-radius: 0.5rem; transition: all 0.15s; font-size: 0.875rem; }
+  .btn-sm { padding: 0.25rem 0.75rem; font-size: 0.75rem; border-radius: 0.25rem; }
+  .btn-blue { background: #2563eb; color: #fff; } .btn-blue:hover { background: #1d4ed8; }
+  .btn-green { background: #16a34a; color: #fff; } .btn-green:hover { background: #15803d; }
+  .btn-red { background: #dc2626; color: #fff; } .btn-red:hover { background: #b91c1c; }
+  .btn-yellow { background: #ca8a04; color: #fff; } .btn-yellow:hover { background: #a16207; }
+  .btn-orange { background: #ea580c; color: #fff; } .btn-orange:hover { background: #c2410c; }
+  .btn-gray { background: #4b5563; color: #fff; } .btn-gray:hover { background: #374151; }
+  .btn-indigo { background: #4f46e5; color: #fff; } .btn-indigo:hover { background: #4338ca; }
+  .btn-teal { background: #0d9488; color: #fff; } .btn-teal:hover { background: #0f766e; }
+  .btn-purple { background: #9333ea; color: #fff; } .btn-purple:hover { background: #7e22ce; }
+  .input { background: #374151; border: 1px solid #4b5563; border-radius: 0.25rem; padding: 0.375rem 0.75rem; font-size: 0.875rem; color: #f3f4f6; width: 100%; }
+  .input:focus { border-color: #3b82f6; }
+  .input-sm { padding: 0.25rem 0.5rem; font-size: 0.75rem; }
+  .label { display: block; font-size: 0.875rem; font-weight: 500; margin-bottom: 0.25rem; }
+  .modal-overlay { position: fixed; top:0; left:0; right:0; bottom:0; background: rgba(0,0,0,0.6); display:flex; align-items:center; justify-content:center; z-index:50; }
+  .modal-content { background:#1f2937; border:1px solid #374151; border-radius:0.75rem; padding:1.5rem; max-width:700px; width:90%; max-height:90vh; overflow-y:auto; }
+  ::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-track { background: #1f2937; } ::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 3px; }
+  @media (min-width: 1024px) { .lg\:grid-cols-2 { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 1023px) { .lg\:grid-cols-2 { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body class="bg-gray-900 text-gray-100 min-h-screen">
+
+<!-- ========== LOGIN SCREEN ========== -->
+<div id="login-screen" class="flex items-center justify-center min-h-screen">
+  <div class="bg-gray-800 rounded-xl shadow-2xl p-8 w-full max-w-md border border-gray-700">
+    <h1 class="text-2xl font-bold text-center mb-2">Rewrite Studio</h1>
+    <p class="text-gray-400 text-center mb-6">Введите лицензионный ключ</p>
+    <input id="license-key-input" type="text" placeholder="ABC-123-DEF"
+      class="input w-full text-center text-lg tracking-widest mb-4 py-3"
+      onkeydown="if(event.key==='Enter')doLogin()">
+    <button onclick="doLogin()" id="login-btn" class="btn btn-blue w-full py-3">Войти</button>
+    <p id="login-error" class="text-red-400 text-sm mt-3 text-center hidden"></p>
+  </div>
+</div>
+
+<!-- ========== MAIN APP ========== -->
+<div id="app" class="hidden flex flex-col min-h-screen">
+  <header class="bg-gray-800 border-b border-gray-700 px-6 py-3 flex items-center justify-between">
+    <h1 class="text-xl font-bold">Rewrite Studio</h1>
+    <div class="flex items-center gap-4">
+      <span id="user-name-display" class="text-gray-400 text-sm"></span>
+      <button onclick="doLogout()" class="text-gray-400 hover:text-red-400 text-sm transition">Выйти</button>
+    </div>
+  </header>
+  <nav class="bg-gray-800 border-b border-gray-700 px-6 flex gap-1 overflow-x-auto">
+    <button class="tab-btn active px-4 py-3 text-sm font-medium" onclick="switchTab('generation',this)">Генерация</button>
+    <button class="tab-btn px-4 py-3 text-sm font-medium" onclick="switchTab('rewrite',this)">Рерайт</button>
+    <button class="tab-btn px-4 py-3 text-sm font-medium" onclick="switchTab('queue',this)">Очередь</button>
+    <button class="tab-btn px-4 py-3 text-sm font-medium" onclick="switchTab('settings',this)">Настройки</button>
+  </nav>
+  <main class="flex-1 overflow-auto p-6">
+
+    <!-- ===== GENERATION TAB ===== -->
+    <div id="tab-generation" class="tab-content max-w-4xl mx-auto space-y-4">
+      <!-- Preset (v2 — single channel per generation) -->
+      <div class="card space-y-3">
+        <div class="flex justify-between items-center">
+          <div class="label">Пресет канала</div>
+          <span id="gen-preset-meta" class="text-xs text-gray-500"></span>
+        </div>
+        <div class="flex gap-2 items-center flex-wrap">
+          <select id="gen-preset" class="input flex-1 min-w-[200px]" onchange="onGenPresetSelected()"></select>
+          <button onclick="openPresetEditor(null)" class="btn btn-sm btn-blue" title="Создать">+ Создать</button>
+          <button onclick="editCurrentPreset()" class="btn btn-sm btn-gray" title="Редактировать">✎ Edit</button>
+          <button onclick="importPresetJson()" class="btn btn-sm btn-gray" title="Импорт .json">📂 Import</button>
+          <button onclick="exportPresetJson()" class="btn btn-sm btn-gray" title="Экспорт .json">⬇ Export</button>
+          <button onclick="deleteCurrentPreset()" class="btn btn-sm" style="background:#7c2d12;color:#fff" title="Удалить">🗑</button>
+        </div>
+      </div>
+
+      <!-- Topics list (одна строка = одна задача, язык на строку) -->
+      <div class="card space-y-2">
+        <div class="label">Темы / источники</div>
+        <p class="text-xs text-gray-500">Каждая строка — отдельная задача (тема + свой язык). Пусто в языке = язык пресета. «➕ Добавить тему» — ещё строка; все уйдут одним кликом.</p>
+        <div id="gen-topics-list" class="space-y-2"></div>
+        <button onclick="addGenRow()" class="btn btn-sm btn-gray">➕ Добавить тему</button>
+      </div>
+
+      <!-- Optional overrides (collapsed by default) -->
+      <details class="card">
+        <summary class="cursor-pointer text-sm text-gray-300 select-none">Опционально — переопределить параметры пресета</summary>
+        <div class="grid grid-cols-3 gap-3 mt-3">
+          <div>
+            <div class="label">Модель</div>
+            <select id="gen-model" class="input">
+              <option value="" selected>(из пресета)</option>
+            </select>
+          </div>
+          <div>
+            <div class="label">Язык</div>
+            <input id="gen-language-override" type="text" class="input" placeholder="(из пресета)">
+          </div>
+          <div>
+            <div class="label">Длина (слов)</div>
+            <input id="gen-length-override" type="number" min="300" max="100000" class="input" placeholder="(из пресета)">
+          </div>
+          <div>
+            <div class="label">Anti-repeat depth</div>
+            <input id="gen-max-log" type="number" min="0" max="20" value="5" class="input">
+          </div>
+          <div class="col-span-2">
+            <div class="label">Размер чанка (слов) — override</div>
+            <input id="gen-chunk-size-override" type="number" min="500" max="100000" class="input" placeholder="авто по модели">
+            <div class="text-xs text-gray-500 mt-1">
+              Auto: Opus 4.7 / Sonnet 4.6 ~25K EN / 13K RU · Haiku 4.5 ~12K / 6.5K · GPT-4o ~8K / 4.5K · GPT-4.1-nano ~8K / 4.5K
+            </div>
+          </div>
+        </div>
+      </details>
+
+      <!-- Generate button + progress -->
+      <div class="flex gap-3 items-center">
+        <button id="gen-submit-btn" onclick="generateScript()" class="btn btn-blue py-2.5 px-6">🎬 Сгенерировать</button>
+        <span id="gen-status" class="text-sm text-gray-400"></span>
+      </div>
+
+      <!-- Output (hidden до первой успешной генерации) -->
+      <div id="gen-output" class="card space-y-3 hidden">
+        <h3 class="text-lg font-semibold">Результат</h3>
+        <div>
+          <div class="label flex justify-between items-center">
+            <span>Preview (для обложки)</span>
+            <button onclick="copyGenField('gen-out-preview')" class="btn btn-sm btn-gray">📋</button>
+          </div>
+          <input id="gen-out-preview" readonly class="input w-full">
+        </div>
+        <div>
+          <div class="label flex justify-between items-center">
+            <span>Title</span>
+            <button onclick="copyGenField('gen-out-title')" class="btn btn-sm btn-gray">📋</button>
+          </div>
+          <input id="gen-out-title" readonly class="input w-full">
+        </div>
+        <div>
+          <div class="label flex justify-between items-center">
+            <span>Script (TTS-ready)</span>
+            <span class="flex gap-2">
+              <button onclick="copyGenField('gen-out-script')" class="btn btn-sm btn-gray">📋 Copy</button>
+              <button onclick="downloadGenScriptTxt()" class="btn btn-sm btn-gray">⬇ .txt</button>
+            </span>
+          </div>
+          <textarea id="gen-out-script" readonly rows="20" class="input w-full"></textarea>
+          <p id="gen-out-meta" class="text-xs text-gray-500 mt-1"></p>
+        </div>
+        <details class="text-sm">
+          <summary class="cursor-pointer text-gray-400">Rotation log update (этого прогона)</summary>
+          <pre id="gen-out-log-update" class="text-xs bg-gray-900 p-2 rounded mt-1 overflow-auto"></pre>
+        </details>
+      </div>
+    </div>
+
+    <!-- Preset editor modal (Generation v2) -->
+    <div id="preset-editor-overlay" class="fixed inset-0 bg-black bg-opacity-70 z-50 hidden items-center justify-center" onclick="if(event.target===this)closePresetEditor()">
+      <div class="bg-gray-800 rounded-lg p-6 max-w-3xl w-full max-h-[90vh] overflow-y-auto space-y-3" style="margin:auto">
+        <h3 id="preset-editor-title" class="text-lg font-semibold">Создать пресет</h3>
+        <div>
+          <div class="label">Название</div>
+          <input id="preset-editor-name" type="text" maxlength="80" class="input w-full" placeholder="Buffett, Survival, etc.">
+        </div>
+        <div>
+          <div class="label">Длина (слов, опц.)</div>
+          <input id="preset-editor-length" type="number" min="300" max="100000" class="input w-full" placeholder="без chunking если пусто, иначе LLM делит на проходы">
+        </div>
+        <div>
+          <div class="label flex justify-between items-center">
+            <span>Content (JSON / markdown / plain text)</span>
+            <button onclick="prettyPrintPresetContent()" class="btn btn-sm btn-gray">⚙ Pretty-print JSON</button>
+          </div>
+          <textarea id="preset-editor-content" rows="20" class="input w-full" style="font-family: ui-monospace, 'SF Mono', Monaco, Menlo, monospace; font-size: 12px;" placeholder="Любая структура — JSON, markdown, plain text. Передаётся LLM как есть."></textarea>
+          <p class="text-xs text-gray-500 mt-1">JSON-ключи: <code>language</code>, <code>host_name</code>, <code>channel_name</code>. Постпроцесс для generation отключён по дизайну (Path B v2, 2026-05-23).</p>
+        </div>
+        <div class="flex gap-2 justify-end">
+          <button onclick="closePresetEditor()" class="btn btn-sm btn-gray">Отмена</button>
+          <button onclick="savePresetFromModal()" class="btn btn-sm btn-blue">💾 Сохранить</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== REWRITE TAB ===== -->
+    <div id="tab-rewrite" class="tab-content hidden max-w-6xl mx-auto space-y-4">
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+        <div class="space-y-4">
+          <!-- File upload -->
+          <div id="drop-zone" class="card border-2 border-dashed border-gray-600 text-center cursor-pointer hover:border-gray-500 transition p-6"
+            onclick="document.getElementById('file-input').click()">
+            <p class="text-gray-400 mb-1">📄 Перетащите файлы или нажмите для загрузки</p>
+            <p class="text-gray-500 text-xs">Поддерживаются .txt, .docx, .pdf, .odt, .rtf</p>
+            <input id="file-input" type="file" multiple accept=".txt,.md,.html,.docx,.doc,.pdf,.odt,.rtf" class="hidden" onchange="handleFiles(this.files)">
+          </div>
+          <div id="uploaded-files-list" class="card hidden">
+            <div class="label mb-2">Загруженные файлы</div>
+            <div id="files-tbody" class="space-y-1 text-sm"></div>
+          </div>
+          <!-- Settings -->
+          <div class="card grid grid-cols-2 gap-3">
+            <div>
+              <div class="label">Модель</div>
+              <select id="rew-model" class="input">
+                <option value="" disabled selected>Выберите модель</option>
+              </select>
+            </div>
+            <div>
+              <div class="label">Потоки</div>
+              <input id="rew-threads" type="number" min="1" max="50" value="3" class="input">
+            </div>
+            <div>
+              <div class="label">Размер чанка</div>
+              <input id="rew-chunk" type="number" min="1000" max="30000" value="8000" step="1000" class="input">
+            </div>
+            <div>
+              <div class="label">Обращение</div>
+              <select id="rew-address" class="input">
+                <option value="">По умолчанию</option>
+                <option value="vy">Вы (formal)</option>
+                <option value="ty">Ты (informal)</option>
+              </select>
+            </div>
+            <div class="col-span-2 flex flex-wrap gap-4">
+              <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" id="rew-safe-text"> Безопасный текст</label>
+              <label id="rew-preserve-paragraphs-wrap" class="flex items-center gap-2 text-sm cursor-pointer" title="Гарантировать что число абзацев в переводе совпадает с оригиналом (нужно для покадровой синхронизации)."><input type="checkbox" id="rew-preserve-paragraphs" checked> Сохранять структуру абзацев оригинала</label>
+            </div>
+          </div>
+          <!-- Rewrite presets -->
+          <div class="card">
+            <div class="label mb-2">Пресет рерайта</div>
+            <div class="flex gap-2 items-center">
+              <select id="rew-preset" class="input flex-1"><option value="">— выберите —</option></select>
+              <button onclick="loadRewPreset()" class="btn btn-sm btn-gray">Применить</button>
+              <button onclick="saveRewPreset()" class="btn btn-sm btn-green">Сохранить</button>
+              <button onclick="deleteRewPreset()" class="btn btn-sm btn-red">✕</button>
+            </div>
+          </div>
+          <!-- Actions -->
+          <div class="flex gap-2">
+            <button onclick="startRewrite(false)" class="btn btn-green flex-1 py-2.5">▶ Запустить рерайт</button>
+            <button onclick="startRewrite(true)" class="btn btn-teal flex-1 py-2.5">⏩ Параллельно</button>
+          </div>
+        </div>
+        <!-- Languages -->
+        <div class="card">
+          <div class="flex items-center justify-between mb-2">
+            <div class="label">Языки</div>
+            <input id="rew-lang-search" type="text" placeholder="Поиск..." class="input input-sm w-40" oninput="filterLangs('rew')">
+          </div>
+          <div class="flex gap-2 mb-2">
+            <button onclick="selectAllLangs('rew')" class="text-xs text-blue-400 hover:underline cursor-pointer">Выбрать все</button>
+            <button onclick="deselectAllLangs('rew')" class="text-xs text-blue-400 hover:underline cursor-pointer">Снять все</button>
+            <button onclick="openBulkEdit('rew')" class="text-xs text-yellow-400 hover:underline cursor-pointer ml-2">Массовое редактирование</button>
+          </div>
+          <div id="rew-lang-table" class="lang-table">
+            <table class="w-full text-sm">
+              <thead class="sticky top-0 bg-gray-800"><tr>
+                <th class="w-8 text-left py-1">☑</th><th class="text-left py-1">Язык</th>
+                <th class="text-left py-1">Канал</th><th class="text-left py-1">Диктор</th>
+                <th class="text-left py-1">Свой промпт</th>
+              </tr></thead>
+              <tbody id="rew-lang-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== QUEUE TAB ===== -->
+    <div id="tab-queue" class="tab-content hidden max-w-6xl mx-auto space-y-4">
+      <div class="card">
+        <div class="flex items-center justify-between mb-3">
+          <h2 class="text-sm font-medium">Задачи</h2>
+          <div class="flex gap-2 flex-wrap">
+            <button onclick="cancelSelectedJob()" class="btn btn-sm btn-red">⏹ Стоп</button>
+            <button onclick="retrySelectedJob()" class="btn btn-sm btn-yellow" title="Перезапустить только провалившиеся / незавершённые чанки. Уже готовые куски не трогаются — дособирает только то что упало.">🔁 Повторить незавершённые</button>
+            <button onclick="retrySelectedJobFull()" class="btn btn-sm btn-orange" title="Полная перегенерация с нуля. Сбрасывает прогресс и удаляет уже сохранённые файлы этой задачи.">🔄 Повторить</button>
+            <button onclick="markParallelSelectedJob()" class="btn btn-sm btn-purple">⏩ Параллельно</button>
+            <button onclick="deleteSelectedJob()" class="btn btn-sm btn-gray">🗑 Удалить</button>
+            <button onclick="downloadSelectedJobFiles()" class="btn btn-sm btn-blue">📥 Скачать</button>
+            <button id="btn-dl-selected" onclick="downloadSelectedJobsZip()" class="btn btn-sm btn-blue">📦 Скачать выбранные (0)</button>
+          </div>
+        </div>
+        <div class="overflow-x-auto max-h-80 overflow-y-auto">
+          <table class="w-full text-sm">
+            <thead class="sticky top-0 bg-gray-800"><tr>
+              <th class="text-left py-1 px-1 w-8"><input type="checkbox" id="jobs-select-all" class="job-cb" onclick="toggleSelectAllJobs(this)" title="Выбрать все"></th>
+              <th class="text-left py-1 px-2 w-20">ID</th>
+              <th class="text-left py-1 px-2 w-16">Тип</th>
+              <th class="text-left py-1 px-2 w-28">Статус</th>
+              <th class="text-left py-1 px-2 w-20">Прогресс</th>
+              <th class="text-left py-1 px-2">Задача</th>
+            </tr></thead>
+            <tbody id="jobs-tbody"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="card">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-sm font-medium">Лог задачи</h2>
+          <button onclick="downloadSelectedJobLog()" class="btn btn-sm btn-gray">💾 Скачать лог</button>
+        </div>
+        <pre id="job-log" class="log-area bg-gray-900 rounded p-3 h-64 overflow-auto text-gray-300 text-xs">(выберите задачу)</pre>
+      </div>
+      <div id="job-files-panel" class="card hidden">
+        <h2 class="text-sm font-medium mb-2">Файлы задачи</h2>
+        <div id="job-files-list" class="space-y-1"></div>
+      </div>
+    </div>
+
+    <!-- ===== SETTINGS TAB ===== -->
+    <div id="tab-settings" class="tab-content hidden max-w-2xl mx-auto space-y-4">
+      <!-- API Keys -->
+      <div class="card space-y-4">
+        <h2 class="text-lg font-semibold">API Ключи</h2>
+        <div>
+          <div class="label">OpenAI API Key (GPT)</div>
+          <input id="set-openai-key" type="password" placeholder="sk-..." class="input">
+        </div>
+      </div>
+      <!-- OAuth -->
+      <div class="card space-y-3">
+        <h2 class="text-lg font-semibold">OAuth токены Pro подписок</h2>
+        <p class="text-xs text-gray-500">Для Claude — единственный путь авторизации. Несколько токенов = больше потоков (макс. 3 на токен). Получить: <code>claude setup-token</code></p>
+        <div id="oauth-tokens-list" class="space-y-1 text-sm"></div>
+        <div class="flex gap-2">
+          <input id="new-oauth-token" type="password" placeholder="Вставьте OAuth токен..." class="input flex-1">
+          <button onclick="addOauthToken()" class="btn btn-sm btn-blue">+ Добавить</button>
+        </div>
+      </div>
+      <!-- GPT settings -->
+      <div class="card space-y-3" data-admin-only>
+        <h2 class="text-lg font-semibold">GPT модели</h2>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <div class="label">Тип</div>
+            <select id="set-gpt-tier" class="input">
+              <option value="default">Default (standard)</option>
+              <option value="flex">Flex (-50% дешевле)</option>
+            </select>
+          </div>
+          <div>
+            <div class="label">Модель проверки (Pass A/B/C/D)</div>
+            <input id="set-check-model" list="check-model-list" class="input" placeholder="gpt-5-mini" value="gpt-5-mini">
+            <datalist id="check-model-list">
+              <option value="gpt-5-mini">gpt-5-mini</option>
+              <option value="gpt-4o-mini">gpt-4o-mini</option>
+              <option value="gpt-4o">gpt-4o</option>
+              <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+              <option value="o1-mini">o1-mini</option>
+            </datalist>
+          </div>
+        </div>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" id="set-gpt-cache" checked> Кэширование input (аналогично Anthropic)
+        </label>
+        <p class="text-xs text-gray-500">Flex: дешевле, медленнее. Кэш: экономия до 90% на input</p>
+      </div>
+      <!-- Custom models -->
+      <div class="card space-y-3" data-admin-only>
+        <h2 class="text-lg font-semibold">Свои модели (fine-tuned, Azure и т.д.)</h2>
+        <div id="custom-models-list" class="space-y-1 text-sm"></div>
+        <div class="flex gap-2">
+          <input id="new-custom-model" type="text" placeholder="ft:gpt-4o-mini:... или model-id" class="input flex-1">
+          <button onclick="addCustomModel()" class="btn btn-sm btn-blue">+ Добавить</button>
+        </div>
+      </div>
+      <!-- Debug -->
+      <div class="card" data-admin-only>
+        <label class="flex items-center gap-2 text-sm cursor-pointer">
+          <input type="checkbox" id="set-debug-mode"> Debug: показывать все запросы и ошибки как есть
+        </label>
+      </div>
+      <!-- Defaults -->
+      <div class="card space-y-3">
+        <h2 class="text-lg font-semibold">По умолчанию</h2>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <div class="label">Модель</div>
+            <select id="set-default-model" class="input">
+              <option value="" disabled selected>Выберите модель</option>
+            </select>
+          </div>
+          <div>
+            <div class="label">Потоки</div>
+            <input id="set-default-threads" type="number" min="1" max="50" value="3" class="input">
+          </div>
+        </div>
+      </div>
+      <!-- Save -->
+      <div class="flex gap-3 items-center flex-wrap">
+        <button onclick="saveAllSettings()" class="btn btn-blue py-2.5 px-6">💾 Сохранить настройки</button>
+        <p id="settings-saved" class="text-green-400 text-sm hidden">✓ Сохранено</p>
+      </div>
+      <!-- Export / Import JSON -->
+      <div class="card space-y-2">
+        <h2 class="text-lg font-semibold">Экспорт / импорт настроек</h2>
+        <p class="text-xs text-gray-500">Скачать все настройки в JSON или загрузить из файла (ключи API, свои модели, пресеты настроек).</p>
+        <div class="flex gap-2 flex-wrap">
+          <button onclick="exportSettingsJson()" class="btn btn-gray py-2 px-4">📤 Экспорт в JSON</button>
+          <button onclick="document.getElementById('import-settings-file').click()" class="btn btn-gray py-2 px-4">📥 Импорт из JSON</button>
+          <input id="import-settings-file" type="file" accept=".json" class="hidden" onchange="handleImportSettingsFile(this)">
+        </div>
+        <div class="pt-2 border-t border-gray-600">
+          <p class="text-xs text-gray-500 mb-1">Пресеты рерайта из десктопного приложения (файл <code class="bg-gray-700 px-1 rounded">.rewrite_presets.json</code> из домашней папки):</p>
+          <button onclick="document.getElementById('import-desktop-rew-file').click()" class="btn btn-blue py-2 px-4">📂 Импорт пресетов рерайта из десктопа</button>
+          <input id="import-desktop-rew-file" type="file" accept=".json" class="hidden" onchange="handleImportDesktopRewritePresets(this)">
+        </div>
+        <p id="import-result" class="text-sm hidden"></p>
+      </div>
+
+      <!-- ============== API v1 keys ============== -->
+      <div class="card space-y-3">
+        <h2 class="text-lg font-semibold">API v1 ключи</h2>
+        <p class="text-xs text-gray-500">
+          Программный доступ к <code class="bg-gray-700 px-1 rounded">/api/v1/*</code>.
+          Plain key показывается ОДИН раз при создании — сохраните сразу.
+          Документация: <a href="/docs" target="_blank" class="text-blue-400 underline">/docs</a>,
+          <a href="/README_API.md" target="_blank" class="text-blue-400 underline">README_API.md</a>.
+        </p>
+        <div class="flex gap-2">
+          <input id="new-api-key-name" type="text" placeholder="Имя (laptop, ci, ...)" class="input flex-1" maxlength="64">
+          <button onclick="createApiKey()" class="btn btn-sm btn-blue">+ Создать ключ</button>
+        </div>
+        <div id="api-key-new-result" class="hidden bg-yellow-900 border border-yellow-600 rounded p-3 text-xs space-y-2">
+          <p class="text-yellow-200 font-semibold">⚠️ Сохраните этот ключ сейчас — он не будет показан снова:</p>
+          <div class="flex gap-2 items-center">
+            <code id="api-key-new-plain" class="bg-gray-900 px-2 py-1 rounded flex-1 break-all"></code>
+            <button onclick="copyApiKey()" class="btn btn-sm btn-gray">📋 Copy</button>
+          </div>
+          <button onclick="dismissApiKeyResult()" class="btn btn-sm btn-gray">Я скопировал</button>
+        </div>
+        <div id="api-keys-list" class="space-y-1 text-sm"></div>
+      </div>
+
+    </div>
+
+  </main>
+</div>
+
+<!-- ========== PRESET EDITOR MODAL ========== -->
+<div id="preset-modal" class="modal-overlay hidden" onclick="if(event.target===this)closePresetModal()">
+  <div class="modal-content space-y-4">
+    <h2 id="preset-modal-title" class="text-lg font-semibold">Новый пресет</h2>
+    <div class="grid grid-cols-2 gap-3">
+      <div>
+        <div class="label">Название</div>
+        <input id="pm-name" class="input" placeholder="Истории выживания">
+      </div>
+      <div>
+        <div class="label">Тип контента</div>
+        <select id="pm-content-type" class="input">
+          <option value="survival">survival</option>
+          <option value="military">military</option>
+          <option value="investigation">investigation</option>
+          <option value="custom">custom</option>
+        </select>
+      </div>
+      <div>
+        <div class="label">Всего слов</div>
+        <input id="pm-total-words" type="number" class="input" value="10000">
+      </div>
+      <div>
+        <div class="label">Кол-во глав</div>
+        <input id="pm-num-chapters" type="number" class="input" value="10">
+      </div>
+      <div>
+        <div class="label">Слов на главу</div>
+        <input id="pm-words-per-chapter" type="number" class="input" value="1000">
+      </div>
+    </div>
+    <div>
+      <div class="label">Инструкции (для хуков, описаний и т.д.)</div>
+      <textarea id="pm-custom-instructions" rows="3" class="input resize-y w-full" placeholder="интригующие факты, загадочные детали..."></textarea>
+    </div>
+    <div>
+      <div class="label">Промпт-шаблон</div>
+      <textarea id="pm-prompt-template" rows="12" class="input resize-y w-full" placeholder="Напиши длинную драматическую историю..."></textarea>
+    </div>
+    <div class="flex gap-3 justify-between">
+      <div class="flex gap-2">
+        <button onclick="savePresetFromModal()" class="btn btn-blue py-2 px-6">💾 Сохранить</button>
+        <button onclick="closePresetModal()" class="btn btn-gray py-2 px-6">Отмена</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ========== BULK EDIT MODAL ========== -->
+<div id="bulk-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeBulkModal()">
+  <div class="modal-content space-y-4">
+    <h2 class="text-lg font-semibold">Массовое редактирование</h2>
+    <div class="grid grid-cols-2 gap-3">
+      <div>
+        <div class="label">Канал (для всех)</div>
+        <input id="bulk-channel" class="input" placeholder="Название канала">
+      </div>
+      <div>
+        <div class="label">Диктор (для всех)</div>
+        <input id="bulk-host" class="input" placeholder="Имя диктора">
+      </div>
+    </div>
+    <div class="flex gap-2">
+      <button onclick="applyBulkToAll()" class="btn btn-blue py-2 px-4">Применить ко всем</button>
+      <button onclick="applyBulkToSelected()" class="btn btn-green py-2 px-4">Только к выбранным</button>
+      <button onclick="closeBulkModal()" class="btn btn-gray py-2 px-4">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==================== STATE ====================
+let SESSION_ID = localStorage.getItem('session_id') || '';
+let USER_NAME = localStorage.getItem('user_name') || '';
+let USER_ID   = localStorage.getItem('user_id') || '';
+// ADMIN_USER_ID keep in sync with server.py / api.py (literal, no shared import)
+const ADMIN_USER_ID = '292d249f2de0';
+let allLanguages = [];
+let allModels = [];
+let allPresets = {};
+let uploadedFiles = JSON.parse(localStorage.getItem('uploaded_files') || '[]');
+let selectedJobId = null;
+let selectedJobIds = new Set();  // PATCH-2026-06-20: множественный выбор задач для скачивания
+let queueTimer = null;
+let pingInterval = null;
+let editingPresetName = null;
+let bulkEditPrefix = 'gen';
+let oauthTokens = [];
+let customModels = [];
+let genSettingsPresets = JSON.parse(localStorage.getItem('gen_settings_presets') || '{}');
+let rewPresets = JSON.parse(localStorage.getItem('rew_presets') || '{}');
+
+const STATUS_ICONS = {
+  pending: '📋 Ждёт', running: '⏳ Идёт', completed: '✅ Готово',
+  failed: '❌ Ошибка', cancelled: '⏹ Остановлен', partial: '⚠️ Частично'
+};
+
+// ==================== API ====================
+async function apiFetch(url, options = {}) {
+  const headers = { 'Content-Type': 'application/json', 'X-Session-Id': SESSION_ID, ...(options.headers || {}) };
+  if (options.body instanceof FormData) { delete headers['Content-Type']; }
+  const resp = await fetch(url, { ...options, headers });
+  if (resp.status === 401) { showLoginScreen(); throw new Error('Сессия истекла'); }
+  if (!resp.ok) { const err = await resp.json().catch(() => ({})); throw new Error(err.error || err.detail || `HTTP ${resp.status}`); }
+  return resp.json();
+}
+
+// ==================== AUTH ====================
+async function doLogin() {
+  const key = document.getElementById('license-key-input').value.trim();
+  const errEl = document.getElementById('login-error');
+  const btn = document.getElementById('login-btn');
+  errEl.classList.add('hidden');
+  if (!key) { errEl.textContent = 'Введите ключ'; errEl.classList.remove('hidden'); return; }
+  btn.disabled = true; btn.textContent = 'Вход...';
+  try {
+    const resp = await fetch('/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ license_key: key }) });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Ошибка входа');
+    SESSION_ID = data.session_id; USER_NAME = data.user_name;
+    USER_ID = data.user_id || '';
+    localStorage.setItem('session_id', SESSION_ID); localStorage.setItem('user_name', USER_NAME);
+    if (USER_ID) localStorage.setItem('user_id', USER_ID); else localStorage.removeItem('user_id');
+    startPing(); showApp();
+  } catch (e) { errEl.textContent = e.message; errEl.classList.remove('hidden'); }
+  finally { btn.disabled = false; btn.textContent = 'Войти'; }
+}
+
+async function doLogout() {
+  try { await fetch('/auth/logout', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID } }); } catch (e) {}
+  SESSION_ID = ''; USER_NAME = ''; USER_ID = '';
+  localStorage.removeItem('session_id'); localStorage.removeItem('user_name'); localStorage.removeItem('user_id');
+  if (pingInterval) clearInterval(pingInterval);
+  if (queueTimer) clearTimeout(queueTimer);
+  showLoginScreen();
+}
+
+function startPing() {
+  if (pingInterval) clearInterval(pingInterval);
+  pingInterval = setInterval(async () => {
+    try {
+      const r = await apiFetch('/auth/ping', { method: 'POST' });
+      // На случай если USER_ID отсутствует в localStorage (старая сессия до релиза gate) — подхватываем из ping
+      if (r && r.user_id && !USER_ID) {
+        USER_ID = r.user_id;
+        localStorage.setItem('user_id', USER_ID);
+        applyPreserveParagraphsGate();
+      }
+    } catch (e) {}
+  }, 30000);
+}
+
+// Task 3: скрывает чекбокс preserve_paragraphs для всех кроме админа (Володя).
+// Fail-open: пока USER_ID неизвестен — НЕ скрываем (избегаем blank UI при cold load).
+function applyPreserveParagraphsGate() {
+  const wrap = document.getElementById('rew-preserve-paragraphs-wrap');
+  if (!wrap) return;
+  if (USER_ID && USER_ID !== ADMIN_USER_ID) {
+    wrap.style.display = 'none';
+    // Принудительно ставим checked=true — на случай если юзер успел снять до релиза.
+    const cb = document.getElementById('rew-preserve-paragraphs');
+    if (cb) cb.checked = true;
+  } else {
+    wrap.style.display = '';
+  }
+}
+
+// ==================== NAVIGATION ====================
+function showLoginScreen() {
+  document.getElementById('login-screen').classList.remove('hidden');
+  document.getElementById('app').classList.add('hidden');
+}
+
+function showApp() {
+  document.getElementById('login-screen').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  document.getElementById('user-name-display').textContent = USER_NAME;
+  applyPreserveParagraphsGate();  // Task 3: скрыть preserve_paragraphs для не-админа
+  loadInitialData();
+}
+
+function switchTab(name, btn) {
+  // PATCH-2026-06-18-tab-modals: закрываем залипающие оверлеи/модалки генерации при смене вкладки
+  try { closePresetEditor(); } catch (e) {}
+  try { closePresetModal(); } catch (e) {}
+  try { closeBulkModal(); } catch (e) {}
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  document.getElementById('tab-' + name).classList.remove('hidden');
+  if (btn) btn.classList.add('active');
+  localStorage.setItem('active_tab', name);
+  if (name === 'queue') { startQueuePolling(); }
+  else if (queueTimer) { clearTimeout(queueTimer); queueTimer = null; }
+}
+
+// ==================== INIT DATA ====================
+async function loadInitialData() {
+  try {
+    const [langs, models, presets, keysCfg] = await Promise.all([
+      apiFetch('/languages'),
+      apiFetch('/models'),
+      apiFetch('/presets'),
+      apiFetch('/settings/keys').catch(() => null),
+    ]);
+    allLanguages = langs;
+    allModels = models;
+    allPresets = presets;
+    // Round 2: gen lang-table удалён (single-language flow), оставляем только rew.
+    renderLangTable('rew');
+    populateModelDropdowns();
+    populatePresetDropdown();
+    if (keysCfg) loadServerSettings(keysCfg);
+  } catch (e) { console.error('Init error:', e); }
+  loadLocalSettings();
+  // Restore tab-specific settings after language tables and models are rendered
+  restoreGenSettings();
+  restoreRewSettings();
+  restoreLangs('rew');
+  renderUploadedFiles();
+  setupAutoSaveListeners();
+  refreshApiKeysList();
+  // Restore active tab
+  const savedTab = localStorage.getItem('active_tab');
+  if (savedTab && savedTab !== 'generation') {
+    const tabBtns = document.querySelectorAll('.tab-btn');
+    const tabNames = ['generation', 'rewrite', 'queue', 'settings'];
+    const idx = tabNames.indexOf(savedTab);
+    if (idx >= 0) switchTab(savedTab, tabBtns[idx]);
+  }
+  startQueuePolling();
+}
+
+// Helper для установки value в <select>. Если model отсутствует в options
+// (preset со старым/удалённым ID) — добавляет ad-hoc option с пометкой (legacy).
+function setModelValue(selectId, model) {
+  const sel = document.getElementById(selectId);
+  if (!sel || !model) return;
+  if (![...sel.options].some(o => o.value === model)) {
+    const opt = new Option(model + ' (legacy)', model);
+    opt.dataset.adhoc = '1';
+    sel.add(opt);
+  }
+  sel.value = model;
+}
+
+function populateModelDropdowns() {
+  // 3 model dropdowns теперь <select>: gen-model, rew-model, set-default-model.
+  // check-model-list (postprocess models) — отдельный datalist, не трогаем здесь.
+  const serverVals = new Set(allModels.map(m => m.value));
+  const localCustom = JSON.parse(localStorage.getItem('custom_models_arr') || '[]');
+  const extraOpts = localCustom
+    .filter(c => !serverVals.has(c))
+    .map(c => ({ value: c, label: c + ' (custom)' }));
+  const allOpts = [...allModels, ...extraOpts];
+
+  ['gen-model', 'rew-model', 'set-default-model'].forEach(selectId => {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const current = sel.value;  // сохранить selection
+    // Удалить все options кроме placeholder (disabled)
+    [...sel.querySelectorAll('option:not([disabled])')].forEach(o => o.remove());
+    allOpts.forEach(m => sel.add(new Option(m.label || m.value, m.value)));
+    if (current) setModelValue(selectId, current);
+  });
+
+  // check-model-list (datalist для postprocess моделей) — оставляем как datalist
+  const checkDl = document.getElementById('check-model-list');
+  if (checkDl) {
+    checkDl.innerHTML = allOpts.map(m => `<option value="${m.value}">${m.label}</option>`).join('');
+  }
+
+  // Set defaults only if no auto-saved value exists
+  const def = localStorage.getItem('default_model');
+  const defT = localStorage.getItem('default_threads');
+  ['gen-model', 'rew-model'].forEach(id => {
+    const el = document.getElementById(id);
+    if (!el.value && def) setModelValue(id, def);
+  });
+  // gen-threads удалён в Round 2 (single-shot flow). Apply default только к rew-threads.
+  const rewT = document.getElementById('rew-threads');
+  if (rewT && rewT.value === '3' && defT) rewT.value = defT;
+}
+
+function populatePresetDropdown() {
+  // Round 2: dropdown.value = preset.id (canonical), отображается name.
+  // /presets возвращает {<name>: <summary>} where summary имеет id поле.
+  const sel = document.getElementById('gen-preset');
+  if (!sel) return;
+  sel.innerHTML = '<option value="" disabled selected>— выберите пресет —</option>';
+  for (const name of Object.keys(allPresets)) {
+    const p = allPresets[name];
+    const pid = (p && p.id) || name;  // fallback на name если id отсутствует
+    sel.add(new Option(name, pid));
+  }
+  onGenPresetSelected();
+}
+
+function onGenPresetSelected() {
+  // Round 2: показывает meta из new schema (target_length_words + last_used_at).
+  const sel = document.getElementById('gen-preset');
+  const meta = document.getElementById('gen-preset-meta');
+  if (!sel || !meta) return;
+  const pid = sel.value;
+  let p = null;
+  for (const name of Object.keys(allPresets)) {
+    if ((allPresets[name].id || name) === pid) { p = allPresets[name]; break; }
+  }
+  if (!p) { meta.textContent = ''; return; }
+  const parts = [];
+  if (p.target_length_words) parts.push(`${p.target_length_words} слов`);
+  else parts.push('без chunking');
+  if (p.last_used_at) {
+    parts.push('last used ' + new Date(p.last_used_at * 1000).toLocaleString());
+  }
+  meta.textContent = parts.join(' · ');
+}
+
+// ==================== LANGUAGES ====================
+function renderLangTable(prefix) {
+  const tbody = document.getElementById(prefix + '-lang-tbody');
+  const isRew = prefix === 'rew';
+  tbody.innerHTML = '';
+  allLanguages.forEach((lang, i) => {
+    const tr = document.createElement('tr');
+    tr.className = 'lang-row border-b border-gray-700';
+    tr.dataset.display = lang.display.toLowerCase();
+    let html = `
+      <td class="py-1"><input type="checkbox" class="lang-cb" data-idx="${i}"></td>
+      <td class="py-1 text-xs">${lang.display}</td>
+      <td class="py-1"><input type="text" class="lang-channel input input-sm w-24" data-idx="${i}"></td>
+      <td class="py-1"><input type="text" class="lang-host input input-sm w-24" data-idx="${i}"></td>`;
+    if (isRew) {
+      html += `<td class="py-1"><input type="text" class="lang-prompt input input-sm w-32" data-idx="${i}" placeholder="свой промпт..."></td>`;
+    }
+    tr.innerHTML = html;
+    tbody.appendChild(tr);
+  });
+}
+
+function filterLangs(prefix) {
+  const q = document.getElementById(prefix + '-lang-search').value.toLowerCase();
+  document.querySelectorAll('#' + prefix + '-lang-tbody .lang-row').forEach(tr => {
+    tr.style.display = tr.dataset.display.includes(q) ? '' : 'none';
+  });
+}
+
+function selectAllLangs(prefix) { document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb').forEach(cb => { if (cb.closest('tr').style.display !== 'none') cb.checked = true; }); }
+function deselectAllLangs(prefix) { document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb').forEach(cb => cb.checked = false); }
+
+function getSelectedLangs(prefix) {
+  const result = [];
+  document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb:checked').forEach(cb => {
+    const idx = parseInt(cb.dataset.idx);
+    const lang = allLanguages[idx];
+    const tr = cb.closest('tr');
+    const channel = tr.querySelector('.lang-channel').value.trim();
+    const host = tr.querySelector('.lang-host').value.trim();
+    const custom_prompt = tr.querySelector('.lang-prompt') ? tr.querySelector('.lang-prompt').value.trim() : '';
+    result.push({ display: lang.display, code: lang.code, channel, host, custom_prompt });
+  });
+  return result;
+}
+
+function setLangTableValues(prefix, data) {
+  const rows = document.querySelectorAll('#' + prefix + '-lang-tbody .lang-row');
+  rows.forEach(tr => {
+    const cb = tr.querySelector('.lang-cb');
+    const idx = parseInt(cb.dataset.idx);
+    const lang = allLanguages[idx];
+    const info = data.find(d => d.display === lang.display || d.code === lang.code);
+    if (info) {
+      cb.checked = true;
+      if (info.channel) tr.querySelector('.lang-channel').value = info.channel;
+      if (info.host) tr.querySelector('.lang-host').value = info.host;
+      if (info.custom_prompt && tr.querySelector('.lang-prompt')) tr.querySelector('.lang-prompt').value = info.custom_prompt;
+    }
+  });
+}
+
+// ==================== BULK EDIT ====================
+function openBulkEdit(prefix) {
+  bulkEditPrefix = prefix;
+  document.getElementById('bulk-channel').value = '';
+  document.getElementById('bulk-host').value = '';
+  document.getElementById('bulk-modal').classList.remove('hidden');
+}
+function closeBulkModal() { document.getElementById('bulk-modal').classList.add('hidden'); }
+
+function applyBulkToAll() {
+  const ch = document.getElementById('bulk-channel').value.trim();
+  const ho = document.getElementById('bulk-host').value.trim();
+  document.querySelectorAll('#' + bulkEditPrefix + '-lang-tbody .lang-row').forEach(tr => {
+    if (ch) tr.querySelector('.lang-channel').value = ch;
+    if (ho) tr.querySelector('.lang-host').value = ho;
+  });
+  closeBulkModal();
+}
+
+function applyBulkToSelected() {
+  const ch = document.getElementById('bulk-channel').value.trim();
+  const ho = document.getElementById('bulk-host').value.trim();
+  document.querySelectorAll('#' + bulkEditPrefix + '-lang-tbody .lang-cb:checked').forEach(cb => {
+    const tr = cb.closest('tr');
+    if (ch) tr.querySelector('.lang-channel').value = ch;
+    if (ho) tr.querySelector('.lang-host').value = ho;
+  });
+  closeBulkModal();
+}
+
+// ==================== PRESET EDITOR (Round 2 v2) ====================
+let editingPresetId = null;  // id текущего открытого в modal для edit
+
+function openPresetEditor(presetId) {
+  // presetId = null → create new; иначе — load existing для edit
+  editingPresetId = presetId;
+  const title = document.getElementById('preset-editor-title');
+  const nameEl = document.getElementById('preset-editor-name');
+  const lenEl = document.getElementById('preset-editor-length');
+  const contentEl = document.getElementById('preset-editor-content');
+  if (presetId) {
+    title.textContent = 'Редактировать пресет';
+    // Найти preset по id в allPresets (ключ — name, поле .id)
+    let found = null;
+    for (const name of Object.keys(allPresets)) {
+      if ((allPresets[name].id || name) === presetId) { found = allPresets[name]; break; }
+    }
+    if (!found) { alert('Пресет не найден'); return; }
+    // Загрузить полный content через /presets/{id}
+    apiFetch('/presets/' + encodeURIComponent(presetId)).then(full => {
+      nameEl.value = full.name || '';
+      lenEl.value = full.target_length_words || '';
+      contentEl.value = full.content || '';
+    }).catch(e => alert('Ошибка загрузки: ' + (e.message || e)));
+  } else {
+    title.textContent = 'Создать пресет';
+    nameEl.value = '';
+    lenEl.value = '';
+    contentEl.value = '';
+  }
+  document.getElementById('preset-editor-overlay').classList.remove('hidden');
+  document.getElementById('preset-editor-overlay').style.display = 'flex';
+}
+
+function closePresetEditor() {
+  document.getElementById('preset-editor-overlay').classList.add('hidden');
+  document.getElementById('preset-editor-overlay').style.display = 'none';
+  editingPresetId = null;
+}
+
+function prettyPrintPresetContent() {
+  const ta = document.getElementById('preset-editor-content');
+  try {
+    const obj = JSON.parse(ta.value);
+    ta.value = JSON.stringify(obj, null, 2);
+  } catch {
+    alert('Content не валидный JSON — pretty-print невозможен');
+  }
+}
+
+function editCurrentPreset() {
+  const pid = document.getElementById('gen-preset').value;
+  if (!pid) { alert('Выберите пресет'); return; }
+  openPresetEditor(pid);
+}
+
+async function deleteCurrentPreset() {
+  const sel = document.getElementById('gen-preset');
+  const pid = sel.value;
+  if (!pid) return;
+  const presetName = sel.options[sel.selectedIndex]?.text || pid;
+  if (!confirm(`Удалить пресет "${presetName}" и весь его rotation log?`)) return;
+  try {
+    await apiFetch('/presets/' + encodeURIComponent(pid), { method: 'DELETE' });
+    await reloadPresets();
+  } catch (e) { alert(e.message || e); }
+}
+
+async function savePresetFromModal() {
+  const name = document.getElementById('preset-editor-name').value.trim();
+  if (!name) { alert('Введите название'); return; }
+  const lenRaw = document.getElementById('preset-editor-length').value.trim();
+  const content = document.getElementById('preset-editor-content').value.trim();
+  if (content.length < 10) { alert('Content слишком короткий (min 10 chars)'); return; }
+  const body = {
+    name: name,
+    target_length_words: lenRaw ? parseInt(lenRaw) : null,
+    content: content,
+  };
+  // Для create — id создаётся сервером (slug). Для edit — переиспользуется existing id.
+  const identifier = editingPresetId || encodeURIComponent(name);
+  try {
+    const saved = await apiFetch('/presets/' + identifier, { method: 'POST', body: JSON.stringify(body) });
+    closePresetEditor();
+    await reloadPresets();
+    // Выбрать только что сохранённый
+    document.getElementById('gen-preset').value = saved.id;
+    onGenPresetSelected();
+  } catch (e) { alert(e.message || e); }
+}
+
+async function reloadPresets() {
+  try {
+    allPresets = await apiFetch('/presets');
+    populatePresetDropdown();
+  } catch (e) { console.warn('reloadPresets failed:', e); }
+}
+
+function importPresetJson() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      // Pre-fill modal
+      openPresetEditor(null);
+      // Try parse to determine name + content
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch {}
+      if (parsed && typeof parsed === 'object') {
+        document.getElementById('preset-editor-name').value =
+          parsed.name || file.name.replace(/\.json$/i, '');
+        document.getElementById('preset-editor-length').value =
+          parsed.target_length_words || parsed.total_words || '';
+        // content: либо явное поле, либо весь JSON как opaque
+        if (typeof parsed.content === 'string' && parsed.content.length > 10) {
+          document.getElementById('preset-editor-content').value = parsed.content;
+        } else {
+          document.getElementById('preset-editor-content').value = JSON.stringify(parsed, null, 2);
+        }
+      } else {
+        document.getElementById('preset-editor-name').value = file.name.replace(/\.json$/i, '');
+        document.getElementById('preset-editor-content').value = text;
+      }
+    } catch (err) {
+      alert('Ошибка чтения файла: ' + err);
+    }
+  };
+  input.click();
+}
+
+async function exportPresetJson() {
+  const pid = document.getElementById('gen-preset').value;
+  if (!pid) { alert('Выберите пресет'); return; }
+  try {
+    const full = await apiFetch('/presets/' + encodeURIComponent(pid));
+    const blob = new Blob([JSON.stringify(full, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (full.name || full.id) + '.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) { alert(e.message || e); }
+}
+
+// ==================== REWRITE PRESETS ====================
+function saveRewPreset() {
+  const current = document.getElementById('rew-preset').value;
+  const name = prompt('Имя пресета рерайта:', current || '');
+  if (!name) return;
+  const langs = getSelectedLangs('rew');
+  rewPresets[name] = {
+    model: document.getElementById('rew-model').value,
+    threads: document.getElementById('rew-threads').value,
+    chunk: document.getElementById('rew-chunk').value,
+    address: document.getElementById('rew-address').value,
+    use_sub: false,  // DEPRECATED 2026-05-22: auto-derived server-side from model+oauth
+    safe_text: document.getElementById('rew-safe-text').checked,
+    preserve_paragraphs: document.getElementById('rew-preserve-paragraphs').checked,
+    languages: langs,
+  };
+  localStorage.setItem('rew_presets', JSON.stringify(rewPresets));
+  refreshRewPresetList();
+  document.getElementById('rew-preset').value = name;
+}
+
+function loadRewPreset() {
+  const name = document.getElementById('rew-preset').value;
+  if (!name || !rewPresets[name]) return;
+  const p = rewPresets[name];
+  if (p.model) setModelValue('rew-model', p.model);
+  if (p.threads) document.getElementById('rew-threads').value = p.threads;
+  if (p.chunk) document.getElementById('rew-chunk').value = p.chunk;
+  if (p.address) document.getElementById('rew-address').value = p.address;
+  // use_sub deprecated — игнорируем p.use_sub из старых пресетов
+  document.getElementById('rew-safe-text').checked = !!p.safe_text;
+  // По умолчанию включаем (фича добавлена позже — старые пресеты её не имели)
+  document.getElementById('rew-preserve-paragraphs').checked = (p.preserve_paragraphs !== false);
+  if (p.languages) {
+    deselectAllLangs('rew');
+    setLangTableValues('rew', p.languages);
+  }
+}
+
+function deleteRewPreset() {
+  const name = document.getElementById('rew-preset').value;
+  if (!name) return;
+  delete rewPresets[name];
+  localStorage.setItem('rew_presets', JSON.stringify(rewPresets));
+  refreshRewPresetList();
+}
+
+function refreshRewPresetList() {
+  const sel = document.getElementById('rew-preset');
+  sel.innerHTML = '<option value="">— выберите —</option>';
+  for (const n of Object.keys(rewPresets)) {
+    sel.innerHTML += `<option value="${n}">${n}</option>`;
+  }
+}
+
+// ==================== GENERATION ====================
+// Round 2: single-topic flow с inline polling + output section.
+let _genJobPollTimer = null;
+
+// PATCH-2026-06-20-gen-rows: строки тем (клик «добавить»), язык на каждую строку.
+function addGenRow(topic, lang) {
+  const list = document.getElementById('gen-topics-list');
+  if (!list) return null;
+  const row = document.createElement('div');
+  row.className = 'gen-row flex gap-2 items-start';
+  // inline flex/width бьёт кастомный .input{width:100%}, иначе колонки разъезжаются
+  row.innerHTML = `
+    <textarea class="gen-row-topic input resize-y" rows="3" style="flex:1 1 0; min-width:0;" placeholder="Тема / источник… (можно многострочно)"></textarea>
+    <input class="gen-row-lang input" type="text" style="flex:0 0 7rem; width:7rem;" placeholder="(из пресета)" title="Язык этой темы (пусто = из пресета)">
+    <button type="button" onclick="removeGenRow(this)" class="btn btn-sm btn-gray" style="flex:0 0 auto;" title="Удалить строку">✕</button>`;
+  list.appendChild(row);
+  if (topic != null) row.querySelector('.gen-row-topic').value = topic;
+  if (lang != null) row.querySelector('.gen-row-lang').value = lang;
+  row.querySelector('.gen-row-topic').addEventListener('input', updateGenBatchCount);
+  row.querySelector('.gen-row-lang').addEventListener('input', updateGenBatchCount);
+  updateGenBatchCount();
+  return row;
+}
+function removeGenRow(btn) {
+  const row = btn.closest('.gen-row');
+  if (row) row.remove();
+  if (!document.querySelector('#gen-topics-list .gen-row')) addGenRow();  // всегда ≥1 строка
+  updateGenBatchCount();
+}
+function ensureGenRows() {
+  if (!document.querySelector('#gen-topics-list .gen-row')) addGenRow();
+  updateGenBatchCount();
+}
+function collectGenItems() {
+  return [...document.querySelectorAll('#gen-topics-list .gen-row')].map(r => ({
+    topic: r.querySelector('.gen-row-topic').value.trim(),
+    language: r.querySelector('.gen-row-lang').value.trim(),
+  })).filter(it => it.topic.length >= 10);
+}
+function updateGenBatchCount() {
+  const btn = document.getElementById('gen-submit-btn');
+  if (!btn) return;
+  const n = collectGenItems().length;
+  btn.textContent = n > 1 ? `🎬 Создать все (${n})` : '🎬 Сгенерировать';
+}
+
+async function generateScript() {
+  const presetId = document.getElementById('gen-preset').value;
+  if (!presetId) { alert('Выберите пресет'); return; }
+  const items = collectGenItems();
+  if (items.length === 0) { alert('Добавьте хотя бы одну тему (min 10 символов)'); return; }
+  const modelOverride = document.getElementById('gen-model').value;
+  const langOverride = document.getElementById('gen-language-override').value.trim();
+  const lenOverride = parseInt(document.getElementById('gen-length-override').value) || null;
+  const chunkOverride = parseInt(document.getElementById('gen-chunk-size-override').value) || null;
+  const maxLog = parseInt(document.getElementById('gen-max-log').value) || 5;
+  const settings = getApiSettings();
+
+  const btn = document.getElementById('gen-submit-btn');
+  const status = document.getElementById('gen-status');
+  document.getElementById('gen-output').classList.add('hidden');
+  btn.disabled = true;
+  status.textContent = items.length > 1 ? `⏳ Ставлю ${items.length} задач...` : '⏳ Отправляю job...';
+
+  const body = {
+    preset_id: presetId,
+    items: items,
+    max_log_entries: maxLog,
+    oauth_tokens: settings.oauth_tokens,
+    anthropic_api_key: '',
+    openai_api_key: settings.openai_key,
+  };
+  if (modelOverride) body.model = modelOverride;
+  if (langOverride) body.language = langOverride;   // дефолт для строк без своего языка
+  if (lenOverride) body.target_length_words = lenOverride;
+  if (chunkOverride) body.chunk_size_words = chunkOverride;
+
+  try {
+    const resp = await apiFetch('/jobs/generation', { method: 'POST', body: JSON.stringify(body) });
+    const count = resp.count || (resp.job_ids ? resp.job_ids.length : 1);
+    const nfail = (resp.failed && resp.failed.length) ? resp.failed.length : 0;
+    btn.disabled = false;
+    if (items.length === 1 && resp.job_id) {
+      // одиночная тема — прежний flow: статус + inline-вывод результата ниже
+      status.textContent = `⏳ Job ${resp.job_id.slice(0, 12)}… в очереди — можно ставить ещё`;
+      pollGenerationJob(resp.job_id);
+    } else {
+      // batch — счётчик и уводим в очередь, где все задачи уже стопкой
+      status.textContent = `✅ Поставлено задач: ${count}${nfail ? ', не прошло: ' + nfail : ''} — открываю очередь...`;
+      const qbtn = [...document.querySelectorAll('.tab-btn')].find(b => /Очеред/.test(b.textContent));
+      setTimeout(() => switchTab('queue', qbtn), 700);
+    }
+  } catch (e) {
+    btn.disabled = false;
+    status.textContent = '';
+    alert('Ошибка создания: ' + (e.message || e));
+  }
+}
+
+async function pollGenerationJob(jobId) {
+  if (_genJobPollTimer) { clearTimeout(_genJobPollTimer); _genJobPollTimer = null; }
+  const btn = document.getElementById('gen-submit-btn');
+  const status = document.getElementById('gen-status');
+  let job;
+  try {
+    job = await apiFetch('/jobs/' + encodeURIComponent(jobId));
+  } catch (e) {
+    btn.disabled = false;
+    status.textContent = 'Ошибка опроса job: ' + (e.message || e);
+    return;
+  }
+  const terminal = ['completed', 'partial', 'failed', 'cancelled', 'interrupted'];
+  const pct = job.progress || job.progress_percent || 0;
+  status.textContent = `⏳ ${job.status} · ${pct}% · ${job.detail || job.progress_detail || ''}`;
+  if (!terminal.includes(job.status)) {
+    _genJobPollTimer = setTimeout(() => pollGenerationJob(jobId), 5000);
+    return;
+  }
+  btn.disabled = false;
+  if (job.status !== 'completed') {
+    status.textContent = `❌ Job ${job.status}: ${job.error || '(no detail)'}`;
+    return;
+  }
+  status.textContent = `✓ Готово (${job.progress_detail || job.detail || ''})`;
+  await loadGenerationOutput(jobId);
+  await reloadPresets();
+}
+
+async function loadGenerationOutput(jobId) {
+  // /jobs/{id}/files возвращает list filenames; meta.json содержит preview+title; .txt — script.
+  let outputFiles = [];
+  try {
+    outputFiles = await apiFetch('/jobs/' + encodeURIComponent(jobId) + '/files');
+  } catch (e) {
+    alert('Не удалось получить список файлов: ' + (e.message || e));
+    return;
+  }
+  if (!outputFiles || !outputFiles.length) {
+    alert('Нет output files');
+    return;
+  }
+  const metaFile = outputFiles.find(f => f.endsWith('.meta.json'));
+  const scriptFile = outputFiles.find(f => f.endsWith('.txt'));
+  // Direct fetch (text). apiFetch возвращает parsed JSON; для .txt используем raw fetch.
+  let preview = '', title = '', logUpdate = [], modelUsed = '', skipPP = false;
+  if (metaFile) {
+    try {
+      const metaResp = await fetch('/jobs/' + encodeURIComponent(jobId) + '/files/' + encodeURIComponent(metaFile), {
+        headers: { 'X-Session-Id': SESSION_ID },
+      });
+      if (metaResp.ok) {
+        const m = await metaResp.json();
+        preview = m.preview || '';
+        title = m.title || '';
+        logUpdate = m.log_update || [];
+        modelUsed = m.model || '';
+        skipPP = !!m.skip_postprocess;
+      }
+    } catch (e) { console.warn('meta load failed', e); }
+  }
+  let scriptText = '';
+  if (scriptFile) {
+    try {
+      const scriptResp = await fetch('/jobs/' + encodeURIComponent(jobId) + '/files/' + encodeURIComponent(scriptFile), {
+        headers: { 'X-Session-Id': SESSION_ID },
+      });
+      if (scriptResp.ok) scriptText = await scriptResp.text();
+    } catch (e) { console.warn('script load failed', e); }
+  }
+  document.getElementById('gen-out-preview').value = preview;
+  document.getElementById('gen-out-title').value = title;
+  document.getElementById('gen-out-script').value = scriptText;
+  document.getElementById('gen-out-log-update').textContent = JSON.stringify(logUpdate, null, 2);
+  document.getElementById('gen-out-meta').textContent =
+    `Модель: ${modelUsed || '?'} · postprocess ${skipPP ? 'skipped' : 'applied'} · ${scriptText.length} chars`;
+  document.getElementById('gen-output').classList.remove('hidden');
+}
+
+function copyGenField(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const txt = el.value || el.textContent || '';
+  navigator.clipboard.writeText(txt).then(
+    () => { const btn = event.target; const old = btn.textContent; btn.textContent = '✓'; setTimeout(() => btn.textContent = old, 1200); },
+    () => alert('Не удалось скопировать — выдели вручную и Ctrl+C')
+  );
+}
+
+function downloadGenScriptTxt() {
+  const script = document.getElementById('gen-out-script').value;
+  const title = document.getElementById('gen-out-title').value || 'script';
+  if (!script) { alert('Пусто'); return; }
+  const safe = title.replace(/[^\wа-яА-ЯёЁ\s-]/g, '').replace(/\s+/g, '_').slice(0, 80) || 'script';
+  const blob = new Blob([script], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = safe + '.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ==================== REWRITE ====================
+const dropZone = document.getElementById('drop-zone');
+if (dropZone) {
+  ['dragover', 'dragenter'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('drag-over'); }));
+  ['dragleave', 'drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('drag-over'); }));
+  dropZone.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+}
+
+async function handleFiles(fileList) {
+  for (const file of fileList) {
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const resp = await fetch('/upload', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID }, body: formData });
+      if (!resp.ok) throw new Error('Ошибка загрузки');
+      const data = await resp.json();
+      uploadedFiles.push(data.filename);
+      renderUploadedFiles();
+    } catch (e) { alert('Ошибка загрузки файла: ' + e.message); }
+  }
+}
+
+function renderUploadedFiles() {
+  const container = document.getElementById('files-tbody');
+  const panel = document.getElementById('uploaded-files-list');
+  localStorage.setItem('uploaded_files', JSON.stringify(uploadedFiles));
+  if (!uploadedFiles.length) { panel.classList.add('hidden'); return; }
+  panel.classList.remove('hidden');
+  container.innerHTML = uploadedFiles.map((f, i) =>
+    `<div class="flex items-center justify-between bg-gray-700 rounded px-2 py-1">
+      <span class="text-xs truncate">${f}</span>
+      <button onclick="removeFile(${i})" class="text-red-400 hover:text-red-300 text-xs ml-2">✕</button>
+    </div>`
+  ).join('');
+}
+
+function removeFile(idx) { uploadedFiles.splice(idx, 1); renderUploadedFiles(); }
+function clearUploadedFiles() { uploadedFiles = []; renderUploadedFiles(); }
+
+async function startRewrite(parallel) {
+  if (!uploadedFiles.length) { alert('Загрузите файлы'); return; }
+  const languages = getSelectedLangs('rew');
+  if (!languages.length) { alert('Выберите языки'); return; }
+  const settings = getApiSettings();
+
+  try {
+    await apiFetch('/jobs/rewrite', {
+      method: 'POST',
+      body: JSON.stringify({
+        files: uploadedFiles, languages,
+        model: document.getElementById('rew-model').value,
+        max_threads: parseInt(document.getElementById('rew-threads').value) || 3,
+        chunk_size: parseInt(document.getElementById('rew-chunk').value) || 8000,
+        address_style: document.getElementById('rew-address').value,
+        use_subscription: false,  // DEPRECATED 2026-05-22: auto-derived server-side
+        safe_text: document.getElementById('rew-safe-text').checked,
+        preserve_paragraphs: document.getElementById('rew-preserve-paragraphs').checked,
+        oauth_tokens: settings.oauth_tokens,
+        anthropic_api_key: '',  // DEPRECATED: Claude теперь только через OAuth
+        openai_api_key: settings.openai_key,
+        parallel
+      })
+    });
+    switchTab('queue', document.querySelectorAll('.tab-btn')[2]);
+  } catch (e) { alert('Ошибка: ' + e.message); }
+}
+
+// ==================== QUEUE ====================
+function startQueuePolling() {
+  if (queueTimer) clearTimeout(queueTimer);
+  pollQueue();
+}
+
+async function pollQueue() {
+  try {
+    const jobs = await apiFetch('/jobs');
+    renderJobsTable(jobs);
+    if (selectedJobId) {
+      // PATCH-2026-06-18-poll-seljob-log: лог тянем только для выбранной задачи (/jobs/{id}); список без логов.
+      const job = jobs.find(j => j.id === selectedJobId);
+      if (job) {
+        try {
+          const full = await apiFetch('/jobs/' + encodeURIComponent(selectedJobId));
+          const logEl = document.getElementById('job-log');
+          const _atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+          logEl.textContent = full.log || '(ожидание лога...)';
+          if (_atBottom) logEl.scrollTop = logEl.scrollHeight;
+        } catch (e) {}
+      }
+    }
+    const hasRunning = jobs.some(j => j.status === 'running');
+    queueTimer = setTimeout(pollQueue, hasRunning ? 2000 : 10000);
+  } catch (e) {
+    // PATCH-2026-06-13-pollqueue: при ошибке поллинга НЕ очищаем таблицу
+    // (renderJobsTable не вызван -> остаётся прошлый список) и ретраим быстрее,
+    // чтобы пустое окно при рестарте сервиса было ~3с, а не 10с.
+    queueTimer = setTimeout(pollQueue, 3000);
+  }
+}
+
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function renderJobsTable(jobs) {
+  const tbody = document.getElementById('jobs-tbody');
+  tbody.innerHTML = '';
+  // выкидываем из выбора задачи, которых больше нет (удалённые) — иначе bulk потянет мусор
+  const live = new Set(jobs.map(j => j.id));
+  selectedJobIds.forEach(id => { if (!live.has(id)) selectedJobIds.delete(id); });
+  jobs.forEach(j => {
+    const st = (j.parallel && j.status === 'pending' ? '⏩ ' : '') + (STATUS_ICONS[j.status] || j.status);
+    const tr = document.createElement('tr');
+    tr.className = 'job-row border-b border-gray-700' + (j.id === selectedJobId ? ' selected' : '');
+    tr.onclick = function() { selectJob(j.id, this); };
+    const checked = selectedJobIds.has(j.id) ? 'checked' : '';
+    const typePill = j.type === 'generation' ? 'GEN' : 'REW';
+    const name = escHtml(j.name || j.detail || '(без имени)');
+    const langs = j.langs ? `<span class="job-badge">${escHtml(j.langs)}</span>` : '';
+    const nfiles = (j.nfiles && j.nfiles > 1) ? `<span class="job-badge">📄 ${j.nfiles}</span>` : '';
+    const dt = j.created_at ? new Date(j.created_at * 1000).toLocaleString([], {month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}) : '';
+    const detail = j.detail ? `<div class="truncate text-gray-500" style="font-size:10px" title="${escHtml(j.detail)}">${escHtml(j.detail)}</div>` : '';
+    tr.innerHTML = `
+      <td class="py-1.5 px-1"><input type="checkbox" class="job-cb" data-id="${j.id}" ${checked} onclick="event.stopPropagation(); toggleJobCheckbox('${j.id}', this.checked)"></td>
+      <td class="py-1.5 px-2 text-xs font-mono">${j.id}</td>
+      <td class="py-1.5 px-2 text-xs">${typePill}</td>
+      <td class="py-1.5 px-2 text-xs">${st}</td>
+      <td class="py-1.5 px-2 text-xs">${j.progress}%</td>
+      <td class="py-1.5 px-2 text-xs" style="max-width:360px">
+        <div class="truncate font-medium" title="${name}">${name}</div>
+        <div class="job-badges">${langs}${nfiles}<span class="job-badge dim">${dt}</span></div>
+        ${detail}
+      </td>`;
+    tbody.appendChild(tr);
+  });
+  updateDlSelectedBtn();
+  syncSelectAllCheckbox();
+}
+
+function selectJob(id, rowEl) {
+  selectedJobId = id;
+  document.querySelectorAll('.job-row').forEach(tr => tr.classList.remove('selected'));
+  if (rowEl) rowEl.classList.add('selected');
+  loadJobLog(id);
+  loadJobFiles(id);
+}
+
+async function loadJobLog(id) {
+  try {
+    const job = await apiFetch(`/jobs/${id}`);
+    document.getElementById('job-log').textContent = job.log || '(нет лога)';
+    const logEl = document.getElementById('job-log');
+    logEl.scrollTop = logEl.scrollHeight;
+  } catch (e) {
+    document.getElementById('job-log').textContent = '(ошибка загрузки лога)';
+  }
+}
+
+async function loadJobFiles(id) {
+  try {
+    const files = await apiFetch(`/jobs/${id}/files`);
+    const panel = document.getElementById('job-files-panel');
+    const list = document.getElementById('job-files-list');
+    if (files.length) {
+      panel.classList.remove('hidden');
+      list.innerHTML = files.map(f => {
+        const url = `/jobs/${id}/files/${encodeURIComponent(f)}?sid=${SESSION_ID}`;
+        return `<a href="${url}" target="_blank" rel="noopener"
+          class="block bg-gray-700 rounded px-3 py-1.5 text-xs text-blue-400 hover:text-blue-300 hover:bg-gray-600 transition truncate">📄 ${f}</a>`;
+      }).join('');
+    } else { panel.classList.add('hidden'); }
+  } catch (e) { document.getElementById('job-files-panel').classList.add('hidden'); }
+}
+
+async function cancelSelectedJob() {
+  if (!selectedJobId) { alert('Выберите задачу'); return; }
+  try { await apiFetch(`/jobs/${selectedJobId}/cancel`, { method: 'POST' }); } catch (e) { alert(e.message); }
+}
+async function retrySelectedJob() {
+  if (!selectedJobId) { alert('Выберите задачу'); return; }
+  try { await apiFetch(`/jobs/${selectedJobId}/retry`, { method: 'POST' }); } catch (e) { alert(e.message); }
+}
+async function retrySelectedJobFull() {
+  if (!selectedJobId) { alert('Выберите задачу'); return; }
+  if (!confirm('Полная перегенерация: уже готовые файлы и прогресс будут удалены. Продолжить?')) return;
+  try {
+    const r = await apiFetch(`/jobs/${selectedJobId}/retry-full`, { method: 'POST' });
+    if (r && typeof r.cleared_tasks === 'number') {
+      console.log('Cleared progress for', r.cleared_tasks, 'tasks');
+    }
+  } catch (e) { alert(e.message); }
+}
+async function markParallelSelectedJob() {
+  if (!selectedJobId) { alert('Выберите задачу'); return; }
+  try { await apiFetch(`/jobs/${selectedJobId}/parallel`, { method: 'POST' }); } catch (e) { alert(e.message); }
+}
+async function deleteSelectedJob() {
+  if (!selectedJobId) { alert('Выберите задачу'); return; }
+  if (!confirm('Удалить задачу?')) return;
+  try { await apiFetch(`/jobs/${selectedJobId}`, { method: 'DELETE' }); selectedJobId = null; } catch (e) { alert(e.message); }
+}
+async function downloadSelectedJobFiles() {
+  if (!selectedJobId) { alert('Выберите задачу'); return; }
+  try {
+    const files = await apiFetch(`/jobs/${selectedJobId}/files`);
+    if (!files.length) { alert('Нет файлов для скачивания'); return; }
+    const url = `/jobs/${selectedJobId}/download-zip?sid=${SESSION_ID}`;
+    window.location.href = url;
+  } catch (e) { alert(e.message); }
+}
+
+// ===== PATCH-2026-06-20: множественный выбор задач + bulk-скачивание одним ZIP =====
+function toggleJobCheckbox(id, on) {
+  if (on) selectedJobIds.add(id); else selectedJobIds.delete(id);
+  updateDlSelectedBtn();
+  syncSelectAllCheckbox();
+}
+function toggleSelectAllJobs(el) {
+  document.querySelectorAll('#jobs-tbody .job-cb').forEach(cb => {
+    cb.checked = el.checked;
+    if (el.checked) selectedJobIds.add(cb.dataset.id); else selectedJobIds.delete(cb.dataset.id);
+  });
+  updateDlSelectedBtn();
+}
+function syncSelectAllCheckbox() {
+  const all = document.querySelectorAll('#jobs-tbody .job-cb');
+  const sa = document.getElementById('jobs-select-all');
+  if (!sa) return;
+  sa.checked = all.length > 0 && [...all].every(cb => cb.checked);
+}
+function updateDlSelectedBtn() {
+  const btn = document.getElementById('btn-dl-selected');
+  if (btn) btn.textContent = `📦 Скачать выбранные (${selectedJobIds.size})`;
+}
+function downloadSelectedJobsZip() {
+  if (selectedJobIds.size === 0) { alert('Отметьте задачи галочками'); return; }
+  const ids = [...selectedJobIds].join(',');
+  // full-page navigation — та же авторизация по ?sid=, что и в одиночном скачивании
+  window.location.href = `/jobs/download-zip-bulk?ids=${encodeURIComponent(ids)}&sid=${SESSION_ID}`;
+}
+
+async function downloadSelectedJobLog() {
+  if (!selectedJobId) { alert('Выберите задачу'); return; }
+  try {
+    const job = await apiFetch(`/jobs/${selectedJobId}`);
+    const logText = job.log || '(нет лога)';
+    const blob = new Blob([logText], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `job_${selectedJobId}.log`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  } catch (e) { alert(e.message); }
+}
+
+// ==================== SETTINGS ====================
+function getApiSettings() {
+  return {
+    // anthropic_key deprecated — Claude теперь только через OAuth
+    openai_key: localStorage.getItem('openai_key') || '',
+    oauth_tokens: JSON.parse(localStorage.getItem('oauth_tokens_arr') || '[]'),
+  };
+}
+
+function loadServerSettings(cfg) {
+  // cfg.anthropic_api_key deprecated — игнорируем при загрузке с сервера
+  if (cfg.openai_api_key && !localStorage.getItem('openai_key')) localStorage.setItem('openai_key', cfg.openai_api_key);
+  oauthTokens = cfg.oauth_tokens || [];
+  customModels = cfg.custom_models || [];
+  if (!localStorage.getItem('oauth_tokens_arr') && oauthTokens.length) {
+    localStorage.setItem('oauth_tokens_arr', JSON.stringify(oauthTokens));
+  } else {
+    oauthTokens = JSON.parse(localStorage.getItem('oauth_tokens_arr') || '[]');
+  }
+  // Hide admin-only cards для non-admin (per-user keys storage Round 2, 2026-05-24)
+  const isAdmin = !!cfg.is_admin;
+  document.querySelectorAll('[data-admin-only]').forEach(el => {
+    el.style.display = isAdmin ? '' : 'none';
+  });
+}
+
+function loadLocalSettings() {
+  // set-anthropic-key input удалён — Claude через OAuth
+  document.getElementById('set-openai-key').value = localStorage.getItem('openai_key') || '';
+  renderOauthTokensList();
+  renderCustomModelsList();
+  const tier = localStorage.getItem('gpt_service_tier') || 'default';
+  document.getElementById('set-gpt-tier').value = tier;
+  document.getElementById('set-gpt-cache').checked = localStorage.getItem('gpt_use_cache') !== 'false';
+  document.getElementById('set-check-model').value = localStorage.getItem('postprocess_check_model') || 'gpt-5-mini';
+  document.getElementById('set-debug-mode').checked = localStorage.getItem('debug_mode') === 'true';
+  const m = localStorage.getItem('default_model');
+  if (m) setModelValue('set-default-model', m);
+  const t = localStorage.getItem('default_threads');
+  if (t) document.getElementById('set-default-threads').value = t;
+  // Round 2: refreshGenSettingsPresetList() удалён (settings-preset card removed from Generation tab)
+  refreshRewPresetList();
+}
+
+function renderOauthTokensList() {
+  oauthTokens = JSON.parse(localStorage.getItem('oauth_tokens_arr') || '[]');
+  const el = document.getElementById('oauth-tokens-list');
+  el.innerHTML = oauthTokens.map((t, i) => {
+    const masked = t.length > 25 ? t.slice(0, 12) + '...' + t.slice(-6) : '***';
+    return `<div class="flex items-center justify-between bg-gray-700 rounded px-2 py-1">
+      <span class="text-xs font-mono truncate">${masked}</span>
+      <button onclick="removeOauthToken(${i})" class="text-red-400 hover:text-red-300 text-xs ml-2">✕</button>
+    </div>`;
+  }).join('');
+}
+
+function addOauthToken() {
+  let token = document.getElementById('new-oauth-token').value.trim();
+  if (!token) return;
+  if (token.toLowerCase().startsWith('bearer')) token = token.slice(6).trim();
+  oauthTokens.push(token);
+  localStorage.setItem('oauth_tokens_arr', JSON.stringify(oauthTokens));
+  document.getElementById('new-oauth-token').value = '';
+  renderOauthTokensList();
+}
+
+function removeOauthToken(idx) {
+  oauthTokens.splice(idx, 1);
+  localStorage.setItem('oauth_tokens_arr', JSON.stringify(oauthTokens));
+  renderOauthTokensList();
+}
+
+function renderCustomModelsList() {
+  customModels = JSON.parse(localStorage.getItem('custom_models_arr') || '[]');
+  const el = document.getElementById('custom-models-list');
+  el.innerHTML = customModels.map((m, i) =>
+    `<div class="flex items-center justify-between bg-gray-700 rounded px-2 py-1">
+      <span class="text-xs font-mono truncate">${m}</span>
+      <button onclick="removeCustomModel(${i})" class="text-red-400 hover:text-red-300 text-xs ml-2">✕</button>
+    </div>`
+  ).join('');
+}
+
+function addCustomModel() {
+  const name = document.getElementById('new-custom-model').value.trim();
+  if (!name) return;
+  customModels.push(name);
+  localStorage.setItem('custom_models_arr', JSON.stringify(customModels));
+  document.getElementById('new-custom-model').value = '';
+  renderCustomModelsList();
+  populateModelDropdowns();
+}
+
+function removeCustomModel(idx) {
+  customModels.splice(idx, 1);
+  localStorage.setItem('custom_models_arr', JSON.stringify(customModels));
+  renderCustomModelsList();
+  populateModelDropdowns();
+}
+
+// ============== API v1 keys management (UI-only, session auth) ==============
+
+async function createApiKey() {
+  const nameEl = document.getElementById('new-api-key-name');
+  const name = nameEl.value.trim();
+  if (!name) { alert('Введите имя ключа'); return; }
+  try {
+    // apiFetch возвращает уже распарсенный JSON; на не-ok сам бросает Error с detail.
+    const data = await apiFetch('/api/keys/create', {
+      method: 'POST',
+      body: JSON.stringify({ name }),
+    });
+    document.getElementById('api-key-new-plain').textContent = data.plain_key;
+    document.getElementById('api-key-new-result').classList.remove('hidden');
+    nameEl.value = '';
+    refreshApiKeysList();
+  } catch (e) {
+    alert('Ошибка создания: ' + (e && e.message ? e.message : e));
+  }
+}
+
+function copyApiKey() {
+  const txt = document.getElementById('api-key-new-plain').textContent;
+  navigator.clipboard.writeText(txt).then(
+    () => { const btn = event.target; btn.textContent = '✓ Скопировано'; setTimeout(() => btn.textContent = '📋 Copy', 1500); },
+    () => alert('Не удалось скопировать — выделите и Ctrl+C')
+  );
+}
+
+function dismissApiKeyResult() {
+  document.getElementById('api-key-new-result').classList.add('hidden');
+  document.getElementById('api-key-new-plain').textContent = '';
+}
+
+async function refreshApiKeysList() {
+  try {
+    // apiFetch уже возвращает parsed JSON и бросает на не-ok.
+    const data = await apiFetch('/api/keys/list');
+    const items = (data && data.items) || [];
+    const box = document.getElementById('api-keys-list');
+    if (!items.length) {
+      box.innerHTML = '<p class="text-xs text-gray-500">Нет ключей. Создайте первый.</p>';
+      return;
+    }
+    box.innerHTML = items.map(k => {
+      const created = k.created_at ? new Date(k.created_at * 1000).toLocaleString() : '—';
+      const used = k.last_used_at ? new Date(k.last_used_at * 1000).toLocaleString() : 'never';
+      const statusColor = k.status === 'active' ? 'text-green-400' : 'text-gray-500';
+      const revokeBtn = k.status === 'active'
+        ? `<button onclick="revokeApiKey('${k.key_id}')" class="btn btn-sm" style="background:#7c2d12;color:#fff">Revoke</button>`
+        : '<span class="text-xs text-gray-500">revoked</span>';
+      return `<div class="flex items-center gap-2 bg-gray-700 px-2 py-1 rounded">
+        <span class="font-medium flex-1">${k.name}</span>
+        <code class="text-xs bg-gray-900 px-1 rounded">${k.prefix}…</code>
+        <span class="text-xs ${statusColor}">${k.status}</span>
+        <span class="text-xs text-gray-400" title="created">${created}</span>
+        <span class="text-xs text-gray-400" title="last used">${used}</span>
+        ${revokeBtn}
+      </div>`;
+    }).join('');
+  } catch (e) {
+    console.warn('refresh api keys failed', e);
+  }
+}
+
+async function revokeApiKey(keyId) {
+  if (!confirm('Отозвать ключ? Программы, использующие его, потеряют доступ.')) return;
+  try {
+    await apiFetch(`/api/keys/${keyId}/revoke`, { method: 'POST' });
+    refreshApiKeysList();
+  } catch (e) {
+    alert('Ошибка: ' + (e && e.message ? e.message : e));
+  }
+}
+
+async function saveAllSettings() {
+  // anthropic_key deprecated — Claude теперь только через OAuth
+  const openaiKey = document.getElementById('set-openai-key').value.trim();
+  localStorage.setItem('openai_key', openaiKey);
+  localStorage.setItem('gpt_service_tier', document.getElementById('set-gpt-tier').value);
+  localStorage.setItem('gpt_use_cache', document.getElementById('set-gpt-cache').checked);
+  localStorage.setItem('postprocess_check_model', document.getElementById('set-check-model').value);
+  localStorage.setItem('debug_mode', document.getElementById('set-debug-mode').checked);
+  localStorage.setItem('default_model', document.getElementById('set-default-model').value);
+  localStorage.setItem('default_threads', document.getElementById('set-default-threads').value);
+
+  const defModel = document.getElementById('set-default-model').value;
+  const defThreads = document.getElementById('set-default-threads').value;
+  if (defModel) ['gen-model', 'rew-model'].forEach(id => setModelValue(id, defModel));
+  // Round 2: gen-threads удалён, defaults apply только к rew-threads.
+  if (defThreads) {
+    const rewT = document.getElementById('rew-threads');
+    if (rewT) rewT.value = defThreads;
+  }
+  autoSaveGenSettings();
+  autoSaveRewSettings();
+
+  try {
+    await apiFetch('/settings/keys', {
+      method: 'POST',
+      body: JSON.stringify({
+        anthropic_api_key: '',  // DEPRECATED: Claude через OAuth
+        openai_api_key: openaiKey,
+        oauth_tokens: oauthTokens,
+        gpt_service_tier: document.getElementById('set-gpt-tier').value,
+        gpt_use_cache: document.getElementById('set-gpt-cache').checked,
+        postprocess_check_model: document.getElementById('set-check-model').value,
+        custom_models: customModels,
+        debug_mode: document.getElementById('set-debug-mode').checked,
+      })
+    });
+    const newModels = await apiFetch('/models');
+    allModels = newModels;
+    populateModelDropdowns();
+  } catch (e) { console.warn('Failed to sync settings to server:', e); }
+
+  const msg = document.getElementById('settings-saved');
+  msg.classList.remove('hidden');
+  setTimeout(() => msg.classList.add('hidden'), 2000);
+}
+
+function exportSettingsJson() {
+  const data = {
+    version: 1,
+    exported_at: new Date().toISOString(),
+    // anthropic_key deprecated — Claude через OAuth (поле не экспортируется)
+    openai_key: localStorage.getItem('openai_key') || '',
+    oauth_tokens_arr: JSON.parse(localStorage.getItem('oauth_tokens_arr') || '[]'),
+    custom_models_arr: JSON.parse(localStorage.getItem('custom_models_arr') || '[]'),
+    gpt_service_tier: localStorage.getItem('gpt_service_tier') || 'default',
+    gpt_use_cache: localStorage.getItem('gpt_use_cache') !== 'false',
+    postprocess_check_model: localStorage.getItem('postprocess_check_model') || 'gpt-5-mini',
+    debug_mode: localStorage.getItem('debug_mode') === 'true',
+    default_model: localStorage.getItem('default_model') || '',
+    default_threads: localStorage.getItem('default_threads') || '3',
+    gen_settings_presets: JSON.parse(localStorage.getItem('gen_settings_presets') || '{}'),
+    rew_presets: JSON.parse(localStorage.getItem('rew_presets') || '{}'),
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'rewrite-studio-settings-' + new Date().toISOString().slice(0, 10) + '.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function importSettingsFromObject(data) {
+  if (!data || typeof data !== 'object') return false;
+  // data.anthropic_key игнорируется при импорте (Claude через OAuth)
+  if (data.openai_key !== undefined) localStorage.setItem('openai_key', String(data.openai_key));
+  if (Array.isArray(data.oauth_tokens_arr)) localStorage.setItem('oauth_tokens_arr', JSON.stringify(data.oauth_tokens_arr));
+  if (Array.isArray(data.custom_models_arr)) localStorage.setItem('custom_models_arr', JSON.stringify(data.custom_models_arr));
+  if (data.gpt_service_tier !== undefined) localStorage.setItem('gpt_service_tier', String(data.gpt_service_tier));
+  if (data.gpt_use_cache !== undefined) localStorage.setItem('gpt_use_cache', data.gpt_use_cache ? 'true' : 'false');
+  if (data.postprocess_check_model !== undefined) localStorage.setItem('postprocess_check_model', String(data.postprocess_check_model));
+  if (data.debug_mode !== undefined) localStorage.setItem('debug_mode', data.debug_mode ? 'true' : 'false');
+  if (data.default_model !== undefined) localStorage.setItem('default_model', String(data.default_model));
+  if (data.default_threads !== undefined) localStorage.setItem('default_threads', String(data.default_threads));
+  if (data.gen_settings_presets && typeof data.gen_settings_presets === 'object') localStorage.setItem('gen_settings_presets', JSON.stringify(data.gen_settings_presets));
+  if (data.rew_presets && typeof data.rew_presets === 'object') localStorage.setItem('rew_presets', JSON.stringify(data.rew_presets));
+  return true;
+}
+
+function handleImportSettingsFile(input) {
+  const el = document.getElementById('import-result');
+  el.classList.add('hidden');
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function () {
+    try {
+      const data = JSON.parse(reader.result);
+      if (importSettingsFromObject(data)) {
+        oauthTokens = JSON.parse(localStorage.getItem('oauth_tokens_arr') || '[]');
+        customModels = JSON.parse(localStorage.getItem('custom_models_arr') || '[]');
+        genSettingsPresets = JSON.parse(localStorage.getItem('gen_settings_presets') || '{}');
+        rewPresets = JSON.parse(localStorage.getItem('rew_presets') || '{}');
+        loadLocalSettings();
+        // Round 2: refreshGenSettingsPresetList removed
+        refreshRewPresetList();
+        populateModelDropdowns();
+        el.textContent = '✓ Импорт выполнен. Обновите поля на экране.';
+        el.className = 'text-sm text-green-400';
+      } else {
+        el.textContent = 'Неверный формат файла.';
+        el.className = 'text-sm text-red-400';
+      }
+    } catch (e) {
+      el.textContent = 'Ошибка: ' + e.message;
+      el.className = 'text-sm text-red-400';
+    }
+    el.classList.remove('hidden');
+    input.value = '';
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+/** Импорт пресетов рерайта из файла десктопного приложения (~/.rewrite_presets.json). */
+function handleImportDesktopRewritePresets(input) {
+  const el = document.getElementById('import-result');
+  el.classList.add('hidden');
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function () {
+    try {
+      const data = JSON.parse(reader.result);
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        el.textContent = 'Неверный формат: нужен объект пресетов из десктопного приложения.';
+        el.className = 'text-sm text-red-400';
+        el.classList.remove('hidden');
+        input.value = '';
+        return;
+      }
+      const converted = {};
+      for (const [name, preset] of Object.entries(data)) {
+        if (!preset || !Array.isArray(preset.languages)) continue;
+        const channelSettings = preset.channel_settings || {};
+        const languages = preset.languages.map(display => {
+          const cs = channelSettings[display] || {};
+          const lang = allLanguages.find(l => l.display === display);
+          const code = lang ? lang.code : display.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+          return {
+            display: display,
+            code: code,
+            channel: cs.channel_name || cs.channel || '',
+            host: cs.host_name || cs.host || '',
+            custom_prompt: cs.custom_prompt || ''
+          };
+        });
+        converted[name] = {
+          model: preset.model || '',
+          threads: preset.threads || 3,
+          chunk: preset.chunk_size || 8000,
+          address: preset.address_style || '',
+          use_sub: !!preset.use_sub,
+          safe_text: !!preset.safe_text,
+          languages: languages
+        };
+      }
+      const count = Object.keys(converted).length;
+      if (count === 0) {
+        el.textContent = 'В файле нет подходящих пресетов (нужны поля languages и channel_settings).';
+        el.className = 'text-sm text-red-400';
+      } else {
+        const existing = JSON.parse(localStorage.getItem('rew_presets') || '{}');
+        Object.assign(existing, converted);
+        localStorage.setItem('rew_presets', JSON.stringify(existing));
+        rewPresets = existing;
+        refreshRewPresetList();
+        el.textContent = '✓ Импортировано пресетов рерайта: ' + count + '. Выберите их во вкладке «Рерайт».';
+        el.className = 'text-sm text-green-400';
+      }
+      el.classList.remove('hidden');
+    } catch (e) {
+      el.textContent = 'Ошибка: ' + e.message;
+      el.className = 'text-sm text-red-400';
+      el.classList.remove('hidden');
+    }
+    input.value = '';
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+// ==================== AUTO-SAVE TAB SETTINGS ====================
+function autoSaveGenSettings() {
+  // Round 2: gen-threads/gen-safe-text/gen-topics удалены. Сохраняем только то что осталось.
+  const data = {
+    model: document.getElementById('gen-model').value,
+    preset: document.getElementById('gen-preset').value,
+    topic: document.getElementById('gen-topic') ? document.getElementById('gen-topic').value : '',
+    language_override: document.getElementById('gen-language-override') ? document.getElementById('gen-language-override').value : '',
+    length_override: document.getElementById('gen-length-override') ? document.getElementById('gen-length-override').value : '',
+    max_log: document.getElementById('gen-max-log') ? document.getElementById('gen-max-log').value : '5',
+    chunk_size_override: document.getElementById('gen-chunk-size-override') ? document.getElementById('gen-chunk-size-override').value : '',
+  };
+  localStorage.setItem('gen_tab_settings', JSON.stringify(data));
+}
+
+function autoSaveRewSettings() {
+  const data = {
+    model: document.getElementById('rew-model').value,
+    threads: document.getElementById('rew-threads').value,
+    chunk: document.getElementById('rew-chunk').value,
+    address: document.getElementById('rew-address').value,
+    use_sub: false,  // DEPRECATED 2026-05-22
+    safe_text: document.getElementById('rew-safe-text').checked,
+  };
+  localStorage.setItem('rew_tab_settings', JSON.stringify(data));
+}
+
+function restoreGenSettings() {
+  // Round 2: восстанавливаем только новые поля Generation tab.
+  const raw = localStorage.getItem('gen_tab_settings');
+  if (!raw) return;
+  try {
+    const p = JSON.parse(raw);
+    if (p.model) setModelValue('gen-model', p.model);
+    if (p.preset) document.getElementById('gen-preset').value = p.preset;
+    if (p.topic && document.getElementById('gen-topic')) document.getElementById('gen-topic').value = p.topic;
+    if (p.language_override && document.getElementById('gen-language-override'))
+      document.getElementById('gen-language-override').value = p.language_override;
+    if (p.length_override && document.getElementById('gen-length-override'))
+      document.getElementById('gen-length-override').value = p.length_override;
+    if (p.max_log && document.getElementById('gen-max-log'))
+      document.getElementById('gen-max-log').value = p.max_log;
+    if (p.chunk_size_override && document.getElementById('gen-chunk-size-override'))
+      document.getElementById('gen-chunk-size-override').value = p.chunk_size_override;
+    onGenPresetSelected();
+  } catch (e) {}
+}
+
+function restoreRewSettings() {
+  const raw = localStorage.getItem('rew_tab_settings');
+  if (!raw) return;
+  try {
+    const p = JSON.parse(raw);
+    if (p.model) setModelValue('rew-model', p.model);
+    if (p.threads) document.getElementById('rew-threads').value = p.threads;
+    if (p.chunk) document.getElementById('rew-chunk').value = p.chunk;
+    if (p.address) document.getElementById('rew-address').value = p.address;
+    // use_sub deprecated — поле p.use_sub из старых tab_settings игнорируется
+    document.getElementById('rew-safe-text').checked = !!p.safe_text;
+  } catch (e) {}
+}
+
+function autoSaveLangs(prefix) {
+  const data = [];
+  document.querySelectorAll('#' + prefix + '-lang-tbody .lang-row').forEach(tr => {
+    const cb = tr.querySelector('.lang-cb');
+    if (!cb.checked) return;
+    const idx = parseInt(cb.dataset.idx);
+    const lang = allLanguages[idx];
+    const entry = {
+      display: lang.display,
+      code: lang.code,
+      channel: tr.querySelector('.lang-channel').value,
+      host: tr.querySelector('.lang-host').value,
+    };
+    const prompt = tr.querySelector('.lang-prompt');
+    if (prompt) entry.custom_prompt = prompt.value;
+    data.push(entry);
+  });
+  localStorage.setItem(prefix + '_selected_langs', JSON.stringify(data));
+}
+
+function restoreLangs(prefix) {
+  const raw = localStorage.getItem(prefix + '_selected_langs');
+  if (!raw) return;
+  try {
+    const data = JSON.parse(raw);
+    if (data.length) setLangTableValues(prefix, data);
+  } catch (e) {}
+}
+
+function setupAutoSaveListeners() {
+  // Generation tab (Round 2)
+  ['gen-model', 'gen-topic', 'gen-language-override', 'gen-length-override', 'gen-max-log', 'gen-chunk-size-override'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', autoSaveGenSettings);
+  });
+  // PATCH-2026-06-20-gen-rows: стартовая строка темы + живой счётчик «Создать все (N)»
+  ensureGenRows();
+  const genPreset = document.getElementById('gen-preset');
+  if (genPreset) genPreset.addEventListener('change', autoSaveGenSettings);
+
+  // Rewrite tab
+  ['rew-model', 'rew-threads', 'rew-chunk'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', autoSaveRewSettings);
+  });
+  ['rew-safe-text'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', autoSaveRewSettings);
+  });
+  const rewAddress = document.getElementById('rew-address');
+  if (rewAddress) rewAddress.addEventListener('change', autoSaveRewSettings);
+
+  // Language tables — delegate to tbody
+  ['gen', 'rew'].forEach(prefix => {
+    const tbody = document.getElementById(prefix + '-lang-tbody');
+    if (tbody) {
+      tbody.addEventListener('change', () => autoSaveLangs(prefix));
+      tbody.addEventListener('input', debounce(() => autoSaveLangs(prefix), 500));
+    }
+  });
+}
+
+function debounce(fn, ms) {
+  let timer;
+  return function (...args) { clearTimeout(timer); timer = setTimeout(() => fn.apply(this, args), ms); };
+}
+
+// ==================== INIT ====================
+(function init() {
+  if (SESSION_ID) {
+    fetch('/auth/ping', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID } })
+      .then(r => { if (r.ok) { startPing(); showApp(); } else { showLoginScreen(); } })
+      .catch(() => showLoginScreen());
+  } else {
+    showLoginScreen();
+  }
+})();
+</script>
+</body>
+</html>

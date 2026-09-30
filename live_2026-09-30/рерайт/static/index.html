@@ -1,0 +1,3144 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Rewrite Studio</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0F1318; --surface: #151A21; --surface2: #1C232D;
+    --border: #232B37; --border2: #2A3240;
+    --text: #E6EAF0; --muted: #98A2B3; --faint: #667085;
+    --accent: #4C8DFF; --accent-hover: #3D7DF0;
+    --ok: #34B37A; --ok-text: #5FCB9B;
+    --warn: #E0A83F; --warn-text: #E8C57E;
+    --err: #E9604A; --err-text: #F0897A;
+    --sidebar-bg: #12161D; --sidebar-border: #1E2530; --nav-active: #1E2836;
+  }
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; font-size: 14px; line-height: 1.55; }
+  .hidden { display: none !important; }
+  .flex { display: flex; } .flex-col { flex-direction: column; } .flex-1 { flex: 1; }
+  .items-center { align-items: center; } .items-start { align-items: flex-start; } .justify-center { justify-content: center; } .justify-between { justify-content: space-between; } .justify-end { justify-content: flex-end; }
+  .flex-wrap { flex-wrap: wrap; }
+  .gap-1 { gap: 0.25rem; } .gap-2 { gap: 0.5rem; } .gap-3 { gap: 0.75rem; } .gap-4 { gap: 1rem; }
+  .grid { display: grid; } .grid-cols-2 { grid-template-columns: repeat(2, 1fr); } .grid-cols-3 { grid-template-columns: repeat(3, 1fr); } .col-span-2 { grid-column: span 2; } .col-span-3 { grid-column: span 3; }
+  .space-y-1 > * + * { margin-top: 0.25rem; } .space-y-2 > * + * { margin-top: 0.5rem; } .space-y-3 > * + * { margin-top: 0.75rem; } .space-y-4 > * + * { margin-top: 1rem; }
+  .overflow-auto { overflow: auto; } .overflow-x-auto { overflow-x: auto; } .overflow-y-auto { overflow-y: auto; } .overflow-hidden { overflow: hidden; }
+  .w-full { width: 100%; } .w-8 { width: 2rem; } .w-16 { width: 4rem; } .w-24 { width: 6rem; } .w-32 { width: 8rem; } .w-40 { width: 10rem; }
+  .min-w-0 { min-width: 0; }
+  .max-h-64 { max-height: 16rem; } .max-h-80 { max-height: 20rem; } .h-48 { height: 12rem; } .h-64 { height: 16rem; } .min-h-screen { min-height: 100vh; }
+  .mx-auto { margin-left: auto; margin-right: auto; }
+  .p-2 { padding: 0.5rem; } .p-3 { padding: 0.75rem; } .p-4 { padding: 1rem; } .p-6 { padding: 1.5rem; }
+  .px-2 { padding-left: 0.5rem; padding-right: 0.5rem; } .px-3 { padding-left: 0.75rem; padding-right: 0.75rem; } .px-4 { padding-left: 1rem; padding-right: 1rem; }
+  .py-1 { padding-top: 0.25rem; padding-bottom: 0.25rem; } .py-2 { padding-top: 0.5rem; padding-bottom: 0.5rem; } .py-3 { padding-top: 0.75rem; padding-bottom: 0.75rem; }
+  .pb-3 { padding-bottom: 0.75rem; } .pt-3 { padding-top: 0.75rem; }
+  .mb-1 { margin-bottom: 0.25rem; } .mb-2 { margin-bottom: 0.5rem; } .mb-3 { margin-bottom: 0.75rem; } .mb-4 { margin-bottom: 1rem; }
+  .mt-1 { margin-top: 0.25rem; } .mt-2 { margin-top: 0.5rem; } .mt-3 { margin-top: 0.75rem; } .ml-2 { margin-left: 0.5rem; }
+  .text-xs { font-size: 0.75rem; } .text-sm { font-size: 0.875rem; } .text-lg { font-size: 1.05rem; } .text-xl { font-size: 1.25rem; } .text-2xl { font-size: 1.5rem; }
+  .font-medium { font-weight: 500; } .font-semibold { font-weight: 600; } .font-bold { font-weight: 700; }
+  .font-mono { font-family: 'IBM Plex Mono', 'Consolas', monospace; }
+  .text-center { text-align: center; } .text-left { text-align: left; }
+  .truncate { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .text-text { color: var(--text); } .text-muted { color: var(--muted); } .text-faint { color: var(--faint); }
+  .text-accent { color: var(--accent); } .text-ok { color: var(--ok-text); } .text-warn { color: var(--warn-text); } .text-err { color: var(--err-text); }
+  .cursor-pointer { cursor: pointer; } .resize-y { resize: vertical; } .select-none { user-select: none; }
+  .rounded { border-radius: 6px; } .rounded-lg { border-radius: 9px; } .rounded-xl { border-radius: 12px; }
+  .sticky { position: sticky; } .top-0 { top: 0; }
+  .transition { transition: all 0.15s ease; }
+
+  a { color: var(--accent); }
+  input, select, textarea { color: var(--text); outline: none; font-family: inherit; }
+  select { appearance: auto; }
+  table { border-collapse: collapse; width: 100%; }
+
+  /* ---- Cards & inputs ---- */
+  .card { background: var(--surface); border-radius: 12px; border: 1px solid var(--border); padding: 16px; }
+  .label { display: block; font-size: 0.8rem; font-weight: 500; color: var(--muted); margin-bottom: 0.25rem; }
+  .card-title { font-size: 14px; font-weight: 600; letter-spacing: -0.01em; }
+  .section-title { font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+  .input { background: var(--surface2); border: 1px solid var(--border2); border-radius: 8px; padding: 8px 11px; font-size: 0.875rem; color: var(--text); width: 100%; transition: border-color .15s; }
+  .input:focus { border-color: var(--accent); }
+  .input-sm { padding: 5px 9px; font-size: 0.78rem; border-radius: 7px; }
+  textarea.input { line-height: 1.5; }
+
+  /* ---- Buttons ---- */
+  .btn { border: none; cursor: pointer; font-weight: 600; border-radius: 8px; transition: all 0.15s; font-size: 0.875rem; padding: 9px 16px; }
+  .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .btn-primary { background: var(--accent); color: #fff; font-weight: 700; }
+  .btn-primary:hover:not(:disabled) { background: var(--accent-hover); }
+  .btn-ghost { background: var(--surface2); border: 1px solid var(--border2); color: #C6CDD8; font-weight: 600; }
+  .btn-ghost:hover:not(:disabled) { border-color: #3A4557; }
+  .btn-sm { padding: 5px 11px; font-size: 0.78rem; border-radius: 7px; }
+  .btn-lg { padding: 12px 20px; font-size: 0.95rem; }
+  .btn-danger-text { background: none; border: none; color: var(--muted); cursor: pointer; font-weight: 600; font-size: 0.8rem; transition: color .15s; }
+  .btn-danger-text:hover { color: var(--err-text); }
+  .btn-warn { background: rgba(224,168,63,.12); border: 1px solid rgba(224,168,63,.35); color: var(--warn-text); font-weight: 600; border-radius: 8px; padding: 9px 16px; cursor: pointer; font-size: 0.875rem; }
+  .btn-warn:hover { background: rgba(224,168,63,.18); }
+  .btn-err { background: rgba(233,96,74,.15); border: 1px solid rgba(233,96,74,.4); color: var(--err-text); border-radius: 7px; padding: 6px 13px; font-weight: 600; cursor: pointer; font-size: 0.8rem; }
+  .btn-err:hover { background: rgba(233,96,74,.22); }
+
+  /* ---- Pills ---- */
+  .pill { border-radius: 99px; padding: 3px 11px; font-size: 12px; font-weight: 600; display: inline-flex; align-items: center; gap: 5px; }
+  .pill-running { background: rgba(76,141,255,.13); color: #7FA9F5; }
+  .pill-pending { background: rgba(152,162,179,.12); color: var(--muted); }
+  .pill-ok { background: rgba(52,179,122,.13); color: var(--ok-text); }
+  .pill-err { background: rgba(233,96,74,.13); color: var(--err-text); }
+  .pill-partial { background: rgba(224,168,63,.13); color: var(--warn-text); }
+  .pill-badge { background: rgba(76,141,255,.14); color: #9DBEF7; border-radius: 99px; padding: 2px 9px; font-size: 12px; font-weight: 600; }
+  .badge-type { font-family: 'IBM Plex Mono', monospace; font-size: 10.5px; font-weight: 700; letter-spacing: .06em; color: var(--muted); border: 1px solid var(--border2); border-radius: 5px; padding: 1px 6px; }
+  .status-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; flex: 0 0 auto; }
+  .session-pill { display: inline-flex; align-items: center; gap: 6px; background: rgba(52,179,122,.10); border: 1px solid rgba(52,179,122,.25); color: var(--ok-text); border-radius: 99px; padding: 3px 11px; font-size: 12px; font-weight: 600; }
+
+  /* ---- Progress bar ---- */
+  .bar { flex: 1; height: 6px; background: var(--surface2); border-radius: 3px; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 3px; transition: width .4s; background: var(--accent); }
+  .bar-fill.running { background: var(--accent); background-image: linear-gradient(45deg, rgba(255,255,255,.15) 25%, transparent 25%, transparent 50%, rgba(255,255,255,.15) 50%, rgba(255,255,255,.15) 75%, transparent 75%, transparent); background-size: 28px 28px; animation: stripes .9s linear infinite; }
+  @keyframes stripes { from { background-position: 0 0; } to { background-position: 28px 0; } }
+
+  /* ---- Language chips (queue cards) ---- */
+  .lang-chip { border-radius: 6px; padding: 2px 8px; font: 600 11.5px 'IBM Plex Mono', monospace; background: var(--surface2); color: var(--faint); border: 1px solid var(--border2); display: inline-block; }
+  .lang-chip.ok { background: rgba(52,179,122,.12); color: var(--ok-text); border-color: rgba(52,179,122,.25); }
+  .lang-chip.err { background: rgba(233,96,74,.1); color: var(--err-text); border-color: rgba(233,96,74,.3); }
+  .lang-chip.run { background: rgba(76,141,255,.12); color: #9DBEF7; border-color: rgba(76,141,255,.3); }
+
+  /* ---- Language selector chips (rewrite form) ---- */
+  .lang-select-chip { border-radius: 6px; padding: 4px 10px; font-size: 12.5px; font-weight: 500; background: var(--surface2); color: var(--muted); border: 1px solid var(--border2); cursor: pointer; transition: all .12s; user-select: none; }
+  .lang-select-chip:hover { border-color: #3A4557; }
+  .lang-select-chip.selected { background: rgba(76,141,255,.14); color: #9DBEF7; border-color: rgba(76,141,255,.5); }
+
+  /* ---- Job card ---- */
+  .job-card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; transition: border-color .15s; }
+  .job-card:hover { border-color: #2E3846; }
+  .job-card.limited { border-color: rgba(224,168,63,.4); }
+  .job-card.errored { border-color: rgba(233,96,74,.35); }
+  .job-head { display: flex; align-items: center; gap: 12px; padding: 12px 14px; cursor: pointer; }
+  .job-chevron { color: var(--faint); transition: transform .2s; }
+  .job-card.expanded .job-chevron { transform: rotate(180deg); }
+  .job-body { display: none; }
+  .job-card.expanded .job-body { display: block; }
+  .err-strip { margin: 0 12px 12px; background: rgba(233,96,74,.08); border: 1px solid rgba(233,96,74,.25); border-radius: 8px; padding: 10px 12px; }
+  .err-strip.warn { background: rgba(224,168,63,.08); border-color: rgba(224,168,63,.28); }
+  .err-strip b { font-weight: 600; color: var(--text); display: block; }
+  .err-strip p { font-size: 12.5px; color: #B8A9A4; margin: 3px 0 8px; }
+  .err-strip .strip-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+  .job-log { background: var(--bg); border: 1px solid var(--border); border-radius: 8px; font-family: 'IBM Plex Mono', monospace; font-size: 11.5px; white-space: pre-wrap; word-break: break-word; padding: 10px; max-height: 160px; overflow: auto; color: var(--muted); }
+
+  /* ---- Segment filters ---- */
+  .seg { display: inline-flex; background: var(--surface2); border: 1px solid var(--border2); border-radius: 8px; padding: 2px; gap: 2px; }
+  .seg-btn { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 0.8rem; font-weight: 600; padding: 5px 12px; border-radius: 6px; transition: all .12s; }
+  .seg-btn.active { background: var(--nav-active); color: var(--text); }
+  .seg-btn:hover:not(.active) { color: var(--text); }
+
+  /* ---- Sidebar / layout ---- */
+  .layout { display: grid; grid-template-columns: 204px 1fr; min-height: 100vh; }
+  .sidebar { background: var(--sidebar-bg); border-right: 1px solid var(--sidebar-border); display: flex; flex-direction: column; padding: 12px 10px; }
+  .nav-item { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 9px 12px; border-radius: 8px; color: var(--muted); cursor: pointer; font-weight: 500; font-size: 0.9rem; border: none; background: none; width: 100%; text-align: left; transition: all .12s; }
+  .nav-item:hover { color: var(--text); }
+  .nav-item.active { background: var(--nav-active); color: var(--text); }
+  .nav-badge { font-family: 'IBM Plex Mono', monospace; font-size: 11px; font-weight: 600; border-radius: 99px; padding: 1px 7px; }
+  .nav-badge.blue { background: rgba(76,141,255,.18); color: #9DBEF7; }
+  .nav-badge.red { background: rgba(233,96,74,.18); color: var(--err-text); }
+  .queue-widget { margin-top: auto; padding: 12px; background: var(--surface); border: 1px solid var(--border); border-radius: 10px; cursor: pointer; }
+  .queue-widget:hover { border-color: #2E3846; }
+  .qw-row { display: flex; align-items: center; justify-content: space-between; font-size: 12px; padding: 2px 0; }
+  /* живая очередь — общая полоска (глобальные числа сервиса) */
+  .vs-qstrip { display: inline-flex; align-items: center; flex-wrap: wrap; gap: 8px; font-size: 12px; padding: 4px 11px; border-radius: 999px; background: var(--surface, #151A21); border: 1px solid var(--border, #232B37); color: var(--text, #E6EAF0); }
+  .vs-qstrip.clickable { cursor: pointer; }
+  .vs-qstrip.clickable:hover { border-color: var(--border2, #2A3240); }
+  .vs-qstrip .muted { color: var(--muted, #98A2B3); }
+  .vs-qstrip .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; background: var(--faint, #667085); }
+  .vs-qstrip[data-state="idle"] .dot { background: var(--ok, #34B37A); }
+  .vs-qstrip[data-state="run"] .dot { background: var(--accent, #4C8DFF); animation: vs-pulse 1.6s ease-in-out infinite; }
+  .vs-qstrip[data-state="paused"] .dot { background: var(--warn, #E0A83F); }
+  @keyframes vs-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
+  .header-bar { height: 52px; display: flex; align-items: center; justify-content: space-between; padding: 0 20px; border-bottom: 1px solid var(--border); background: var(--surface); }
+  .logo-sq { width: 22px; height: 22px; border-radius: 6px; background: var(--accent); flex: 0 0 auto; }
+  .content-area { padding: 24px; overflow: auto; }
+
+  /* drop zone */
+  .drop-zone { border: 1.5px dashed #2E3846; border-radius: 10px; padding: 22px; text-align: center; cursor: pointer; transition: all .15s; background: var(--surface2); }
+  .drop-zone:hover, .drop-zone.drag-over { border-color: var(--accent); background: rgba(76,141,255,.05); }
+  .file-row { display: flex; align-items: center; gap: 10px; background: var(--surface2); border-radius: 8px; padding: 7px 11px; }
+  .file-marker { width: 8px; height: 8px; border-radius: 2px; background: var(--accent); flex: 0 0 auto; }
+
+  /* modal */
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.62); display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .modal-content { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 20px; max-width: 700px; width: 92%; max-height: 90vh; overflow-y: auto; }
+
+  /* toasts */
+  #toast-container { position: fixed; right: 20px; bottom: 20px; z-index: 100; display: flex; flex-direction: column; gap: 10px; }
+  .toast { display: flex; align-items: center; gap: 9px; max-width: 380px; background: var(--surface2); border: 1px solid #2E3846; border-radius: 10px; padding: 11px 14px; font-size: 13px; color: var(--text); box-shadow: 0 8px 24px rgba(0,0,0,.4); animation: toast-in .2s ease; }
+  .toast.warn { border-color: rgba(224,168,63,.4); }
+  .toast.err { border-color: rgba(233,96,74,.4); }
+  @keyframes toast-in { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+  /* session banner */
+  #session-banner { display: none; background: rgba(224,168,63,.1); border-bottom: 1px solid rgba(224,168,63,.3); color: var(--warn-text); font-size: 13px; padding: 8px 20px; align-items: center; justify-content: space-between; gap: 12px; }
+  #provider-notice { display: flex; background: rgba(224,168,63,.1); border-bottom: 1px solid rgba(224,168,63,.3); color: var(--warn-text); font-size: 13px; padding: 9px 20px; align-items: center; gap: 8px; }
+
+  ::-webkit-scrollbar { width: 8px; height: 8px; } ::-webkit-scrollbar-track { background: transparent; } ::-webkit-scrollbar-thumb { background: var(--border2); border-radius: 4px; }
+
+  @media (max-width: 900px) {
+    .layout { grid-template-columns: 1fr; }
+    .sidebar { position: fixed; bottom: 0; left: 0; right: 0; top: auto; flex-direction: row; border-right: none; border-top: 1px solid var(--sidebar-border); padding: 8px; z-index: 40; }
+    .nav-item { flex-direction: column; gap: 2px; font-size: 0.72rem; padding: 6px; text-align: center; justify-content: center; }
+    .queue-widget { display: none; }
+    .content-area { padding: 16px 14px 84px; }
+    .rew-grid { grid-template-columns: 1fr !important; }
+    .rew-rail { position: static !important; }
+  }
+  .ic{width:1em;height:1em;flex:none;vertical-align:-0.135em;display:inline-block;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round;pointer-events:none}
+  .ic-lg{width:1.25em;height:1.25em}
+</style>
+</head>
+<body>
+
+<!-- ===== ICON SPRITE ===== -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false"><defs>
+<symbol id="ic-video" viewBox="0 0 24 24"><rect x="2.5" y="5.5" width="13" height="13" rx="2.5"/><path d="M15.5 10.2l5-2.7v9l-5-2.7z"/></symbol>
+<symbol id="ic-film" viewBox="0 0 24 24"><rect x="2.5" y="4" width="19" height="16" rx="2.5"/><path d="M7 4v16M17 4v16M2.5 12h19M2.5 8h4.5M2.5 16h4.5M17 8h4.5M17 16h4.5"/></symbol>
+<symbol id="ic-image" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="16" rx="2.5"/><circle cx="8.5" cy="9.5" r="1.8"/><path d="M21 16l-5-5-9 9"/></symbol>
+<symbol id="ic-download" viewBox="0 0 24 24"><path d="M12 3v12m0 0l-4.5-4.5M12 15l4.5-4.5"/><path d="M4 17v2.5a1.5 1.5 0 001.5 1.5h13a1.5 1.5 0 001.5-1.5V17"/></symbol>
+<symbol id="ic-upload" viewBox="0 0 24 24"><path d="M12 21V9m0 0L7.5 13.5M12 9l4.5 4.5"/><path d="M4 7V4.5A1.5 1.5 0 015.5 3h13A1.5 1.5 0 0120 4.5V7"/></symbol>
+<symbol id="ic-save" viewBox="0 0 24 24"><path d="M5 3h11l4 4v12.5A1.5 1.5 0 0118.5 21h-13A1.5 1.5 0 014 19.5v-15A1.5 1.5 0 015.5 3z"/><path d="M8 3v6h7V3M8 21v-6h8v6"/></symbol>
+<symbol id="ic-refresh" viewBox="0 0 24 24"><path d="M20.5 12a8.5 8.5 0 11-2.6-6.1"/><path d="M20.5 4v5h-5"/></symbol>
+<symbol id="ic-trash" viewBox="0 0 24 24"><path d="M4 6.5h16M9.5 6.5V4.5A1.5 1.5 0 0111 3h2a1.5 1.5 0 011.5 1.5v2"/><path d="M6.5 6.5l1 13A1.5 1.5 0 009 21h6a1.5 1.5 0 001.5-1.5l1-13"/><path d="M10.5 10.5v7M13.5 10.5v7"/></symbol>
+<symbol id="ic-edit" viewBox="0 0 24 24"><path d="M13 5.5l5.5 5.5M4 20l1-4.5L16 4.5a2.1 2.1 0 013 3L8 18.5 4 20z"/></symbol>
+<symbol id="ic-copy" viewBox="0 0 24 24"><rect x="8" y="8" width="12.5" height="12.5" rx="2"/><path d="M16 8V5.5A1.5 1.5 0 0014.5 4h-9A1.5 1.5 0 004 5.5v9A1.5 1.5 0 005.5 16H8"/></symbol>
+<symbol id="ic-package" viewBox="0 0 24 24"><path d="M12 3l8.5 4.5v9L12 21l-8.5-4.5v-9z"/><path d="M3.5 7.5L12 12l8.5-4.5M12 12v9M7.75 5.25l8.5 4.5"/></symbol>
+<symbol id="ic-star" viewBox="0 0 24 24"><path d="M12 3.5l2.7 5.5 6 .9-4.35 4.2 1.03 6L12 17.25 6.62 20.1l1.03-6L3.3 9.9l6-.9z"/></symbol>
+<symbol id="ic-coin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v10M14.5 9.3c-.6-.8-1.5-1.2-2.5-1.2-1.4 0-2.5.8-2.5 1.9 0 2.6 5 1.3 5 3.9 0 1.1-1.1 2-2.5 2-1.1 0-2-.4-2.6-1.2"/></symbol>
+<symbol id="ic-flask" viewBox="0 0 24 24"><path d="M9.5 3v6L4.6 17.4A2 2 0 006.3 20.5h11.4a2 2 0 001.7-3.1L14.5 9V3"/><path d="M8 3h8M7.2 14h9.6"/></symbol>
+<symbol id="ic-ruler" viewBox="0 0 24 24"><rect x="2.2" y="8" width="19.6" height="8" rx="1.6" transform="rotate(-45 12 12)"/><path d="M9 7.5l1.6 1.6M11.5 5l1.6 1.6M6.5 10l1.6 1.6M14 2.5l1.6 1.6"/></symbol>
+<symbol id="ic-sparkle" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M18.5 15.5l.8 2.2 2.2.8-2.2.8-.8 2.2-.8-2.2-2.2-.8 2.2-.8z"/></symbol>
+<symbol id="ic-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 7v5.2l3.4 2"/></symbol>
+<symbol id="ic-alert" viewBox="0 0 24 24"><path d="M10.3 4.2L2.6 17.4a2 2 0 001.7 3h15.4a2 2 0 001.7-3L13.7 4.2a2 2 0 00-3.4 0z"/><path d="M12 9.5v4M12 17.2v.01"/></symbol>
+<symbol id="ic-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M9 9l6 6M15 9l-6 6"/></symbol>
+<symbol id="ic-check" viewBox="0 0 24 24"><path d="M4.5 12.5l5 5 10-11"/></symbol>
+<symbol id="ic-check-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M8 12.2l2.8 2.8 5.2-6"/></symbol>
+<symbol id="ic-stop" viewBox="0 0 24 24"><rect x="5.5" y="5.5" width="13" height="13" rx="2.5"/></symbol>
+<symbol id="ic-play" viewBox="0 0 24 24"><path d="M7 4.8l12 7.2-12 7.2z"/></symbol>
+<symbol id="ic-pause" viewBox="0 0 24 24"><path d="M9 5v14M15 5v14"/></symbol>
+<symbol id="ic-scissors" viewBox="0 0 24 24"><circle cx="6.5" cy="6.5" r="2.6"/><circle cx="6.5" cy="17.5" r="2.6"/><path d="M8.7 8.3L20 18M20 6L8.7 15.7"/></symbol>
+<symbol id="ic-shuffle" viewBox="0 0 24 24"><path d="M3.5 6.5h3.2l10 11h4"/><path d="M3.5 17.5h3.2l3.1-3.4M13.6 9.4l3.1-2.9h4"/><path d="M18 3.5l3 3-3 3M18 14.5l3 3-3 3"/></symbol>
+<symbol id="ic-volume" viewBox="0 0 24 24"><path d="M4 9.5h3.5L12 5.5v13L7.5 14.5H4z"/><path d="M15.5 9.2a4 4 0 010 5.6M18.2 6.5a7.8 7.8 0 010 11"/></symbol>
+<symbol id="ic-music" viewBox="0 0 24 24"><path d="M9 18V5.2l11-2v12.6"/><circle cx="6.5" cy="18" r="2.6"/><circle cx="17.5" cy="15.8" r="2.6"/></symbol>
+<symbol id="ic-mic" viewBox="0 0 24 24"><rect x="9" y="2.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0013 0M12 18v3.5M8.5 21.5h7"/></symbol>
+<symbol id="ic-key" viewBox="0 0 24 24"><circle cx="7.5" cy="12" r="4"/><path d="M11.5 12H21M18 12v3.5M14.8 12v2.8"/></symbol>
+<symbol id="ic-cpu" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2"/><rect x="9.8" y="9.8" width="4.4" height="4.4" rx="1"/><path d="M10 3v3.5M14 3v3.5M10 17.5V21M14 17.5V21M3 10h3.5M3 14h3.5M17.5 10H21M17.5 14H21"/></symbol>
+<symbol id="ic-user" viewBox="0 0 24 24"><circle cx="12" cy="8" r="3.8"/><path d="M4.5 20.5a7.5 7.5 0 0115 0"/></symbol>
+<symbol id="ic-users" viewBox="0 0 24 24"><circle cx="9.5" cy="8" r="3.5"/><path d="M3 20a6.5 6.5 0 0113 0"/><path d="M16.5 5.2a3.5 3.5 0 010 6.6M17.5 14.4A6.5 6.5 0 0121 20"/></symbol>
+<symbol id="ic-search" viewBox="0 0 24 24"><circle cx="10.5" cy="10.5" r="6.5"/><path d="M15.3 15.3L21 21"/></symbol>
+<symbol id="ic-chart" viewBox="0 0 24 24"><path d="M4 20V4M4 20h16"/><path d="M8 20v-6M12.5 20V8.5M17 20v-9"/></symbol>
+<symbol id="ic-palette" viewBox="0 0 24 24"><path d="M12 3.2c-4.9 0-8.8 3.8-8.8 8.5S7.1 20 12 20c1.2 0 2-.8 2-1.8 0-.5-.2-.9-.5-1.2-.3-.3-.5-.7-.5-1.2 0-1 .9-1.8 2-1.8h1.3c2.5 0 4.5-1.9 4.5-4.3 0-3.6-3.5-6.5-7.8-6.5z"/><circle cx="7.6" cy="11.5" r="1.1"/><circle cx="10.4" cy="7.6" r="1.1"/><circle cx="15.2" cy="8.2" r="1.1"/></symbol>
+<symbol id="ic-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3.2"/><path d="M19.2 14.4a1.6 1.6 0 00.3 1.8l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.6 1.6 0 00-1.8-.3 1.6 1.6 0 00-1 1.5v.3a2 2 0 01-4 0v-.2a1.6 1.6 0 00-1-1.5 1.6 1.6 0 00-1.8.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.6 1.6 0 00.3-1.8 1.6 1.6 0 00-1.5-1H2.8a2 2 0 010-4H3a1.6 1.6 0 001.5-1 1.6 1.6 0 00-.3-1.8l-.1-.1a2 2 0 112.8-2.8l.1.1a1.6 1.6 0 001.8.3H9a1.6 1.6 0 001-1.5V2.8a2 2 0 014 0V3a1.6 1.6 0 001 1.5 1.6 1.6 0 001.8-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.6 1.6 0 00-.3 1.8V9a1.6 1.6 0 001.5 1h.3a2 2 0 010 4H21a1.6 1.6 0 00-1.5 1z"/></symbol>
+<symbol id="ic-link" viewBox="0 0 24 24"><path d="M10.2 13.8a4 4 0 006 .5l2.5-2.5a4.2 4.2 0 00-6-6l-1.4 1.4"/><path d="M13.8 10.2a4 4 0 00-6-.5L5.3 12.2a4.2 4.2 0 006 6l1.4-1.4"/></symbol>
+<symbol id="ic-folder" viewBox="0 0 24 24"><path d="M3 7.5A1.5 1.5 0 014.5 6h4.2l2 2.5h8.8A1.5 1.5 0 0121 10v8.5A1.5 1.5 0 0119.5 20h-15A1.5 1.5 0 013 18.5z"/></symbol>
+<symbol id="ic-file" viewBox="0 0 24 24"><path d="M13.5 3H7a1.5 1.5 0 00-1.5 1.5v15A1.5 1.5 0 007 21h10a1.5 1.5 0 001.5-1.5V8z"/><path d="M13.5 3v5h5M9 13h6M9 16.5h6"/></symbol>
+<symbol id="ic-zap" viewBox="0 0 24 24"><path d="M13.5 2.5L4.5 13.8h6.3L10.5 21.5l9-11.3h-6.3z"/></symbol>
+<symbol id="ic-flame" viewBox="0 0 24 24"><path d="M12 21c3.6 0 6.5-2.7 6.5-6 0-4.4-4-6.2-4.6-10.8-2 1.4-3.4 3.4-3.4 5.6 0 1.3-1 2-1.9 1.3-.8-.6-1.1-1.6-1.1-2.4C6 10.1 5.5 12.2 5.5 15c0 3.3 2.9 6 6.5 6z"/></symbol>
+<symbol id="ic-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><circle cx="12" cy="12" r="4.6"/><circle cx="12" cy="12" r="1"/></symbol>
+<symbol id="ic-bell" viewBox="0 0 24 24"><path d="M18 9.5a6 6 0 10-12 0c0 5-2 6.5-2 6.5h16s-2-1.5-2-6.5z"/><path d="M13.7 20a2 2 0 01-3.4 0"/></symbol>
+<symbol id="ic-lock" viewBox="0 0 24 24"><rect x="4.5" y="10.5" width="15" height="10" rx="2"/><path d="M8 10.5V7.2a4 4 0 018 0v3.3"/></symbol>
+<symbol id="ic-info" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M12 11.2v5M12 7.9v.01"/></symbol>
+<symbol id="ic-plus" viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></symbol>
+<symbol id="ic-x" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+<symbol id="ic-chevron-down" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></symbol>
+<symbol id="ic-chevron-right" viewBox="0 0 24 24"><path d="M9.5 6l6 6-6 6"/></symbol>
+<symbol id="ic-eye" viewBox="0 0 24 24"><path d="M2.5 12S6 5.5 12 5.5 21.5 12 21.5 12 18 18.5 12 18.5 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="3.2"/></symbol>
+<symbol id="ic-list" viewBox="0 0 24 24"><path d="M9 6.5h12M9 12h12M9 17.5h12M4 6.5v.01M4 12v.01M4 17.5v.01"/></symbol>
+<symbol id="ic-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><path d="M3.5 12h17M12 3.5c2.3 2.4 3.5 5.4 3.5 8.5s-1.2 6.1-3.5 8.5c-2.3-2.4-3.5-5.4-3.5-8.5S9.7 5.9 12 3.5z"/></symbol>
+<symbol id="ic-message" viewBox="0 0 24 24"><path d="M20.5 11.5a7.6 7.6 0 01-8.5 7.5c-.9 0-1.8-.1-2.6-.4L4 20.5l1.4-4.2A7.3 7.3 0 013.5 11.5C3.5 7.4 7.3 4 12 4s8.5 3.4 8.5 7.5z"/></symbol>
+<symbol id="ic-calendar" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="15.5" rx="2"/><path d="M3.5 10h17M8 3v4M16 3v4"/></symbol>
+<symbol id="ic-rocket" viewBox="0 0 24 24"><path d="M13 4.5c3.5-2 6.5-1.5 6.5-1.5s.5 3-1.5 6.5c-1.6 2.8-4 5-6.3 6.4l-3.6-3.6C9.5 10 11.4 6.1 13 4.5z"/><circle cx="15.2" cy="8.8" r="1.4"/><path d="M8.1 12.3L5 13.4l1.6 1.6M11.7 15.9l-1.1 3.1-1.6-1.6M6.5 17.5c-1 1-1.5 3-1.5 3s2-.5 3-1.5"/></symbol>
+</defs></svg>
+
+<!-- ========== TOASTS ========== -->
+<div id="toast-container"></div>
+
+<!-- ========== LOGIN SCREEN ========== -->
+<div id="login-screen" class="flex items-center justify-center min-h-screen p-4">
+  <div class="card" style="width:100%;max-width:400px;padding:32px;">
+    <div class="flex items-center justify-center gap-2 mb-6">
+      <div class="logo-sq"></div>
+      <h1 class="text-xl font-bold">Rewrite Studio</h1>
+    </div>
+
+    <!-- Первичная настройка -->
+    <div id="auth-setup" class="hidden">
+      <p class="text-center mb-1 font-medium">Первичная настройка</p>
+      <p class="text-faint text-center text-xs mb-4">Создайте администраторский аккаунт</p>
+      <input id="setup-username" type="text" placeholder="Логин админа (мин. 3)" autocomplete="username" class="input w-full mb-3">
+      <input id="setup-password" type="password" placeholder="Пароль (мин. 6)" autocomplete="new-password"
+        class="input w-full mb-4" onkeydown="if(event.key==='Enter')doSetup()">
+      <button onclick="doSetup()" id="setup-btn" class="btn btn-primary w-full">Создать администратора</button>
+    </div>
+
+    <!-- Вход по логину/паролю -->
+    <div id="auth-login">
+      <p class="text-muted text-center mb-4">Вход в аккаунт</p>
+      <input id="lp-username" type="text" placeholder="Логин" autocomplete="username"
+        class="input w-full mb-3" onkeydown="if(event.key==='Enter')doLoginPassword()">
+      <input id="lp-password" type="password" placeholder="Пароль" autocomplete="current-password"
+        class="input w-full mb-4" onkeydown="if(event.key==='Enter')doLoginPassword()">
+      <button onclick="doLoginPassword()" id="lp-btn" class="btn btn-primary w-full">Войти</button>
+    </div>
+
+    <p id="login-error" class="text-err text-sm mt-4 text-center hidden"></p>
+  </div>
+</div>
+
+<!-- ========== MAIN APP ========== -->
+<div id="app" class="hidden">
+  <div class="layout">
+    <!-- ===== SIDEBAR ===== -->
+    <aside class="sidebar">
+      <div class="flex items-center gap-2 px-2 mb-4" style="height:32px">
+        <div class="logo-sq"></div>
+        <span class="font-bold" style="font-size:0.95rem">Rewrite Studio</span>
+      </div>
+      <nav class="space-y-1">
+        <button class="nav-item active" data-tab="rewrite" onclick="switchTab('rewrite',this)"><span>Рерайт</span></button>
+        <button class="nav-item" data-tab="generation" onclick="switchTab('generation',this)"><span>Генерация</span></button>
+        <button class="nav-item" data-tab="queue" onclick="switchTab('queue',this)"><span>Очередь</span><span id="nav-queue-badges" class="flex gap-1"></span></button>
+        <button class="nav-item" data-tab="settings" onclick="switchTab('settings',this)"><span>Настройки</span></button>
+      </nav>
+      <div class="queue-widget" onclick="switchTab('queue', document.querySelector('.nav-item[data-tab=queue]'))">
+        <div class="text-xs font-semibold text-muted mb-2">Очередь сейчас</div>
+        <div class="qw-row"><span class="text-muted">В работе</span><span id="qw-running" class="font-mono text-accent">0</span></div>
+        <div class="qw-row"><span class="text-muted">Ошибки</span><span id="qw-errors" class="font-mono text-err">0</span></div>
+        <div class="qw-row"><span class="text-muted">Готово сегодня</span><span id="qw-done" class="font-mono text-ok">0</span></div>
+      </div>
+    </aside>
+
+    <!-- ===== MAIN COLUMN ===== -->
+    <div class="flex flex-col" style="min-width:0">
+      <div id="session-banner">
+        <span>Нет активности — сессия будет продлена автоматически при любом действии. Данные форм сохранены.</span>
+        <button onclick="renewSession()" class="btn-warn btn-sm">Продлить сейчас</button>
+      </div>
+      <header class="header-bar">
+        <div class="flex items-center gap-2">
+          <span class="text-sm font-semibold text-muted">Многотенантный рерайт и генерация</span>
+        </div>
+        <div class="flex items-center gap-3">
+          <a class="text-muted text-sm" style="text-decoration:none" href="https://gen.13.140.129.66.sslip.io" title="VideoStudio — генерация видео"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Видео</a>
+          <a class="text-muted text-sm" style="text-decoration:none" href="https://cover.13.140.129.66.sslip.io" title="Cover Generator — обложки"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-image"/></svg> Обложки</a>
+          <span class="session-pill" title="Сессия продлевается автоматически"><span class="status-dot" style="background:var(--ok)"></span>Сессия активна</span>
+          <span id="user-name-display" class="text-muted text-sm"></span>
+          <button onclick="doLogout()" class="btn-danger-text">Выйти</button>
+        </div>
+      </header>
+
+      <main class="content-area flex-1">
+
+    <!-- ===== REWRITE TAB ===== -->
+    <div id="tab-rewrite" class="tab-content" style="max-width:1060px;margin:0 auto">
+      <!-- Живая очередь: числа ОБЩИЕ по сервису (личные — в сайдбаре «Очередь сейчас»). -->
+      <div class="vs-qstrip clickable mb-3" data-qstrip data-state="off" title="Общая очередь сервиса — все пользователи. Нажмите, чтобы открыть свои задачи" onclick="switchTab('queue', document.querySelector('.nav-item[data-tab=queue]'))">
+        <span class="dot"></span>
+        <span data-qs-main>Очередь: загрузка…</span>
+        <span class="muted hidden" data-qs-mine></span>
+      </div>
+      <div class="flex items-center justify-between mb-1 flex-wrap gap-2">
+        <div>
+          <div class="section-title">Новый рерайт</div>
+          <div class="text-xs text-muted mt-1">Настройки запоминаются автоматически</div>
+        </div>
+        <button onclick="repeatLastRewrite()" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> Повторить последнюю задачу</button>
+      </div>
+      <div class="rew-grid grid gap-4 mt-3" style="grid-template-columns:minmax(0,1fr) 296px">
+        <div class="space-y-4" style="min-width:0">
+          <!-- Files -->
+          <div class="card space-y-3">
+            <div class="card-title">Исходные файлы</div>
+            <div id="uploaded-files-list" class="space-y-1 hidden">
+              <div id="files-tbody" class="space-y-1"></div>
+            </div>
+            <div id="drop-zone" class="drop-zone" onclick="document.getElementById('file-input').click()">
+              <p class="text-muted text-sm mb-1">Перетащите файлы сюда или нажмите для выбора</p>
+              <p class="text-faint text-xs">Поддерживаются .txt, .docx, .pdf, .odt, .rtf</p>
+              <input id="file-input" type="file" multiple accept=".txt,.md,.html,.docx,.doc,.pdf,.odt,.rtf" class="hidden" onchange="handleFiles(this.files)">
+            </div>
+          </div>
+          <!-- Languages -->
+          <div class="card">
+            <div class="flex items-center justify-between mb-2 flex-wrap gap-2">
+              <div class="flex items-center gap-2">
+                <div class="card-title">Языки</div>
+                <span id="rew-lang-count" class="pill-badge">0</span>
+              </div>
+              <div class="flex items-center gap-2">
+                <input id="rew-lang-search" type="text" placeholder="Поиск..." class="input input-sm" style="width:150px" oninput="filterLangs('rew')">
+                <button onclick="deselectAllLangs('rew')" class="btn-danger-text">снять все</button>
+              </div>
+            </div>
+            <div id="rew-lang-chips" class="flex flex-wrap gap-2" style="max-height:260px;overflow-y:auto"></div>
+            <div class="flex items-center justify-between mt-3 mb-1">
+              <span class="text-xs text-muted font-semibold">Канал и диктор по языкам</span>
+              <button onclick="fillLangDetailsAll('rew')" class="text-accent" style="background:none;border:none;cursor:pointer;font-size:11.5px" title="Скопировать канал/диктора первого языка во все">заполнить все одинаково</button>
+            </div>
+            <div id="rew-lang-details" class="flex flex-col gap-2"></div>
+            <p class="text-xs text-faint mt-2">На каждый выбранный язык — свои канал и диктор. Пусто → берётся из пресета.</p>
+            <!-- Hidden legacy language table (contract preserved: getSelectedLangs/setLangTableValues) -->
+            <div id="rew-lang-table" class="hidden">
+              <table><tbody id="rew-lang-tbody"></tbody></table>
+            </div>
+          </div>
+          <!-- Parameters -->
+          <div class="card">
+            <div class="card-title mb-3">Параметры</div>
+            <div class="grid grid-cols-3 gap-3">
+              <div>
+                <div class="label">Модель</div>
+                <select id="rew-model" class="input">
+                  <option value="" disabled selected>Выберите модель</option>
+                </select>
+              </div>
+              <div>
+                <div class="label">Пресет рерайта</div>
+                <div class="flex gap-1">
+                  <select id="rew-preset" class="input" onchange="loadRewPreset()"><option value="">— выберите —</option></select>
+                  <button onclick="saveRewPreset()" class="btn btn-ghost btn-sm" title="Сохранить пресет"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg></button>
+                  <button onclick="deleteRewPreset()" class="btn-danger-text" title="Удалить пресет"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>
+                </div>
+              </div>
+              <div id="rew-chunk-wrap">
+                <div class="label">Размер чанка</div>
+                <input id="rew-chunk" type="number" min="1000" max="30000" value="8000" step="1000" class="input">
+              </div>
+              <div class="col-span-2 flex flex-wrap gap-4 items-end">
+                <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" id="rew-safe-text"> Безопасный текст</label>
+                <label id="rew-preserve-paragraphs-wrap" class="flex items-center gap-2 text-sm cursor-pointer" title="Гарантировать что число абзацев в переводе совпадает с оригиналом."><input type="checkbox" id="rew-preserve-paragraphs" checked> Сохранять структуру абзацев оригинала</label>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Right rail: run summary -->
+        <div class="rew-rail sticky" style="top:24px;align-self:start">
+          <div class="card space-y-3">
+            <div class="card-title">Сводка запуска</div>
+            <div class="space-y-1 text-sm">
+              <div class="flex justify-between"><span class="text-muted">Файлы</span><span id="sum-files" class="font-medium">0</span></div>
+              <div class="flex justify-between"><span class="text-muted">Языки</span><span id="sum-langs" class="font-medium">0</span></div>
+              <div class="flex justify-between"><span class="text-muted">Модель</span><span id="sum-model" class="font-medium truncate" style="max-width:150px">—</span></div>
+              <div class="flex justify-between"><span class="text-muted">Пресет</span><span id="sum-preset" class="font-medium truncate" style="max-width:150px">—</span></div>
+            </div>
+            <div style="border-top:1px solid var(--border)"></div>
+            <div class="flex justify-between items-center">
+              <span class="text-muted text-sm">Результатов</span>
+              <span id="sum-results" class="text-accent font-bold text-lg">0</span>
+            </div>
+            <button id="rew-run-btn" onclick="startRewrite()" class="btn btn-primary btn-lg w-full">Запустить рерайт</button>
+            <p class="text-xs text-faint">Серверная fair queue автоматически распределяет задачи по провайдерам.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== GENERATION TAB ===== -->
+    <div id="tab-generation" class="tab-content hidden" style="max-width:820px;margin:0 auto">
+      <div class="section-title mb-3">Генерация</div>
+      <div class="space-y-4">
+        <!-- Preset -->
+        <div class="card space-y-3">
+          <div class="flex justify-between items-center">
+            <div class="card-title">Пресет канала</div>
+            <span id="gen-preset-meta" class="text-xs text-faint"></span>
+          </div>
+          <div class="flex gap-2 items-center flex-wrap">
+            <select id="gen-preset" class="input flex-1" style="min-width:200px" onchange="onGenPresetSelected()"></select>
+            <button onclick="openPresetEditor(null)" class="btn btn-ghost btn-sm" title="Создать">+ Новый</button>
+            <button onclick="editCurrentPreset()" class="btn btn-ghost btn-sm" title="Редактировать">Редактировать</button>
+            <button onclick="importPresetJson()" class="btn btn-ghost btn-sm" title="Импорт .json">Import</button>
+            <button onclick="exportPresetJson()" class="btn btn-ghost btn-sm" title="Экспорт .json">Export</button>
+            <button onclick="deleteCurrentPreset()" class="btn-danger-text" title="Удалить"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-trash"/></svg></button>
+          </div>
+        </div>
+
+        <!-- Topics -->
+        <div class="card space-y-2">
+          <div class="card-title">Темы / источники</div>
+          <p class="text-xs text-faint">Каждая строка — отдельная задача (тема + свой язык). Пусто в языке = язык пресета. «Добавить тему» — ещё строка; все уйдут одним кликом.</p>
+          <div id="gen-topics-list" class="space-y-2"></div>
+          <button onclick="addGenRow()" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-plus"/></svg> Добавить тему</button>
+        </div>
+
+        <!-- Overrides -->
+        <details class="card">
+          <summary class="cursor-pointer text-sm text-muted select-none">Переопределить параметры пресета</summary>
+          <div class="grid grid-cols-3 gap-3 mt-3">
+            <div>
+              <div class="label">Модель</div>
+              <select id="gen-model" class="input"><option value="" selected>(из пресета)</option></select>
+            </div>
+            <div>
+              <div class="label">Язык</div>
+              <input id="gen-language-override" type="text" class="input" placeholder="(из пресета)">
+            </div>
+            <div>
+              <div class="label">Длина (слов)</div>
+              <input id="gen-length-override" type="number" min="300" max="100000" class="input" placeholder="(из пресета)">
+            </div>
+            <div>
+              <div class="label">Anti-repeat depth</div>
+              <input id="gen-max-log" type="number" min="0" max="20" value="5" class="input">
+            </div>
+            <div class="col-span-2">
+              <div class="label">Размер чанка (слов) — override</div>
+              <input id="gen-chunk-size-override" type="number" min="500" max="100000" class="input" placeholder="авто по модели">
+              <div class="text-xs text-faint mt-1">Auto: Opus 4.7 / Sonnet 4.6 ~25K EN / 13K RU · Haiku 4.5 ~12K / 6.5K · GPT-4o ~8K / 4.5K</div>
+            </div>
+          </div>
+        </details>
+
+        <div class="flex gap-3 items-center">
+          <button id="gen-submit-btn" onclick="generateScript()" class="btn btn-primary btn-lg"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Сгенерировать</button>
+          <span id="gen-status" class="text-sm text-muted"></span>
+        </div>
+        <p class="text-xs text-faint">≈ 4–7 минут для 12 000 слов. Результат уходит в очередь.</p>
+
+        <!-- Output -->
+        <div id="gen-output" class="card space-y-3 hidden">
+          <div class="card-title">Результат</div>
+          <div>
+            <div class="label flex justify-between items-center"><span>Preview (для обложки)</span><button onclick="copyGenField('gen-out-preview')" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-copy"/></svg></button></div>
+            <input id="gen-out-preview" readonly class="input w-full">
+          </div>
+          <div>
+            <div class="label flex justify-between items-center"><span>Title</span><button onclick="copyGenField('gen-out-title')" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-copy"/></svg></button></div>
+            <input id="gen-out-title" readonly class="input w-full">
+          </div>
+          <div>
+            <div class="label flex justify-between items-center"><span>Script (TTS-ready)</span>
+              <span class="flex gap-2"><button onclick="copyGenField('gen-out-script')" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-copy"/></svg> Copy</button><button onclick="downloadGenScriptTxt()" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg> .txt</button></span>
+            </div>
+            <textarea id="gen-out-script" readonly rows="20" class="input w-full"></textarea>
+            <p id="gen-out-meta" class="text-xs text-faint mt-1"></p>
+          </div>
+          <details class="text-sm">
+            <summary class="cursor-pointer text-muted">Rotation log update (этого прогона)</summary>
+            <pre id="gen-out-log-update" class="text-xs p-2 rounded mt-1 overflow-auto" style="background:var(--bg)"></pre>
+          </details>
+        </div>
+      </div>
+    </div>
+
+    <!-- Preset editor modal (Generation v2) -->
+    <div id="preset-editor-overlay" class="modal-overlay hidden" onclick="if(event.target===this)closePresetEditor()">
+      <div class="modal-content space-y-3" style="max-width:760px">
+        <h3 id="preset-editor-title" class="card-title">Создать пресет</h3>
+        <div>
+          <div class="label">Название</div>
+          <input id="preset-editor-name" type="text" maxlength="80" class="input w-full" placeholder="Buffett, Survival, etc.">
+        </div>
+        <div>
+          <div class="label">Длина (слов, опц.)</div>
+          <input id="preset-editor-length" type="number" min="300" max="100000" class="input w-full" placeholder="без chunking если пусто">
+        </div>
+        <div>
+          <div class="label flex justify-between items-center"><span>Content (JSON / markdown / plain text)</span><button onclick="prettyPrintPresetContent()" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-settings"/></svg> Pretty-print JSON</button></div>
+          <textarea id="preset-editor-content" rows="18" class="input w-full font-mono" style="font-size:12px" placeholder="Любая структура — JSON, markdown, plain text."></textarea>
+          <p class="text-xs text-faint mt-1">JSON-ключи: <code>language</code>, <code>host_name</code>, <code>channel_name</code>.</p>
+        </div>
+        <div class="flex gap-2 justify-end">
+          <button onclick="closePresetEditor()" class="btn btn-ghost btn-sm">Отмена</button>
+          <button onclick="savePresetFromModal()" class="btn btn-primary btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Сохранить</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== QUEUE TAB ===== -->
+    <div id="tab-queue" class="tab-content hidden" style="max-width:1060px;margin:0 auto">
+      <!-- Живая очередь: числа ОБЩИЕ по сервису, список ниже — только свои задачи. -->
+      <div class="vs-qstrip mb-3" data-qstrip data-state="off" title="Общая очередь сервиса — все пользователи">
+        <span class="dot"></span>
+        <span data-qs-main>Очередь: загрузка…</span>
+        <span class="muted hidden" data-qs-mine></span>
+      </div>
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <div class="section-title">Очередь</div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <button onclick="retryAllUnfinished()" class="btn-warn btn-sm" title="Повторяет только отмеченные галочками задачи (незавершённые: ошибка/частично/остановлено)"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> Повторить незавершённые (выбранные)</button>
+          <button onclick="downloadAllCompleted()" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg> Скачать всё готовое</button>
+        </div>
+      </div>
+      <div class="text-xs text-muted mb-3">Задачи и готовые результаты хранятся 30 дней, затем удаляются автоматически — скачивайте нужное вовремя.</div>
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <div class="seg" id="queue-filters">
+          <button class="seg-btn active" data-filter="all" onclick="setQueueFilter('all',this)">Все · <span data-cnt="all">0</span></button>
+          <button class="seg-btn" data-filter="active" onclick="setQueueFilter('active',this)">Активные · <span data-cnt="active">0</span></button>
+          <button class="seg-btn" data-filter="errors" onclick="setQueueFilter('errors',this)">Ошибки · <span data-cnt="errors">0</span></button>
+          <button class="seg-btn" data-filter="done" onclick="setQueueFilter('done',this)">Готово · <span data-cnt="done">0</span></button>
+        </div>
+        <div class="flex items-center gap-2 flex-wrap">
+          <button id="btn-dl-selected" onclick="downloadSelectedJobsZip()" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-package"/></svg> Скачать выбранные (0)</button>
+        </div>
+      </div>
+      <div id="jobs-container" class="space-y-3"></div>
+      <div id="jobs-empty" class="hidden">
+        <div class="drop-zone" style="padding:40px;cursor:default">
+          <p class="text-muted mb-1">Задач пока нет</p>
+          <p class="text-faint text-xs mb-4">Создайте рерайт или генерацию — они появятся здесь</p>
+          <button onclick="switchTab('rewrite', document.querySelector('.nav-item[data-tab=rewrite]'))" class="btn btn-primary btn-sm">Создать рерайт</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ===== SETTINGS TAB ===== -->
+    <div id="tab-settings" class="tab-content hidden" style="max-width:760px;margin:0 auto">
+      <div class="flex items-center justify-between mb-3 flex-wrap gap-2">
+        <div class="section-title">Настройки</div>
+        <span class="text-xs text-faint">Источник истины — сервер</span>
+      </div>
+      <!-- Sync banner -->
+      <div id="settings-sync-banner" class="card mb-4" style="padding:10px 14px;display:flex;align-items:center;gap:9px">
+        <span class="status-dot" style="background:var(--ok)"></span>
+        <span id="settings-sync-text" class="text-sm text-ok">Все изменения синхронизированы с сервером</span>
+      </div>
+
+      <div class="space-y-4">
+      <!-- Аккаунты (только админ) -->
+      <div class="card space-y-3" data-admin-only>
+        <div class="card-title">Аккаунты <span class="text-xs text-warn font-medium ml-2">только админ</span></div>
+        <p class="text-xs text-faint">Логин/пароль для сотрудников. Новый аккаунт = чистый профиль (свои пресеты/данные с нуля).</p>
+        <div id="accounts-list" class="space-y-1"></div>
+        <div style="border-top:1px solid var(--border);padding-top:12px" class="space-y-2">
+          <div class="grid grid-cols-2 gap-2">
+            <input id="acc-username" type="text" placeholder="Логин (мин. 3)" class="input" autocomplete="off">
+            <input id="acc-name" type="text" placeholder="Имя (опц.)" class="input" autocomplete="off">
+          </div>
+          <input id="acc-password" type="password" placeholder="Пароль (мин. 6)" class="input" autocomplete="new-password">
+          <button onclick="createAccount()" class="btn btn-primary w-full">Создать аккаунт</button>
+          <p id="acc-msg" class="text-xs hidden"></p>
+        </div>
+      </div>
+
+      <div class="card space-y-3">
+        <div class="card-title">Источник ключей</div>
+        <label class="flex items-center gap-2"><input id="set-own-only" type="checkbox" onchange="saveCredentialMode()"> Только мои ключи и подписки</label>
+        <p class="text-xs text-faint">В этом режиме отсутствие или лимит личного ключа не переключает задачу на серверный. До 100 ключей или подписок каждого типа; общая параллельность ограничена сервером.</p>
+      </div>
+      <!-- Claude: свой токен (доступно всем) + статус серверного pool.
+           BYOK-2026-07-30: значения (ни свои, ни серверные) в браузер не отдаются. -->
+      <div class="card space-y-3">
+        <div class="flex items-center gap-2">
+          <div class="card-title">Claude</div>
+        </div>
+        <p id="claude-server-status" class="text-xs text-faint">Проверяю серверный pool…</p>
+        <p id="claude-own-status" class="text-xs text-faint">Свой токен: проверяю…</p>
+        <div class="flex gap-2">
+          <input id="set-own-claude-token" type="password" class="input flex-1" autocomplete="off"
+                 placeholder="Claude OAuth-токены через запятую">
+          <button onclick="saveOwnCredential('claude')" class="btn btn-primary btn-sm">Сохранить</button>
+          <button onclick="clearOwnCredential('claude')" class="btn btn-ghost btn-sm">Удалить свой</button>
+        </div>
+        <p class="text-xs text-faint">Свой токен приоритетнее серверного. Введённое значение
+          сохраняется на сервере и обратно в браузер никогда не отдаётся — виден только признак «задан».</p>
+      </div>
+
+      <!-- Anthropic API-ключ: свой ключ (доступно всем).
+           BYOK-2026-07-30 (задачи A+C): Claude-модели работают либо по своей
+           OAuth-подписке, либо по своему Anthropic API-ключу. Серверный
+           Anthropic-ключ — владельческий и другим тенантам не выдаётся. -->
+      <div class="card space-y-3">
+        <div class="card-title">Anthropic API-ключ</div>
+        <p id="anthropic-server-status" class="text-xs text-faint">Проверяю серверный ключ…</p>
+        <p id="anthropic-own-status" class="text-xs text-faint">Свой ключ: проверяю…</p>
+        <div class="flex gap-2">
+          <input id="set-own-anthropic-key" type="password" class="input flex-1" autocomplete="off"
+                 placeholder="Anthropic API-ключи через запятую">
+          <button onclick="saveOwnCredential('anthropic')" class="btn btn-primary btn-sm">Сохранить</button>
+          <button onclick="clearOwnCredential('anthropic')" class="btn btn-ghost btn-sm">Удалить свой</button>
+        </div>
+        <p class="text-xs text-faint">Используется, когда OAuth-токена нет. Значение хранится
+          на сервере и обратно в браузер никогда не отдаётся — виден только признак «задан».</p>
+      </div>
+
+      <!-- Codex: своя подписка (доступно всем). Серверная подписка владельца
+           другим тенантам не достаётся — им нужен свой auth.json. -->
+      <div class="card space-y-3">
+        <div class="card-title">Codex (подписка ChatGPT)</div>
+        <p id="codex-server-status" class="text-xs text-faint">Проверяю серверную подписку…</p>
+        <p id="codex-own-status" class="text-xs text-faint">Своя подписка: проверяю…</p>
+        <textarea id="set-own-codex-auth" rows="3" class="input w-full" autocomplete="off"
+                  placeholder='auth.json: один JSON-объект или JSON-массив личных подписок'></textarea>
+        <div class="flex gap-2">
+          <button onclick="saveOwnCredential('codex')" class="btn btn-primary btn-sm">Сохранить</button>
+          <button onclick="clearOwnCredential('codex')" class="btn btn-ghost btn-sm">Удалить свою</button>
+        </div>
+        <p class="text-xs text-faint">Серверная подписка Codex принадлежит владельцу сервиса и
+          другим аккаунтам не выдаётся: чтобы пользоваться Codex-моделями, вставьте свой
+          <code>auth.json</code> (получается локально командой <code>codex login</code>).
+          Значение хранится на сервере и обратно не отдаётся.</p>
+      </div>
+
+      <!-- OpenAI: свой ключ (доступно всем) + статус серверного ключа -->
+      <div class="card space-y-3">
+        <div class="card-title">OpenAI (GPT)</div>
+        <p id="openai-server-status" class="text-xs text-faint">Проверяю серверный ключ…</p>
+        <p id="openai-own-status" class="text-xs text-faint">Свой ключ: проверяю…</p>
+        <div class="flex gap-2">
+          <input id="set-own-openai-key" type="password" class="input flex-1" autocomplete="off"
+                 placeholder="OpenAI API-ключи через запятую">
+          <button onclick="saveOwnCredential('openai')" class="btn btn-primary btn-sm">Сохранить</button>
+          <button onclick="clearOwnCredential('openai')" class="btn btn-ghost btn-sm">Удалить свой</button>
+        </div>
+        <p class="text-xs text-faint">Свой ключ приоритетнее серверного. Введённое значение
+          сохраняется на сервере и обратно в браузер никогда не отдаётся — виден только признак «задан».</p>
+      </div>
+
+      <!-- Defaults -->
+      <div class="card space-y-3">
+        <div class="card-title">По умолчанию</div>
+        <div class="grid grid-cols-3 gap-3">
+          <div>
+            <div class="label">Модель</div>
+            <select id="set-default-model" class="input"><option value="" disabled selected>Выберите модель</option></select>
+          </div>
+          <div data-admin-only>
+            <div class="label">Модель проверки (Pass A–D)</div>
+            <input id="set-check-model" list="check-model-list" class="input" placeholder="gpt-5-mini" value="gpt-5-mini">
+            <datalist id="check-model-list">
+              <option value="gpt-5-mini">gpt-5-mini</option>
+              <option value="gpt-4o-mini">gpt-4o-mini</option>
+              <option value="gpt-4o">gpt-4o</option>
+              <option value="gpt-4.1-mini">gpt-4.1-mini</option>
+              <option value="o1-mini">o1-mini</option>
+            </datalist>
+          </div>
+        </div>
+      </div>
+
+      <!-- GPT settings (admin) -->
+      <div class="card space-y-3" data-admin-only>
+        <div class="card-title">GPT модели <span class="text-xs text-warn font-medium ml-2">только админ</span></div>
+        <div class="grid grid-cols-2 gap-3">
+          <div>
+            <div class="label">Тип</div>
+            <select id="set-gpt-tier" class="input">
+              <option value="default">Default (standard)</option>
+              <option value="flex">Flex (-50% дешевле)</option>
+            </select>
+          </div>
+        </div>
+        <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" id="set-gpt-cache" checked> Кэширование input (аналогично Anthropic)</label>
+        <p class="text-xs text-faint">Flex: дешевле, медленнее. Кэш: экономия до 90% на input</p>
+      </div>
+
+      <!-- Custom models (admin) -->
+      <div class="card space-y-3" data-admin-only>
+        <div class="card-title">Свои модели (fine-tuned, Azure и т.д.) <span class="text-xs text-warn font-medium ml-2">только админ</span></div>
+        <div id="custom-models-list" class="space-y-2"></div>
+        <div class="flex gap-2">
+          <input id="new-custom-model" type="text" placeholder="ft:gpt-4o-mini:... или model-id" class="input flex-1">
+          <button onclick="addCustomModel()" class="btn btn-primary btn-sm">Добавить</button>
+        </div>
+      </div>
+
+      <!-- Debug (admin) -->
+      <div class="card" data-admin-only>
+        <label class="flex items-center gap-2 text-sm cursor-pointer"><input type="checkbox" id="set-debug-mode"> Debug: показывать все запросы и ошибки как есть <span class="text-xs text-warn font-medium ml-2">только админ</span></label>
+      </div>
+
+      <!-- Save -->
+      <div class="flex gap-3 items-center flex-wrap">
+        <button onclick="saveAllSettings()" class="btn btn-primary"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Сохранить настройки</button>
+        <p id="settings-saved" class="text-ok text-sm hidden"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> Сохранено</p>
+      </div>
+
+      <!-- Export / Import -->
+      <div class="card space-y-2">
+        <div class="card-title">Экспорт / импорт настроек</div>
+        <p class="text-xs text-faint">Скачать или загрузить только несекретные настройки (модели и пресеты). Provider credentials управляются на сервере и в экспорт не входят.</p>
+        <div class="flex gap-2 flex-wrap">
+          <button onclick="exportSettingsJson()" class="btn btn-ghost"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-upload"/></svg> Экспорт в JSON</button>
+          <button onclick="document.getElementById('import-settings-file').click()" class="btn btn-ghost"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg> Импорт из JSON</button>
+          <input id="import-settings-file" type="file" accept=".json" class="hidden" onchange="handleImportSettingsFile(this)">
+        </div>
+        <div style="border-top:1px solid var(--border);padding-top:8px" class="mt-2">
+          <p class="text-xs text-faint mb-1">Пресеты рерайта из десктопного приложения (файл <code>.rewrite_presets.json</code>):</p>
+          <button onclick="document.getElementById('import-desktop-rew-file').click()" class="btn btn-ghost"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-folder"/></svg> Импорт пресетов рерайта из десктопа</button>
+          <input id="import-desktop-rew-file" type="file" accept=".json" class="hidden" onchange="handleImportDesktopRewritePresets(this)">
+        </div>
+        <p id="import-result" class="text-sm hidden"></p>
+      </div>
+
+      <!-- API v1 keys -->
+      <div class="card space-y-3">
+        <div class="card-title">API v1 ключи</div>
+        <p class="text-xs text-faint">
+          Программный доступ к <code>/api/v1/*</code>. Plain key показывается ОДИН раз при создании — сохраните сразу.
+          Документация: <a href="/docs" target="_blank">/docs</a>, <a href="/README_API.md" target="_blank">README_API.md</a>.
+        </p>
+        <div class="flex gap-2">
+          <input id="new-api-key-name" type="text" placeholder="Имя (laptop, ci, ...)" class="input flex-1" maxlength="64">
+          <button onclick="createApiKey()" class="btn btn-primary btn-sm">+ Создать ключ</button>
+        </div>
+        <div id="api-key-new-result" class="hidden rounded p-3 text-xs space-y-2" style="background:rgba(224,168,63,.1);border:1px solid rgba(224,168,63,.35)">
+          <p class="text-warn font-semibold"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Сохраните этот ключ сейчас — он не будет показан снова:</p>
+          <div class="flex gap-2 items-center">
+            <code id="api-key-new-plain" class="px-2 py-1 rounded flex-1" style="background:var(--bg);word-break:break-all"></code>
+            <button onclick="copyApiKey()" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-copy"/></svg> Copy</button>
+          </div>
+          <button onclick="dismissApiKeyResult()" class="btn btn-ghost btn-sm">Я скопировал</button>
+        </div>
+        <div id="api-keys-list" class="space-y-1 text-sm"></div>
+      </div>
+      </div>
+    </div>
+
+      </main>
+    </div>
+  </div>
+</div>
+
+<!-- ========== PRESET EDITOR MODAL (rewrite-preset legacy modal) ========== -->
+<div id="preset-modal" class="modal-overlay hidden" onclick="if(event.target===this)closePresetModal()">
+  <div class="modal-content space-y-4">
+    <h2 id="preset-modal-title" class="card-title">Новый пресет</h2>
+    <div class="grid grid-cols-2 gap-3">
+      <div><div class="label">Название</div><input id="pm-name" class="input" placeholder="Истории выживания"></div>
+      <div><div class="label">Тип контента</div><select id="pm-content-type" class="input"><option value="survival">survival</option><option value="military">military</option><option value="investigation">investigation</option><option value="custom">custom</option></select></div>
+      <div><div class="label">Всего слов</div><input id="pm-total-words" type="number" class="input" value="10000"></div>
+      <div><div class="label">Кол-во глав</div><input id="pm-num-chapters" type="number" class="input" value="10"></div>
+      <div><div class="label">Слов на главу</div><input id="pm-words-per-chapter" type="number" class="input" value="1000"></div>
+    </div>
+    <div><div class="label">Инструкции</div><textarea id="pm-custom-instructions" rows="3" class="input resize-y w-full"></textarea></div>
+    <div><div class="label">Промпт-шаблон</div><textarea id="pm-prompt-template" rows="12" class="input resize-y w-full"></textarea></div>
+    <div class="flex gap-2">
+      <button onclick="savePresetFromModal()" class="btn btn-primary"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Сохранить</button>
+      <button onclick="closePresetModal()" class="btn btn-ghost">Отмена</button>
+    </div>
+  </div>
+</div>
+
+<!-- ========== BULK EDIT MODAL (per-language channel/host) ========== -->
+<div id="bulk-modal" class="modal-overlay hidden" onclick="if(event.target===this)closeBulkModal()">
+  <div class="modal-content space-y-4">
+    <h2 class="card-title">Настроить по языкам</h2>
+    <div class="grid grid-cols-2 gap-3">
+      <div><div class="label">Канал (для всех)</div><input id="bulk-channel" class="input" placeholder="Название канала"></div>
+      <div><div class="label">Диктор (для всех)</div><input id="bulk-host" class="input" placeholder="Имя диктора"></div>
+    </div>
+    <div class="flex gap-2">
+      <button onclick="applyBulkToAll()" class="btn btn-primary btn-sm">Применить ко всем</button>
+      <button onclick="applyBulkToSelected()" class="btn btn-ghost btn-sm">Только к выбранным</button>
+      <button onclick="closeBulkModal()" class="btn btn-ghost btn-sm">Закрыть</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==================== STATE ====================
+let SESSION_ID = localStorage.getItem('session_id') || '';
+let USER_NAME = localStorage.getItem('user_name') || '';
+let USER_ID   = localStorage.getItem('user_id') || '';
+// ADMIN_USER_ID keep in sync with server.py / api.py (literal, no shared import)
+const ADMIN_USER_ID = '292d249f2de0';
+let allLanguages = [];
+let allModels = [];
+let allPresets = {};
+let uploadedFiles = JSON.parse(localStorage.getItem('uploaded_files') || '[]');
+let selectedJobId = null;
+let selectedJobIds = new Set();  // PATCH-2026-06-20: множественный выбор задач для скачивания
+let queueTimer = null;
+let pingInterval = null;
+let editingPresetName = null;
+let bulkEditPrefix = 'rew';
+let customModels = [];
+let genSettingsPresets = JSON.parse(localStorage.getItem('gen_settings_presets') || '{}');
+let rewPresets = JSON.parse(localStorage.getItem('rew_presets') || '{}');
+let queueFilter = 'all';           // NEW: сегмент-фильтр очереди
+let expandedJobIds = new Set();    // NEW: раскрытые карточки задач
+
+const STATUS_ICONS = {
+  pending: '📋 Ждёт', running: '⏳ Идёт', completed: '✅ Готово',
+  failed: '❌ Ошибка', cancelled: '⏹ Остановлен', partial: '⚠️ Частично'
+};
+
+// ==================== TOASTS ====================
+// NEW: заменяют alert()/confirm() — правый нижний угол, 4с.
+function toast(msg, kind) {
+  const cont = document.getElementById('toast-container');
+  if (!cont) { console.log('[toast]', msg); return; }
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind === 'warn' ? ' warn' : kind === 'err' ? ' err' : '');
+  const dotColor = kind === 'warn' ? 'var(--warn)' : kind === 'err' ? 'var(--err)' : 'var(--ok)';
+  el.innerHTML = `<span class="status-dot" style="background:${dotColor}"></span><span>${escHtml(msg)}</span>`;
+  cont.appendChild(el);
+  setTimeout(() => { el.style.opacity = '0'; el.style.transform = 'translateY(8px)'; el.style.transition = 'all .2s'; setTimeout(() => el.remove(), 220); }, 4000);
+}
+// confirm-заменитель: показывает окно подтверждения. Для критичных необратимых операций
+// используем нативный confirm (безопасность важнее эстетики), но оборачиваем для единообразия.
+function confirmAction(msg) { return window.confirm(msg); }
+
+// ==================== API ====================
+const pendingCreateRequests = new Map();
+const removedJobIds = new Set();
+const pendingLogRequests = new Map();
+
+function canonicalIntent(value) {
+  if (Array.isArray(value)) return '[' + value.map(canonicalIntent).join(',') + ']';
+  if (value && typeof value === 'object') return '{' + Object.keys(value).sort().map(k => JSON.stringify(k) + ':' + canonicalIntent(value[k])).join(',') + '}';
+  return JSON.stringify(value);
+}
+function withIntentLock(name, action) {
+  return navigator.locks ? navigator.locks.request(name, action) : Promise.resolve().then(action);
+}
+function readIntents(storageKey) {
+  const raw = localStorage.getItem(storageKey);
+  if (!raw) return [];
+  const records = JSON.parse(raw);
+  if (!Array.isArray(records) || records.some(r => !r || typeof r.body !== 'string' || typeof r.key !== 'string')) throw new Error('Повреждено хранилище неподтверждённых отправок; отправка остановлена');
+  return records;
+}
+async function requestJson(url, options, headers) {
+  const resp = await fetch(url, { ...options, headers });
+  if (!resp.ok) {
+    const data = await resp.json().catch(() => ({}));
+    const error = new Error(resp.status === 401 ? 'Сессия истекла' : data.error || data.detail || `HTTP ${resp.status}`);
+    error.status = resp.status;
+    if (resp.status === 401) showLoginScreen();
+    throw error;
+  }
+  return resp.json();
+}
+async function durableCreate(url, options, headers, owner, body) {
+  // Keep unresolved requests across reload and login changes. Never evict an
+  // uncertain request: retrying it must use the same key before another POST.
+  const storageKey = 'rewrite.pending-create.v1:' + encodeURIComponent(owner) + ':' + url;
+  const intent = await withIntentLock(storageKey, () => {
+    const records = readIntents(storageKey);
+    const previous = records.find(r => r.body === body);
+    if (previous) return previous;
+    if (records.length >= 100) throw new Error('Слишком много неподтверждённых отправок. Сначала повторите их и проверьте очередь');
+    const bytes = new Uint8Array(16); crypto.getRandomValues(bytes);
+    const next = { body, key: Array.from(bytes, n => n.toString(16).padStart(2, '0')).join('') };
+    records.push(next);
+    try { localStorage.setItem(storageKey, JSON.stringify(records)); }
+    catch (_) { throw new Error('Не удалось сохранить идентификатор отправки. Освободите хранилище браузера и повторите'); }
+    return next;
+  });
+  const result = await requestJson(url, options, { ...headers, 'Idempotency-Key': intent.key });
+  // Only a confirmed successful response retires the intent. 5xx/network/JSON
+  // errors leave it intact, including when the server already created the job.
+  await withIntentLock(storageKey, () => {
+    const records = readIntents(storageKey).filter(r => r.key !== intent.key);
+    if (records.length) localStorage.setItem(storageKey, JSON.stringify(records));
+    else localStorage.removeItem(storageKey);
+  });
+  return result;
+}
+async function apiFetch(url, options = {}) {
+  const headers = { 'Content-Type': 'application/json', 'X-Session-Id': SESSION_ID, ...(options.headers || {}) };
+  if (options.body instanceof FormData) delete headers['Content-Type'];
+  if (String(options.method || 'GET').toUpperCase() === 'POST' && ['/jobs/rewrite', '/jobs/generation'].includes(url)) {
+    const owner = USER_ID;
+    if (!owner) throw new Error('Войдите в аккаунт перед отправкой задачи');
+    const body = canonicalIntent(JSON.parse(options.body || '{}'));
+    const requestKey = owner + '\0' + url + '\0' + body;
+    if (pendingCreateRequests.has(requestKey)) return pendingCreateRequests.get(requestKey);
+    const promise = durableCreate(url, options, headers, owner, body);
+    pendingCreateRequests.set(requestKey, promise);
+    try { return await promise; }
+    finally { if (pendingCreateRequests.get(requestKey) === promise) pendingCreateRequests.delete(requestKey); }
+  }
+  return requestJson(url, options, headers);
+}
+
+// ==================== AUTH ====================
+// FIX-2026-07-02: переключение форм входа (логин/пароль · регистрация · по ключу).
+function showAuthForm(which) {
+  ['setup', 'login'].forEach(w => {
+    const el = document.getElementById('auth-' + w);
+    if (el) el.classList.toggle('hidden', w !== which);
+  });
+  const err = document.getElementById('login-error');
+  if (err) err.classList.add('hidden');
+}
+
+function _applyLoginSuccess(data) {
+  SESSION_ID = data.session_id; USER_NAME = data.user_name;
+  USER_ID = data.user_id || '';
+  localStorage.setItem('session_id', SESSION_ID); localStorage.setItem('user_name', USER_NAME);
+  if (USER_ID) localStorage.setItem('user_id', USER_ID); else localStorage.removeItem('user_id');
+  startPing(); showApp();
+}
+
+async function _authPost(url, payload, btn, btnLabel, errEl) {
+  errEl.classList.add('hidden');
+  btn.disabled = true; btn.textContent = 'Подождите...';
+  try {
+    const resp = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Ошибка');
+    _applyLoginSuccess(data);
+  } catch (e) { errEl.textContent = e.message; errEl.classList.remove('hidden'); }
+  finally { btn.disabled = false; btn.textContent = btnLabel; }
+}
+
+// Вход по логину/паролю.
+async function doLoginPassword() {
+  const username = document.getElementById('lp-username').value.trim();
+  const password = document.getElementById('lp-password').value;
+  const errEl = document.getElementById('login-error');
+  if (!username || !password) { errEl.textContent = 'Введите логин и пароль'; errEl.classList.remove('hidden'); return; }
+  await _authPost('/auth/login-password', { username, password }, document.getElementById('lp-btn'), 'Войти', errEl);
+}
+
+// Первичная настройка: создать первого (админ) пользователя.
+async function doSetup() {
+  const username = document.getElementById('setup-username').value.trim();
+  const password = document.getElementById('setup-password').value;
+  const errEl = document.getElementById('login-error');
+  if (!username || !password) { errEl.textContent = 'Введите логин и пароль'; errEl.classList.remove('hidden'); return; }
+  await _authPost('/auth/setup', { username, password }, document.getElementById('setup-btn'), 'Создать администратора', errEl);
+}
+
+// ---- Управление аккаунтами (только админ) ----
+async function loadAccounts() {
+  const list = document.getElementById('accounts-list');
+  if (!list) return;
+  try {
+    const data = await apiFetch('/auth/accounts');
+    const accs = (data && data.accounts) || [];
+    list.innerHTML = accs.map(a => {
+      const badge = a.is_admin ? '<span class="text-xs text-warn ml-2">админ</span>' : '';
+      const disabled = a.status !== 'active'
+        ? '<span class="text-xs text-faint ml-2">отключён</span>' : '';
+      const delBtn = a.is_admin || a.status !== 'active' ? ''
+        : `<button onclick="deleteAccount('${encodeURIComponent(a.username)}')" class="btn-danger-text ml-2">Отключить</button>`;
+      return `<div class="flex items-center justify-between rounded px-3 py-2" style="background:var(--surface2)">
+        <span class="text-xs font-mono truncate">${escHtml(a.username)}${badge}${disabled}<span class="text-faint ml-2">${escHtml(a.user_name || '')}</span></span>
+        ${delBtn}
+      </div>`;
+    }).join('') || '<p class="text-xs text-faint">Пока только ты.</p>';
+  } catch (e) { /* не админ / ошибка — молча */ }
+}
+
+async function createAccount() {
+  const username = document.getElementById('acc-username').value.trim();
+  const password = document.getElementById('acc-password').value;
+  const user_name = document.getElementById('acc-name').value.trim();
+  const msg = document.getElementById('acc-msg');
+  msg.classList.add('hidden');
+  if (!username || !password) { msg.textContent = 'Введите логин и пароль'; msg.className = 'text-xs text-err'; msg.classList.remove('hidden'); return; }
+  try {
+    await apiFetch('/auth/accounts', { method: 'POST', body: JSON.stringify({ username, password, user_name }) });
+    document.getElementById('acc-username').value = '';
+    document.getElementById('acc-password').value = '';
+    document.getElementById('acc-name').value = '';
+    msg.textContent = 'Аккаунт создан'; msg.className = 'text-xs text-ok'; msg.classList.remove('hidden');
+    loadAccounts();
+  } catch (e) { msg.textContent = e.message; msg.className = 'text-xs text-err'; msg.classList.remove('hidden'); }
+}
+
+async function deleteAccount(usernameEnc) {
+  const username = decodeURIComponent(usernameEnc);
+  if (!confirmAction('Отключить аккаунт «' + username + '»? Сессии и API-ключи будут отозваны, данные останутся.')) return;
+  try {
+    await apiFetch('/auth/accounts/' + encodeURIComponent(username), { method: 'DELETE' });
+    loadAccounts();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function doLogout() {
+  try { await fetch('/auth/logout', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID } }); } catch (e) {}
+  SESSION_ID = ''; USER_NAME = ''; USER_ID = '';
+  localStorage.removeItem('session_id'); localStorage.removeItem('user_name'); localStorage.removeItem('user_id');
+  if (pingInterval) clearInterval(pingInterval);
+  if (queueTimer) clearTimeout(queueTimer);
+  showLoginScreen();
+}
+
+function startPing() {
+  if (pingInterval) clearInterval(pingInterval);
+  pingInterval = setInterval(async () => {
+    try {
+      const r = await apiFetch('/auth/ping', { method: 'POST' });
+      // На случай если USER_ID отсутствует в localStorage (старая сессия до релиза gate) — подхватываем из ping
+      if (r && r.user_id && !USER_ID) {
+        USER_ID = r.user_id;
+        localStorage.setItem('user_id', USER_ID);
+        applyPreserveParagraphsGate();
+      }
+    } catch (e) {}
+  }, 30000);
+}
+
+// NEW: ручное продление сессии (баннер). Любой запрос с валидным X-Session-Id продлевает TTL.
+async function renewSession() {
+  try { await apiFetch('/auth/ping', { method: 'POST' }); toast('Сессия продлена', 'ok'); } catch (e) {}
+  const b = document.getElementById('session-banner'); if (b) b.style.display = 'none';
+}
+
+// UI-честность контролов рерайта в зависимости от модели.
+// Сервер для Claude ИГНОРИРУЕТ chunk_size (хардкод) и preserve_paragraphs (всегда False),
+// а для не-админа форсит preserve — поэтому скрываем то, что не влияет на результат.
+// Fail-safe: если элементов нет — не падаем. USER_ID неизвестен → fail-open (не скрываем preserve).
+function applyRewriteControlVisibility() {
+  const modelEl = document.getElementById('rew-model');
+  const model = modelEl ? (modelEl.value || '') : '';
+  const isClaude = /claude/i.test(model);
+
+  // «Размер чанка» — только для не-Claude моделей.
+  const chunkWrap = document.getElementById('rew-chunk-wrap');
+  if (chunkWrap) chunkWrap.style.display = isClaude ? 'none' : '';
+
+  // «Сохранять абзацы» — только для не-Claude И админа.
+  const wrap = document.getElementById('rew-preserve-paragraphs-wrap');
+  if (wrap) {
+    const isNonAdmin = USER_ID && USER_ID !== ADMIN_USER_ID;
+    if (isClaude || isNonAdmin) {
+      wrap.style.display = 'none';
+      // Принудительно ставим checked=true — на случай если юзер успел снять до релиза.
+      const cb = document.getElementById('rew-preserve-paragraphs');
+      if (cb) cb.checked = true;
+    } else {
+      wrap.style.display = '';
+    }
+  }
+  updateRunSummary();
+}
+// Совместимость: старые call-site'ы зовут applyPreserveParagraphsGate.
+function applyPreserveParagraphsGate() { applyRewriteControlVisibility(); }
+
+// ==================== NAVIGATION ====================
+function showLoginScreen() {
+  document.getElementById('login-screen').classList.remove('hidden');
+  document.getElementById('app').classList.add('hidden');
+  // FIX-2026-07-02: если в системе ещё нет аккаунтов — показать первичную настройку (setup),
+  // иначе обычный вход. /auth/status — публичный.
+  fetch('/auth/status').then(r => r.json())
+    .then(d => showAuthForm(d && d.needs_setup ? 'setup' : 'login'))
+    .catch(() => showAuthForm('login'));
+}
+
+function showApp() {
+  document.getElementById('login-screen').classList.add('hidden');
+  document.getElementById('app').classList.remove('hidden');
+  document.getElementById('user-name-display').textContent = USER_NAME;
+  applyPreserveParagraphsGate();  // Task 3: скрыть preserve_paragraphs для не-админа
+  loadInitialData();
+}
+
+// NEW: сайдбар-навигация. Активный пункт по data-tab; сохранение в localStorage active_tab.
+function switchTab(name, btn) {
+  // PATCH-2026-06-18-tab-modals: закрываем залипающие оверлеи/модалки генерации при смене вкладки
+  try { closePresetEditor(); } catch (e) {}
+  try { closePresetModal(); } catch (e) {}
+  try { closeBulkModal(); } catch (e) {}
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.add('hidden'));
+  document.querySelectorAll('.nav-item').forEach(el => el.classList.remove('active'));
+  const tab = document.getElementById('tab-' + name);
+  if (tab) tab.classList.remove('hidden');
+  // Активируем правильный пункт: либо переданную кнопку, либо по data-tab.
+  let navBtn = btn;
+  if (!navBtn || !navBtn.classList.contains('nav-item')) {
+    navBtn = document.querySelector('.nav-item[data-tab="' + name + '"]');
+  }
+  if (navBtn) navBtn.classList.add('active');
+  localStorage.setItem('active_tab', name);
+  if (name === 'queue') { startQueuePolling(); }
+  else if (queueTimer) { clearTimeout(queueTimer); queueTimer = null; }
+}
+
+// ==================== INIT DATA ====================
+async function loadInitialData() {
+  try {
+    const [langs, models, presets, keysCfg] = await Promise.all([
+      apiFetch('/languages'),
+      apiFetch('/models'),
+      apiFetch('/presets'),
+      apiFetch('/settings/keys').catch(() => null),
+    ]);
+    allLanguages = langs;
+    allModels = models;
+    allPresets = presets;
+    // Round 2: gen lang-table удалён (single-language flow), оставляем только rew.
+    renderLangTable('rew');
+    renderLangChips('rew');   // NEW: чипы языков поверх скрытой таблицы
+    populateModelDropdowns();
+    populatePresetDropdown();
+    if (keysCfg) loadServerSettings(keysCfg);
+  } catch (e) { console.error('Init error:', e); }
+  loadLocalSettings();
+  // Restore tab-specific settings after language tables and models are rendered
+  restoreGenSettings();
+  restoreRewSettings();
+  restoreLangs('rew');
+  syncLangChips('rew');     // NEW: подсветить чипы по восстановленному состоянию таблицы
+  renderUploadedFiles();
+  setupAutoSaveListeners();
+  refreshApiKeysList();
+  updateRunSummary();       // NEW
+  // Restore active tab
+  const savedTab = localStorage.getItem('active_tab') || 'rewrite';
+  switchTab(savedTab, document.querySelector('.nav-item[data-tab="' + savedTab + '"]'));
+  startQueuePolling();
+  startQueuePulse();   // живая очередь: стартует только после входа (иначе первый же запрос — 401)
+}
+
+// Миграции удалённых model ID. GPT-5.4 снова доступен как штатная Codex-модель.
+const MODEL_MIGRATIONS = {};
+
+function isCodexModel(model) {
+  return /^codex:/i.test(String(model || '').trim());
+}
+
+function isAvailableCodexModel(model) {
+  const selected = String(model || '').trim();
+  return isCodexModel(selected) && allModels.some(m => m.value === selected);
+}
+
+// FIX-2026-09-17-server-models: /models отдаёт только то, что аккаунту реально можно
+// запустить (ключ + список сервера). Явно выбранная доступная модель — любой провайдер —
+// сохраняется; на Codex переводим только недоступный/старый выбор.
+function isAvailableModel(model) {
+  const selected = String(model || '').trim();
+  return !!selected && allModels.some(m => m.value === selected);
+}
+
+function getAvailableCodexModel() {
+  // FIX-2026-09-13: модель по умолчанию назначает сервер — /models помечает её
+  // default=true (REWRITE_STUDIO_CODEX_MODEL). Раньше бралась первая Codex-модель
+  // по алфавиту, и 13.09 это была снятая OpenAI gpt-5.4-mini. Без пометки — как раньше.
+  const codex = allModels.filter(m =>
+    m && typeof m.value === 'string' && isCodexModel(m.value)
+  );
+  const found = codex.find(m => m.default === true) || codex[0];
+  return found ? found.value : '';
+}
+
+function migrateTabModelToCodex(storageKey, codexModel) {
+  try {
+    const raw = localStorage.getItem(storageKey);
+    if (!raw) return;
+    const value = JSON.parse(raw);
+    if (!value || typeof value !== 'object') return;
+    if (!isAvailableModel(value.model)) {
+      value.model = codexModel;
+      localStorage.setItem(storageKey, JSON.stringify(value));
+    }
+  } catch (e) {}
+}
+
+function getAutomaticDefaultModel() {
+  // /models уже учитывает credential и allowlist текущего аккаунта: выбираем
+  // только реально доступный server-side Codex ID, не local custom option.
+  const codexModel = getAvailableCodexModel();
+  if (!codexModel) return localStorage.getItem('default_model') || '';
+
+  // Пока Codex доступен, любой старый API/Claude/пустой дефолт переводим на
+  // него при каждой загрузке. Конкретную явно выбранную Codex-модель сохраняем.
+  const savedDefault = localStorage.getItem('default_model');
+  if (!isAvailableModel(savedDefault)) {
+    localStorage.setItem('default_model', codexModel);
+  }
+  migrateTabModelToCodex('gen_tab_settings', codexModel);
+  migrateTabModelToCodex('rew_tab_settings', codexModel);
+  return localStorage.getItem('default_model') || codexModel;
+}
+
+function requireCodexModelForSubmit(selectId) {
+  const sel = document.getElementById(selectId);
+  const selected = String((sel && sel.value) || '').trim();
+  if (isAvailableModel(selected)) return selected;
+
+  // Если Codex доступен — он всегда выигрывает у API/Claude/stale выбора.
+  // Если его у аккаунта нет, не ломаем BYOK: сохраняем доступную выбранную
+  // модель либо берём первую модель, которую вернул сервер.
+  const codexModel = getAvailableCodexModel();
+  const selectedIsAvailable = allModels.some(m => m.value === selected);
+  const effectiveModel = codexModel || (selectedIsAvailable ? selected : (allModels[0]?.value || ''));
+  if (!effectiveModel) {
+    toast('Нет доступных моделей. Проверьте провайдер в Настройках.', 'err');
+    return '';
+  }
+
+  if (effectiveModel === selected) return selected;
+  setModelValue(selectId, effectiveModel);
+  if (selectId === 'gen-model') {
+    autoSaveGenSettings();
+  } else {
+    applyRewriteControlVisibility();
+    autoSaveRewSettings();
+  }
+  return effectiveModel;
+}
+
+// Helper для установки value в <select>. Если model отсутствует в options
+// (preset со старым/удалённым ID) — добавляет ad-hoc option с пометкой (legacy).
+function setModelValue(selectId, model) {
+  const sel = document.getElementById(selectId);
+  if (!sel || !model) return;
+  model = MODEL_MIGRATIONS[model] || model;
+  if (![...sel.options].some(o => o.value === model)) {
+    const opt = new Option(model + ' (legacy)', model);
+    opt.dataset.adhoc = '1';
+    sel.add(opt);
+  }
+  sel.value = model;
+}
+
+function populateModelDropdowns() {
+  // 3 model dropdowns теперь <select>: gen-model, rew-model, set-default-model.
+  // check-model-list (postprocess models) — отдельный datalist, не трогаем здесь.
+  const serverVals = new Set(allModels.map(m => m.value));
+  const localCustom = JSON.parse(localStorage.getItem('custom_models_arr') || '[]')
+    .filter(model => !MODEL_MIGRATIONS[model]);
+  const extraOpts = localCustom
+    .filter(c => !serverVals.has(c))
+    .map(c => ({ value: c, label: c + ' (custom)' }));
+  const allOpts = [...allModels, ...extraOpts];
+  const currentModels = {};
+
+  ['gen-model', 'rew-model', 'set-default-model'].forEach(selectId => {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    const current = sel.value;  // сохранить selection
+    currentModels[selectId] = current;
+    // Удалить все options кроме placeholder (disabled)
+    [...sel.querySelectorAll('option:not([disabled])')].forEach(o => o.remove());
+    allOpts.forEach(m => sel.add(new Option(m.label || m.value, m.value)));
+    if (current) setModelValue(selectId, current);
+  });
+
+  // check-model-list (datalist для postprocess моделей) — оставляем как datalist
+  const checkDl = document.getElementById('check-model-list');
+  if (checkDl) {
+    checkDl.innerHTML = allOpts.map(m => `<option value="${m.value}">${m.label}</option>`).join('');
+  }
+
+  // Codex is the implicit default whenever /models says this account has it.
+  const def = getAutomaticDefaultModel();
+  ['gen-model', 'rew-model', 'set-default-model'].forEach(id => {
+    const el = document.getElementById(id);
+    // После удаления placeholder браузер сам выбирает первый option (сейчас это
+    // Claude). Ориентируемся на value ДО rebuild, а не на авто-выбор браузера.
+    if (el && !currentModels[id] && def) setModelValue(id, def);
+  });
+  updateRunSummary();
+}
+
+function populatePresetDropdown() {
+  // Round 2: dropdown.value = preset.id (canonical), отображается name.
+  // /presets возвращает {<name>: <summary>} where summary имеет id поле.
+  const sel = document.getElementById('gen-preset');
+  if (!sel) return;
+  sel.innerHTML = '<option value="" disabled selected>— выберите пресет —</option>';
+  for (const name of Object.keys(allPresets)) {
+    const p = allPresets[name];
+    const pid = (p && p.id) || name;  // fallback на name если id отсутствует
+    sel.add(new Option(name, pid));
+  }
+  onGenPresetSelected();
+}
+
+function onGenPresetSelected() {
+  // Round 2: показывает meta из new schema (target_length_words + last_used_at).
+  const sel = document.getElementById('gen-preset');
+  const meta = document.getElementById('gen-preset-meta');
+  if (!sel || !meta) return;
+  const pid = sel.value;
+  let p = null;
+  for (const name of Object.keys(allPresets)) {
+    if ((allPresets[name].id || name) === pid) { p = allPresets[name]; break; }
+  }
+  if (!p) { meta.textContent = ''; return; }
+  const parts = [];
+  if (p.target_length_words) parts.push(`${p.target_length_words} слов`);
+  else parts.push('без chunking');
+  if (p.last_used_at) {
+    parts.push('last used ' + new Date(p.last_used_at * 1000).toLocaleString());
+  }
+  meta.textContent = parts.join(' · ');
+}
+
+// ==================== LANGUAGES ====================
+// NB: скрытая таблица #rew-lang-tbody — источник истины для getSelectedLangs/setLangTableValues.
+// Чипы (renderLangChips) — презентация поверх неё: клик по чипу переключает соответствующий checkbox.
+function renderLangTable(prefix) {
+  const tbody = document.getElementById(prefix + '-lang-tbody');
+  const isRew = prefix === 'rew';
+  tbody.innerHTML = '';
+  allLanguages.forEach((lang, i) => {
+    const tr = document.createElement('tr');
+    tr.className = 'lang-row';
+    tr.dataset.display = lang.display.toLowerCase();
+    let html = `
+      <td><input type="checkbox" class="lang-cb" data-idx="${i}"></td>
+      <td class="text-xs">${lang.display}</td>
+      <td><input type="text" class="lang-channel input input-sm w-24" data-idx="${i}"></td>
+      <td><input type="text" class="lang-host input input-sm w-24" data-idx="${i}"></td>`;
+    if (isRew) {
+      html += `<td><input type="text" class="lang-prompt input input-sm w-32" data-idx="${i}" placeholder="свой промпт..."></td>`;
+    }
+    tr.innerHTML = html;
+    tbody.appendChild(tr);
+  });
+}
+
+// NEW: чипы языков (форма рерайта). Отражают состояние скрытой таблицы.
+function renderLangChips(prefix) {
+  const cont = document.getElementById(prefix + '-lang-chips');
+  if (!cont) return;
+  cont.innerHTML = '';
+  allLanguages.forEach((lang, i) => {
+    const chip = document.createElement('div');
+    chip.className = 'lang-select-chip';
+    chip.dataset.idx = i;
+    chip.dataset.display = lang.display.toLowerCase();
+    chip.textContent = lang.display;
+    chip.onclick = () => toggleLangChip(prefix, i);
+    cont.appendChild(chip);
+  });
+  syncLangChips(prefix);
+}
+function toggleLangChip(prefix, idx) {
+  const cb = document.querySelector('#' + prefix + '-lang-tbody .lang-cb[data-idx="' + idx + '"]');
+  if (!cb) return;
+  cb.checked = !cb.checked;
+  cb.dispatchEvent(new Event('change', { bubbles: true }));  // триггерит autoSaveLangs через делегата
+  syncLangChips(prefix);
+  updateRunSummary();
+}
+// Подсветить чипы по состоянию таблицы (после restoreLangs / preset load).
+function syncLangChips(prefix) {
+  const cont = document.getElementById(prefix + '-lang-chips');
+  if (!cont) return;
+  cont.querySelectorAll('.lang-select-chip').forEach(chip => {
+    const cb = document.querySelector('#' + prefix + '-lang-tbody .lang-cb[data-idx="' + chip.dataset.idx + '"]');
+    chip.classList.toggle('selected', !!(cb && cb.checked));
+  });
+  const count = document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb:checked').length;
+  const badge = document.getElementById(prefix + '-lang-count');
+  if (badge) badge.textContent = count;
+  renderLangDetails(prefix);   // per-language поля Канал/Диктор под чипами
+}
+
+// На КАЖДЫЙ выбранный язык — свои поля Канал/Диктор. Пишут в скрытую легаси-таблицу
+// (.lang-channel/.lang-host) → getSelectedLangs их отдаёт per-language. autoSaveLangs(prefix,true)
+// сохраняет БЕЗ перерисовки этого блока (иначе терялся бы фокус ввода).
+function renderLangDetails(prefix) {
+  const cont = document.getElementById(prefix + '-lang-details');
+  if (!cont) return;
+  const checked = document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb:checked');
+  if (!checked.length) {
+    cont.innerHTML = '<p class="text-xs text-faint">Выберите языки — появятся поля «Канал» и «Диктор» для каждого.</p>';
+    return;
+  }
+  cont.innerHTML = '';
+  checked.forEach(cb => {
+    const lang = allLanguages[parseInt(cb.dataset.idx)];
+    const tr = cb.closest('tr');
+    const chSrc = tr.querySelector('.lang-channel'), hoSrc = tr.querySelector('.lang-host');
+    const row = document.createElement('div');
+    row.className = 'flex items-center gap-2';
+    row.innerHTML =
+      '<span class="text-xs text-muted" style="width:120px;flex-shrink:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escHtml(lang.display) + '">' + escHtml(lang.display) + '</span>' +
+      '<input class="input input-sm lang-det-channel" style="flex:1;min-width:0" placeholder="Канал">' +
+      '<input class="input input-sm lang-det-host" style="flex:1;min-width:0" placeholder="Диктор">';
+    const chIn = row.querySelector('.lang-det-channel'), hoIn = row.querySelector('.lang-det-host');
+    chIn.value = chSrc.value; hoIn.value = hoSrc.value;
+    chIn.oninput = () => { chSrc.value = chIn.value; autoSaveLangs(prefix, true); };
+    hoIn.oninput = () => { hoSrc.value = hoIn.value; autoSaveLangs(prefix, true); };
+    cont.appendChild(row);
+  });
+}
+
+// Скопировать канал/диктора ПЕРВОГО выбранного языка во все остальные (для одинаковых каналов).
+function fillLangDetailsAll(prefix) {
+  const checked = document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb:checked');
+  if (checked.length < 2) { toast('Нужно 2+ языка', 'warn'); return; }
+  const first = checked[0].closest('tr');
+  const ch = first.querySelector('.lang-channel').value, ho = first.querySelector('.lang-host').value;
+  checked.forEach(cb => { const tr = cb.closest('tr'); tr.querySelector('.lang-channel').value = ch; tr.querySelector('.lang-host').value = ho; });
+  autoSaveLangs(prefix);  // с перерисовкой — обновит поля
+  toast('Канал/диктор скопированы во все языки', 'ok');
+}
+
+function filterLangs(prefix) {
+  const q = document.getElementById(prefix + '-lang-search').value.toLowerCase();
+  // фильтруем и таблицу (совместимость), и чипы (презентация)
+  document.querySelectorAll('#' + prefix + '-lang-tbody .lang-row').forEach(tr => {
+    tr.style.display = tr.dataset.display.includes(q) ? '' : 'none';
+  });
+  const cont = document.getElementById(prefix + '-lang-chips');
+  if (cont) cont.querySelectorAll('.lang-select-chip').forEach(chip => {
+    chip.style.display = chip.dataset.display.includes(q) ? '' : 'none';
+  });
+}
+
+function selectAllLangs(prefix) { document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb').forEach(cb => { if (cb.closest('tr').style.display !== 'none') cb.checked = true; }); syncLangChips(prefix); updateRunSummary(); }
+function deselectAllLangs(prefix) { document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb').forEach(cb => cb.checked = false); autoSaveLangs(prefix); syncLangChips(prefix); updateRunSummary(); }
+
+function getSelectedLangs(prefix) {
+  const result = [];
+  document.querySelectorAll('#' + prefix + '-lang-tbody .lang-cb:checked').forEach(cb => {
+    const idx = parseInt(cb.dataset.idx);
+    const lang = allLanguages[idx];
+    const tr = cb.closest('tr');
+    const channel = tr.querySelector('.lang-channel').value.trim();
+    const host = tr.querySelector('.lang-host').value.trim();
+    const custom_prompt = tr.querySelector('.lang-prompt') ? tr.querySelector('.lang-prompt').value.trim() : '';
+    result.push({ display: lang.display, code: lang.code, channel, host, custom_prompt });
+  });
+  return result;
+}
+
+function setLangTableValues(prefix, data) {
+  const rows = document.querySelectorAll('#' + prefix + '-lang-tbody .lang-row');
+  rows.forEach(tr => {
+    const cb = tr.querySelector('.lang-cb');
+    const idx = parseInt(cb.dataset.idx);
+    const lang = allLanguages[idx];
+    const info = data.find(d => d.display === lang.display || d.code === lang.code);
+    if (info) {
+      cb.checked = true;
+      if (info.channel) tr.querySelector('.lang-channel').value = info.channel;
+      if (info.host) tr.querySelector('.lang-host').value = info.host;
+      if (info.custom_prompt && tr.querySelector('.lang-prompt')) tr.querySelector('.lang-prompt').value = info.custom_prompt;
+    }
+  });
+  syncLangChips(prefix);
+}
+
+// ==================== BULK EDIT ====================
+function openBulkEdit(prefix) {
+  bulkEditPrefix = prefix;
+  document.getElementById('bulk-channel').value = '';
+  document.getElementById('bulk-host').value = '';
+  document.getElementById('bulk-modal').classList.remove('hidden');
+}
+function closeBulkModal() { document.getElementById('bulk-modal').classList.add('hidden'); }
+
+function applyBulkToAll() {
+  const ch = document.getElementById('bulk-channel').value.trim();
+  const ho = document.getElementById('bulk-host').value.trim();
+  document.querySelectorAll('#' + bulkEditPrefix + '-lang-tbody .lang-row').forEach(tr => {
+    if (ch) tr.querySelector('.lang-channel').value = ch;
+    if (ho) tr.querySelector('.lang-host').value = ho;
+  });
+  closeBulkModal();
+}
+
+function applyBulkToSelected() {
+  const ch = document.getElementById('bulk-channel').value.trim();
+  const ho = document.getElementById('bulk-host').value.trim();
+  document.querySelectorAll('#' + bulkEditPrefix + '-lang-tbody .lang-cb:checked').forEach(cb => {
+    const tr = cb.closest('tr');
+    if (ch) tr.querySelector('.lang-channel').value = ch;
+    if (ho) tr.querySelector('.lang-host').value = ho;
+  });
+  closeBulkModal();
+}
+
+// ==================== PRESET EDITOR (Round 2 v2) ====================
+let editingPresetId = null;  // id текущего открытого в modal для edit
+
+function openPresetEditor(presetId) {
+  // presetId = null → create new; иначе — load existing для edit
+  editingPresetId = presetId;
+  const title = document.getElementById('preset-editor-title');
+  const nameEl = document.getElementById('preset-editor-name');
+  const lenEl = document.getElementById('preset-editor-length');
+  const contentEl = document.getElementById('preset-editor-content');
+  if (presetId) {
+    title.textContent = 'Редактировать пресет';
+    // Найти preset по id в allPresets (ключ — name, поле .id)
+    let found = null;
+    for (const name of Object.keys(allPresets)) {
+      if ((allPresets[name].id || name) === presetId) { found = allPresets[name]; break; }
+    }
+    if (!found) { toast('Пресет не найден', 'err'); return; }
+    // Загрузить полный content через /presets/{id}
+    apiFetch('/presets/' + encodeURIComponent(presetId)).then(full => {
+      nameEl.value = full.name || '';
+      lenEl.value = full.target_length_words || '';
+      contentEl.value = full.content || '';
+    }).catch(e => toast('Ошибка загрузки: ' + (e.message || e), 'err'));
+  } else {
+    title.textContent = 'Создать пресет';
+    nameEl.value = '';
+    lenEl.value = '';
+    contentEl.value = '';
+  }
+  document.getElementById('preset-editor-overlay').classList.remove('hidden');
+  document.getElementById('preset-editor-overlay').style.display = 'flex';
+}
+
+function closePresetEditor() {
+  document.getElementById('preset-editor-overlay').classList.add('hidden');
+  document.getElementById('preset-editor-overlay').style.display = 'none';
+  editingPresetId = null;
+}
+
+function prettyPrintPresetContent() {
+  const ta = document.getElementById('preset-editor-content');
+  try {
+    const obj = JSON.parse(ta.value);
+    ta.value = JSON.stringify(obj, null, 2);
+  } catch {
+    toast('Content не валидный JSON — pretty-print невозможен', 'warn');
+  }
+}
+
+function editCurrentPreset() {
+  const pid = document.getElementById('gen-preset').value;
+  if (!pid) { toast('Выберите пресет', 'warn'); return; }
+  openPresetEditor(pid);
+}
+
+async function deleteCurrentPreset() {
+  const sel = document.getElementById('gen-preset');
+  const pid = sel.value;
+  if (!pid) return;
+  const presetName = sel.options[sel.selectedIndex]?.text || pid;
+  if (!confirmAction(`Удалить пресет "${presetName}" и весь его rotation log?`)) return;
+  try {
+    await apiFetch('/presets/' + encodeURIComponent(pid), { method: 'DELETE' });
+    await reloadPresets();
+  } catch (e) { toast(e.message || e, 'err'); }
+}
+
+async function savePresetFromModal() {
+  const name = document.getElementById('preset-editor-name').value.trim();
+  if (!name) { toast('Введите название', 'warn'); return; }
+  const lenRaw = document.getElementById('preset-editor-length').value.trim();
+  const content = document.getElementById('preset-editor-content').value.trim();
+  if (content.length < 10) { toast('Content слишком короткий (min 10 chars)', 'warn'); return; }
+  const body = {
+    name: name,
+    target_length_words: lenRaw ? parseInt(lenRaw) : null,
+    content: content,
+  };
+  // Для create — id создаётся сервером (slug). Для edit — переиспользуется existing id.
+  const identifier = editingPresetId || encodeURIComponent(name);
+  try {
+    const saved = await apiFetch('/presets/' + identifier, { method: 'POST', body: JSON.stringify(body) });
+    closePresetEditor();
+    await reloadPresets();
+    // Выбрать только что сохранённый
+    document.getElementById('gen-preset').value = saved.id;
+    onGenPresetSelected();
+  } catch (e) { toast(e.message || e, 'err'); }
+}
+
+async function reloadPresets() {
+  try {
+    allPresets = await apiFetch('/presets');
+    populatePresetDropdown();
+  } catch (e) { console.warn('reloadPresets failed:', e); }
+}
+
+function importPresetJson() {
+  const input = document.createElement('input');
+  input.type = 'file';
+  input.accept = '.json,application/json';
+  input.onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const text = await file.text();
+      // Pre-fill modal
+      openPresetEditor(null);
+      // Try parse to determine name + content
+      let parsed = null;
+      try { parsed = JSON.parse(text); } catch {}
+      if (parsed && typeof parsed === 'object') {
+        document.getElementById('preset-editor-name').value =
+          parsed.name || file.name.replace(/\.json$/i, '');
+        document.getElementById('preset-editor-length').value =
+          parsed.target_length_words || parsed.total_words || '';
+        // content: либо явное поле, либо весь JSON как opaque
+        if (typeof parsed.content === 'string' && parsed.content.length > 10) {
+          document.getElementById('preset-editor-content').value = parsed.content;
+        } else {
+          document.getElementById('preset-editor-content').value = JSON.stringify(parsed, null, 2);
+        }
+      } else {
+        document.getElementById('preset-editor-name').value = file.name.replace(/\.json$/i, '');
+        document.getElementById('preset-editor-content').value = text;
+      }
+    } catch (err) {
+      toast('Ошибка чтения файла: ' + err, 'err');
+    }
+  };
+  input.click();
+}
+
+async function exportPresetJson() {
+  const pid = document.getElementById('gen-preset').value;
+  if (!pid) { toast('Выберите пресет', 'warn'); return; }
+  try {
+    const full = await apiFetch('/presets/' + encodeURIComponent(pid));
+    const blob = new Blob([JSON.stringify(full, null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (full.name || full.id) + '.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  } catch (e) { toast(e.message || e, 'err'); }
+}
+
+// ==================== REWRITE PRESETS ====================
+function saveRewPreset() {
+  const current = document.getElementById('rew-preset').value;
+  const name = prompt('Имя пресета рерайта:', current || '');
+  if (!name) return;
+  const langs = getSelectedLangs('rew');
+  rewPresets[name] = {
+    model: document.getElementById('rew-model').value,
+    chunk: document.getElementById('rew-chunk').value,
+    use_sub: false,  // DEPRECATED 2026-05-22: auto-derived server-side from model+oauth
+    safe_text: document.getElementById('rew-safe-text').checked,
+    preserve_paragraphs: document.getElementById('rew-preserve-paragraphs').checked,
+    languages: langs,
+  };
+  localStorage.setItem('rew_presets', JSON.stringify(rewPresets));
+  syncRewPresetsToServer();  // FIX-2026-07-02: персист на сервер
+  refreshRewPresetList();
+  document.getElementById('rew-preset').value = name;
+  updateRunSummary();
+}
+
+function loadRewPreset() {
+  const name = document.getElementById('rew-preset').value;
+  if (!name || !rewPresets[name]) { updateRunSummary(); return; }
+  const p = rewPresets[name];
+  if (p.model) setModelValue('rew-model', p.model);
+  if (p.chunk) document.getElementById('rew-chunk').value = p.chunk;
+  // use_sub deprecated — игнорируем p.use_sub из старых пресетов
+  document.getElementById('rew-safe-text').checked = !!p.safe_text;
+  // По умолчанию включаем (фича добавлена позже — старые пресеты её не имели)
+  document.getElementById('rew-preserve-paragraphs').checked = (p.preserve_paragraphs !== false);
+  if (p.languages) {
+    deselectAllLangs('rew');
+    setLangTableValues('rew', p.languages);
+  }
+  applyRewriteControlVisibility();  // модель сменилась программно — обновить видимость контролов
+  syncLangChips('rew');
+  updateRunSummary();
+}
+
+function deleteRewPreset() {
+  const name = document.getElementById('rew-preset').value;
+  if (!name) return;
+  delete rewPresets[name];
+  localStorage.setItem('rew_presets', JSON.stringify(rewPresets));
+  syncRewPresetsToServer();  // FIX-2026-07-02: персист удаления на сервер
+  refreshRewPresetList();
+}
+
+function refreshRewPresetList() {
+  const sel = document.getElementById('rew-preset');
+  sel.innerHTML = '<option value="">— выберите —</option>';
+  for (const n of Object.keys(rewPresets)) {
+    sel.innerHTML += `<option value="${escHtml(n)}">${escHtml(n)}</option>`;  // FIX-2026-07-02: экран имени (self-XSS)
+  }
+}
+
+// FIX-2026-07-02: пресеты рерайта хранятся на СЕРВЕРЕ (user_keys.rew_presets), не только
+// в localStorage браузера. Вызывается после любой мутации rewPresets.
+function syncRewPresetsToServer() {
+  apiFetch('/settings/presets', {
+    method: 'POST',
+    body: JSON.stringify({ rew_presets: rewPresets })
+  }).catch(e => console.warn('rew_presets sync to server failed:', e));
+}
+
+// ==================== GENERATION ====================
+// Round 2: single-topic flow с inline polling + output section.
+let _genJobPollTimer = null;
+
+// PATCH-2026-06-20-gen-rows: строки тем (клик «добавить»), язык на каждую строку.
+function addGenRow(topic, lang) {
+  const list = document.getElementById('gen-topics-list');
+  if (!list) return null;
+  const row = document.createElement('div');
+  row.className = 'gen-row flex gap-2 items-start';
+  // inline flex/width бьёт кастомный .input{width:100%}, иначе колонки разъезжаются
+  row.innerHTML = `
+    <textarea class="gen-row-topic input resize-y" rows="3" style="flex:1 1 0; min-width:0;" placeholder="Тема / источник… (можно многострочно)"></textarea>
+    <input class="gen-row-lang input" type="text" style="flex:0 0 7rem; width:7rem;" placeholder="(из пресета)" title="Язык этой темы (пусто = из пресета)">
+    <button type="button" onclick="removeGenRow(this)" class="btn btn-ghost btn-sm" style="flex:0 0 auto;" title="Удалить строку"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>`;
+  list.appendChild(row);
+  if (topic != null) row.querySelector('.gen-row-topic').value = topic;
+  if (lang != null) row.querySelector('.gen-row-lang').value = lang;
+  row.querySelector('.gen-row-topic').addEventListener('input', updateGenBatchCount);
+  row.querySelector('.gen-row-lang').addEventListener('input', updateGenBatchCount);
+  updateGenBatchCount();
+  return row;
+}
+function removeGenRow(btn) {
+  const row = btn.closest('.gen-row');
+  if (row) row.remove();
+  if (!document.querySelector('#gen-topics-list .gen-row')) addGenRow();  // всегда ≥1 строка
+  updateGenBatchCount();
+}
+function ensureGenRows() {
+  if (!document.querySelector('#gen-topics-list .gen-row')) addGenRow();
+  updateGenBatchCount();
+}
+function collectGenItems() {
+  return [...document.querySelectorAll('#gen-topics-list .gen-row')].map(r => ({
+    topic: r.querySelector('.gen-row-topic').value.trim(),
+    language: r.querySelector('.gen-row-lang').value.trim(),
+  })).filter(it => it.topic.length >= 10);
+}
+function updateGenBatchCount() {
+  const btn = document.getElementById('gen-submit-btn');
+  if (!btn) return;
+  const n = collectGenItems().length;
+  btn.innerHTML = n > 1 ? `<svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Создать все (${n})` : '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-video"/></svg> Сгенерировать';
+}
+
+async function generateScript() {
+  const presetId = document.getElementById('gen-preset').value;
+  if (!presetId) { toast('Выберите пресет', 'warn'); return; }
+  const items = collectGenItems();
+  if (items.length === 0) { toast('Добавьте хотя бы одну тему (min 10 символов)', 'warn'); return; }
+  const modelOverride = requireCodexModelForSubmit('gen-model');
+  if (!modelOverride) return;
+  const langOverride = document.getElementById('gen-language-override').value.trim();
+  const lenOverride = parseInt(document.getElementById('gen-length-override').value) || null;
+  const chunkOverride = parseInt(document.getElementById('gen-chunk-size-override').value) || null;
+  const maxLog = parseInt(document.getElementById('gen-max-log').value) || 5;
+  const btn = document.getElementById('gen-submit-btn');
+  const status = document.getElementById('gen-status');
+  document.getElementById('gen-output').classList.add('hidden');
+  btn.disabled = true;
+  status.textContent = items.length > 1 ? `Ставлю ${items.length} задач...` : 'Отправляю job...';
+
+  const body = {
+    preset_id: presetId,
+    items: items,
+    max_log_entries: maxLog,
+  };
+  body.model = modelOverride;
+  if (langOverride) body.language = langOverride;   // дефолт для строк без своего языка
+  if (lenOverride) body.target_length_words = lenOverride;
+  if (chunkOverride) body.chunk_size_words = chunkOverride;
+
+  try {
+    const resp = await apiFetch('/jobs/generation', { method: 'POST', body: JSON.stringify(body) });
+    const count = resp.count || (resp.job_ids ? resp.job_ids.length : 1);
+    const nfail = (resp.failed && resp.failed.length) ? resp.failed.length : 0;
+    btn.disabled = false;
+    if (items.length === 1 && resp.job_id) {
+      // одиночная тема — прежний flow: статус + inline-вывод результата ниже
+      status.textContent = `Job ${resp.job_id.slice(0, 12)}… в очереди — можно ставить ещё`;
+      pollGenerationJob(resp.job_id);
+    } else {
+      // batch — счётчик и уводим в очередь, где все задачи уже стопкой
+      status.textContent = `Поставлено задач: ${count}${nfail ? ', не прошло: ' + nfail : ''} — открываю очередь...`;
+      setTimeout(() => switchTab('queue', document.querySelector('.nav-item[data-tab=queue]')), 700);
+    }
+  } catch (e) {
+    btn.disabled = false;
+    status.textContent = '';
+    toast('Ошибка создания: ' + (e.message || e), 'err');
+  }
+}
+
+async function pollGenerationJob(jobId) {
+  if (_genJobPollTimer) { clearTimeout(_genJobPollTimer); _genJobPollTimer = null; }
+  const btn = document.getElementById('gen-submit-btn');
+  const status = document.getElementById('gen-status');
+  let job;
+  try {
+    job = await apiFetch('/jobs/' + encodeURIComponent(jobId));
+  } catch (e) {
+    btn.disabled = false;
+    status.textContent = 'Ошибка опроса job: ' + (e.message || e);
+    return;
+  }
+  const terminal = ['completed', 'partial', 'failed', 'cancelled', 'interrupted'];
+  const pct = job.progress || job.progress_percent || 0;
+  status.textContent = `${job.status} · ${pct}% · ${job.detail || job.progress_detail || ''}`;
+  if (!terminal.includes(job.status)) {
+    _genJobPollTimer = setTimeout(() => pollGenerationJob(jobId), 5000);
+    return;
+  }
+  btn.disabled = false;
+  if (job.status !== 'completed') {
+    status.textContent = `Job ${job.status}: ${job.error || '(no detail)'}`;
+    return;
+  }
+  status.textContent = `Готово (${job.progress_detail || job.detail || ''})`;
+  await loadGenerationOutput(jobId);
+  await reloadPresets();
+}
+
+async function loadGenerationOutput(jobId) {
+  // /jobs/{id}/files возвращает list filenames; meta.json содержит preview+title; .txt — script.
+  let outputFiles = [];
+  try {
+    outputFiles = await apiFetch('/jobs/' + encodeURIComponent(jobId) + '/files');
+  } catch (e) {
+    toast('Не удалось получить список файлов: ' + (e.message || e), 'err');
+    return;
+  }
+  if (!outputFiles || !outputFiles.length) {
+    toast('Нет output files', 'warn');
+    return;
+  }
+  const metaFile = outputFiles.find(f => f.endsWith('.meta.json'));
+  const scriptFile = outputFiles.find(f => f.endsWith('.txt'));
+  // Direct fetch (text). apiFetch возвращает parsed JSON; для .txt используем raw fetch.
+  let preview = '', title = '', logUpdate = [], modelUsed = '', skipPP = false;
+  if (metaFile) {
+    try {
+      const metaResp = await fetch('/jobs/' + encodeURIComponent(jobId) + '/files/' + encodeURIComponent(metaFile), {
+        headers: { 'X-Session-Id': SESSION_ID },
+      });
+      if (metaResp.ok) {
+        const m = await metaResp.json();
+        preview = m.preview || '';
+        title = m.title || '';
+        logUpdate = m.log_update || [];
+        modelUsed = m.model || '';
+        skipPP = !!m.skip_postprocess;
+      }
+    } catch (e) { console.warn('meta load failed', e); }
+  }
+  let scriptText = '';
+  if (scriptFile) {
+    try {
+      const scriptResp = await fetch('/jobs/' + encodeURIComponent(jobId) + '/files/' + encodeURIComponent(scriptFile), {
+        headers: { 'X-Session-Id': SESSION_ID },
+      });
+      if (scriptResp.ok) scriptText = await scriptResp.text();
+    } catch (e) { console.warn('script load failed', e); }
+  }
+  document.getElementById('gen-out-preview').value = preview;
+  document.getElementById('gen-out-title').value = title;
+  document.getElementById('gen-out-script').value = scriptText;
+  document.getElementById('gen-out-log-update').textContent = JSON.stringify(logUpdate, null, 2);
+  document.getElementById('gen-out-meta').textContent =
+    `Модель: ${modelUsed || '?'} · postprocess ${skipPP ? 'skipped' : 'applied'} · ${scriptText.length} chars`;
+  document.getElementById('gen-output').classList.remove('hidden');
+}
+
+function copyGenField(id) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  const txt = el.value || el.textContent || '';
+  navigator.clipboard.writeText(txt).then(
+    () => { const btn = event.target; const old = btn.innerHTML; btn.innerHTML = '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg>'; setTimeout(() => btn.innerHTML = old, 1200); },
+    () => toast('Не удалось скопировать — выдели вручную и Ctrl+C', 'warn')
+  );
+}
+
+function downloadGenScriptTxt() {
+  const script = document.getElementById('gen-out-script').value;
+  const title = document.getElementById('gen-out-title').value || 'script';
+  if (!script) { toast('Пусто', 'warn'); return; }
+  const safe = title.replace(/[^\wа-яА-ЯёЁ\s-]/g, '').replace(/\s+/g, '_').slice(0, 80) || 'script';
+  const blob = new Blob([script], { type: 'text/plain;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = safe + '.txt';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+// ==================== REWRITE ====================
+const dropZone = document.getElementById('drop-zone');
+if (dropZone) {
+  ['dragover', 'dragenter'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.add('drag-over'); }));
+  ['dragleave', 'drop'].forEach(ev => dropZone.addEventListener(ev, e => { e.preventDefault(); dropZone.classList.remove('drag-over'); }));
+  dropZone.addEventListener('drop', e => handleFiles(e.dataTransfer.files));
+}
+
+async function handleFiles(fileList) {
+  for (const file of fileList) {
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      const resp = await fetch('/upload', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID }, body: formData });
+      if (!resp.ok) {
+        // Показываем detail сервера (тип файла, размер, кодировка) — раньше глотался.
+        let d = '';
+        try { d = (await resp.json()).detail || ''; } catch (_) {}
+        throw new Error(d || ('HTTP ' + resp.status));
+      }
+      const data = await resp.json();
+      uploadedFiles.push(data.filename);
+      renderUploadedFiles();
+    } catch (e) { toast('Ошибка загрузки файла: ' + e.message, 'err'); }
+  }
+}
+
+function renderUploadedFiles() {
+  const container = document.getElementById('files-tbody');
+  const panel = document.getElementById('uploaded-files-list');
+  localStorage.setItem('uploaded_files', JSON.stringify(uploadedFiles));
+  if (!uploadedFiles.length) { panel.classList.add('hidden'); updateRunSummary(); return; }
+  panel.classList.remove('hidden');
+  container.innerHTML = uploadedFiles.map((f, i) =>
+    `<div class="file-row">
+      <span class="file-marker"></span>
+      <span class="text-xs truncate flex-1">${escHtml(f)}</span>
+      <button onclick="removeFile(${i})" class="btn-danger-text"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>
+    </div>`
+  ).join('');
+  updateRunSummary();
+}
+
+function removeFile(idx) { uploadedFiles.splice(idx, 1); renderUploadedFiles(); }
+
+// NEW: sticky-рейл сводки запуска.
+function updateRunSummary() {
+  const nFiles = uploadedFiles.length;
+  const nLangs = document.querySelectorAll('#rew-lang-tbody .lang-cb:checked').length;
+  const model = (document.getElementById('rew-model') || {}).value || '—';
+  const preset = (document.getElementById('rew-preset') || {}).value || '—';
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set('sum-files', nFiles);
+  set('sum-langs', nLangs);
+  set('sum-model', model || '—');
+  set('sum-preset', preset || '—');
+  set('sum-results', nFiles * nLangs);
+  const runBtn = document.getElementById('rew-run-btn');
+  if (runBtn) {
+    const ok = nFiles > 0 && nLangs > 0;
+    runBtn.disabled = !ok;
+    runBtn.title = ok ? '' : (nFiles === 0 ? 'Загрузите хотя бы один файл' : 'Выберите хотя бы один язык');
+  }
+}
+
+// NEW: «Повторить последнюю задачу» — восстановить параметры прошлого запуска и запустить.
+function repeatLastRewrite() {
+  const raw = localStorage.getItem('last_run_params');
+  if (!raw) { toast('Нет сохранённой последней задачи', 'warn'); return; }
+  try {
+    const p = JSON.parse(raw);
+    if (p.model) setModelValue('rew-model', p.model);
+    if (p.chunk_size) document.getElementById('rew-chunk').value = p.chunk_size;
+    document.getElementById('rew-safe-text').checked = !!p.safe_text;
+    document.getElementById('rew-preserve-paragraphs').checked = (p.preserve_paragraphs !== false);
+    if (Array.isArray(p.languages)) { deselectAllLangs('rew'); setLangTableValues('rew', p.languages); }
+    if (Array.isArray(p.files)) { uploadedFiles = p.files.slice(); renderUploadedFiles(); }
+    applyRewriteControlVisibility();
+    updateRunSummary();
+    startRewrite();
+  } catch (e) { toast('Не удалось восстановить: ' + e.message, 'err'); }
+}
+
+async function startRewrite() {
+  if (!uploadedFiles.length) { toast('Загрузите файлы', 'warn'); return; }
+  const languages = getSelectedLangs('rew');
+  if (!languages.length) { toast('Выберите языки', 'warn'); return; }
+  const model = requireCodexModelForSubmit('rew-model');
+  if (!model) return;
+  const runParams = {
+    files: uploadedFiles, languages,
+    model,
+    chunk_size: parseInt(document.getElementById('rew-chunk').value) || 8000,
+    use_subscription: false,  // DEPRECATED 2026-05-22: auto-derived server-side
+    safe_text: document.getElementById('rew-safe-text').checked,
+    preserve_paragraphs: document.getElementById('rew-preserve-paragraphs').checked
+  };
+  try {
+    await apiFetch('/jobs/rewrite', { method: 'POST', body: JSON.stringify(runParams) });
+    // NEW: сохранить параметры для «Повторить последнюю» (без ключей — только форма).
+    localStorage.setItem('last_run_params', JSON.stringify({
+      files: uploadedFiles, languages, model: runParams.model,
+      chunk_size: runParams.chunk_size, safe_text: runParams.safe_text,
+      preserve_paragraphs: runParams.preserve_paragraphs
+    }));
+    toast('Задача запущена — настройки формы сохранены', 'ok');
+    switchTab('queue', document.querySelector('.nav-item[data-tab=queue]'));
+  } catch (e) { toast('Ошибка: ' + e.message, 'err'); }
+}
+
+// ==================== QUEUE ====================
+function startQueuePolling() {
+  if (queueTimer) clearTimeout(queueTimer);
+  pollQueue();
+}
+
+async function pollQueue() {
+  try {
+    const jobs = await apiFetch('/jobs');
+    renderJobsTable(jobs);
+    if (selectedJobId) {
+      const id = selectedJobId;
+      if (jobs.some(j => j.id === id)) await loadJobLogInto(id);
+      else forgetRemovedJob(id);
+    }
+    const hasRunning = jobs.some(j => j.status === 'running');
+    queueTimer = setTimeout(pollQueue, hasRunning ? 2000 : 10000);
+  } catch (e) {
+    // PATCH-2026-06-13-pollqueue: при ошибке поллинга НЕ очищаем таблицу
+    // (renderJobsTable не вызван -> остаётся прошлый список) и ретраим быстрее.
+    queueTimer = setTimeout(pollQueue, 3000);
+  }
+}
+
+// ==================== ЖИВАЯ ОЧЕРЕДЬ (полоска) ====================
+// Свой таймер, НЕ приклеен к pollQueue: у того адаптивный интервал 2/10 c и он
+// завязан на список СВОИХ задач, а здесь глобальные числа сервиса.
+// 5 c при видимой вкладке, полный стоп при скрытой, backoff x4 после 3 ошибок, 401 — стоп навсегда.
+const QPULSE_BASE_MS = 5000, QPULSE_MAX_MS = 30000;
+let qpulseTimer = null, qpulseFails = 0, qpulseStopped = true;
+
+function renderQueuePulse(d) {
+  const t = (d && d.totals) || {}, m = (d && d.mine) || {};
+  const waiting = t.waiting || 0, running = t.running || 0;
+  let state = 'idle', main;
+  if (!d || d.degraded) { state = 'off'; main = 'Очередь: нет данных'; }
+  else if (d.paused) { state = 'paused'; main = 'Очередь приостановлена'; }
+  else if (!waiting && !running) { main = 'Очередь пуста — задачи стартуют сразу'; }
+  else {
+    state = running > 0 ? 'run' : 'idle';
+    // people_label считает сервер (точно / бакетами) — рисуем его как есть.
+    // согласование по числу: «1 ждёт», «2 ждут»; нулевую часть не показываем
+    const wd = (k, one, many) => (k % 10 === 1 && k % 100 !== 11) ? one : many;
+    const qp = [];
+    if (waiting) qp.push(`${waiting} ${wd(waiting, 'ждёт', 'ждут')}`);
+    if (running) qp.push(`${running} ${wd(running, 'идёт', 'идут')}`);
+    main = `Очередь: ${qp.join(' · ')} · ${t.people_label || '0'} чел.`;
+  }
+  const mineParts = [];
+  if (m.waiting) mineParts.push(m.waiting + ' в очереди');
+  if (m.running) mineParts.push(m.running + ' идёт');
+  document.querySelectorAll('[data-qstrip]').forEach(el => {
+    el.dataset.state = state;
+    const mainEl = el.querySelector('[data-qs-main]');
+    if (mainEl) mainEl.textContent = main;
+    const mineEl = el.querySelector('[data-qs-mine]');
+    if (mineEl) {
+      mineEl.textContent = mineParts.length ? 'вы: ' + mineParts.join(', ') : '';
+      mineEl.classList.toggle('hidden', mineParts.length === 0);
+    }
+  });
+}
+
+function scheduleQueuePulse() {
+  if (qpulseTimer) { clearTimeout(qpulseTimer); qpulseTimer = null; }
+  if (qpulseStopped || document.hidden) return;  // скрытая вкладка — таймер не живёт вообще
+  qpulseTimer = setTimeout(pollQueuePulse, qpulseFails >= 3 ? Math.min(QPULSE_BASE_MS * 4, QPULSE_MAX_MS) : QPULSE_BASE_MS);
+}
+
+async function pollQueuePulse() {
+  if (qpulseStopped) return;
+  try {
+    renderQueuePulse(await apiFetch('/api/queue/pulse'));
+    qpulseFails = 0;
+  } catch (e) {
+    // 401: apiFetch уже показал экран входа — дальше сервер не дёргаем.
+    if (e && e.message === 'Сессия истекла') { qpulseStopped = true; scheduleQueuePulse(); return; }
+    qpulseFails++;
+    // Числа оставляем прошлые, гасим только индикатор — «нет связи», а не «пусто».
+    if (qpulseFails >= 3) document.querySelectorAll('[data-qstrip]').forEach(el => { el.dataset.state = 'off'; });
+  }
+  scheduleQueuePulse();
+}
+
+function startQueuePulse() {
+  qpulseStopped = false;
+  qpulseFails = 0;
+  pollQueuePulse();
+}
+
+document.addEventListener('visibilitychange', () => {
+  if (qpulseStopped) return;
+  if (document.hidden) scheduleQueuePulse();  // остановит таймер
+  else pollQueuePulse();                      // вернулись — сразу запрос + перезапуск таймера
+});
+
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+}
+
+function fmtTime(ts) {
+  if (!ts) return '—';
+  try { return new Date(ts * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }); } catch (e) { return '—'; }
+}
+
+// NEW: карта ошибок задач (клиент). error.code → человеческий текст + действия.
+// Graceful fallback: если error.code нет — показываем сырой лог (в раскрытой карточке).
+const JOB_ERRORS = {
+  quota_exhausted: (e, id) => ({ warn: true, title: 'Лимит подписки Claude исчерпан',
+    hint: `Сброс в ${fmtTime(e.resets_at)} — задача продолжится автоматически, либо переключитесь на другой токен сейчас.`,
+    actions: [['Сменить токен', `switchTab('settings',document.querySelector('.nav-item[data-tab=settings]'))`], ['Повторить', `retryJobById('${id}')`]] }),
+  no_oauth_token: (e, id) => ({ title: 'Нет валидного OAuth-токена Claude',
+    hint: 'Добавьте токен в Настройках — задача останется в очереди и запустится сама.',
+    actions: [['Добавить токен', `switchTab('settings',document.querySelector('.nav-item[data-tab=settings]'))`]] }),
+  token_invalid: (e, id) => ({ title: 'Токен Claude отклонён',
+    hint: 'Перевыпустите: claude setup-token, затем замените в Настройках.',
+    actions: [['Заменить токен', `switchTab('settings',document.querySelector('.nav-item[data-tab=settings]'))`]] }),
+  file_not_found: (e, id) => ({ title: 'Исходный файл не найден',
+    hint: 'Файл удалён с сервера. Загрузите заново и повторите с нуля.',
+    actions: [['Повторить с нуля', `retryFullJobById('${id}')`]] }),
+  connection: (e, id) => ({ title: 'Обрыв соединения с LLM',
+    hint: '«Повторить незавершённые» дособерёт только упавшие чанки.',
+    actions: [['Повторить незавершённые', `retryJobById('${id}')`]] }),
+  unknown: (e, id) => ({ title: 'Ошибка выполнения',
+    hint: (e && e.message) ? e.message : 'Смотрите лог задачи ниже.',
+    actions: [['Повторить незавершённые', `retryJobById('${id}')`]] }),
+};
+
+function jobStatusPill(j) {
+  const map = {
+    running: ['pill-running', 'Выполняется'], pending: ['pill-pending', 'В очереди'],
+    completed: ['pill-ok', 'Готово'], failed: ['pill-err', 'Ошибка'],
+    cancelled: ['pill-pending', 'Остановлен'], partial: ['pill-partial', 'Частично'],
+  };
+  const [cls, label] = map[j.status] || ['pill-pending', j.status];
+  return `<span class="pill ${cls}">${label}</span>`;
+}
+
+// NEW: чипы языков в карточке задачи. Использует опциональное j.languages:[{code,state,progress}],
+// graceful fallback на j.langs (строка) если структурированных данных нет.
+function jobLangChips(j) {
+  if (Array.isArray(j.languages) && j.languages.length) {
+    return j.languages.map(l => {
+      const code = escHtml((l.code || '').toUpperCase());
+      if (l.state === 'done' || l.state === 'completed') return `<span class="lang-chip ok">${code} <svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg></span>`;
+      if (l.state === 'failed' || l.state === 'error') return `<span class="lang-chip err">${code} <svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></span>`;
+      if (l.state === 'running' || (l.progress > 0 && l.progress < 100)) return `<span class="lang-chip run">${code} ${l.progress || 0}%</span>`;
+      return `<span class="lang-chip">${code}</span>`;
+    }).join('');
+  }
+  if (j.langs) return `<span class="lang-chip">${escHtml(j.langs)}</span>`;
+  return '';
+}
+
+function jobMatchesFilter(j, f) {
+  if (f === 'all') return true;
+  if (f === 'active') return j.status === 'running' || j.status === 'pending';
+  if (f === 'errors') return j.status === 'failed' || j.status === 'partial';
+  if (f === 'done') return j.status === 'completed';
+  return true;
+}
+
+function setQueueFilter(f, btn) {
+  queueFilter = f;
+  document.querySelectorAll('#queue-filters .seg-btn').forEach(b => b.classList.remove('active'));
+  if (btn) btn.classList.add('active');
+  // перерисуем из последнего снимка (диффом), если он есть
+  if (_lastJobsSnapshot) renderJobsTable(_lastJobsSnapshot);
+}
+
+let _lastJobsSnapshot = null;
+
+// РЕНДЕР ОЧЕРЕДИ: карточки задач с DIFF по data-job-id (не innerHTML всего контейнера).
+function renderJobsTable(jobs) {
+  jobs = jobs.filter(j => !removedJobIds.has(j.id));
+  _lastJobsSnapshot = jobs;
+  const cont = document.getElementById('jobs-container');
+  const empty = document.getElementById('jobs-empty');
+  if (!cont) return;
+  // Обновляем сайдбар-бейджи и виджет и счётчики фильтров.
+  updateQueueCounters(jobs);
+  // выкидываем из выбора задачи, которых больше нет (удалённые)
+  const live = new Set(jobs.map(j => j.id));
+  selectedJobIds.forEach(id => { if (!live.has(id)) selectedJobIds.delete(id); });
+  expandedJobIds.forEach(id => { if (!live.has(id)) expandedJobIds.delete(id); });
+  if (selectedJobId && !live.has(selectedJobId)) selectedJobId = null;
+
+  const filtered = jobs.filter(j => jobMatchesFilter(j, queueFilter));
+  if (!jobs.length) { cont.innerHTML = ''; if (empty) empty.classList.remove('hidden'); updateDlSelectedBtn(); return; }
+  if (empty) empty.classList.add('hidden');
+
+  // DIFF: удаляем карточки, которых нет в filtered
+  const wantIds = new Set(filtered.map(j => j.id));
+  [...cont.children].forEach(el => { if (!wantIds.has(el.dataset.jobId)) el.remove(); });
+
+  // upsert карточек в порядке filtered
+  let prev = null;
+  filtered.forEach(j => {
+    let card = cont.querySelector('.job-card[data-job-id="' + j.id + '"]');
+    if (!card) {
+      card = document.createElement('article');
+      card.className = 'job-card';
+      card.dataset.jobId = j.id;
+      // порядок: вставить после prev (или в начало)
+      if (prev && prev.nextSibling) cont.insertBefore(card, prev.nextSibling);
+      else if (prev) cont.appendChild(card);
+      else cont.insertBefore(card, cont.firstChild);
+    }
+    updateJobCard(card, j);
+    prev = card;
+  });
+  updateDlSelectedBtn();
+}
+
+// Точечное обновление одной карточки. FIX-2026-07-08-logflicker:
+// скелет карточки (в т.ч. <pre> лога) строится ОДИН раз; при поллинге патчатся
+// только изменяемые части (статус/бар/%/чипы/ошибка). Раньше card.innerHTML
+// пересобирался каждые 2с → <pre> лога пересоздавался и «схлопывался/грузился заново».
+function updateJobCard(card, j) {
+  const expanded = expandedJobIds.has(j.id);
+  card.classList.toggle('expanded', expanded);
+  card.classList.toggle('errored', j.status === 'failed');
+  card.classList.toggle('limited', j.status === 'partial');
+  const pct = j.progress || 0;
+  const running = j.status === 'running';
+  const barColor = j.status === 'failed' ? 'var(--err)' : j.status === 'partial' ? 'var(--warn)' : j.status === 'completed' ? 'var(--ok)' : 'var(--accent)';
+
+  // error strip (опционально) — мутабельная часть
+  let errStripHtml = '';
+  if ((j.status === 'failed' || j.status === 'partial') && j.error && j.error.code && JOB_ERRORS[j.error.code]) {
+    const spec = JOB_ERRORS[j.error.code](j.error, j.id);
+    const acts = spec.actions.map(([label, code]) =>
+      `<button class="${label.includes('Удал') ? 'btn-err' : 'btn-ghost btn-sm'}" onclick="${code}">${escHtml(label)}</button>`).join('');
+    errStripHtml = `<div class="err-strip ${spec.warn ? 'warn' : ''}"><b>${escHtml(spec.title)}</b><p>${escHtml(spec.hint)}</p><div class="strip-actions">${acts}</div></div>`;
+  }
+  // FIX-2026-09-13-length: задача успешна, но текст короче исходника / цели — жёлтая плашка
+  // (раньше это было видно, только если пересчитать слова руками).
+  if (!errStripHtml && j.warning) {
+    errStripHtml = `<div class="err-strip warn"><b>Текст получился короче ожидаемого</b><p>${escHtml(j.warning).replace(/\n/g, '<br>')}</p></div>`;
+  }
+
+  if (!card.dataset.built) {
+    // --- СКЕЛЕТ: строится один раз ---
+    const typePill = j.type === 'generation' ? 'GEN' : 'REW';
+    const name = escHtml(j.name || j.detail || '(без имени)');
+    const dt = j.created_at ? new Date(j.created_at * 1000).toLocaleString([], { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) : '';
+    const sub = escHtml([j.model, j.langs ? j.langs : (j.nfiles ? j.nfiles + ' файлов' : '')].filter(Boolean).join(' · '));
+    card.innerHTML = `
+    <div class="job-head" onclick="toggleJobExpand('${j.id}')">
+      <input type="checkbox" class="job-cb" data-id="${j.id}" onclick="event.stopPropagation(); toggleJobCheckbox('${j.id}', this.checked)">
+      <span class="font-mono text-xs text-faint">${escHtml(j.id)}</span>
+      <span class="badge-type">${typePill}</span>
+      <span class="font-semibold text-sm truncate" style="max-width:220px" title="${name}">${name}</span>
+      <span class="text-xs text-faint truncate" style="max-width:180px">${sub}</span>
+      <span class="text-xs text-faint">${dt}</span>
+      <span class="flex-1"></span>
+      <span class="js-status-slot">${jobStatusPill(j)}</span>
+      <span class="job-chevron"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-chevron-down"/></svg></span>
+    </div>
+    <div class="px-3 pb-3 flex items-center gap-3">
+      <div class="bar"><div class="bar-fill" style="width:${pct}%;background:${barColor}"></div></div>
+      <span class="js-pct text-xs text-muted" style="min-width:34px;text-align:right">${pct}%</span>
+    </div>
+    <div class="js-chips px-3 pb-3 flex flex-wrap gap-1">${jobLangChips(j)}</div>
+    <div class="js-errslot">${errStripHtml}</div>
+    <div class="job-body">
+      <pre id="job-log-${j.id}" class="job-log" style="margin:0 14px 12px">(нажмите, чтобы загрузить лог)</pre>
+      <div class="px-3 pb-3 flex items-center gap-2 flex-wrap">
+        <button onclick="retryJobById('${j.id}')" class="btn btn-ghost btn-sm" title="Дособрать только упавшие/незавершённые чанки"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> Повторить незавершённые</button>
+        <button onclick="cancelJobById('${j.id}')" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-stop"/></svg> Стоп</button>
+        <button onclick="retryFullJobById('${j.id}')" class="btn btn-ghost btn-sm" title="Полная перегенерация с нуля"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-refresh"/></svg> Повторить с нуля</button>
+        <button onclick="downloadJobZip('${j.id}')" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-download"/></svg> Скачать ZIP</button>
+        <button onclick="downloadJobLog('${j.id}')" class="btn btn-ghost btn-sm"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-save"/></svg> Лог</button>
+        <span class="flex-1"></span>
+        <button onclick="deleteJobById('${j.id}')" class="btn-danger-text">Удалить</button>
+      </div>
+    </div>`;
+    card.dataset.built = '1';
+    if (expanded) loadJobLogInto(j.id);
+  } else {
+    // --- ПАТЧ: только изменяемое, БЕЗ пересоздания <pre> лога ---
+    const statusSlot = card.querySelector('.js-status-slot');
+    if (statusSlot) statusSlot.innerHTML = jobStatusPill(j);
+    const pctEl = card.querySelector('.js-pct');
+    if (pctEl) pctEl.textContent = pct + '%';
+    const chips = card.querySelector('.js-chips');
+    if (chips) chips.innerHTML = jobLangChips(j);
+    const errslot = card.querySelector('.js-errslot');
+    if (errslot && errslot.innerHTML !== errStripHtml) errslot.innerHTML = errStripHtml;
+  }
+
+  // общее для create+patch: бар и чекбокс (не сбивают фокус/лог)
+  const bar = card.querySelector('.bar-fill');
+  if (bar) { bar.style.width = pct + '%'; bar.style.background = barColor; bar.classList.toggle('running', running); }
+  const cb = card.querySelector('.job-cb');
+  if (cb) cb.checked = selectedJobIds.has(j.id);
+}
+
+function updateQueueCounters(jobs) {
+  const nActive = jobs.filter(j => j.status === 'running' || j.status === 'pending').length;
+  const nRunning = jobs.filter(j => j.status === 'running').length;
+  const nErrors = jobs.filter(j => j.status === 'failed' || j.status === 'partial').length;
+  const todayStart = new Date(); todayStart.setHours(0, 0, 0, 0);
+  const nDone = jobs.filter(j => j.status === 'completed').length;
+  const nDoneToday = jobs.filter(j => j.status === 'completed' && j.created_at && j.created_at * 1000 >= todayStart.getTime()).length;
+  // сегмент-счётчики
+  const setCnt = (k, v) => { const el = document.querySelector('#queue-filters [data-cnt="' + k + '"]'); if (el) el.textContent = v; };
+  setCnt('all', jobs.length); setCnt('active', nActive); setCnt('errors', nErrors); setCnt('done', nDone);
+  // сайдбар-бейджи
+  const nb = document.getElementById('nav-queue-badges');
+  if (nb) {
+    let h = '';
+    if (nActive > 0) h += `<span class="nav-badge blue">${nActive}</span>`;
+    if (nErrors > 0) h += `<span class="nav-badge red">${nErrors}</span>`;
+    nb.innerHTML = h;
+  }
+  // виджет «Очередь сейчас»
+  const set = (id, v) => { const el = document.getElementById(id); if (el) el.textContent = v; };
+  set('qw-running', nRunning); set('qw-errors', nErrors); set('qw-done', nDoneToday);
+}
+
+function toggleJobExpand(id) {
+  if (expandedJobIds.has(id)) expandedJobIds.delete(id); else { expandedJobIds.add(id); selectedJobId = id; loadJobLogInto(id); }
+  const card = document.querySelector('.job-card[data-job-id="' + id + '"]');
+  if (card) card.classList.toggle('expanded', expandedJobIds.has(id));
+}
+
+function forgetRemovedJob(id) {
+  removedJobIds.add(id);
+  expandedJobIds.delete(id); selectedJobIds.delete(id);
+  if (selectedJobId === id) selectedJobId = null;
+  const card = document.querySelector('.job-card[data-job-id="' + id + '"]');
+  if (card) card.remove();
+  if (_lastJobsSnapshot) _lastJobsSnapshot = _lastJobsSnapshot.filter(j => j.id !== id);
+  updateDlSelectedBtn();
+}
+async function loadJobLogInto(id) {
+  if (removedJobIds.has(id)) return;
+  if (pendingLogRequests.has(id)) return pendingLogRequests.get(id);
+  const logEl = document.getElementById('job-log-' + id);
+  if (!logEl) return;
+  const pending = (async () => {
+    try {
+      const job = await apiFetch('/jobs/' + encodeURIComponent(id));
+      const atBottom = logEl.scrollHeight - logEl.scrollTop - logEl.clientHeight < 40;
+      logEl.textContent = job.log || '(нет лога)';
+      if (atBottom) logEl.scrollTop = logEl.scrollHeight;
+    } catch (e) {
+      if (e.status === 404 || e.status === 410) forgetRemovedJob(id);
+      else logEl.textContent = '(ошибка загрузки лога)';
+    }
+  })();
+  pendingLogRequests.set(id, pending);
+  try { await pending; } finally { pendingLogRequests.delete(id); }
+}
+
+// ---- per-job actions (id-based; вызываются из карточек) ----
+async function cancelJobById(id) {
+  try { await apiFetch(`/jobs/${id}/cancel`, { method: 'POST' }); toast('Остановка запрошена', 'ok'); } catch (e) { toast(e.message, 'err'); }
+}
+async function retryJobById(id) {
+  try { await apiFetch(`/jobs/${id}/retry`, { method: 'POST' }); toast('Повтор незавершённых запущен', 'ok'); } catch (e) { toast(e.message, 'err'); }
+}
+async function retryFullJobById(id) {
+  if (!confirmAction('Полная перегенерация: уже готовые файлы и прогресс будут удалены. Продолжить?')) return;
+  try {
+    const r = await apiFetch(`/jobs/${id}/retry-full`, { method: 'POST' });
+    if (r && typeof r.cleared_tasks === 'number') console.log('Cleared progress for', r.cleared_tasks, 'tasks');
+    toast('Полный повтор запущен', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function deleteJobById(id) {
+  if (!confirmAction('Удалить задачу?')) return;
+  try { await apiFetch(`/jobs/${id}`, { method: 'DELETE' }); if (selectedJobId === id) selectedJobId = null; expandedJobIds.delete(id); if (_lastJobsSnapshot) renderJobsTable(_lastJobsSnapshot.filter(j => j.id !== id)); } catch (e) { toast(e.message, 'err'); }
+}
+
+// Скачивание БЕЗ ?sid= — через fetch с X-Session-Id → Blob → objectURL.
+async function downloadJobZip(id) {
+  try {
+    const files = await apiFetch(`/jobs/${id}/files`);
+    if (!files.length) { toast('Нет файлов для скачивания', 'warn'); return; }
+    const resp = await fetch(`/jobs/${id}/download-zip`, { headers: { 'X-Session-Id': SESSION_ID } });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `job_${id}.zip`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  } catch (e) { toast('Ошибка скачивания: ' + e.message, 'err'); }
+}
+
+async function downloadJobLog(id) {
+  try {
+    const job = await apiFetch(`/jobs/${id}`);
+    const logText = job.log || '(нет лога)';
+    const blob = new Blob([logText], { type: 'text/plain;charset=utf-8' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = `job_${id}.log`;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+// ---- массовые операции очереди ----
+async function retryAllUnfinished() {
+  if (!_lastJobsSnapshot) return;
+  // Работает ТОЛЬКО по выбранным галочками задачам (selectedJobIds), среди них — незавершённые.
+  if (selectedJobIds.size === 0) { toast('Отметьте задачи галочками', 'warn'); return; }
+  const RETRYABLE = ['failed', 'partial', 'cancelled', 'interrupted'];
+  const targets = _lastJobsSnapshot.filter(j => selectedJobIds.has(j.id) && RETRYABLE.includes(j.status));
+  if (!targets.length) { toast('Среди выбранных нет незавершённых задач', 'warn'); return; }
+  let ok = 0, firstError = '';
+  for (const j of targets) {
+    try { await apiFetch(`/jobs/${j.id}/retry`, { method: 'POST' }); ok++; }
+    catch (e) { if (!firstError) firstError = (e && (e.detail || e.message)) || String(e); }
+  }
+  // Отказ сервера (например, «модель недоступна» 422) не должен превращаться в зелёное «0 задач».
+  if (ok === targets.length) toast(`Повтор запущен для ${ok} задач`, 'ok');
+  else toast(`Повтор запущен для ${ok} из ${targets.length}. ${firstError}`, ok ? 'warn' : 'err');
+}
+
+function downloadAllCompleted() {
+  if (!_lastJobsSnapshot) return;
+  const ids = _lastJobsSnapshot.filter(j => j.status === 'completed').map(j => j.id);
+  if (!ids.length) { toast('Нет готовых задач', 'warn'); return; }
+  downloadJobsZipBulk(ids);
+}
+
+// ===== PATCH-2026-06-20: множественный выбор задач + bulk-скачивание одним ZIP =====
+function toggleJobCheckbox(id, on) {
+  if (on) selectedJobIds.add(id); else selectedJobIds.delete(id);
+  updateDlSelectedBtn();
+}
+function updateDlSelectedBtn() {
+  const btn = document.getElementById('btn-dl-selected');
+  if (btn) btn.innerHTML = `<svg class="ic" viewBox="0 0 24 24"><use href="#ic-package"/></svg> Скачать выбранные (${selectedJobIds.size})`;
+}
+function downloadSelectedJobsZip() {
+  if (selectedJobIds.size === 0) { toast('Отметьте задачи галочками', 'warn'); return; }
+  downloadJobsZipBulk([...selectedJobIds]);
+}
+// Bulk-скачивание БЕЗ ?sid= — fetch с X-Session-Id → Blob → objectURL.
+async function downloadJobsZipBulk(idsArr) {
+  const ids = idsArr.join(',');
+  try {
+    const resp = await fetch(`/jobs/download-zip-bulk?ids=${encodeURIComponent(ids)}`, { headers: { 'X-Session-Id': SESSION_ID } });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    const blob = await resp.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'jobs_bulk.zip';
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    URL.revokeObjectURL(a.href);
+  } catch (e) { toast('Ошибка скачивания: ' + e.message, 'err'); }
+}
+
+// ==================== SETTINGS ====================
+// BYOK-2026-07-30: свой ключ может вписать ЛЮБОЙ пользователь. Значение ключа
+// сервер обратно не отдаёт — в UI живёт только признак «задан» и источник.
+const OWN_CREDENTIAL_FIELDS = {
+  openai: { input: 'set-own-openai-key', status: 'openai-own-status', label: 'Свой ключ OpenAI' },
+  claude: { input: 'set-own-claude-token', status: 'claude-own-status', label: 'Свой токен Claude' },
+  anthropic: { input: 'set-own-anthropic-key', status: 'anthropic-own-status', label: 'Свой Anthropic-ключ' },
+  codex: { input: 'set-own-codex-auth', status: 'codex-own-status', label: 'Своя подписка Codex' },
+};
+
+function renderOwnCredentialStatus(provider, isSet, source) {
+  const meta = OWN_CREDENTIAL_FIELDS[provider];
+  if (!meta) return;
+  const el = document.getElementById(meta.status);
+  if (!el) return;
+  const src = source === 'user' ? 'используется ваш' : (source === 'server' ? 'используется серверный' : 'нет ни своего, ни серверного');
+  el.textContent = isSet ? `${meta.label}: задан (${src})` : `${meta.label}: не задан (${src})`;
+  el.className = (isSet || source === 'server') ? 'text-xs text-ok' : 'text-xs text-warn';
+  const input = document.getElementById(meta.input);
+  if (input) input.value = '';  // значение никогда не подставляется обратно
+}
+
+// Все виды credential рисуются из ОДНОГО ответа /settings/keys — значений там нет,
+// только признаки «задан» и источник (user/server/none).
+function renderAllOwnCredentialStatuses(cfg) {
+  const mode = document.getElementById('set-own-only');
+  if (mode) { mode.checked = cfg.credential_mode === 'own_only'; mode.disabled = !!cfg.credential_mode_forced; }
+
+  renderOwnCredentialStatus('openai', cfg.own_openai_key_set, cfg.openai_key_source);
+  renderOwnCredentialStatus('claude', cfg.own_claude_token_set, cfg.claude_key_source);
+  renderOwnCredentialStatus('anthropic', cfg.own_anthropic_key_set, cfg.anthropic_key_source);
+  renderOwnCredentialStatus('codex', cfg.own_codex_auth_set, cfg.codex_key_source);
+  for (const [provider, meta] of Object.entries(OWN_CREDENTIAL_FIELDS)) {
+    const el = document.getElementById(meta.status);
+    if (el) el.textContent += ' · своих: ' + ((cfg.own_credential_counts || {})[provider] || 0);
+  }
+}
+
+async function saveCredentialMode() {
+  try {
+    await apiFetch('/settings/keys', {method: 'POST', body: JSON.stringify({credential_mode: document.getElementById('set-own-only').checked ? 'own_only' : 'server_fallback'})});
+    renderAllOwnCredentialStatuses(await apiFetch('/settings/keys'));
+    allModels = await apiFetch('/models');
+    populateModelDropdowns();
+    toast('Источник ключей сохранён', 'ok');
+  } catch (e) { toast('Не сохранено: ' + e.message, 'err'); }
+}
+
+function _ownCredentialBody(provider, value) {
+  if (provider === 'claude') return { oauth_tokens: value ? value.split(/[\r\n,]+/).map(v => v.trim()).filter(Boolean) : [] };
+  if (provider === 'anthropic') return { anthropic_api_key: value };
+  if (provider === 'codex') return { codex_auth: value };
+  return { openai_api_key: value };
+}
+
+async function _postOwnCredential(provider, value) {
+  const r = await apiFetch('/settings/keys', { method: 'POST', body: JSON.stringify(_ownCredentialBody(provider, value)) });
+  const cfg = await apiFetch('/settings/keys');
+  renderAllOwnCredentialStatuses(cfg);
+  const newModels = await apiFetch('/models');
+  allModels = newModels;
+  populateModelDropdowns();
+  return r;
+}
+
+async function saveOwnCredential(provider) {
+  const meta = OWN_CREDENTIAL_FIELDS[provider];
+  if (!meta) return;
+  const input = document.getElementById(meta.input);
+  const value = input ? input.value.trim() : '';
+  if (!value) { toast('Введите свой ключ или нажмите «Удалить свой»', 'warn'); return; }
+  try {
+    await _postOwnCredential(provider, value);
+    toast(meta.label + ' сохранён', 'ok');
+  } catch (e) {
+    toast('Не сохранено: ' + (e && e.message ? e.message : e), 'err');
+  }
+}
+
+async function clearOwnCredential(provider) {
+  const meta = OWN_CREDENTIAL_FIELDS[provider];
+  if (!meta) return;
+  if (!confirmAction('Удалить личные ключи этого типа? В режиме «Только мои» новые задачи без личного ключа не запустятся.')) return;
+  try {
+    await _postOwnCredential(provider, '');
+    toast(meta.label + ' удалён', 'ok');
+  } catch (e) {
+    toast('Не удалено: ' + (e && e.message ? e.message : e), 'err');
+  }
+}
+
+function loadServerSettings(cfg) {
+  const isAdmin = !!cfg.is_admin;
+  // Legacy browser copies must not retain provider credentials.
+  localStorage.removeItem('openai_key');
+  localStorage.removeItem('oauth_tokens_arr');
+  const openaiStatus = document.getElementById('openai-server-status');
+  if (openaiStatus) {
+    openaiStatus.textContent = cfg.openai_configured
+      ? 'Серверный ключ настроен'
+      : 'Серверный ключ пока не настроен';
+    openaiStatus.className = cfg.openai_configured ? 'text-xs text-ok' : 'text-xs text-warn';
+  }
+  const claudeStatus = document.getElementById('claude-server-status');
+  if (claudeStatus) {
+    const count = ((cfg.provider_pool_sizes || {}).claude || 0);
+    claudeStatus.textContent = cfg.claude_configured
+      ? `Серверный pool настроен (${count} credential slot${count === 1 ? '' : 's'})`
+      : 'Серверный pool пока не настроен';
+    claudeStatus.className = cfg.claude_configured ? 'text-xs text-ok' : 'text-xs text-warn';
+  }
+  const anthropicStatus = document.getElementById('anthropic-server-status');
+  if (anthropicStatus) {
+    anthropicStatus.textContent = cfg.anthropic_configured
+      ? 'Серверный Anthropic-ключ настроен'
+      : 'Серверного Anthropic-ключа для этого аккаунта нет — используйте свой';
+    anthropicStatus.className = cfg.anthropic_configured ? 'text-xs text-ok' : 'text-xs text-faint';
+  }
+  const codexStatus = document.getElementById('codex-server-status');
+  if (codexStatus) {
+    codexStatus.textContent = cfg.codex_configured
+      ? 'Серверная подписка Codex доступна этому аккаунту'
+      : 'Серверная подписка Codex принадлежит владельцу — используйте свою';
+    codexStatus.className = cfg.codex_configured ? 'text-xs text-ok' : 'text-xs text-faint';
+  }
+  // BYOK-2026-07-30: показываем ТОЛЬКО признак «задан» + какой источник сработает.
+  renderAllOwnCredentialStatuses(cfg);
+  customModels = cfg.custom_models || [];
+  // FIX-2026-07-02: синхронизируем localStorage-кэш custom_models с сервером.
+  localStorage.setItem('custom_models_arr', JSON.stringify(customModels));
+  // FIX-2026-07-02: UI-пресеты настроек теперь СЕРВЕРНЫЕ.
+  let _localRew = {}, _localGen = {};
+  try { _localRew = JSON.parse(localStorage.getItem('rew_presets') || '{}') || {}; } catch (e) {}
+  try { _localGen = JSON.parse(localStorage.getItem('gen_settings_presets') || '{}') || {}; } catch (e) {}
+  if (typeof _localRew !== 'object' || Array.isArray(_localRew)) _localRew = {};
+  if (typeof _localGen !== 'object' || Array.isArray(_localGen)) _localGen = {};
+  const _srvRew = (cfg.rew_presets && typeof cfg.rew_presets === 'object' && !Array.isArray(cfg.rew_presets)) ? cfg.rew_presets : {};
+  const _srvGen = (cfg.gen_settings_presets && typeof cfg.gen_settings_presets === 'object' && !Array.isArray(cfg.gen_settings_presets)) ? cfg.gen_settings_presets : {};
+  rewPresets = { ..._localRew, ..._srvRew };
+  genSettingsPresets = { ..._localGen, ..._srvGen };
+  localStorage.setItem('rew_presets', JSON.stringify(rewPresets));
+  localStorage.setItem('gen_settings_presets', JSON.stringify(genSettingsPresets));
+  if (Object.keys(_localRew).some(k => !(k in _srvRew)) || Object.keys(_localGen).some(k => !(k in _srvGen))) {
+    apiFetch('/settings/presets', { method: 'POST', body: JSON.stringify({ rew_presets: rewPresets, gen_settings_presets: genSettingsPresets }) }).catch(e => console.warn('preset migration to server failed:', e));
+  }
+  if (typeof refreshRewPresetList === 'function') refreshRewPresetList();
+  // Hide admin-only cards для non-admin
+  document.querySelectorAll('[data-admin-only]').forEach(el => {
+    el.style.display = isAdmin ? '' : 'none';
+  });
+  if (isAdmin && typeof loadAccounts === 'function') loadAccounts();  // FIX-2026-07-02: список аккаунтов админу
+  updateSyncBanner('ok');
+}
+
+// NEW: баннер синка настроек.
+function updateSyncBanner(kind, text) {
+  const banner = document.getElementById('settings-sync-banner');
+  const txt = document.getElementById('settings-sync-text');
+  const dot = banner ? banner.querySelector('.status-dot') : null;
+  if (!banner || !txt) return;
+  const now = new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (kind === 'ok') {
+    txt.className = 'text-sm text-ok'; txt.textContent = text || ('Все изменения синхронизированы с сервером · ' + now);
+    if (dot) dot.style.background = 'var(--ok)';
+  } else if (kind === 'warn') {
+    txt.className = 'text-sm text-warn'; txt.textContent = text || 'Есть несохранённые изменения…';
+    if (dot) dot.style.background = 'var(--warn)';
+  } else {
+    txt.className = 'text-sm text-err'; txt.textContent = text || 'Не сохранено';
+    if (dot) dot.style.background = 'var(--err)';
+  }
+}
+
+function loadLocalSettings() {
+  localStorage.removeItem('openai_key');
+  localStorage.removeItem('oauth_tokens_arr');
+  renderCustomModelsList();
+  const tier = localStorage.getItem('gpt_service_tier') || 'default';
+  document.getElementById('set-gpt-tier').value = tier;
+  document.getElementById('set-gpt-cache').checked = localStorage.getItem('gpt_use_cache') !== 'false';
+  document.getElementById('set-check-model').value = localStorage.getItem('postprocess_check_model') || 'gpt-5-mini';
+  document.getElementById('set-debug-mode').checked = localStorage.getItem('debug_mode') === 'true';
+  const m = localStorage.getItem('default_model');
+  if (m) setModelValue('set-default-model', m);
+  refreshRewPresetList();
+}
+
+function renderCustomModelsList() {
+  customModels = JSON.parse(localStorage.getItem('custom_models_arr') || '[]');
+  const el = document.getElementById('custom-models-list');
+  el.innerHTML = customModels.map((m, i) =>
+    `<div class="flex items-center justify-between rounded px-3 py-2" style="background:var(--surface2)">
+      <span class="text-xs font-mono truncate">${escHtml(m)}</span>
+      <button onclick="removeCustomModel(${i})" class="btn-danger-text"><svg class="ic" viewBox="0 0 24 24"><use href="#ic-x"/></svg></button>
+    </div>`
+  ).join('');
+}
+
+function addCustomModel() {
+  const name = document.getElementById('new-custom-model').value.trim();
+  if (!name) return;
+  customModels.push(name);
+  localStorage.setItem('custom_models_arr', JSON.stringify(customModels));
+  document.getElementById('new-custom-model').value = '';
+  renderCustomModelsList();
+  populateModelDropdowns();
+}
+
+function removeCustomModel(idx) {
+  customModels.splice(idx, 1);
+  localStorage.setItem('custom_models_arr', JSON.stringify(customModels));
+  renderCustomModelsList();
+  populateModelDropdowns();
+}
+
+// ============== API v1 keys management (UI-only, session auth) ==============
+
+async function createApiKey() {
+  const nameEl = document.getElementById('new-api-key-name');
+  const name = nameEl.value.trim();
+  if (!name) { toast('Введите имя ключа', 'warn'); return; }
+  try {
+    const data = await apiFetch('/api/keys/create', { method: 'POST', body: JSON.stringify({ name }) });
+    document.getElementById('api-key-new-plain').textContent = data.plain_key;
+    document.getElementById('api-key-new-result').classList.remove('hidden');
+    nameEl.value = '';
+    refreshApiKeysList();
+  } catch (e) {
+    toast('Ошибка создания: ' + (e && e.message ? e.message : e), 'err');
+  }
+}
+
+function copyApiKey() {
+  const txt = document.getElementById('api-key-new-plain').textContent;
+  navigator.clipboard.writeText(txt).then(
+    () => { const btn = event.target; btn.innerHTML = '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> Скопировано'; setTimeout(() => btn.innerHTML = '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-copy"/></svg> Copy', 1500); },
+    () => toast('Не удалось скопировать — выделите и Ctrl+C', 'warn')
+  );
+}
+
+function dismissApiKeyResult() {
+  document.getElementById('api-key-new-result').classList.add('hidden');
+  document.getElementById('api-key-new-plain').textContent = '';
+}
+
+async function refreshApiKeysList() {
+  try {
+    const data = await apiFetch('/api/keys/list');
+    const items = (data && data.items) || [];
+    const box = document.getElementById('api-keys-list');
+    if (!items.length) {
+      box.innerHTML = '<p class="text-xs text-faint">Нет ключей. Создайте первый.</p>';
+      return;
+    }
+    box.innerHTML = items.map(k => {
+      const created = k.created_at ? new Date(k.created_at * 1000).toLocaleString() : '—';
+      const used = k.last_used_at ? new Date(k.last_used_at * 1000).toLocaleString() : 'never';
+      const statusColor = k.status === 'active' ? 'text-ok' : 'text-faint';
+      const revokeBtn = k.status === 'active'
+        ? `<button onclick="revokeApiKey('${k.key_id}')" class="btn-err">Revoke</button>`
+        : '<span class="text-xs text-faint">revoked</span>';
+      return `<div class="flex items-center gap-2 px-3 py-2 rounded" style="background:var(--surface2)">
+        <span class="font-medium flex-1">${escHtml(k.name)}</span>
+        <code class="text-xs px-1 rounded" style="background:var(--bg)">${escHtml(k.prefix)}…</code>
+        <span class="text-xs ${statusColor}">${escHtml(k.status)}</span>
+        <span class="text-xs text-faint" title="created">${created}</span>
+        <span class="text-xs text-faint" title="last used">${used}</span>
+        ${revokeBtn}
+      </div>`;
+    }).join('');
+  } catch (e) {
+    console.warn('refresh api keys failed', e);
+  }
+}
+
+async function revokeApiKey(keyId) {
+  if (!confirmAction('Отозвать ключ? Программы, использующие его, потеряют доступ.')) return;
+  try {
+    await apiFetch(`/api/keys/${keyId}/revoke`, { method: 'POST' });
+    refreshApiKeysList();
+  } catch (e) {
+    toast('Ошибка: ' + (e && e.message ? e.message : e), 'err');
+  }
+}
+
+async function saveAllSettings() {
+  localStorage.removeItem('openai_key');
+  localStorage.removeItem('oauth_tokens_arr');
+  localStorage.setItem('gpt_service_tier', document.getElementById('set-gpt-tier').value);
+  localStorage.setItem('gpt_use_cache', document.getElementById('set-gpt-cache').checked);
+  localStorage.setItem('postprocess_check_model', document.getElementById('set-check-model').value);
+  localStorage.setItem('debug_mode', document.getElementById('set-debug-mode').checked);
+  localStorage.setItem('default_model', document.getElementById('set-default-model').value);
+
+  const defModel = document.getElementById('set-default-model').value;
+  if (defModel) ['gen-model', 'rew-model'].forEach(id => setModelValue(id, defModel));
+  autoSaveGenSettings();
+  autoSaveRewSettings();
+  updateSyncBanner('warn', 'Сохраняю…');
+
+  try {
+    const r = await apiFetch('/settings/keys', {
+      method: 'POST',
+      body: JSON.stringify({
+        gpt_service_tier: document.getElementById('set-gpt-tier').value,
+        gpt_use_cache: document.getElementById('set-gpt-cache').checked,
+        postprocess_check_model: document.getElementById('set-check-model').value,
+        custom_models: customModels,
+        debug_mode: document.getElementById('set-debug-mode').checked,
+      })
+    });
+    const newModels = await apiFetch('/models');
+    allModels = newModels;
+    populateModelDropdowns();
+    const msg = document.getElementById('settings-saved');
+    msg.innerHTML = '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-check"/></svg> Сохранено';
+    msg.classList.remove('hidden', 'text-err');
+    msg.classList.add('text-ok');
+    setTimeout(() => msg.classList.add('hidden'), 2000);
+    toast('Настройки сохранены', 'ok');
+    updateSyncBanner('ok');
+  } catch (e) {
+    console.warn('Failed to sync settings to server:', e);
+    const msg = document.getElementById('settings-saved');
+    msg.innerHTML = '<svg class="ic" viewBox="0 0 24 24"><use href="#ic-alert"/></svg> Сохранено локально, но НЕ синхронизировано с сервером — джобы могут использовать старые ключи';
+    msg.classList.remove('hidden', 'text-ok');
+    msg.classList.add('text-err');
+    toast('Не синхронизировано с сервером', 'err');
+    updateSyncBanner('err', 'Не синхронизировано с сервером');
+  }
+}
+
+function exportSettingsJson() {
+  const data = {
+    version: 1,
+    exported_at: new Date().toISOString(),
+    custom_models_arr: JSON.parse(localStorage.getItem('custom_models_arr') || '[]'),
+    gpt_service_tier: localStorage.getItem('gpt_service_tier') || 'default',
+    gpt_use_cache: localStorage.getItem('gpt_use_cache') !== 'false',
+    postprocess_check_model: localStorage.getItem('postprocess_check_model') || 'gpt-5-mini',
+    debug_mode: localStorage.getItem('debug_mode') === 'true',
+    default_model: localStorage.getItem('default_model') || '',
+    gen_settings_presets: JSON.parse(localStorage.getItem('gen_settings_presets') || '{}'),
+    rew_presets: JSON.parse(localStorage.getItem('rew_presets') || '{}'),
+  };
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'rewrite-studio-settings-' + new Date().toISOString().slice(0, 10) + '.json';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+function importSettingsFromObject(data) {
+  if (!data || typeof data !== 'object') return false;
+  // Provider credentials from legacy exports are intentionally ignored.
+  localStorage.removeItem('openai_key');
+  localStorage.removeItem('oauth_tokens_arr');
+  if (Array.isArray(data.custom_models_arr)) localStorage.setItem('custom_models_arr', JSON.stringify(data.custom_models_arr));
+  if (data.gpt_service_tier !== undefined) localStorage.setItem('gpt_service_tier', String(data.gpt_service_tier));
+  if (data.gpt_use_cache !== undefined) localStorage.setItem('gpt_use_cache', data.gpt_use_cache ? 'true' : 'false');
+  if (data.postprocess_check_model !== undefined) localStorage.setItem('postprocess_check_model', String(data.postprocess_check_model));
+  if (data.debug_mode !== undefined) localStorage.setItem('debug_mode', data.debug_mode ? 'true' : 'false');
+  if (data.default_model !== undefined) localStorage.setItem('default_model', String(data.default_model));
+  if (data.gen_settings_presets && typeof data.gen_settings_presets === 'object') localStorage.setItem('gen_settings_presets', JSON.stringify(data.gen_settings_presets));
+  if (data.rew_presets && typeof data.rew_presets === 'object') localStorage.setItem('rew_presets', JSON.stringify(data.rew_presets));
+  // FIX-2026-07-02: импортированные пресеты — сразу на сервер (не только localStorage).
+  try { rewPresets = JSON.parse(localStorage.getItem('rew_presets') || '{}') || {}; } catch (e) {}
+  try { genSettingsPresets = JSON.parse(localStorage.getItem('gen_settings_presets') || '{}') || {}; } catch (e) {}
+  apiFetch('/settings/presets', { method: 'POST', body: JSON.stringify({ rew_presets: rewPresets, gen_settings_presets: genSettingsPresets }) }).catch(e => console.warn('imported presets sync to server failed:', e));
+  return true;
+}
+
+function handleImportSettingsFile(input) {
+  const el = document.getElementById('import-result');
+  el.classList.add('hidden');
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function () {
+    try {
+      const data = JSON.parse(reader.result);
+      if (importSettingsFromObject(data)) {
+        customModels = JSON.parse(localStorage.getItem('custom_models_arr') || '[]');
+        genSettingsPresets = JSON.parse(localStorage.getItem('gen_settings_presets') || '{}');
+        rewPresets = JSON.parse(localStorage.getItem('rew_presets') || '{}');
+        loadLocalSettings();
+        // Round 2: refreshGenSettingsPresetList removed
+        refreshRewPresetList();
+        populateModelDropdowns();
+        el.textContent = 'Импорт выполнен. Обновите поля на экране.';
+        el.className = 'text-sm text-ok';
+      } else {
+        el.textContent = 'Неверный формат файла.';
+        el.className = 'text-sm text-err';
+      }
+    } catch (e) {
+      el.textContent = 'Ошибка: ' + e.message;
+      el.className = 'text-sm text-err';
+    }
+    el.classList.remove('hidden');
+    input.value = '';
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+/** Импорт пресетов рерайта из файла десктопного приложения (~/.rewrite_presets.json). */
+function handleImportDesktopRewritePresets(input) {
+  const el = document.getElementById('import-result');
+  el.classList.add('hidden');
+  const file = input && input.files && input.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = function () {
+    try {
+      const data = JSON.parse(reader.result);
+      if (!data || typeof data !== 'object' || Array.isArray(data)) {
+        el.textContent = 'Неверный формат: нужен объект пресетов из десктопного приложения.';
+        el.className = 'text-sm text-err';
+        el.classList.remove('hidden');
+        input.value = '';
+        return;
+      }
+      const converted = {};
+      for (const [name, preset] of Object.entries(data)) {
+        if (!preset || !Array.isArray(preset.languages)) continue;
+        const channelSettings = preset.channel_settings || {};
+        const languages = preset.languages.map(display => {
+          const cs = channelSettings[display] || {};
+          const lang = allLanguages.find(l => l.display === display);
+          const code = lang ? lang.code : display.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+          return {
+            display: display,
+            code: code,
+            channel: cs.channel_name || cs.channel || '',
+            host: cs.host_name || cs.host || '',
+            custom_prompt: cs.custom_prompt || ''
+          };
+        });
+        converted[name] = {
+          model: preset.model || '',
+          chunk: preset.chunk_size || 8000,
+          use_sub: !!preset.use_sub,
+          safe_text: !!preset.safe_text,
+          languages: languages
+        };
+      }
+      const count = Object.keys(converted).length;
+      if (count === 0) {
+        el.textContent = 'В файле нет подходящих пресетов (нужны поля languages и channel_settings).';
+        el.className = 'text-sm text-err';
+      } else {
+        const existing = JSON.parse(localStorage.getItem('rew_presets') || '{}');
+        Object.assign(existing, converted);
+        localStorage.setItem('rew_presets', JSON.stringify(existing));
+        rewPresets = existing;
+        syncRewPresetsToServer();  // FIX-2026-07-02: импортированные пресеты — на сервер
+        refreshRewPresetList();
+        el.textContent = 'Импортировано пресетов рерайта: ' + count + '. Выберите их во вкладке «Рерайт».';
+        el.className = 'text-sm text-ok';
+      }
+      el.classList.remove('hidden');
+    } catch (e) {
+      el.textContent = 'Ошибка: ' + e.message;
+      el.className = 'text-sm text-err';
+      el.classList.remove('hidden');
+    }
+    input.value = '';
+  };
+  reader.readAsText(file, 'UTF-8');
+}
+
+// ==================== AUTO-SAVE TAB SETTINGS ====================
+function autoSaveGenSettings() {
+  // Round 2: gen-threads/gen-safe-text/gen-topics удалены. Сохраняем только то что осталось.
+  const data = {
+    model: document.getElementById('gen-model').value,
+    preset: document.getElementById('gen-preset').value,
+    topic: document.getElementById('gen-topic') ? document.getElementById('gen-topic').value : '',
+    language_override: document.getElementById('gen-language-override') ? document.getElementById('gen-language-override').value : '',
+    length_override: document.getElementById('gen-length-override') ? document.getElementById('gen-length-override').value : '',
+    max_log: document.getElementById('gen-max-log') ? document.getElementById('gen-max-log').value : '5',
+    chunk_size_override: document.getElementById('gen-chunk-size-override') ? document.getElementById('gen-chunk-size-override').value : '',
+  };
+  localStorage.setItem('gen_tab_settings', JSON.stringify(data));
+}
+
+function autoSaveRewSettings() {
+  const data = {
+    model: document.getElementById('rew-model').value,
+    chunk: document.getElementById('rew-chunk').value,
+    use_sub: false,  // DEPRECATED 2026-05-22
+    safe_text: document.getElementById('rew-safe-text').checked,
+  };
+  localStorage.setItem('rew_tab_settings', JSON.stringify(data));
+  updateRunSummary();
+}
+
+function restoreGenSettings() {
+  // Round 2: восстанавливаем только новые поля Generation tab.
+  const raw = localStorage.getItem('gen_tab_settings');
+  if (!raw) return;
+  try {
+    const p = JSON.parse(raw);
+    if (p.model) setModelValue('gen-model', p.model);
+    if (p.preset) document.getElementById('gen-preset').value = p.preset;
+    if (p.topic && document.getElementById('gen-topic')) document.getElementById('gen-topic').value = p.topic;
+    if (p.language_override && document.getElementById('gen-language-override'))
+      document.getElementById('gen-language-override').value = p.language_override;
+    if (p.length_override && document.getElementById('gen-length-override'))
+      document.getElementById('gen-length-override').value = p.length_override;
+    if (p.max_log && document.getElementById('gen-max-log'))
+      document.getElementById('gen-max-log').value = p.max_log;
+    if (p.chunk_size_override && document.getElementById('gen-chunk-size-override'))
+      document.getElementById('gen-chunk-size-override').value = p.chunk_size_override;
+    onGenPresetSelected();
+  } catch (e) {}
+}
+
+function restoreRewSettings() {
+  const raw = localStorage.getItem('rew_tab_settings');
+  if (!raw) return;
+  try {
+    const p = JSON.parse(raw);
+    if (p.model) setModelValue('rew-model', p.model);
+    if (p.chunk) document.getElementById('rew-chunk').value = p.chunk;
+    // use_sub deprecated — поле p.use_sub из старых tab_settings игнорируется
+    document.getElementById('rew-safe-text').checked = !!p.safe_text;
+    applyRewriteControlVisibility();  // модель восстановлена программно — обновить видимость
+  } catch (e) {}
+}
+
+function autoSaveLangs(prefix, skipRender) {
+  const data = [];
+  document.querySelectorAll('#' + prefix + '-lang-tbody .lang-row').forEach(tr => {
+    const cb = tr.querySelector('.lang-cb');
+    if (!cb.checked) return;
+    const idx = parseInt(cb.dataset.idx);
+    const lang = allLanguages[idx];
+    const entry = {
+      display: lang.display,
+      code: lang.code,
+      channel: tr.querySelector('.lang-channel').value,
+      host: tr.querySelector('.lang-host').value,
+    };
+    const prompt = tr.querySelector('.lang-prompt');
+    if (prompt) entry.custom_prompt = prompt.value;
+    data.push(entry);
+  });
+  localStorage.setItem(prefix + '_selected_langs', JSON.stringify(data));
+  if (!skipRender) syncLangChips(prefix);  // skipRender=true из per-language ввода — не терять фокус
+  updateRunSummary();
+}
+
+function restoreLangs(prefix) {
+  const raw = localStorage.getItem(prefix + '_selected_langs');
+  if (!raw) return;
+  try {
+    const data = JSON.parse(raw);
+    if (data.length) setLangTableValues(prefix, data);
+  } catch (e) {}
+}
+
+function setupAutoSaveListeners() {
+  // Generation tab (Round 2)
+  ['gen-model', 'gen-topic', 'gen-language-override', 'gen-length-override', 'gen-max-log', 'gen-chunk-size-override'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', autoSaveGenSettings);
+  });
+  // PATCH-2026-06-20-gen-rows: стартовая строка темы + живой счётчик «Создать все (N)»
+  ensureGenRows();
+  const genPreset = document.getElementById('gen-preset');
+  if (genPreset) genPreset.addEventListener('change', autoSaveGenSettings);
+
+  // Rewrite tab
+  ['rew-model', 'rew-chunk'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', autoSaveRewSettings);
+  });
+  // Модель-зависимая честность контролов (chunk / preserve_paragraphs).
+  const rewModel = document.getElementById('rew-model');
+  if (rewModel) rewModel.addEventListener('change', applyRewriteControlVisibility);
+  ['rew-safe-text'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('change', autoSaveRewSettings);
+  });
+
+  // Language tables — delegate to tbody (скрытая таблица — источник истины)
+  ['gen', 'rew'].forEach(prefix => {
+    const tbody = document.getElementById(prefix + '-lang-tbody');
+    if (tbody) {
+      tbody.addEventListener('change', () => autoSaveLangs(prefix));
+      tbody.addEventListener('input', debounce(() => autoSaveLangs(prefix), 500));
+    }
+  });
+
+  // NEW: клавиатурные шорткаты g/r/q/s — переход между разделами.
+  document.addEventListener('keydown', (e) => {
+    if (e.target && /INPUT|TEXTAREA|SELECT/.test(e.target.tagName)) return;
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    const map = { r: 'rewrite', g: 'generation', q: 'queue', s: 'settings' };
+    const t = map[e.key.toLowerCase()];
+    if (t) { switchTab(t, document.querySelector('.nav-item[data-tab="' + t + '"]')); }
+  });
+}
+
+function debounce(fn, ms) {
+  let timer;
+  return function (...args) { clearTimeout(timer); timer = setTimeout(() => fn.apply(this, args), ms); };
+}
+
+// ==================== INIT ====================
+(function init() {
+  if (SESSION_ID) {
+    fetch('/auth/ping', { method: 'POST', headers: { 'X-Session-Id': SESSION_ID } })
+      .then(r => { if (r.ok) { startPing(); showApp(); } else { showLoginScreen(); } })
+      .catch(() => showLoginScreen());
+  } else {
+    showLoginScreen();
+  }
+})();
+</script>
+</body>
+</html>

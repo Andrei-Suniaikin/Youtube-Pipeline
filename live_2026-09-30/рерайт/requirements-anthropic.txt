@@ -1,0 +1,7 @@
+# Direct Anthropic API runtime, verified by real SDK/HTTPX isolated tests.
+# Existing service interpreter is /usr/bin/python3 (Python 3.10), not .venv.
+anthropic==0.76.0
+httpx==0.28.1
+jiter==0.12.0
+sniffio==1.3.1
+docstring-parser==0.17.0
