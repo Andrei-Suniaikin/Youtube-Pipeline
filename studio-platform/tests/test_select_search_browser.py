@@ -150,6 +150,20 @@ SCENARIO = r"""
     out.широкийОбёрнут = !!wbox;
     out.широкийНеСжался = wbox ? wbox.offsetWidth >= 396 : 0;
 
+    // Список заперли снаружи — кнопка обязана погаснуть вместе с ним. Присвоение
+    // `disabled` не шлёт никаких событий, и без наблюдателя кнопка оставалась живой над
+    // запертым списком: человек менял ею выбор, экран показывал одно, а ушло другое.
+    const запираемый = document.getElementById('long');
+    btn('long').click();
+    await sleep(60);
+    запираемый.disabled = true;
+    await sleep(60);
+    out.кнопкаПогаслаСоСписком = btn('long').disabled;
+    out.открытыйСписокЗакрылся = !document.getElementById('sfind-pop');
+    запираемый.disabled = false;
+    await sleep(60);
+    out.кнопкаВернулась = !btn('long').disabled;
+
     // Список, дорисованный ПОСЛЕ отрисовки экрана, тоже получает поиск.
     const late = document.createElement('div');
     late.innerHTML = `<select id="late">${many(12)}</select>`;
@@ -232,6 +246,11 @@ def main() -> int:
           (res.get("подписьПослеПрограммной") or "").startswith("Профиль 7"), True)
     check("и в списке оно помечено выбранным",
           (res.get("выбранноеПомечено") or "").startswith("Профиль 7"), True)
+
+    print("Запертый снаружи список запирает и кнопку")
+    check("кнопка погасла вместе со списком", res.get("кнопкаПогаслаСоСписком"), True)
+    check("и открытый список закрылся", res.get("открытыйСписокЗакрылся"), True)
+    check("отперли — кнопка вернулась", res.get("кнопкаВернулась"), True)
 
     print("Списки, дорисованные позже")
     check("поздний список тоже с поиском", res.get("поздний"), True)
