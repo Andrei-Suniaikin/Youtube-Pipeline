@@ -1230,7 +1230,12 @@ function reasonKey(text){
   if (!s) return '';
   return s.replace(REASON_NOISE, m => {
     if (/^https?:\/\//.test(m)) return '‹ссылка›';
-    if (/^(?:http|код|code|status)/i.test(m)) return 'код' + m.match(/\d{3}/)[0];
+    // Сначала берём число, потом решаем. Раньше здесь стояло `m.match(/\d{3}/)[0]`, и
+    // слово вроде «code42» — его ловит последняя ветка «слово с цифрой», а начинается
+    // оно на «code» — давало match === null и падение всего экрана очереди. Одна
+    // причина странного вида уносила список целиком.
+    const код = m.match(/\d{3}/);
+    if (код && /^(?:http|код|code|status)/i.test(m)) return 'код' + код[0];
     if (/^\d{4}-\d{2}-\d{2}/.test(m) || /^\d{1,2}:\d{2}/.test(m)) return '‹время›';
     if (/[\\/]/.test(m)) return '‹путь›';
     if (/\./.test(m)) return '‹файл›';
@@ -2741,18 +2746,45 @@ async function viewChannels(){
     let list = [];
     try{ list = (await api('/ui/channel-presets')).presets || []; }
     catch(e){ toast(e.message); return; }
-    modal('Назначить пресет канала',
+    // Первым пунктом — пустая заготовка, а НЕ «снять с пресета». Разбор 30.09.2026:
+    // раньше первым и потому выбранным по умолчанию стояло снятие, кнопка называлась
+    // «Назначить», подтверждения не было — и человек, нажавший «Назначить» не глядя,
+    // разом снимал пресет со всех отмеченных каналов. Вернуть это одним действием
+    // нельзя: какой канал на каком пресете сидел, система после снятия не помнит.
+    const m = modal('Назначить пресет канала',
       `<div class="fldrow"><label>Пресет</label>
          <select id="b-preset" style="width:260px">
-           <option value="">— снять с пресета —</option>${list.map(p =>
-             `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+           <option value="">— выберите пресет —</option>${list.map(p =>
+             `<option value="${p.id}">${esc(p.name)}</option>`).join('')}
+           <option value="off">— снять с пресета —</option></select></div>
        <div class="note muted">${каналов}. Пока канал сидит на пресете, перекрытые
          поля приходят из пресета, и правка пресета меняет их у всех сразу.</div>`,
       {ok: 'Назначить', onOk: async (body, close) => {
         const val = body.querySelector('#b-preset').value;
+        if (!val){
+          // Окно закрывать не за что: выбора не было. Кнопку возвращаем в запертое
+          // состояние — общий обработчик окна включает её обратно в любом случае.
+          setTimeout(sync, 0);
+          return;
+        }
+        if (val === 'off'){
+          close();
+          // Снятие спрашиваем отдельно и с числом: это потеря настроек, а не смена.
+          return confirmModal('Снять пресет?',
+            `${каналов} перестанут брать настройки из пресета и останутся со своими. `
+            + `Вернуть одним действием не получится: чей это был пресет, система не помнит.`,
+            () => runBulk('channel_preset', {preset_id: null}));
+        }
         close();
-        await runBulk('channel_preset', {preset_id: val ? Number(val) : null});
+        await runBulk('channel_preset', {preset_id: Number(val)});
       }});
+    // Пока пресет не выбран, «Назначить» заперта: кнопка, которая на пустом выборе
+    // что-то делает, и есть та ловушка, из-за которой затевалась эта правка.
+    const pick = m.el.querySelector('#b-preset');
+    const ok = m.el.querySelector('.m-ok');
+    const sync = () => { if (ok) ok.disabled = !pick.value; };
+    pick.addEventListener('change', sync);
+    sync();
   }
 
   async function runBulk(act, extra){
@@ -2971,7 +3003,18 @@ async function channelReleases(id, d){
   };
 
   if (!d.calendar.length){
-    app.append($(`<div class="card">${emptyBox({
+    // Причину берём из САМОГО расписания, а не из пустого календаря. Разбор 30.09.2026:
+    // раньше здесь стояло только «расписание не задано», и канал с заданным расписанием,
+    // у которого лента пуста по другой причине (горизонт короче ближайшего выхода,
+    // история не показана, все слоты впереди окна), получал прямую неправду — а человек
+    // шёл править то, что и так в порядке.
+    const есть = Object.keys((d.channel || {}).schedule || {}).length > 0;
+    app.append($(`<div class="card">${emptyBox(есть ? {
+      why: 'Выходов в этом окне нет, хотя расписание задано.',
+      means: 'Лента показывает выходы за выбранный отрезок. Ближайший может быть '
+           + 'дальше горизонта канала — тогда он появится, когда подойдёт срок.',
+      href: `#/channel/${encodeURIComponent(id)}/nastroyki`,
+      act: 'Посмотреть расписание и горизонт'} : {
       why: 'Расписание не задано — выходов у канала нет.',
       means: 'Поставить ссылку можно и сейчас, но даты она не получит и из очереди '
            + 'не выйдет: очередь раскладывает ссылки по выходам расписания.',

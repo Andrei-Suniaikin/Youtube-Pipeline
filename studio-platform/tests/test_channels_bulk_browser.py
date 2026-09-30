@@ -264,6 +264,40 @@ SCENARIO = r"""
     out.кнопкаВернулась = document.querySelector('#pickmode').textContent;
     card('Front Wschodni').click();
     out.хешПослеВыхода = location.hash;
+
+    // ── окно «Назначить пресет»: снятие не должно быть выбором по умолчанию ──
+    // Разбор 30.09.2026: первым и потому выбранным пунктом стояло «снять с пресета», а
+    // кнопка называлась «Назначить». Человек, нажавший её не глядя, разом снимал пресет
+    // со всех отмеченных каналов — и вернуть это одним действием нельзя: какой канал на
+    // каком пресете сидел, система после снятия не помнит.
+    // Предыдущая часть ушла в канал обычным кликом — возвращаемся к списку.
+    location.hash = '#/channels';
+    await sleep(350);
+    document.querySelector('#pickmode').click();
+    await sleep(60);
+    document.querySelector('#b-all').click();
+    await sleep(60);
+    [...document.querySelectorAll('.b-act')]
+      .find(b => (b.textContent || '').includes('Назначить пресет')).click();
+    await sleep(220);
+    const окно = document.querySelector('dialog.modal');
+    const список = окно ? окно.querySelector('#b-preset') : null;
+    out.пресетПервыйПункт = список ? список.options[0].textContent : '';
+    out.пресетПустойПоУмолчанию = список ? список.value : 'нет окна';
+    const назначить = окно ? окно.querySelector('.m-ok') : null;
+    out.кнопкаЗапертаБезВыбора = !!(назначить && назначить.disabled);
+    // Выбрали снятие — должно спросить отдельно и с числом.
+    if (список){
+      список.value = 'off';
+      список.dispatchEvent(new Event('change', {bubbles: true}));
+      out.кнопкаОткрылась = !назначить.disabled;
+      назначить.click();
+      await sleep(220);
+    }
+    const спрос = [...document.querySelectorAll('dialog.modal')]
+      .map(d => d.textContent).join(' ');
+    out.снятиеСпросило = спрос;
+    document.querySelectorAll('dialog.modal').forEach(d => d.close && d.close());
   } catch (e) { out.errs.push(String(e && e.message || e)); }
   document.documentElement.setAttribute('data-result', JSON.stringify(out));
 })();
@@ -371,6 +405,18 @@ def main() -> int:
     check("кнопка снова зовёт выбирать", flat(res.get("кнопкаВернулась")), "Выбрать")
     check("клик по карточке снова ведёт в канал",
           res.get("хешПослеВыхода"), "#/channel/3")
+
+    print("Снятие пресета не делается нечаянно")
+    check("первым пунктом — пустая заготовка, а не снятие",
+          "выберите" in (res.get("пресетПервыйПункт") or "").lower(), True)
+    check("и ничего не выбрано по умолчанию", res.get("пресетПустойПоУмолчанию"), "")
+    check("«Назначить» заперта, пока не выбрали",
+          res.get("кнопкаЗапертаБезВыбора"), True)
+    check("после выбора отпирается", res.get("кнопкаОткрылась"), True)
+    снятие = flat(res.get("снятиеСпросило"))
+    check("снятие спрашивает отдельно", "Снять пресет?" in снятие, True)
+    check("и называет число каналов", "3 канала" in снятие or "3 каналов" in снятие, True)
+    check("и предупреждает, что не вернуть", "не получится" in снятие, True)
 
     print()
     if FAILS:
