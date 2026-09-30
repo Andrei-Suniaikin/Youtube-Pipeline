@@ -343,6 +343,16 @@
   /* Необратимое — красным на наведении: «убрать» и «отменить» не переигрываются. */
   .iconbtn.bad:hover{color:var(--bad);border-color:rgba(248,113,113,.45)}
   .iconbtn:disabled{opacity:.45;cursor:default}
+  /* Свёрнутая группа одинаковых причин: сорок строк про один упавший ключ — одна
+     строка с числом (30.09.2026). Подложка отличает заголовок группы от строки
+     задачи, отступ у раскрытых — говорит, что они внутри него, а не рядом. */
+  tr.grp>td{background:var(--card-2)}
+  .grphead{display:flex;gap:10px;align-items:flex-start}
+  .grphead .grpsum{font-size:13.5px}
+  .grphead .why{color:var(--bad)}
+  .iconbtn.fold svg{transition:transform .12s}
+  .iconbtn.fold.open svg{transform:rotate(180deg)}
+  tr.grp-item>td:first-child{padding-left:30px}
   /* Колонка действий одной ширины во всех строках: иначе «в работе» (есть кнопка) и
      «готово» (кнопки нет) двигали бы таблицу друг относительно друга при каждом
      обновлении очереди. */
@@ -1139,6 +1149,112 @@ function fail(e){
     <p class="muted">Обновите страницу. Если не помогло — сервис недоступен.</p>`));
 }
 
+/* ───────────── одинаковые причины — одной строкой (30.09.2026) ─────────────
+
+   Когда падает общий ключ или ложится провайдер, экран показывает сорок строк с одной
+   и той же причиной. Человек их не читает — он их прокручивает, и вместе с ними
+   прокручивает ту единственную, которая про другое. Поэтому одинаковое по СМЫСЛУ
+   сворачивается в одну строку с числом, а раскрытие показывает сами строки.
+
+   Одинаковость считается по смыслу, а не по буквам. В причине стоят номера задач,
+   время, идентификаторы заказов и маски ключей — по буквам сорок одинаковых отказов
+   дали бы сорок групп по одной строке, то есть ровно то, от чего уходили.
+
+   Что НЕ обезличивается — код ответа провайдера (`HTTP 402` против `HTTP 429`): он и
+   есть причина, «кончились деньги» и «превышен лимит» — разные беды с разным
+   действием. Остальные числа в тексте — обстоятельства одной и той же беды.
+
+   Склеивать разное запрещено: лишняя группа стоит дешевле, чем две непохожие беды под
+   одной подписью. Поэтому в ключ группы входит ВЕСЬ текст причины (одинаковое начало
+   при разном конце — это две причины), а вызывающая сторона добавляет к нему то, что
+   группа рисует одно на всех: сервис, состояние, наличие действия. */
+
+// Что в причине — обстоятельство, а не сама причина. Разбор идёт ОДНИМ проходом слева
+// направо: подставленное больше не перечитывается, поэтому «код 402» не превращается
+// потом в «код ‹число›». Порядок веток — это приоритет: ссылка раньше кода ответа
+// (в «http://…» тоже есть слово http), дата раньше слова с цифрой.
+const REASON_NOISE = new RegExp([
+  'https?://\\S+',
+  '(?<![\\p{L}\\p{N}])(?:http|код|code|status)\\s*[:=]?\\s*\\d{3}(?![\\p{L}\\p{N}])',
+  '\\d{4}-\\d{2}-\\d{2}(?:[t ]\\d{2}:\\d{2}(?::\\d{2})?)?',
+  '(?<![\\p{L}\\p{N}])\\d{1,2}:\\d{2}(?::\\d{2})?(?![\\p{L}\\p{N}])',
+  '(?:[a-z]:\\\\|/)[\\p{L}\\p{N}_-]+(?:[\\\\/.][\\p{L}\\p{N}_-]+)+',
+  '[\\p{L}\\p{N}_-]+\\.(?:png|jpe?g|mp3|mp4|wav|json|txt|srt|webm|mov)(?![\\p{L}\\p{N}])',
+  '(?<![\\p{L}\\p{N}_-])[\\p{L}\\p{N}_-]*\\p{N}[\\p{L}\\p{N}_-]*(?![\\p{L}\\p{N}_-])',
+].join('|'), 'giu');
+
+function reasonKey(text){
+  const s = String(text == null ? '' : text).replace(/\s+/g, ' ').trim().toLowerCase();
+  if (!s) return '';
+  return s.replace(REASON_NOISE, m => {
+    if (/^https?:\/\//.test(m)) return '‹ссылка›';
+    if (/^(?:http|код|code|status)/i.test(m)) return 'код' + m.match(/\d{3}/)[0];
+    if (/^\d{4}-\d{2}-\d{2}/.test(m) || /^\d{1,2}:\d{2}/.test(m)) return '‹время›';
+    if (/[\\/]/.test(m)) return '‹путь›';
+    if (/\./.test(m)) return '‹файл›';
+    if (/^\d+$/.test(m)) return '‹число›';
+    return '‹имя›';
+  // Пунктуация и «ё» — тоже случайность записи: одна и та же причина приходит то с
+  // точкой в конце, то в кавычках. Различать по ним значит опять получить группы по одной.
+  }).replace(/ё/g, 'е').replace(/[«»"'`()\[\],.;:!?—–-]+/g, ' ')
+    .replace(/\s+/g, ' ').trim();
+}
+
+/* Разложить строки на группы по смыслу причины, сохраняя порядок первого появления.
+
+   Группа из одной строки — не группа: она рисуется обычной строкой. Иначе экран
+   заставлял бы раскрывать одиночную беду ради одной строки, а одиночная беда — это
+   как раз то, что должно быть видно сразу.
+
+   `whyOf` — где в строке лежит причина, `shapeOf` — что ещё группа рисует одно на всех
+   (сервис, состояние, действие); строки с разной «формой» в одну группу не идут. */
+function groupByReason(rows, whyOf, shapeOf, prefix){
+  const out = [], seen = new Map();
+  (rows || []).forEach(r => {
+    const why = String(whyOf(r) || '').trim();
+    const sense = reasonKey(why);
+    // Без причины — строка сама по себе: молчание не повод считать её такой же, как
+    // другое молчание.
+    const key = sense ? [shapeOf ? shapeOf(r) : '', sense].join('\u0000') : '';
+    const at = key ? seen.get(key) : undefined;
+    if (at !== undefined){ out[at].rows.push(r); return; }
+    if (key) seen.set(key, out.length);
+    out.push({id: (prefix || 'g') + out.length, why, rows: [r]});
+  });
+  return out;
+}
+
+// Заголовок группы: раскрытие, число, причина. Число — не украшение: именно оно
+// отвечает на вопрос «это одна беда или сорок».
+function groupHeadHtml(g, count, tail){
+  const label = 'Показать все — ' + count;
+  return `<div class="grphead">
+    <button class="iconbtn fold" data-fold="${esc(g.id)}" data-count="${esc(count)}"
+            aria-expanded="false" title="${esc(label)}" aria-label="${esc(label)}"
+      >${ICON.expand}</button>
+    <div><span class="grpsum"><b>${esc(count)}</b> · <span class="why"
+      >${esc(g.why)}</span></span>${tail || ''}</div>
+  </div>`;
+}
+
+function wireReasonFolds(root){
+  root.querySelectorAll('button.fold[data-fold]').forEach(b => {
+    b.onclick = ev => {
+      // Строка выпуска сама по себе кликабельна (ведёт в выпуск) — раскрытие группы
+      // не должно заодно уводить с экрана.
+      ev.stopPropagation();
+      const open = b.getAttribute('aria-expanded') !== 'true';
+      b.setAttribute('aria-expanded', open ? 'true' : 'false');
+      b.classList.toggle('open', open);
+      const label = (open ? 'Свернуть — ' : 'Показать все — ') + b.dataset.count;
+      b.title = label;
+      b.setAttribute('aria-label', label);
+      root.querySelectorAll(`tr[data-of="${b.dataset.fold}"]`)
+          .forEach(tr => { tr.hidden = !open; });
+    };
+  });
+}
+
 /* ─────────────────────────── список выпусков ─────────────────────────── */
 
 let FILTERS = {channel:'', phase:'', status:''};
@@ -1193,8 +1309,9 @@ async function viewReleases(){
     `<i class="${b.state}" title="${esc(b.title)} — ${SEG_STATE[b.state] || b.state}"></i>`
     ).join('')}</div>`;
 
-  const rows = data.releases.map(r => `
-    <tr class="row" data-id="${esc(r.release_id)}">
+  const relRowHtml = (r, of) => `
+    <tr class="row${of ? ' grp-item' : ''}" data-id="${esc(r.release_id)}"
+        ${of ? `data-of="${esc(of)}" hidden` : ''}>
       <td>
         <div style="font-weight:600">${esc(r.donor_title || r.donor_url || r.release_id)}</div>
         <div class="muted mono">${esc(r.release_id)}</div>
@@ -1210,13 +1327,32 @@ async function viewReleases(){
       </td>
       <td class="muted">${ago(r.idle_sec)}${r.attempts ? `<div>попыток ${r.attempts}</div>` : ''}
         ${r.blocked_reason ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : ''}</td>
-    </tr>`).join('');
+    </tr>`;
+
+  // Одинаковые причины остановки — одной строкой (см. `groupByReason`). Один упавший
+  // общий ключ останавливает все выпуски сразу, и список превращался в сорок строк с
+  // одной фразой. В ключ группы входит статус: «остановлен» и «ожидает» — разные
+  // судьбы, и склеивать их под одной причиной нельзя.
+  const STATUS_WORD = {blocked:'остановлен', pending:'ожидает', running:'в работе',
+                       done:'готово'};
+  const rows = groupByReason(data.releases, r => r.blocked_reason,
+                             r => r.status || '', 'rg').map(g => {
+    if (g.rows.length < 2) return relRowHtml(g.rows[0], '');
+    const st = g.rows[0].status || '';
+    const count = `${g.rows.length} ${plural(g.rows.length, 'выпуск', 'выпуска',
+                                             'выпусков')}`;
+    return `<tr class="grp"><td colspan="5">${groupHeadHtml(g, count, STATUS_WORD[st]
+      ? ` <span class="pill s-${st === 'blocked' ? 'error' : 'queued'}"
+            >${esc(STATUS_WORD[st])}</span>` : '')}</td></tr>`
+      + g.rows.map(r => relRowHtml(r, g.id)).join('');
+  }).join('');
 
   const table = $(`<div class="card"><table>
     <thead><tr><th>Выпуск</th><th>Канал</th><th>Выход</th><th>Фаза</th><th>Без движения</th></tr></thead>
     <tbody>${rows}</tbody></table></div>`);
   table.querySelectorAll('tr.row').forEach(tr =>
     tr.onclick = () => location.hash = '#/release/' + tr.dataset.id);
+  wireReasonFolds(table);
   app.append(table);
 }
 
@@ -4132,8 +4268,17 @@ async function viewQueue(){
   const card = $(`<div class="card"><table>
     <thead><tr><th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th>
       <th class="acts"></th></tr></thead>
-    <tbody>${d.rows.map(r => `
-      <tr>
+    <tbody>${queueBodyHtml(d.rows)}</tbody></table></div>`);
+  app.append(card);
+  wireActions(card);
+  wireReleaseDrop(card);
+  wireReasonFolds(card);
+  wireGroupRetry(card);
+}
+
+function queueRowHtml(r, of){
+  return `
+      <tr class="${of ? 'grp-item' : ''}" ${of ? `data-of="${esc(of)}" hidden` : ''}>
         <td><span class="pill s-idle">${esc(SVC_TITLE[r.service] || r.service)}</span></td>
         <td>${taskCellHtml(r)}</td>
         <td>${esc(r.kind_title || r.kind || '—')}
@@ -4145,10 +4290,77 @@ async function viewQueue(){
             ${jobLogBtnHtml(r.service, r.id, r.state)}</td>
         <td class="muted when">${when(r.created)}</td>
         <td class="acts">${actions(r)}</td>
-      </tr>`).join('')}</tbody></table></div>`);
-  app.append(card);
-  wireActions(card);
-  wireReleaseDrop(card);
+      </tr>`;
+}
+
+/* Тело очереди: одинаковые причины — одной строкой (см. `groupByReason`).
+
+   В ключ группы, кроме самой причины, входит всё, что заголовок рисует ОДНО на всех:
+   сервис (его плашка), состояние (его плашка) и наличие «повторить» (действие на
+   группу). Склеить под одной плашкой строки с разной судьбой значило бы соврать про
+   половину из них — а лишняя группа не врёт ни про одну.
+
+   Клетку «Создана» группа не занимает вовсе: у сорока строк сорок разных времён, и
+   любое одно число на всех было бы выдумкой. Раскрытие показывает настоящие. */
+function queueBodyHtml(rows){
+  return groupByReason(rows, r => r.error,
+      r => [r.service, r.state, canRetry(r) ? 'retry' : ''].join('|'), 'qg')
+    .map(g => {
+      if (g.rows.length < 2) return queueRowHtml(g.rows[0], '');
+      const r0 = g.rows[0], n = g.rows.length;
+      const count = `${n} ${r0.service === 'release'
+        ? plural(n, 'выпуск', 'выпуска', 'выпусков')
+        : plural(n, 'задача', 'задачи', 'задач')}`;
+      const label = 'Повторить все — ' + count;
+      return `<tr class="grp">
+        <td><span class="pill s-idle">${esc(SVC_TITLE[r0.service] || r0.service)}</span></td>
+        <td colspan="4">${groupHeadHtml(g, count, ` <span class="pill ${
+          STATE_CLS[r0.state]}">${STATE_TITLE[r0.state]}</span>`)}</td>
+        <td class="acts">${canRetry(r0)
+          ? `<button class="iconbtn retry-all" data-grp="${esc(g.id)}"
+               data-count="${esc(count)}" title="${esc(label)}"
+               aria-label="${esc(label)}">${ICON.retry}</button>` : ''}</td>
+      </tr>` + g.rows.map(r => queueRowHtml(r, g.id)).join('');
+    }).join('');
+}
+
+/* Повтор всей группы. Одиночное «повторить» спрашивает молча, а здесь вопрос
+   обязателен, и обязательно С ЧИСЛОМ: внутри задачи есть оплачиваемые вызовы, и сорок
+   повторов — это сорок оплат. Число и есть цена решения, поэтому оно в заголовке
+   вопроса, а не в мелком тексте под ним. */
+function wireGroupRetry(root){
+  root.querySelectorAll('button.retry-all').forEach(b => {
+    b.onclick = () => {
+      const count = b.dataset.count;
+      const jobs = [...root.querySelectorAll(`tr[data-of="${b.dataset.grp}"]`)]
+        .map(tr => tr.querySelector('button.act[data-act="retry"]')).filter(Boolean);
+      confirmModal(`Повторить ${count}?`,
+        `Каждая задача пойдёт заново, и платные вызовы внутри неё будут оплачены ещё `
+        + `раз — всего ${count}. Уже потраченное не вернётся. Причина у всех одна: если `
+        + `она не устранена, повтор упрётся в неё снова и деньги уйдут впустую.`,
+        async () => {
+        b.disabled = true;
+        // По одной, а не залпом: залп из сорока запросов сосед обрывает на середине, и
+        // тогда неизвестно, какие задачи ушли в работу, — то есть неизвестно, за что
+        // уже заплачено.
+        let ok = 0, refused = '';
+        for (const el of jobs){
+          const {service, id} = el.dataset;
+          try{
+            await post(`/ui/actions/${encodeURIComponent(service)}/${
+              encodeURIComponent(id)}/retry`);
+            ok++;
+          }catch(e){ refused = refused || e.message; }
+        }
+        // Сколько ушло и сколько нет — словами. Молчаливая перерисовка на вопрос «за
+        // что я заплатил» не отвечает.
+        toast(refused
+          ? `Отправлено на повтор ${ok} из ${jobs.length}; остальные отказали: ${refused}`
+          : `Отправлено на повтор: ${ok}`, refused ? 'bad' : 'ok');
+        await render();
+      });
+    };
+  });
 }
 
 /* Кнопка показывается только там, где действие имеет смысл: отменить можно то, что
@@ -4171,9 +4383,15 @@ function actions(r){
   }
   if (r.state === 'running' || r.state === 'queued')
     return btn('cancel', 'cancel', 'Отменить', true);
-  if (r.state === 'error' || r.status === 'cancelled')
-    return btn('retry', 'retry', 'Повторить');
+  if (canRetry(r)) return btn('retry', 'retry', 'Повторить');
   return '';
+}
+
+// Одно правило на двоих: кнопка в строке и кнопка «повторить всю группу». Посчитанное
+// второй раз, оно разойдётся — и группа предложит повтор там, где строки его не дают.
+// Выпуск сюда не попадает: его ведёт движок, повторять у него нечего.
+function canRetry(r){
+  return r.service !== 'release' && (r.state === 'error' || r.status === 'cancelled');
 }
 
 function wireActions(root){
