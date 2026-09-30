@@ -646,6 +646,19 @@ def parse_tags(raw: str) -> list:
 
 # ─────────────────────── очередь ссылок ───────────────────────
 
+# Статусы, при которых строка плана ЖИВАЯ: ролик считается взятым, а его выход —
+# занятым. Снятое (`cancelled`) и упавшее (`error`) сюда не входят: снятую ссылку
+# человек убрал сам, и не пустить её обратно значило бы запереть канал на ролике,
+# от которого он отказался.
+#
+# Константа, а не литерал в каждом запросе: этот же набор спрашивает раскладка пачки
+# (`link_spread.known_donors`), чтобы пометить дубль ДО постановки. Разойдись они —
+# экран сказал бы «дубль» там, где `add_links` ссылку поставит, или промолчал бы там,
+# где она будет пропущена.
+LIVE_STATUSES = ("planned", "frozen", "running", "done")
+_LIVE_SQL = ",".join(f"'{s}'" for s in LIVE_STATUSES)
+
+
 def parse_links(raw: str) -> list:
     """Текст из поля → список ссылок. По одной в строке либо просто вперемешку."""
     out, seen = [], set()
@@ -699,7 +712,7 @@ def add_links(c, tenant_id: str, channel, urls: list, now: float, slot=None,
         dup = c.execute(
             "SELECT id FROM pub_plan_items WHERE channel_id=? "
             "AND (donor_url=? OR (?!='' AND donor_video_id=?)) "
-            "AND status IN ('planned','frozen','running','done')",
+            f"AND status IN ({_LIVE_SQL})",
             (channel["id"], url, vid, vid)).fetchone()
         if dup:
             skipped.append(url)
@@ -875,7 +888,7 @@ def move_item(c, item_id: int, target_slot: float, now: float) -> None:
         raise ValueError("ролик уже взят в работу — переставить нельзя")
     other = c.execute(
         "SELECT * FROM pub_plan_items WHERE channel_id=? AND slot_at=? AND id!=? "
-        "AND status IN ('planned','frozen','running','done')",
+        f"AND status IN ({_LIVE_SQL})",
         (row["channel_id"], target_slot, item_id)).fetchone()
     if other and other["frozen"]:
         raise ValueError("в том выходе ролик уже готовится — менять местами нельзя")

@@ -2475,10 +2475,15 @@ async function viewChannels(){
   const bar = $(`<div class="head"><div><h1>Каналы ${hintDot(
     'Расписание выходов, план и история. Цвет карточки — состояние канала.')}</h1></div>
     <div class="head-acts">
+      <button class="ghost small" id="spread">Разложить ссылки</button>
       <button class="ghost small" id="impch">Перенести списком</button>
       <button class="ghost small" id="pickmode">Выбрать</button>
       <button class="small" id="newch">Новый канал</button></div></div>`);
   app.append(bar);
+
+  // Ссылки приходят общим списком, а каналов полтораста: раскладывать их по одному
+  // каналу — полтораста заходов в карточки (владелец 30.09.2026).
+  bar.querySelector('#spread').onclick = () => { location.hash = '#/spread'; };
 
   bar.querySelector('#impch').onclick = () => {
     if (document.getElementById('imp-form')) return;
@@ -11449,6 +11454,255 @@ async function viewDigest(){
 /* Каждая строка: какая вкладка подсвечивается, как узнать свой адрес, что рисовать.
    Раньше это была цепочка if с четырьмя булевыми переменными — при пятой вкладке
    она начала врать о подсветке. */
+
+/* ────────── раскладка ссылок по каналам (владелец 30.09.2026) ──────────
+
+   «Сделать чекбокс, что завести много на много каналов — и тогда открывается попап,
+   где делаешь контрол-в, и он создаёт кучу карточек со вставленными ссылками и
+   названиями видео в скобочках в заголовке карточки; и тогда просто справа в
+   дропдауне по названию канал выбираешь, опять же с фильтром по названию».
+
+   Раньше ссылки ставились по одному каналу — заходом в карточку. На ста пятидесяти
+   каналах и общем списке ссылок это полтораста заходов.
+
+   Главное правило экрана: КАНАЛ НЕ ПОДСТАВЛЯЕТСЯ САМ. Подсказка живёт отдельной
+   строкой и переносится в выбор только нажатием — ролик, ушедший на чужой канал, уже
+   у YouTube, и вернуть его нельзя. Поэтому же «Поставить» берёт ровно то, что стоит в
+   списках справа, и ничего больше.
+
+   Поиск по длинному списку каналов писать здесь не нужно: `wireSearchableSelects`
+   выдаёт его любому списку длиннее пяти пунктов сам, и второй поиск разошёлся бы с
+   общим поведением студии на первой же правке. */
+
+const SPREAD_HINT_NONE = 'подсказки нет';
+
+function spreadTitle(row){
+  // Ссылка и название ролика в скобках — так владелец и описал заголовок карточки.
+  // Пустого названия здесь не бывает: «названия не добыли» сказано словами, потому что
+  // по заголовку человек решает, тот ли это ролик.
+  const name = row.title || row.title_note || 'название не добыли';
+  return `${esc(row.url)} <span class="muted">(${esc(name)})</span>`;
+}
+
+function spreadOptions(channels, chosen){
+  const head = `<option value="">— канал не выбран —</option>`;
+  return head + channels.map(ch => `<option value="${ch.id}"
+    ${String(ch.id) === String(chosen || '') ? 'selected' : ''}>${esc(ch.name)}${
+      ch.lang ? ' · ' + esc(ch.lang.toUpperCase()) : ''}${
+      ch.status === 'paused' ? ' · на паузе' : ''}</option>`).join('');
+}
+
+function spreadDup(row){
+  const d = row.duplicate;
+  if (!d) return '';
+  return `<div class="note muted sp-dup">Этот ролик уже стоит у канала
+    «${esc(d.channel)}». Сам собой он никуда не встанет — но если донор нарочно идёт
+    на второй язык, выберите канал вручную.</div>`;
+}
+
+function spreadHintLine(row, channels){
+  const h = row.hint || {};
+  const ch = channels.find(c => c.id === h.channel_id);
+  if (!ch) return `<div class="note muted sp-hint" data-hint="">${SPREAD_HINT_NONE}:
+    ${esc(h.why || 'уверенности нет')}</div>`;
+  return `<div class="note muted sp-hint" data-hint="${ch.id}">Подсказка:
+    <b>${esc(ch.name)}</b> — ${esc(h.why || '')}.
+    <button class="ghost small sp-take" type="button">Взять подсказку</button></div>`;
+}
+
+function spreadDonorLine(d){
+  if (!d) return '';
+  const facts = [donorSubsText(d), donorLengthText(d), d.lang_ru || ''].filter(Boolean);
+  return `<span class="pill ${DONOR_CLS[d.verdict] || 's-idle'}">${
+      esc(DONOR_TITLE[d.verdict] || d.verdict)}</span>
+    ${esc(facts.join(' · '))}${d.why ? ' · ' + esc(d.why) : ''}`;
+}
+
+const SPREAD_STATE = {
+  placed: ['s-done', 'встало на дату'],
+  queued: ['s-queued', 'встало без даты'],
+  skipped: ['s-idle', 'пропущено'],
+  failed: ['s-error', 'не вышло'],
+};
+
+async function viewSpread(){
+  app.innerHTML = '';
+  app.append($(`<div class="head"><div><h1>Разложить ссылки ${hintDot(
+    'Вставьте список ссылок — на каждую появится карточка с названием ролика и '
+    + 'выбором канала справа. Канал сам не подставляется.')}</h1></div>
+    <div class="head-acts"><a class="ghost small" href="#/channels">Ко всем каналам</a>
+    </div></div>`));
+
+  const form = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Вставьте ссылки пачкой</div>
+    <div class="secbody">
+      <textarea id="sp-in" rows="6" style="width:100%"
+        placeholder="ссылки на доноров — по одной в строке или вперемешку с текстом"
+        ></textarea>
+      <div style="margin-top:10px"><button id="sp-read" class="small">Разобрать</button>
+      </div>
+      <div class="note muted">Названия роликов берутся бесплатно: квоту YouTube Data API
+        это не тратит. Субтитры и длину смотрит отдельная кнопка — она ходит через
+        выходы субтитров и на сотне ссылок думает минутами.</div>
+      <div id="sp-err"></div>
+    </div></div>`);
+  app.append(form);
+
+  const box = $(`<div id="sp-out"></div>`);
+  app.append(box);
+
+  form.querySelector('#sp-read').onclick = async () => {
+    const btn = form.querySelector('#sp-read');
+    btn.disabled = true;
+    form.querySelector('#sp-err').innerHTML = '';
+    box.innerHTML = '';
+    try{
+      const out = await post('/ui/spread/preview',
+                             {links: form.querySelector('#sp-in').value});
+      spreadDraw(box, out);
+    }catch(e){
+      form.querySelector('#sp-err').innerHTML = `<div class="err">${esc(e.message)}
+        Ничего не записано и денег это не стоило.</div>`;
+    }
+    finally{ btn.disabled = false; }
+  };
+}
+
+function spreadDraw(box, out){
+  const channels = out.channels || [], rows = out.rows || [];
+  box.innerHTML = `<div class="card" style="margin-bottom:12px"><div class="secbody">
+      <div><b>Разобрано ссылок: ${rows.length}</b>
+        <span class="muted" id="sp-count"></span></div>
+      <div class="note muted">${esc(out.note || '')}</div>
+      <div class="note muted">${esc(out.no_channel || '')}</div>
+      <div style="margin-top:10px">
+        <button class="small" id="sp-place">Поставить</button>
+        <button class="ghost small" id="sp-check" style="margin-left:8px">Проверить
+          доноров</button>
+        <button class="ghost small" id="sp-hints" style="margin-left:8px">Подставить
+          подсказки</button></div>
+      <div id="sp-res"></div>
+    </div></div>
+    ${rows.map((r, n) => `<div class="card sp-row" data-n="${n}"
+        data-url="${esc(r.url)}" style="margin-bottom:8px"><div class="secbody"
+        style="display:flex;gap:16px;align-items:flex-start;flex-wrap:wrap">
+      <div style="flex:1;min-width:280px">
+        <div style="font-weight:600;word-break:break-all">${spreadTitle(r)}</div>
+        ${spreadDup(r)}
+        <div class="note muted sp-donor"></div>
+        <div class="note sp-res"></div>
+      </div>
+      <div style="width:300px">
+        <select class="sp-ch" style="width:100%">${spreadOptions(channels, '')}</select>
+        ${spreadHintLine(r, channels)}
+      </div></div></div>`).join('')}`;
+
+  const cards = [...box.querySelectorAll('.sp-row')];
+  const picked = () => cards.filter(card => !card.querySelector('.sp-ch').disabled
+                                            && card.querySelector('.sp-ch').value);
+  const count = () => {
+    const n = picked().length;
+    box.querySelector('#sp-count').textContent =
+      n ? ` · канал выбран у ${n}` : ' · канал пока не выбран ни у одной';
+    box.querySelector('#sp-place').disabled = !n;
+  };
+  box.addEventListener('change', ev => {
+    if (ev.target.classList && ev.target.classList.contains('sp-ch')) count();
+  });
+
+  // Подсказку переносит в выбор только человек — и переносит видимо: список справа
+  // после нажатия показывает канал, и «Поставить» берёт именно его.
+  const take = card => {
+    const hint = card.querySelector('.sp-hint');
+    const id = hint && hint.dataset.hint;
+    const sel = card.querySelector('.sp-ch');
+    if (!id || sel.disabled || sel.value) return false;
+    sel.value = id;
+    sel.dispatchEvent(new Event('change', {bubbles: true}));
+    return true;
+  };
+  cards.forEach(card => {
+    const b = card.querySelector('.sp-take');
+    if (b) b.onclick = () => { take(card); };
+  });
+  box.querySelector('#sp-hints').onclick = () => {
+    // Дубли пропускаем: про них уже сказано, что сами они никуда не встают, и
+    // подставить их пачкой значило бы обойти это одним нажатием.
+    const n = cards.filter(c => !c.querySelector('.sp-dup') && take(c)).length;
+    toast(n ? `Подсказки подставлены: ${n}. Просмотрите их перед «Поставить».`
+            : 'Подставлять нечего: подсказок нет или каналы уже выбраны');
+  };
+
+  box.querySelector('#sp-check').onclick = async () => {
+    const btn = box.querySelector('#sp-check');
+    btn.disabled = true;
+    cards.forEach(c => c.querySelector('.sp-donor').textContent = 'проверяем…');
+    try{
+      const res = await post('/ui/spread/check', {urls: cards.map(c => c.dataset.url)});
+      const by = {};
+      for (const d of (res.donors || [])) by[d.url] = d;
+      cards.forEach(c => c.querySelector('.sp-donor').innerHTML =
+        spreadDonorLine(by[c.dataset.url]) || 'проверить не удалось');
+      box.querySelector('#sp-res').innerHTML = `<div class="note muted">${
+        res.timed_out ? `Проверка не уложилась в ${Math.round(res.wall_sec || 0)} с и
+          была остановлена — что успели, показано в строках. ` : ''}${
+        esc(res.donor_note || '')}</div>`;
+    }catch(e){
+      cards.forEach(c => c.querySelector('.sp-donor').textContent = '');
+      box.querySelector('#sp-res').innerHTML = `<div class="note bad">Проверить ролики
+        не удалось: ${esc(e.message)}. Денег это не стоило, в план ничего не записано —
+        ставить ссылки можно и без проверки.</div>`;
+    }
+    finally{ btn.disabled = false; }
+  };
+
+  box.querySelector('#sp-place').onclick = async () => {
+    const btn = box.querySelector('#sp-place');
+    const mine = picked();
+    btn.disabled = true;
+    try{
+      const res = await post('/ui/spread/apply', {rows: mine.map(c => ({
+        url: c.dataset.url, channel_id: Number(c.querySelector('.sp-ch').value)}))});
+      const by = {};
+      for (const r of (res.rows || [])) by[r.url] = r;
+      for (const card of mine){
+        const r = by[card.dataset.url];
+        if (!r) continue;
+        const [cls, word] = SPREAD_STATE[r.state] || ['s-idle', r.state];
+        card.querySelector('.sp-res').innerHTML = `<span class="pill ${cls}">${
+          esc(word)}</span> ${esc(r.channel || '')}${
+          r.slot ? ' · ' + esc(spreadWhen(r.slot)) : ''}${
+          r.why ? ' · ' + esc(r.why) : ''}`;
+        // Поставленное и пропущенное больше не выбирается: второе нажатие «Поставить»
+        // не должно ни отправить его ещё раз, ни выглядеть так, будто может.
+        if (r.state !== 'failed') card.querySelector('.sp-ch').disabled = true;
+      }
+      const c = res.counts || {};
+      box.querySelector('#sp-res').innerHTML = `<div class="res">Встало на дату:
+        <b>${c.placed || 0}</b> · без даты: <b>${c.queued || 0}</b> · пропущено:
+        <b>${c.skipped || 0}</b> · не вышло: <b>${c.failed || 0}</b>.
+        ${c.failed ? 'Отказ по строке не отменил остальные — что встало, то встало.'
+                   : ''}</div>`;
+    }catch(e){
+      box.querySelector('#sp-res').innerHTML = `<div class="err">${esc(e.message)}</div>`;
+    }
+    finally{ count(); }
+  };
+  count();
+  // Поиска по списку каналов здесь нет намеренно: его выдаёт общий наблюдатель студии
+  // (`wireSearchableSelects`) любому списку длиннее пяти пунктов, и карточки, дорисованные
+  // внутри уже вставленного узла, тоже через него проходят. Свой поиск на этом экране
+  // разошёлся бы с остальными списками на первой же правке общего.
+}
+
+function spreadWhen(value){
+  const t = new Date(value);
+  return isNaN(t) ? String(value)
+    : t.toLocaleString('ru-RU', {weekday: 'short', day: '2-digit', month: '2-digit',
+                                 hour: '2-digit', minute: '2-digit'});
+}
+
+
 const ROUTES = [
   ['digest',   h => h === '#/digest',             () => viewDigest()],
   ['queue',    h => h === '#/queue',              () => viewQueue()],
@@ -11477,6 +11731,7 @@ const ROUTES = [
   ['channels', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
   ['channels', h => h === '#/new',                () => viewNew()],
   ['channels', h => h === '#/releases',           () => viewReleases()],
+  ['channels', h => h === '#/spread',             () => viewSpread()],
   ['profile',  h => h === '#/profile',            () => viewProfile()],
   ['channels', () => true,                        () => viewChannels()],
 ];

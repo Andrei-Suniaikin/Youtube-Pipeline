@@ -51,7 +51,8 @@ import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
 from pub_engine import channel_presets                            # noqa: E402
 from pub_remote import (COVER_BASE, LANG_TO_RU, REWRITE_BASE,     # noqa: E402
-                        YT_ID_RE, donor_subs, donor_text, get_key, subs_exits_state,
+                        YT_ID_RE, donor_cache_put_title, donor_cache_title,
+                        donor_subs, donor_text, get_key, subs_exits_state,
                         subs_probe_async, video_id)
 from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
                           MEDIA_STAGES, OPTIONAL_STAGES, REWRITE_BAD, REWRITE_DONE,
@@ -63,6 +64,7 @@ from pub_tags import (DONOR_UNKNOWN_WHY, add_links, add_tag,       # noqa: E402
                       donor_title, donor_verdict, drop_tag, parse_links, plan_rows)
 from pub_tags import tag_names as pub_tags_names                 # noqa: E402
 import channel_supply                                            # noqa: E402
+import link_spread                                               # noqa: E402
 import pub_ui                                                    # noqa: E402
 
 import pub_alerts                                                # noqa: E402
@@ -3627,48 +3629,18 @@ class LinksCheckIn(BaseModel):
     urls: list[str] = []
 
 
-@app.post("/ui/links/check")
-def ui_links_check(body: LinksCheckIn):
-    """Есть ли у доноров субтитры и сколько в них знаков. Денег не тратит.
+def donor_report(urls: list, limits: dict, duplicates: int = 0) -> dict:
+    """Проверка пачки ссылок по часам пульта — общая для карточки канала и раскладки.
 
-    Отдельно от `/ui/links/preview` сознательно: раскладка по датам — это база, она
-    обязана отвечать мгновенно, а это — сеть через выходы субтитров, и её время нам
-    не принадлежит. Зовётся ПОСЛЕ отсева дублей: пульт присылает `fresh` из ответа
-    предпросмотра.
+    Вынесена из `ui_links_check` в отдельную функцию, когда у проверки доноров
+    появился второй вход — экран «Разложить ссылки» (`/ui/spread/check`). Второй
+    копии этой машинерии быть не должно: в ней живут два прохода (кэш, потом сеть),
+    потолок ожидания и разметка «не смогли проверить» — расхождение любой из трёх
+    означало бы, что один и тот же донор на двух экранах выглядит по-разному.
 
-    Повтор одной и той же ссылки внутри пачки проверяется ОДИН раз, и это сказано
-    числом `duplicates`: результаты всё равно лежат в словаре по url и схлопнулись бы
-    в одну строку — но молча, а экран считает строки и сдвинул бы весь список.
-    Поэтому строк в ответе ровно столько, сколько РАЗНЫХ ссылок пришло.
-
-    Что не успело за отведённые часы, возвращается вердиктом `unknown` с причиной
-    `budget` — «не смогли проверить», а НЕ «донор плохой». Разница здесь не
-    косметическая: unknown приходит ровно тогда, когда лёг наш туннель, и выбрасывать
-    из-за него исправные ссылки дороже, чем поставить сомнительную.
+    `duplicates` — сколько повторов ссылки схлопнул вызывающий: строк в ответе
+    столько, сколько РАЗНЫХ ссылок, и молчать об этом нельзя (экран считает строки).
     """
-    asked = [str(u).strip() for u in (body.urls or []) if str(u).strip()]
-    if not asked:
-        raise HTTPException(400, "нечего проверять")
-    urls, seen = [], set()
-    for u in asked:
-        if u in seen:
-            continue              # тот же ролик через дефицитный выход второй раз — нет
-        seen.add(u)
-        urls.append(u)
-    duplicates = len(asked) - len(urls)
-    c = db()
-    try:
-        # Канал спрашивается ради прав: у соседней `/ui/links/preview` проверка
-        # принадлежности есть, и разница между двумя соседними ручками ничем не
-        # объяснима. Пороги при этом общие — канальных порогов в схеме нет.
-        ch = c.execute("SELECT id FROM pub_channels_live WHERE id=? AND tenant_id=?",
-                       (body.channel_id, TENANT)).fetchone()
-        if not ch:
-            raise HTTPException(404, "канал не найден")
-        limits = donor_limits(c)
-    finally:
-        c.close()                 # соединение закрыто ДО сети: транзакций под сетью нет
-
     found, gate = {}, threading.Lock()
 
     def one(url, number, net, deadline):
@@ -3747,6 +3719,282 @@ def ui_links_check(body: LinksCheckIn):
                       "«Не смогли проверить» — это про нашу сторону (туннель, квота "
                       "выходов, время), а не про донора: такую ссылку ставить можно.",
     }
+
+
+@app.post("/ui/links/check")
+def ui_links_check(body: LinksCheckIn):
+    """Есть ли у доноров субтитры и сколько в них знаков. Денег не тратит.
+
+    Отдельно от `/ui/links/preview` сознательно: раскладка по датам — это база, она
+    обязана отвечать мгновенно, а это — сеть через выходы субтитров, и её время нам
+    не принадлежит. Зовётся ПОСЛЕ отсева дублей: пульт присылает `fresh` из ответа
+    предпросмотра.
+
+    Повтор одной и той же ссылки внутри пачки проверяется ОДИН раз, и это сказано
+    числом `duplicates`: результаты всё равно лежат в словаре по url и схлопнулись бы
+    в одну строку — но молча, а экран считает строки и сдвинул бы весь список.
+    Поэтому строк в ответе ровно столько, сколько РАЗНЫХ ссылок пришло.
+
+    Что не успело за отведённые часы, возвращается вердиктом `unknown` с причиной
+    `budget` — «не смогли проверить», а НЕ «донор плохой». Разница здесь не
+    косметическая: unknown приходит ровно тогда, когда лёг наш туннель, и выбрасывать
+    из-за него исправные ссылки дороже, чем поставить сомнительную.
+    """
+    asked = [str(u).strip() for u in (body.urls or []) if str(u).strip()]
+    if not asked:
+        raise HTTPException(400, "нечего проверять")
+    urls, seen = [], set()
+    for u in asked:
+        if u in seen:
+            continue              # тот же ролик через дефицитный выход второй раз — нет
+        seen.add(u)
+        urls.append(u)
+    duplicates = len(asked) - len(urls)
+    c = db()
+    try:
+        # Канал спрашивается ради прав: у соседней `/ui/links/preview` проверка
+        # принадлежности есть, и разница между двумя соседними ручками ничем не
+        # объяснима. Пороги при этом общие — канальных порогов в схеме нет.
+        ch = c.execute("SELECT id FROM pub_channels_live WHERE id=? AND tenant_id=?",
+                       (body.channel_id, TENANT)).fetchone()
+        if not ch:
+            raise HTTPException(404, "канал не найден")
+        limits = donor_limits(c)
+    finally:
+        c.close()                 # соединение закрыто ДО сети: транзакций под сетью нет
+
+    return donor_report(urls, limits, duplicates)
+
+
+# ───────────────── раскладка ссылок по каналам (владелец 30.09.2026) ─────────────────
+#
+# «Сделать чекбокс, что завести много на много каналов — и тогда открывается попап, где
+# делаешь контрол-в, и он создаёт кучу карточек со вставленными ссылками и названиями
+# видео в скобочках в заголовке карточки; и тогда просто справа в дропдауне по названию
+# канал выбираешь».
+#
+# Три ручки вместо одной, и это то же разделение, что уже сделано у карточки канала:
+# раскладка (`preview`) обязана отвечать мгновенно, проверка доноров (`check`) ходит
+# через дефицитные выходы субтитров и думает десятками секунд, а постановка (`apply`)
+# пишет в план. Склеенные, они выглядели бы как зависший экран на первой же сотне
+# ссылок — и человек не понял бы, потрачено ли что-нибудь.
+
+
+class SpreadIn(BaseModel):
+    links: str = ""
+
+
+class SpreadCheckIn(BaseModel):
+    urls: list[str] = []
+
+
+class SpreadRowIn(BaseModel):
+    url: str = ""
+    # `None` — «канал не выбран». Именно этим, а не нулём: ноль выглядел бы как номер
+    # канала, а «не выбрано» — это отсутствие выбора, и путать их тут нельзя.
+    channel_id: Optional[int] = None
+
+
+class SpreadApplyIn(BaseModel):
+    rows: list[SpreadRowIn] = []
+
+
+def _spread_channels_sync() -> list:
+    """Каналы для выбора справа и для подсказки.
+
+    Убранные в архив не показываем: поставить в архив ролик человек не хочет никогда, а
+    в списке из полутора сотен строк лишний десяток мешает искать. Остановленные —
+    показываем: пауза временная, и заранее разложить ссылки по ней осмысленно.
+    """
+    c = db()
+    try:
+        out = []
+        for ch in c.execute("SELECT * FROM pub_channels_live WHERE tenant_id=? "
+                            "AND status!='archived' ORDER BY name", (TENANT,)):
+            out.append({"id": ch["id"], "name": ch["name"],
+                        "lang": (ch["lang"] or "").lower(), "niche": ch["niche"] or "",
+                        "status": ch["status"], "tags": pub_tags_names(c, ch["id"])})
+        return out
+    finally:
+        c.close()
+
+
+def _spread_title_ttl() -> float:
+    c = db()
+    try:
+        return float(donor_limits(c).get("title_ttl_sec") or 0)
+    finally:
+        c.close()
+
+
+def spread_titles_cached(urls: list, ttl: float, now: float) -> dict:
+    """Названия, которые уже знаем, — из общего кэша `subs_cache`, без единого запроса
+    в сеть.
+
+    Кэш здесь не ускорение, а условие работоспособности экрана: сто ссылок — это сто
+    походов в oembed, и даже впятером они заняли бы больше минуты. Один и тот же донор
+    к тому же приходит на экран не по одному разу: разобрал пачку, ушёл, вернулся.
+
+    Срок жизни — общий `title_ttl_sec` (месяц): название донора владелец канала
+    переписать может, но редко, и показывать годичной давности имя нельзя.
+    """
+    out = {}
+    for url in urls:
+        vid = video_id(url)
+        if not vid:
+            continue
+        try:
+            title, at = donor_cache_title(vid)
+        except Exception:                                          # noqa: BLE001
+            title, at = "", 0.0        # кэш недоступен — спросим сеть, это не отказ
+        if title and (now - at) < ttl:
+            out[url] = title
+    return out
+
+
+def _spread_remember_titles(titles: dict, now: float) -> None:
+    """Добытое из сети кладём в тот же кэш, откуда его возьмёт проверка донора и сам
+    выпуск: сходить за названием второй раз — значит потратить время человека зря."""
+    for url, title in (titles or {}).items():
+        vid = video_id(url)
+        if vid and title:
+            try:
+                donor_cache_put_title(vid, title, now)
+            except Exception:                                      # noqa: BLE001
+                pass                   # не записалось — спросим ещё раз, беды нет
+
+
+async def _spread_titles(urls: list, now: float) -> dict:
+    """Названия всей пачки: сначала кэш, потом сеть — и сеть пачкой, а не по одному.
+
+    Поимённо: `_fetch_titles` ходит в oembed до `DONOR_TITLE_PARALLEL_LIMIT` запросов
+    разом. Цикл по одной ссылке на сотне ссылок держал бы экран минутами, и это ровно
+    то, чего делать нельзя: человек с пачкой ссылок пришёл сюда, чтобы не ждать.
+    """
+    ttl = await run_in_threadpool(_spread_title_ttl)
+    known = await run_in_threadpool(spread_titles_cached, urls, ttl, now)
+    need = [u for u in urls if u not in known]
+    fetched = await _fetch_titles(need) if need else {}
+    got = {u: t for u, t in fetched.items() if t}
+    if got:
+        await run_in_threadpool(_spread_remember_titles, got, now)
+    return {**known, **got}
+
+
+def _spread_rows_sync(urls: list, titles: dict, channels: list) -> list:
+    c = db()
+    try:
+        return link_spread.rows(c, TENANT, urls, titles, channels)
+    finally:
+        c.close()
+
+
+def spread_urls(rows: list) -> list:
+    """Строки экрана → пары (ссылка, канал) для постановки.
+
+    Строка без канала выбрасывается ЗДЕСЬ и молча — так и задумано: «поставить всё, у
+    чего выбран канал» означает ровно выбранное. Подсказка канала выбором не является
+    и до сервера как выбор не доезжает: в ответе раскладки она лежит отдельным полем
+    `hint`, а поля «выбранный канал» там нет вовсе.
+    """
+    pairs, seen = [], set()
+    for row in rows or []:
+        url = (row.url or "").strip()
+        if not url or not row.channel_id:
+            continue
+        key = (url, int(row.channel_id))
+        if key in seen:
+            continue               # двойной клик по строке — ставим один раз
+        seen.add(key)
+        pairs.append(key)
+    return pairs
+
+
+@app.post("/ui/spread/preview")
+async def ui_spread_preview(body: SpreadIn):
+    """Разобрать вставленную пачку: строка-карточка на каждую ссылку. Ничего не пишет.
+
+    Разбор ссылок — `pub_tags.parse_links`, та же, что у поля в карточке канала.
+    Названия — открытый oembed (денег не стоит, квоту YouTube Data API не тратит).
+    Дубли и подсказка — `server/link_spread.py`.
+    """
+    urls = parse_links(body.links or "")
+    if not urls:
+        raise HTTPException(400, "в поле нет ни одной ссылки")
+    if len(urls) > link_spread.SPREAD_LIMIT:
+        raise HTTPException(400, f"за раз — не больше {link_spread.SPREAD_LIMIT} ссылок, "
+                                 f"вставлено {len(urls)}")
+    now = time.time()
+    channels = await run_in_threadpool(_spread_channels_sync)
+    titles = await _spread_titles(urls, now)
+    rows = await run_in_threadpool(_spread_rows_sync, urls, titles, channels)
+    return {"rows": rows, "channels": channels, "asked": len(urls),
+            "limit": link_spread.SPREAD_LIMIT,
+            "note": "Канал не подставляется сам. Подсказка — предположение по языку "
+                    "ролика и нише канала; ролик, ушедший на чужой канал, не вернуть.",
+            "title_note": "Названия берутся бесплатно, открытым oembed; денег это не "
+                          "стоит. Субтитры и длину смотрит отдельная кнопка.",
+            "no_channel": "Строка без выбранного канала никуда не ставится и ждёт."}
+
+
+@app.post("/ui/spread/check")
+def ui_spread_check(body: SpreadCheckIn):
+    """Полная проверка доноров пачки: субтитры, длина, язык. Денег не тратит.
+
+    Отдельной кнопкой, а не вместе с раскладкой (решение владельца 30.09.2026): она
+    ходит через выходы субтитров, и на сотне ссылок это минуты. Держать человека у
+    экрана столько нельзя — названия он получил сразу, а это уточнение по требованию.
+    """
+    asked = [str(u).strip() for u in (body.urls or []) if str(u).strip()]
+    if not asked:
+        raise HTTPException(400, "нечего проверять")
+    if len(asked) > link_spread.SPREAD_LIMIT:
+        raise HTTPException(400, f"за раз — не больше {link_spread.SPREAD_LIMIT} ссылок, "
+                                 f"прислано {len(asked)}")
+    urls, seen = [], set()
+    for u in asked:
+        if u in seen:
+            continue               # тот же ролик через дефицитный выход второй раз — нет
+        seen.add(u)
+        urls.append(u)
+    c = db()
+    try:
+        limits = donor_limits(c)
+    finally:
+        c.close()                  # соединение закрыто ДО сети: транзакций под сетью нет
+    return donor_report(urls, limits, len(asked) - len(urls))
+
+
+def _spread_place_sync(pairs: list, titles: dict, now: float) -> list:
+    c = db()
+    try:
+        return link_spread.place(c, TENANT, pairs, now, titles=titles)
+    finally:
+        c.close()
+
+
+@app.post("/ui/spread/apply")
+async def ui_spread_apply(body: SpreadApplyIn):
+    """Поставить то, чему выбран канал. Отказ по одной строке не отменяет остальные.
+
+    Ответ — по строкам: что встало на дату, что без даты, что пропущено и почему.
+    Общего «готово» здесь нет и быть не может: человек ставит сотню ссылок в полтораста
+    каналов, и одно слово на всех не сказало бы ему ничего.
+    """
+    pairs = spread_urls(body.rows or [])
+    if not pairs:
+        raise HTTPException(400, "ни одной строке не выбран канал — ставить нечего")
+    if len(pairs) > link_spread.SPREAD_LIMIT:
+        raise HTTPException(400, f"за раз — не больше {link_spread.SPREAD_LIMIT} ссылок, "
+                                 f"выбрано {len(pairs)}")
+    now = time.time()
+    titles = await _spread_titles([u for u, _cid in pairs], now)
+    rows = await run_in_threadpool(_spread_place_sync, pairs, titles, now)
+    counts = {"placed": 0, "queued": 0, "skipped": 0, "failed": 0}
+    for row in rows:
+        counts[row["state"]] = counts.get(row["state"], 0) + 1
+    return {"ok": True, "asked": len(pairs), "rows": rows, "counts": counts}
+
 
 
 def _channel_presets(c, ch) -> list:
