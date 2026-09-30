@@ -107,7 +107,7 @@ Cover `/jobs/*` + `/favorites/*`.
 `pub_upload_jobs`, `projects`, `queue_tasks`, `gen_jobs`, `card_jobs`, `job_files`, `job_logs`.
 
 Готовые помощники для переиспользования: `pub_ui.release_steps()` уже строит цепочку
-этапов, `release_look()` — статус и цвет, `release_state()` — состояние выпуска.
+этапов, `release_look()` — состояние выпуска словами и цвет.
 
 ### 2. Каналы
 Карточки по статусу + календарь + история + пул ссылок.

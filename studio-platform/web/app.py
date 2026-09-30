@@ -61,6 +61,8 @@ from pub_neighbors import (cover_presets, rewrite_preset_config,  # noqa: E402
 from pub_tags import (DONOR_UNKNOWN_WHY, add_links, check_donor,   # noqa: E402
                       donor_facts_blank, donor_limits, donor_title, donor_verdict,
                       parse_links, plan_rows)
+from pub_tags import tag_names as pub_tags_names                 # noqa: E402
+import channel_supply                                            # noqa: E402
 import pub_ui                                                    # noqa: E402
 
 import pub_alerts                                                # noqa: E402
@@ -600,8 +602,21 @@ def ui_release(release_id: str):
 
 @app.get("/ui/channels")
 def ui_channels():
+    """Список каналов со всем, по чему их ищут и раскладывают.
+
+    Ниша, теги и запас приезжают сюда не «на всякий случай»: владелец 30.09.2026 —
+    «двадцать каналов нормально, а когда будет 150, будет тяжело». Искать и
+    сортировать можно только по тому, что список о себе рассказал, поэтому лишний
+    столбец здесь дешевле, чем второй запрос с экрана на каждый канал.
+
+    Запас считается одним проходом на всех (`supply_facts` — один запрос к плану),
+    а не по каналу: на сотне каналов поканальный счёт превратил бы открытие списка
+    в сотню запросов.
+    """
     c = db()
     try:
+        now = time.time()
+        facts = channel_supply.supply_facts(c, TENANT, now)
         out = []
         for ch in c.execute("SELECT * FROM pub_channels_live WHERE tenant_id=? ORDER BY name",
                             (TENANT,)):
@@ -609,9 +624,15 @@ def ui_channels():
                 schedule = json.loads(ch["schedule"] or "{}")
             except ValueError:
                 schedule = {}
+            supply = channel_supply.channel_supply(ch, facts.get(ch["id"]), now=now)
             out.append({
                 "id": ch["id"], "name": ch["name"], "handle": ch["handle"] or "",
                 "lang": (ch["lang"] or "").upper(), "status": ch["status"],
+                "niche": ch["niche"] or "",
+                # ID канала отдаём целиком, а не только признаком «есть»: в письмах и
+                # таблицах канал чаще приходит именно строкой UC…, и искать по ней надо.
+                "uc": ch["uc"] or "",
+                "tags": pub_tags_names(c, ch["id"]),
                 "tz": ch["tz"], "horizon_days": ch["horizon_days"],
                 "lead_days": ch["lead_days"],
                 "per_day": sum(len(v or []) for v in schedule.values()),
@@ -619,6 +640,9 @@ def ui_channels():
                 # Пункт 6.1 ТЗ: канал можно завести без ID — списку нужно как-то
                 # отличить этот случай, чтобы показать плашку «ID пустой».
                 "has_uc": bool(ch["uc"]),
+                # Запас: `known=false` — «не знаем» (нет расписания), это НЕ ноль.
+                "supply": {"known": supply["known"], "items": supply["items"],
+                           "days": supply["days"], "covered": supply["covered"]},
             })
         return {"channels": out}
     finally:

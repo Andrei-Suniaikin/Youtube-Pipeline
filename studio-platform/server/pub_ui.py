@@ -97,26 +97,6 @@ PHASE_TITLES = {
 }
 
 
-def release_state(rel) -> tuple:
-    """(текст, класс бейджа) — состояние выпуска человеческим языком.
-
-    Выход читается по фазе ровно по той же причине, что и в `release_look`: статус
-    `done` означает подтверждённое расписание, а не публикацию.
-    """
-    if rel is None:
-        return "", ""
-    if rel["status"] == "blocked":
-        return "сбой: " + (rel["blocked_reason"] or "нужен разбор"), "badge-error"
-    if (rel["phase"] or "") == "published":
-        return "вышел публично — подтверждено", "badge-done"
-    if (rel["phase"] or "") == "scheduled":
-        return "назначено, выход ещё не подтверждён", "badge-queued"
-    phase = PHASE_TITLES.get(rel["phase"], rel["phase"] or "начинаю")
-    if rel["blocked_reason"] and rel["blocked_reason"].startswith("ждём"):
-        return phase + " · " + rel["blocked_reason"], "badge-queued"
-    return phase, "badge-running"
-
-
 class ChannelError(ValueError):
     """Ошибка ввода, текст которой можно показать владельцу как есть."""
 

@@ -93,7 +93,7 @@ stdlib. Всё это работает офлайн.
 |---|---|---|
 | `add_links()` | `server/pub_tags.py:111` | раскладка ссылок: дубли, горизонт, точный слот |
 | `next_free_slot()`, `upcoming_slots()` | `server/channel_slots.py` | ближайший свободный выход |
-| `release_steps()`, `release_look()`, `release_state()` | `server/pub_ui.py` | цепочка этапов, статус, цвет |
+| `release_steps()`, `release_look()` | `server/pub_ui.py` | цепочка этапов, состояние и цвет |
 | `schedule_text()`, `per_day()`, `flag()`, `lang_title()` | `server/pub_ui.py` | расписание и подписи |
 | `PHASES`, `PHASE_DEADLINES` | `server/pub_engine.py:39` | порядок и сроки фаз |
 

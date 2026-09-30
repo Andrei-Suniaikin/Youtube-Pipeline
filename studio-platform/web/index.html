@@ -192,6 +192,9 @@
   .facts{color:var(--muted);font-size:13.5px;margin-top:3px}
   .note{margin-top:4px;font-size:13px;color:var(--muted)}
   .note.bad{color:var(--bad)}
+  /* Строка поиска и отборов над списком каналов. */
+  .sieve-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+  .sieve .secbody{padding:14px 18px}
   /* Строка чисел под названием канала. */
   .topline{margin:-4px 0 14px;font-size:14px;color:var(--fg)}
   .topline .sep{margin:0 10px;color:var(--off)}
@@ -2343,7 +2346,15 @@ async function viewChannels(){
   const cls = c => c.status === 'active' ? 'active'
                  : c.status === 'paused' ? 'paused'
                  : c.status === 'problem' ? 'problem' : '';
-  const grid = $(`<div class="chgrid">${d.channels.map(c => `
+  const panel = channelSieve(d.channels, stats, list => draw(list));
+  app.append(panel.el);
+  const grid = $('<div class="chgrid"></div>').firstElementChild;
+  app.append(grid);
+  draw(panel.apply());
+  return;
+
+  function draw(list){
+    grid.innerHTML = list.map(c => `
     <div class="chcard ${cls(c)}" data-id="${c.id}" tabindex="0" role="link"
       aria-label="Канал ${esc(c.name)}">
       <h3>${esc(c.name)}</h3>
@@ -2359,14 +2370,21 @@ async function viewChannels(){
           c.status === 'active' ? 's-done' : c.status === 'problem' ? 's-error' : 's-idle'
         }">${esc(CH_STATUS[c.status] || c.status)}</span>
         ${c.has_uc ? '' : '<span class="pill s-error">ID пустой</span>'}
+        ${supplyPill(c.supply)}
       </div>
-    </div>`).join('')}</div>`);
-  grid.querySelectorAll('.chcard').forEach(el => {
-    const go = () => location.hash = '#/channel/' + el.dataset.id;
-    el.onclick = go;
-    el.onkeydown = ev => { if (ev.key === 'Enter' || ev.key === ' '){ ev.preventDefault(); go(); } };
-  });
-  app.append(grid);
+    </div>`).join('');
+    if (!list.length){
+      grid.innerHTML = `<div class="card" style="grid-column:1/-1"><div class="empty">
+        Ни один канал не подошёл. Смягчите поиск или сбросьте отборы.</div></div>`;
+    }
+    grid.querySelectorAll('.chcard').forEach(el => {
+      const go = () => location.hash = '#/channel/' + el.dataset.id;
+      el.onclick = go;
+      el.onkeydown = ev => {
+        if (ev.key === 'Enter' || ev.key === ' '){ ev.preventDefault(); go(); }
+      };
+    });
+  }
 }
 
 // Календарь месяцами: в каждом дне справа сверху — сколько роликов подтверждённо
@@ -3235,6 +3253,146 @@ function sfindWatch(){
     if (pop && !pop.contains(ev.target) && !ev.target.closest('.sfind')) sfindClose();
   }, true);
   addEventListener('keydown', ev => { if (ev.key === 'Escape') sfindClose(); });
+}
+
+
+/* ────────── поиск и разбор списка каналов (владелец 30.09.2026) ──────────
+
+   «Двадцать каналов нормально, а когда будет 150, будет тяжело». Поэтому здесь поиск
+   по названию, отборы по нише, языку, состоянию и тегу, и порядок — в том числе по
+   запасу, потому что на сотне каналов первый вопрос не «какие есть», а «кому нечего
+   выпускать завтра».
+
+   Всё считается в браузере, на уже полученном списке: сто каналов — это десятки
+   килобайт, и второй поход на сервер за каждой буквой поиска сделал бы экран медленнее,
+   а не быстрее.
+
+   Выбор запоминается. Оператор возвращается на этот экран десятки раз за смену, и
+   каждый раз заново отмечать «только польские, только проблемные» — это и есть та
+   работа руками, ради устранения которой всё затевалось.                             */
+
+const SIEVE_KEY = 'vs.channels.sieve';
+
+function supplyPill(sup){
+  // «Не знаем» и «нечего выпускать» — разные вещи. Первое значит «нет расписания, судить
+  // не по чему», и красным его красить нельзя: канал не сломан, он просто не настроен.
+  if (!sup) return '';
+  if (!sup.known) return '<span class="pill s-idle">запас неизвестен</span>';
+  if (!sup.items) return '<span class="pill s-error">запаса нет</span>';
+  const d = Math.floor(sup.days || 0);
+  if (d < 3) return `<span class="pill s-queued">запас ${d} дн</span>`;
+  return `<span class="pill s-idle">запас ${d} дн</span>`;
+}
+
+function sieveSaved(){
+  try { return JSON.parse(localStorage.getItem(SIEVE_KEY) || '{}') || {}; }
+  catch (e){ return {}; }
+}
+
+function sieveSave(v){
+  try { localStorage.setItem(SIEVE_KEY, JSON.stringify(v)); } catch (e){ /* приват */ }
+}
+
+const CH_SORTS = [
+  ['name',   'по названию'],
+  ['supply', 'сначала без запаса'],
+  ['lang',   'по языку'],
+  ['niche',  'по нише'],
+  ['status', 'по состоянию'],
+  ['per_day', 'по числу выходов'],
+];
+
+function channelSieve(all, stats, onChange){
+  const было = sieveSaved();
+  const st = {q: было.q || '', lang: было.lang || '', niche: было.niche || '',
+              status: было.status || '', tag: было.tag || '', sort: было.sort || 'name'};
+  const uniq = (key) => [...new Set(all.map(c => c[key]).filter(Boolean))].sort(
+    (a, b) => String(a).localeCompare(String(b), 'ru'));
+  const tags = [...new Set(all.flatMap(c => c.tags || []))].sort(
+    (a, b) => a.localeCompare(b, 'ru'));
+
+  const opts = (list, cur, пусто) =>
+    `<option value="">${пусто}</option>` + list.map(v =>
+      `<option value="${esc(v)}"${v === cur ? ' selected' : ''}>${esc(v)}</option>`).join('');
+
+  const el = $(`<div class="card sieve" style="margin-bottom:16px"><div class="secbody">
+    <div class="sieve-row">
+      <input id="s-q" type="search" placeholder="поиск по названию, хэндлу или ID"
+             value="${esc(st.q)}" style="flex:1 1 260px;min-width:200px">
+      <select id="s-lang" style="width:150px">${opts(uniq('lang'), st.lang, 'любой язык')}</select>
+      <select id="s-niche" style="width:190px">${opts(uniq('niche'), st.niche, 'любая ниша')}</select>
+      <select id="s-status" style="width:170px">${
+        `<option value="">любое состояние</option>` + Object.entries(CH_STATUS).map(([k, v]) =>
+          `<option value="${esc(k)}"${k === st.status ? ' selected' : ''}>${esc(v)}</option>`
+        ).join('')}</select>
+      ${tags.length ? `<select id="s-tag" style="width:160px">${
+        opts(tags, st.tag, 'любой тег')}</select>` : ''}
+      <select id="s-sort" style="width:200px">${CH_SORTS.map(([k, v]) =>
+        `<option value="${k}"${k === st.sort ? ' selected' : ''}>${esc(v)}</option>`
+      ).join('')}</select>
+      <button id="s-off" class="ghost small">Сбросить</button>
+    </div>
+    <div class="note muted" id="s-count" style="margin-top:8px"></div>
+  </div></div>`).firstElementChild;
+
+  const count = el.querySelector('#s-count');
+
+  const apply = () => {
+    const q = st.q.trim().toLowerCase();
+    let list = all.filter(c => {
+      if (st.lang && c.lang !== st.lang) return false;
+      if (st.niche && c.niche !== st.niche) return false;
+      if (st.status && c.status !== st.status) return false;
+      if (st.tag && !(c.tags || []).includes(st.tag)) return false;
+      if (!q) return true;
+      // Ищем по тому, чем канал зовут в жизни: название, хэндл и сам ID. По ID — потому
+      // что в письмах и таблицах канал чаще приходит именно строкой UC….
+      return [c.name, c.handle, c.uc, c.niche].filter(Boolean)
+        .some(v => String(v).toLowerCase().includes(q));
+    });
+    const days = c => (c.supply && c.supply.known) ? (c.supply.days || 0) : Infinity;
+    const by = {
+      name: (a, b) => a.name.localeCompare(b.name, 'ru'),
+      // Сначала те, кому нечего выпускать: это и есть работа на сегодня. Каналы без
+      // расписания уезжают в конец — про них ответ «не знаем», а не «всё плохо».
+      supply: (a, b) => days(a) - days(b) || a.name.localeCompare(b.name, 'ru'),
+      lang: (a, b) => (a.lang || '').localeCompare(b.lang || '', 'ru')
+                      || a.name.localeCompare(b.name, 'ru'),
+      niche: (a, b) => (a.niche || '').localeCompare(b.niche || '', 'ru')
+                       || a.name.localeCompare(b.name, 'ru'),
+      status: (a, b) => (a.status || '').localeCompare(b.status || '')
+                        || a.name.localeCompare(b.name, 'ru'),
+      per_day: (a, b) => (b.per_day || 0) - (a.per_day || 0)
+                         || a.name.localeCompare(b.name, 'ru'),
+    };
+    list = list.slice().sort(by[st.sort] || by.name);
+    const отобрано = list.length, всего = all.length;
+    count.textContent = отобрано === всего
+      ? `${всего} ${plural(всего, 'канал', 'канала', 'каналов')}`
+      : `${отобрано} из ${всего} — остальные скрыты отбором`;
+    return list;
+  };
+
+  const touch = () => { sieveSave(st); onChange(apply()); };
+  const bind = (id, key) => {
+    const node = el.querySelector(id);
+    if (!node) return;
+    node.addEventListener(node.tagName === 'INPUT' ? 'input' : 'change', () => {
+      st[key] = node.value;
+      touch();
+    });
+  };
+  bind('#s-q', 'q'); bind('#s-lang', 'lang'); bind('#s-niche', 'niche');
+  bind('#s-status', 'status'); bind('#s-tag', 'tag'); bind('#s-sort', 'sort');
+  el.querySelector('#s-off').onclick = () => {
+    for (const k of ['q', 'lang', 'niche', 'status', 'tag']) st[k] = '';
+    st.sort = 'name';
+    el.querySelectorAll('input,select').forEach(n => { n.value = ''; });
+    const srt = el.querySelector('#s-sort');
+    if (srt) srt.value = 'name';
+    touch();
+  };
+  return {el, apply};
 }
 
 function calendarFeed(d){

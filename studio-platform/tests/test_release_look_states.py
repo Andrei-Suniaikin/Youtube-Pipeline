@@ -226,15 +226,6 @@ set_phase("r-sched", "media_ready", "blocked", "нет обложки")
 check("карантин показывается сбоем", U.release_look(row_of("r-sched"), ""),
       ("сбой: нет обложки", "err"))
 
-# Та же развилка во втором пересказе состояния (`release_state`, бейдж выпуска):
-# статус там решал ровно так же и говорил «опубликован».
-set_phase("r-sched", "scheduled", "done", None)
-check("бейдж: расписание подтверждено — не публикация",
-      U.release_state(row_of("r-sched")), (OUT_SCHEDULED, "badge-queued"))
-set_phase("r-sched", "published", "done", None)
-check("бейдж: подтверждённый выход", U.release_state(row_of("r-sched")),
-      (OUT_CONFIRMED, "badge-done"))
-
 
 # ─────────────────────────── 2. настоящие экраны ───────────────────────────
 
