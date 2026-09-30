@@ -59,13 +59,16 @@ SCENARIO = r"""
   const out = {sent: [], errs: []};
   addEventListener('error', e => out.errs.push(e.message));
   const sleep = ms => new Promise(r => setTimeout(r, ms));
-  // Чтение файла (`File.text()`) под `--virtual-time-budget` иногда разрешается не
-  // сразу — фиксированной паузы не хватает через раз. Ждём условие, а не время.
-  const waitFor = async (fn, timeout, step) => {
-    const t0 = Date.now();
-    while (Date.now() - t0 < (timeout || 2000)){
+  // Чтение файла (`File.text()`) под `--virtual-time-budget` разрешается не сразу.
+  // Здесь уже стояло «ждём условие, а не время» — но ждало оно ПО ЧАСАМ, а часы в стенде
+  // виртуальные: Date.now() бежит вместе с ними, и «две секунды» истекают почти
+  // мгновенно, тогда как чтение файла идёт в настоящем времени. Под нагрузкой ожидание
+  // сдавалось, и тест падал тремя проверками сразу, оставаясь зелёным в одиночку.
+  // Считаем ШАГИ: каждый отдаёт управление, и настоящая работа продвигается.
+  const waitFor = async (fn, steps, step) => {
+    for (let i = 0; i < (steps || 120); i++){
       if (fn()) return true;
-      await sleep(step || 50);
+      await sleep(step || 25);
     }
     return false;
   };
