@@ -1,0 +1,36 @@
+# Снимок публичной статистики каналов: подписчики, просмотры, ролики.
+#
+# Почему таймером, а не потоком внутри кабинета: снимок нужен раз в сутки, и он обязан
+# состояться даже в день, когда кабинет перезапускали. Type=oneshot плюс таймер с
+# Persistent=true даёт и то и другое — пропущенный за время простоя запуск наверстается.
+#
+#   sudo cp deploy/studio-stats.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now studio-stats.timer
+#   systemctl list-timers studio-stats.timer
+#   journalctl -u studio-stats -n 50
+
+[Unit]
+Description=Studio: суточный снимок статистики каналов
+After=network-online.target studio-platform.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/studio/app
+# Ключ YouTube Data API живёт в настройках студии (0600) и в git не попадает.
+EnvironmentFile=-/srv/studio/studio.env
+Environment=VS_DEV_DB=/srv/studio/data/vsgen.db
+Environment=VS_TENANTS_DIR=/srv/studio/data/tenants
+ExecStart=/srv/studio/.venv/bin/python dev/stats.py --once
+# Сто каналов — три запроса; минуты хватает с запасом, а висеть сутками незачем.
+TimeoutStartSec=300
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/studio
+
+[Install]
+WantedBy=multi-user.target

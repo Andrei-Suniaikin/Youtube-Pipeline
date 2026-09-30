@@ -31,6 +31,7 @@ from channel_slots import (
     parse_time,
     upcoming_slots,
 )
+from channel_supply import channel_supply, supply_facts
 from pub_log import read as read_log
 from pub_neighbors import (
     COVER_URL,
@@ -92,18 +93,24 @@ PHASE_TITLES = {
     "upload_pending": "передаю на заливку",
     "upload_running": "заливаю",
     "scheduled": "стоит в расписании",
-    "published": "опубликован",
+    "published": "вышел публично",
 }
 
 
 def release_state(rel) -> tuple:
-    """(текст, класс бейджа) — состояние выпуска человеческим языком."""
+    """(текст, класс бейджа) — состояние выпуска человеческим языком.
+
+    Выход читается по фазе ровно по той же причине, что и в `release_look`: статус
+    `done` означает подтверждённое расписание, а не публикацию.
+    """
     if rel is None:
         return "", ""
     if rel["status"] == "blocked":
         return "сбой: " + (rel["blocked_reason"] or "нужен разбор"), "badge-error"
-    if rel["status"] == "done":
-        return "опубликован", "badge-done"
+    if (rel["phase"] or "") == "published":
+        return "вышел публично — подтверждено", "badge-done"
+    if (rel["phase"] or "") == "scheduled":
+        return "назначено, выход ещё не подтверждён", "badge-queued"
     phase = PHASE_TITLES.get(rel["phase"], rel["phase"] or "начинаю")
     if rel["blocked_reason"] and rel["blocked_reason"].startswith("ждём"):
         return phase + " · " + rel["blocked_reason"], "badge-queued"
@@ -463,8 +470,12 @@ PHASE_LOOK = {
     "cover_ready": ("делаю обложку", "work"),
     "upload_pending": ("готов, жду заливки", "work"),
     "upload_running": ("заливаю", "work"),
-    "scheduled": ("стоит в расписании", "ok"),
-    "published": ("выложен на канал", "ok"),
+    # Две последние фазы — ЗАМЫСЕЛ и ФАКТ, и путать их дороже всего: «стоит в
+    # расписании» ролик может простоять приватным до самого удаления. Подписи и цвета
+    # для строки выпуска выбирает `release_look`, здесь эти две записи остались только
+    # для цепочки пройденного в журнале ролика.
+    "scheduled": ("стоит в расписании", "warn"),
+    "published": ("вышел публично", "ok"),
 }
 
 
@@ -515,14 +526,36 @@ def release_steps(rel, stages: dict, upload) -> str:
 
 
 def release_look(rel, item_status: str) -> tuple:
-    """(текст, цвет) для строки ролика."""
+    """(текст, цвет) для строки ролика.
+
+    Три состояния выхода читаются по ФАЗЕ, а не по статусу. Закон проекта: движок
+    закрывает выпуск (`status='done'`) уже на фазе `scheduled`, и это означает ровно
+    «Studio показала SCHEDULED на нужном канале в нужное время» — замысел. Ролик при
+    этом может остаться приватным, открыться только по ссылке или быть удалён. Факт
+    выхода добывает одна лишь поздняя проверка (`server/pub_verify.py`) и поднимает
+    фазу до `published`. Пока обе фазы читались по статусу, кабинет звал выходом то,
+    чего никто не спрашивал, — та же неправда, что уже убрана из пульта (3f64785).
+
+    Времени слота здесь нет намеренно: «слот прошёл — значит вышел» — это и есть
+    запрещённый вывод выхода из часов, которые идут независимо от YouTube. Сам срок
+    владелец и так видит: в строке он стоит отдельной колонкой.
+    """
     if rel is None:
         return ("ждёт очереди", "muted")
     if rel["status"] == "blocked":
         return ("сбой: " + (rel["blocked_reason"] or "нужен разбор"), "err")
-    if rel["status"] == "done":
-        return ("выложен на канал", "ok")
-    text, color = PHASE_LOOK.get(rel["phase"] or "created", ("в работе", "work"))
+    phase = rel["phase"] or "created"
+    if phase == "published":
+        return ("вышел публично — подтверждено", "ok")
+    if phase == "scheduled":
+        # Проверка не понижает фазу, а пишет причину: «только по ссылке» или «ключом
+        # API не виден». Это дефект на уже оплаченном выпуске, и показать его важнее
+        # слова «назначено» — больше он не виден нигде, кроме журнала ролика.
+        reason = rel["blocked_reason"] or ""
+        if reason and not reason.startswith("ждём"):
+            return (reason, "warn")
+        return ("назначено, выход ещё не подтверждён", "warn")
+    text, color = PHASE_LOOK.get(phase, ("в работе", "work"))
     if rel["blocked_reason"] and rel["blocked_reason"].startswith("ждём"):
         return (text + " · " + rel["blocked_reason"].replace("ждём: ", "жду: "), "muted")
     return (text, color)
@@ -665,7 +698,28 @@ def tile_menu(row, back: str) -> str:
             f'<div class=pub-menu-body>{"".join(пункты)}</div></details>')
 
 
-def channel_tile(row, state, back: str = "/channels") -> str:
+def supply_line(supply: dict) -> str:
+    """Строка запаса для плитки и для карточки канала.
+
+    Цвет берётся не от «мало/много», а от того, знаем ли мы ответ. «Не знаем» серое и
+    никогда не красное: у канала без расписания запас не кончился — его не с чем
+    сравнивать, и красный цвет послал бы владельца чинить то, что не сломано.
+    """
+    if supply is None:
+        return ""
+    if not supply["known"]:
+        цвет = "muted"
+    elif supply["covered"] == 0:
+        цвет = "pub-err"
+    elif supply["days"] < 2:
+        цвет = "pub-warn"
+    else:
+        цвет = "muted"
+    return (f'<div class="{цвет}" style="font-size:12px;margin-top:3px">'
+            f'{e(supply["text"])}</div>')
+
+
+def channel_tile(row, state, back: str = "/channels", supply: dict = None) -> str:
     # Плитка не вправе падать из-за незнакомой пометки состояния: канал со сбоем
     # приходит как "error", а таблица цветов знала только "err" — и весь список каналов
     # отдавал пятисотую, стоило одному выпуску уйти в разбор.
@@ -685,6 +739,7 @@ def channel_tile(row, state, back: str = "/channels") -> str:
 <div class=muted style="font-size:12.5px;margin-top:5px">{e(' · '.join(bits) + метка) or '—'}</div>
 <div class=pub-bar><i style="width:{pct}%;background:{fill}"></i></div>
 <div class="{color}" style="font-size:12px;margin-top:5px">{e(state['text'])}</div>
+{supply_line(supply)}
 </div>"""
 
 
@@ -784,6 +839,7 @@ def register_pub_routes(app, ctx):
         taken = plan_by_channel(c, tid, now - 86400, now + 92 * 86400)
         troubles = troubles_by_channel(c, tid)
         work = work_by_channel(c, tid)      # что реально происходит на каждом канале
+        supply = supply_facts(c, tid, now)  # чем канал будет выходить дальше
         langs = c.execute(
             "SELECT lang, COUNT(*) n FROM pub_channels WHERE tenant_id=? AND status!='archived'"
             " AND lang IS NOT NULL AND lang!='' GROUP BY lang ORDER BY n DESC", (tid,)).fetchall()
@@ -798,7 +854,8 @@ def register_pub_routes(app, ctx):
         back = "/channels" + (f"?{request.url.query}" if request.url.query else "")
         tiles = "".join(channel_tile(r, channel_state(r, taken.get(r["id"], set()),
                                                       troubles.get(r["id"], ""),
-                                                      work=work.get(r["id"])), back)
+                                                      work=work.get(r["id"])), back,
+                                     channel_supply(r, supply.get(r["id"]), now))
                         for r in rows)
         if not tiles:
             tiles = ('<div class=card><span class=muted>'
@@ -875,6 +932,8 @@ def register_pub_routes(app, ctx):
         rels = releases_by_item(c, row["id"])
         stages = release_stages(c, row["id"])
         ups = upload_jobs_by_release(c, row["id"])
+        now_ts = _now()
+        supply = channel_supply(row, supply_facts(c, tid, now_ts).get(row["id"]), now_ts)
         c.close()
 
         # 04.09.2026: спрашиваем по общему идентификатору, а не по логину. Логин
@@ -910,8 +969,15 @@ def register_pub_routes(app, ctx):
                     # выпуск и не начнёт заводиться, пока ID не появится. Цвет — из
                     # уже существующего набора (см. `dot` ниже): это не сбой движка.
                     text, color = "нет ID канала — выпуск не заводится", "muted"
-                dot = {"ok": "#5fa463", "err": "#c25a4e", "work": "var(--accent)",
-                       "muted": "var(--muted)"}[color]
+                # «warn» — жёлтая точка: назначенный, но не подтверждённый выход не
+                # зелёный (это ещё не факт) и не красный (никто ничего не сломал).
+                # Через .get, а не через квадратные скобки: новый цвет состояния — а их
+                # добавляли уже дважды — ронял бы всю карточку канала пятисоткой вместо
+                # того, чтобы показаться серым. Экран про сотню каналов не должен падать
+                # из-за одного незнакомого слова.
+                dot = {"ok": "#5fa463", "err": "#c25a4e", "warn": "#e0a33e",
+                       "work": "var(--accent)",
+                       "muted": "var(--muted)"}.get(color, "var(--muted)")
                 # Название донорского ролика, а не длинная ссылка. Клик ведёт в проект,
                 # когда он уже заведён, иначе — на сам ролик-донор.
                 title = (item["donor_title"] or "").strip() or item["donor_url"]
@@ -950,8 +1016,15 @@ def register_pub_routes(app, ctx):
                     f'<button class="btn btn-ghost btn-sm">Поставить</button></form></td></tr>')
 
         waiting = [r for r in rows_plan if not r["slot_at"]]
-        wait_html = (f'<p class=hint style="margin:10px 0 0">Ждут свободного места: {len(waiting)} '
-                     f'{plural(len(waiting), "ссылка", "ссылки", "ссылок")}.</p>') if waiting else ""
+        wait_html = (
+            f'<p class=hint style="margin:10px 0 0">Ждут свободного места: {len(waiting)} '
+            f'{plural(len(waiting), "ссылка", "ссылки", "ссылок")}. '
+            f'Каждая встанет сама, как только выход освободится.</p>') if waiting else ""
+        # Запас — над таблицей, а не под ней: это ответ на вопрос «когда вставлять
+        # следующие», и он нужен раньше, чем разбор того, что уже стоит.
+        supply_row = supply_line(supply)
+        supply_html = (f'<div style="margin:-2px 0 8px">{supply_row}</div>'
+                       if supply_row else "")
 
         st = row["status"] or "active"
         acts = []
@@ -972,6 +1045,7 @@ def register_pub_routes(app, ctx):
 {pause_block(u, tid)}
 <div class=panel style="margin-top:10px">
 <div class=panel-title>Ролики канала</div>
+{supply_html}
 <table class=pub-tab>
 <tr><th style="width:130px">Когда</th><th>Ролик</th><th style="width:125px">Этапы</th>
 <th style="width:205px">Что с ним</th><th></th></tr>

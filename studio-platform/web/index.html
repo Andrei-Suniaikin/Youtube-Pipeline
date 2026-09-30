@@ -192,6 +192,16 @@
   .facts{color:var(--muted);font-size:13.5px;margin-top:3px}
   .note{margin-top:4px;font-size:13px;color:var(--muted)}
   .note.bad{color:var(--bad)}
+  /* Строка чисел под названием канала. */
+  .topline{margin:-4px 0 14px;font-size:14px;color:var(--fg)}
+  .topline .sep{margin:0 10px;color:var(--off)}
+  /* Канал в цифрах: три числа в ряд, на узком экране — в столбик. */
+  .statgrid{display:flex;gap:38px;flex-wrap:wrap}
+  .statgrid>div{min-width:170px}
+  .statnum{font-size:26px;line-height:1.15;letter-spacing:-.01em}
+  .delta{font-weight:600}
+  .delta.up{color:var(--ok)}
+  .delta.down{color:var(--bad)}
   /* Предупреждение при успехе (рерайт отдаёт «текст короче цели»): работа сделана,
      но смотреть на неё стоит. Красный тут соврал бы про отказ, серый — промолчал. */
   .note.warn{color:var(--wait)}
@@ -603,6 +613,33 @@
          background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%239a9ca3'%3E%3Cpath d='M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z'/%3E%3C/svg%3E");
          background-repeat:no-repeat;background-position:right 9px center;
          background-size:15px 15px}
+  /* ── длинный список: та же строка, но с поиском (владелец 30.09.2026) ──
+     Родной <select> остаётся на месте и остаётся источником правды — он просто не виден.
+     Поэтому весь код, который читает .value и слушает change, продолжает работать, а
+     сорок три места вызова трогать не пришлось. */
+  .sfind{position:relative;display:inline-block;vertical-align:middle}
+  .sfind > select{position:absolute;inset:0;opacity:0;pointer-events:none}
+  .sfind > button{width:100%;text-align:left;font:inherit;color:var(--fg);
+                  background:var(--card);border:1px solid var(--line);
+                  border-radius:var(--r-sm);padding:8px 30px 8px 10px;cursor:pointer;
+                  overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+                  background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='%239a9ca3'%3E%3Cpath d='M16.59 8.59 12 13.17 7.41 8.59 6 10l6 6 6-6z'/%3E%3C/svg%3E");
+                  background-repeat:no-repeat;background-position:right 9px center;
+                  background-size:15px 15px}
+  .sfind > button:focus{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-dim);
+                        outline:none}
+  .sfind > button[disabled]{opacity:.55;cursor:default}
+  .sfind-pop{position:fixed;z-index:80;background:var(--card);border:1px solid var(--line);
+             border-radius:var(--r);box-shadow:0 12px 34px rgba(0,0,0,.45);
+             padding:8px;display:flex;flex-direction:column;gap:6px}
+  .sfind-pop input{width:100%;padding:7px 9px}
+  .sfind-list{overflow:auto;max-height:260px;margin:0;padding:0;list-style:none}
+  .sfind-list li{padding:7px 9px;border-radius:var(--r-xs);cursor:pointer;
+                 white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .sfind-list li.on{background:var(--acc-dim)}
+  .sfind-list li.cur{font-weight:600}
+  .sfind-list li[aria-disabled="true"]{opacity:.5;cursor:default}
+  .sfind-none{padding:7px 9px;color:var(--off);font-size:13px}
   /* Множественный выбор рисуется списком, а не строкой: стрелка ему не нужна. */
   select[multiple]{background-image:none;padding-right:10px}
   select:focus,input:focus,textarea:focus{border-color:var(--acc);box-shadow:0 0 0 2px var(--acc-dim)}
@@ -902,6 +939,9 @@
 <header>
   <nav>
     <span class="brand">Studio<b>.</b></span>
+    <!-- «Сводка» стоит первой намеренно: это единственный экран, который читают
+         целиком и каждый день, и с него начинается утро оператора. -->
+    <a class="tab" href="#/digest" id="tab-digest">Сводка</a>
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
@@ -1937,16 +1977,25 @@ async function viewKeys(){
 
 /* ───────────────────────────── каналы ───────────────────────────── */
 
-const CAL_TITLE = {done:'вышел', running:'в работе', blocked:'остановлен',
+// Три состояния выпуска — три разные подписи (ТЗ §11). `done` называлось «вышел», и
+// это была неправда: `done` означает только «расписание подтверждено», а выход на
+// YouTube никто не проверял. Подтверждает его одна лишь поздняя проверка
+// (`server/pub_verify.py`), и она поднимает фазу до `published` — сервер отдаёт такой
+// слот отдельным состоянием `public` (`web/app.py` `_calendar`). Знак и цвет у них
+// тоже разные: «✓» зелёным — факт, «→» цветом ожидания — только замысел.
+const CAL_TITLE = {public:'вышел публично', done:'назначен на дату',
+                   running:'в работе', blocked:'остановлен',
                    planned:'запланирован', missed:'пропуск', free:'свободен'};
-const CAL_DOT   = {done:'✓', running:'◐', blocked:'!', planned:'·', missed:'✗', free:'○'};
+const CAL_DOT   = {public:'✓', done:'→', running:'◐', blocked:'!', planned:'·',
+                   missed:'✗', free:'○'};
 // Статус канала словами — как их называет кабинет (pub_ui.STATUS_TITLES); на карточке
 // стояло сырое «active». И действие, которое переводит в статус, — глаголом: кнопки
 // «пауза» / «в архиве» рядом со скрытым текущим статусом читались как состояние.
 const CH_STATUS = {active: 'работает', paused: 'пауза', archived: 'в архиве', problem: 'проблема'};
 const CH_VERB = {active: 'Возобновить', paused: 'Поставить на паузу', archived: 'Убрать в архив'};
-const CAL_CLS   = {done:'s-done', running:'s-running', blocked:'s-error',
-                   planned:'s-queued', missed:'s-error', free:'s-idle'};
+const CAL_CLS   = {public:'s-done', done:'s-queued', running:'s-running',
+                   blocked:'s-error', planned:'s-queued', missed:'s-error',
+                   free:'s-idle'};
 
 /* ───────────────── машины заливки и профили AdsPower (§6.4 ТЗ) ─────────────────
    Опись — только по кнопке (ФТ §5.5): ничего здесь не опрашивается само, ни по
@@ -1981,17 +2030,30 @@ function hostRowHtml(h){
     </div></div>`;
 }
 
+// Занятость профиля тремя состояниями. «Не знаем» намеренно не выглядит как
+// «свободен» (пунктир, а не заливка): человек, увидевший «свободен», откроет профиль
+// руками — и если на самом деле там идёт чужая заливка, порвёт ей куки. Состояние
+// считает сервер по `active_at` (когда занятость стала известна), а не браузер.
+const PROFILE_BUSY = {
+  busy: {dot: 's-running', mark: '●', pill: 's-running', title: 'занят'},
+  free: {dot: 's-idle', mark: '·', pill: 's-idle', title: 'свободен'},
+  unknown: {dot: 's-off', mark: '?', pill: 's-off', title: 'не знаем'},
+};
+
 function profileRowHtml(p){
   const hostLabel = p.host ? esc(p.host.title || p.host.code) : 'машина неизвестна';
   const facts = [p.group_name, p.remark].filter(Boolean).map(esc).join(' · ');
+  const st = PROFILE_BUSY[p.busy] || PROFILE_BUSY.unknown;
+  const why = p.busy === 'unknown' && p.busy_why ? esc(p.busy_why) : '';
   return `<div class="stage pitem">
-    <div class="dot ${p.active_now ? 's-done' : 's-idle'}">${p.active_now ? '●' : '·'}</div>
+    <div class="dot ${st.dot}">${st.mark}</div>
     <div class="body">
       <div class="pline"><span class="name">${esc(p.title || p.serial)}</span>
         <span class="facts mono">№${esc(p.serial)}</span>
         <span class="pill">${hostLabel}</span>
-        ${p.active_now ? '<span class="pill s-done">открыт сейчас</span>' : ''}
+        <span class="pill ${st.pill}" title="${why}">${st.title}</span>
         ${p.missing_since ? '<span class="pill s-error">на машине больше нет</span>' : ''}</div>
+      ${why ? `<div class="note muted">${why}</div>` : ''}
       ${facts ? `<div class="note muted">${facts}</div>` : ''}
     </div></div>`;
 }
@@ -2088,7 +2150,8 @@ async function paintHostsProfiles(container){
   const profilesCard = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec stage-head"><span class="grow">Профили AdsPower ${hintDot(
       'Все профили со всех машин сразу: где живёт номер, занят ли он сейчас и не '
-      + 'пропал ли он с машины при последней описи.')}</span>
+      + 'пропал ли он с машины при последней описи. «Не знаем» — это не «свободен»: '
+      + 'значит, свежих сведений о занятости нет, и открывать профиль руками опасно.')}</span>
       <button class="ghost small" id="prof-refresh-all">Обновить все</button></div>
     ${profErr
       ? `<div class="secbody"><div class="note bad">Список профилей прочитать не удалось: ${
@@ -2156,8 +2219,28 @@ function foldRefCard(card, key, summary){
   };
 }
 
+/* Строка с подписчиками на плитке канала. Снимка нет — строки нет: пустое место
+   честнее прочерка, который выглядит как «ноль подписчиков». */
+function tileStats(st){
+  if (!st || !st.day) return '';
+  const d7 = (st.delta || {})['7'] || {};
+  const subs = st.hidden ? 'подписчики скрыты' : `${bigNum(st.subs)} подписчиков`;
+  const up = (d7.subs === null || d7.subs === undefined) ? ''
+    : ` · <span class="delta ${d7.subs > 0 ? 'up' : d7.subs < 0 ? 'down' : ''}">${
+        d7.subs > 0 ? '+' : d7.subs < 0 ? '−' : ''}${bigNum(Math.abs(d7.subs))}</span>
+        <span class="muted">за неделю</span>`;
+  return `<div class="meta" style="margin-top:7px">${subs}${up}</div>`;
+}
+
 async function viewChannels(){
   const d = await api('/ui/channels');
+  // Статистика — отдельным запросом и молча: она читается из своих снимков, в сеть не
+  // ходит, и её отсутствие не имеет права оставить человека без списка каналов.
+  let stats = {};
+  try{
+    const s = await api('/ui/channels/stats');
+    for (const row of (s.channels || [])) stats[row.id] = row;
+  }catch(e){ stats = {}; }
   app.innerHTML = '';
   // Кнопки — в строке заголовка, как на «Проектах» и «Пресетах» (владелец 22.09.2026:
   // «перенести в один ряд с тайтлом и сэкономить место на красивые отступы»).
@@ -2270,6 +2353,7 @@ async function viewChannels(){
       </div>
       <div class="meta">готовим за ${c.lead_days} дн ·
         ${c.has_profile ? 'профиль есть' : '<span style="color:var(--bad)">профиля нет</span>'}</div>
+      ${tileStats(stats[c.id])}
       <div style="margin-top:9px;display:flex;gap:7px;flex-wrap:wrap">
         <span class="pill ${
           c.status === 'active' ? 's-done' : c.status === 'problem' ? 's-error' : 's-idle'
@@ -2285,8 +2369,9 @@ async function viewChannels(){
   app.append(grid);
 }
 
-// Календарь месяцами: в каждом дне справа сверху — сколько роликов вышло. Лента по
-// слотам остаётся ниже: сетка отвечает «сколько и когда», лента — «что именно».
+// Календарь месяцами: в каждом дне справа сверху — сколько роликов подтверждённо
+// вышло. Лента по слотам остаётся ниже: сетка отвечает «сколько и когда», лента —
+// «что именно».
 function monthGrid(byDay, tz){
   const days = Object.keys(byDay).sort();
   if (!days.length) return $('<div></div>');
@@ -2308,7 +2393,12 @@ function monthGrid(byDay, tz){
     for (let dnum = 1; dnum <= total; dnum++){
       const key = `${m}-${String(dnum).padStart(2, '0')}`;
       const b = byDay[key];
-      const done = b ? b.done : 0;
+      // Подтверждённый выход и просто назначенный срок — два разных числа, а не одно
+      // (ТЗ §11). Раньше сетка считала «вышло» по `done`, то есть по подтверждённому
+      // расписанию: месяц выглядел выпущенным целиком ещё до того, как хоть один
+      // ролик проверили. Яркое число — факт (`public`), бледное — только замысел.
+      const out_ = b ? (b.public || 0) : 0;
+      const done = b ? (b.done || 0) : 0;
       const bad = b ? b.missed : 0;
       // Остановленный выход (`blocked`) сервер присылал всегда, а сетка его не читала:
       // остановленный день выглядел как свободный, хотя под сеткой горело «остановлен: 2».
@@ -2318,11 +2408,14 @@ function monthGrid(byDay, tz){
       const stop = b ? (b.blocked || 0) : 0;
       const run = b ? (b.running || 0) : 0;
       const plan = b ? (b.planned || 0) : 0;
-      const said = b ? [done && `вышло: ${done}`, stop && `остановлено: ${stop}`,
+      const said = b ? [out_ && `вышло публично: ${out_}`,
+        done && `назначено, выход не подтверждён: ${done}`,
+        stop && `остановлено: ${stop}`,
         run && `идёт: ${run}`, plan && `запланировано: ${plan}`,
         bad && `пропущено: ${bad}`].filter(Boolean).join(', ') : '';
-      const mark = done ? `<span class="cnt">${done}</span>`
+      const mark = out_ ? `<span class="cnt">${out_}</span>`
         : stop ? '<span class="cnt bad">!</span>'
+        : done ? `<span class="cnt plan">${done}→</span>`
         : run ? '<span class="cnt run">◐</span>'
         : plan ? '<span class="cnt plan">·</span>'
         : bad ? '<span class="cnt bad">—</span>' : '';
@@ -2459,7 +2552,7 @@ async function channelReleases(id, d){
     return;
   }
   app.append(calendarFeed(d));
-  if ((d.uploads || []).length) app.append(uploadsCard(d.uploads));
+  if ((d.uploads || []).length) app.append(uploadsCard(d.uploads, d.video_stats));
   app.append($(`<div class="note muted" style="margin-top:10px">
     <a href="#/releases">Все выпуски по всем каналам →</a></div>`));
 }
@@ -2592,7 +2685,20 @@ function donorsHtml(out){
 // «файл ушёл в форму» повторная заливка запрещена навсегда — второй заход создаст на
 // канале дубль. Разрешено только найти начатый ролик и довести его, и это делает сам
 // заливщик. Экран показывает состояние, а не предлагает недопустимое действие.
-function uploadsCard(rows){
+/* Просмотры ролика приписываются к строке заливки по идентификатору. Числа нет —
+   строки нет: у только что залитого ролика просмотров ещё не спрашивали, и «0
+   просмотров» было бы неправдой, а не отсутствием данных. */
+function videoViews(st){
+  if (!st || st.views === null || st.views === undefined) return '';
+  const grew = (st.delta === null || st.delta === undefined) ? ''
+    : ` <span class="delta ${st.delta > 0 ? 'up' : ''}">${
+        st.delta > 0 ? '+' + bigNum(st.delta) : bigNum(st.delta)}</span>
+        <span class="muted">за неделю</span>`;
+  return `<b>${bigNum(st.views)}</b> ${plural(st.views, 'просмотр', 'просмотра',
+    'просмотров')}${grew}`;
+}
+
+function uploadsCard(rows, byVideo){
   return $(`<div class="card" style="margin-top:16px">
     <div class="sec">Заливка на YouTube ${hintDot('Вердикт читается из состояния строки '
       + 'в YouTube Studio, а не из текста на странице: для запланированного ролика '
@@ -2610,6 +2716,8 @@ function uploadsCard(rows){
         <div class="upsteps">${u.phases.map(f =>
           `<span class="upstep ${f.done ? 'on' : ''}" title="${esc(f.title)}"></span>`).join('')}
           <span class="muted" style="font-size:12px">${esc(u.phase_title)}</span></div>
+        ${videoViews((byVideo || {})[u.video_id])
+          ? `<div class="facts">${videoViews((byVideo || {})[u.video_id])}</div>` : ''}
         <div class="facts">${[
             u.verdict_title && ('вердикт: ' + u.verdict_title),
             u.video_id && ('ролик ' + u.video_id),
@@ -2633,6 +2741,7 @@ async function viewChannel(id){
     <p class="sub">${[c.handle, c.lang, c.niche].filter(Boolean).map(esc).join(' · ')}</p>
     ${c.uc ? '' : `<span class="pill s-error">ID пустой — выпуски на этом канале
       не заводятся. Вписать во вкладке «Настройки» ниже — один раз</span>`}`));
+  app.append(channelTopLine(d));
 
   // Две вкладки: «Ролики» — то, чем занимаются каждый день, «Настройки» — то, что
   // трогают раз в месяц. Ролики первыми: канал открывают, чтобы посмотреть выпуски,
@@ -2641,11 +2750,14 @@ async function viewChannel(id){
   const tabs = $(`<div class="subtabs">
     <a href="#/channel/${encodeURIComponent(id)}/roliki"
        class="${tab === 'roliki' ? 'on' : ''}">Ролики</a>
+    <a href="#/channel/${encodeURIComponent(id)}/statistika"
+       class="${tab === 'statistika' ? 'on' : ''}">Статистика</a>
     <a href="#/channel/${encodeURIComponent(id)}/nastroyki"
        class="${tab === 'nastroyki' ? 'on' : ''}">Настройки</a></div>`);
   app.append(tabs);
 
   if (tab === 'roliki'){ await channelReleases(id, d); return; }
+  if (tab === 'statistika'){ channelStatsTab(id, d); return; }
 
   // Сводка убрана (доработка §5, Дополнение 16.09): расписание, часовой пояс,
   // горизонт, «заранее», машина и профиль — те же поля, что и в форме ниже, а
@@ -2656,6 +2768,473 @@ async function viewChannel(id){
     <div id="editbox" class="secbody"></div></div>`);
   app.append(head);
   wireChannelEdit(head, c, d.channel_preset || {});
+}
+
+
+/* ────────── канал в цифрах: подписчики, просмотры, ролики (25.09.2026) ──────────
+
+   YouTube отдаёт только «сколько сейчас» — прироста в его ответе нет вовсе. Всё, что
+   здесь написано словами «за 7 дней», взято из наших собственных ежедневных снимков,
+   и поэтому у молодого канала прирост честно неизвестен, а не равен нулю: ноль значил
+   бы «не изменилось», а это разные вещи.
+
+   Чего тут нет и не будет: времени просмотра, CTR обложки, удержания, дохода. Они не
+   публичны, их отдаёт только Analytics API по согласию владельца канала. Показать
+   вместо них просмотры и назвать это аналитикой — врать экраном.                     */
+
+function bigNum(v){
+  if (v === null || v === undefined) return '—';
+  return Number(v).toLocaleString('ru-RU');
+}
+
+function deltaText(v, span){
+  // «Не знаем» и «не изменилось» выглядят по-разному. Первое — короткий ряд наблюдений,
+  // и об этом надо сказать, а не нарисовать ноль.
+  if (v === null || v === undefined)
+    return `<span class="muted">за ${span} дн — ещё наблюдаем</span>`;
+  if (!v) return `<span class="muted">без изменений за ${span} дн</span>`;
+  const cls = v > 0 ? 'up' : 'down';
+  return `<span class="delta ${cls}">${v > 0 ? '+' : '−'}${bigNum(Math.abs(v))}</span>
+    <span class="muted">за ${span} дн</span>`;
+}
+
+function sparkline(series, field){
+  const pts = series.filter(r => r[field] !== null && r[field] !== undefined);
+  if (pts.length < 3) return '';        // две точки — не линия, а обещание линии
+  const vals = pts.map(r => Number(r[field]));
+  const lo = Math.min(...vals), hi = Math.max(...vals);
+  const w = 96, h = 26, pad = 2;
+  const x = i => pad + i * (w - 2 * pad) / (vals.length - 1);
+  // Плоский ряд (всё выросло на ноль) делит на ноль — держим линию посередине.
+  const y = v => hi === lo ? h / 2
+    : h - pad - (v - lo) * (h - 2 * pad) / (hi - lo);
+  const dpath = vals.map((v, i) => `${i ? 'L' : 'M'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ');
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" aria-hidden="true"
+    style="vertical-align:middle;margin-left:6px"><path d="${dpath}" fill="none"
+    stroke="var(--run)" stroke-width="1.6" stroke-linejoin="round"/></svg>`;
+}
+
+function channelStatsCard(id, st){
+  const has = !!st.day;
+  const rows = has ? `
+    <div class="statgrid">
+      <div><div class="statnum">${st.hidden ? '<span class="muted">скрыты</span>'
+        : bigNum(st.subs)}</div>
+        <div class="meta">подписчиков ${st.hidden ? '' : sparkline(st.series || [], 'subs')}</div>
+        <div class="meta">${deltaText(st.hidden ? null : (st.delta['7'] || {}).subs, 7)}</div></div>
+      <div><div class="statnum">${bigNum(st.views)}</div>
+        <div class="meta">просмотров ${sparkline(st.series || [], 'views')}</div>
+        <div class="meta">${deltaText((st.delta['7'] || {}).views, 7)}</div></div>
+      <div><div class="statnum">${bigNum(st.videos)}</div>
+        <div class="meta">роликов на канале</div>
+        <div class="meta">${deltaText((st.delta['28'] || {}).videos, 28)}</div></div>
+    </div>
+    <div class="note muted" style="margin-top:10px">Снимок ${esc(st.day)}. Это публичные
+      числа YouTube: время просмотра, CTR и удержание публичными не бывают.</div>`
+    : `<div class="empty">${st.key
+        ? 'Снимков ещё нет — первый появится ближайшей ночью либо по кнопке справа.'
+        : 'Нет ключа YouTube Data API — спрашивать числа нечем. Ключ бесплатный, ' +
+          'заводится в Google Cloud; класть в настройки студии.'}</div>`;
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Канал в цифрах ${hintDot(
+      'Подписчики, просмотры и число роликов — публичные счётчики YouTube. ' +
+      'Прирост считается по нашим ежедневным снимкам, поэтому у нового канала ' +
+      'он появляется не сразу.')}
+      <button class="ghost small" id="refresh" style="float:right;margin-top:-4px"
+        ${st.key ? '' : 'disabled'}>Обновить</button></div>
+    <div class="secbody" id="body">${rows}</div></div>`);
+  card.querySelector('#refresh').onclick = async () => {
+    const b = card.querySelector('#refresh');
+    b.disabled = true;
+    try{
+      const out = await post('/ui/channels/stats/refresh', {});
+      const run = out.run || {};
+      toast(run.why || `Обновлено каналов: ${run.saved}`, run.why ? '' : 'ok');
+      if (!run.why) await render();
+    }catch(e){ toast(e.message); }
+    finally{ b.disabled = false; }
+  };
+  return card;
+}
+
+
+/* ────────── вкладка «Статистика»: публичные числа и подробные ──────────
+
+   Владелец 28.09.2026: «в канале сделать вкладку стату, по дефолту отображать то, что
+   без ключа, а если ключ есть — показывать подробную».
+
+   Сверху всегда публичное: подписчики, просмотры, ролики. Ниже — либо подробное (время
+   просмотра, досмотренность, подписчики), либо объяснение, как его включить. Пустой
+   таблицы «пока нет данных» тут нет ни в одном состоянии: человеку либо показывают
+   числа, либо говорят, чего именно не хватает и что с этим сделать.                 */
+
+function hours(minutes){
+  if (minutes === null || minutes === undefined) return '—';
+  const h = Number(minutes) / 60;
+  return h >= 100 ? bigNum(Math.round(h)) : h.toFixed(1).replace('.', ',');
+}
+
+function mmss(sec){
+  if (sec === null || sec === undefined) return '—';
+  const s = Math.round(Number(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function since(now_, was_, fmt){
+  /* Число рядом с тем же числом за прошлый такой же отрезок. Без сравнения «за 28 дней
+     столько-то» не отвечает на единственный вопрос, который задают: лучше или хуже. */
+  if (now_ === null || now_ === undefined) return '<span class="muted">—</span>';
+  if (was_ === null || was_ === undefined || !was_)
+    return `<span class="muted">не с чем сравнить</span>`;
+  const diff = Number(now_) - Number(was_);
+  if (!diff) return '<span class="muted">как в прошлый раз</span>';
+  const pct = Math.round(diff / Math.abs(Number(was_)) * 100);
+  return `<span class="delta ${diff > 0 ? 'up' : 'down'}">${diff > 0 ? '+' : '−'}${
+    fmt(Math.abs(diff))}</span> <span class="muted">(${diff > 0 ? '+' : '−'}${
+    Math.abs(pct)}% к прошлым 28 дн)</span>`;
+}
+
+function analyticsHowTo(id){
+  return `<div class="note muted" style="margin-top:12px;line-height:1.7">
+    Токен берётся <b>внутри того профиля AdsPower, где залогинен этот канал</b> — из
+    обычного браузера гугл-аккаунт канала входить не должен.
+    <br>1. Открыть в профиле служебную страницу Google OAuth Playground.
+    <br>2. В настройках (шестерёнка) включить «Use your own OAuth credentials» и вписать
+    наши идентификатор и секрет приложения — те, что заданы на странице «Ключи».
+    <br>3. Запросить доступ <code>yt-analytics.readonly</code>, на экране
+    «приложение не проверено» развернуть «Дополнительно» и продолжить.
+    <br>4. Обменять код и скопировать <b>refresh token</b> — это и есть строка ниже.
+    <br>Токен хранится закрыто и наружу не показывается: видно только последние четыре
+    знака.</div>`;
+}
+
+function analyticsNumbers(a){
+  const now_ = (a.totals || {}).now || {}, was = (a.totals || {}).was || {};
+  const ctrKnown = now_.impressions !== null && now_.impressions !== undefined;
+  return `
+    <div class="statgrid">
+      <div><div class="statnum">${bigNum(now_.views)}</div>
+        <div class="meta">просмотров за 28 дн</div>
+        <div class="meta">${since(now_.views, was.views, bigNum)}</div></div>
+      <div><div class="statnum">${hours(now_.minutes)}</div>
+        <div class="meta">часов просмотра</div>
+        <div class="meta">${since(now_.minutes, was.minutes, v => hours(v))}</div></div>
+      <div><div class="statnum">${now_.avg_pct === null || now_.avg_pct === undefined
+          ? '—' : Math.round(now_.avg_pct) + '%'}</div>
+        <div class="meta">досмотрено, средняя ${mmss(now_.avg_sec)}</div>
+        <div class="meta">${since(now_.avg_pct, was.avg_pct, v => Math.round(v) + '%')}</div></div>
+      <div><div class="statnum">${now_.subs_net > 0 ? '+' : ''}${bigNum(now_.subs_net)}</div>
+        <div class="meta">подписчиков за 28 дн</div>
+        <div class="meta">${bigNum(now_.subs_gained)} пришло, ${
+          bigNum(now_.subs_lost)} ушло</div></div>
+    </div>
+    <div class="note muted" style="margin-top:12px">
+      ${ctrKnown
+        ? `Показов превью: <b>${bigNum(now_.impressions)}</b>`
+        : `Показы превью и CTR обложки этим путём не приходят — их отдаёт другой сервис
+           Google, суточными выгрузками. Пока не подключено.`}
+      · отрезок ${esc(now_.from || '')} — ${esc(now_.to || '')}
+    </div>`;
+}
+
+function channelStatsTab(id, d){
+  app.append(channelStatsCard(id, d.stats || {}));
+  const a = d.analytics || {};
+  const acc = a.access || {};
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Подробная статистика ${hintDot(
+      'Время просмотра, досмотренность и подписчики. Эти числа YouTube отдаёт только ' +
+      'владельцу канала, поэтому канал подключается отдельно — своим токеном.')}
+      ${acc.connected ? `<button class="ghost small" id="off"
+        style="float:right;margin-top:-4px">Отключить</button>
+        <button class="ghost small" id="upd"
+        style="float:right;margin-top:-4px;margin-right:8px">Обновить</button>` : ''}</div>
+    <div class="secbody" id="body"></div></div>`);
+  const body = card.querySelector('#body');
+
+  if (acc.connected && a.days){
+    body.innerHTML = analyticsNumbers(a) +
+      `<div class="note muted" style="margin-top:8px">История с ${esc(a.first)} —
+       ${a.days} ${plural(a.days, 'день', 'дня', 'дней')} наблюдений.
+       ${acc.state === 'dead' ? '<b style="color:var(--bad)">Доступ перестал работать: ' +
+         esc(acc.error || '') + ' — нужен новый токен.</b>' : ''}</div>`;
+  } else if (acc.connected){
+    body.innerHTML = `<div class="empty">Канал подключён, но чисел ещё нет.
+      ${acc.error ? esc(acc.error) : 'Нажмите «Обновить» — первая выгрузка забирает год.'}</div>`;
+  } else {
+    body.innerHTML = `
+      <div class="note muted">Без подключения видно только то, что выше: это публичные
+        счётчики YouTube. Время просмотра, досмотренность и приход подписчиков публичными
+        не бывают — их отдаёт лишь владелец канала, своим согласием.</div>
+      ${acc.client === false ? `<div class="note bad" style="margin-top:10px">
+        Сначала впишите идентификатор и секрет приложения Google на странице
+        «Ключи» — без них токен обновлять нечем.</div>` : ''}
+      <div style="margin-top:12px">
+        <input id="tok" style="width:100%;font-family:var(--mono);font-size:12px"
+          placeholder="refresh token из OAuth Playground" autocomplete="off"></div>
+      <div style="margin-top:10px"><button id="on" class="small">Подключить</button></div>
+      ${analyticsHowTo(id)}`;
+  }
+  app.append(card);
+
+  const on = card.querySelector('#on');
+  if (on) on.onclick = async () => {
+    on.disabled = true;
+    try{
+      const out = await post(`/ui/channels/${encodeURIComponent(id)}/analytics`,
+                             {token: card.querySelector('#tok').value});
+      toast(`Подключено, забрано дней: ${out.loaded_days}`, 'ok');
+      await render();
+    }catch(e){ toast(e.message); on.disabled = false; }
+  };
+  const off = card.querySelector('#off');
+  if (off) off.onclick = () => confirmModal('Отключить подробную статистику?',
+    'Согласие будет забыто. Уже собранные числа останутся — их не теряем.',
+    async () => {
+      try{
+        await api(`/ui/channels/${encodeURIComponent(id)}/analytics`, {method: 'DELETE'});
+        toast('Отключено', 'ok');
+        await render();
+      }catch(e){ toast(e.message); }
+    });
+  const upd = card.querySelector('#upd');
+  if (upd) upd.onclick = async () => {
+    upd.disabled = true;
+    try{
+      const out = await post(`/ui/channels/${encodeURIComponent(id)}/analytics/refresh`, {});
+      toast(`Обновлено суток: ${out.days}`, 'ok');
+      await render();
+    }catch(e){ toast(e.message); upd.disabled = false; }
+  };
+}
+
+
+/* ────────── строка сверху: подписчики, просмотры, часы просмотра ──────────
+
+   Владелец 28.09.2026: «надо чтобы на страницу канала сверху выводились просмотры,
+   подписчики и часы просмотра».
+
+   Три числа приходят из РАЗНЫХ мест, и это видно в поведении строки. Подписчики и
+   просмотры — публичные, их даёт ключ студии. Часы просмотра публичными не бывают
+   вовсе: их отдаёт только владелец канала своим согласием, поэтому у неподключённого
+   канала на этом месте не ноль и не прочерк, а приглашение подключить.
+
+   Нет ни одного числа — строки нет совсем: пустая полоса из трёх прочерков занимает
+   место и не отвечает ни на один вопрос.                                            */
+
+function channelTopLine(d){
+  const st = d.stats || {}, an = d.analytics || {};
+  const deep = (an.totals || {}).now || {};
+  const parts = [];
+  if (st.day && !st.hidden && st.subs !== null && st.subs !== undefined)
+    parts.push(`<b>${bigNum(st.subs)}</b> ${plural(st.subs, 'подписчик', 'подписчика',
+      'подписчиков')}`);
+  else if (st.day && st.hidden)
+    parts.push(`<span class="muted">подписчики скрыты владельцем канала</span>`);
+  if (st.day && st.views !== null && st.views !== undefined)
+    parts.push(`<b>${bigNum(st.views)}</b> ${plural(st.views, 'просмотр', 'просмотра',
+      'просмотров')}`);
+  const haveHours = deep.minutes !== null && deep.minutes !== undefined;
+  if (haveHours)
+    parts.push(`<b>${hours(deep.minutes)}</b> ч просмотра
+      <span class="muted">за 28 дн</span>`);
+  else
+    parts.push(`<a href="#/channel/${encodeURIComponent(d.channel.id)}/statistika"
+      class="muted">часы просмотра — подключить →</a>`);
+  // Прячем строку, только если показывать НЕЧЕГО: ни публичного снимка, ни часов.
+  // Раньше здесь пряталось и то, что есть: у канала без ключа студии, но с подключённой
+  // подробной статистикой, часы просмотра пропадали вместе со строкой.
+  if (!st.day && !haveHours) return $('<div></div>');
+  return $(`<div class="topline">${parts.join('<span class="sep">·</span>')}</div>`);
+}
+
+
+/* ────────── длинные списки ищутся, а не листаются (владелец 30.09.2026) ──────────
+
+   «Пробегись по дропдаунам и, если там больше 5 айтемов, сделай ещё быстрый поиск».
+
+   Устройство выбрано так, чтобы НИЧЕГО не переписывать в сорока трёх местах, где эти
+   списки заводятся и читаются. Родной <select> остаётся в странице и остаётся
+   источником правды: он просто становится невидимым, а поверх него рисуется кнопка со
+   списком и полем поиска. Любой существующий код, который делает `.value`, ставит
+   `.value` или слушает `change`, продолжает работать слово в слово.
+
+   Почему не «заменить select на свой компонент»: пятьдесят два профиля AdsPower, пресеты,
+   голоса и модели живут в разных экранах, и каждая замена — это шанс потерять обработчик.
+   Обёртка ничего не отнимает.
+
+   Что сознательно НЕ трогаем:
+     • списки с множественным выбором — они рисуются столбиком, там и так всё видно;
+     • списки короче порога — поиск по трём строкам мешает, а не помогает;
+     • выключенные списки — искать в том, чего нельзя выбрать, незачем.                */
+
+const SFIND_FROM = 6;          // «больше пяти» — то есть с шестого пункта
+
+function sfindLabel(sel){
+  const one = sel.selectedOptions && sel.selectedOptions[0];
+  return one ? one.textContent.trim() : '';
+}
+
+function sfindClose(){
+  const pop = document.getElementById('sfind-pop');
+  if (!pop) return;
+  const owner = pop._owner;
+  pop.remove();
+  if (owner){
+    owner.setAttribute('aria-expanded', 'false');
+    owner.focus();
+  }
+}
+
+function sfindOpen(box){
+  sfindClose();
+  const sel = box.querySelector('select');
+  const btn = box.querySelector('button');
+  // Подпись освежаем ПЕРЕД показом списка: значение могли поставить программно, а такая
+  // запись события `change` не шлёт, и кнопка осталась бы с прежним именем. Человек
+  // открыл бы список и увидел выбранным одно, а на кнопке — другое.
+  btn.textContent = sfindLabel(sel) || '— не выбрано —';
+  const opts = [...sel.options];
+  const pop = document.createElement('div');
+  pop.className = 'sfind-pop';
+  pop.id = 'sfind-pop';
+  pop._owner = btn;
+  pop.innerHTML = `<input type="search" autocomplete="off" spellcheck="false"
+      placeholder="поиск — начните печатать" aria-label="Поиск по списку">
+    <ul class="sfind-list" role="listbox"></ul>`;
+  const find = pop.querySelector('input');
+  const list = pop.querySelector('ul');
+
+  let shown = [];
+  const draw = () => {
+    const q = find.value.trim().toLowerCase();
+    shown = opts.filter(o => !q || o.textContent.toLowerCase().includes(q));
+    if (!shown.length){
+      list.innerHTML = `<li class="sfind-none" role="presentation">ничего не нашлось</li>`;
+      return;
+    }
+    list.innerHTML = shown.map((o, i) => `<li role="option" data-i="${i}"
+      aria-selected="${o.selected ? 'true' : 'false'}"
+      ${o.disabled ? 'aria-disabled="true"' : ''}
+      class="${o.selected ? 'cur' : ''}">${esc(o.textContent)}</li>`).join('');
+    // Подсвечен либо выбранный, либо первый подходящий: стрелка вниз должна вести
+    // откуда-то, а не из пустоты.
+    const at = Math.max(0, shown.findIndex(o => o.selected));
+    mark(q ? 0 : at);
+  };
+  const mark = i => {
+    [...list.children].forEach((li, n) => li.classList.toggle('on', n === i));
+    const on = list.children[i];
+    if (on && on.scrollIntoView) on.scrollIntoView({block: 'nearest'});
+  };
+  const active = () => [...list.children].findIndex(li => li.classList.contains('on'));
+  const take = i => {
+    const opt = shown[i];
+    if (!opt || opt.disabled) return;
+    if (sel.value !== opt.value){
+      sel.value = opt.value;
+      // Ровно то событие, которого ждут уже написанные обработчики. Без него выбор
+      //бы  менялся на экране и никуда не доходил.
+      sel.dispatchEvent(new Event('change', {bubbles: true}));
+    }
+    btn.textContent = sfindLabel(sel) || '— не выбрано —';
+    sfindClose();
+  };
+
+  find.addEventListener('input', draw);
+  find.addEventListener('keydown', ev => {
+    if (ev.key === 'ArrowDown' || ev.key === 'ArrowUp'){
+      ev.preventDefault();
+      const n = list.children.length;
+      if (!n) return;
+      const step = ev.key === 'ArrowDown' ? 1 : -1;
+      mark((active() + step + n) % n);
+    } else if (ev.key === 'Enter'){
+      ev.preventDefault();
+      take(active());
+    } else if (ev.key === 'Escape'){
+      ev.preventDefault();
+      sfindClose();
+    }
+  });
+  list.addEventListener('click', ev => {
+    const li = ev.target.closest('li[data-i]');
+    if (li) take(Number(li.dataset.i));
+  });
+
+  document.body.append(pop);
+  const r = btn.getBoundingClientRect();
+  pop.style.width = Math.max(r.width, 240) + 'px';
+  pop.style.left = Math.min(r.left, innerWidth - pop.offsetWidth - 8) + 'px';
+  // Не помещается снизу — открываем вверх: список из полусотни строк иначе уезжает за
+  // нижний край, и человек ищет его прокруткой всей страницы.
+  const below = innerHeight - r.bottom;
+  pop.style.top = (below > 300 || below > r.top ? r.bottom + 4
+                   : Math.max(8, r.top - pop.offsetHeight - 4)) + 'px';
+  draw();
+  find.focus();
+  btn.setAttribute('aria-expanded', 'true');
+}
+
+function wireSearchableSelects(root){
+  const where = root && root.querySelectorAll ? root : document;
+  for (const sel of where.querySelectorAll('select:not([data-sfind])')){
+    if (sel.multiple || sel.options.length < SFIND_FROM){ continue; }
+    sel.setAttribute('data-sfind', '1');
+    const box = document.createElement('div');
+    box.className = 'sfind';
+    // Ширину задаёт сам список: у большинства она проставлена стилем на месте объявления
+    // («width:230px», «min-width:280px»), и обёртка обязана её унаследовать, иначе
+    // аккуратно расставленные поля разъедутся.
+    // Ширину меряем, а не угадываем по строке стиля: у половины списков она задана
+    // классом (`.fld select{width:100%}`), инлайна там нет вовсе, и обёртка сжалась бы
+    // по содержимому — поля в карточках разъехались бы. Меряем ДО того, как спрячем
+    // список: спрятанный уже ничего не покажет.
+    const wide = sel.parentNode.clientWidth
+                 && sel.offsetWidth >= sel.parentNode.clientWidth - 2;
+    box.style.display = wide ? 'block' : 'inline-block';
+    box.style.width = wide ? '100%' : (sel.style.width || '');
+    box.style.minWidth = sel.style.minWidth || '';
+    box.style.marginTop = sel.style.marginTop || '';
+    box.style.marginBottom = sel.style.marginBottom || '';
+    sel.parentNode.insertBefore(box, sel);
+    box.append(sel);
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.setAttribute('aria-haspopup', 'listbox');
+    btn.setAttribute('aria-expanded', 'false');
+    btn.textContent = sfindLabel(sel) || '— не выбрано —';
+    btn.disabled = sel.disabled;
+    btn.onclick = () => { btn.disabled ? null : sfindOpen(box); };
+    box.append(btn);
+    // Значение меняют и снаружи — формой, сбросом, соседним полем. `change` при этом
+    // приходит не всегда (программная запись .value его не шлёт), поэтому подпись
+    // освежаем и по событию, и при каждом открытии списка.
+    sel.addEventListener('change', () => {
+      btn.textContent = sfindLabel(sel) || '— не выбрано —';
+      btn.disabled = sel.disabled;
+    });
+  }
+}
+
+// Экраны дорисовываются частями и после ответов сервера, поэтому одного вызова после
+// render() не хватит: наблюдатель ловит и то, что появилось позже.
+const SFIND_WATCH = new MutationObserver(list => {
+  for (const m of list){
+    for (const node of m.addedNodes){
+      if (node.nodeType === 1) wireSearchableSelects(node);
+    }
+  }
+});
+
+function sfindWatch(){
+  const app = document.getElementById('app');
+  if (app) SFIND_WATCH.observe(app, {childList: true, subtree: true});
+  addEventListener('click', ev => {
+    const pop = document.getElementById('sfind-pop');
+    if (pop && !pop.contains(ev.target) && !ev.target.closest('.sfind')) sfindClose();
+  }, true);
+  addEventListener('keydown', ev => { if (ev.key === 'Escape') sfindClose(); });
 }
 
 function calendarFeed(d){
@@ -2673,7 +3252,7 @@ function calendarFeed(d){
   let drawn = false;
   // «Сейчас» — своё время браузера, а не серверное `r.past`: строка календаря может
   // полежать в ответе секунды и минуты, пока человек листает экран, а честная подпись
-  // «опубликован»/«загружен» (пункт 1 владельца, 22.09.2026) обязана дать тот же ответ,
+  // «загружен»/«назначен» (пункт 1 владельца, 22.09.2026) обязана дать тот же ответ,
   // что дал бы новый запрос в ту же секунду.
   const nowSec = Date.now() / 1000;
   for (const r of [...future, ...past]){
@@ -2684,11 +3263,13 @@ function calendarFeed(d){
     // статус `pub_releases.status='done'` проверяет только расписание, а не то, что
     // ролик реально вышел на YouTube. Пока собственный слот ещё не наступил, ссылка на
     // youtu.be была бы обещанием, которое мы не проверяли, — ведём на донора и
-    // подписываем честно: «загружен, выйдет …», не «опубликован». Мутация-проверка:
-    // убери `&& r.at <= nowSec` — тест с future-слотом начнёт видеть youtu.be и
-    // «опубликован» раньше времени и упадёт.
-    const published = r.state === 'done' && r.at <= nowSec;
-    const useYoutube = published && r.video_id;
+    // подписываем честно: «загружен, выйдет …», не «вышел». Мутация-проверка: убери
+    // `slotPassed` из `useYoutube` — тест с future-слотом начнёт видеть youtu.be и
+    // подпись про прошедший срок раньше времени и упадёт.
+    const confirmed = r.state === 'public';       // поздняя проверка увидела ролик
+    const scheduled = r.state === 'done';         // только расписание, выход не проверен
+    const slotPassed = r.at <= nowSec;
+    const useYoutube = (confirmed || (scheduled && slotPassed)) && r.video_id;
     const link = useYoutube ? `https://youtu.be/${esc(r.video_id)}` : (r.donor_url || '');
     // Куда ведёт ссылка не всегда видно по одному названию (Issue 3 ревью 22.09.2026):
     // до слота и после него текст-ссылка выглядит одинаково, хотя ведёт в разные
@@ -2702,16 +3283,27 @@ function calendarFeed(d){
     // отличать реальное название от голой ссылки.
     const title = r.donor_title || r.donor_url || (r.state === 'missed'
       ? 'ролика не было' : 'свободен — сюда встанет следующая ссылка');
+    // Четыре разные подписи вместо прежних двух — ровно три состояния ТЗ §11 плюс
+    // промежуточное «залит, но срок ещё не настал»:
+    //   «файл готов, выйдет …»       — материалы готовы, ролика на YouTube ещё нет;
+    //   «загружен, выйдет …»         — файл уже у YouTube, срок в будущем;
+    //   «назначен на …, выход ещё не подтверждён» — срок ПРОШЁЛ, а проверки не было;
+    //   «вышел публично — подтверждено» — `pub_verify` увидел ролик публичным.
+    // Прежде последние две были одним словом «опубликован», и различал их календарь
+    // часами: слот прошёл — значит вышло. Часы идут независимо от YouTube; так экран
+    // объявлял выпущенными ролики, оставшиеся приватными.
     // `done` ≠ «опубликовано» касается и подписи БЕЗ `video_id` (Issue 2 ревью
     // 22.09.2026): расписание могло подтвердиться раньше, чем ролик вообще залит —
-    // тогда до слота нет ни «опубликован», ни «загружен» (заливки ещё не было), и уж
-    // тем более не «вышел» — тот же обман, что и с youtu.be раньше времени. Мутация-
-    // проверка: убери ветку `r.video_id ? … : 'готов, выйдет …'` (верни `CAL_TITLE.done`)
-    // — строка `done` с будущим слотом и без `video_id` снова станет говорить «вышел».
-    const statusText = r.state === 'done'
-      ? (published ? 'опубликован'
-         : (r.video_id ? `загружен, выйдет ${when_}` : `готов, выйдет ${when_}`))
-      : CAL_TITLE[r.state];
+    // тогда до слота нет ни «вышел», ни «загружен» (заливки ещё не было).
+    // Мутация-проверка: сделай `confirmed` равным `scheduled && slotPassed` — строка
+    // с непроверенным выходом снова скажет «вышел публично», и тест упадёт.
+    const statusText = confirmed
+      ? 'вышел публично — подтверждено'
+      : scheduled
+        ? (slotPassed ? `назначен на ${when_}, выход ещё не подтверждён`
+           : (r.video_id ? `загружен, выйдет ${when_}`
+              : `файл готов, выйдет ${when_}`))
+        : CAL_TITLE[r.state];
     // Клик по строке — только когда есть куда вести (пункт 1, «честно показать»):
     // `planned` без `project_id` не кликается вовсе, а не ведёт в никуда. Мутация-
     // проверка: замени условие на `!!r.release_id` — строка без проекта, но с чужим
@@ -9672,7 +10264,7 @@ async function viewAdmin(){
             ? `сказано ${when(x.said_at)}${x.times > 1 ? `, раз: ${x.times}` : ''}`
             : 'ещё не сказано'}</div>
         </div></div>`).join('')
-      : '<div class="empty">Ни один из двенадцати поводов не выполнен.</div>'}
+      : '<div class="empty">Ни один из тринадцати поводов не выполнен.</div>'}
     ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
        ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
   </div>`);
@@ -9845,12 +10437,168 @@ async function viewAdmin(){
   if (people) app.append(people);
 }
 
+/* ─────────────────────────── ежедневная сводка ─────────────────────────── */
+
+/* Экран одной страницы: то, что заказчик просит присылать каждый день, и то, что
+   оператор до сих пор собирал руками по сотне строк. Читается за минуту, копируется
+   целиком одной кнопкой.
+
+   Готовый текст отчёта приходит с сервера и НЕ собирается здесь заново. Причина та
+   же, по которой сводку вообще считает машина: два места, собирающие одну и ту же
+   строку, расходятся молча, и расхождение обнаружится тогда, когда заказчик сверит
+   отчёт из телеграма с отчётом из пульта. Числа рядом — это тот же текст, разложенный
+   по карточкам, чтобы по нему можно было кликнуть. */
+async function viewDigest(){
+  const d = await api('/ui/digest');
+  const g = d.digest, t = g.today, p = g.production;
+  app.innerHTML = '';
+  app.append($(`<h1>Сводка за ${esc(g.day)} ${hintDot(
+    'Сутки календарные, по поясу ' + g.tz + '. Всё, что здесь есть, посчитано из базы: '
+    + 'план, выпуски, заливки, подтверждённые выходы, запас каналов и тревоги.')}</h1>
+    <p class="sub">Часовой пояс отчёта: ${esc(g.tz)}</p>`));
+
+  /* ── сегодня ── */
+  // «Подтверждено» — самое дорогое число экрана, поэтому ему отдельная плитка и
+  // отдельные слова. Ноль тут пишется только тогда, когда про каждый выход есть
+  // ответ; иначе стоит «не знаем» и причина — см. `server/pub_digest.py`.
+  const known = t.expected - t.unknown;
+  const confirmText = (t.unknown && known <= 0) ? 'не знаем' : String(t.confirmed);
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Сегодня</div>
+    <table><tbody>
+      <tr><td>Ожидалось выходов</td>
+          <td style="text-align:right;font-weight:600">${t.expected}</td></tr>
+      <tr><td>Подтверждён выход на YouTube ${hintDot(
+        'Подтверждение — это ответ YouTube Data API о том, что ролик публичный. '
+        + 'Статус «готово» в базе значит только подтверждённое расписание и '
+        + 'подтверждением выхода не является.')}</td>
+          <td style="text-align:right;font-weight:600"${
+            (t.unknown && known <= 0) ? ' class="muted"' : ''}>${esc(confirmText)}</td></tr>
+      <tr><td>Задержано</td>
+          <td style="text-align:right;font-weight:600${
+            t.delayed ? ';color:var(--bad)' : ''}">${t.delayed}</td></tr>
+      ${t.unknown ? `<tr><td class="muted">Про столько выходов ответа нет</td>
+          <td style="text-align:right;font-weight:600" class="muted">${t.unknown}</td></tr>`
+        : ''}
+      ${t.ahead ? `<tr><td class="muted">Ещё впереди сегодня</td>
+          <td style="text-align:right" class="muted">${t.ahead}</td></tr>` : ''}
+    </tbody></table>
+    ${(t.why || []).length ? `<div class="secbody">${(t.why || []).map(w =>
+      `<div class="note muted">не знаем потому, что ${esc(w)}</div>`).join('')}</div>` : ''}
+  </div>`));
+
+  /* ── группы ── */
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Группы каналов ${hintDot(
+      'Группа — это тег канала. Канал без тегов попадает в «прочие» и не теряется; '
+      + 'канал с двумя тегами считается в обеих группах, '
+      + 'поэтому строки не складываются.')}</div>
+    ${g.groups.length ? `<table>
+      <thead><tr><th>Группа</th><th style="text-align:right">Каналов</th>
+        <th style="text-align:right">В плане</th><th style="text-align:right">Принято</th>
+        <th style="text-align:right">Блокеры</th></tr></thead>
+      <tbody>${g.groups.map(x => `<tr>
+        <td>${esc(x.tag)}</td>
+        <td style="text-align:right">${x.channels}</td>
+        <td style="text-align:right">${x.plan}</td>
+        <td style="text-align:right">${x.accepted}</td>
+        <td style="text-align:right${
+          x.blocked ? ';color:var(--bad)' : ''}">${x.blocked}</td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Каналов нет.</div>'}
+  </div>`));
+
+  /* ── производство ── */
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Производство</div>
+    <table><tbody>
+      <tr><td>Принято новых роликов за сутки ${hintDot(
+        'Принят — значит YouTube Studio подтвердила расписание ролика на канале. '
+        + 'Это не «вышел»: выход подтверждается отдельно и позже.')}</td>
+          <td style="text-align:right;font-weight:600">${p.accepted}</td></tr>
+      <tr><td>Каналов без запаса материала</td>
+          <td style="text-align:right;font-weight:600${
+            p.no_supply ? ';color:var(--bad)' : ''}">${p.no_supply}</td></tr>
+      ${p.supply_unknown ? `<tr><td class="muted">Каналов, у которых запас неизвестен
+          (расписание не задано) — это не ноль</td>
+          <td style="text-align:right" class="muted">${p.supply_unknown}</td></tr>` : ''}
+    </tbody></table>
+  </div>`));
+
+  /* ── проблемы ── */
+  app.append($(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Проблемы</div>
+    ${g.problems.length ? `<table>
+      <thead><tr><th>Канал</th><th>Причина</th><th>Следующий результат</th></tr></thead>
+      <tbody>${g.problems.map(x => `<tr data-cid="${x.channel_id}" class="row">
+        <td style="font-weight:600">${esc(x.channel)}</td>
+        <td>${esc(x.why)}</td><td class="muted">${esc(x.next)}</td>
+      </tr>`).join('')}</tbody></table>`
+      : '<div class="empty">Ни одного канала в разборе и без материала.</div>'}
+    ${g.alerts_why ? `<div class="secbody"><div class="note bad">${esc(g.alerts_why)}
+      </div></div>`
+      : (g.alerts || []).length ? `<div class="secbody"><div class="note muted">
+         Действующие тревоги: ${g.alerts.map(a => esc(a.title)).join('; ')}</div></div>` : ''}
+  </div>`));
+  app.querySelectorAll('tr[data-cid]').forEach(tr => tr.onclick =
+    () => { location.hash = '#/channel/' + tr.dataset.cid; });
+
+  /* ── текст отчёта и рассылка ── */
+  const s = d.settings;
+  const box = $(`<div class="card">
+    <div class="sec">Отчёт целиком</div>
+    <div class="secbody">
+      <textarea id="digest-text" readonly rows="16"
+        style="width:100%;font-family:ui-monospace,monospace;font-size:12.5px"
+        >${esc(d.text)}</textarea>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
+        <button class="ghost" id="digest-copy">Скопировать отчёт</button>
+        <label style="display:flex;gap:8px;align-items:center">
+          <input type="checkbox" id="digest-tg"${s.telegram ? ' checked' : ''}${
+            ME && ME.role === 'admin' ? '' : ' disabled'}>
+          Присылать в телеграм раз в сутки</label>
+        <label style="display:flex;gap:8px;align-items:center" class="muted">
+          в <input type="number" id="digest-hour" min="0" max="23" value="${s.hour}"
+            style="width:64px;text-align:right"${
+            ME && ME.role === 'admin' ? '' : ' disabled'}> часов</label>
+      </div>
+      <div class="note muted">Рассылка выключена, пока её не включат здесь: новых
+        сообщений без спроса не появляется. Включает и выключает администратор.</div>
+    </div>
+  </div>`);
+  app.append(box);
+  box.querySelector('#digest-copy').onclick = async () => {
+    // Копируем ТОТ ЖЕ текст, что уходит в телеграм, а не разметку страницы: отчёт
+    // вставляют в переписку, и таблица из буфера приезжает туда кашей.
+    try{ await navigator.clipboard.writeText(d.text); toast('отчёт скопирован', 'ok'); }
+    catch(e){ toast('Скопировать не вышло — текст выделяется в поле ниже'); }
+  };
+  const saveDigest = async () => {
+    try{
+      const out = await post('/ui/digest/settings', {
+        telegram: box.querySelector('#digest-tg').checked,
+        hour: Number(box.querySelector('#digest-hour').value)});
+      toast(out.telegram ? `сводка будет приходить в ${out.hour}:00`
+                         : 'рассылка сводки выключена', 'ok');
+    }catch(e){
+      // Возвращаем переключатель как было: галочка, оставшаяся включённой после
+      // отказа сервера, обещает рассылку, которой не будет.
+      box.querySelector('#digest-tg').checked = s.telegram;
+      box.querySelector('#digest-hour').value = s.hour;
+      toast(e.message);
+    }
+  };
+  box.querySelector('#digest-tg').onchange = saveDigest;
+  box.querySelector('#digest-hour').onchange = saveDigest;
+}
+
 /* ─────────────────────────────── роутер ─────────────────────────────── */
 
 /* Каждая строка: какая вкладка подсвечивается, как узнать свой адрес, что рисовать.
    Раньше это была цепочка if с четырьмя булевыми переменными — при пятой вкладке
    она начала врать о подсветке. */
 const ROUTES = [
+  ['digest',   h => h === '#/digest',             () => viewDigest()],
   ['queue',    h => h === '#/queue',              () => viewQueue()],
   ['queue',    h => h === '#/paid-texts',         () => viewPaidTexts()],
   ['channels', h => h.startsWith('#/channel/'),
@@ -9940,7 +10688,7 @@ async function render(){
   // «Профиль» среди них — это имя человека справа: отдельной вкладки у него больше
   // нет, id висит на ссылке, которую рисует showWho(). На экране входа имени нет, и
   // слепое обращение к нему уронило бы весь роутер — поэтому проверяем.
-  for (const id of ['channels', 'projects', 'queue', 'presets', 'profile']){
+  for (const id of ['digest', 'channels', 'projects', 'queue', 'presets', 'profile']){
     const tab = document.getElementById('tab-' + id);
     if (tab) tab.classList.toggle('on', hit[0] === id);
   }
@@ -9972,6 +10720,7 @@ function busyOff(){
   if (spin) spin.hidden = true;
   document.body.classList.remove('loading');
 }
+sfindWatch();                      // длинные списки получают поиск сами
 addEventListener('hashchange', render);
 render();
 </script>

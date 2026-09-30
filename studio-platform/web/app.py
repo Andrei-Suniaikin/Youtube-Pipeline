@@ -69,6 +69,10 @@ import accounts                                                  # noqa: E402
 import pub_calls                                                 # noqa: E402
 import pub_retention                                             # noqa: E402
 import pub_verify                                                # noqa: E402
+import pub_stats                                                 # noqa: E402
+import pub_digest                                                # noqa: E402
+import pub_analytics                                              # noqa: E402
+import channel_oauth                                              # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
 
 load_env()
@@ -661,12 +665,25 @@ def _calendar(c, ch, history_days: int) -> list:
     """Прошлое и будущее канала одной лентой.
 
     Состояния слота:
-      done      выпуск дошёл до конца
+      public    поздняя проверка подтвердила: ролик виден публично (фаза `published`)
+      done      расписание подтверждено, выход ещё НЕ подтверждён
       running   выпуск в работе
       blocked   выпуск остановлен
       planned   ссылка стоит, работа ещё не начиналась
       missed    время прошло, а ролика не было — ПРОПУСК, его и требует показывать ТЗ
       free      будущий слот свободен, сюда и ложится следующая ссылка
+
+    Почему `public` — отдельное состояние, а не оттенок `done`. Закон проекта:
+    `status='done'` означает ровно «Studio показала SCHEDULED на нужном канале в
+    нужное время», и больше ничего. Это ЗАМЫСЕЛ, а не факт: ролик может остаться
+    приватным, стать доступным только по ссылке или быть удалённым — расписание об
+    этом не знает. Пока оба случая назывались одним словом, экран сообщал о выходе,
+    которого никто не проверял. Разводить их по времени слота («слот прошёл — значит
+    вышел») нельзя по той же причине: часы идут независимо от YouTube.
+
+    Факт добывает только `pub_verify` (`videos.list`, part=status) и записывает
+    фазой `published`. Поэтому `public` читается из фазы, а не из статуса: статус
+    закрыт движком ещё на `scheduled` и выше уже не поднимается.
     """
     try:
         schedule = json.loads(ch["schedule"] or "{}")
@@ -693,7 +710,13 @@ def _calendar(c, ch, history_days: int) -> list:
 
     def row_for(moment, item, is_past, beyond=False):
         rel = rels.get(item["id"]) if item else None
-        if rel is not None:
+        if rel is not None and (rel["phase"] or "") == "published":
+            # Фаза старше статуса: только её поднимает поздняя проверка, и только
+            # она означает «ролик виден публично». Статус к этому моменту давно
+            # `done` — если решать по нему, подтверждённый и неподтверждённый выход
+            # снова сольются в одно слово.
+            state = "public"
+        elif rel is not None:
             state = {"done": "done", "blocked": "blocked"}.get(rel["status"] or "", "running")
         elif item is not None:
             state = "planned"
@@ -2066,9 +2089,30 @@ def ui_host_refresh_profiles(host_id: int):
     return out
 
 
+def _profile_busy(row, now: float) -> tuple:
+    """Занятость одного профиля тремя состояниями: занят / свободен / не знаем.
+
+    «Не знаем» — отдельное состояние, а не «свободен», и это главное здесь. Сведения о
+    занятости живут секунды: их приносит либо опись машины, либо ворота выдачи заливки
+    (`pub_upload_api`), и обе пишут `active_at` — когда это стало известно. Показать
+    вчерашнее «свободен» как сегодняшнее значит позвать человека открыть профиль,
+    в котором прямо сейчас идёт чужая заливка.
+    """
+    if row["missing_since"] is not None:
+        return "unknown", "профиль пропал с машины при последней описи"
+    at = row["active_at"]
+    if not at:
+        return "unknown", "занятость ещё не спрашивали — нажмите «Обновить все»"
+    old = now - float(at)
+    if old > _adspower().ACTIVE_FRESH_SEC:
+        return "unknown", f"сведениям {int(old // 60)} мин — это уже не «сейчас»"
+    return ("busy" if row["active_now"] else "free"), ""
+
+
 @app.get("/ui/profiles")
 def ui_profiles():
     """Общий список профилей со всех машин — владелец просил именно так."""
+    now = time.time()
     c = db()
     try:
         rows = c.execute(
@@ -2078,16 +2122,21 @@ def ui_profiles():
             (TENANT,)).fetchall()
     finally:
         c.close()
-    return {"profiles": [{
-        "id": r["id"], "serial": r["serial"], "title": r["title"] or "",
-        "group_name": r["group_name"] or "", "remark": r["remark"] or "",
-        "last_open_time": r["last_open_time"] or "", "status": r["status"],
-        "active_now": bool(r["active_now"]), "missing_since": r["missing_since"],
-        "last_seen": r["last_seen"],
-        "host": ({"id": r["default_host_id"], "code": r["host_code"] or "",
-                  "title": r["host_title"] or r["host_code"] or ""}
-                 if r["default_host_id"] is not None else None),
-    } for r in rows]}
+    out = []
+    for r in rows:
+        busy, why = _profile_busy(r, now)
+        out.append({
+            "id": r["id"], "serial": r["serial"], "title": r["title"] or "",
+            "group_name": r["group_name"] or "", "remark": r["remark"] or "",
+            "last_open_time": r["last_open_time"] or "", "status": r["status"],
+            "active_now": bool(r["active_now"]), "missing_since": r["missing_since"],
+            "last_seen": r["last_seen"], "active_at": r["active_at"],
+            "busy": busy, "busy_why": why,
+            "host": ({"id": r["default_host_id"], "code": r["host_code"] or "",
+                      "title": r["host_title"] or r["host_code"] or ""}
+                     if r["default_host_id"] is not None else None),
+        })
+    return {"profiles": out}
 
 
 # ─────────────── серверные ключи владельца: правка из студии (24.09.2026) ───────────────
@@ -2603,8 +2652,12 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             zone = dt.timezone.utc
         for row in cal:
             day = dt.datetime.fromtimestamp(row["at"], zone).strftime("%Y-%m-%d")
-            box = by_day.setdefault(day, {"done": 0, "running": 0, "missed": 0,
-                                          "planned": 0, "free": 0, "blocked": 0})
+            # `public` заводится наравне с остальными, а не «по факту появления»:
+            # сетка месяца читает ключи напрямую, и отсутствующий ключ она показала
+            # бы как ноль подтверждённых выходов — то есть как «не вышло ничего».
+            box = by_day.setdefault(day, {"public": 0, "done": 0, "running": 0,
+                                          "missed": 0, "planned": 0, "free": 0,
+                                          "blocked": 0})
             box[row["state"]] = box.get(row["state"], 0) + 1
         return {
             "channel": {
@@ -2638,6 +2691,9 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             "calendar": [_strip_internal(r) for r in cal],
             "counts": counts,
             "uploads": _uploads(c, channel_id),
+            # Просмотры по каждому нашему ролику: экран подмешивает их к заливкам по
+            # идентификатору, а не строит второй список.
+            "video_stats": pub_stats.videos_of_channel(c, channel_id),
             "by_day": by_day,
             "tz": tzname,
             "channel_preset": {
@@ -2655,6 +2711,12 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             "waiting_without_slot": waiting,
             "waiting_items": waiting_rows,
             "history_days": history,
+            # Публичная статистика канала — из своих снимков, а не из живого запроса:
+            # страница канала открывается часто, а числа обновляются раз в сутки.
+            "stats": pub_stats.channel_state(c, channel_id),
+            # Подробная статистика — из своих же записей. Токен наружу не уходит:
+            # `channel_state` отдаёт только «подключено», хвост и состояние.
+            "analytics": pub_analytics.channel_state(c, channel_id),
         }
     finally:
         c.close()
@@ -2883,6 +2945,58 @@ def ui_alert_threshold(body: AlertLimitIn, request: Request):
         c.close()
     _audit(f"порог {body.key} = {body.value if body.value is not None else 'как на машине'}"
            f", это сделал {who['name']}")
+    return out
+
+
+@app.get("/ui/digest")
+def ui_digest():
+    """Ежедневная сводка в формате заказчика — одной страницей.
+
+    Готовый текст отдаётся вместе с числами намеренно: отчёт заказчику уходит именно
+    текстом, и он обязан быть тем же самым, что уходит в телеграм. Собирай экран этот
+    текст сам из чисел — два представления разошлись бы при первой же правке, и никто
+    бы этого не заметил до тех пор, пока заказчик не сверит два отчёта.
+    """
+    c = db()
+    try:
+        data = pub_digest.collect(c, TENANT)
+        return {"digest": data, "text": pub_digest.render(data),
+                "settings": pub_digest.settings(c)}
+    finally:
+        c.close()
+
+
+class DigestSettingsIn(BaseModel):
+    telegram: bool | None = None
+    hour: int | None = None
+
+
+@app.post("/ui/digest/settings")
+def ui_digest_settings(body: DigestSettingsIn, request: Request):
+    """Включить или выключить суточную рассылку сводки, задать час отправки.
+
+    Только администратору: рассылка идёт в общий чат владельца, и включать её за него
+    посторонний не должен. По умолчанию она выключена и таковой остаётся, пока сюда не
+    придёт явное `telegram: true`.
+
+    Свой отказ, а не общий `_require_admin`: тот говорит про учётные записи, и человек,
+    нажавший галочку на экране сводки, прочёл бы ответ про совершенно другое место и
+    пошёл бы искать несуществующую беду.
+    """
+    user = getattr(request.state, "user", None)
+    role = (user["role"] if user is not None and "role" in user.keys() else "") or ""
+    if role != "admin":
+        raise HTTPException(403, "рассылку сводки включает и выключает администратор")
+    who = {"id": user["id"], "name": user["name"]}
+    c = db()
+    try:
+        out = pub_digest.set_settings(c, telegram=body.telegram, hour=body.hour)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        c.close()
+    _audit(f"рассылка сводки: {'включена' if out['telegram'] else 'выключена'}, "
+           f"час {out['hour']}, это сделал {who['name']}")
     return out
 
 
@@ -6722,6 +6836,127 @@ def ui_channel_edit(cid: int, body: dict):
     return {"ok": True}
 
 
+class ChannelTokenIn(BaseModel):
+    token: str = ""
+
+
+@app.post("/ui/channels/{cid:int}/analytics")
+def ui_channel_analytics_connect(cid: int, body: ChannelTokenIn, request: Request):
+    """Подключить канал к подробной статистике вставленным токеном.
+
+    Три шага в одном нажатии, и порядок важен: запомнить → ПРОВЕРИТЬ, что токен именно
+    от этого канала → забрать прошлое. Проверка живым запросом обязательна: у заказчика
+    каждый канал на своём гугл-аккаунте, токены вставляются руками сотню раз подряд, и
+    «вставил не в ту строку» — не гипотеза, а вопрос времени. Без проверки чужие числа
+    молча легли бы в карточку этого канала.
+
+    Не сошлось — токен НЕ остаётся лежать: полуподключённый канал хуже неподключённого,
+    он выглядит рабочим.
+    """
+    _require_admin(request)
+    c = db()
+    try:
+        ch = c.execute("SELECT id, uc, name FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (cid, TENANT)).fetchone()
+        if ch is None:
+            raise HTTPException(404, "канала нет")
+        if not (ch["uc"] or "").strip():
+            raise HTTPException(400, "у канала не заполнен ID YouTube — без него нельзя "
+                                     "проверить, что токен от этого канала")
+        if not channel_oauth.client_ready():
+            raise HTTPException(400, "не заданы реквизиты приложения Google — впишите их "
+                                     "на странице «Ключи», иначе обновить доступ нечем")
+        try:
+            channel_oauth.set_token(cid, body.token)
+        except channel_oauth.OAuthError as exc:
+            raise HTTPException(400, str(exc))
+        check = pub_analytics.verify(cid, ch["uc"])
+        if not check["ok"]:
+            channel_oauth.drop(cid)
+            raise HTTPException(400, check["why"])
+        got = pub_analytics.collect_channel(c, cid, ch["uc"])
+        _audit(f'статистика канала «{ch["name"]}» подключена')
+        return {"access": channel_oauth.state(cid), "loaded_days": got["days"],
+                "why": got["why"],
+                "analytics": pub_analytics.channel_state(c, cid)}
+    finally:
+        c.close()
+
+
+@app.delete("/ui/channels/{cid:int}/analytics")
+def ui_channel_analytics_off(cid: int, request: Request):
+    """Отключить канал от подробной статистики.
+
+    Согласие забываем, УЖЕ СОБРАННОЕ оставляем: это наши записи, а не заимствованный
+    доступ, и терять историю канала из-за смены токена незачем.
+    """
+    _require_admin(request)
+    c = db()
+    try:
+        ch = c.execute("SELECT name FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (cid, TENANT)).fetchone()
+        if ch is None:
+            raise HTTPException(404, "канала нет")
+        channel_oauth.drop(cid)
+        _audit(f'статистика канала «{ch["name"]}» отключена')
+        return {"access": channel_oauth.state(cid)}
+    finally:
+        c.close()
+
+
+@app.post("/ui/channels/{cid:int}/analytics/refresh")
+def ui_channel_analytics_refresh(cid: int, request: Request):
+    """Забрать свежие сутки прямо сейчас, не дожидаясь ночного прохода."""
+    _require_admin(request)
+    c = db()
+    try:
+        ch = c.execute("SELECT uc FROM pub_channels WHERE id=? AND tenant_id=?",
+                       (cid, TENANT)).fetchone()
+        if ch is None:
+            raise HTTPException(404, "канала нет")
+        got = pub_analytics.collect_channel(c, cid, ch["uc"])
+        if got["why"]:
+            raise HTTPException(400, got["why"])
+        return {"days": got["days"], "analytics": pub_analytics.channel_state(c, cid)}
+    finally:
+        c.close()
+
+
+@app.get("/ui/channels/stats")
+def ui_channels_stats():
+    """Статистика по всем каналам: последние числа и прирост.
+
+    Отвечает из своих снимков и в сеть не ходит: страница открывается часто, а YouTube
+    обновляет публичные счётчики раз в сутки и с задержкой. За свежестью — отдельная
+    кнопка ниже, у которой есть цена в единицах общего ключа.
+    """
+    c = db()
+    try:
+        return pub_stats.overview(c, TENANT)
+    finally:
+        c.close()
+
+
+@app.post("/ui/channels/stats/refresh")
+def ui_channels_stats_refresh():
+    """Снять статистику прямо сейчас.
+
+    Стоит одну единицу общего ключа на каждые пятьдесят каналов, поэтому чаще раза в
+    десять минут не ходит: снимок суточный, и десять нажатий подряд не сделают числа
+    свежее — только выедят кошелёк, из которого живёт проверка публикаций.
+    """
+    c = db()
+    try:
+        out = pub_stats.collect_if_stale(c, TENANT)
+        # Ролики — тем же нажатием: спрашивать «обновить статистику» и получать только
+        # половину значило бы заставлять человека искать вторую кнопку.
+        if not out.get("fresh"):
+            out["videos"] = pub_stats.collect_videos(c, TENANT)
+        return {"run": out, "state": pub_stats.overview(c, TENANT)}
+    finally:
+        c.close()
+
+
 @app.delete("/ui/channels/{cid:int}")
 def ui_channel_delete(cid: int, request: Request):
     """Удалить канал насовсем (решение владельца 24.09.2026).
@@ -6760,6 +6995,15 @@ def ui_channel_delete(cid: int, request: Request):
         c.execute("DELETE FROM pub_plan_items WHERE channel_id=? AND tenant_id=?",
                   (cid, TENANT))
         c.execute("DELETE FROM pub_channel_tags WHERE channel_id=?", (cid,))
+        # Снимки статистики — по той же причине, что и всё остальное выше: ряд без
+        # канала прилипнет к новому каналу с тем же номером и покажет чужой прирост.
+        pub_stats.forget_channel(c, cid)
+        pub_stats.forget_channel_videos(c, cid)
+        # Подробная статистика и само согласие — по той же причине: ряд без канала
+        # прилипнет к новому каналу с тем же номером, а забытый токен останется лежать
+        # рабочим доступом к чужим числам.
+        pub_analytics.forget_channel(c, cid)
+        channel_oauth.drop(cid)
         c.execute("DELETE FROM pub_channels WHERE id=? AND tenant_id=?", (cid, TENANT))
         c.commit()
     finally:

@@ -23,6 +23,7 @@ import os
 import sqlite3
 import time
 
+import pub_artifact
 import pub_calls
 from pub_engine import ItemFailed, ResourceDown
 # Фазу выпуска двигает не только движок: проход «забрать уже оплаченное» (в конце
@@ -874,6 +875,10 @@ class PubServices:
         """Собрать комплект и поставить задание машине с профилем.
 
         Комплект собирается ОДИН раз: если задание уже есть, повторный тик его не создаёт.
+        Проверка здесь — быстрая, а настоящая охрана от второго задания стоит в базе
+        (`release_id` в `pub_upload_jobs` уникален). Обе нужны: между этой проверкой и
+        вставкой помещается второй тик или ручной запуск прохода, и тогда единственное,
+        что удержит выпуск от второй работы, — уникальность.
         """
         if self._upload_job(c, rel["release_id"]) is not None:
             return {}
@@ -934,20 +939,39 @@ class PubServices:
         except TitleError as exc:
             raise ItemFailed(str(exc))
 
+        # Допуск привязывается к КОНКРЕТНОЙ версии ролика: запоминаем, чем был файл в
+        # эту секунду (какой рендер его дал и каков он на диске). Перед выдачей задания
+        # и перед отдачей байтов это сверяется заново — см. `pub_artifact` и ворота в
+        # `pub_upload_api`. Без такой записи в задании оставался только путь, а путь у
+        # рендера постоянный: пересобранный проект молча подменял принятый ролик.
+        mark = pub_artifact.passport(c, rel["release_id"], video)
         now = self._clock()
-        c.execute(
-            "INSERT INTO pub_upload_jobs(release_id,tenant_id,channel_id,uc,profile_id,host_id,"
-            "channel_url,title,description,schedule_iso,visibility,collaborator,video_path,"
-            "cover_path,slot_at,created,updated) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (rel["release_id"], rel["tenant_id"], rel["channel_id"], rel["uc"],
-             rel["profile_id"], rel["host_id"],
-             f'https://studio.youtube.com/channel/{rel["uc"]}/',
-             title, description, schedule, "public", rel["collaborator"] or "",
-             video, cover, rel["slot_at"], now, now))
+        try:
+            c.execute(
+                "INSERT INTO pub_upload_jobs(release_id,tenant_id,channel_id,uc,profile_id,"
+                "host_id,channel_url,title,description,schedule_iso,visibility,collaborator,"
+                "video_path,video_sha256,video_passport,cover_path,slot_at,created,updated) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (rel["release_id"], rel["tenant_id"], rel["channel_id"], rel["uc"],
+                 rel["profile_id"], rel["host_id"],
+                 f'https://studio.youtube.com/channel/{rel["uc"]}/',
+                 title, description, schedule, "public", rel["collaborator"] or "",
+                 video, mark["build"]["sha256"], pub_artifact.dump(mark),
+                 cover, rel["slot_at"], now, now))
+        except sqlite3.IntegrityError:
+            # Задание на этот выпуск уже завёл параллельный проход. Уникальность
+            # `release_id` сделала ровно то, ради чего стоит, — второй работы не будет.
+            # Для выпуска это не отказ: допуск состоялся, просто не в этом проходе.
+            # Падать здесь нельзя: движок ловит любое исключение обработчика и уводит
+            # выпуск в разбор, то есть готовый ролик остановился бы из-за гонки.
+            return {}
         log_line(c, rel["release_id"], "заливка",
                  f"комплект готов: «{title}», выход {schedule or 'сразу'}, "
                  f"обложка {'есть' if cover else 'нет'}, профиль {rel['profile_id']}")
+        log_line(c, rel["release_id"], "заливка",
+                 f"допущена версия: рендер №{mark['build']['job'] or 'неизвестен'}, "
+                 f"файл {os.path.basename(video)} "
+                 f"{pub_artifact.human_size(mark['file'].get('size'))}")
         return {"payload": {"title": title, "schedule": schedule}}
 
     def do_upload_running(self, c, rel):
@@ -990,7 +1014,7 @@ class PubServices:
         if not key:
             raise ResourceDown("проверка публикации",
                                "нет ключа YouTube Data API "
-                               "(admin_state.youtube_api_key или VS_YT_API_KEY)")
+                               "(вставить на экране «Ключи»)")
         res = pub_verify.check(rel["video_id"] or "", key)
         if res["state"] == pub_verify.PUBLIC:
             return {"video_id": rel["video_id"] or "",

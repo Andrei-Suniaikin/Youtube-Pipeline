@@ -253,7 +253,8 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
               "serial TEXT NOT NULL, title TEXT, default_host_id INTEGER, "
               "status TEXT NOT NULL DEFAULT 'active', note TEXT, created REAL NOT NULL, "
               "adspower_user_id TEXT, group_name TEXT, remark TEXT, last_open_time TEXT, "
-              "active_now INTEGER NOT NULL DEFAULT 0, last_seen REAL, missing_since REAL, "
+              "active_now INTEGER NOT NULL DEFAULT 0, active_at REAL, "
+              "last_seen REAL, missing_since REAL, "
               "UNIQUE(tenant_id,default_host_id,serial))")
     # Существующие базы: колонки могли не существовать до этой описи. ADD COLUMN на уже
     # актуальной базе падает молча (except) — проверяется живым SELECT в тестах, не
@@ -267,6 +268,7 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
         ("remark", "TEXT"),
         ("last_open_time", "TEXT"),
         ("active_now", "INTEGER NOT NULL DEFAULT 0"),
+        ("active_at", "REAL"),
         ("last_seen", "REAL"),
         ("missing_since", "REAL"),
     ):
@@ -468,7 +470,24 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
               "slot_at REAL NOT NULL, status TEXT NOT NULL DEFAULT 'queued', "
               "phase TEXT, claim_token TEXT, host TEXT, worker TEXT, claimed REAL, lease_until REAL, "
               "heartbeat REAL, verdict TEXT, video_id TEXT, evidence TEXT, error TEXT, "
-              "finished REAL, created REAL NOT NULL, updated REAL NOT NULL)")
+              "finished REAL, blocked_since REAL, blocked_why TEXT, "
+              "created REAL NOT NULL, updated REAL NOT NULL)")
+    # Задание, которое не выдаётся, потому что его профиль открыт ПОСТОРОННИМ (чужой
+    # конвейер на той же машине или человек руками): когда придержали впервые и почему.
+    # Без `blocked_since` нельзя ответить на вопрос «а долго ли оно так стоит», а
+    # именно на нём держится тревога §13 — ждать вечно молча нельзя.
+    # `video_passport` — опознание ролика на момент допуска: версия сборки плюс
+    # отпечаток файла (`server/pub_artifact.py`). Без него в задании был только ПУТЬ,
+    # а путь у рендера постоянный: пересборка подменяла файл, не меняя задания, и на
+    # канал уходила версия, которую никто не принимал. Задания, допущенные до этой
+    # колонки, живут с пустым значением — пустое значит «не знаем», и сверка по ним
+    # молчит, а не объявляет их пересобранными.
+    for _col, _sql in (("blocked_since", "REAL"), ("blocked_why", "TEXT"),
+                       ("video_passport", "TEXT")):
+        try:
+            c.execute(f"ALTER TABLE pub_upload_jobs ADD COLUMN {_col} {_sql}")
+        except Exception:
+            pass
     c.execute("CREATE INDEX IF NOT EXISTS idx_pub_upload_queue "
               "ON pub_upload_jobs(status, slot_at, id)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pub_upload_profile "

@@ -8,8 +8,10 @@ HTTP-контракт §6.4 зафиксирован в спецификации
   • карточка «Машины заливки»: список (включая `disabled`), добавление, правка,
     статус («Убрать»/«Включить» не удаляет строку), «Обновить список профилей» —
     успех тостом со сводкой, неудача — честной ошибкой, список не пустеет;
-  • карточка «Профили AdsPower»: метки «открыт сейчас» / «на машине больше нет»,
-    машина-владелец у каждой строки; «Обновить все» — только по активным машинам,
+  • карточка «Профили AdsPower»: занятость тремя состояниями («занят» / «свободен» /
+    «не знаем», причём «не знаем» — это НЕ «свободен»: человек, увидевший «свободен»,
+    откроет профиль руками и порвёт куки идущей заливке), метка «на машине больше
+    нет», машина-владелец у каждой строки; «Обновить все» — только по активным машинам,
     строго по одной одновременно (не параллельно) и без остановки на ошибке одной;
   • честная ошибка вместо пустого списка, если сам `GET /ui/hosts`/`GET /ui/profiles`
     не отвечает;
@@ -62,10 +64,11 @@ SCENARIO = r"""
   const PROFILES = [
     {id: 12, serial: '46', title: 'Профиль 46', group_name: 'history-pl', remark: '',
      last_open_time: '2026-09-22 10:11:03', status: 'active', active_now: true,
-     missing_since: null, last_seen: 1758600000,
+     busy: 'busy', busy_why: '', missing_since: null, last_seen: 1758600000,
      host: {id: 1, code: 'minsk', title: 'Минская машина'}},
     {id: 99, serial: '12', title: 'Профиль 12', group_name: '', remark: '',
      last_open_time: '2026-09-20 08:00:00', status: 'active', active_now: false,
+     busy: 'unknown', busy_why: 'профиль пропал с машины при последней описи',
      missing_since: 1758600500, last_seen: 1758595000,
      host: {id: 1, code: 'minsk', title: 'Минская машина'}},
   ];
@@ -219,7 +222,10 @@ SCENARIO = r"""
   out.profRowsCount = profRows().length;
   const activeRow = profRows().find(r => /№46/.test(txt(r)));
   const missingRow = profRows().find(r => /№12/.test(txt(r)));
-  out.activeNowShown = /открыт сейчас/.test(txt(activeRow));
+  out.activeNowShown = /занят/.test(txt(activeRow));
+  out.unknownShown = /не знаем/.test(txt(missingRow));
+  out.unknownNotFree = !/свободен/.test(txt(missingRow));
+  out.unknownWhyShown = /пропал с машины/.test(txt(missingRow));
   out.missingShown = /на машине больше нет/.test(txt(missingRow));
   out.activeRowNotMissing = !/на машине больше нет/.test(txt(activeRow));
   out.hostLabelShown = /Минская машина/.test(txt(activeRow));
@@ -369,7 +375,10 @@ def main() -> int:
     print("\nПрофили AdsPower — общий список")
     check("карточка найдена", res.get("profCardFound"), True)
     check("оба профиля видны", res.get("profRowsCount"), 2)
-    check("«открыт сейчас» у активного", res.get("activeNowShown"), True)
+    check("«занят» у открытого профиля", res.get("activeNowShown"), True)
+    check("«не знаем» там, где свежих сведений нет", res.get("unknownShown"), True)
+    check("«не знаем» не выдано за «свободен»", res.get("unknownNotFree"), True)
+    check("и сказано, почему не знаем", res.get("unknownWhyShown"), True)
     check("активный не помечен пропавшим", res.get("activeRowNotMissing"), True)
     check("«на машине больше нет» у пропавшего", res.get("missingShown"), True)
     check("машина-владелец видна в строке", res.get("hostLabelShown"), True)
