@@ -10341,8 +10341,25 @@ async function viewPresets(){
     () => channelPresetModal(Number(b.dataset.id)));
   chpCard.querySelectorAll('.chp-del').forEach(b => b.onclick = () =>
     confirmModal('Удалить пресет канала', `Удалить «${b.dataset.name}»?`, async () => {
-      try{ await api(`/ui/channel-presets/${b.dataset.id}`, {method: 'DELETE'}); await render(); }
-      catch(e){ toast(e.message); }
+      try{
+        await api(`/ui/channel-presets/${b.dataset.id}`, {method: 'DELETE'});
+        // Убираем строку на месте, а НЕ перерисовываем экран целиком. Полная
+        // перерисовка заново тянет список пресетов производства, а он ходит по сети к
+        // соседним сервисам с шестисекундным ожиданием на каждого — из-за этого
+        // удаление и «происходило долго» (жалоба владельца 30.09.2026). Сервер на само
+        // удаление тратит миллисекунды.
+        const row = b.closest('[data-chp]');
+        if (row) row.remove();
+        // Список опустел — показываем объяснение, а не пустое место: «ничего нет» и
+        // «всё удалили» человек читает одинаково, и второе без подписи выглядит сбоем.
+        if (!chpCard.querySelector('[data-chp]')){
+          const шапка = chpCard.querySelector('.sec');
+          if (шапка) шапка.insertAdjacentHTML('afterend', emptyBox({
+            why: 'Пресетов каналов нет.',
+            means: 'Пресет канала задаёт расписание, машину и нишу сразу многим каналам.'}));
+        }
+        toast(`Пресет «${b.dataset.name}» удалён`, 'ok');
+      }catch(e){ toast(e.message); }
     }));
 
 }
@@ -10543,12 +10560,19 @@ async function channelPresetModal(id){
     try{ d = await api(`/ui/channel-presets/${id}`); }
     catch(e){ toast(e.message); return; }
   }else{
-    // Поля для нового берём у пустого набора: тот же список, что и при правке.
+    // Поля для нового спрашиваем у сервера отдельным маршрутом. Раньше их брали у УЖЕ
+    // существующего пресета — и когда ни одного нет (первый пресет в студии или все
+    // удалили), брать было не у кого: окно выходило без единого поля, человек сохранял
+    // одно название, и в списке появлялся пустой пресет. Жалоба владельца 30.09.2026.
     try{
-      const probe = await api('/ui/channel-presets');
-      d.fields = (probe.presets[0] ? (await api(`/ui/channel-presets/${probe.presets[0].id}`)).fields
-                                   : []).map(f => ({...f, value: f.kind === 'days' ? [] : ''}));
-    }catch(e){ /* полей нет — заведём по названию, поля добавятся при правке */ }
+      d = await api('/ui/channel-presets/new');
+    }catch(e){ toast(e.message); return; }
+  }
+  // Без полей окно заводить нельзя: это та самая пустая форма, из-за которой пресет
+  // получался пустым. Лучше честно отказать, чем принять название в никуда.
+  if (creating && !(d.fields || []).length){
+    toast('Не удалось получить поля пресета — попробуйте ещё раз');
+    return;
   }
 
   const fieldHtml = f => {
