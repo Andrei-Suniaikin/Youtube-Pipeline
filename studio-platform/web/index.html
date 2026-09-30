@@ -237,6 +237,27 @@
   .chcard h3{margin:0 0 4px;font-size:16px;font-weight:700;color:var(--ink-hi)}
   .chcard .meta{color:var(--muted);font-size:13px}
 
+  /* Режим выбора. Отметка — внутри карточки, слева: снаружи она уехала бы в зазор
+     сетки и на узком экране слиплась бы с соседней карточкой. Отступ снизу у сетки —
+     чтобы прибитая к низу строка действий не накрыла последний ряд. */
+  .chgrid.picking{padding-bottom:112px}
+  .chgrid.picking .chcard{padding-left:44px;position:relative}
+  .chmark{position:absolute;left:15px;top:17px;width:19px;height:19px;border-radius:50%;
+          border:2px solid var(--line-2);display:grid;place-items:center;font-size:12px;
+          line-height:1;color:transparent}
+  .chcard.on{border-left-color:var(--acc);background:var(--card-2)}
+  .chcard.on .chmark{background:var(--acc);border-color:var(--acc);color:var(--on-acc)}
+  /* Строка действий не уезжает при прокрутке: выбор идёт по всему списку, и кнопка,
+     до которой надо доскроллить, превращает выбор в две работы вместо одной. */
+  .bulkbar{position:fixed;left:0;right:0;bottom:0;z-index:40;background:var(--card-2);
+           border-top:1px solid var(--line-2);padding:11px 18px}
+  .bulkbar[hidden]{display:none}
+  .bulkrow{display:flex;gap:9px;flex-wrap:wrap;align-items:center;
+           max-width:1180px;margin:0 auto}
+  .bulkbar #b-count{font-weight:700;color:var(--ink-hi)}
+  .bulkbar .bnote{max-width:1180px;margin:7px auto 0;font-size:12.5px}
+  .bulksep{flex:1 1 0;min-width:0}
+
   .cal{display:flex;gap:13px;padding:11px 18px;border-bottom:1px solid var(--line);
        align-items:flex-start}
   .cal:last-child{border-bottom:0}
@@ -2252,6 +2273,7 @@ async function viewChannels(){
     'Расписание выходов, план и история. Цвет карточки — состояние канала.')}</h1></div>
     <div class="head-acts">
       <button class="ghost small" id="impch">Перенести списком</button>
+      <button class="ghost small" id="pickmode">Выбрать</button>
       <button class="small" id="newch">Новый канал</button></div></div>`);
   app.append(bar);
 
@@ -2350,13 +2372,79 @@ async function viewChannels(){
   app.append(panel.el);
   const grid = $('<div class="chgrid"></div>').firstElementChild;
   app.append(grid);
+
+  // ── Режим выбора (владелец 30.09.2026: «как в айфоне в галерее — кнопка "Выбрать",
+  // и потом уже выбор действия с этими карточками»). Работает ПОВЕРХ отбора: «выбрать
+  // все отобранные» берёт то, что сейчас в сетке, а не все каналы вообще.
+  let picking = false;
+  const picked = new Set();     // id отмеченных, строками: data-атрибут даёт строку
+  let shown = [];               // что сейчас в сетке — на это и работает «выбрать все»
+  const bulk = $(`<div class="bulkbar" id="bulkbar" hidden>
+    <div class="bulkrow">
+      <span id="b-count">ничего не выбрано</span>
+      <button class="ghost small" id="b-all">выбрать все отобранные</button>
+      <button class="ghost small" id="b-none">снять выбор</button>
+      <span class="bulksep"></span>
+      <button class="small b-act" data-act="paused">Поставить на паузу</button>
+      <button class="small b-act" data-act="active">Вернуть в работу</button>
+      <button class="small b-act" data-act="archived">Убрать в архив</button>
+      <button class="small b-act" data-act="tag_add">Проставить тег</button>
+      <button class="small b-act" data-act="tag_remove">Снять тег</button>
+      <button class="small b-act" data-act="channel_preset">Назначить пресет</button>
+      <button class="ghost small" id="b-off">Готово</button>
+    </div>
+    <div class="note muted bnote">Удалить каналы пачкой нельзя: удаление необратимо и
+      у канала с историей не проходит вовсе. Массовый безопасный шаг — архив: канал
+      перестаёт работать, а прошлое и настройки остаются на месте.</div>
+  </div>`).firstElementChild;
+  app.append(bulk);
+  const countBox = bulk.querySelector('#b-count');
+  const pickBtn = bar.querySelector('#pickmode');
+
+  pickBtn.onclick = () => setPicking(!picking);
+  bulk.querySelector('#b-off').onclick = () => setPicking(false);
+  bulk.querySelector('#b-none').onclick = () => { picked.clear(); draw(shown); };
+  bulk.querySelector('#b-all').onclick = () => {
+    // Только отобранные: тот, кого отбор скрыл, человеку сейчас не виден, и молча
+    // менять его — значит сделать не то, что он видел на экране.
+    for (const c of shown) picked.add(String(c.id));
+    draw(shown);
+  };
+  bulk.querySelectorAll('.b-act').forEach(b => b.onclick = () => askThenRun(b.dataset.act));
+
   draw(panel.apply());
   return;
 
+  function setPicking(on){
+    picking = on;
+    if (!on) picked.clear();
+    pickBtn.textContent = on ? 'Отменить выбор' : 'Выбрать';
+    bulk.hidden = !on;
+    grid.classList.toggle('picking', on);
+    draw(shown);
+  }
+
+  function pickCount(){
+    const n = picked.size;
+    countBox.textContent = n
+      ? `выбрано ${n} ${plural(n, 'канал', 'канала', 'каналов')}`
+      : 'ничего не выбрано';
+    bulk.querySelectorAll('.b-act').forEach(b => { b.disabled = !n; });
+  }
+
   function draw(list){
+    shown = list;
+    // Отмеченный канал, которого отбор больше не показывает, из выбора уходит: иначе
+    // действие задело бы канал, которого человек на экране уже не видит.
+    const видно = new Set(list.map(c => String(c.id)));
+    for (const id of [...picked]) if (!видно.has(id)) picked.delete(id);
     grid.innerHTML = list.map(c => `
-    <div class="chcard ${cls(c)}" data-id="${c.id}" tabindex="0" role="link"
+    <div class="chcard ${cls(c)}${picking && picked.has(String(c.id)) ? ' on' : ''}"
+      data-id="${c.id}" tabindex="0"
+      ${picking ? `role="checkbox" aria-checked="${picked.has(String(c.id))}"`
+                : 'role="link"'}
       aria-label="Канал ${esc(c.name)}">
+      ${picking ? '<span class="chmark">✓</span>' : ''}
       <h3>${esc(c.name)}</h3>
       <div class="meta">${esc(c.handle || '—')} · ${esc(c.lang)}</div>
       <div class="meta" style="margin-top:7px">
@@ -2378,12 +2466,122 @@ async function viewChannels(){
         Ни один канал не подошёл. Смягчите поиск или сбросьте отборы.</div></div>`;
     }
     grid.querySelectorAll('.chcard').forEach(el => {
-      const go = () => location.hash = '#/channel/' + el.dataset.id;
-      el.onclick = go;
+      // Главная ловушка режима выбора: привычный клик по карточке не должен уносить со
+      // страницы посреди выбора — уход стирает всё отмеченное, и человек начинает
+      // заново. Поэтому в режиме выбора тот же клик отмечает, а не ведёт в канал.
+      const hit = () => {
+        if (picking){ mark(el); return; }
+        location.hash = '#/channel/' + el.dataset.id;
+      };
+      el.onclick = hit;
       el.onkeydown = ev => {
-        if (ev.key === 'Enter' || ev.key === ' '){ ev.preventDefault(); go(); }
+        if (ev.key === 'Enter' || ev.key === ' '){ ev.preventDefault(); hit(); }
       };
     });
+    pickCount();
+  }
+
+  function mark(el){
+    const id = el.dataset.id;
+    if (picked.has(id)) picked.delete(id); else picked.add(id);
+    el.classList.toggle('on', picked.has(id));
+    el.setAttribute('aria-checked', String(picked.has(id)));
+    pickCount();
+  }
+
+  // Спросить то, без чего действие не выполнить (тег, пресет), и подтвердить то, чего
+  // человек не ждёт увидеть массовым (архив).
+  function askThenRun(act){
+    const n = picked.size;
+    if (!n){ toast('Сначала отметьте каналы'); return; }
+    const каналов = `${n} ${plural(n, 'канал', 'канала', 'каналов')}`;
+    if (act === 'tag_add' || act === 'tag_remove'){
+      const known = [...new Set(d.channels.flatMap(c => c.tags || []))]
+        .sort((a, b) => a.localeCompare(b, 'ru'));
+      const add = act === 'tag_add';
+      modal(add ? 'Проставить тег' : 'Снять тег',
+        `<div class="fldrow"><label>Тег</label>
+           <input id="b-tag" list="b-tags" style="width:240px" placeholder="ww2">
+           <datalist id="b-tags">${known.map(t =>
+             `<option value="${esc(t)}"></option>`).join('')}</datalist></div>
+         <div class="note muted">${каналов}. ${add
+           ? 'Тег добавится к тем, что на канале уже стоят — ничего не сотрётся.'
+           : 'Снимется только этот тег, остальные останутся.'}</div>`,
+        {ok: 'Применить', onOk: async (body, close) => {
+          const tag = body.querySelector('#b-tag').value.trim();
+          if (!tag) throw new Error('впишите тег');
+          close();
+          await runBulk(act, {tag});
+        }});
+      return;
+    }
+    if (act === 'channel_preset'){
+      pickPreset(каналов);
+      return;
+    }
+    if (act === 'archived'){
+      confirmModal('Убрать в архив',
+        `Убрать в архив ${каналов}? В архиве канал перестаёт работать, но история и `
+        + 'настройки остаются — вернуть его в работу можно тем же списком.',
+        () => runBulk(act, {}));
+      return;
+    }
+    runBulk(act, {});
+  }
+
+  async function pickPreset(каналов){
+    let list = [];
+    try{ list = (await api('/ui/channel-presets')).presets || []; }
+    catch(e){ toast(e.message); return; }
+    modal('Назначить пресет канала',
+      `<div class="fldrow"><label>Пресет</label>
+         <select id="b-preset" style="width:260px">
+           <option value="">— снять с пресета —</option>${list.map(p =>
+             `<option value="${p.id}">${esc(p.name)}</option>`).join('')}</select></div>
+       <div class="note muted">${каналов}. Пока канал сидит на пресете, перекрытые
+         поля приходят из пресета, и правка пресета меняет их у всех сразу.</div>`,
+      {ok: 'Назначить', onOk: async (body, close) => {
+        const val = body.querySelector('#b-preset').value;
+        close();
+        await runBulk('channel_preset', {preset_id: val ? Number(val) : null});
+      }});
+  }
+
+  async function runBulk(act, extra){
+    const ids = [...picked].map(Number);
+    // Кнопки действий гасим на время запроса: второй клик по «на паузу» пока идёт
+    // первый — это второй проход по тем же каналам и второй ответ про один результат.
+    bulk.querySelectorAll('.b-act').forEach(b => { b.disabled = true; });
+    let out;
+    try{
+      out = await post('/ui/channels/bulk', Object.assign({ids, action: act}, extra));
+    }catch(e){
+      // Отказ всему запросу — отмеченное не тронуто, и выбор остаётся как был:
+      // человеку нужно исправить причину и нажать снова, а не отмечать заново.
+      toast(e.message);
+      pickCount();
+      return;
+    }
+    // Итог называем поимённо. «Сделано 18, не вышло у двух» без имён отправляет
+    // человека искать эти два вручную по всему списку.
+    const parts = [`${out.action}: сделано ${out.done.length}`];
+    if (out.same.length) parts.push(`менять было нечего у ${out.same.join(', ')}`);
+    if (out.failed.length) parts.push('не вышло — '
+      + out.failed.map(f => `${f.name}: ${f.why}`).join('; '));
+    parts.push('денег это не тратит');
+    toast(parts.join(' · '), out.failed.length ? 'warn' : 'ok');
+    // Список перечитываем, а страницу не перерисовываем: режим выбора и отбор остаются
+    // на месте. Отмеченными оставляем только те, у кого не вышло, — их видно, и повтор
+    // идёт ровно по ним, а не по всей пачке второй раз.
+    try{
+      const fresh = await api('/ui/channels');
+      d.channels.length = 0;
+      d.channels.push(...fresh.channels);
+      panel.refill();
+    }catch(e){ toast(e.message); }
+    picked.clear();
+    for (const f of out.failed) picked.add(String(f.id));
+    draw(panel.apply());
   }
 }
 
@@ -3308,7 +3506,10 @@ function channelSieve(all, stats, onChange){
               status: было.status || '', tag: было.tag || '', sort: было.sort || 'name'};
   const uniq = (key) => [...new Set(all.map(c => c[key]).filter(Boolean))].sort(
     (a, b) => String(a).localeCompare(String(b), 'ru'));
-  const tags = [...new Set(all.flatMap(c => c.tags || []))].sort(
+  // Функцией, а не разовым списком: массовая простановка тега (кнопка «Выбрать» на этом
+  // же экране) заводит теги на ходу, и отбор обязан их увидеть, не дожидаясь
+  // перезагрузки страницы.
+  const tags = () => [...new Set(all.flatMap(c => c.tags || []))].sort(
     (a, b) => a.localeCompare(b, 'ru'));
 
   const opts = (list, cur, пусто) =>
@@ -3325,8 +3526,7 @@ function channelSieve(all, stats, onChange){
         `<option value="">любое состояние</option>` + Object.entries(CH_STATUS).map(([k, v]) =>
           `<option value="${esc(k)}"${k === st.status ? ' selected' : ''}>${esc(v)}</option>`
         ).join('')}</select>
-      ${tags.length ? `<select id="s-tag" style="width:160px">${
-        opts(tags, st.tag, 'любой тег')}</select>` : ''}
+      <select id="s-tag" style="width:160px">${opts(tags(), st.tag, 'любой тег')}</select>
       <select id="s-sort" style="width:200px">${CH_SORTS.map(([k, v]) =>
         `<option value="${k}"${k === st.sort ? ' selected' : ''}>${esc(v)}</option>`
       ).join('')}</select>
@@ -3392,7 +3592,25 @@ function channelSieve(all, stats, onChange){
     if (srt) srt.value = 'name';
     touch();
   };
-  return {el, apply};
+  // Пересобрать списки значений по текущему `all`. Нужно после массового действия: оно
+  // могло завести новый тег или сменить состояние каналов, а отбор, показывающий
+  // прошлый набор значений, врёт о том, что на экране есть.
+  const refill = () => {
+    const fill = (id, list, пусто) => {
+      const node = el.querySelector(id);
+      if (!node) return;
+      const был = node.value;
+      node.innerHTML = opts(list, был, пусто);
+      // Значение могло исчезнуть вместе с последним каналом, который его носил: тогда
+      // отбор снимаем, иначе сетка останется пустой без причины, названной словами.
+      if (node.value !== был) st[id.slice(3)] = node.value;
+    };
+    fill('#s-lang', uniq('lang'), 'любой язык');
+    fill('#s-niche', uniq('niche'), 'любая ниша');
+    fill('#s-tag', tags(), 'любой тег');
+    sieveSave(st);
+  };
+  return {el, apply, refill};
 }
 
 function calendarFeed(d){

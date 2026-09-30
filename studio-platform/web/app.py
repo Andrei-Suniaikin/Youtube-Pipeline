@@ -58,9 +58,9 @@ from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
                           collect_paid_texts, paid_texts_waiting)
 from pub_neighbors import (cover_presets, rewrite_preset_config,  # noqa: E402
                            rewrite_presets, vsgen_presets)
-from pub_tags import (DONOR_UNKNOWN_WHY, add_links, check_donor,   # noqa: E402
-                      donor_facts_blank, donor_limits, donor_title, donor_verdict,
-                      parse_links, plan_rows)
+from pub_tags import (DONOR_UNKNOWN_WHY, add_links, add_tag,       # noqa: E402
+                      check_donor, clean_tag, donor_facts_blank, donor_limits,
+                      donor_title, donor_verdict, drop_tag, parse_links, plan_rows)
 from pub_tags import tag_names as pub_tags_names                 # noqa: E402
 import channel_supply                                            # noqa: E402
 import pub_ui                                                    # noqa: E402
@@ -7049,6 +7049,121 @@ def ui_channel_status(cid: int, body: dict):
     finally:
         c.close()
     return {"ok": True}
+
+
+# Массовые действия. Ключ — то, что пришло с экрана, значение — как это назвать человеку
+# в ответе. Удаления в этом списке нет намеренно, см. `ui_channels_bulk`.
+BULK_ACTIONS = {
+    "active": "вернуть в работу",
+    "paused": "поставить на паузу",
+    "archived": "убрать в архив",
+    "tag_add": "проставить тег",
+    "tag_remove": "снять тег",
+    "channel_preset": "назначить пресет канала",
+}
+# Больше трёхсот каналов за один раз — это уже не «отметил и нажал», а промах: пусть
+# лучше откажет сразу, чем полчаса молча пишет в базу под открытым запросом.
+BULK_LIMIT = 300
+
+
+class ChannelsBulkIn(BaseModel):
+    ids: list[int] = []
+    action: str = ""
+    tag: str = ""
+    preset_id: int | None = None
+
+
+@app.post("/ui/channels/bulk")
+def ui_channels_bulk(body: ChannelsBulkIn):
+    """Одно действие над отмеченными каналами (владелец 30.09.2026: «можно сделать как в
+    айфоне в галерее — кнопку "Выбрать", и потом уже выбор действия с этими карточками»).
+
+    Три решения, которые здесь важнее кода:
+
+    • УДАЛЕНИЯ ЗДЕСЬ НЕТ И НЕ БУДЕТ. Удаление канала обставлено проверками
+      (`ui_channel_delete`: канал с историей не удаляется — иначе его выпуски повиснут
+      на номере, который выдадут заново, и однажды найдутся у другого канала). Пачкой
+      такое однажды снесёт не то. Архив безопасен и обратим — его и даём.
+    • НЕ «ВСЁ ИЛИ НИЧЕГО». Каждый канал пишется и фиксируется сам, отказ по одному не
+      отменяет остальные. Общая транзакция откатила бы уже удавшееся, и человек, увидев
+      одну ошибку, не знал бы, что из двадцати каналов изменилось, а что нет.
+    • ТЕ ЖЕ ПРОВЕРКИ, ЧТО У ОДИНОЧНОГО ДЕЙСТВИЯ, а не в обход них: статус пишет
+      `pub_ui.set_channel_status`, пресет ищет `_channel_preset_row`, имя тега приводит
+      `clean_tag` — ровно те функции, что зовут одиночные маршруты.
+
+    «Менять было нечего» — третий ответ рядом с «сделано» и «не вышло»: канал, который
+    уже стоял на паузе, ничего не прибавляет к сделанному, и выдавать его за проделанную
+    работу — врать о том, что произошло.
+    """
+    act = (body.action or "").strip()
+    if act not in BULK_ACTIONS:
+        raise HTTPException(400, "неизвестное массовое действие")
+    # Повторы номера сворачиваем: по одной карточке успевают кликнуть дважды, а канал
+    # должен обработаться один раз, а не столько, сколько его прислали.
+    ids, seen = [], set()
+    for cid in body.ids or []:
+        if cid not in seen:
+            seen.add(cid)
+            ids.append(cid)
+    if not ids:
+        raise HTTPException(400, "не отмечен ни один канал")
+    if len(ids) > BULK_LIMIT:
+        raise HTTPException(400, f"за один раз — не больше {BULK_LIMIT} каналов, "
+                                 f"отмечено {len(ids)}")
+    tag = ""
+    if act in ("tag_add", "tag_remove"):
+        tag = clean_tag(body.tag)
+        if not tag:
+            raise HTTPException(400, "не задан тег")
+    now = time.time()
+    done, same, failed = [], [], []
+    c = db()
+    try:
+        # Пресет проверяем один раз и ДО цикла: «нет такого пресета» — это про сам
+        # запрос, а не про отдельный канал, и двадцать одинаковых отказов подряд
+        # ничего человеку не объяснят.
+        if act == "channel_preset" and body.preset_id is not None:
+            _channel_preset_row(c, body.preset_id)
+        for cid in ids:
+            ch = c.execute("SELECT id, name, status, preset_channel_id FROM pub_channels "
+                           "WHERE id=? AND tenant_id=?", (cid, TENANT)).fetchone()
+            if ch is None:
+                failed.append({"id": cid, "name": f"канал №{cid}",
+                               "why": "канала нет — возможно, его уже удалили"})
+                continue
+            name = ch["name"]
+            try:
+                if act in ("active", "paused", "archived"):
+                    if ch["status"] == act:
+                        same.append(name)
+                        continue
+                    pub_ui.set_channel_status(c, TENANT, cid, act, now=now)
+                elif act == "tag_add":
+                    if not add_tag(c, TENANT, cid, tag, now):
+                        same.append(name)
+                        continue
+                elif act == "tag_remove":
+                    if not drop_tag(c, TENANT, cid, tag):
+                        same.append(name)
+                        continue
+                else:
+                    if ch["preset_channel_id"] == body.preset_id:
+                        same.append(name)
+                        continue
+                    c.execute("UPDATE pub_channels SET preset_channel_id=?, updated=? "
+                              "WHERE id=? AND tenant_id=?",
+                              (body.preset_id, now, cid, TENANT))
+                # Фиксируем по каналу: так «сделано» в ответе означает «записано», а не
+                # «записалось бы, если бы дальше всё прошло».
+                c.commit()
+                done.append(name)
+            except (pub_ui.ChannelError, ValueError, sqlite3.Error) as exc:
+                c.rollback()
+                failed.append({"id": cid, "name": name, "why": str(exc)})
+    finally:
+        c.close()
+    return {"ok": True, "action": BULK_ACTIONS[act], "asked": len(ids),
+            "done": done, "same": same, "failed": failed}
 
 
 class ChannelUCIn(BaseModel):

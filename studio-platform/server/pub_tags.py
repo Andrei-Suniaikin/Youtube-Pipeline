@@ -574,11 +574,56 @@ def all_tags(c, tenant_id: str) -> list:
     return [(r[0], r[1]) for r in rows]
 
 
+def clean_tag(raw) -> str:
+    """Имя тега так, как оно лежит в базе: без лишних пробелов, строчными, до 40 знаков.
+
+    Вынесено из `set_tags` (30.09.2026, массовая простановка тега): вторая копия этого
+    правила рано или поздно разошлась бы с первой, и « WW2 » завёл бы второй тег рядом с
+    «ww2» — отбор по тегу после этого находил бы половину каналов вместо всех.
+    """
+    return " ".join(str(raw or "").split()).strip().lower()[:40]
+
+
+def add_tag(c, tenant_id: str, channel_id: int, name: str, now: float) -> bool:
+    """Дописать каналу один тег. `False` — тег на нём уже стоял, менять было нечего.
+
+    Не через `set_tags`: та переписывает НАБОР целиком, и массовое «проставить тег»
+    через неё стёрло бы всё, что на канале уже висит.
+    """
+    tag = clean_tag(name)
+    if not tag:
+        raise ValueError("тег не задан")
+    row = c.execute("SELECT id FROM pub_tags WHERE tenant_id=? AND name=?",
+                    (tenant_id, tag)).fetchone()
+    tag_id = row[0] if row else c.execute(
+        "INSERT INTO pub_tags(tenant_id,name,created) VALUES(?,?,?)",
+        (tenant_id, tag, now)).lastrowid
+    cur = c.execute("INSERT OR IGNORE INTO pub_channel_tags(channel_id,tag_id) VALUES(?,?)",
+                    (channel_id, tag_id))
+    return cur.rowcount > 0
+
+
+def drop_tag(c, tenant_id: str, channel_id: int, name: str) -> bool:
+    """Снять с канала один тег. `False` — тега на канале и не было.
+
+    Сам тег из справочника не удаляется: его носят другие каналы, а `all_tags` и так
+    не показывает теги, за которыми не осталось ни одного канала.
+    """
+    tag = clean_tag(name)
+    if not tag:
+        raise ValueError("тег не задан")
+    cur = c.execute(
+        "DELETE FROM pub_channel_tags WHERE channel_id=? AND tag_id IN "
+        "(SELECT id FROM pub_tags WHERE tenant_id=? AND name=?)",
+        (channel_id, tenant_id, tag))
+    return cur.rowcount > 0
+
+
 def set_tags(c, tenant_id: str, channel_id: int, names: list, now: float) -> None:
     """Переписать теги канала. Неизвестные заводятся на лету."""
     clean = []
     for raw in names:
-        name = " ".join(str(raw).split()).strip().lower()[:40]
+        name = clean_tag(raw)
         if name and name not in clean:
             clean.append(name)
     c.execute("DELETE FROM pub_channel_tags WHERE channel_id=?", (channel_id,))
