@@ -9596,13 +9596,22 @@ async def ui_release_confirm_by_hand(release_id: str, request: Request):
         body = await request.json()
     except Exception:
         pass
+    # Кто вошёл — уже выяснила общая охрана (`require_session`): без входа до ручки
+    # дело не доходит вовсе. Второй раз спрашивать базу незачем, а главное — незачем
+    # заводить второй ответ на вопрос «кто это».
+    user = getattr(request.state, "user", None)
+    кто = (user["name"] if user is not None else "")
     c = db()
     try:
-        user = auth.who(c, request.cookies.get(auth.COOKIE) or "")
-        if user is None:
-            raise HTTPException(401, "нужен вход")
+        # Чей выпуск — спрашиваем явно, хотя пульт и так живёт одним арендатором.
+        # Действие необратимое и пометка навсегда: ошибиться тут нечем, но и платить за
+        # «и так не бывает» нечем тоже.
+        own = c.execute("SELECT 1 FROM pub_releases WHERE release_id=? AND tenant_id=?",
+                        (release_id, TENANT)).fetchone()
+        if not own:
+            raise HTTPException(404, "выпуск не найден")
         out = pub_engine_confirm_by_hand(
-            c, release_id, who=user["name"],
+            c, release_id, who=кто,
             video_id=str((body or {}).get("video_id") or ""),
             note=str((body or {}).get("note") or ""))
         if not out["ok"]:

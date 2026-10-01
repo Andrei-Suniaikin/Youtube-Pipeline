@@ -59,11 +59,12 @@ SCENARIO = r"""
       day: '07.10.2026', tz: 'UTC',
       groups: [{tag: 'ww2', channels: 2, plan: 3, accepted: 1, blocked: 0},
                {tag: 'прочие', channels: 1, plan: 0, accepted: 0, blocked: 2}],
-      today: {expected: 2, ahead: 1, confirmed: 0, delayed: 0, unknown: 2,
+      today: {expected: 2, ahead: 1, confirmed: 0, by_hand: 0, delayed: 0, unknown: 2,
               why: ['нет ключа YouTube Data API — подтвердить выход нечем']},
       production: {accepted: 1, no_supply: 2, supply_unknown: 1, threshold_days: 3},
       problems: [{channel: 'Третий', channel_id: 77, why: 'ключ FastGen кончился',
                   next: 'не назначен — материала на ближайший выход нет'}],
+      uploads: {'всего': 0, safe: 0, silent: 0, sent: 0, stale: 0},
       alerts: [{key: 'a', title: 'Каналам не хватает материала'}], alerts_why: ''
     }
   };
@@ -90,6 +91,9 @@ SCENARIO = r"""
   await tick(500);
 
   out.экран = document.querySelector('#app').textContent.replace(/\s+/g, ' ');
+  // Срывов не было — карточки про них быть не должно: «срывов нет» каждое утро
+  // приучает не читать строку (решение владельца, п. 7).
+  out.безСрывовКарточкиНет = !out.экран.includes('Срывы заливки');
   out.вкладкаПодсвечена = document.getElementById('tab-digest')
                             .classList.contains('on');
   out.чужаяВкладкаПогасла = !document.getElementById('tab-channels')
@@ -106,6 +110,26 @@ SCENARIO = r"""
   tg.checked = true;
   tg.dispatchEvent(new Event('change', {bubbles: true}));
   await tick(200);
+
+  // ── числа, которых на экране не было: подтверждение человеком и срывы заливки ──
+  DIGEST.digest.today = {expected: 3, ahead: 0, confirmed: 1, by_hand: 1, delayed: 0,
+                         unknown: 1, why: ['проверка выхода ещё не проходила']};
+  DIGEST.digest.uploads = {'всего': 4, safe: 1, silent: 2, sent: 1, stale: 0};
+  location.hash = '#/channels';
+  await tick(150);
+  location.hash = '#/digest';
+  await tick(500);
+  out.второй = document.querySelector('#app').textContent.replace(/\s+/g, ' ');
+  // Само число подтверждённого — из его клетки, а не поиском «2» по всей странице:
+  // двойка на экране сводки встречается в десяти местах.
+  {
+    const ряд = [...document.querySelectorAll('#app tr')].find(
+      tr => (tr.textContent || '').includes('Подтверждён выход на YouTube'));
+    out.подтвержденоЧисло = ряд ? (ряд.cells[1].textContent || '').trim() : '';
+    const руками = [...document.querySelectorAll('#app tr')].find(
+      tr => (tr.textContent || '').includes('В том числе подтверждено человеком'));
+    out.рукамиЧисло = руками ? (руками.cells[1].textContent || '').trim() : '';
+  }
 
   // Клик по строке проблемы ведёт на её канал.
   document.querySelector('#app tr[data-cid]').click();
@@ -157,6 +181,27 @@ def main() -> int:
           "/ui/digest/settings")
     check("включение передано явно", posted and posted[0][1].get("telegram"), True)
     check("час отправки передан", posted and posted[0][1].get("hour"), 9)
+
+    print("\nПодтверждённое человеком и срывы заливки")
+    check("без срывов карточки про них нет", res.get("безСрывовКарточкиНет"), True)
+    второй = res.get("второй") or ""
+    # Число на экране обязано совпадать с числом в тексте отчёта: подтверждённое
+    # человеком — выполнение плана, и складывают его оба места одинаково.
+    # Машиной подтверждён один, человеком ещё один — на экране обязано стоять два,
+    # ровно как в тексте отчёта (`pub_digest._confirmed_text`). Разойдясь, экран и
+    # отчёт расходятся молча, и находит это заказчик, сверив одно с другим.
+    check("подтверждено считается вместе с руками",
+          res.get("подтвержденоЧисло"), "2")
+    check("и отдельной строкой сказано, сколько руками", res.get("рукамиЧисло"), "1")
+    check("карточка срывов появилась", "Срывы заливки за сутки" in второй, True)
+    check("сказано, сколько безопасно повторить",
+          "Файл не уходил — повтор безопасен" in второй, True)
+    check("и что молчание ноды — не разрешение",
+          "Нода замолчала — не знаем, уходил ли файл" in второй, True)
+    check("и что уже ушедшее повторять нельзя",
+          "Файл уже уходил — повторять нельзя" in второй, True)
+    # Классов без случаев на экране нет: пустая строка «0» ничего не говорит.
+    check("класса без случаев на экране нет", "Повторять нечего" in второй, False)
 
     print("\nПереходы")
     check("клик по проблеме ведёт на её канал", res.get("ушлиНаКанал"), "#/channel/77")

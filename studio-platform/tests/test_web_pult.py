@@ -1094,6 +1094,68 @@ def main() -> int:
     finally:
         drop_release(rel_id, plan_id)
 
+    print("\n«Подтвердить руками» — ручка на живом стенде (01.10.2026)")
+    # Серверная логика проверена в tests/test_hand_confirm.py. Здесь — ручка: вход,
+    # чужой выпуск и то, что отказ доезжает до человека словами, а не пятисоткой.
+    check("без входа закрыто",
+          anon.go("/ui/releases/нет-такого/confirm-by-hand", {})[0], 401)
+    check("несуществующий выпуск — 404",
+          me.go("/ui/releases/нет-такого-выпуска/confirm-by-hand", {})[0], 404)
+    rel_id, plan_id = make_release("test-hand-confirm")
+    try:
+        # Выпуск в работе, не в разборе: подтверждать такой нельзя, и отказ обязан быть
+        # 409 со словами, а не 500.
+        code, body = me.go(f"/ui/releases/{rel_id}/confirm-by-hand",
+                           {"video_id": "abcDEF12345"})
+        check("выпуск не в разборе — отказ 409", code, 409)
+        check("и сказано почему",
+              "только выпуск в разборе" in str(body.get("detail") or ""), True)
+        set_release_phase(rel_id, "upload_running")
+        c = sqlite3.connect(DB, timeout=5)
+        try:
+            c.execute("UPDATE pub_releases SET status='blocked' WHERE release_id=?",
+                      (rel_id,))
+            # Журнал фаз — то, по чему движок решает, уходил ли файл. Без него
+            # подтверждение обязано отказать: закрывать невыложенный выпуск нельзя.
+            c.execute("INSERT INTO pub_release_events(release_id,seq,phase,created) "
+                      "VALUES(?,1,'upload_running',?)", (rel_id, time.time()))
+            c.commit()
+        finally:
+            c.close()
+        code, body = me.go(f"/ui/releases/{rel_id}/confirm-by-hand", {})
+        check("без номера ролика — отказ", code, 409)
+        check("и сказано, что делать",
+              "скопируйте ссылку" in str(body.get("detail") or ""), True)
+        code, body = me.go(f"/ui/releases/{rel_id}/confirm-by-hand",
+                           {"video_id": "https://youtu.be/abcDEF12345",
+                            "note": "проверка ручки"})
+        check("со ссылкой — принято", code, 200)
+        check("номер разобран", (body or {}).get("video_id"), "abcDEF12345")
+        check("выпуск закрыт как выполненный", release_status(rel_id), "done")
+        c = sqlite3.connect(DB, timeout=5)
+        c.row_factory = sqlite3.Row
+        try:
+            r = c.execute("SELECT hand_confirmed, hand_by, hand_video_id FROM pub_releases "
+                          "WHERE release_id=?", (rel_id,)).fetchone()
+            check("пометка стоит", bool(r["hand_confirmed"]), True)
+            check("и кто подтвердил — вошедший, а не то, что пришло в теле",
+                  r["hand_by"], LOGIN)
+            check("и номер ролика", r["hand_video_id"], "abcDEF12345")
+        finally:
+            c.close()
+        code, body = me.go(f"/ui/releases/{rel_id}/confirm-by-hand",
+                           {"video_id": "abcDEF12345"})
+        check("второй раз — отказ", code, 409)
+    finally:
+        drop_release(rel_id, plan_id)
+        c = sqlite3.connect(DB, timeout=5)
+        try:
+            c.execute("DELETE FROM pub_release_events WHERE release_id=?", (rel_id,))
+            c.execute("DELETE FROM pub_release_log WHERE release_id=?", (rel_id,))
+            c.commit()
+        finally:
+            c.close()
+
     print("\nСсылки без даты видно списком, а не только числом (18.09.2026)")
     mark = "test-waiting-list"
     code, body = me.go("/ui/links", {"channel_id": 1, "links": f"https://youtu.be/{mark}"})

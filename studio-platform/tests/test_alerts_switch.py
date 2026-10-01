@@ -35,7 +35,8 @@ ADMIN = r"""
   const out = {errs: []};
   addEventListener('error', e => out.errs.push(e.message));
   try {
-    const A = off => ({active: [], owed_recovered: [], thresholds: [],
+    let ДОЛГИ = [];
+    const A = off => ({active: [], owed_recovered: ДОЛГИ, thresholds: [],
       transport: {configured: true, token: '12…ab', chat: '-100', how: '', loop_off: off}});
     let OFF = true;
     window.api = async p => {
@@ -63,6 +64,22 @@ ADMIN = r"""
     OFF = false;
     try { await viewAdmin(); } catch (e) { out.errs.push('viewAdmin: ' + e.message + ' @ ' + String(e.stack).split('\n')[1]); }
     out.включён = name();
+
+    // Строка «ждут сообщения «починилось»» появляется только когда долги есть, и
+    // именно поэтому её отступы однажды уехали незамеченными: пустой список её не
+    // рисует, а замер отступов (tests/test_spacing_browser.py) ловит её только на тех
+    // данных стенда, где долг случился. Здесь долг задан нарочно.
+    ДОЛГИ = [{key: 'fastgen', title: 'Ключ FastGen кончился'}];
+    try { await viewAdmin(); } catch (e) { out.errs.push('viewAdmin: ' + e.message); }
+    {
+      const нота = [...document.querySelectorAll('.note')].find(
+          x => (x.textContent || '').includes('Ждут сообщения'));
+      out.долгВиден = !!нота;
+      out.долгНазван = нота ? (нота.textContent || '').includes('Ключ FastGen') : false;
+      // Отступ берёт обёртка .secbody — то же правило, что у остального содержимого
+      // карточек. Без неё строка стоит вплотную к рамке и к низу карточки.
+      out.долгВОбёртке = !!(нота && нота.closest('.secbody'));
+    }
   } catch (e) { out.errs.push(String(e && e.stack || e)); }
   document.documentElement.setAttribute('data-result', JSON.stringify(out));
 })();
@@ -137,6 +154,14 @@ def main() -> int:
            "ok": False})
     check("включённый — как раньше", res.get("включён"),
           {"name": "Телеграм настроен", "ok": True})
+
+    print("\nДолг «починилось» видно, и он не слипается с рамкой")
+    check("строка про долг показана", res.get("долгВиден"), True)
+    check("и названа тревога", res.get("долгНазван"), True)
+    # Отступ даёт обёртка `.secbody` — то же правило, что у остального содержимого
+    # карточек. Без неё строка стояла вплотную к левой рамке и к низу карточки, и
+    # поймал это только замер отступов на тех данных стенда, где долг случился.
+    check("отступ есть — строка в .secbody", res.get("долгВОбёртке"), True)
 
     print()
     if FAILS:

@@ -11108,8 +11108,9 @@ async function viewAdmin(){
             : 'ещё не сказано'}</div>
         </div></div>`).join('')
       : '<div class="empty">Ни один из тринадцати поводов не выполнен.</div>'}
-    ${a.owed_recovered.length ? `<div class="note">Ждут сообщения «починилось»:
-       ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div>` : ''}
+    ${a.owed_recovered.length ? `<div class="secbody"><div class="note"
+       style="margin:0">Ждут сообщения «починилось»:
+       ${a.owed_recovered.map(o => esc(o.title)).join(', ')}</div></div>` : ''}
   </div>`);
   app.append(alertsWrap);
 
@@ -11402,7 +11403,13 @@ async function viewDigest(){
   // отдельные слова. Ноль тут пишется только тогда, когда про каждый выход есть
   // ответ; иначе стоит «не знаем» и причина — см. `server/pub_digest.py`.
   const known = t.expected - t.unknown;
-  const confirmText = (t.unknown && known <= 0) ? 'не знаем' : String(t.confirmed);
+  // Подтверждённое человеком — выполнение плана (владелец 01.10.2026, п. 6), поэтому
+  // входит в число. Складывается ЗДЕСЬ так же, как в тексте отчёта
+  // (`pub_digest._confirmed_text`): два места, считающие одно число по-разному,
+  // расходятся молча, и расхождение находит заказчик, сверив отчёт с экраном.
+  const руками = t.by_hand || 0;
+  const confirmText = (t.unknown && known <= 0) ? 'не знаем'
+    : String((t.confirmed || 0) + руками);
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Сегодня</div>
     <table><tbody>
@@ -11417,6 +11424,12 @@ async function viewDigest(){
       <tr><td>Задержано</td>
           <td style="text-align:right;font-weight:600${
             t.delayed ? ';color:var(--bad)' : ''}">${t.delayed}</td></tr>
+      ${руками ? `<tr><td class="muted">В том числе подтверждено человеком ${hintDot(
+        'Человек открыл канал и увидел ролик там. План выполнен, заливка не '
+        + 'повторится. Машинного подтверждения по этим выходам у нас нет: ответа '
+        + 'YouTube Data API не было.')}</td>
+          <td style="text-align:right;font-weight:600" class="muted">${руками}</td></tr>`
+        : ''}
       ${t.unknown ? `<tr><td class="muted">Про столько выходов ответа нет</td>
           <td style="text-align:right;font-weight:600" class="muted">${t.unknown}</td></tr>`
         : ''}
@@ -11464,6 +11477,39 @@ async function viewDigest(){
           <td style="text-align:right" class="muted">${p.supply_unknown}</td></tr>` : ''}
     </tbody></table>
   </div>`));
+
+  /* ── срывы заливки ── */
+  // Замер под решение владельца 01.10.2026, п. 7: автоповтор заливки решается по
+  // числам. Карточка показывается только когда срывы были: «срывов нет» каждое утро
+  // приучает не читать строку, и в день, когда они появятся, её не заметят.
+  const u = g.uploads || {};
+  if (u['всего']){
+    const ряд = (ключ, подпись, подсказка, плохо) => (u[ключ] ? `<tr>
+      <td${плохо ? '' : ' class="muted"'}>${подпись} ${hintDot(подсказка)}</td>
+      <td style="text-align:right;font-weight:600${плохо ? ';color:var(--bad)' : ''}"${
+        плохо ? '' : ' class="muted"'}>${u[ключ]}</td></tr>` : '');
+    app.append($(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">Срывы заливки за сутки ${hintDot(
+        'Одна строка на каждый сорвавшийся выпуск. Разбор на классы делается в момент '
+        + 'срыва: позже ответить, уходил ли файл в YouTube, уже нечем.')}</div>
+      <table><tbody>
+        <tr><td>Всего</td>
+            <td style="text-align:right;font-weight:600">${u['всего']}</td></tr>
+        ${ряд('safe', 'Файл не уходил — повтор безопасен',
+              'Доказано: ни номера ролика, ни фазы отправки. Такой выпуск возвращают '
+              + 'в работу кнопкой на его странице.', false)}
+        ${ряд('silent', 'Нода замолчала — не знаем, уходил ли файл',
+              'Это НЕ ноль и НЕ разрешение повторить: машина могла продолжать '
+              + 'загрузку молча. Повтор дал бы второй ролик на канале.', true)}
+        ${ряд('sent', 'Файл уже уходил — повторять нельзя',
+              'Есть номер ролика или фаза отправки. Разбирается руками: на странице '
+              + 'выпуска есть «Подтвердить руками».', true)}
+        ${ряд('stale', 'Повторять нечего',
+              'Ролик пересобрали или время выхода прошло. Нужна новая приёмка, а не '
+              + 'повтор заливки.', false)}
+      </tbody></table>
+    </div>`));
+  }
 
   /* ── проблемы ── */
   app.append($(`<div class="card" style="margin-bottom:16px">
