@@ -33,6 +33,8 @@
 схемой должно падать здесь, а не на VPS.
 """
 import importlib.util
+import contextlib
+import io
 import json
 import os
 import sqlite3
@@ -285,10 +287,18 @@ def test_passports(tmp):
           gate.is_accepted(gate.taken("m_x", "UC", {"video": {}}, 1.0)), True)
     check("у старого ролика версия названа словом",
           gate.unknown_version(1.0)["version"], "unknown")
-    check("паспорта нет — сверять не с чем, молчим",
-          gate.mismatch({}, {"video": {"size": 1}}), "")
-    check("«версия неизвестна» не выдаётся за пересборку",
-          gate.mismatch(gate.unknown_version(1.0), {"video": {"size": 1}}), "")
+    # Разбор 01.10.2026: «паспорта нет» — это НЕ «совпало». Раньше здесь ждали пустую
+    # строку, то есть «всё в порядке», и выпуск прежней версии моста возвращался в
+    # очередь со словами «срывалось не по вине ролика» — хотя версию файла никто ни с
+    # чем не сверял. На боевой машине около сорока пяти роликов пересобраны 26.09:
+    # пересобранный уехал бы в YouTube как принятый.
+    check("паспорта нет — подтвердить нечем, и это сказано",
+          gate.mismatch({}, {"video": {"size": 1}}), gate.НЕ_ЗНАЕМ)
+    check("None — то же самое", gate.mismatch(None, {"video": {"size": 1}}), gate.НЕ_ЗНАЕМ)
+    check("«версия неизвестна» — тоже не подтверждение",
+          gate.mismatch(gate.unknown_version(1.0), {"video": {"size": 1}}), gate.НЕ_ЗНАЕМ)
+    check("и это отличается от пересборки",
+          gate.НЕ_ЗНАЕМ == "", False)
 
     store = os.path.join(tmp, "паспорта.json")
     check("нет файла — пусто", gate.load_store(store), {})
@@ -307,7 +317,11 @@ def test_settings(tmp):
     print("\n── настройки ворот рядом с мостом ──")
     s = gate.load_settings(os.path.join(tmp, "нет.json"))
     check("нет файла — обложка никому не обязательна", s["covers"], set())
-    check("нет файла — машина обязательна", s["host_required"], True)
+    # Разбор 01.10.2026: по умолчанию машина НЕ требуется. Не послабление, а факт
+    # боевой базы: `manga_channels.py` при заведении двадцати каналов host_id не ставил,
+    # а default_host_id не пишет ни один файл кабинета. Требование по умолчанию закрыло
+    # бы все двадцать каналов на первом же прогоне при шести десятках готовых роликов.
+    check("нет файла — машина НЕ обязательна", s["host_required"], False)
 
     path = os.path.join(tmp, "manga_gate.json")
 
@@ -407,13 +421,19 @@ def test_channel(tmp):
 # ── прогон целиком ────────────────────────────────────────────────────────────────
 
 def run(apply_it, limit=0):
+    """Прогон моста. Возвращает то, что он напечатал: проверять надо и слова тоже."""
     argv = sys.argv
     sys.argv = ["manga_bridge.py"] + (["--apply"] if apply_it else []) \
         + (["--limit", str(limit)] if limit else [])
+    буфер = io.StringIO()
     try:
-        bridge.main()
+        with contextlib.redirect_stdout(буфер):
+            bridge.main()
     finally:
         sys.argv = argv
+    сказано = буфер.getvalue()
+    print(сказано, end="")
+    return сказано
 
 
 def rows(db, sql, args=()):
@@ -470,11 +490,13 @@ def test_run(tmp):
 
     run(True)
     jobs = rows(db, "SELECT * FROM pub_upload_jobs ORDER BY release_id")
-    check("допущены ровно два ролика", [j["release_id"] for j in jobs],
-          ["m_p_coverok", "m_p_good"])
-    check("модель позвали ровно два раза", len(CALLS), 2)
+    # Канал без машины теперь допускается (см. выше): требование включается настройкой,
+    # когда host_id у каналов действительно заполнен.
+    check("допущены три ролика, включая канал без машины",
+          [j["release_id"] for j in jobs], ["m_p_coverok", "m_p_good", "m_p_nohost"])
+    check("модель позвали ровно три раза", len(CALLS), 3)
     check("и только за допущенные ролики", sorted(s for s, _ in CALLS),
-          ["История о возвращении", "История о возвращении"])
+          ["История о возвращении"] * 3)
     check("видимость осталась public", sorted({j["visibility"] for j in jobs}),
           ["public"])
     check("обложка допущенного ролика в задании",
@@ -494,15 +516,16 @@ def test_run(tmp):
           saved["p_legacy"]["version"], "unknown")
     check("и принятым не считается", gate.is_accepted(saved["p_legacy"]), False)
     check("непринятым роликам паспорта не выдавались",
-          sorted(k for k in saved if k not in ("p_good", "p_coverok", "p_legacy")), [])
+          sorted(k for k in saved
+                 if k not in ("p_good", "p_coverok", "p_legacy", "p_nohost")), [])
 
     print("\n── повтор допуска не создаёт вторую работу ──")
     run(True)
-    check("заданий по-прежнему два",
-          rows(db, "SELECT COUNT(*) n FROM pub_upload_jobs")[0]["n"], 2)
-    check("выпусков по-прежнему два",
-          rows(db, "SELECT COUNT(*) n FROM pub_releases")[0]["n"], 2)
-    check("модель больше не звали", len(CALLS), 2)
+    check("заданий по-прежнему три",
+          rows(db, "SELECT COUNT(*) n FROM pub_upload_jobs")[0]["n"], 3)
+    check("выпусков по-прежнему три",
+          rows(db, "SELECT COUNT(*) n FROM pub_releases")[0]["n"], 3)
+    check("модель больше не звали", len(CALLS), 3)
 
     print("\n── пересборка отменяет приёмку ──")
     with open(os.path.join(good, "out", "video.mp4"), "ab") as f:
@@ -515,8 +538,8 @@ def test_run(tmp):
     check("задание снято до выдачи", job["status"], "cancelled")
     check_has("и в задании та же причина", job["error"], "пересобран после приёмки")
     check("второго задания не появилось",
-          rows(db, "SELECT COUNT(*) n FROM pub_upload_jobs")[0]["n"], 2)
-    check("модель на пересобранный ролик не звали", len(CALLS), 2)
+          rows(db, "SELECT COUNT(*) n FROM pub_upload_jobs")[0]["n"], 3)
+    check("модель на пересобранный ролик не звали", len(CALLS), 3)
 
     print("\n── оживление не воскрешает непринятую версию ──")
     run(True)
@@ -547,7 +570,52 @@ def test_run(tmp):
     check("выпуск вернулся в работу", rel["status"], "running")
     check("задание снова в очереди", job["status"], "queued")
     check("причина простоя снята", rel["blocked_reason"], None)
-    check("и это не стоило нового вызова модели", len(CALLS), 2)
+    check("и это не стоило нового вызова модели", len(CALLS), 3)
+
+    print("\n── выпуск ПРЕЖНЕГО моста: подтвердить нечем, в очередь не возвращаем ──")
+    # Главная находка разбора 01.10.2026. У выпусков, заведённых прежней версией моста,
+    # паспорта нет ни у одного. Раньше «паспорта нет» означало «совпало», и такой выпуск
+    # возвращался в очередь со словами «срывалось не по вине ролика» — хотя версию файла
+    # никто ни с чем не сверял. На боевой машине около сорока пяти роликов пересобраны
+    # 26.09: пересобранный уехал бы в YouTube как принятый. И слепота не кончалась —
+    # паспорт при возврате не писался, и на каждом следующем прогоне повторялось то же.
+    store_before = gate.load_store(store)
+    без_паспорта = dict(store_before)
+    без_паспорта.pop("p_coverok", None)
+    gate.save_store(store, без_паспорта)
+    c = sqlite3.connect(db)
+    c.row_factory = sqlite3.Row
+    c.execute("UPDATE pub_releases SET status='blocked', blocked_reason='браузер умер' "
+              "WHERE release_id='m_p_coverok'")
+    c.execute("UPDATE pub_upload_jobs SET status='error', video_id=NULL, verdict=NULL, "
+              "phase=NULL WHERE release_id='m_p_coverok'")
+    c.commit(); c.close()
+    звонков = len(CALLS)
+    out = run(True)
+    rel = rows(db, "SELECT * FROM pub_releases WHERE release_id='m_p_coverok'")[0]
+    job = rows(db, "SELECT * FROM pub_upload_jobs WHERE release_id='m_p_coverok'")[0]
+    check("в очередь НЕ вернули", job["status"], "error")
+    check("выпуск остался в карантине", rel["status"], "blocked")
+    check("и причина его простоя не затёрта", rel["blocked_reason"], "браузер умер")
+    # Смотрим только строки ПРО ЭТОТ ролик: в том же прогоне мост говорит и про
+    # пересобранный m_p_good, и поиск по всему выхлопу нашёл бы его слова.
+    про_него = "\n".join(l for l in out.splitlines() if "p_covero" in l)
+    check("мост про него вообще сказал", bool(про_него.strip()), True)
+    check("человеку сказано, что подтвердить нечем",
+          "подтвердить нечем" in про_него, True)
+    check("и это не названо пересборкой", "пересобран" in про_него, False)
+    # Разница между правильным и неправильным поведением здесь ВИДНА ТОЛЬКО В СЛОВАХ:
+    # обе ветки оставляют базу нетронутой, потому что UPDATE в `hold` сужены условием
+    # по статусу. Поэтому проверяется ровно то, что читает человек: мост не рапортует о
+    # действии, которого не совершал, и не записывает ролик в пересобранные.
+    check("мост не объявил, что снял задание — он его не трогал",
+          "снято до выдачи" in про_него, False)
+    check("в сводке это названо своими словами",
+          "версия не записана — на разбор" in out, True)
+    check("и в пересобранные записан только тот один, который правда пересобран",
+          "пересобран после приёмки: 1" in out, True)
+    check("денег это не стоило", len(CALLS), звонков)
+    gate.save_store(store, store_before)
 
     print("\n── ролик, который уже уходил в YouTube, не трогаем ──")
     c = sqlite3.connect(db)
