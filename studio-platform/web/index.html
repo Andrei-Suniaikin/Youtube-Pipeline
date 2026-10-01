@@ -3505,6 +3505,44 @@ function analyticsNumbers(a){
     </div>`;
 }
 
+/* ────────── ключ канала: поле, кнопка и гайд рядом, в любом состоянии ──────────
+
+   Владелец 01.10.2026: «нужно в каждом канале на уровне ключа выводить гайд, как
+   сделать этот ключ».
+
+   Раньше гайд показывался ТОЛЬКО у неподключённого канала. Хуже всего это выходило в
+   единственном месте, где он по-настоящему нужен: когда согласие умерло. Карточка
+   говорила «доступ перестал работать — нужен новый токен», и на этом всё: ни поля,
+   чтобы вписать новый, ни инструкции, где его взять. Человек оставался с диагнозом и
+   без инструмента.
+
+   Поэтому блок один и тот же на все три состояния, и он всегда на месте:
+     · не подключён — поле и гайд раскрыты;
+     · согласие умерло — то же, и красной строкой сказано, почему;
+     · работает — поле и гайд свёрнуты, чтобы не мешали, но доступны одним щелчком
+       (ключ меняют не только когда он умер: канал мог переехать на другой аккаунт).  */
+function analyticsKeyBlock(id, acc){
+  const connected = !!acc.connected;
+  const dead = acc.state === 'dead';
+  // Раскрыт тогда, когда ключ нужен прямо сейчас. У работающего канала — свёрнут.
+  const open = (!connected || dead) ? ' open' : '';
+  return `<details class="keyblock" style="margin-top:12px"${open}>
+    <summary style="cursor:pointer;font-weight:600;font-size:13px">${
+      connected ? (dead ? 'Выдать новый ключ этому каналу' : 'Заменить ключ этого канала')
+                : 'Как получить ключ для этого канала'}</summary>
+    ${acc.client === false ? `<div class="note bad" style="margin-top:10px">
+      Сначала впишите идентификатор и секрет приложения Google на странице
+      «Ключи» — без них токен обновлять нечем.</div>` : ''}
+    <div style="margin-top:10px">
+      <input id="tok" style="width:100%;font-family:var(--mono);font-size:12px"
+        placeholder="refresh token из OAuth Playground" autocomplete="off"></div>
+    <div style="margin-top:10px"><button id="on" class="small">${
+      connected ? 'Заменить' : 'Подключить'}</button></div>
+    ${analyticsHowTo(id)}
+  </details>`;
+}
+
+
 function channelStatsTab(id, d){
   app.append(channelStatsCard(id, d.stats || {}));
   const a = d.analytics || {};
@@ -3525,23 +3563,18 @@ function channelStatsTab(id, d){
       `<div class="note muted" style="margin-top:8px">История с ${esc(a.first)} —
        ${a.days} ${plural(a.days, 'день', 'дня', 'дней')} наблюдений.
        ${acc.state === 'dead' ? '<b style="color:var(--bad)">Доступ перестал работать: ' +
-         esc(acc.error || '') + ' — нужен новый токен.</b>' : ''}</div>`;
+         esc(acc.error || '') + ' — нужен новый ключ, поле ниже.</b>' : ''}</div>`
+      + analyticsKeyBlock(id, acc);
   } else if (acc.connected){
     body.innerHTML = `<div class="empty">Канал подключён, но чисел ещё нет.
-      ${acc.error ? esc(acc.error) : 'Нажмите «Обновить» — первая выгрузка забирает год.'}</div>`;
+      ${acc.error ? esc(acc.error) : 'Нажмите «Обновить» — первая выгрузка забирает год.'}</div>`
+      + analyticsKeyBlock(id, acc);
   } else {
     body.innerHTML = `
       <div class="note muted">Без подключения видно только то, что выше: это публичные
         счётчики YouTube. Время просмотра, досмотренность и приход подписчиков публичными
-        не бывают — их отдаёт лишь владелец канала, своим согласием.</div>
-      ${acc.client === false ? `<div class="note bad" style="margin-top:10px">
-        Сначала впишите идентификатор и секрет приложения Google на странице
-        «Ключи» — без них токен обновлять нечем.</div>` : ''}
-      <div style="margin-top:12px">
-        <input id="tok" style="width:100%;font-family:var(--mono);font-size:12px"
-          placeholder="refresh token из OAuth Playground" autocomplete="off"></div>
-      <div style="margin-top:10px"><button id="on" class="small">Подключить</button></div>
-      ${analyticsHowTo(id)}`;
+        не бывают — их отдаёт лишь владелец канала, своим согласием.</div>`
+      + analyticsKeyBlock(id, acc);
   }
   app.append(card);
 
@@ -3551,7 +3584,9 @@ function channelStatsTab(id, d){
     try{
       const out = await post(`/ui/channels/${encodeURIComponent(id)}/analytics`,
                              {token: card.querySelector('#tok').value});
-      toast(`Подключено, забрано дней: ${out.loaded_days}`, 'ok');
+      toast(acc.connected
+        ? `Ключ заменён, забрано дней: ${out.loaded_days}`
+        : `Подключено, забрано дней: ${out.loaded_days}`, 'ok');
       await render();
     }catch(e){ toast(e.message); on.disabled = false; }
   };

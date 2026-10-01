@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Политика конфиденциальности — {{НАЗВАНИЕ}}</title>
+<meta name="description" content="Какие данные читает и хранит приложение {{НАЗВАНИЕ}}, кому они доступны и как отозвать доступ.">
+<style>
+:root{color-scheme:light dark;
+  --bg:#fbfbfa; --card:#fff; --ink:#1a1a18; --muted:#6b6b66; --line:#e6e5e1;
+  --accent:#8a4a2b; --r:10px}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#17171a; --card:#1e1e22; --ink:#ececea; --muted:#9a9a96; --line:#2e2e34;
+  --accent:#d2906b}}
+:root[data-theme="dark"]{
+  --bg:#17171a; --card:#1e1e22; --ink:#ececea; --muted:#9a9a96; --line:#2e2e34;
+  --accent:#d2906b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:720px;margin:0 auto;padding:48px 16px 72px}
+h1{font-size:28px;line-height:1.25;margin:0 0 6px;letter-spacing:-.01em}
+h2{font-size:17px;margin:34px 0 10px;letter-spacing:-.005em}
+h3{font-size:15px;margin:22px 0 6px}
+p,li{margin:0 0 12px}
+ul{padding-left:22px}
+.sub{color:var(--muted);margin:0 0 28px;font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  padding:18px 20px;margin:20px 0}
+a{color:var(--accent)}
+code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:color-mix(in srgb,var(--ink) 7%,transparent);padding:1px 5px;border-radius:5px}
+footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);
+  color:var(--muted);font-size:13px}
+.en{margin-top:40px;padding-top:24px;border-top:1px solid var(--line)}
+.en h2:first-child{margin-top:0}
+table{border-collapse:collapse;width:100%;font-size:14px;margin:0 0 12px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}
+@media (max-width:520px){.wrap{padding:32px 16px 56px}h1{font-size:24px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Политика конфиденциальности</h1>
+<p class="sub">{{НАЗВАНИЕ}} · {{ДОМЕН}} · действует с момента публикации</p>
+
+<p>{{НАЗВАНИЕ}} — внутреннее приложение одной команды для ведения собственных каналов
+YouTube. Открытой регистрации нет: им пользуемся мы сами и наши операторы. Ниже — что
+приложение читает, что хранит, кому это доступно и как отозвать доступ.</p>
+
+<div class="card">
+<p style="margin:0"><b>{{НАЗВАНИЕ}} использует API Services YouTube.</b> На данные,
+которые Google получает и обрабатывает в рамках работы своих API, распространяется
+<a href="http://www.google.com/policies/privacy">Политика конфиденциальности Google</a>.
+Пользуясь приложением, вы соглашаетесь с
+<a href="https://www.youtube.com/t/terms">Условиями использования YouTube</a> (см. также
+<a href="/terms">наши условия</a>).</p>
+</div>
+
+<h2>1. Какие данные приложение получает, собирает и хранит</h2>
+<p>Через API Google, и только после согласия владельца канала:</p>
+<ul>
+  <li>публичные счётчики канала: число подписчиков, просмотров и роликов;</li>
+  <li>статистику канала: просмотры, время просмотра, среднюю продолжительность
+      просмотра, приход и уход подписчиков;</li>
+  <li>просмотры по отдельным роликам канала;</li>
+  <li>токен доступа — то есть само согласие владельца канала.</li>
+</ul>
+<p>Приложение <b>не</b> получает и <b>не</b> хранит аудиовизуальный контент YouTube: ни
+видеофайлы, ни их копии. Оба запрашиваемых права — <b>только на чтение</b>: приложение не
+публикует, не изменяет и не удаляет ничего на каналах через API Google.</p>
+
+<h2>2. Чьи это данные</h2>
+<p>Только каналов, которыми мы владеем сами. Данные посторонних людей приложение не
+собирает и не обрабатывает: у него нет открытого доступа, нет регистрации и нет формы, в
+которую посторонний мог бы что-либо ввести.</p>
+
+<h2>3. Как мы эти данные используем, обрабатываем и передаём</h2>
+<div class="card">
+<table>
+  <tr><th>Что</th><th>Где хранится</th><th>Зачем</th></tr>
+  <tr>
+    <td>Суточные числа по каналу и по ролику</td>
+    <td>в базе приложения на нашем сервере</td>
+    <td>YouTube отдаёт только «сколько сейчас». Прирост существует лишь постольку,
+        поскольку мы записали своё число вчера.</td>
+  </tr>
+  <tr>
+    <td>Токен доступа</td>
+    <td>отдельным файлом на нашем сервере, читать его может только служебная учётная
+        запись приложения</td>
+    <td>чтобы обновлять доступ без повторного согласия</td>
+  </tr>
+</table>
+</div>
+<p>Числа используются ровно для одного: показать нам, как работают наши каналы. Токен
+доступа наружу не выдаётся ни в одном виде — в интерфейсе видно только, что канал
+подключён, и последние четыре знака токена; в журналы он не попадает.</p>
+<p><b>Передача.</b> Данные не передаются, не продаются и не публикуются. Никому, кроме
+сервисов Google, у которых они изначально и запрашиваются, они не отправляются.</p>
+
+<h2>4. Реклама и сторонний контент</h2>
+<p>Приложение <b>не показывает рекламу</b> — ни свою, ни чужую. Сторонние лица не
+показывают в нём контент и не получают доступ к данным для рекламных целей. Для
+профилирования и для показа рекламы данные не используются.</p>
+
+<h2>5. Cookies и данные на устройстве</h2>
+<p>Публичные страницы ({{ДОМЕН}}) не пишут ни cookies, ни иных данных на ваше
+устройство и не содержат счётчиков или трекеров третьих лиц. В самом приложении есть одна
+служебная cookie сеанса — она нужна, чтобы оператор оставался в системе, живёт до выхода и
+никому не передаётся. Cookies третьих лиц приложение не использует.</p>
+
+<h2>6. Как отозвать доступ</h2>
+<ul>
+  <li><b>На стороне Google:</b>
+      <a href="https://security.google.com/settings/security/permissions">security.google.com/settings/security/permissions</a>
+      — отозвать доступ приложению. То же можно сделать на
+      <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>.</li>
+  <li><b>В приложении:</b> кнопка «Отключить» на странице канала — приложение забывает
+      токен.</li>
+</ul>
+<p>После отзыва приложение перестаёт получать новые данные по этому каналу. Уже собранные
+суточные числа остаются в базе как история; чтобы их удалили, напишите на адрес из
+раздела 8.</p>
+
+<h2>7. Изменения</h2>
+<p>Если приложение станет запрашивать другие права, получать другие данные или
+использовать их иначе, эта страница будет изменена до того, как это произойдёт.</p>
+
+<h2>8. Связь по вопросам конфиденциальности</h2>
+<p><a href="mailto:{{ПОЧТА}}">{{ПОЧТА}}</a> — пишите по любому вопросу о данных,
+включая удаление уже собранного.</p>
+
+<div class="en">
+<h2>Privacy Policy (English)</h2>
+<p>{{НАЗВАНИЕ}} is an internal tool used by a single team to operate its own YouTube
+channels. There is no public sign-up; its users are ourselves and our operators.</p>
+<p><b>{{НАЗВАНИЕ}} uses YouTube API Services.</b> Data handled by Google through its APIs
+is subject to the
+<a href="http://www.google.com/policies/privacy">Google Privacy Policy</a>. By using the
+application you agree to be bound by the
+<a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a> (see also our
+<a href="/terms">Terms of Use</a>).</p>
+
+<h3>What we access, collect and store</h3>
+<p>Through Google APIs, and only after the channel owner grants consent: public channel
+counters (subscribers, views, video count); channel statistics (views, estimated minutes
+watched, average view duration, subscribers gained and lost); per-video view counts; and
+the refresh token that represents the owner's consent. We do not retrieve or store YouTube
+audiovisual content. Both requested scopes are <b>read-only</b>: the application never
+publishes, modifies or deletes anything on a channel through Google APIs.</p>
+
+<h3>Whose data</h3>
+<p>Only channels we own ourselves. The application does not collect or process data about
+third parties.</p>
+
+<h3>How we use, process and share it</h3>
+<p>Daily figures are stored in the application's own database on our server, because
+YouTube reports only current totals — growth exists only if yesterday's figure was
+recorded. The refresh token is stored in a separate file readable only by the
+application's service account; it is never shown in the interface (only its last four
+characters) and never written to logs. Data is used solely to show us how our own channels
+perform. It is not sold, shared or published, and is not sent to anyone other than the
+Google services it is requested from.</p>
+
+<h3>Advertising and third-party content</h3>
+<p>The application shows no advertising of any kind. No third party displays content in it
+or receives access to the data for advertising purposes, and the data is not used for
+profiling.</p>
+
+<h3>Cookies and data stored on your device</h3>
+<p>These public pages store no cookies or other data on your device and contain no
+third-party analytics or trackers. The application itself uses a single session cookie so
+that an operator stays signed in; it expires on sign-out and is shared with no one. No
+third-party cookies are used.</p>
+
+<h3>Revoking access</h3>
+<p>At
+<a href="https://security.google.com/settings/security/permissions">security.google.com/settings/security/permissions</a>
+(or <a href="https://myaccount.google.com/permissions">myaccount.google.com/permissions</a>),
+or with the "Disconnect" button on the channel page in the application. After revocation
+the application receives no new data for that channel. Already collected daily figures
+remain as history; to have them deleted, write to the address below.</p>
+
+<h3>Changes</h3>
+<p>If the application starts requesting other scopes, receiving other data, or using it
+differently, this page will be updated before that happens.</p>
+
+<h3>Privacy contact</h3>
+<p><a href="mailto:{{ПОЧТА}}">{{ПОЧТА}}</a> — for any question about the data, including
+deletion of what has already been collected.</p>
+</div>
+
+<footer>
+{{НАЗВАНИЕ}} · {{ДОМЕН}} · <a href="/">о приложении</a> · <a href="/terms">условия</a>
+</footer>
+</div>
+</body>
+</html>

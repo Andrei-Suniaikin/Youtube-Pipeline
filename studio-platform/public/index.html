@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{НАЗВАНИЕ}}</title>
+<meta name="description" content="Рабочий инструмент для ведения собственных каналов YouTube: план выходов, производство роликов и статистика.">
+<style>
+:root{color-scheme:light dark;
+  --bg:#fbfbfa; --card:#fff; --ink:#1a1a18; --muted:#6b6b66; --line:#e6e5e1;
+  --accent:#8a4a2b; --r:10px}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#17171a; --card:#1e1e22; --ink:#ececea; --muted:#9a9a96; --line:#2e2e34;
+  --accent:#d2906b}}
+:root[data-theme="dark"]{
+  --bg:#17171a; --card:#1e1e22; --ink:#ececea; --muted:#9a9a96; --line:#2e2e34;
+  --accent:#d2906b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:720px;margin:0 auto;padding:48px 16px 72px}
+h1{font-size:28px;line-height:1.25;margin:0 0 6px;letter-spacing:-.01em}
+h2{font-size:17px;margin:34px 0 10px;letter-spacing:-.005em}
+h3{font-size:15px;margin:22px 0 6px}
+p,li{margin:0 0 12px}
+ul{padding-left:22px}
+.sub{color:var(--muted);margin:0 0 28px;font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  padding:18px 20px;margin:20px 0}
+a{color:var(--accent)}
+code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:color-mix(in srgb,var(--ink) 7%,transparent);padding:1px 5px;border-radius:5px}
+footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);
+  color:var(--muted);font-size:13px}
+.en{margin-top:40px;padding-top:24px;border-top:1px solid var(--line)}
+.en h2:first-child{margin-top:0}
+table{border-collapse:collapse;width:100%;font-size:14px;margin:0 0 12px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}
+@media (max-width:520px){.wrap{padding:32px 16px 56px}h1{font-size:24px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>{{НАЗВАНИЕ}}</h1>
+<p class="sub">Рабочий инструмент одной команды для ведения собственных каналов YouTube.</p>
+
+<p>{{НАЗВАНИЕ}} — внутреннее приложение, которым мы ведём свои каналы YouTube: планируем
+выходы роликов, собираем их производство и смотрим статистику. Приложение не продаётся,
+не распространяется и не предлагается посторонним: им пользуемся мы сами и наши
+операторы.</p>
+
+<h2>Что приложение делает</h2>
+<ul>
+  <li><b>План выходов.</b> Держит расписание каналов и очередь роликов: что выходит,
+      когда и на каком канале.</li>
+  <li><b>Производство.</b> Заказывает текст, озвучку, кадры, сборку ролика и обложку,
+      ведёт журнал по каждому выпуску.</li>
+  <li><b>Публикация.</b> Готовит комплект к заливке и подтверждает, что ролик
+      действительно вышел на канале.</li>
+  <li><b>Статистика.</b> Показывает по каждому нашему каналу просмотры, подписчиков,
+      время просмотра и приход подписчиков — чтобы видеть, как работают каналы.</li>
+</ul>
+
+<h2>Зачем приложению доступ к API Google</h2>
+<div class="card">
+<table>
+  <tr><th>Право</th><th>Зачем именно</th></tr>
+  <tr>
+    <td><code>youtube.readonly</code></td>
+    <td>Обязательное условие метода отчётов YouTube Analytics. Используется только для
+        чтения сведений о наших же каналах.</td>
+  </tr>
+  <tr>
+    <td><code>yt-analytics.readonly</code></td>
+    <td>Чтение статистики наших каналов: просмотры, время просмотра, средняя
+        продолжительность просмотра, приход и уход подписчиков.</td>
+  </tr>
+</table>
+</div>
+<p>Оба права — <b>только на чтение</b>. Приложение не публикует, не изменяет и не
+удаляет ничего на каналах через API Google.</p>
+
+<h2>Чьи данные читаются</h2>
+<p>Только наших собственных каналов, и только после того, как владелец канала сам выдал
+согласие в своём аккаунте Google. Данные посторонних людей приложение не собирает:
+у него нет ни регистрации, ни открытого доступа.</p>
+
+<h2>Связь</h2>
+<p>По любым вопросам о приложении: <a href="mailto:{{ПОЧТА}}">{{ПОЧТА}}</a>.</p>
+
+<p><a href="/privacy">Политика конфиденциальности</a> ·
+<a href="/terms">Условия использования</a></p>
+
+<div class="en">
+<h2>About this application (English)</h2>
+<p>{{НАЗВАНИЕ}} is an internal tool used by a single team to operate its own YouTube
+channels: scheduling releases, producing videos and reviewing channel statistics. It is
+not offered to the public and has no sign-up.</p>
+<p>It requests two read-only Google scopes:
+<code>https://www.googleapis.com/auth/youtube.readonly</code> (required by the YouTube
+Analytics <code>reports.query</code> method) and
+<code>https://www.googleapis.com/auth/yt-analytics.readonly</code> (channel statistics:
+views, estimated minutes watched, average view duration, subscribers gained and lost).
+Both are read-only: the application never publishes, modifies or deletes anything on a
+channel through Google APIs.</p>
+<p>Data is read only for channels we own, and only after the channel owner grants consent
+in their own Google Account. No data about third parties is collected. See our
+<a href="/privacy">Privacy Policy</a> and <a href="/terms">Terms of Use</a>. Contact: <a href="mailto:{{ПОЧТА}}">{{ПОЧТА}}</a>.</p>
+</div>
+
+<footer>
+{{НАЗВАНИЕ}} · {{ДОМЕН}} · <a href="/privacy">политика конфиденциальности</a> ·
+<a href="/terms">условия</a>
+</footer>
+</div>
+</body>
+</html>

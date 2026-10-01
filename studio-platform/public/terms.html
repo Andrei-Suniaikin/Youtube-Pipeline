@@ -1,0 +1,109 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Условия использования — {{НАЗВАНИЕ}}</title>
+<meta name="description" content="Условия использования приложения {{НАЗВАНИЕ}}.">
+<style>
+:root{color-scheme:light dark;
+  --bg:#fbfbfa; --card:#fff; --ink:#1a1a18; --muted:#6b6b66; --line:#e6e5e1;
+  --accent:#8a4a2b; --r:10px}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#17171a; --card:#1e1e22; --ink:#ececea; --muted:#9a9a96; --line:#2e2e34;
+  --accent:#d2906b}}
+:root[data-theme="dark"]{
+  --bg:#17171a; --card:#1e1e22; --ink:#ececea; --muted:#9a9a96; --line:#2e2e34;
+  --accent:#d2906b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);
+  font:15px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  -webkit-font-smoothing:antialiased}
+.wrap{max-width:720px;margin:0 auto;padding:48px 16px 72px}
+h1{font-size:28px;line-height:1.25;margin:0 0 6px;letter-spacing:-.01em}
+h2{font-size:17px;margin:34px 0 10px;letter-spacing:-.005em}
+h3{font-size:15px;margin:22px 0 6px}
+p,li{margin:0 0 12px}
+ul{padding-left:22px}
+.sub{color:var(--muted);margin:0 0 28px;font-size:14px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--r);
+  padding:18px 20px;margin:20px 0}
+a{color:var(--accent)}
+code{font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace;
+  background:color-mix(in srgb,var(--ink) 7%,transparent);padding:1px 5px;border-radius:5px}
+footer{margin-top:44px;padding-top:18px;border-top:1px solid var(--line);
+  color:var(--muted);font-size:13px}
+.en{margin-top:40px;padding-top:24px;border-top:1px solid var(--line)}
+.en h2:first-child{margin-top:0}
+table{border-collapse:collapse;width:100%;font-size:14px;margin:0 0 12px}
+th,td{text-align:left;padding:7px 10px;border-bottom:1px solid var(--line);vertical-align:top}
+th{color:var(--muted);font-weight:600}
+@media (max-width:520px){.wrap{padding:32px 16px 56px}h1{font-size:24px}}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<h1>Условия использования</h1>
+<p class="sub">{{НАЗВАНИЕ}} · {{ДОМЕН}}</p>
+
+<h2>1. Что это</h2>
+<p>{{НАЗВАНИЕ}} — внутреннее приложение одной команды для ведения собственных каналов
+YouTube. Доступ к нему имеют только мы и наши операторы; открытой регистрации нет.</p>
+
+<h2>2. Согласие с условиями YouTube</h2>
+<p><b>Пользуясь {{НАЗВАНИЕ}}, вы соглашаетесь с
+<a href="https://www.youtube.com/t/terms">Условиями использования YouTube</a></b> и
+обязуетесь их соблюдать. Приложение работает через API Services YouTube.</p>
+
+<h2>3. Что приложение делает и чего не делает</h2>
+<ul>
+  <li>Читает статистику каналов, которыми мы владеем, — после согласия владельца
+      канала, выданного в его аккаунте Google.</li>
+  <li><b>Не</b> публикует, <b>не</b> изменяет и <b>не</b> удаляет ничего на каналах
+      через API Google: запрашиваемые права дают только чтение.</li>
+  <li><b>Не</b> обращается к каналам, которыми мы не владеем.</li>
+</ul>
+
+<h2>4. Отзыв доступа</h2>
+<p>Владелец канала может отозвать доступ в любой момент — в приложении кнопкой
+«Отключить» либо на стороне Google:
+<a href="https://security.google.com/settings/security/permissions">security.google.com/settings/security/permissions</a>.</p>
+
+<h2>5. Ответственность</h2>
+<p>Приложение предоставляется «как есть», без гарантий. Мы не отвечаем за решения,
+принятые на основании показанных им чисел, и за перерывы в работе сторонних сервисов, от
+которых оно зависит.</p>
+
+<h2>6. Изменения</h2>
+<p>Условия могут меняться. Изменения вступают в силу с момента публикации на этой
+странице.</p>
+
+<h2>7. Связь</h2>
+<p><a href="mailto:{{ПОЧТА}}">{{ПОЧТА}}</a></p>
+
+<div class="en">
+<h2>Terms of Use (English)</h2>
+<p>{{НАЗВАНИЕ}} is an internal tool used by a single team to operate its own YouTube
+channels. There is no public sign-up.</p>
+<p><b>By using {{НАЗВАНИЕ}}, you agree to be bound by the
+<a href="https://www.youtube.com/t/terms">YouTube Terms of Service</a>.</b> The
+application uses YouTube API Services.</p>
+<p>The application reads statistics for channels we own, after the channel owner grants
+consent in their own Google Account. It never publishes, modifies or deletes anything on a
+channel through Google APIs — the requested scopes are read-only — and it never accesses
+channels we do not own.</p>
+<p>Access can be revoked at any time: with the "Disconnect" button in the application, or
+at
+<a href="https://security.google.com/settings/security/permissions">security.google.com/settings/security/permissions</a>.</p>
+<p>The application is provided "as is", without warranties. Contact:
+<a href="mailto:{{ПОЧТА}}">{{ПОЧТА}}</a>.</p>
+</div>
+
+<footer>
+{{НАЗВАНИЕ}} · {{ДОМЕН}} · <a href="/">о приложении</a> ·
+<a href="/privacy">политика конфиденциальности</a>
+</footer>
+</div>
+</body>
+</html>

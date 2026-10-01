@@ -142,6 +142,34 @@ SCENARIO = r"""
                             {state: 'dead', error: 'согласие отозвано'})});
     await go();
     out.мёртвый = (card() || {}).textContent || '';
+    // У мёртвого ключа инструмент обязан быть ПОД РУКОЙ, а не только диагноз: поле для
+    // нового ключа, кнопка и раскрытый гайд.
+    out.мёртвыйПолеЕсть = !!document.querySelector('#tok');
+    out.мёртвыйКнопка = ((document.querySelector('#on') || {}).textContent || '').trim();
+    {
+      const g = document.querySelector('details.keyblock');
+      out.мёртвыйГайдРаскрыт = !!(g && g.open);
+    }
+
+    // 5. Работающий канал: блок на месте, но свёрнут — чтобы не мешал числам.
+    analytics = NUMBERS;
+    await go();
+    out.живойПолеЕсть = !!document.querySelector('#tok');
+    out.живойКнопка = ((document.querySelector('#on') || {}).textContent || '').trim();
+    {
+      const g = document.querySelector('details.keyblock');
+      out.живойГайдЕсть = !!g;
+      out.живойГайдСвёрнут = !!(g && !g.open);
+      out.живойГайдВнутри = g ? (g.textContent || '').includes('OAuth Playground') : false;
+    }
+
+    // 6. Неподключённый канал: гайд раскрыт сразу.
+    analytics = {access: {connected: false, client: true}, days: 0};
+    await go();
+    {
+      const g = document.querySelector('details.keyblock');
+      out.пустойГайдРаскрыт = !!(g && g.open);
+    }
   } catch (e) { out.errs.push(String(e && e.message || e)); }
   document.documentElement.setAttribute('data-result', JSON.stringify(out));
 })();
@@ -216,7 +244,22 @@ def main() -> int:
     dead = res.get("мёртвый") or ""
     has("сказано прямо", dead, "перестал работать")
     has("названа причина", dead, "согласие отозвано")
-    has("сказано, что делать", dead, "нужен новый токен")
+    has("сказано, что делать", dead, "нужен новый ключ")
+    # Главное в этом месте: у мёртвого ключа должен быть не только диагноз, но и
+    # инструмент. Раньше карточка говорила «нужен новый токен» и на этом кончалась —
+    # ни поля, ни инструкции, где его взять.
+    check("поле для нового ключа есть", res.get("мёртвыйПолеЕсть"), True)
+    check("кнопка говорит о замене", res.get("мёртвыйКнопка"), "Заменить")
+    check("и гайд раскрыт сразу", res.get("мёртвыйГайдРаскрыт"), True)
+
+    print("Гайд есть в канале всегда, а не только у неподключённого")
+    # Владелец 01.10.2026: «нужно в каждом канале на уровне ключа выводить гайд».
+    check("у работающего канала гайд на месте", res.get("живойГайдЕсть"), True)
+    check("но свёрнут, чтобы не мешал числам", res.get("живойГайдСвёрнут"), True)
+    check("внутри он тот же", res.get("живойГайдВнутри"), True)
+    check("и поле замены рядом", res.get("живойПолеЕсть"), True)
+    check("кнопка — «Заменить»", res.get("живойКнопка"), "Заменить")
+    check("у неподключённого гайд раскрыт", res.get("пустойГайдРаскрыт"), True)
 
     print()
     if FAILS:
