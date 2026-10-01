@@ -488,6 +488,38 @@ def part_text():
 
 # ─────────────────────── 3б. срывы заливки за сутки ───────────────────────
 
+def part_hand_confirmed():
+    """Подтверждённый человеком выход — выполнение плана, но названное отдельно.
+
+    Решение владельца 01.10.2026, п. 6. Два требования разом, и они тянут в разные
+    стороны: такой выход НЕ должен висеть в «не знаем» до конца суток (план выполнен,
+    ждать нечего), и он НЕ должен притворяться машинным подтверждением — за `published`
+    стоит ответ YouTube Data API, а здесь человек, посмотревший канал.
+    """
+    print("\nПодтверждённое человеком — выполнение плана, но своё слово")
+    c = fresh()
+    ch = channel(c, "Первый", {"*": ["10:00"]})
+    # Выход сегодня, время прошло, машинного подтверждения нет и не будет: фаза
+    # `upload_running` и ролик на канале, который увидел человек.
+    rid = release(c, ch, plan(c, ch, day_at(8)), day_at(8), "upload_running",
+                  status="done")
+    c.execute("UPDATE pub_releases SET hand_confirmed=?, hand_by='хозяин', "
+              "hand_video_id='v1' WHERE release_id=?", (NOW - HOUR, rid))
+    c.commit()
+
+    d = D.collect(c, TID, now=NOW, have_key=True)
+    check("ожидался один выход", d["today"]["expected"], 1)
+    check("он посчитан как подтверждённый человеком", d["today"]["by_hand"], 1)
+    check("машинным подтверждением он НЕ считается", d["today"]["confirmed"], 0)
+    check("и в «не знаем» не висит", d["today"]["unknown"], 0)
+    check("и задержанным не считается", d["today"]["delayed"], 0)
+
+    text = D.render(d)
+    check("в тексте выход назван выполненным", "подтверждено 1" in text, True)
+    check("и отдельно сказано, что руками", "в том числе руками 1" in text, True)
+    c.close()
+
+
 def part_uploads():
     """Числа переписи срывов заливки попадают в сводку (решение владельца 01.10.2026, п. 7).
 
@@ -649,6 +681,7 @@ def main() -> int:
     part_patience()
     part_alerts_guard()
     part_text()
+    part_hand_confirmed()
     part_uploads()
     part_screen()
     part_telegram()

@@ -658,6 +658,21 @@ def parse_tags(raw: str) -> list:
 LIVE_STATUSES = ("planned", "frozen", "running", "done")
 _LIVE_SQL = ",".join(f"'{s}'" for s in LIVE_STATUSES)
 
+# Статусы, при которых ссылку считаем УЖЕ ВЗЯТОЙ этим каналом. Шире живых ровно на один
+# `error`, и это не придирка (разбор 01.10.2026, Д28).
+#
+# Сорвавшаяся строка плана занимает выход канала (`taken_slots` её учитывает), а дубль
+# её не видел — та же донорская ссылка вставлялась второй раз, заводила вторую строку
+# плана и второй выпуск. Если первая заливка успела отдать файл, на канале появлялся
+# ВТОРОЙ ролик, причём каждая его стадия оплачена заново. Повторять сорвавшийся выпуск
+# надо не новой ссылкой, а возвратом в работу — он сохраняет уже оплаченную работу и
+# проверяет, что файл не уходил.
+#
+# `cancelled` сюда не входит и входить не должен: снятую ссылку человек убрал сам, и не
+# пустить её обратно значило бы запереть канал на ролике, от которого он отказался.
+DUP_STATUSES = LIVE_STATUSES + ("error",)
+_DUP_SQL = ",".join(f"'{s}'" for s in DUP_STATUSES)
+
 
 def parse_links(raw: str) -> list:
     """Текст из поля → список ссылок. По одной в строке либо просто вперемешку."""
@@ -712,7 +727,7 @@ def add_links(c, tenant_id: str, channel, urls: list, now: float, slot=None,
         dup = c.execute(
             "SELECT id FROM pub_plan_items WHERE channel_id=? "
             "AND (donor_url=? OR (?!='' AND donor_video_id=?)) "
-            f"AND status IN ({_LIVE_SQL})",
+            f"AND status IN ({_DUP_SQL})",
             (channel["id"], url, vid, vid)).fetchone()
         if dup:
             skipped.append(url)

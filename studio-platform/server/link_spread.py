@@ -36,7 +36,7 @@ import json
 import sqlite3
 
 from pub_ids import video_id
-from pub_tags import LIVE_STATUSES, add_links
+from pub_tags import DUP_STATUSES, add_links
 
 # Сколько ссылок принимаем за раз. Число наше, не владельца: оно про то, сколько
 # названий разумно тянуть из oembed на один показ экрана, а не про устройство работы.
@@ -46,7 +46,9 @@ SPREAD_LIMIT = 200
 # спрашивали» — разные вещи, и человек по заголовку карточки решает, тот ли это ролик.
 TITLE_UNKNOWN = "название не добыли"
 
-_LIVE_SQL = ",".join(f"'{s}'" for s in LIVE_STATUSES)
+# Те же статусы, по которым дубль ловит постановка. Берём константу у неё, а не
+# перечисляем здесь: два списка «что считать взятым» молча разъедутся.
+_DUP_SQL = ",".join(f"'{s}'" for s in DUP_STATUSES)
 
 
 # ───────────────────────── дубли ─────────────────────────
@@ -59,9 +61,11 @@ def known_donors(c, tenant_id: str, urls: list) -> dict:
     сравнение строк объявило бы их разными. Строка ссылки остаётся запасным признаком —
     у не-YouTube доноров идентификатора нет.
 
-    Статусы — ровно те же `pub_tags.LIVE_STATUSES`, по которым дубль ловит сама
+    Статусы — ровно те же `pub_tags.DUP_STATUSES`, по которым дубль ловит сама
     постановка (`add_links`). Разойдясь, экран показывал бы дубль там, где постановка
-    его не видит, — или, хуже, молчал бы там, где она пропустит ссылку.
+    его не видит, — или, хуже, молчал бы там, где она пропустит ссылку. В набор входит
+    и `error`: сорвавшаяся строка держит выход канала, и вставленная заново ссылка
+    завела бы второй выпуск того же ролика (разбор 01.10.2026, Д28).
     """
     out = {}
     urls = [u for u in (urls or []) if u]
@@ -78,7 +82,7 @@ def known_donors(c, tenant_id: str, urls: list) -> dict:
         "SELECT p.donor_url AS url, p.donor_video_id AS vid, p.status AS status, "
         "p.slot_at AS slot_at, ch.id AS channel_id, ch.name AS channel_name "
         "FROM pub_plan_items p JOIN pub_channels_live ch ON ch.id=p.channel_id "
-        f"WHERE p.tenant_id=? AND p.status IN ({_LIVE_SQL}) "
+        f"WHERE p.tenant_id=? AND p.status IN ({_DUP_SQL}) "
         f"AND (p.donor_url IN ({url_marks}) OR (p.donor_video_id IS NOT NULL "
         f"AND p.donor_video_id!='' AND p.donor_video_id IN ({vid_marks}))) "
         "ORDER BY p.id",

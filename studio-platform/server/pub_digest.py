@@ -213,8 +213,10 @@ def _accepted_at(c, since: float, until: float) -> set:
 def _confirm_state(rel, checked: dict, now: float, have_key: bool, quota: dict) -> tuple:
     """Что мы знаем про один ожидавшийся выход: («вид», «причина»).
 
-    Виды: `confirmed` — ролик подтверждённо публичный; `delayed` — задержку видно;
-    `unknown` — судить нечем, и это не ноль (см. пункт 2 шапки модуля).
+    Виды: `confirmed` — ролик подтверждённо публичный; `by_hand` — выход закрыт
+    человеком, который посмотрел канал (план выполнен, но машинного подтверждения нет);
+    `delayed` — задержку видно; `unknown` — судить нечем, и это не ноль (см. пункт 2
+    шапки модуля).
 
     Порядок проверок не произвольный: СНАЧАЛА всё, что мы уже знаем, и только потом —
     почему не знаем остального. Знания тут два рода, и ни одному ключ не нужен: выпуск,
@@ -234,6 +236,14 @@ def _confirm_state(rel, checked: dict, now: float, have_key: bool, quota: dict) 
     phase = rel["phase"] or "created"
     if phase == PUBLISHED_PHASE:
         return "confirmed", ""
+    # Подтверждение человеком (решение владельца 01.10.2026, п. 6): план выполнен, ролик
+    # на канале есть, и ждать по нему больше нечего. Но это НЕ машинное подтверждение, и
+    # смешивать их в одно число нельзя: за первым стоит ответ YouTube Data API, за вторым
+    # — человек, который посмотрел канал. Поэтому свой вид, а в тексте — «в том числе
+    # руками N». Спрашивается раньше ответов проверки: проверка по такому выпуску могла
+    # не проходить вовсе, и без этой ветки он до конца суток числился бы «не знаем».
+    if "hand_confirmed" in rel.keys() and rel["hand_confirmed"]:
+        return "by_hand", ""
     if PHASE_INDEX.get(phase, 0) < ACCEPTED_INDEX:
         return "delayed", (rel["blocked_reason"]
                            or "ролик не дошёл до канала: расписание не подтверждено")
@@ -322,7 +332,7 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None) -> 
 
     # ── сегодня: ожидалось, подтверждено, задержано, не знаем ──
     today = {"expected": len(today_items), "ahead": ahead_today, "confirmed": 0,
-             "delayed": 0, "unknown": 0, "why": []}
+             "by_hand": 0, "delayed": 0, "unknown": 0, "why": []}
     delayed_by_channel: dict = {}
     for item in today_items:
         rel = releases.get(item["id"])
@@ -506,12 +516,16 @@ def _confirmed_text(today: dict) -> str:
     когда ответа нет ни про один, слова «подтверждено 0» не появляется вовсе.
     """
     known = today["expected"] - today["unknown"]
+    # Подтверждённое человеком считается выполнением плана, но называется отдельно:
+    # иначе отчёт заказчику обещал бы машинную проверку там, где её не было.
+    руками = today.get("by_hand") or 0
+    хвост = f" (в том числе руками {руками})" if руками else ""
     if today["unknown"] and known <= 0:
-        return "подтверждено: не знаем"
+        return f"подтверждено: не знаем{хвост}"
     if today["unknown"]:
-        return (f"подтверждено {today['confirmed']}, "
+        return (f"подтверждено {today['confirmed'] + руками}{хвост}, "
                 f"про {today['unknown']} не знаем")
-    return f"подтверждено {today['confirmed']}"
+    return f"подтверждено {today['confirmed'] + руками}{хвост}"
 
 
 def render(data: dict) -> str:

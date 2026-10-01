@@ -46,6 +46,7 @@ import pult_auth as auth                                       # noqa: E402
 from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
                            normalize_schedule, upcoming_slots)
 from pub_engine import PHASES, PHASE_DEADLINES, IRREVERSIBLE_FROM                   # noqa: E402
+from pub_engine import confirm_by_hand as pub_engine_confirm_by_hand  # noqa: E402
 from pub_engine import revive as pub_engine_revive                # noqa: E402
 import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
@@ -99,6 +100,12 @@ PHASE_TITLE = {
     "upload_running": "загрузка идёт",
     "scheduled": "запланирован",
     "published": "опубликован",
+    # Не фазы пути, а события журнала: их пишет `pub_engine.log_phase` тем же способом.
+    # Без имён они выходили на экран как есть, латиницей.
+    "blocked": "убран в разбор",
+    "revived": "возвращён в работу",
+    "resource_wait": "ждёт ресурса",
+    "hand_confirmed": "подтверждён человеком",
 }
 
 # Семь стадий раздела 14 ТЗ. Третье поле говорит, откуда берётся строка.
@@ -252,6 +259,7 @@ def _state(status) -> str:
 def _releases(c, channel=None, phase=None, status=None) -> list:
     sql = ("SELECT r.release_id, r.phase, r.status, r.slot_at, r.attempts, r.updated,"
            "       r.blocked_reason, r.video_id, r.project_id,"
+           "       r.hand_confirmed, r.hand_by,"
            "       ch.id ch_id, ch.name ch_name, ch.lang lang,"
            "       p.donor_url, p.donor_title "
            "FROM pub_releases r "
@@ -299,6 +307,11 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
             "bar": bars.get(r["release_id"], []),
             "video_id": r["video_id"] or "",
             "project_id": r["project_id"] or "",
+            # Подтверждение человеком: пометка навсегда (решение владельца, п. 6).
+            # Экран обязан отличать её от машинного подтверждения — за ней стоит
+            # человек, а не ответ YouTube Data API.
+            "hand_confirmed": r["hand_confirmed"] or 0,
+            "hand_by": r["hand_by"] or "",
             "idle_sec": max(0, int(now - (r["updated"] or now))),
         })
     return out
@@ -9555,6 +9568,43 @@ def ui_release_revive(release_id: str):
     c = db()
     try:
         out = pub_engine_revive(c, release_id)
+        if not out["ok"]:
+            raise HTTPException(409, out["why"])
+        c.commit()
+    finally:
+        c.close()
+    return out
+
+
+@app.post("/ui/releases/{release_id}/confirm-by-hand")
+async def ui_release_confirm_by_hand(release_id: str, request: Request):
+    """Человек посмотрел канал и подтверждает: ролик там.
+
+    Единственный выход из тупика, в котором у выпуска не было ни одного действия:
+    загрузка уже начиналась, значит повтор запрещён навсегда, а выход канала занят.
+    Решение владельца 01.10.2026, п. 6: это считается выполнением плана, и пометка
+    «подтверждено человеком» остаётся навсегда.
+
+    Ручка ОДИНОЧНАЯ нарочно: массовое применение здесь — прямой запрет ТЗ. Один выпуск,
+    одно нажатие, своими глазами.
+
+    Кто подтвердил — записывается. Это не формальность: в отличие от машинной проверки,
+    за этой пометкой стоит человек, и в разборе через месяц нужно знать, кто именно.
+    """
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        pass
+    c = db()
+    try:
+        user = auth.who(c, request.cookies.get(auth.COOKIE) or "")
+        if user is None:
+            raise HTTPException(401, "нужен вход")
+        out = pub_engine_confirm_by_hand(
+            c, release_id, who=user["name"],
+            video_id=str((body or {}).get("video_id") or ""),
+            note=str((body or {}).get("note") or ""))
         if not out["ok"]:
             raise HTTPException(409, out["why"])
         c.commit()

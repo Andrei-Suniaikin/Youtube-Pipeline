@@ -1439,10 +1439,16 @@ async function viewRelease(id){
       <div><div class="k">Без движения</div>${ago(r.idle_sec) || '—'}</div>
       <div><div class="k">Ролик</div>${r.video_id ? esc(r.video_id) : '—'}</div>
     </div>
+    ${r.hand_confirmed ? `<div class="sec">
+        Подтверждено человеком${r.hand_by ? ' — ' + esc(r.hand_by) : ''}, ${
+          when(r.hand_confirmed)}. Ролик на канале есть; заливка не повторится.
+        <span class="muted" style="font-weight:400">Это не машинное подтверждение:
+          ответа YouTube Data API по этому выпуску у нас нет.</span></div>` : ''}
     ${r.blocked_reason ? `<div class="sec" style="color:var(--bad)">
         Остановлен: ${esc(r.blocked_reason)}
-        ${r.status === 'blocked'
+        ${r.status === 'blocked' && !r.hand_confirmed
           ? '<button class="ghost" id="revive" style="margin-left:10px">Вернуть в работу</button>'
+            + '<button class="ghost" id="byhand" style="margin-left:8px">Подтвердить руками</button>'
           : ''}</div>` : ''}
     ${d.stages.map(s => `
       <div class="stage ${s.state === 'off' ? 'off' : ''}">
@@ -1478,6 +1484,49 @@ async function viewRelease(id){
       await render();
     }catch(e){ rev.disabled = false; toast(e.message); }
   });
+
+  /* Подтверждение человеком — единственный выход из тупика, в котором у выпуска нет ни
+     одного действия: загрузка уже начиналась, значит повтор запрещён навсегда, а выход
+     канала занят. Решение владельца 01.10.2026, п. 6: это считается выполнением плана,
+     и пометка остаётся навсегда.
+
+     Кнопка ОДИНОЧНАЯ и живёт только здесь, на странице одного выпуска: массовое
+     применение — прямой запрет ТЗ, и правильно оно быть не может, потому что каждый
+     такой выпуск человек смотрит на канале своими глазами.
+
+     Номер ролика спрашиваем, если нода его не присылала. Без номера подтверждать нечем:
+     «не знаем» не равно «подтверждено», и закрывать выпуск на доверии нельзя — ролика
+     на канале может не быть вовсе. */
+  const byhand = head.querySelector('#byhand');
+  if (byhand) byhand.onclick = () => {
+    const есть = !!r.video_id;
+    modal('Подтвердить руками', `
+      <div style="font-size:14px">Вы открыли канал и видите ролик там. Выпуск закроется
+        как выполненный: выход канала останется занятым, заливка больше не повторится,
+        а пометка «подтверждено человеком» останется навсегда.</div>
+      ${есть
+        ? `<div class="note muted">Ролик: ${esc(r.video_id)} — номер прислала машина
+             заливки, вписывать ничего не нужно.</div>`
+        : `<div class="fld" style="margin-top:12px">
+             <label>Ссылка на ролик или его номер<span style="color:var(--bad)">*</span></label>
+             <input id="bh-vid" placeholder="https://youtu.be/… или 11 символов">
+             <div class="note muted">Номера ролика мы не знаем: машина его не прислала.
+               Откройте ролик на канале и скопируйте ссылку из адресной строки.</div>
+           </div>`}
+      <div class="fld" style="margin-top:10px">
+        <label>Заметка для разбора</label>
+        <input id="bh-note" placeholder="что было видно на канале — необязательно">
+      </div>`,
+      {ok: 'Подтвердить', no: 'Отмена', onOk: async (body, close) => {
+        const vid = (body.querySelector('#bh-vid') || {}).value || '';
+        if (!есть && !vid.trim()) throw new Error('впишите ссылку на ролик или его номер');
+        await post(`/ui/releases/${encodeURIComponent(r.release_id)}/confirm-by-hand`,
+                   {video_id: vid.trim(),
+                    note: ((body.querySelector('#bh-note') || {}).value || '').trim()});
+        close();
+        await render();
+      }});
+  };
 
   app.append($(`<div class="card">
     <div class="sec">Что происходило</div>

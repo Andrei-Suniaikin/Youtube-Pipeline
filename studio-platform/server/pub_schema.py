@@ -414,6 +414,19 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
               "heartbeat REAL, deadline REAL, attempts INTEGER NOT NULL DEFAULT 0, "
               "created REAL NOT NULL, updated REAL NOT NULL, "
               "UNIQUE(plan_item_id,plan_item_version))")
+    # Подтверждение человеком (решение владельца 01.10.2026, п. 6). Из выпуска, у
+    # которого загрузка уже начиналась, выхода не было ни одного: вернуть в работу
+    # нельзя (повтор запрещён навсегда), снять строку плана нельзя, переставить нельзя,
+    # а выход канала занят. Единственный честный исход — человек посмотрел канал своими
+    # глазами и говорит: ролик там. Это считается выполнением плана, и пометка остаётся
+    # НАВСЕГДА: её не снимает ни возврат в работу, ни повторная проверка. Машинным
+    # подтверждением она при этом не становится — в сводке такие выходы названы отдельно.
+    for _col, _sql in (("hand_confirmed", "REAL"), ("hand_by", "TEXT"),
+                       ("hand_video_id", "TEXT"), ("hand_note", "TEXT")):
+        try:
+            c.execute(f"ALTER TABLE pub_releases ADD COLUMN {_col} {_sql}")
+        except Exception:
+            pass   # колонка уже есть
     c.execute("CREATE INDEX IF NOT EXISTS idx_pub_releases_live "
               "ON pub_releases(tenant_id,status,slot_at)")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pub_releases_channel "
