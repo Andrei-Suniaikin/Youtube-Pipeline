@@ -38,6 +38,7 @@ from starlette.concurrency import run_in_threadpool
 
 import pub_adspower
 import pub_artifact
+import pub_upload_census
 from pub_log import add as log_line, add_lines
 
 # Сколько ждать вестей от ноды, прежде чем считать заливку зависшей.
@@ -213,6 +214,9 @@ def register_upload_routes(app, ctx):
         c.execute("UPDATE pub_upload_jobs SET status='error', error=?, finished=?, "
                   "updated=? WHERE id=? AND status=?", (text, now, now, row["id"], was))
         log_line(c, row["release_id"], "заливка", text, level="error", now=now)
+        # `stale`: повтор здесь не запрещён, он бессмыслен — на диске другой ролик, и
+        # заливать его можно только после новой приёмки (решение владельца, п. 7).
+        pub_upload_census.note(c, row["release_id"], text, now=now, stale=True)
         return text
 
     # ── взять задание ──
@@ -294,6 +298,10 @@ def register_upload_routes(app, ctx):
                     log_line(c, r["release_id"], "заливка",
                              "задание состарилось в очереди — время выхода прошло",
                              level="error", now=now)
+                    # Тоже `stale`: повторять нечего, время выхода уже прошло.
+                    pub_upload_census.note(
+                        c, r["release_id"], "время выхода прошло, пока стояло в очереди",
+                        now=now, stale=True)
                     continue
                 ours = r["profile_id"] in busy_profiles
                 # (5) Чужим считаем профиль, только если он НЕ занят нами: наша же идущая
@@ -510,6 +518,13 @@ def register_upload_routes(app, ctx):
                          "нода домолчалась до успеха: ролик подтверждён, снимаю разбор",
                          now=now)
             level = {"scheduled": "info", "published": "info"}.get(verdict["kind"], "error")
+            if verdict["kind"] not in ("scheduled", "published"):
+                # Класс берётся уликами, а не словом вердикта: `needs_repair` означает,
+                # что ролик на канале есть, и это `sent`; `failed` до передачи файла —
+                # `safe`. Разбирать текст ошибки на слова нельзя, он меняется.
+                pub_upload_census.note(c, release_id,
+                                       f"{verdict['kind']}: {verdict['error'] or 'без слов'}",
+                                       now=now)
             log_line(c, release_id, "заливка",
                      f"вердикт: {verdict['kind']}"
                      + (f", видео {verdict['video_id']}" if verdict["video_id"] else "")
@@ -608,5 +623,10 @@ def sweep_stuck(c, now: float) -> list:
             "WHERE id=?",
             (f"нода молчит дольше {UPLOAD_LEASE_SEC // 60} минут — нужен разбор",
              now, now, r["id"]))
+        # `silent` и только он: фаз у замолчавшей ноды нет, и по фазам такой срыв
+        # выглядит безопасным. Она могла продолжать загрузку молча.
+        pub_upload_census.note(c, r["release_id"],
+                               f"нода молчит дольше {UPLOAD_LEASE_SEC // 60} минут",
+                               now=now, silent=True)
         out.append(r["release_id"])
     return out

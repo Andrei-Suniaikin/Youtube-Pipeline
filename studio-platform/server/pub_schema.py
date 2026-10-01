@@ -502,3 +502,10 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
               "created REAL NOT NULL, updated REAL NOT NULL, "
               "UNIQUE(release_id,service,kind))")
     c.execute("CREATE INDEX IF NOT EXISTS idx_pub_release_jobs_rid ON pub_release_jobs(release_id)")
+    # Перепись срывов заливки: одна строка на срыв, с разбором «безопасно ли повторять»
+    # в тот момент, когда ответ ещё известен. Решение владельца 01.10.2026, п. 7:
+    # автоповтор заливки решается по числам, а числа надо сначала собрать — статус
+    # задания перетирается следующим исходом и разобранный руками срыв следа не
+    # оставляет. Подробности и классы — `server/pub_upload_census.py`.
+    import pub_upload_census                                       # noqa: PLC0415
+    pub_upload_census.ensure(c)

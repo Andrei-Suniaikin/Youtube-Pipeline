@@ -76,6 +76,7 @@ except ImportError:                      # pragma: no cover — питон ст�
 
 import pub_alerts
 import pub_calls
+import pub_upload_census
 import pub_verify
 from channel_supply import channel_supply, supply_facts
 from pub_engine import PHASE_INDEX
@@ -410,6 +411,12 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None) -> 
                        "supply_unknown": supply_unknown,
                        "threshold_days": float(pub_alerts.SUPPLY_MIN_DAYS)},
         "problems": problems,
+        # Срывы заливки за те же сутки, разобранные на «безопасно повторить» и
+        # «повторять нельзя». Решение владельца 01.10.2026, п. 7: автоповтор решается
+        # по числам, а числа надо собрать. Сводка — то место, куда владелец смотрит
+        # каждый день, поэтому замер живёт здесь, а не в отдельном отчёте, который
+        # никто не откроет.
+        "uploads": pub_upload_census.since(c, since, until),
         "alerts": alerts, "alerts_why": alerts_why,
     }
 
@@ -540,6 +547,15 @@ def render(data: dict) -> str:
         lines.append(f"  ещё про {prod['supply_unknown']} "
                      f"{_plural(prod['supply_unknown'], 'канал', 'канала', 'каналов')} "
                      f"запас неизвестен: расписание не задано — это не ноль.")
+
+    загрузки = data.get("uploads") or {}
+    if загрузки.get("всего"):
+        # Ноль в отчёт не пишем: строка «срывов нет» каждое утро приучает её не читать,
+        # и в день, когда срывы появятся, её не заметят.
+        lines += ["", "Заливка: " + pub_upload_census.text(загрузки) + "."]
+        if загрузки.get("silent"):
+            lines.append("  «нода молчала» — это НЕ ноль и не безопасный повтор: "
+                         "она могла продолжать загрузку молча.")
 
     lines += ["", "Проблемы:"]
     if not data["problems"]:
