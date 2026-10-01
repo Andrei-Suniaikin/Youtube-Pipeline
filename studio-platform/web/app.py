@@ -60,7 +60,7 @@ from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
                           collect_paid_texts, paid_texts_waiting)
 from pub_neighbors import (cover_presets, rewrite_preset_config,  # noqa: E402
                            rewrite_presets, vsgen_presets)
-from pub_tags import (DONOR_UNKNOWN_WHY, add_links, add_tag,       # noqa: E402
+from pub_tags import (DONOR_UNKNOWN_WHY, add_links, add_tag, cancel_item,  # noqa: E402
                       check_donor, clean_tag, donor_facts_blank, donor_limits,
                       donor_title, donor_verdict, drop_tag, parse_links, plan_rows)
 from pub_tags import tag_names as pub_tags_names                 # noqa: E402
@@ -7103,18 +7103,50 @@ def ui_channel_create(body: ChannelIn):
 
 @app.post("/ui/plan/{pid:int}/cancel")
 def ui_plan_cancel(pid: int, request: Request):
-    """Убрать ссылку из плана. Снимает её кабинет (`cancel_item`): он же проверяет,
-    что выпуск по ней ещё не пошёл, и он же владеет статусами."""
+    """Убрать ссылку из плана. Отказ доезжает до человека словами.
+
+    Жалоба владельца 01.10.2026: «нажимает в попапе „да“, страница перезагружается, а
+    ролик на месте». Воспроизведено: пульт отвечал `200 {"ok": true}` в том числе тогда,
+    когда не убирал НИЧЕГО.
+
+    Как получалась эта ложь. Пульт пересылал нажатие формой в кабинет и считал успехом
+    сам факт ответа. А кабинет на отказ `cancel_item` отвечает не ошибкой, а СТРАНИЦЕЙ с
+    объяснением — кодом 200, потому что писалась эта ручка для браузера, которому эту
+    страницу и показывают. Пульт страницу не читает (это разметка, а не контракт), видел
+    код 200 и рапортовал успех. Экран честно перерисовывался и честно показывал ту же
+    строку: убирать её кабинет отказался, а сказать об этом было некому.
+
+    Поэтому снимаем строку здесь и той же самой функцией `pub_tags.cancel_item`, которой
+    это делает кабинет: она одна на обоих, второй правды о статусах не заводится. Её
+    отказ — текст для человека («ролик уже заливается на канал»), он и уходит как 409, а
+    фронт показывает его тостом.
+
+    Что `cancel_item` делает и чего не делает: гасит ждущее задание заливки (иначе нода
+    позже заберёт его и зальёт ролик, которого в плане уже нет), уводит выпуск в
+    `cancelled`, и ОТКАЗЫВАЕТ, если загрузка уже началась или машина взяла ролик в
+    работу. Материалы проекта на диске остаются — их убирает уборка по сроку хранения.
+    """
     c = db()
     try:
         row = c.execute("SELECT id FROM pub_plan_items WHERE id=? AND tenant_id=?",
                         (pid, TENANT)).fetchone()
+        if not row:
+            raise HTTPException(404, "ссылка не найдена")
+        try:
+            release_id = cancel_item(c, pid, time.time())
+        except ValueError as exc:
+            # Это не сбой, а ответ: «убирать поздно, ролик уже уходит на канал».
+            raise HTTPException(409, str(exc))
+        c.commit()
+        # Сторож на будущее: отвечать «убрал» имеет право только тот, кто проверил, что
+        # убрал. Условие то же, по которому строка исчезает из списков экрана.
+        left = c.execute("SELECT status FROM pub_plan_items WHERE id=?", (pid,)).fetchone()
+        if not left or left["status"] != "cancelled":
+            raise HTTPException(500, "строка осталась в плане — снять её не удалось")
     finally:
         c.close()
-    if not row:
-        raise HTTPException(404, "ссылка не найдена")
-    _cabinet_form(f"/api/plan/{pid}/cancel", [], request, expect_json=False)
-    return {"ok": True}
+    _audit(f"ссылка {pid} убрана из плана")
+    return {"ok": True, "release_id": release_id}
 
 
 # {cid:int} — иначе этот путь перехватывает «/ui/channels/import».

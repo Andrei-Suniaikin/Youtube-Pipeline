@@ -1094,6 +1094,78 @@ def main() -> int:
     finally:
         drop_release(rel_id, plan_id)
 
+    print("\n«Убрать» из плана: отказ доезжает словами (01.10.2026)")
+    # Жалоба владельца: «нажимает в попапе „да“, страница перезагружается, а ролик на
+    # месте». Пульт отвечал 200 {"ok": true} в том числе когда не убирал ничего: он
+    # пересылал нажатие формой в кабинет, а кабинет на отказ отвечает СТРАНИЦЕЙ с кодом
+    # 200 (она писалась для браузера). Код 200 читался как успех.
+    c = sqlite3.connect(DB, timeout=5)
+    c.row_factory = sqlite3.Row
+    try:
+        ch = c.execute("SELECT id, uc FROM pub_channels WHERE tenant_id=? ORDER BY id "
+                       "LIMIT 1", (TENANT,)).fetchone()
+        now = time.time()
+        # Строка без даты — ровно та, что стоит в списке «Ждут даты».
+        c.execute("INSERT INTO pub_plan_items(tenant_id,channel_id,donor_url,donor_title,"
+                  "position,slot_at,status,created,updated) "
+                  "VALUES(?,?,?,?,997,NULL,'planned',?,?)",
+                  (TENANT, ch["id"], "https://youtu.be/plancancel1", "Без даты", now, now))
+        простая = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        # И вторая — та же с виду, но её кабинет снимать отказывается: заливка начата.
+        c.execute("INSERT INTO pub_plan_items(tenant_id,channel_id,donor_url,donor_title,"
+                  "position,slot_at,status,created,updated) "
+                  "VALUES(?,?,?,?,996,NULL,'planned',?,?)",
+                  (TENANT, ch["id"], "https://youtu.be/plancancel2", "Уже льётся", now, now))
+        поздняя = c.execute("SELECT last_insert_rowid()").fetchone()[0]
+        поздний_rid = f"rel-cancel-{поздняя}"
+        c.execute("INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,"
+                  "plan_item_version,channel_id,uc,slot_at,status,phase,created,updated) "
+                  "VALUES(?,?,?,1,?,?,?,'running','upload_running',?,?)",
+                  (поздний_rid, TENANT, поздняя, ch["id"], ch["uc"] or "UC1", now, now, now))
+        c.execute("INSERT INTO pub_release_events(release_id,seq,phase,created) "
+                  "VALUES(?,1,'upload_running',?)", (поздний_rid, now))
+        c.commit()
+    finally:
+        c.close()
+    try:
+        def статус(pid):
+            cc = sqlite3.connect(DB, timeout=5)
+            try:
+                r = cc.execute("SELECT status FROM pub_plan_items WHERE id=?",
+                               (pid,)).fetchone()
+                return r[0] if r else ""
+            finally:
+                cc.close()
+
+        def ждут(cid):
+            return [w["id"] for w in
+                    (me.go(f"/ui/channels/{cid}")[1].get("waiting_items") or [])]
+
+        check("обе строки стоят в «Ждут даты»",
+              all(x in ждут(ch["id"]) for x in (простая, поздняя)), True)
+
+        code, body = me.go(f"/ui/plan/{простая}/cancel", {})
+        check("обычная строка убрана", code, 200)
+        check("и в базе она снята", статус(простая), "cancelled")
+        check("и из списка пропала", простая in ждут(ch["id"]), False)
+
+        code, body = me.go(f"/ui/plan/{поздняя}/cancel", {})
+        # Главное в этой проверке: НЕ 200. Успех, о котором не спросили, — это ложь.
+        check("убрать поздно — отказ, а не «ok»", code, 409)
+        check("и сказано словами, почему",
+              "заливается на канал" in str((body or {}).get("detail") or ""), True)
+        check("строка осталась в плане", статус(поздняя), "planned")
+        check("и видна человеку на месте", поздняя in ждут(ch["id"]), True)
+    finally:
+        c = sqlite3.connect(DB, timeout=5)
+        try:
+            c.execute("DELETE FROM pub_release_events WHERE release_id=?", (поздний_rid,))
+            c.execute("DELETE FROM pub_releases WHERE release_id=?", (поздний_rid,))
+            c.execute("DELETE FROM pub_plan_items WHERE id IN (?,?)", (простая, поздняя))
+            c.commit()
+        finally:
+            c.close()
+
     print("\n«Подтвердить руками» — ручка на живом стенде (01.10.2026)")
     # Серверная логика проверена в tests/test_hand_confirm.py. Здесь — ручка: вход,
     # чужой выпуск и то, что отказ доезжает до человека словами, а не пятисоткой.
