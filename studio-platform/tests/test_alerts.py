@@ -51,7 +51,8 @@ def fresh() -> sqlite3.Connection:
       CREATE TABLE pub_upload_jobs(id INTEGER PRIMARY KEY, tenant_id TEXT, status TEXT,
                                    created REAL, finished REAL);
       CREATE TABLE pub_releases(id INTEGER PRIMARY KEY, tenant_id TEXT, plan_item_id INT,
-                                slot_at REAL, phase TEXT, status TEXT);
+                                slot_at REAL, phase TEXT, status TEXT,
+                                project_id TEXT, blocked_reason TEXT);
       CREATE TABLE pub_plan_items(id INTEGER PRIMARY KEY, tenant_id TEXT, slot_at REAL,
                                   status TEXT);
     """)
@@ -140,7 +141,8 @@ def main() -> int:
 
     print("\nПовод 4 — слот прошёл")
     c = fresh()
-    c.execute("INSERT INTO pub_releases VALUES(1,'dev',7,?,'media_ready','running')",
+    c.execute("INSERT INTO pub_releases(id,tenant_id,plan_item_id,slot_at,phase,status) "
+              "VALUES(1,'dev',7,?,'media_ready','running')",
               (NOW - HOUR,))
     check("выпуск не доехал до слота", keys(c), ["slot_missed"])
     c.execute("UPDATE pub_releases SET phase='scheduled'")
@@ -158,6 +160,32 @@ def main() -> int:
     check("семь часов в очереди", "oldest_task" in keys(c), True)
     c.execute("UPDATE queue_tasks SET status='running'")
     check("начатая задача сюда не считается", "oldest_task" in keys(c), False)
+
+    print("\n  ...но задача заблокированного выпуска не голодает, её держат")
+    # Так это и пришло 02.10.2026: тревога «задача #13 стоит 6 ч» увела владельца
+    # искать поломку в очереди, а очередь была цела — у проекта упала озвучка, выпуск
+    # из-за этого blocked, и студия нарочно не начинала платный этап картинок.
+    c = fresh()
+    c.execute("INSERT INTO projects VALUES('p_1','Zaginiona Cywilizacja')")
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished,"
+              "project_id) VALUES(13,'dev','images','queued',?,NULL,'p_1')",
+              (NOW - 9 * HOUR,))
+    check("пока выпуск жив — это голод, и повод есть", "oldest_task" in keys(c), True)
+    c.execute("INSERT INTO pub_releases(id,tenant_id,phase,status,project_id,blocked_reason) "
+              "VALUES(1,'dev','project_ready','blocked','p_1','этап «tts» упал')")
+    check("выпуск заблокирован — повода нет", "oldest_task" in keys(c), False)
+
+    print("\n  а настоящий голод рядом с придержанными виден, и про них сказано")
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished,"
+              "project_id) VALUES(14,'dev','prompts','queued',?,NULL,'p_живой')",
+              (NOW - 8 * HOUR,))
+    тревога = A.detect(c, NOW).get("oldest_task")
+    check("голодающая задача названа", bool(тревога) and "#14" in тревога.text, True)
+    check("и сказано, что ждёт именно очереди",
+          "ждёт именно очереди" in (тревога.text if тревога else ""), True)
+    check("а про придержанную сказано отдельной строкой",
+          "по другой причине" in (тревога.text if тревога else ""), True)
+    check("и её номер в тревогу не попал", "#13" in (тревога.text if тревога else ""), False)
 
     print("\nМесто на машинах рендера и заливки")
     c = fresh()
