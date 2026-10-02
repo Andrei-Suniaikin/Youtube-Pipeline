@@ -83,16 +83,29 @@ if [ -n "$_altkey" ]; then
   # оплачен и расходует ОТДЕЛЬНУЮ квоту prompt.tokens.hour, не кредиты картинок.
   # Ключ сюда НЕ кладём: его выдаёт сервер из семейства `googler` при вызове воркера —
   # одна копия секрета, в файле ключей.
-  export VS_GPT_CHAT_URL="${VS_GPT_CHAT_URL:-https://api.fast-gen.ai/v1/chat/completions}"
-  case "$VS_GPT_CHAT_URL" in
-    *fast-gen.ai*)
-      # Модель переставляется ВМЕСТЕ с адресом: `gpt-4.1-nano` у FastGen не существует,
-      # живой вызов отвечает 400 «No supported model found» — и это читается как
-      # поломка прогона, а не как неверная настройка.
-      export VS_GPT_MODEL="${VS_GPT_MODEL:-gpt-4.1-mini}"
-      export VS_SCENE_GPT_MODEL="${VS_SCENE_GPT_MODEL:-gpt-4.1-mini}"
-      ;;
-  esac
+  # ВЫКЛЮЧЕНО 02.10.2026, в тот же вечер, по итогам живой проверки. Деньги FastGen
+  # решает, схему — нет. Задача 154 на FastGen дала 23 отказа схемы из 50 попыток и
+  # умерла («semantic v4 block: не массив units»), тогда как на прежнем адресе соседние
+  # задачи давали 0–2 из 12–53 и доходили. Причина названа в нашем же коде, строкой
+  # 2660: сторонний OpenAI-совместимый прокси уважает `response_format` НЕ на всех
+  # моделях и возвращает свободный текст. Планировщику сцен нужен строгий JSON — значит
+  # сначала надо передавать схему ещё и текстовой директивой (приём уже есть в
+  # `_alt_llm_call`), и только потом включать это обратно.
+  #
+  # Включается одной переменной, когда директива будет сделана:
+  #   VS_GPT_CHAT_URL=https://api.fast-gen.ai/v1/chat/completions
+  if [ -n "${VS_GPT_CHAT_URL:-}" ]; then
+    export VS_GPT_CHAT_URL
+    case "$VS_GPT_CHAT_URL" in
+      *fast-gen.ai*)
+        # Модель переставляется ВМЕСТЕ с адресом: `gpt-4.1-nano` у FastGen не
+        # существует, живой вызов отвечает 400 «No supported model found» — и это
+        # читается как поломка прогона, а не как неверная настройка.
+        export VS_GPT_MODEL="${VS_GPT_MODEL:-gpt-4.1-mini}"
+        export VS_SCENE_GPT_MODEL="${VS_SCENE_GPT_MODEL:-gpt-4.1-mini}"
+        ;;
+    esac
+  fi
   export REWRITE_GPT_CHAT_URL="${REWRITE_GPT_CHAT_URL:-https://api.fast-gen.ai/v1/chat/completions}"
   export REWRITE_GPT_CHAT_KEY="${REWRITE_GPT_CHAT_KEY:-$_altkey}"
   case "$REWRITE_GPT_CHAT_URL" in
