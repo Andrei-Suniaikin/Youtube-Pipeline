@@ -339,6 +339,60 @@ def _note(c, release_id: str, payload: dict, now: float) -> None:
                          video_id=payload.get("video_id") or "", payload=payload)
 
 
+def _plural_videos(n: int) -> str:
+    """«1 ролик» / «2 ролика» / «5 роликов» — сообщение читает человек."""
+    n = int(n)
+    t = n % 100
+    if 11 <= t <= 14:
+        форма = "роликов"
+    elif n % 10 == 1:
+        форма = "ролик"
+    elif 2 <= n % 10 <= 4:
+        форма = "ролика"
+    else:
+        форма = "роликов"
+    return f"{n} {форма}"
+
+
+def хорошая_новость(c, вышли) -> str:
+    """Сообщение «ролики вышли» — или пустая строка, если выходить было некому.
+
+    Отдельной функцией, а не строкой внутри прохода, по двум причинам. Первая: это
+    единственная ХОРОШАЯ новость, которую студия отправляет сама, и проверять её текст
+    надо без сети. Вторая: до 02.10.2026 выход ролика не сообщался никак — проход
+    поднимал запись `scheduled` → `published` в базе, и всё. Владелец 02.10: «да, я
+    хочу знать, что видосы готовы». Знать из базы — это не знать.
+
+    Канал называем по имени, а не по UC: человеку нужно имя. Нет имени в справочнике —
+    пишем UC, но не молчим.
+    """
+    if not вышли:
+        return ""
+    строки = [f"✅ Вышли на YouTube: {_plural_videos(len(вышли))}", ""]
+    for запись in вышли[:20]:
+        имя = ""
+        uc = str(запись.get("channel_id") or "")
+        if uc:
+            try:
+                row = c.execute(
+                    "SELECT name, lang FROM pub_channels WHERE uc=?", (uc,)).fetchone()
+            except Exception:                                      # noqa: BLE001
+                row = None
+            if row:
+                имя = str(row[0] or "")
+                if row[1]:
+                    имя += f" ({row[1]})"
+        строки.append(f"• {имя or uc or 'канал неизвестен'}")
+        строки.append(f"  youtu.be/{запись.get('video_id') or '—'}")
+    остаток = len(вышли) - 20
+    if остаток > 0:
+        строки.append(f"…и ещё {_plural_videos(остаток)}")
+    строки += ["",
+               "Это ответ самой YouTube на вопрос «ролик публичный?», а не наше "
+               "расписание: до этой строки «залито» и «вышло» были разными вещами."]
+    return "\n".join(строки)
+
+
 def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
     """Один поздний проход. Возвращает счётчики и не бросает наружу.
 
@@ -368,7 +422,9 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
     now = now or time.time()
     log = log or (lambda *_a: None)
     key = api_key(c) if key is None else key
-    out = {"checked": 0, "published": 0, "unlisted": 0, "waiting": 0,
+    # «вышли» — не счётчик, а список: по нему строится сообщение «ролики готовы», и
+    # собрать его можно только во время прохода (см. место, где ставится phase).
+    out = {"вышли": [], "checked": 0, "published": 0, "unlisted": 0, "waiting": 0,
            "stale": 0, "unknown": 0, "skipped": 0, "quota_wait": 0,
            # Сколько осталось следующему проходу из-за предела ASK_LIMIT. Отдельно от
            # `quota_wait`: там ждут сброса квоты, здесь — просто очередь, и путать эти
@@ -468,6 +524,11 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
                         + (f", вышел {res.get('published_at')}"
                            if res.get("published_at") else ""), now=now)
             out["published"] += 1
+            out["вышли"].append({
+                "release_id": rid,
+                "video_id": rel["video_id"],
+                "channel_id": (rel["channel_id"] if "channel_id" in rel.keys() else ""),
+            })
             log(f"  {rid}: вышел")
         elif res["state"] == UNLISTED:
             c.execute("UPDATE pub_releases SET blocked_reason=?, updated=? WHERE id=?",

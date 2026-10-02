@@ -39,7 +39,8 @@ def fresh(phase="scheduled", video_id="vid1", slot=NOW - 3 * HOUR, tenant="dev")
       CREATE TABLE admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL);
       CREATE TABLE pub_releases(id INTEGER PRIMARY KEY, release_id TEXT, tenant_id TEXT,
                                 plan_item_id INT, slot_at REAL, phase TEXT, status TEXT,
-                                video_id TEXT, blocked_reason TEXT, updated REAL);
+                                video_id TEXT, blocked_reason TEXT, updated REAL,
+                                channel_id TEXT);
       CREATE TABLE pub_release_events(id INTEGER PRIMARY KEY AUTOINCREMENT,
                                 release_id TEXT, seq INTEGER, phase TEXT, video_id TEXT,
                                 payload TEXT, created REAL,
@@ -48,8 +49,10 @@ def fresh(phase="scheduled", video_id="vid1", slot=NOW - 3 * HOUR, tenant="dev")
       CREATE TABLE pub_release_log(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
                                 ts REAL, level TEXT, step TEXT, message TEXT,
                                 repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
+      CREATE TABLE pub_channels(uc TEXT PRIMARY KEY, name TEXT, lang TEXT);
     """)
-    c.execute("INSERT INTO pub_releases VALUES(1,'r1',?,1,?,?,'done',?,NULL,?)",
+    c.execute("INSERT INTO pub_channels VALUES('UC_1','S-Ранг Манхва','ru')")
+    c.execute("INSERT INTO pub_releases VALUES(1,'r1',?,1,?,?,'done',?,NULL,?,'UC_1')",
               (tenant, slot, phase, video_id, NOW))
     c.commit()
     return c
@@ -170,6 +173,35 @@ def main() -> int:
         os.environ.pop("VS_YT_API_KEY", None)
 
     print()
+    print("\nВышел ролик — про это ГОВОРЯТ, а не только пишут в базу")
+    # Владелец 02.10.2026: «да, я хочу знать, что видосы готовы». До этой работы проход
+    # поднимал phase=published и молчал: знать из базы — это не знать.
+    c = fresh()
+    out = V.run(c, "dev", NOW, fetch=answer("public"), key="k")
+    check("фаза повышена", phase_of(c), "published")
+    check("и проход вернул, КТО именно вышел", len(out["вышли"]), 1)
+    текст = V.хорошая_новость(c, out["вышли"])
+    check("в сообщении сказано, сколько вышло", "Вышли на YouTube: 1 ролик" in текст, True)
+    check("канал назван именем, а не UC", "S-Ранг Манхва (ru)" in текст, True)
+    check("и дана ссылка на ролик", "youtu.be/vid1" in текст, True)
+    check("сказано, что это ответ YouTube, а не наше расписание",
+          "ответ самой YouTube" in текст, True)
+
+    print("\n  выходить некому — сообщения нет вовсе")
+    check("пустой список даёт пустой текст", V.хорошая_новость(c, []), "")
+    c2 = fresh()
+    out2 = V.run(c2, "dev", NOW, fetch=answer("unlisted"), key="k")
+    check("ролик «только по ссылке» вышедшим не считается", out2["вышли"], [])
+    check("и текста по нему нет", V.хорошая_новость(c2, out2["вышли"]), "")
+
+    print("\n  канала нет в справочнике — молчать всё равно нельзя")
+    c3 = fresh()
+    c3.execute("DELETE FROM pub_channels")
+    out3 = V.run(c3, "dev", NOW, fetch=answer("public"), key="k")
+    текст3 = V.хорошая_новость(c3, out3["вышли"])
+    check("вместо имени стоит UC", "• UC_1" in текст3, True)
+    check("и ссылка на месте", "youtu.be/vid1" in текст3, True)
+
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
         for f in FAILS:
