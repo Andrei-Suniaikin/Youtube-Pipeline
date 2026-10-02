@@ -554,6 +554,13 @@ def check_key_exhausted(c, now, tenant=None) -> list:
 ЧУЖИЕ_СЛОВА = ("http 502", "http 503", "http 504", "техработ", "service unavailable",
                "temporarily unavailable", "bad gateway", "gateway timeout",
                "исчерпали квоту", "quota", "rate limit", "429", "не поднялся")
+# Беда НАША, даже если рядом стоят слова про квоту: кончились деньги, отвергнут ключ,
+# нет доступа. Проверяется раньше признаков чужого простоя. Ошибка в эту сторону дорогая:
+# «ждём, пока поднимется» на пустом счёте — это сутки простоя вместо пополнения за
+# минуту (жалоба владельца 02.10.2026: `rc=2` на пустом счёте OpenAI).
+НАШИ_СЛОВА = ("no credits", "add credits", "insufficient", "исчерпан счёт",
+              "кончились кредиты", "нет кредитов", "ключ", "unauthorized", "forbidden",
+              "invalid api key", "payment", "billing", "оплат")
 
 
 def внешняя_беда(error: str) -> tuple:
@@ -564,6 +571,8 @@ def внешняя_беда(error: str) -> tuple:
     """
     текст = " ".join(str(error or "").split())
     низ = текст.lower()
+    if any(w in низ for w in НАШИ_СЛОВА):
+        return "", ""
     if not any(w in низ for w in ЧУЖИЕ_СЛОВА):
         return "", ""
     for имя, метки in ЧУЖАЯ_БЕДА:
@@ -597,6 +606,11 @@ def check_failed_tasks(c, now, tenant=None) -> list:
         f"FROM queue_tasks q LEFT JOIN projects p ON p.id = q.project_id "
         f"WHERE q.status='error' AND COALESCE(q.finished, q.created) >= ?{where} "
         f"ORDER BY COALESCE(q.finished, q.created) DESC", (now - FAILED_SEC,) + args).fetchall()
+    # Следствие чужого падения тревогой не считается. «Конвейер оборван: последняя задача
+    # промптов не завершилась успешно» — это не беда, а её тень: настоящая беда уже
+    # названа тревогой про промпты, и вторая на тот же случай удваивает шум. На тридцати
+    # проектах из одной поломки выходило шестьдесят сообщений (владелец, 02.10.2026).
+    rows = [r for r in rows if "конвейер оборван" not in str(r[2] or "").lower()]
     out = []
     for job_id, kind, error, finished, project_id, name in rows[:FAILED_MAX]:
         # Деньги считаем по журналу вызовов: у падения этап известен, а вот потратил

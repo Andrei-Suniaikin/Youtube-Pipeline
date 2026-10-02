@@ -1155,7 +1155,7 @@ def _key_refusal_text(jid, key_value="", limit_msg=""):
 
 
 def _worker_error_text(jid, rc, key_value="", limit_msg="", card_worker_error="",
-                       provider_down_msg=""):
+                       provider_down_msg="", prompt_channel_msg=""):
     """Что увидит человек в карточке упавшей задачи. Порядок приоритетов — здесь.
 
     Первая опознанная причина отказа ключа важнее и последней строки воркера, и кода
@@ -1167,7 +1167,8 @@ def _worker_error_text(jid, rc, key_value="", limit_msg="", card_worker_error=""
     технические работы» заставляет искать поломку у себя (владелец, 02.10.2026).
     """
     return (_key_refusal_text(jid, key_value, limit_msg) or limit_msg
-            or card_worker_error or provider_down_msg or f"rc={rc}")
+            or card_worker_error or prompt_channel_msg or provider_down_msg
+            or f"rc={rc}")
 
 
 def _prompt_policy():
@@ -10730,6 +10731,7 @@ def _run_task(t):
     card_worker_error = ""
     provider_down_msg = ""          # последние слова провайдера про собственный простой
     stale_receipt_msg = ""          # воркер упёрся в след прошлой попытки
+    prompt_channel_msg = ""         # приговор по каналу промптов (деньги, ключ, доступ)
 
     def _task_key_value():
         """Чей ключ отказал: свой ключ юзера, если задача ушла на него, иначе серверный.
@@ -10977,6 +10979,10 @@ def _run_task(t):
             _след = _stale_receipt_line(clean)
             if _след:
                 stale_receipt_msg = _след
+            # Первый приговор по каналу промптов и есть причина: дальше воркер печатает
+            # следствия, и последнее из них увело бы в карточку не то.
+            if not prompt_channel_msg:
+                prompt_channel_msg = _prompt_channel_line(clean)
             _heartbeat(jid, claim_token)   # heartbeat только своего run-token
         proc.wait()
         rc = proc.returncode
@@ -11112,7 +11118,8 @@ def _run_task(t):
             _limit_wait_clear(jid)
             limit_msg = _gen_limit_reason(jid)
             err = _worker_error_text(jid, rc, _task_key_value(), limit_msg,
-                                     card_worker_error, provider_down_msg)
+                                     card_worker_error, provider_down_msg,
+                                     prompt_channel_msg)
             card_error_code = None
             if t["kind"] == "cards":
                 card_error_code = ("contract_error" if rc == card_contract.PERMANENT_EXIT
@@ -11422,6 +11429,25 @@ _PROVIDER_DOWN_NEVER = (
 # `reserved` без номера заказа означает, что номера мы не видели никогда. Если журнал
 # это подтверждает, след можно убрать и попробовать ещё раз.
 _STALE_RECEIPT_MARKS = ("orphan receipt", "не подтверждает точный оплаченный заказ")
+
+
+# Отказ КАНАЛА ПРОМПТОВ. У него свой механизм пометки (`_scan_prompt_channel_line`), но
+# в ошибку задачи его слова не попадали, и в тревогу уезжало голое `rc=2` — по нему
+# нельзя понять, что кончились деньги на счёте OpenAI (жалоба владельца 02.10.2026).
+# Распознаём только САМУ строку диагноза, которую воркер печатает человеку.
+_PROMPT_CHANNEL_MARKS = ("канал промптов", "каналу промптов", "канала промптов")
+
+
+def _prompt_channel_line(text: str) -> str:
+    """Строка воркера с диагнозом по каналу промптов. Вернёт её же, без украшений."""
+    низ = (text or "").lower()
+    if not низ.strip() or not any(w in низ for w in _PROMPT_CHANNEL_MARKS):
+        return ""
+    # Берём только приговор, а не ход работы: «не паркую», «попытка 1» и прочее — это
+    # течение, а не причина.
+    if any(w in низ for w in ("не паркую", "попытка", "продолжает работать", "отдыхает")):
+        return ""
+    return _key_refusal_body(text)[:300]
 
 
 def _stale_receipt_line(text: str) -> str:
