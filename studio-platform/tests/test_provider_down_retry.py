@@ -117,6 +117,84 @@ def main() -> int:
     check("три попытки", len(M._PROVIDER_DOWN_DELAYS), 3)
     check("по десять минут", list(M._PROVIDER_DOWN_DELAYS), [600, 600, 600])
 
+    print("\nСлед первой попытки убирается, иначе повтор упрётся в себя")
+    # Найдено на боевой машине 02.10.2026: первая попытка пишет «собираюсь заказать»
+    # ДО обращения к провайдеру, провайдер отвечает 503, запись остаётся — и ВТОРАЯ
+    # попытка падает уже не на 503, а на собственный след: «orphan receipt».
+    import io as _io, json as _json, tempfile                      # noqa: PLC0415
+    гнездо = tempfile.mkdtemp(prefix="receipts-")
+    папка = os.path.join(гнездо, "_FINAL_AUDIO_LUMEAN")
+    os.makedirs(папка)
+
+    def квитанция(имя, **поля):
+        with _io.open(os.path.join(папка, имя), "w", encoding="utf-8") as f:
+            _json.dump(поля, f)
+
+    квитанция("1.mp3.lumean.json", provider="lumean", state="creating")
+    check("квитанция без номера отодвинута", M._park_unordered_receipts(гнездо), 1)
+    check("и файл больше не мешает воркеру",
+          os.path.exists(os.path.join(папка, "1.mp3.lumean.json")), False)
+    # Но сам файл остался: квитанция — свидетельство, выбрасывать его нельзя.
+    check("свидетельство осталось на диске",
+          any(f.startswith("1.mp3.lumean.json.not-ordered-") for f in os.listdir(папка)), True)
+
+    квитанция("2.mp3.lumean.json", provider="lumean", state="created", order_id="ord-77")
+    check("квитанцию С НОМЕРОМ не трогаем", M._park_unordered_receipts(гнездо), 0)
+    check("она на месте", os.path.exists(os.path.join(папка, "2.mp3.lumean.json")), True)
+
+    готовое = os.path.join(гнездо, "_FINAL_AUDIO_LUMEAN2")
+    os.makedirs(готовое)
+    with _io.open(os.path.join(готовое, "1.mp3"), "w") as f:
+        f.write("звук")
+    with _io.open(os.path.join(готовое, "1.mp3.lumean.json"), "w", encoding="utf-8") as f:
+        _json.dump({"provider": "lumean", "state": "creating"}, f)
+    # Рядом лежит готовый звук — значит заказ был и оплачен, что бы ни стояло в состоянии.
+    check("где рядом есть mp3 — не трогаем", M._park_unordered_receipts(готовое), 0)
+
+    print("\nБронь снимается только та, по которой заказа не было")
+    # Второй след первой попытки — строка журнала платных вызовов. Снимать её можно
+    # ровно тогда, когда журнал САМ говорит, что заказа не было: состояние `reserved`
+    # без номера. В `ordered` переводит только получение номера от провайдера, поэтому
+    # «reserved без номера» — не догадка про 5xx, а состояние машины состояний.
+    import sqlite3 as _sq, tempfile as _tf                          # noqa: PLC0415
+    import pub_calls                                               # noqa: PLC0415
+    файл = os.path.join(_tf.mkdtemp(prefix="calls-"), "vsgen.db")
+
+    def связь():
+        """Как настоящая `db()`: НОВОЕ соединение на каждый вызов. Проверяемый код
+        закрывает его за собой, и общий объект на всех тут не годится."""
+        c = _sq.connect(файл)
+        c.row_factory = _sq.Row
+        return c
+
+    c0 = связь()
+    pub_calls.ensure_calls_schema(c0)
+    c0.execute("INSERT INTO provider_calls(tenant_id,project_id,release_id,kind,unit,"
+               "fingerprint,provider,status,created,updated) "
+               "VALUES('t','p1','r','tts','all','f1','lumean','reserved',1,1)")
+    c0.execute("INSERT INTO provider_calls(tenant_id,project_id,release_id,kind,unit,"
+               "fingerprint,provider,status,remote_order_id,created,updated) "
+               "VALUES('t','p1','r','tts','two','f2','lumean','reserved','ord-9',1,1)")
+    c0.commit(); c0.close()
+
+    было_db = M.db
+    M.db = связь
+    try:
+        check("снята одна бронь", M._clear_unordered_reservation("p1", "tts"), 1)
+        c1 = связь()
+        состояния = {r["fingerprint"]: r["status"] for r in
+                     c1.execute("SELECT fingerprint, status FROM provider_calls")}
+        c1.close()
+        check("бронь без номера закрыта", состояния["f1"], "failed")
+        # Строку с номером не трогаем: там заказ есть, его надо проверять, а не создавать
+        # второй. Ровно та разница, ради которой журнал и заведён.
+        check("бронь С НОМЕРОМ осталась", состояния["f2"], "reserved")
+        check("повторный проход уже ничего не снимает",
+              M._clear_unordered_reservation("p1", "tts"), 0)
+        check("без проекта не трогаем ничего", M._clear_unordered_reservation("", "tts"), 0)
+    finally:
+        M.db = было_db
+
     print("\nНе смогли посчитать деньги — считаем, что они были")
     # Осторожность асимметрична намеренно: ошибка в эту сторону стоит звонка человеку,
     # в обратную — повторно оплаченного этапа.
