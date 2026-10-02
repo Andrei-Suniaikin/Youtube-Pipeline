@@ -48,6 +48,8 @@ def fresh():
       CREATE TABLE queue_tasks(job_id INTEGER PRIMARY KEY, tenant_id TEXT, project_id TEXT,
         kind TEXT, status TEXT, error TEXT, created REAL, finished REAL);
       CREATE TABLE projects(id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT);
+      CREATE TABLE job_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER,
+        ts REAL, line TEXT);
     """)
     pub_calls.ensure_calls_schema(c)
     c.execute("INSERT INTO projects VALUES('p1','t1','Лесные байки')")
@@ -95,6 +97,53 @@ def main() -> int:
     ]
     for текст, почему in своё:
         check(f"не выдано за чужое ({почему})", pub_alerts.внешняя_беда(текст)[0], "")
+
+    print("\nГолый код возврата до человека не доходит")
+    # Владелец: «если бы я не спросил, что случилось, я бы никак не понял, что
+    # закончились кредиты». Разбирать каждую новую беду по отдельности — гонка, которую
+    # не выиграть: не знаем причину — показываем, что сказал воркер.
+    c = fresh()
+    упала(c, 20, "prompts", "rc=2")
+    for строка in (
+            "▶ старт: prompts",
+            "$ prompts_worker.py --project p1 …",
+            "⏳ Обработка 1 текстов...",
+            'У канала промптов «openai» исчерпан счёт/лимит: You have no credits remaining',
+            "ℹ️ Включите режим отладки для получения детальной информации",
+            # Итоговая строка самого сервера — та же пустота, что и `rc=N`: она лишь
+            # повторяет код. Показать её вместо причины значит ничего не показать.
+            "❌ ошибка (код 2)"):
+        c.execute("INSERT INTO job_logs(job_id, ts, line) VALUES(20, 1, ?)", (строка,))
+    c.commit()
+    a = pub_alerts.check_failed_tasks(c, NOW, tenant=None)[0]
+    check("в тревоге настоящий текст", "no credits remaining" in a.text, True)
+    check("и голого кода в ней нет", "rc=2" in a.text, False)
+    # Шум журнала показывать так же бесполезно, как код.
+    for шум in ("Включите режим отладки", "▶ старт", "Обработка 1 текстов",
+                "ошибка (код 2)"):
+        check(f"шум не показан ({шум[:18]})", шум in a.text, False)
+
+    print("\nЕсли и в журнале пусто — так и сказано")
+    c = fresh()
+    упала(c, 21, "tts", "rc=1")
+    a = pub_alerts.check_failed_tasks(c, NOW, tenant=None)[0]
+    check("сказано, что причины нет", "причина не записана" in a.text, True)
+    # Код оставлен в скобках: человеку он не говорит ничего, но разбирающему пригодится.
+    # Главное — что сообщение ведёт СЛОВАМИ, а не им.
+    check("код только в скобках", "(rc=1)" in a.text, True)
+    хвост = a.text.split("ошибкой.", 1)[-1].strip()
+    check("сообщение начинается не с кода", хвост.startswith("rc="), False)
+    # И выдуманной причины нет: пустоту не выдаём за диагноз.
+    check("пустота названа пустотой", "не записана ни в задаче, ни в журнале" in a.text, True)
+
+    print("\nКогда причина записана — журнал не трогаем")
+    c = fresh()
+    упала(c, 22, "tts", "у ролика нет субтитров (TranscriptsDisabled)")
+    c.execute("INSERT INTO job_logs(job_id, ts, line) VALUES(22, 1, 'посторонняя строка')")
+    c.commit()
+    a = pub_alerts.check_failed_tasks(c, NOW, tenant=None)[0]
+    check("показана записанная причина", "TranscriptsDisabled" in a.text, True)
+    check("и журнал не подмешан", "посторонняя строка" in a.text, False)
 
     print("\nДеньги и ключи — наша беда, даже когда рядом слово «квота»")
     # Самая дорогая ошибка в эту сторону: сказать «ждём, пока поднимется» на пустом
