@@ -1154,15 +1154,20 @@ def _key_refusal_text(jid, key_value="", limit_msg=""):
     return f"{head}{_KEY_REFUSAL_WORDS.get(info.get('kind'), 'отказ ключа')}{code}{tail}"
 
 
-def _worker_error_text(jid, rc, key_value="", limit_msg="", card_worker_error=""):
+def _worker_error_text(jid, rc, key_value="", limit_msg="", card_worker_error="",
+                       provider_down_msg=""):
     """Что увидит человек в карточке упавшей задачи. Порядок приоритетов — здесь.
 
     Первая опознанная причина отказа ключа важнее и последней строки воркера, и кода
     выхода: по ней понятно, ЧТО чинить. «rc=3» не чинит ничего и остаётся последним
     словом — только когда ни одной причины не опознано.
+
+    Слова провайдера про собственный простой стоят ниже отказа ключа (ключ чинить нам,
+    а простой — не нам), но ВЫШЕ кода возврата: `rc=1` вместо «HTTP 503: идут
+    технические работы» заставляет искать поломку у себя (владелец, 02.10.2026).
     """
     return (_key_refusal_text(jid, key_value, limit_msg) or limit_msg
-            or card_worker_error or f"rc={rc}")
+            or card_worker_error or provider_down_msg or f"rc={rc}")
 
 
 def _prompt_policy():
@@ -10723,6 +10728,7 @@ def _run_task(t):
     # занимает секунды и не должен тормозить стрим логов).
     channel_incident = {}
     card_worker_error = ""
+    provider_down_msg = ""          # последние слова провайдера про собственный простой
 
     def _task_key_value():
         """Чей ключ отказал: свой ключ юзера, если задача ушла на него, иначе серверный.
@@ -10961,6 +10967,12 @@ def _run_task(t):
             # аккаунт). Запоминаем именно первую: дальше воркер печатает следствия, и
             # раньше в карточку уезжало последнее из них или голое «rc=3».
             _scan_key_refusal(jid, clean)
+            # Провайдер сказал, что лежит. Запоминаем ПОСЛЕДНЮЮ такую строку: воркер
+            # печатает её по каждому неудавшемуся куску, и последняя — ближе всего к
+            # тому, на чём он сдался.
+            _down = _provider_down_line(clean)
+            if _down:
+                provider_down_msg = _down
             _heartbeat(jid, claim_token)   # heartbeat только своего run-token
         proc.wait()
         rc = proc.returncode
@@ -11051,10 +11063,36 @@ def _run_task(t):
                     return
             if t["kind"] == "cards" and rc == card_contract.PERMANENT_EXIT:
                 _record_card_failure_artifacts(t, params, projdir)
+            # Провайдер лежит — это не наша поломка и не повод звать человека сразу.
+            # Повторяем сами, но ТОЛЬКО если по этому этапу ничего не оплачено:
+            # «повтор лишь тогда, когда доказано, что вызов не состоялся». Деньги есть —
+            # останавливаемся и зовём человека, как раньше.
+            if provider_down_msg:
+                оплачено = _paid_calls_done(t["project_id"] or "", t["kind"])
+                if оплачено:
+                    _log_line(jid, "⏸ провайдер лежит, но по этапу уже оплачено вызовов: "
+                                   f"{оплачено} — автоповтор запрещён, нужен человек")
+                else:
+                    повтор = _requeue_provider_down(jid, claim_token)
+                    if повтор is None:
+                        return
+                    if повтор.get("state") == "queued":
+                        _log_line(jid, "♻️ не мы: %s. Повтор через %d мин (попытка %d из %d)"
+                                  % (provider_down_msg, повтор["delay"] // 60,
+                                     повтор["attempt"], len(_PROVIDER_DOWN_DELAYS)))
+                        return
+                    # Попытки кончились: дальше хороним — но словами провайдера, а не
+                    # кодом возврата. Тревога §7 покажет ровно это.
+                    err = ("сервис провайдера не поднялся за %d попыток: %s"
+                           % (len(_PROVIDER_DOWN_DELAYS), provider_down_msg))
+                    if _finish_worker_task(jid, "error", err[:400],
+                                           claim_token=claim_token):
+                        _log_line(jid, "❌ " + err)
+                    return
             _limit_wait_clear(jid)
             limit_msg = _gen_limit_reason(jid)
             err = _worker_error_text(jid, rc, _task_key_value(), limit_msg,
-                                     card_worker_error)
+                                     card_worker_error, provider_down_msg)
             card_error_code = None
             if t["kind"] == "cards":
                 card_error_code = ("contract_error" if rc == card_contract.PERMANENT_EXIT
@@ -11318,6 +11356,125 @@ def _requeue_delay_task(jid, delay):
     except Exception:                                              # noqa: BLE001
         log_exc("key_budget/delay")
         return False
+
+
+# ── Провайдер лёг: не наша поломка, и повторять её должна машина ──────────────
+#
+# Владелец 02.10.2026: «давай прямо так и писать эту ошибку в студии, чтобы у меня не
+# было ощущения, что проблема с нашей стороны, плюс раз сервис недоступен — делать
+# ретрай автоматический через 10 минут, если не получилось — уведомлять».
+#
+# Повод: озвучка упала с `rc=1`, а в журнале стояло «Lumean: /orders: HTTP 503: Сервис
+# временно недоступен: идут технические работы». В карточку и в тревогу уезжало голое
+# `rc=1`, по которому нельзя отличить чужие техработы от своей поломки.
+#
+# Распознаём ТОЛЬКО временную недоступность: 502/503/504 и слова самого провайдера про
+# техработы. Отказ ключа, нехватка денег и битые данные сюда не попадают намеренно —
+# они повтором не лечатся, и молчаливый повтор по ним означал бы сжигать деньги по
+# кругу.
+_PROVIDER_DOWN_DELAYS = tuple(
+    int(x) for x in (os.environ.get("VS_PROVIDER_DOWN_DELAYS") or "600,600,600").split(",")
+    if str(x).strip().isdigit()) or (600, 600, 600)
+
+# Признаки ищем КОРНЯМИ, а не целыми словами: провайдер пишет на своём языке и в своём
+# падеже — «идут технические работы», «сервис на технических работах», «техработы до
+# 18:00». Проверка на точную фразу узнавала только первое из трёх (найдено проверкой
+# 02.10.2026, когда признак стоял как «технические работы»).
+_PROVIDER_DOWN_MARKS = (
+    "http 502", "http 503", "http 504",
+    "техработ", "temporarily unavailable", "service unavailable",
+    "service temporarily", "bad gateway", "gateway timeout",
+)
+# Пары «оба корня рядом» — для случаев, где одного слова мало: «технический» сам по себе
+# встречается и в безобидных строках.
+_PROVIDER_DOWN_PAIRS = (("техническ", "работ"),)
+# Слова, при которых повтор НЕ помогает, даже если рядом стоит 503: деньги кончились
+# или ключ отвергнут. Проверяются раньше признаков недоступности.
+_PROVIDER_DOWN_NEVER = (
+    "insufficient", "allowance exhausted", "quota", "payment", "unauthorized",
+    "forbidden", "invalid api key", "ключ", "лимит аккаунта",
+)
+
+
+def _provider_down_line(text: str) -> str:
+    """Строка воркера говорит «сервис провайдера временно лежит»? Вернёт её же.
+
+    Возвращаем САМУ строку, а не свой пересказ: в карточке должно стоять то, что
+    ответил провайдер, его словами. Иначе человек читает нашу формулировку и думает,
+    что это мы сломались.
+    """
+    low = (text or "").lower()
+    if not low.strip():
+        return ""
+    if any(w in low for w in _PROVIDER_DOWN_NEVER):
+        return ""
+    if not any(w in low for w in _PROVIDER_DOWN_MARKS) \
+            and not any(all(w in low for w in пара) for пара in _PROVIDER_DOWN_PAIRS):
+        return ""
+    return " ".join(str(text).split())[:400]
+
+
+def _paid_calls_done(project_id: str, kind: str) -> int:
+    """Сколько оплаченных вызовов этого этапа уже доставлено. Не знаем — считаем, что есть.
+
+    Осторожность намеренно асимметрична: ошибиться в сторону «деньги были» значит не
+    повторить автоматически и позвать человека, а ошибиться в другую — повторить
+    оплаченное. Второе дороже.
+    """
+    if not project_id:
+        return 1
+    try:
+        c = db()
+        try:
+            row = c.execute(
+                "SELECT COUNT(*) FROM provider_calls "
+                "WHERE project_id=? AND kind=? AND status='delivered'",
+                (project_id, kind)).fetchone()
+            return int(row[0] or 0)
+        finally:
+            c.close()
+    except Exception:                                              # noqa: BLE001
+        return 1
+
+
+def _requeue_provider_down(jid, claim_token, now=None):
+    """Отложить задачу, пока провайдер лежит. Та же строка очереди, тот же job_id.
+
+    Возвращает `{"state": "queued"|"exhausted", ...}` либо None, если строка устарела
+    (задачу отменили или перезабрали) — тогда трогать её нельзя.
+    """
+    if not claim_token:
+        return None
+    now = _now() if now is None else float(now)
+    c = db()
+    c.execute("BEGIN IMMEDIATE")
+    try:
+        row = c.execute(
+            "SELECT status,claim_token,COALESCE(transient_attempts,0) attempts "
+            "FROM queue_tasks WHERE job_id=?", (jid,)).fetchone()
+        if (not row or row["status"] != "running"
+                or not secrets.compare_digest(
+                    str(row["claim_token"] or ""), str(claim_token or ""))):
+            c.rollback()
+            return None
+        attempt = int(row["attempts"] or 0) + 1
+        if attempt > len(_PROVIDER_DOWN_DELAYS):
+            c.rollback()
+            return {"state": "exhausted", "attempt": attempt}
+        delay = _PROVIDER_DOWN_DELAYS[attempt - 1]
+        cur = c.execute(
+            "UPDATE queue_tasks SET status='queued',started=NULL,claimed=NULL,"
+            "claim_token=NULL,finished=NULL,error=NULL,transient_attempts=?,retry_after=? "
+            "WHERE job_id=? AND status='running' AND claim_token=?",
+            (attempt, now + delay, jid, claim_token))
+        if cur.rowcount != 1:
+            c.rollback()
+            return None
+        c.execute("UPDATE gen_jobs SET status='queued',error=NULL WHERE id=?", (jid,))
+        c.commit()
+        return {"state": "queued", "attempt": attempt, "delay": delay}
+    finally:
+        c.close()
 
 
 _WORKER_TEMPFAIL = getattr(os, "EX_TEMPFAIL", 75)
