@@ -43,6 +43,7 @@ from zoneinfo import ZoneInfo
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, "/root/VideoStudio/server")
 import manga_gate as gate                                            # noqa: E402
+import manga_title                                                   # noqa: E402
 import pub_publish                                                   # noqa: E402
 
 DB = "/root/VideoStudio/server/vsgen.db"
@@ -279,7 +280,9 @@ def put(c, ch, pid, meta, video, cover, llm, now) -> str:
     slot = next_slot(c, ch, now)
     if not slot:
         raise RuntimeError("свободного выхода у канала нет на 90 дней вперёд")
-    title = pub_publish.make_title(meta.get("title") or "", ch["lang"] or "en", llm)
+    # Заголовок делает Кодекс подписки, если он настроен, иначе прокси — как раньше
+    # (разрешение заказчика 02.10.2026, после того как ключ прокси встал на лимите).
+    title = manga_title.make_title(meta.get("title") or "", ch["lang"] or "en", llm)
     description = pub_publish.make_description(title)
     schedule = pub_publish.schedule_iso(slot, ch["tz"])
 
@@ -347,8 +350,8 @@ def main():
     c.row_factory = sqlite3.Row
     now = time.time()
     llm = title_llm()
-    if not llm.get("base") or not llm.get("key"):
-        print("нет настроек прокси названий — названия писать нечем"); sys.exit(2)
+    if not manga_title.ready() and (not llm.get("base") or not llm.get("key")):
+        print("названия писать нечем: Кодекс не настроен и прокси без ключа"); sys.exit(2)
 
     made = legacy = 0
     counts = {"залит раньше": 0, "залит раньше, версия неизвестна": 0,
