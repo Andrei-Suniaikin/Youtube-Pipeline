@@ -10729,6 +10729,7 @@ def _run_task(t):
     channel_incident = {}
     card_worker_error = ""
     provider_down_msg = ""          # последние слова провайдера про собственный простой
+    stale_receipt_msg = ""          # воркер упёрся в след прошлой попытки
 
     def _task_key_value():
         """Чей ключ отказал: свой ключ юзера, если задача ушла на него, иначе серверный.
@@ -10973,6 +10974,9 @@ def _run_task(t):
             _down = _provider_down_line(clean)
             if _down:
                 provider_down_msg = _down
+            _след = _stale_receipt_line(clean)
+            if _след:
+                stale_receipt_msg = _след
             _heartbeat(jid, claim_token)   # heartbeat только своего run-token
         proc.wait()
         rc = proc.returncode
@@ -11067,6 +11071,15 @@ def _run_task(t):
             # Повторяем сами, но ТОЛЬКО если по этому этапу ничего не оплачено:
             # «повтор лишь тогда, когда доказано, что вызов не состоялся». Деньги есть —
             # останавливаемся и зовём человека, как раньше.
+            # Воркер упёрся в след прошлой попытки. Сам он разбираться не вправе, а
+            # журнал денег знает: нет номера заказа — не было и заказа. Тогда убираем
+            # след и пробуем ещё раз; журнал молчит — оставляем человеку, как было.
+            if stale_receipt_msg and not provider_down_msg:
+                if _stale_trace_clearable(t["project_id"] or "", t["kind"]):
+                    provider_down_msg = stale_receipt_msg
+                else:
+                    _log_line(jid, "⏸ след прошлой попытки есть, а журнал заказ не "
+                                   "опровергает — разбирает человек")
             if provider_down_msg:
                 оплачено = _paid_calls_done(t["project_id"] or "", t["kind"])
                 if оплачено:
@@ -11403,6 +11416,22 @@ _PROVIDER_DOWN_NEVER = (
 )
 
 
+# След прошлой попытки, на который воркер справедливо не идёт сам. Он говорит «заказ
+# подтвердить нечем» и останавливается — и правильно: решать про деньги по косвенным
+# признакам не его дело. А вот ЖУРНАЛ платных вызовов знает точно: строка в состоянии
+# `reserved` без номера заказа означает, что номера мы не видели никогда. Если журнал
+# это подтверждает, след можно убрать и попробовать ещё раз.
+_STALE_RECEIPT_MARKS = ("orphan receipt", "не подтверждает точный оплаченный заказ")
+
+
+def _stale_receipt_line(text: str) -> str:
+    """Строка воркера про собственный след прошлой попытки. Вернёт её же."""
+    низ = (text or "").lower()
+    if not низ.strip() or not any(w in низ for w in _STALE_RECEIPT_MARKS):
+        return ""
+    return " ".join(str(text).split())[:400]
+
+
 def _provider_down_line(text: str) -> str:
     """Строка воркера говорит «сервис провайдера временно лежит»? Вернёт её же.
 
@@ -11442,6 +11471,41 @@ def _paid_calls_done(project_id: str, kind: str) -> int:
             c.close()
     except Exception:                                              # noqa: BLE001
         return 1
+
+
+def _unordered_reservations(project_id: str, kind: str) -> int:
+    """Сколько броней этого этапа журнал считает несостоявшимися. Не знаем — ноль.
+
+    Отдельно от снятия: сначала СПРОСИТЬ, можно ли, и только потом трогать. Ноль здесь
+    означает «журнал заказ не опровергает» — и тогда след прошлой попытки разбирает
+    человек, а не машина.
+    """
+    if not project_id:
+        return 0
+    try:
+        c = db()
+        try:
+            row = c.execute(
+                "SELECT COUNT(*) FROM provider_calls WHERE project_id=? AND kind=? "
+                "AND status='reserved' AND (remote_order_id IS NULL OR remote_order_id='')",
+                (project_id, kind)).fetchone()
+            return int(row[0] or 0)
+        finally:
+            c.close()
+    except Exception:                                              # noqa: BLE001
+        log_exc("provider_down/reservation-count")
+        return 0
+
+
+def _stale_trace_clearable(project_id: str, kind: str) -> bool:
+    """Можно ли убрать след прошлой попытки — то есть опровергает ли журнал заказ.
+
+    Правило одной строкой, и живёт оно здесь, а не внутри обработчика задачи: это
+    решение про ДЕНЬГИ, и его надо видеть и проверять отдельно от всего остального.
+    «Нет брони без номера» означает, что журнал заказ не опровергает, — и тогда след
+    разбирает человек.
+    """
+    return _unordered_reservations(project_id, kind) > 0
 
 
 def _clear_unordered_reservation(project_id: str, kind: str) -> int:
