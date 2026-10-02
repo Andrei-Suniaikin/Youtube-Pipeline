@@ -257,6 +257,7 @@ _WORKER_CREDENTIAL_ENV_NAMES = (
     "LUMEAN_API_KEY", "LUMEAN_API_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN", "VS_CLAUDE_OAUTH_TOKEN",
     "VS_ALT_LLM_KEY", "VS_ALT_LLM_BASE", "VS_ALT_LLM_MODEL",
+    "VS_GPT_CHAT_KEY",
     "ANTHROPIC_API_KEY", "CLAUDE_API_KEY",
     "CODEX_HOME", "VS_CODEX_HOME", "REWRITE_CODEX_HOME",
 )
@@ -1603,6 +1604,28 @@ def _key_env(u, shared=False, credential_overrides=None, prompt_provider=None):
     env["VS_SCENE_THREADS"] = str(prompt_threads)     # пул параллельной генерации сцен в воркере
     env["VS_CODEX_MODEL"] = codex_model
     env["VS_CLAUDE_MODEL"] = str(k.get("claude_model") or "claude-sonnet-4-6")
+    # Адрес и модели чата движка. Не секреты, поэтому передаются как есть — но передать
+    # их НАДО: окружение воркера строится по белому списку (`_sanitized_worker_env`), и
+    # до 02.10 эти ручки существовали только в самом воркере, то есть в бою были мертвы.
+    # Их пара — адрес и имя модели — переставляется вместе: модель, которой у провайдера
+    # нет, даёт 400 и читается как поломка прогона. Пустое значение не передаём совсем,
+    # чтобы умолчание жило в одном месте — в воркере.
+    for _knob in ("VS_GPT_CHAT_URL", "VS_GPT_MODEL", "VS_SCENE_GPT_MODEL"):
+        _value = (os.environ.get(_knob) or "").strip()
+        if _value:
+            env[_knob] = _value
+    # Ключ для переставленного адреса чата. Второй копии секрета не заводим: у FastGen
+    # это тот же ключ семейства `googler`, которым движок уже платит за картинки, и он у
+    # нас в руках. Для любого ДРУГОГО адреса ключ обязан быть задан явно — придумывать,
+    # чьим ключом ходить к незнакомому хосту, нельзя. Воркер без ключа откажется сам,
+    # до запроса, чтобы не отправить ключ OpenAI постороннему.
+    _chat_url = env.get("VS_GPT_CHAT_URL", "")
+    if _chat_url:
+        _chat_key = (os.environ.get("VS_GPT_CHAT_KEY") or "").strip()
+        if not _chat_key and "fast-gen.ai" in _chat_url:
+            _chat_key = str(k.get("googler") or "").strip()
+        if _chat_key:
+            env["VS_GPT_CHAT_KEY"] = _chat_key
     env["VS_CODEX_MAX_PARALLEL"] = str(prompt_threads)
     env["VS_CLAUDE_MAX_PARALLEL"] = str(prompt_threads)
     if shared:

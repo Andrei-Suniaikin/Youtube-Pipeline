@@ -775,6 +775,13 @@ def part_literal_in_sync() -> None:
     # с /etc/rewrite.env — пусть покраснеет и человек сверит машину.
     check("и это та, что выкачена 02.10",
           литералы["rewrite/server.py"], ["codex:gpt-5.6-sol"])
+    # Вычитка — четыре прохода по уже написанному, то есть тот же рерайт. Держать её на
+    # другой модели значит платить за medium-размышление там, где основной текст пишется
+    # на low. Переменной в окружении нет нигде, поэтому умолчание кода и есть боевое.
+    src = io.open(os.path.join(BASE, "rewrite", "rewrite_core.py"), encoding="utf-8").read()
+    чистка = re.search(r'REWRITE_CLEANUP_MODEL"\) or "([^"]+)"', src)
+    check("вычитка на той же модели, что основной текст",
+          чистка.group(1) if чистка else "(не нашёл)", "codex:gpt-5.6-sol")
 
 
 def main() -> int:

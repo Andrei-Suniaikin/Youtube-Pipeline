@@ -265,8 +265,23 @@ def _has_openai_key() -> bool:
     return bool(OPENAI_API_KEY and str(OPENAI_API_KEY).strip())
 
 
+def _chat_key() -> str:
+    """Чем авторизоваться в чате: своим ключом, если адрес переставлен, иначе OpenAI.
+
+    Отказ при переставленном адресе без своего ключа — намеренный и до запроса: молча
+    подставить сюда OPENAI_API_KEY значит отдать ключ OpenAI постороннему хосту.
+    """
+    if GPT_CHAT_URL_OVERRIDDEN:
+        if not GPT_CHAT_KEY:
+            raise OpenAIKeyError(
+                "адрес чата переставлен (VS_GPT_CHAT_URL), а ключ для него не задан "
+                "(VS_GPT_CHAT_KEY). Останавливаюсь: ключ OpenAI чужому адресу не отдаю.")
+        return GPT_CHAT_KEY
+    return str(OPENAI_API_KEY or "")
+
+
 def _openai_chat_headers() -> dict:
-    return {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    return {"Authorization": f"Bearer {_chat_key()}", "Content-Type": "application/json"}
 
 
 def _has_prompt_channel() -> bool:
@@ -437,13 +452,36 @@ VIDEO_METHOD_V6 = {"flower": "flower-video", "flow": "flow-video-fast", "grok": 
 GOOGLER_BASE_URL_V1 = GOOGLER_BASE_URL_V2  # Для обратной совместимости
 VEO_BASE_URL = ((os.environ.get("VS_VEO_BASE") or "https://veononstop.org").rstrip("/")
                 + "/api/v1")  # VeoNonStop — отдельный провайдер видео (X-API-Key: veo_...)
-OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
+# Адрес чата вынесен в окружение по тому же принципу, что VS_GOOGLER_BASE (04.09) и
+# VS_VEO_BASE: адрес провайдера меняется без правки кода.
+#
+# Повод 02.10.2026. Этот адрес — НЕ канал промптов. Канал («Ключи → Чем писать промпты»)
+# с 02.09 переведён на Codex и openai в нём запрещён вовсе. А вот предварительные
+# анализы — visual_context и semantic_beats — политику канала не спрашивали никогда и
+# постили прямо сюда своим ключом OpenAI. Счёт OpenAI пуст, поэтому прогон падал на
+# первом же анализе («You have no credits remaining»), а за ним обрывался этап картинок
+# («конвейер оборван»). Из интерфейса это читалось как поломка у нас, хотя канал
+# промптов был настроен верно.
+#
+# Умолчание оставлено прежним: вернуться на OpenAI — одна переменная, а не откат кода.
+OPENAI_API_URL = (os.environ.get("VS_GPT_CHAT_URL")
+                  or "https://api.openai.com/v1/chat/completions")
 
 # Модели
-GPT_MODEL = "gpt-4.1-nano"
+# Имя модели ОБЯЗАНО соответствовать адресу выше: у FastGen, например, модели
+# `gpt-4.1-nano` не существует вовсе — живой вызов отвечает 400 «No supported model
+# found», и это выглядит как поломка прогона, а не как неверная настройка. Поэтому
+# адрес и модель переставляются вместе.
+GPT_MODEL = os.environ.get("VS_GPT_MODEL") or "gpt-4.1-nano"
+# Ключ чата отдельный от OPENAI_API_KEY — и это не удобство, а защита. Если адрес
+# увести на чужого провайдера, а ключ оставить прежним, мы отправим ключ OpenAI
+# постороннему хосту. Поэтому правило: СВОЙ адрес — СВОЙ ключ, иначе отказ до запроса.
+# Ровно так же устроен рерайт (REWRITE_GPT_CHAT_URL + REWRITE_GPT_CHAT_KEY).
+GPT_CHAT_KEY = (os.environ.get("VS_GPT_CHAT_KEY") or "").strip()
+GPT_CHAT_URL_OVERRIDDEN = bool((os.environ.get("VS_GPT_CHAT_URL") or "").strip())
 # Сильнее nano для задач, где важна НАДЁЖНОСТЬ (извлечение персонажей + тег entities на сцену):
 # nano мусорит (пере/недо-тегает), mini == 4.1 по качеству тега, но дешевле (~$0.17/ролик). Output мал → дёшево.
-SCENE_GPT_MODEL = "gpt-4.1-mini"
+SCENE_GPT_MODEL = os.environ.get("VS_SCENE_GPT_MODEL") or "gpt-4.1-mini"
 # 16.09.2026: живой GET https://api.openai.com/v1/models показал, что модели "gpt-image-2.5"
 # не существует — есть "gpt-image-2.5-flare" и "gpt-image-2.5-sunburst"; владелец выбрал
 # sunburst. Cover Studio с 17.09 шлёт ту же модель (cover/cover_core.py, GPT_IMAGE_MODEL). Вынесено в окружение по тому же принципу, что и адрес
@@ -1256,7 +1294,7 @@ def _soften_prompt_gpt(prompt: str, round_no: int = 1) -> Optional[str]:
     }
     try:
         r = _llm_post(OPENAI_API_URL,
-                              headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                              headers=_openai_chat_headers(),
                               json=payload, timeout=60)
         if r.status_code != 200:
             print_debug(f"смягчение промпта (раунд {round_no}): HTTP {r.status_code}")
@@ -2240,10 +2278,7 @@ IMPORTANT:
 - CRITICAL: NEVER mention names of famous people, celebrities, historical figures, or real persons. Describe generic characters only, matching the nationality/ethnicity from the script.
 - Return ONLY valid JSON object, no markdown, no code blocks"""
     
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = _openai_chat_headers()
     
     # Генерируем сцены параллельно
     with ThreadPoolExecutor(max_workers=min(GPT_PARALLEL_THREADS, len(groups))) as executor:
@@ -4287,7 +4322,7 @@ def extract_main_subject(text: str, title: str = "") -> dict:
     }
     try:
         r = _llm_post(OPENAI_API_URL,
-                              headers={"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"},
+                              headers=_openai_chat_headers(),
                               json=payload, timeout=60)
         if r.status_code != 200:
             print_debug(f"extract_main_subject: HTTP {r.status_code}")
@@ -4593,10 +4628,7 @@ Rules:
             "with Игорь known → \"entities\":[\"Игорь\"]. Use [] ONLY if truly none of the known entities are present."
         )
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = _openai_chat_headers()
 
     all_scenes = []
 
@@ -5392,10 +5424,7 @@ def generate_visual_context(text: str) -> Optional[str]:
 
     system_prompt = """Analyze the script and write a concise VISUAL BIBLE (max 100 words) in English. Include: 1. Visual Style (e.g. 1940s photo, cinematic). 2. World/era and atmosphere: when the script has a specific setting, name the EXACT time period and region/culture (e.g. "British colonial India, 1850s"), what typical people of that world look like (ethnicity, period clothing), and the architecture and technology level of that era; then add one short line "NEVER show: ..." listing the most likely anachronisms (e.g. modern clothing, cars, electric lights, skyscrapers). This is the broad world and mood — NOT a single fixed location; individual scenes will change location to match their own content. If the script is contemporary or timeless, keep this part brief and generic and skip the NEVER line. 3. Recurring character ONLY if the script has a persistent on-screen narrator/host who is literally shown on camera: describe them in one short clause (appearance matching their nationality/ethnicity from the script). If there is NO such persistent on-screen person, write exactly "NO fixed character — each scene's hero is the specific subject, object, place or process that the segment names" and do NOT invent a presenter. Never inject a person into segments that describe plants, food, objects, places, or processes. CRITICAL: Do NOT lock the whole video into one room or one location — describe the world/era, not a single recurring set. CRITICAL: Never mention text, words, letters, numbers, or any written content. CRITICAL: Never mention names of famous people, celebrities, historical figures, or real persons. Describe generic characters only. Output as a single paragraph."""
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = _openai_chat_headers()
 
     payload = {
         "model": GPT_MODEL,
@@ -5687,7 +5716,7 @@ def _analyze_text_chunk(chunk_text: str) -> Optional[dict]:
         "claiming an exact recognizable likeness for a real person; never mention text/letters/numbers. If this passage "
         "has no person, return characters:[]. Keep the SAME id and identity_names for the same named entity across passages."
     )
-    headers = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
+    headers = _openai_chat_headers()
     payload = {
         "model": SCENE_GPT_MODEL,  # надёжное извлечение персонажей (nano дублировал/путал роли)
         "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": f"Passage:\n{chunk_text}"}],
@@ -5867,10 +5896,7 @@ def _explicit_story_identity_link(candidates: List[dict],
     try:
         response = _llm_post(
             OPENAI_API_URL,
-            headers={
-                "Authorization": f"Bearer {OPENAI_API_KEY}",
-                "Content-Type": "application/json",
-            },
+            headers=_openai_chat_headers(),
             json=payload,
             timeout=60,
         )
@@ -6651,10 +6677,7 @@ RULES:
     # Обязательно добавляем ракурс камеры
     user_content += f"\nMANDATORY CAMERA ANGLE: {angle}. You MUST write the prompt description matching this specific angle. Do not ignore this."
 
-    headers = {
-        "Authorization": f"Bearer {OPENAI_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = _openai_chat_headers()
 
     payload = {
         "model": GPT_MODEL,
@@ -11312,6 +11335,9 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             else:
                 gi_body = {"model": GPT_IMAGE_MODEL, "prompt": prompt, "size": gi_size, "quality": "low", "n": 1, "output_format": "jpeg"}
                 try:
+                    # НЕ через _openai_chat_headers(): это картинки у самого OpenAI,
+                    # а не чат. Адрес здесь жёсткий, значит и ключ должен быть ключом
+                    # OpenAI — ключ чужого чат-провайдера сюда не подходит.
                     _gh = {"Authorization": f"Bearer {OPENAI_API_KEY}", "Content-Type": "application/json"}
                     _gr = requests.post("https://api.openai.com/v1/images/generations", headers=_gh, json=gi_body, timeout=180)
                     if _gr.status_code == 200:

@@ -72,6 +72,27 @@ print(v if isinstance(v, str) else "")
 ALTK
 )"
 if [ -n "$_altkey" ]; then
+  # ── Чат движка картинок (02.10.2026) ────────────────────────────────────────
+  # Предварительные анализы движка (visual_context, semantic_beats) ходят НЕ через
+  # канал промптов, а прямо в чат, и адрес у них был прибит к api.openai.com. Счёт
+  # OpenAI пуст, поэтому прогон падал на первом же анализе, а за ним обрывался этап
+  # картинок — и выглядело это как поломка у нас, хотя канал промптов был настроен
+  # верно (с 02.09 только Codex).
+  #
+  # Уводим на тот же OpenAI-совместимый чат FastGen, которым уже пишет рерайт: он
+  # оплачен и расходует ОТДЕЛЬНУЮ квоту prompt.tokens.hour, не кредиты картинок.
+  # Ключ сюда НЕ кладём: его выдаёт сервер из семейства `googler` при вызове воркера —
+  # одна копия секрета, в файле ключей.
+  export VS_GPT_CHAT_URL="${VS_GPT_CHAT_URL:-https://api.fast-gen.ai/v1/chat/completions}"
+  case "$VS_GPT_CHAT_URL" in
+    *fast-gen.ai*)
+      # Модель переставляется ВМЕСТЕ с адресом: `gpt-4.1-nano` у FastGen не существует,
+      # живой вызов отвечает 400 «No supported model found» — и это читается как
+      # поломка прогона, а не как неверная настройка.
+      export VS_GPT_MODEL="${VS_GPT_MODEL:-gpt-4.1-mini}"
+      export VS_SCENE_GPT_MODEL="${VS_SCENE_GPT_MODEL:-gpt-4.1-mini}"
+      ;;
+  esac
   export REWRITE_GPT_CHAT_URL="${REWRITE_GPT_CHAT_URL:-https://api.fast-gen.ai/v1/chat/completions}"
   export REWRITE_GPT_CHAT_KEY="${REWRITE_GPT_CHAT_KEY:-$_altkey}"
   case "$REWRITE_GPT_CHAT_URL" in

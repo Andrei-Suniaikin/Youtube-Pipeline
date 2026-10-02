@@ -9961,7 +9961,7 @@ def translate_paragraphs_recursive(
 # Переменные окружения:
 #   REWRITE_CLEANUP             — общий выключатель (по умолчанию включено)
 #   REWRITE_CLEANUP_PRESERVE    — чистка в режиме сохранения абзацев (по умолчанию включено)
-#   REWRITE_CLEANUP_MODEL       — модель (по умолчанию codex:gpt-5.6-terra)
+#   REWRITE_CLEANUP_MODEL       — модель (по умолчанию codex:gpt-5.6-sol)
 #   REWRITE_CLEANUP_MAX_CALLS   — потолок вызовов модели на язык (по умолчанию 3)
 #   REWRITE_CLEANUP_BUDGET_SEC  — потолок времени на язык (по умолчанию 900)
 #   REWRITE_CLEANUP_CHUNK_CHARS — длина куска для одного вызова (по умолчанию 45000)
@@ -10056,7 +10056,13 @@ def cleanup_enabled(preserve_paragraphs: bool = False) -> bool:
 
 def cleanup_model_name() -> str:
     """Модель чистки. Только подписка Codex: ключа OpenAI на сервере нет."""
-    return (os.environ.get("REWRITE_CLEANUP_MODEL") or "codex:gpt-5.6-terra").strip()
+    # 02.10.2026 — sol вместо terra, вместе с основной моделью рерайта: владелец на
+    # вопрос «вычитку тоже?» ответил «ну если рерайт, то без проблем». Вычитка — это
+    # четыре прохода по уже написанному тексту, то есть тот же рерайт, и держать её на
+    # другой модели значило бы платить за medium-размышление там, где основной текст
+    # уже пишется на low. В окружении переменная не задана нигде, поэтому умолчание
+    # здесь и есть действующее значение.
+    return (os.environ.get("REWRITE_CLEANUP_MODEL") or "codex:gpt-5.6-sol").strip()
 
 
 def _cleanup_state_put(store: Dict[str, Any], key: str, value: Any) -> None:
