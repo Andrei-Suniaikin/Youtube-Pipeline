@@ -313,7 +313,7 @@ def _credential_candidates(config, family):
         values.extend(_credential_items(
             os.environ.get("VS_CODEX_HOME") or os.environ.get("REWRITE_CODEX_HOME")
         ))
-        if not values and os.path.isdir(CODEX_HOME):
+        if not values and _codex_home_ready(CODEX_HOME):
             values.append(CODEX_HOME)
     # Одинаковый secret не создаёт фальшивую дополнительную ёмкость.
     return list(dict.fromkeys(values))
@@ -809,11 +809,45 @@ function upd(){var v=s.value;var ps=document.querySelectorAll('.pchan-pane');
 for(var i=0;i<ps.length;i++){ps[i].style.display=(ps[i].getAttribute('data-ch')===v)?'':'none';}}
 s.addEventListener('change',upd);upd();})();</script>"""
 # Codex с ChatGPT-аккаунтом не принимает gpt-4.1-* → только модели подписки.
-# gpt-5.4-mini = ближайший аналог текущего API-дефолта gpt-4.1-mini.
-CODEX_MODELS = ["gpt-5.4-mini", "gpt-5.4", "gpt-5.5", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna"]
-DEFAULT_CODEX_MODEL = "gpt-5.4-mini"
+#
+# Список сверен с боевым каталогом 02.10.2026: `models_cache.json` обоих живых домов
+# (`/root/.codex-server` и `/root/.codex-vova04`, снят клиентом 0.152.0) отдаёт шесть
+# слагов — gpt-reserve, gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna, gpt-5.5,
+# codex-auto-review. Прежний список предлагал `gpt-5.4-mini` и `gpt-5.4`, которых там
+# НЕТ, и `gpt-5.4-mini` при этом стояла умолчанием — то есть выпадающий список
+# показывал модель, которой невозможно воспользоваться, а проверка на строке
+# «cm in CODEX_MODELS» её же и ПРИНИМАЛА. Это ровно та ложь интерфейса, из-за которой
+# переписывается пульт.
+#
+# Чего в списке нарочно нет: `gpt-reserve` и `codex-auto-review`. Каталог их отдаёт, но
+# что они делают, не проверено, а предложить непонятное — та же ложь, только наоборот.
+CODEX_MODELS = ["gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.5"]
+# Умолчание совпадает с боевым: поле `codex_model` в файле ключей и
+# REWRITE_STUDIO_CODEX_MODEL в /etc/rewrite.env — оба `gpt-5.6-terra`.
+DEFAULT_CODEX_MODEL = "gpt-5.6-terra"
 # CODEX_HOME с авторизованной подпиской ChatGPT (её же использует rewrite-server).
-CODEX_HOME = os.environ.get("VS_CODEX_HOME") or os.environ.get("REWRITE_CODEX_HOME") or "/root/.codex-rewrite"
+#
+# Умолчание было `/root/.codex-rewrite` — каталог, в котором живого входа нет с 01.09
+# (остались только auth.json.expired-* и auth.json.bak.revoked-*). Пока в окружении
+# задан REWRITE_CODEX_HOME, не стреляет; пропадёт переменная — и кабинет молча пойдёт
+# в разлогиненный дом. Ставим тот, которым бой действительно ходит.
+CODEX_HOME = (os.environ.get("VS_CODEX_HOME") or os.environ.get("REWRITE_CODEX_HOME")
+              or "/root/.codex-server")
+
+
+def _codex_home_ready(path) -> bool:
+    """Дом Codex пригоден: это каталог И в нём есть auth.json.
+
+    Проверять `isdir` недостаточно, и это не придирка: именно так мина и работала.
+    Разлогиненный `/root/.codex-rewrite` каталогом БЫТЬ не перестал — внутри лежат
+    просроченные копии входа, — поэтому `os.path.isdir` отвечал «да», путь уходил
+    воркеру, и Codex падал уже у провайдера. Отказ наступал на платном шаге вместо
+    того, чтобы не наступить вовсе.
+    """
+    try:
+        return bool(path) and os.path.isfile(os.path.join(str(path), "auth.json"))
+    except (OSError, TypeError, ValueError):
+        return False
 def _policy_user_matches(u, values):
     if not isinstance(values, (list, tuple, set)):
         return False
@@ -1586,7 +1620,7 @@ def _key_env(u, shared=False, credential_overrides=None, prompt_provider=None):
         env["VS_CODEX_BIN"] = str(k.get("codex_bin") or
                                   os.environ.get("VS_CODEX_BIN") or
                                   os.environ.get("REWRITE_CODEX_BIN") or "codex")
-    elif not shared and _codex_allowed(u) and os.path.isdir(CODEX_HOME):
+    elif not shared and _codex_allowed(u) and _codex_home_ready(CODEX_HOME):
         env["VS_CODEX_HOME"] = CODEX_HOME
     if prov == "claude" and not shared and claude_tok:
         env["CLAUDE_CODE_OAUTH_TOKEN"] = claude_tok
