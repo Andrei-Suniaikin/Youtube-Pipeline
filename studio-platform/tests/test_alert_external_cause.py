@@ -193,6 +193,65 @@ def main() -> int:
     check("заголовок прежний", a.title, "Задача упала: images")
     check("и в теле нет успокоительного", "Чинить нечего" in a.text, False)
 
+    print("\nСорок одна задача на одном лежащем Lumean — одно сообщение")
+    # Так это и выглядело 02.10.2026: сорок одна упавшая озвучка, причина у всех одна,
+    # сорок одно сообщение в телеге. Владелец: «понятно, что если у одного проекта не
+    # работает Lumean, то и в другом он тоже не работает».
+    c = fresh()
+    for i in range(2, 12):
+        c.execute("INSERT INTO projects VALUES(?,'t1',?)", (f"p{i}", f"Проект {i}"))
+    for i in range(1, 42):
+        pid = f"p{(i % 10) + 2}"
+        c.execute("INSERT INTO queue_tasks(job_id,tenant_id,project_id,kind,status,error,"
+                  "created,finished) VALUES(?,'t1',?,'tts','error',?,?,?)",
+                  (i, pid, ЛЮМЕН, NOW - 60 - i, NOW - 60 - i))
+    # И одна своя беда рядом: её прятать за чужой простой нельзя ни в каком случае.
+    упала(c, 99, "images", "кончились кредиты OpenAI: добавьте средства на счёт")
+    c.commit()
+    alerts = pub_alerts.check_failed_tasks(c, NOW, tenant=None)
+    check("сообщений два, а не сорок два", len(alerts), 2)
+    чужое = [a for a in alerts if "Lumean" in a.title]
+    своё = [a for a in alerts if "Lumean" not in a.title]
+    check("чужая беда — одна на всех", len(чужое), 1)
+    check("и в ней сказано, сколько задач стоит",
+          "стоит 41 задача" in чужое[0].title, True)
+    check("слова провайдера приведены один раз", чужое[0].text.count("HTTP 503"), 1)
+    check("названы не все проекты, а несколько", "и ещё 6" in чужое[0].text, True)
+    check("сказано, что сообщение одно нарочно",
+          "Одно сообщение на всех" in чужое[0].text, True)
+    check("своя беда НЕ съедена чужой", len(своё), 1)
+    check("и она про деньги", "кредиты" in своё[0].text, True)
+
+    print("\nОплаченные вызовы в группе не теряются")
+    # Опасность складывания — соврать про деньги: если хоть по одной задаче группы
+    # вызов уже оплачен, молчать об этом нельзя.
+    pub_calls.reserve(c, tenant_id="t1", project_id="p3", kind="tts",
+                      unit="весь текст", fp="отп1", provider="lumean", now=NOW - 600)
+    c.execute("UPDATE provider_calls SET status='delivered', cost=12 WHERE project_id='p3'")
+    c.commit()
+    чужое = [a for a in pub_alerts.check_failed_tasks(c, NOW, tenant=None)
+             if "Lumean" in a.title][0]
+    check("про оплату сказано прямо", "оплаченные вызовы ЕСТЬ" in (чужое.money or ""), True)
+    check("и названо, где смотреть", "Проект 3" in (чужое.money or ""), True)
+
+    print("\nДве беды с одинаковым началом не съедают друг друга")
+    # Ключ тревоги режется по длине, чтобы не раздувать состояние. Если бы он был просто
+    # обрезанным текстом, две причины с общим длинным началом получили бы ОДИН ключ — и
+    # вторую `tick` счёл бы повтором первой, то есть молча проглотил бы целую беду.
+    c = fresh()
+    общее = "этап остановился на шаге подготовки материалов, подробности такие: "
+    for jid, хвост in ((1, "не найден шрифт"), (2, "не найден шрифт"),
+                       (3, "не хватило места"), (4, "не хватило места")):
+        упала(c, jid, "render", общее + хвост)
+    беды = pub_alerts.check_failed_tasks(c, NOW, tenant=None)
+    check("тревоги две, а не одна", len(беды), 2)
+    # Одинаковый ключ = вторую тревогу `tick` счёл бы повтором первой и не отправил.
+    check("и ключи у них разные", len({a.key for a in беды}), 2)
+    check("в одной сказано про шрифт",
+          len([a for a in беды if "шрифт" in a.text]), 1)
+    check("в другой — про место",
+          len([a for a in беды if "места" in a.text]), 1)
+
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
