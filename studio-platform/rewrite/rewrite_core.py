@@ -1654,7 +1654,7 @@ def get_allowed_codex_models() -> Set[str]:
     # ни одного успешного ответа — потерянная переменная не должна их вернуть.
     return _allowed_values(
         "REWRITE_ALLOWED_CODEX_MODELS",
-        "codex:gpt-5.6-terra,codex:gpt-5.6-sol",
+        "codex:gpt-5.6-sol,codex:gpt-5.6-terra",
     )
 
 

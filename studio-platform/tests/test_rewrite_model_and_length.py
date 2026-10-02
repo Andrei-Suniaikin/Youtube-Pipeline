@@ -640,22 +640,25 @@ def part_models_endpoint():
 
         print("\n  есть Codex — помечена та модель, которую сервер и так подставит")
         creds["codex"] = "server"
-        # Литерал обязан совпадать с запасным в `server._resolve_studio_model`.
-        # Ребейз 19.09 переставил его с `codex:gpt-5.4` (форк 31.08) на
-        # `codex:gpt-5.6-terra` (бой 18.09); список нарочно включает обе модели,
-        # чтобы пометка досталась НАЗНАЧЕННОЙ, а не первой по алфавиту. Иначе
-        # проверка проходила бы сама собой и ничего не охраняла.
-        allowed["codex"] = {"codex:gpt-5.4", "codex:gpt-5.6-terra"}
+        # Литерал обязан совпадать с запасным в `server._resolve_studio_model`, и он
+        # здесь продублирован НАРОЧНО: разойдутся — проверка покраснеет, и человек
+        # узнает про расхождение, а не узнает про него потом из чужого заказа.
+        # История переездов: `codex:gpt-5.4` (форк 31.08) → `codex:gpt-5.6-terra`
+        # (бой 18.09, ребейз 19.09) → `codex:gpt-5.6-sol` (02.10, слово владельца).
+        # Список нарочно включает две модели, чтобы пометка досталась НАЗНАЧЕННОЙ, а
+        # не первой по алфавиту; `codex:gpt-5.4` алфавитно впереди sol, так что
+        # проверка сама собой не проходит.
+        allowed["codex"] = {"codex:gpt-5.4", "codex:gpt-5.6-sol"}
         body = handler(user={"user_id": "u1"})
         marked = [i["value"] for i in body if i.get("default")]
-        check("помечена ровно одна", marked, ["codex:gpt-5.6-terra"])
+        check("помечена ровно одна", marked, ["codex:gpt-5.6-sol"])
         check("а вторая без пометки", len(body), 2)
 
         print("\n  ответ понятен кабинету без переводчика")
         items = pub_remote._parse_models(body)
         check("кабинет разобрал ответ", [i["value"] for i in items],
-              ["codex:gpt-5.4", "codex:gpt-5.6-terra"])
-        check("и выбрал бы помеченную", _chosen_from(items), "codex:gpt-5.6-terra")
+              ["codex:gpt-5.4", "codex:gpt-5.6-sol"])
+        check("и выбрал бы помеченную", _chosen_from(items), "codex:gpt-5.6-sol")
 
         print("\n  переменная сервера переставляет пометку")
         # Берём ВТОРУЮ модель из того же списка: смысл проверки в том, что пометка
@@ -745,10 +748,40 @@ def _refusal_for(items) -> bool:
         return True
 
 
+def part_literal_in_sync() -> None:
+    """Запасная модель записана в трёх местах — проверяем, что все три совпадают.
+
+    Комментарий в `api.py` давно утверждает, что литерал обязан совпадать с
+    `server._resolve_studio_model`, но проверяла это ровно одна сторона: мутация
+    «сервер остался на terra» 02.10 не покраснела ни одной проверкой. Расхождение
+    тихое и дорогое — ручка пометит одну модель, сервер закажет другую, и платит за
+    это владелец. Сверяем по исходнику, а не по импорту: `server.py` на импорте
+    поднимает приложение, а нам нужна одна строка.
+    """
+    import io
+    import re
+    литералы = {}
+    for файл in ("rewrite/server.py", "rewrite/api.py"):
+        путь = os.path.join(BASE, файл)
+        src = io.open(путь, encoding="utf-8").read()
+        найдено = re.findall(
+            r'"REWRITE_STUDIO_CODEX_MODEL",\s*"([^"]+)"', src)
+        литералы[файл] = sorted(set(найдено))
+    print("\n  запасная модель одна во всех трёх местах")
+    check("в server.py она одна и та же", len(литералы["rewrite/server.py"]), 1)
+    check("и ручка называет ту же самую",
+          литералы["rewrite/api.py"], литералы["rewrite/server.py"])
+    # Третья сторона — то, что реально стоит в бою. Держим список здесь: разойдётся
+    # с /etc/rewrite.env — пусть покраснеет и человек сверит машину.
+    check("и это та, что выкачена 02.10",
+          литералы["rewrite/server.py"], ["codex:gpt-5.6-sol"])
+
+
 def main() -> int:
     part_model()
     part_models_endpoint()
     part_length()
+    part_literal_in_sync()
     if FAILS:
         print(f"\nПРОВАЛЕНО: {len(FAILS)}")
         for label in FAILS:

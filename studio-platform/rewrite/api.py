@@ -638,8 +638,17 @@ def build_api_router(
             # (live server.py:398 и :2322). При ребейзе 19.09 оно поехало с
             # `codex:gpt-5.4` (форк 31.08) на `codex:gpt-5.6-terra` (бой 18.09) —
             # разойдутся, и ручка пометит одну модель, а сервер закажет другую.
+            #
+            # 02.10.2026 — на `codex:gpt-5.6-sol` по слову владельца. Модели различаются
+            # ровно одним полем каталога: у sol `default_reasoning_level` = low, у terra
+            # medium (проверено по `models_cache.json` живых домов; наш же разбор 17.09
+            # записал это в `rewrite_core._alt_codex_flags`). Остальное — контекст,
+            # модальности, уровни усилия, скоростные тарифы — совпадает побайтно. На
+            # маршруте подписки усилие явно НЕ передаётся, значит действует умолчание
+            # модели: меньше токенов размышления, меньше расход окна, быстрее ответ.
+            # Платим за это возможным качеством текста — решение владельца.
             preferred = os.environ.get(
-                "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-terra"
+                "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-sol"
             ).strip()
             default_codex = (
                 preferred if preferred in codex_models else next(iter(codex_models), "")

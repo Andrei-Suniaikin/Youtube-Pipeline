@@ -395,7 +395,7 @@ def _resolve_studio_model(model: str, user_id: str) -> str:
         return selected
     # FIX-2026-09-13-models: по умолчанию живая terra, а не снятая gpt-5.4.
     preferred = os.environ.get(
-        "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-terra"
+        "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-sol"
     ).strip()
     return preferred if preferred in allowed else allowed[0]
 
@@ -2346,7 +2346,7 @@ def get_models(request: Request):
         # Значение по умолчанию — то же, что в _resolve_studio_model (FIX-2026-09-13-models),
         # иначе без переменной интерфейс пометил бы sol, а сервер подменял бы на terra.
         preferred = os.environ.get(
-            "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-terra"
+            "REWRITE_STUDIO_CODEX_MODEL", "codex:gpt-5.6-sol"
         ).strip()
         default_codex = (
             preferred if preferred in codex_models else next(iter(codex_models), "")
