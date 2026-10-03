@@ -22,6 +22,7 @@ sys.path.insert(0, os.path.join(BASE, "server"))
 
 import pub_calls                                                  # noqa: E402
 import pub_remote                                                 # noqa: E402
+import pub_engine                                                 # noqa: E402
 import pub_services                                               # noqa: E402
 from pub_engine import ItemFailed, ResourceDown                   # noqa: E402
 
@@ -68,6 +69,15 @@ class FakeClient:
         FakeClient.keys.append(idempotency_key)
         return f"job-{FakeClient.made}"
 
+    retried = []            # какие задачи просили возобновить
+    retry_error = None      # чем отвечать на возобновление вместо «принято»
+
+    def retry(self, job_id):
+        if FakeClient.retry_error is not None:
+            raise FakeClient.retry_error
+        FakeClient.retried.append(job_id)
+        return {"status": "pending"}
+
     def job(self, job_id):
         if FakeClient.missing:
             from pub_remote import RemoteJobMissing
@@ -88,7 +98,8 @@ def fresh():
       CREATE TABLE admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL);
       CREATE TABLE pub_release_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT,
         release_id TEXT, service TEXT, kind TEXT, remote_job_id TEXT, status TEXT,
-        error TEXT, created REAL, updated REAL, UNIQUE(release_id,service,kind));
+        payload TEXT, error TEXT, created REAL, updated REAL,
+        UNIQUE(release_id,service,kind));
       CREATE TABLE pub_release_log(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
         ts REAL, level TEXT, step TEXT, message TEXT,
         repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
@@ -226,6 +237,132 @@ def main() -> int:
         check("текст сохранён", len(store), 1)
         row = c.execute("SELECT * FROM provider_calls").fetchone()
         check("теперь «готово»", row["status"], "delivered")
+
+        print("\n  рерайт прервал задачу — возобновляем ЕЁ ЖЕ, а не заказываем новую")
+        # 03.10.2026: рестарт службы оставил десять задач в «interrupted» с 14/18,
+        # 13/23, 12/23 готовыми кусками. Сосед сам их не поднимает; новый заказ начал
+        # бы с первого куска. Движок зовёт /retry той же задачи — и ждёт дальше.
+        c3 = fresh()
+        FakeClient.made = 0
+        FakeClient.retried = []
+        svc3 = services([])
+        svc3.do_source_ready(c3, REL)                      # заказ создан: job-1
+        saved_job = FakeClient.job
+
+        def mirror():
+            return c3.execute("SELECT status, payload FROM pub_release_jobs "
+                              "WHERE service='rewrite' AND kind='job'").fetchone()
+
+        def journal():
+            return c3.execute("SELECT status FROM provider_calls WHERE kind='text' "
+                              "ORDER BY id DESC LIMIT 1").fetchone()[0]
+
+        FakeClient.job = lambda self, job_id: {"status": "interrupted",
+                                               "progress_detail": "продолжение 14/18"}
+        try:
+            out = svc3.do_source_ready(c3, REL)
+            check("прерванная задача не «ждём» молча, а возобновлена", out, {"wait": True})
+            check("возобновили ТУ ЖЕ задачу", FakeClient.retried, ["job-1"])
+            check("нового заказа нет", FakeClient.made, 1)
+            check("журнал платных вызовов не тронут: заказ тот же", journal(), "ordered")
+            check("зеркало снова «running»", mirror()["status"], "running")
+            check("возобновление посчитано", '"resumes": 1' in (mirror()["payload"] or ""), True)
+            msg = c3.execute("SELECT message FROM pub_release_log ORDER BY id DESC LIMIT 1"
+                             ).fetchone()[0]
+            check("в журнале выпуска — словами соседа", "продолжение 14/18" in msg, True)
+            check("и сказано, что готовые куски не переделываются",
+                  "не переделываются" in msg, True)
+
+            print("\n  три раза подряд — и хватит: дальше разбор")
+            svc3.do_source_ready(c3, REL)
+            svc3.do_source_ready(c3, REL)
+            check("третье возобновление ещё даётся", len(FakeClient.retried), 3)
+            try:
+                svc3.do_source_ready(c3, REL)
+                check("четвёртое — провал этапа", "не упало", "ItemFailed")
+            except pub_services.ItemFailed as exc:
+                check("четвёртое — провал этапа", "возобновлял 3 раз" in str(exc), True)
+            check("а возобновлений по-прежнему три", len(FakeClient.retried), 3)
+            check("зеркало закрыто ошибкой", mirror()["status"], "error")
+            # Отказ после созданного заказа закрывается как ordered=True: заказ был,
+            # деньги потрачены — строка остаётся «ordered», и повтор спросит про него,
+            # а не создаст новый (pub_calls.mark_failed).
+            check("журнал: заказ остаётся — повтор спросит про него, а не создаст новый",
+                  journal(), "ordered")
+
+            print("\n  «вернуть в работу» обнуляет счёт — и задачу снова можно поднять")
+            import inspect
+            check("«вернуть в работу» действительно снимает счётчик (проводка в revive)",
+                  "reset_rewrite_resumes(c, release_id)" in inspect.getsource(pub_engine.revive),
+                  True)
+            check("счётчик снят", pub_engine.reset_rewrite_resumes(c3, REL["release_id"]), True)
+            check("повторный сброс — нечего снимать",
+                  pub_engine.reset_rewrite_resumes(c3, REL["release_id"]), False)
+            out = svc3.do_source_ready(c3, REL)
+            check("после возврата в работу — возобновление, не разбор", out, {"wait": True})
+            check("и это снова та же задача", FakeClient.retried[-1], "job-1")
+        finally:
+            FakeClient.job = saved_job
+
+        print("\n  упала сама — сначала разбор; вернули в работу — поднимаем ту же")
+        # До 03.10 «вернуть в работу» после «рерайт не справился» было пустым жестом:
+        # зеркало оставалось, движок опрашивал ту же упавшую задачу и тем же тиком
+        # снова ронял выпуск в разбор. Обход был один — снести строку и заплатить заново.
+        c4 = fresh()
+        FakeClient.made = 0
+        FakeClient.retried = []
+        svc4 = services([])
+        svc4.do_source_ready(c4, REL)
+        FakeClient.job = lambda self, job_id: {"status": "failed",
+                                               "error": "1 из 1 задач не выполнено"}
+        try:
+            try:
+                svc4.do_source_ready(c4, REL)
+                check("первый раз упавшая — провал этапа", "не упало", "ItemFailed")
+            except pub_services.ItemFailed as exc:
+                check("первый раз упавшая — провал этапа", "не справился" in str(exc), True)
+            check("возобновлять без человека не стали", FakeClient.retried, [])
+            # человек нажал «вернуть в работу»: зеркало в «error», выпуск снова живой
+            out = svc4.do_source_ready(c4, REL)
+            check("после возврата — та же задача возобновлена", FakeClient.retried, ["job-1"])
+            check("и движок ждёт её", out, {"wait": True})
+            check("нового заказа нет", FakeClient.made, 1)
+
+            print("\n  «partial» — это конец, а не «ещё работает»")
+            FakeClient.job = lambda self, job_id: {"status": "partial", "error": "0/1"}
+            c5 = fresh(); FakeClient.made = 0; FakeClient.retried = []
+            svc5 = services([])
+            svc5.do_source_ready(c5, REL)
+            try:
+                svc5.do_source_ready(c5, REL)
+                check("partial — провал, не ожидание", "не упало", "ItemFailed")
+            except pub_services.ItemFailed as exc:
+                check("partial — провал, не ожидание", "не справился" in str(exc), True)
+
+            print("\n  сосед лежит в момент возобновления — ждём, а не в разбор")
+            FakeClient.job = lambda self, job_id: {"status": "interrupted"}
+            FakeClient.retry_error = ResourceDown("рерайт", "рерайт не отвечает")
+            c6 = fresh(); FakeClient.made = 0; FakeClient.retried = []
+            svc6 = services([])
+            svc6.do_source_ready(c6, REL)
+            try:
+                svc6.do_source_ready(c6, REL)
+                check("ResourceDown пробрасывается", "не упало", "ResourceDown")
+            except ResourceDown:
+                check("ResourceDown пробрасывается", True, True)
+            except pub_services.ItemFailed as exc:
+                check("ResourceDown пробрасывается", f"ItemFailed: {exc}", "ResourceDown")
+            FakeClient.retry_error = RuntimeError("409: retry only for failed jobs")
+            try:
+                svc6.do_source_ready(c6, REL)
+                check("отказ соседа возобновить — провал словами", "не упало", "ItemFailed")
+            except pub_services.ItemFailed as exc:
+                check("отказ соседа возобновить — провал словами",
+                      "не дал возобновить" in str(exc) and "409" in str(exc), True)
+        finally:
+            FakeClient.job = saved_job
+            FakeClient.retry_error = None
+            FakeClient.retried = []
 
         print("\nТот же текст и те же настройки — второй раз не платим")
         c2 = fresh()

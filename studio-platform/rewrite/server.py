@@ -252,8 +252,12 @@ def _run_task_with_resume(attempts, backoff, log_q, stop_event, user_id, fn, *ar
         # тот же отказ, вызовы на него не тратим.
         if model_unavailable_reason(getattr(stop_event, "_rewrite_job_id", "")):
             return res
-        from rewrite_core import host_budget_wait_until
+        from rewrite_core import host_budget_wait_until, limit_hit_until
         if host_budget_wait_until(getattr(stop_event, "_rewrite_job_id", "")):
+            return res
+        # Окно подписки исчерпано: новый круг даст тот же отказ за секунды, а
+        # воркер ниже отложит джоб до сброса окна (pop_limit_hit) — не хороним.
+        if limit_hit_until(getattr(stop_event, "_rewrite_job_id", "")):
             return res
         if _att < attempts - 1:
             try:
@@ -1573,7 +1577,9 @@ def _execute_rewrite_job(job: Job):
             job.error = "Ожидание общего лимита ключа до вызова провайдера"
             queue.update_running(job)
             if queue.defer_job(job.id, max(time.time()+1, host_until), job.run_token):
-                log_queue.put("⏳ общий лимит ключа занят — задача ожидает в очереди, прогресс сохранён")
+                log_queue.put("⏳ общий лимит ключа занят — задача ожидает в очереди, "
+                              f"прогресс сохранён (следующая попытка через "
+                              f"{max(1, int(host_until - time.time()))} с)")
                 return
 
         # Защита от ложного COMPLETED (backlog #1):

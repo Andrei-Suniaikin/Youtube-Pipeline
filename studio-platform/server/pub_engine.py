@@ -505,11 +505,40 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
                  "и соберём комплект с нуля", now=now)
     c.execute("UPDATE pub_plan_items SET status='running', updated=? WHERE id=? "
               "AND status='error'", (now, rel["plan_item_id"]))
+    reset_rewrite_resumes(c, release_id)
     log_line(c, release_id, "движок",
              f"возвращён в работу с фазы «{phase}»"
              + ("" if keep_attempts else ", счётчик попыток обнулён"), now=now)
     log_phase(c, release_id, "revived", now, payload={"from_phase": rel["phase"]})
     return {"ok": True, "phase": phase}
+
+
+def reset_rewrite_resumes(c, release_id: str) -> bool:
+    """Обнулить счётчик возобновлений задачи рерайта (pub_services._resume_rewrite).
+
+    Движок возобновляет одну задачу соседа не больше REWRITE_MAX_RESUMES раз подряд.
+    Человек, вернувший выпуск в работу, посмотрел и решил, что причина устранена, —
+    счёт начинается заново, как и `attempts` выше. Зеркало задачи при этом остаётся в
+    «error»: именно по нему движок понимает, что упавшую задачу велено поднять.
+    """
+    try:
+        row = c.execute("SELECT payload FROM pub_release_jobs WHERE release_id=? "
+                        "AND service='rewrite' AND kind='job'", (release_id,)).fetchone()
+    except Exception:                                              # noqa: BLE001
+        return False                 # база старше колонки `payload` — считать негде
+    if not row or not row["payload"]:
+        return False
+    try:
+        payload = json.loads(row["payload"]) or {}
+    except (TypeError, ValueError):
+        return False
+    if "resumes" not in payload:
+        return False
+    payload.pop("resumes", None)
+    c.execute("UPDATE pub_release_jobs SET payload=? WHERE release_id=? "
+              "AND service='rewrite' AND kind='job'",
+              (json.dumps(payload, ensure_ascii=False), release_id))
+    return True
 
 
 HAND_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")

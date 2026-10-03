@@ -82,6 +82,15 @@ TEXT_MIN_RATIO = float(os.environ.get("VS_TEXT_MIN_RATIO", "0.6"))
 TEXT_MIN_CHARS = int(os.environ.get("VS_TEXT_MIN_CHARS", "500"))
 
 
+# Состояния задачи рерайта, из которых её можно ВОЗОБНОВИТЬ тем же номером: сосед
+# дописывает только незавершённые куски (`/jobs/{id}/retry`). «Прерванную» он сам не
+# поднимает никогда — у него это конечное состояние после рестарта.
+REWRITE_RESUMABLE = ("interrupted", "failed", "partial", "cancelled")
+# Сколько раз подряд движок возобновляет одну задачу без человека. Дальше — разбор:
+# «вернуть в работу» обнуляет счётчик (pub_engine.revive).
+REWRITE_MAX_RESUMES = 3
+
+
 class PubServices:
     """Обработчики фаз. Каждый метод возвращает {} (шаг сделан) или {"wait": True}."""
 
@@ -417,7 +426,12 @@ class PubServices:
             log_line(c, rel["release_id"], "рерайт", str(exc), level="error")
             raise
         state = str(info.get("status") or "").lower()
-        if state in ("error", "failed", "cancelled"):
+        if state in REWRITE_RESUMABLE and (state == "interrupted"
+                                           or known["status"] == "error"):
+            # Прерванную задачу поднимаем сами; упавшую — только после того, как
+            # человек вернул выпуск в работу (строка-зеркало уже стоит в «error»).
+            return self._resume_rewrite(c, rel, known, info, client)
+        if state in ("error", "failed", "cancelled", "partial"):
             reason = "рерайт не справился: " + str(info.get("error") or state)
             self._close_text_call(c, rel, error=reason)
             self._finish_remote(c, rel["release_id"], "rewrite", "error", reason)
@@ -480,6 +494,87 @@ class PubServices:
         # обе длины рядом, а не только итог «убрал в разбор».
         log_line(c, rel["release_id"], "рерайт", message, level="error")
         raise ItemFailed(message)
+
+    @staticmethod
+    def _resumes(known) -> int:
+        """Сколько раз эту задачу соседа уже возобновляли (payload.resumes)."""
+        try:
+            raw = known["payload"]
+        except (KeyError, IndexError, TypeError):
+            return 0
+        try:
+            return int((json.loads(raw) or {}).get("resumes") or 0)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return 0
+
+    def _note_resume(self, c, release_id: str, n: int) -> None:
+        """Запомнить возобновление: счётчик в payload, зеркало снова «running»."""
+        row = self._remote(c, release_id, "rewrite")
+        try:
+            payload = json.loads(row["payload"] or "{}") or {}
+        except (KeyError, IndexError, TypeError, ValueError, json.JSONDecodeError):
+            payload = {}
+        payload["resumes"] = int(n)
+        c.execute(
+            "UPDATE pub_release_jobs SET status='running', error=NULL, payload=?, "
+            "updated=? WHERE release_id=? AND service='rewrite' AND kind='job'",
+            (json.dumps(payload, ensure_ascii=False), self._clock(), release_id))
+
+    def _resume_rewrite(self, c, rel, known, info, client):
+        """Возобновить задачу рерайта ТЕМ ЖЕ номером вместо нового заказа.
+
+        03.10.2026, ролики на час и длиннее. Две находки на бою:
+
+        * рестарт службы переводит идущую задачу соседа в «interrupted» — у него это
+          конечное состояние, сам он её не поднимает (job_queue.reap_stale_running).
+          Для движка это не входило ни в «не справился», ни в «готово» и попадало в
+          «ждём»: выпуск двенадцать часов числился работающим, до потолка HARD_STALL.
+          Десять задач стояли так с 14/18, 13/23, 12/23 готовыми кусками;
+        * «вернуть в работу» после «рерайт не справился» ничего не возвращало: зеркало
+          задачи оставалось, движок опрашивал ту же упавшую задачу и тем же тиком снова
+          ронял выпуск в разбор. Единственный обход — снести строку и заказать заново,
+          то есть заплатить за все куски второй раз.
+
+        Сосед умеет `/retry`: дописать только незавершённые куски той же задачи.
+        Это не новый заказ (номер и деньги те же), поэтому журнал платных вызовов не
+        трогаем, а считаем возобновления в payload зеркала — не больше
+        REWRITE_MAX_RESUMES подряд, дальше честный провал с причиной словами.
+        «Вернуть в работу» обнуляет счётчик (pub_engine.revive).
+        """
+        job_id = str(known["remote_job_id"] or "")
+        state = str(info.get("status") or "").lower()
+        сказал = str(info.get("progress_detail") or info.get("error") or "").strip()
+        words = "прервал задачу" if state == "interrupted" else f"задача в «{state}»"
+        done = self._resumes(known)
+        if done >= REWRITE_MAX_RESUMES:
+            reason = (f"рерайт {words}" + (f": {сказал}" if сказал else "")
+                      + f"; возобновлял {done} раз(а) подряд — дальше нужен разбор")
+            self._close_text_call(c, rel, error=reason)
+            self._finish_remote(c, rel["release_id"], "rewrite", "error", reason)
+            raise ItemFailed(reason)
+        try:
+            client.retry(job_id)
+        except ResourceDown:
+            raise                 # сосед лежит — это «ждём», а не «в разбор»
+        except Exception as exc:                                   # noqa: BLE001
+            reason = f"рерайт не дал возобновить задачу {job_id}: {exc}"
+            self._close_text_call(c, rel, error=reason)
+            self._finish_remote(c, rel["release_id"], "rewrite", "error", reason)
+            raise ItemFailed(reason) from exc
+        try:
+            self._note_resume(c, rel["release_id"], done + 1)
+        except sqlite3.OperationalError as exc:
+            # База старше колонки `payload`: без счётчика возобновлять нельзя — это
+            # была бы вечная петля на задаче, которую сосед никогда не доделает.
+            reason = f"возобновил задачу {job_id}, но считать возобновления негде: {exc}"
+            self._finish_remote(c, rel["release_id"], "rewrite", "error", reason)
+            raise ItemFailed(reason) from exc
+        log_line(c, rel["release_id"], "рерайт",
+                 f"рерайт {words}" + (f": {сказал}" if сказал else "")
+                 + f" — возобновил её же (попытка {done + 1} из {REWRITE_MAX_RESUMES}): "
+                 f"готовые куски не переделываются и второй раз не оплачиваются",
+                 level="warn")
+        return {"wait": True}
 
     def _close_text_call(self, c, rel, result: str = "", error: str = "") -> None:
         """Закрыть строку журнала за этот текст: получено или не получено.

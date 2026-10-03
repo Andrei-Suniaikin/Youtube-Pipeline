@@ -703,6 +703,55 @@ def _note_subscription(provider: str, value: str, outcome: str,
         _text_subs.note(provider, value, outcome, until=until, detail=detail)
 
 
+_CODEX_REL_HOURS = re.compile(r"(\d+)\s*(?:h\b|hr\b|hours?\b|час)", re.I)
+_CODEX_REL_MINUTES = re.compile(r"(\d+)\s*(?:m\b|min\b|minutes?\b|мин)", re.I)
+
+
+def _codex_limit_reset_from_text(text) -> float:
+    """«try again in 2h 15m», «resets in 45 minutes» → unix-время сброса; 0 — не нашлось."""
+    t = str(text or "")
+    if not re.search(r"\b(?:in|after|через)\b", t, re.I):
+        return 0.0
+    h = _CODEX_REL_HOURS.search(t)
+    m = _CODEX_REL_MINUTES.search(t)
+    secs = (int(h.group(1)) * 3600 if h else 0) + (int(m.group(1)) * 60 if m else 0)
+    return time.time() + secs if secs > 0 else 0.0
+
+
+def _codex_limit_to_cooldown(pool, codex_home: str, result):
+    """CODEX_LIMIT → дом отдыхает до сброса, ответ получает префикс SUBSCRIPTION_LIMIT.
+
+    03.10.2026, девять выпусков «рерайт не справился: 0 файлов». Окно подписки дома
+    Codex кончилось, но отказ только записывался в состояние ключа: дом не гасился,
+    пул выдавал его снова, кусок падал за шесть секунд, три круга авто-повтора по
+    двадцать секунд — и задача с пятью готовыми кусками из шести хоронилась как
+    провал, хотя речь шла о паузе до сброса окна. Теперь, как у Claude (mark_limited
+    в call_api_universal): этот дом не выдаётся до сброса (живой сосед по пулу
+    продолжает раздаваться), а ответ помечается SUBSCRIPTION_LIMIT — по этому
+    префиксу remember_limit_hit откладывает джоб до сброса, а не роняет его.
+    Время сброса: из ответа, если он его называет; иначе _LIMIT_DEFAULT_WAIT_SEC —
+    первый успешный вызов снимет кулдаун раньше (clear_limit).
+    """
+    ok = bool(result[0])
+    text = str(result[-1] or "")
+    if ok:
+        try:
+            pool.clear_limit(codex_home)
+        except Exception:                                   # noqa: BLE001
+            pass
+        return result
+    if not text.startswith("CODEX_LIMIT"):
+        return result
+    reset_ts = (parse_limit_reset(text) or _codex_limit_reset_from_text(text)
+                or time.time() + _LIMIT_DEFAULT_WAIT_SEC)
+    try:
+        pool.mark_limited(codex_home, reset_ts)
+    except Exception:                                       # noqa: BLE001
+        pass
+    marked = f"{SUBSCRIPTION_LIMIT_PREFIX}reset={int(reset_ts)}|{text}"
+    return tuple(result[:-1]) + (marked,)
+
+
 def _note_codex_result(codex_home: str, ok: bool, message: Any) -> None:
     text = str(message or "")
     if ok:
@@ -901,6 +950,8 @@ class ServerCredentialPool:
                         entry.in_use += 1
                         _PHYSICAL_CREDENTIAL_IN_USE[identity] = _PHYSICAL_CREDENTIAL_IN_USE.get(identity, 0) + 1
                         self._cursor = chosen
+                        if job_id:
+                            forget_host_budget_streak(job_id)   # ключ дали: серия возвратов прервана
                         return CredentialLease(self, entry, entry.value, host)
                 if host_blocked and time.monotonic() >= host_deadline:
                     remember_host_budget_wait(job_id)
@@ -7931,13 +7982,46 @@ def _call_claude_subscription_impl(
 
 HOST_BUDGET_WAIT_PREFIX = "HOST_BUDGET_WAIT:"
 _JOB_HOST_BUDGET_WAITS = {}
+_JOB_HOST_BUDGET_STREAK: Dict[str, int] = {}
 _HOST_BUDGET_WAIT_LOCK = threading.Lock()
+HOST_BUDGET_WAIT_BASE_SEC = 5
+HOST_BUDGET_WAIT_MAX_SEC = int(os.environ.get("REWRITE_HOST_BUDGET_WAIT_MAX_SEC", "300") or 300)
+
+
+def host_budget_wait_delay(streak: int) -> float:
+    """Пауза перед N-м ПОДРЯД возвратом в очередь: 5, 10, 20, 40 … до потолка."""
+    return float(min(HOST_BUDGET_WAIT_BASE_SEC * (2 ** max(0, int(streak) - 1)),
+                     HOST_BUDGET_WAIT_MAX_SEC))
 
 
 def remember_host_budget_wait(job_id):
+    """Общий лимит ключа занят — вернуть джоб в очередь и не трогать какое-то время.
+
+    03.10.2026, ролик на 455 тысяч знаков. Пауза была пять секунд всегда: джоб
+    возвращался в очередь, через семь секунд брался снова, две секунды ждал ключ и
+    снова возвращался — 1015 кругов и три тысячи строк «Задача принята / Подготовка»
+    в журнале одной задачи, пока рестарт службы её не прервал. Теперь пауза удваивается
+    с каждым кругом подряд (5, 10, 20 … до HOST_BUDGET_WAIT_MAX_SEC) и сбрасывается,
+    как только ключ действительно получен (forget_host_budget_streak из acquire).
+    """
     if job_id:
         with _HOST_BUDGET_WAIT_LOCK:
-            _JOB_HOST_BUDGET_WAITS[str(job_id)] = time.time() + 5
+            n = _JOB_HOST_BUDGET_STREAK.get(str(job_id), 0) + 1
+            _JOB_HOST_BUDGET_STREAK[str(job_id)] = n
+            _JOB_HOST_BUDGET_WAITS[str(job_id)] = time.time() + host_budget_wait_delay(n)
+
+
+def host_budget_wait_streak(job_id) -> int:
+    """Сколько раз подряд этот джоб возвращался в очередь из-за общего лимита."""
+    with _HOST_BUDGET_WAIT_LOCK:
+        return _JOB_HOST_BUDGET_STREAK.get(str(job_id or ""), 0)
+
+
+def forget_host_budget_streak(job_id) -> None:
+    """Ключ получен — серия возвратов прервана, следующая пауза снова короткая."""
+    if job_id:
+        with _HOST_BUDGET_WAIT_LOCK:
+            _JOB_HOST_BUDGET_STREAK.pop(str(job_id), None)
 
 
 def host_budget_wait_until(job_id, pop=False):
@@ -7971,6 +8055,12 @@ def remember_limit_hit(job_id: str, text) -> None:
     until = parse_limit_reset(text) or (time.time() + _LIMIT_DEFAULT_WAIT_SEC)
     with _JOB_LIMIT_LOCK:
         _JOB_LIMIT_HITS[str(job_id)] = max(_JOB_LIMIT_HITS.get(str(job_id), 0.0), until)
+
+
+def limit_hit_until(job_id: str) -> float:
+    """Посмотреть отметку о лимите, НЕ снимая её. 0 — джоб в окно не упирался."""
+    with _JOB_LIMIT_LOCK:
+        return _JOB_LIMIT_HITS.get(str(job_id or ""), 0.0)
 
 
 def pop_limit_hit(job_id: str) -> float:
@@ -9178,7 +9268,8 @@ def call_codex_subscription(
             ensure_provider_execution_allowed("codex")
             # BYOK-2026-07-30: своя подписка тенанта, иначе серверная — и только
             # если она вообще разрешена этому тенанту (задача B).
-            lease = get_effective_credential_pool("codex").acquire(timeout=300.0)
+            pool = get_effective_credential_pool("codex")
+            lease = pool.acquire(timeout=300.0)
         except (CredentialPoolExhausted, RuntimeError) as exc:
             return False, str(exc)
         with lease as codex_home:
@@ -9191,7 +9282,7 @@ def call_codex_subscription(
                 _codex_home_override=codex_home,
             )
         _note_codex_result(codex_home, result[0], result[-1])
-        return result
+        return _codex_limit_to_cooldown(pool, codex_home, result)
     codex_bin_setting = os.environ.get("REWRITE_CODEX_BIN", "codex")
     codex_bin = shutil.which(codex_bin_setting)
     if not codex_bin and os.path.isfile(codex_bin_setting):
@@ -9385,7 +9476,8 @@ def call_codex_conversation(
         try:
             ensure_provider_execution_allowed("codex")
             # BYOK-2026-07-30: своя подписка тенанта, иначе серверная (задача B).
-            lease = get_effective_credential_pool("codex").acquire(timeout=300.0)
+            pool = get_effective_credential_pool("codex")
+            lease = pool.acquire(timeout=300.0)
         except (CredentialPoolExhausted, RuntimeError) as exc:
             return False, [], str(exc)
         with lease as codex_home:
@@ -9402,7 +9494,7 @@ def call_codex_conversation(
                 _codex_home_override=codex_home,
             )
         _note_codex_result(codex_home, result[0], result[-1])
-        return result
+        return _codex_limit_to_cooldown(pool, codex_home, result)
     if not turn_prompts:
         return False, [], "no turn_prompts"
 
