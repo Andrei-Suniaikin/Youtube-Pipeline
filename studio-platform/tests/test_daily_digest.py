@@ -588,7 +588,8 @@ def part_screen():
     src = open(os.path.join(BASE, "web", "index.html"), encoding="utf-8").read()
     check("вкладка «Сводка» есть в шапке", 'href="#/digest" id="tab-digest"' in src, True)
     check("адрес #/digest разбирается роутером", "h === '#/digest'" in src, True)
-    check("вкладка подсвечивается", "'digest', 'channels'" in src, True)
+    # С 03.10.2026 между ними стоит «Выпуски» — проверяем, что «Сводка» в списке подсветки.
+    check("вкладка подсвечивается", "for (const id of ['digest', " in src, True)
     check("экран нарисован своей функцией", "async function viewDigest(){" in src, True)
     check("экран берёт данные с сервера", "api('/ui/digest')" in src, True)
     # Текст отчёта копируется ТОТ ЖЕ, что уходит в телеграм: если экран соберёт свой,

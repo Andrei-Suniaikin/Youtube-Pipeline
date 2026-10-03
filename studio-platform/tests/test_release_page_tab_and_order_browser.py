@@ -53,13 +53,16 @@ SCENARIO = r"""
                  {created: 1790000300, phase_title: 'второе событие', video_id: '', repeats: 1}],
         log: [{ts: 1790000200, level: 'info', step: 'ролик', message: 'старая запись', repeats: 1, last_ts: 1790000200},
               {ts: 1790000400, level: 'info', step: 'ролик', message: 'НОВЕЙШАЯ запись', repeats: 1, last_ts: 1790000400}]};
-      if (p === '/ui/releases') return {releases: [r]};
+      if (p === '/ui/releases') return {releases: [r], phases: []};
+      if (p.startsWith('/ui/projects')) return {projects: [], rows: [], total: 0};
       if (p === '/ui/channels') return {channels: []};
       return {};
     };
     window.post = async () => ({ok: true});
     addEventListener('hashchange', render);
 
+    // Пришли из проектов — подсвечены «Проекты» (жалоба владельца 03.10.2026).
+    CAME_FROM = '#/projects';
     location.hash = '#/release/rel-1';
     await sleep(400);
     const on = [...document.querySelectorAll('nav .tab.on')].map(a => a.id);
@@ -69,10 +72,22 @@ SCENARIO = r"""
     out.первая = evs[0] || '';
     out.последняя = evs[evs.length - 1] || '';
 
-    // Список выпусков — по-прежнему «Каналы»: там это про канал, не про ролик.
+    // Список выпусков — своя вкладка «Выпуски» (03.10.2026: «там очень удобно
+    // отслеживать проблемы»).
     location.hash = '#/releases';
     await sleep(300);
     out.подсвеченоСписок = [...document.querySelectorAll('nav .tab.on')].map(a => a.id);
+    out.вкладкаЕсть = !!document.getElementById('tab-releases');
+    out.вкладкаВедёт = (document.getElementById('tab-releases') || {}).getAttribute
+      ? document.getElementById('tab-releases').getAttribute('href') : '';
+    // Из списка выпусков в выпуск — подсвечены «Выпуски», а не «Проекты».
+    location.hash = '#/release/rel-1';
+    await sleep(300);
+    out.подсвеченоИзСписка = [...document.querySelectorAll('nav .tab.on')].map(a => a.id);
+    // Новый выпуск по ссылке — тоже раздел «Выпуски».
+    location.hash = '#/new';
+    await sleep(300);
+    out.подсвеченоНовый = [...document.querySelectorAll('nav .tab.on')].map(a => a.id);
   } catch (e) { out.errs.push('scenario: ' + (e && e.message || e)); }
   document.documentElement.setAttribute('data-result', JSON.stringify(out));
 })();
@@ -88,8 +103,14 @@ def main() -> int:
 
     print("Страница выпуска подсвечивает «Проекты», а не «Каналы»")
     check("подсвечена ровно одна вкладка", len(res.get("подсвечено") or []), 1)
-    check("и это «Проекты»", res.get("подсвечено"), ["tab-projects"])
-    check("а список выпусков остался в «Каналах»", res.get("подсвеченоСписок"), ["tab-channels"])
+    check("пришли из проектов — это «Проекты»", res.get("подсвечено"), ["tab-projects"])
+
+    print("\nВкладка «Выпуски»")
+    check("в меню есть вкладка «Выпуски»", res.get("вкладкаЕсть"), True)
+    check("и ведёт в список выпусков", res.get("вкладкаВедёт"), "#/releases")
+    check("список выпусков подсвечивает её", res.get("подсвеченоСписок"), ["tab-releases"])
+    check("выпуск, открытый из списка, — тоже её", res.get("подсвеченоИзСписка"), ["tab-releases"])
+    check("новый выпуск по ссылке — тоже её", res.get("подсвеченоНовый"), ["tab-releases"])
 
     print("\nЛента «Что происходило» — от новых к старым")
     лента = res.get("лента") or []

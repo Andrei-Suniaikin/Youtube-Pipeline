@@ -995,6 +995,9 @@
     .card:has(> table){overflow-x:auto}
     .head{flex-wrap:wrap}
     .head .segs i{font-size:10.5px;padding:0 5px}
+    /* шесть вкладок шире телефона: меню листается само, страница вбок не едет */
+    nav{overflow-x:auto;scrollbar-width:none}
+    nav a.tab{padding:15px 9px;white-space:nowrap}
   }
 </style>
 </head>
@@ -1008,6 +1011,10 @@
          без адреса ведёт сюда же (homeHash). Вкладка остаётся на месте и у того, кто
          убрал сводку со входа: это его единственная дорога назад. -->
     <a class="tab" href="#/digest" id="tab-digest">Сводка</a>
+    <!-- «Выпуски» — своя вкладка с 03.10.2026 (владелец: «там очень удобно отслеживать
+         проблемы»). Раньше список жил внутри «Каналов», и найти его можно было только
+         по ссылке со страницы канала. -->
+    <a class="tab" href="#/releases" id="tab-releases">Выпуски</a>
     <a class="tab" href="#/channels" id="tab-channels">Каналы</a>
     <a class="tab" href="#/projects" id="tab-projects">Проекты</a>
     <a class="tab" href="#/queue" id="tab-queue">Очередь</a>
@@ -12083,9 +12090,13 @@ const ROUTES = [
   // Страница ОДНОГО выпуска — это работа над роликом, и человек заходит в неё как в
   // «проект» (владелец 03.10.2026: «захожу в проект — в топбаре подсвечены каналы»).
   // Список выпусков и планирование остаются в «Каналах»: там это про канал, не про ролик.
-  ['projects', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
-  ['channels', h => h === '#/new',                () => viewNew()],
-  ['channels', h => h === '#/releases',           () => viewReleases()],
+  // Вкладка страницы выпуска — та, откуда на неё пришли (`tabFrom(CAME_FROM)`): из
+  // проектов — «Проекты» (владелец 03.10.2026: «захожу в проект — подсвечены каналы»),
+  // из списка выпусков — «Выпуски». Открыли по ссылке — «Выпуски».
+  [() => tabFrom(CAME_FROM), h => h.startsWith('#/release/'),
+                                                 h  => viewRelease(decodeURIComponent(h.slice(10)))],
+  ['releases', h => h === '#/new',                () => viewNew()],
+  ['releases', h => h === '#/releases',           () => viewReleases()],
   ['channels', h => h === '#/spread',             () => viewSpread()],
   ['profile',  h => h === '#/profile',            () => viewProfile()],
   ['channels', () => true,                        () => viewChannels()],
@@ -12128,8 +12139,19 @@ function backFrom(h){
   if (h.startsWith('#/channel/')) return [h, 'к каналу'];
   if (h === '#/queue') return [h, 'к очереди'];
   if (h === '#/digest') return [h, 'к сводке'];
-  // Страница выпуска живёт во вкладке «Проекты» — по умолчанию туда.
-  return ['#/projects', 'ко всем проектам'];
+  if (h === '#/projects') return [h, 'ко всем проектам'];
+  // По ссылке, без истории — в список выпусков: у них теперь своя вкладка.
+  return ['#/releases', 'ко всем выпускам'];
+}
+
+// Какая вкладка подсвечена на странице выпуска — по тому же «откуда пришли».
+function tabFrom(h){
+  h = h || '';
+  if (h === '#/projects' || h.startsWith('#/project/')) return 'projects';
+  if (h.startsWith('#/channel/') || h === '#/channels') return 'channels';
+  if (h === '#/queue') return 'queue';
+  if (h === '#/digest') return 'digest';
+  return 'releases';
 }
 
 async function render(){
@@ -12169,9 +12191,10 @@ async function render(){
   // «Профиль» среди них — это имя человека справа: отдельной вкладки у него больше
   // нет, id висит на ссылке, которую рисует showWho(). На экране входа имени нет, и
   // слепое обращение к нему уронило бы весь роутер — поэтому проверяем.
-  for (const id of ['digest', 'channels', 'projects', 'queue', 'presets', 'profile']){
+  const tabOn = typeof hit[0] === 'function' ? hit[0]() : hit[0];
+  for (const id of ['digest', 'releases', 'channels', 'projects', 'queue', 'presets', 'profile']){
     const tab = document.getElementById('tab-' + id);
-    if (tab) tab.classList.toggle('on', hit[0] === id);
+    if (tab) tab.classList.toggle('on', tabOn === id);
   }
   // Полоса появляется, только если экран думает дольше мгновения: на быстром переходе
   // мигание раздражает сильнее, чем помогает.
