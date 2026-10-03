@@ -1530,18 +1530,23 @@ async function viewRelease(id){
 
   app.append($(`<div class="card">
     <div class="sec">Что происходило</div>
-    ${d.events.length ? d.events.map(e => `<div class="ev">
+    ${[
+      // Одна лента, а не две подряд: фазы и журнал — события одного ролика, и
+      // читать их надо вперемешку по времени. От новых к старым — текущее состояние
+      // сверху (владелец 03.10.2026: «для понимания текущей ситуации»).
+      ...d.events.map(e => ({t: e.created, html: `<div class="ev">
         <time>${when(e.created)}</time>
         <div class="step">фаза</div>
         <div>${esc(e.phase_title)}${e.video_id ? ' · ролик ' + esc(e.video_id) : ''}
           ${again(e.repeats, e.last_seen)}</div>
-      </div>`).join('') : ''}
-    ${d.log.map(l => `<div class="ev">
+      </div>`})),
+      ...d.log.map(l => ({t: l.ts, html: `<div class="ev">
         <time>${when(l.ts)}</time>
         <div class="step">${esc(l.step)}</div>
         <div${l.level === 'warn' || l.level === 'error' ? ' class="note bad"' : ''}
           >${esc(l.message)} ${again(l.repeats, l.last_ts)}</div>
-      </div>`).join('')}
+      </div>`})),
+    ].sort((a, b) => (b.t || 0) - (a.t || 0)).map(x => x.html).join('')}
     ${!d.events.length && !d.log.length ? '<div class="empty">Записей пока нет.</div>' : ''}
   </div>`));
 }
@@ -11935,7 +11940,10 @@ const ROUTES = [
   ['presets',  h => h.startsWith('#/lumean/'),     h  => viewLumeanTemplate(
                                                           decodeURIComponent(h.split('/')[2]))],
   ['profile',  h => h === '#/admin',              () => viewAdmin()],
-  ['channels', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
+  // Страница ОДНОГО выпуска — это работа над роликом, и человек заходит в неё как в
+  // «проект» (владелец 03.10.2026: «захожу в проект — в топбаре подсвечены каналы»).
+  // Список выпусков и планирование остаются в «Каналах»: там это про канал, не про ролик.
+  ['projects', h => h.startsWith('#/release/'),   h  => viewRelease(decodeURIComponent(h.slice(10)))],
   ['channels', h => h === '#/new',                () => viewNew()],
   ['channels', h => h === '#/releases',           () => viewReleases()],
   ['channels', h => h === '#/spread',             () => viewSpread()],
