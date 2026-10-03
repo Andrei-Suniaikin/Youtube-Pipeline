@@ -269,9 +269,14 @@ def main() -> int:
             check("возобновление посчитано", '"resumes": 1' in (mirror()["payload"] or ""), True)
             msg = c3.execute("SELECT message FROM pub_release_log ORDER BY id DESC LIMIT 1"
                              ).fetchone()[0]
-            check("в журнале выпуска — словами соседа", "продолжение 14/18" in msg, True)
-            check("и сказано, что готовые куски не переделываются",
-                  "не переделываются" in msg, True)
+            # Владелец 03.10.2026 о прежней строке «рерайт прервал задачу: 1/1 —
+            # mzyZGlue_r_0e1ec6aba2.txt (Polish) — возобновил её же…»: «что это значит?»
+            check("в журнале — словами человека: что случилось",
+                  "рерайт перезапускали, пока он писал текст" in msg, True)
+            check("и что сделала студия",
+                  "продолжила ту же задачу с места остановки" in msg, True)
+            check("и что это не стоит денег второй раз", "второй раз не оплачиваются" in msg, True)
+            check("счётчик файлов соседа в строку не попал", "14/18" in msg, False)
 
             print("\n  три раза подряд — и хватит: дальше разбор")
             svc3.do_source_ready(c3, REL)
@@ -281,7 +286,7 @@ def main() -> int:
                 svc3.do_source_ready(c3, REL)
                 check("четвёртое — провал этапа", "не упало", "ItemFailed")
             except pub_services.ItemFailed as exc:
-                check("четвёртое — провал этапа", "возобновлял 3 раз" in str(exc), True)
+                check("четвёртое — провал этапа", "продолжал её 3 раз" in str(exc), True)
             check("а возобновлений по-прежнему три", len(FakeClient.retried), 3)
             check("зеркало закрыто ошибкой", mirror()["status"], "error")
             # Отказ после созданного заказа закрывается как ordered=True: заказ был,

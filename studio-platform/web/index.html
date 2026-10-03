@@ -372,6 +372,17 @@
   .iconbtn.fold svg{transition:transform .12s}
   .iconbtn.fold.open svg{transform:rotate(180deg)}
   tr.grp-item>td:first-child{padding-left:30px}
+  /* Выпуски одной причины — отдельной карточкой (владелец 03.10.2026: «проблемные и
+     нормальные слеплены, кажется, что у тех, что снизу, те же проблемы»). Цвет кромки —
+     чья беда: донор, настройка канала, прочая остановка, ожидание. */
+  .grpcard{margin-bottom:12px;border-left:3px solid var(--bad);overflow:hidden}
+  .grpcard.donor{border-left-color:var(--wait)}
+  .grpcard.channel{border-left-color:var(--run)}
+  .grpcard.pending{border-left-color:var(--wait)}
+  .grpcard>.grpbar{padding:12px 16px;background:var(--card-2)}
+  .grpcard.pending .grphead .why{color:var(--wait)}
+  .grpcard tr.grp-item>td:first-child{padding-left:16px}
+  .restcap{padding:12px 16px 4px;font-size:13px;color:var(--muted)}
   /* Колонка действий одной ширины во всех строках: иначе «в работе» (есть кнопка) и
      «готово» (кнопки нет) двигали бы таблицу друг относительно друга при каждом
      обновлении очереди. */
@@ -1113,6 +1124,9 @@ class NeedLogin extends Error {}
 // База берётся из адреса страницы, а не из настройки: одна сборка годится и под
 // префиксом, и при запуске пульта отдельно.
 const API = (location.pathname.match(/^\/studio(?=\/|$)/) || [''])[0];
+// Адреса файлов проекта приходят от сервера путём пульта (`/ui/projects/…/file/`) —
+// ему, как и `api()`, нужен префикс пульта. Кабинетные пути (`/p/…`) — как есть.
+const pultUrl = path => (String(path || '').startsWith('/ui/') ? API + path : (path || ''));
 
 // Значок вкладки браузера. Ставится здесь, а не в разметке, по той же причине, что и
 // адреса запросов: страница открывается и в корне, и под префиксом. В шапке логотипа
@@ -1278,6 +1292,25 @@ function blockNote(r){
     >${esc(b.tag)}</span> ${esc(b.title)}</div>`;
 }
 
+// Недосмотр настройки канала, который выпуск не остановил (нет пресета текста — текст
+// на умолчаниях): короткая строка в списке и блок на карточке выпуска.
+function gapNotes(r){
+  return ((r && r.gaps) || []).map(g => `<div class="note" style="color:var(--wait)"
+    ><span class="blktag ${esc(g.kind)}">${esc(g.tag)}</span> ${esc(g.title)}</div>`).join('');
+}
+
+function gapBoxes(r){
+  const ch = encodeURIComponent(r.channel_id == null ? '' : r.channel_id);
+  return ((r && r.gaps) || []).map(g => `<div class="blk ${esc(g.kind)} gap">
+    <div class="blkhead"><span class="blktag ${esc(g.kind)}">${esc(g.tag)}</span>
+      ${esc(g.title)} <span class="muted" style="font-weight:400">— выпуск идёт, это
+      предупреждение</span></div>
+    <p>${esc(g.what)}</p>
+    <p><b>Что делать:</b> ${esc(g.fix)}</p>
+    <div class="blkacts"><a href="#/channel/${ch}/nastroyki">Открыть настройки канала →</a></div>
+  </div>`).join('');
+}
+
 function blockLabel(r){
   const b = (r && r.block) || {};
   return b.kind ? `${b.tag}: ${b.title}` : ((r && r.blocked_reason) || '');
@@ -1370,7 +1403,9 @@ async function viewReleases(){
 
   app.innerHTML = '';
   app.append($(`<h1>Выпуски ${hintDot(
-    'Путь ролика от донорской ссылки до подтверждённой публикации.')}</h1>`));
+    'Выпуск — ролик в расписании канала: путь от донорской ссылки до подтверждённой '
+    + 'публикации. Производство самого ролика (текст, озвучка, кадры, сборка) — его '
+    + 'проект во вкладке «Проекты»; там же проекты, заведённые руками, без канала.')}</h1>`));
 
   const bar = $(`<div class="toolbar">
     <select id="f-ch"><option value="">все каналы</option>${
@@ -1444,7 +1479,7 @@ async function viewReleases(){
         ${segs(r)}
       </td>
       <td class="muted">${ago(r.idle_sec)}${r.attempts ? `<div>попыток ${r.attempts}</div>` : ''}
-        ${blockNote(r)}</td>
+        ${blockNote(r)}${gapNotes(r)}</td>
     </tr>`;
 
   // Одинаковые причины остановки — одной строкой (см. `groupByReason`). Один упавший
@@ -1453,9 +1488,18 @@ async function viewReleases(){
   // судьбы, и склеивать их под одной причиной нельзя.
   const STATUS_WORD = {blocked:'остановлен', pending:'ожидает', running:'в работе',
                        done:'готово'};
-  const rows = groupByReason(data.releases, blockLabel,
-                             r => r.status || '', 'rg').map(g => {
-    if (g.rows.length < 2) return relRowHtml(g.rows[0], '');
+  // Выпуски одной причины — своей карточкой, остальные — своей (владелец 03.10.2026:
+  // в общей таблице заголовок группы и обычные строки под ним сливались, и казалось,
+  // что у нижних та же беда). Карточки бед — сверху: сначала остановленные, потом
+  // ждущие; внутри — в прежнем порядке выходов.
+  const THEAD = of => `<thead><tr ${of ? `data-of="${esc(of)}" hidden` : ''}>
+    <th>Выпуск</th><th>Канал</th><th>Выход</th><th>Фаза</th><th>Без движения</th></tr></thead>`;
+  const groups = groupByReason(data.releases, blockLabel, r => r.status || '', 'rg');
+  const singles = groups.filter(g => g.rows.length < 2).map(g => g.rows[0]);
+  const many = groups.filter(g => g.rows.length >= 2);
+  const RANK = {blocked: 0, pending: 1};
+  many.sort((a, b) => (RANK[a.rows[0].status] ?? 2) - (RANK[b.rows[0].status] ?? 2));
+  const cards = many.map(g => {
     const st = g.rows[0].status || '';
     const count = `${g.rows.length} ${plural(g.rows.length, 'выпуск', 'выпуска',
                                              'выпусков')}`;
@@ -1466,20 +1510,25 @@ async function viewReleases(){
           .map(([id, name]) => `<a href="#/channel/${encodeURIComponent(id)}/nastroyki"
             >${esc(name)}</a>`).join(', ')
       : '';
-    return `<tr class="grp"><td colspan="5">${groupHeadHtml(g, count, (STATUS_WORD[st]
-      ? ` <span class="pill s-${st === 'blocked' ? 'error' : 'queued'}"
-            >${esc(STATUS_WORD[st])}</span>` : '')
-      + (где ? `<div class="note blk-where">каналы: ${где}</div>` : ''))}</td></tr>`
-      + g.rows.map(r => relRowHtml(r, g.id)).join('');
-  }).join('');
+    const cls = kind || (st === 'blocked' ? '' : 'pending');
+    return `<div class="card grpcard ${esc(cls)}" data-grp="${esc(g.id)}">
+      <div class="grpbar">${groupHeadHtml(g, count, (STATUS_WORD[st]
+        ? ` <span class="pill s-${st === 'blocked' ? 'error' : 'queued'}"
+              >${esc(STATUS_WORD[st])}</span>` : '')
+        + (где ? `<div class="note blk-where">каналы: ${где}</div>` : ''))}</div>
+      <table>${THEAD(g.id)}<tbody>${g.rows.map(r => relRowHtml(r, g.id)).join('')}</tbody></table>
+    </div>`;
+  });
+  const rest = singles.length ? `<div class="card" id="rel-rest">
+      ${cards.length ? `<div class="restcap">Остальные выпуски — ${singles.length}</div>` : ''}
+      <table>${THEAD('')}<tbody>${singles.map(r => relRowHtml(r, '')).join('')}</tbody></table>
+    </div>` : '';
 
-  const table = $(`<div class="card"><table>
-    <thead><tr><th>Выпуск</th><th>Канал</th><th>Выход</th><th>Фаза</th><th>Без движения</th></tr></thead>
-    <tbody>${rows}</tbody></table></div>`);
-  table.querySelectorAll('tr.row').forEach(tr =>
+  const box = $(`<div>${cards.join('')}${rest}</div>`);
+  box.querySelectorAll('tr.row').forEach(tr =>
     tr.onclick = () => location.hash = '#/release/' + tr.dataset.id);
-  wireReasonFolds(table);
-  app.append(table);
+  wireReasonFolds(box);
+  app.append(box);
 }
 
 /* ─────────────────────────── карточка выпуска ─────────────────────────── */
@@ -1489,7 +1538,8 @@ async function viewRelease(id){
   const r = d.release;
 
   app.innerHTML = '';
-  app.append($(`<a class="back" href="#/releases">← ко всем выпускам</a>
+  const [backHref, backText] = backFrom(CAME_FROM);
+  app.append($(`<a class="back" href="${esc(backHref)}">← ${esc(backText)}</a>
     <h1>${esc(r.donor_title || r.release_id)}</h1>
     <p class="sub">${esc(r.channel)} · ${esc(r.lang)} · выход ${when(r.slot_at)}
       · фаза «${esc(r.phase_title)}»</p>`));
@@ -1507,6 +1557,7 @@ async function viewRelease(id){
           when(r.hand_confirmed)}. Ролик на канале есть; заливка не повторится.
         <span class="muted" style="font-weight:400">Это не машинное подтверждение:
           ответа YouTube Data API по этому выпуску у нас нет.</span></div>` : ''}
+    ${gapBoxes(r)}
     ${blockBox(r) || (r.blocked_reason ? `<div class="sec" style="color:var(--bad)">
         Остановлен: ${esc(r.blocked_reason)}
         ${r.status === 'blocked' && !r.hand_confirmed
@@ -2806,6 +2857,9 @@ async function viewChannels(){
         ${c.has_cover_preset === false
           ? '<span class="pill s-error" title="выпуски этого канала встанут на обложке">нет пресета обложек</span>'
           : ''}
+        ${c.has_text_preset === false
+          ? '<span class="pill s-queued" title="сценарий пишется на умолчаниях рерайта: без ведущего и стиля канала">нет пресета текста</span>'
+          : ''}
         ${supplyPill(c.supply)}
       </div>
     </div>`).join('');
@@ -3079,11 +3133,20 @@ async function channelReleases(id, d){
     !ch.profile_id && 'не выбран профиль AdsPower — заливать нечем',
     !ch.host_id && 'не выбрана машина заливки',
   ].filter(Boolean);
+  // Выйдет, но не таким, как задумано (03.10.2026): без пресета текста рерайт пишет на
+  // своих умолчаниях — без ведущего и стиля канала. Это не «не выйдет», поэтому отдельно.
+  const worse = [
+    !(ch.presets || {}).rewrite && 'не выбран пресет текста — сценарий пишется на умолчаниях '
+      + 'рерайта, без ведущего и стиля канала',
+  ].filter(Boolean);
   const add = $(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Поставить ролики</div>
     <div class="secbody">
     ${lacks.length ? `<div class="note bad" style="margin-bottom:10px">Ролик с этого
       канала сейчас не выйдет: ${lacks.map(esc).join('; ')}.
+      <a href="#/channel/${encodeURIComponent(id)}/nastroyki">Настроить канал →</a></div>` : ''}
+    ${worse.length ? `<div class="note warn" style="margin-bottom:10px">Ролик выйдет, но не
+      таким, как задуман: ${worse.map(esc).join('; ')}.
       <a href="#/channel/${encodeURIComponent(id)}/nastroyki">Настроить канал →</a></div>` : ''}
     <textarea id="lk" rows="4" style="width:100%"
       placeholder="ссылки на доноров, по одной в строке — разложатся по свободным датам"></textarea>
@@ -5060,7 +5123,7 @@ function wireRegen(root){
 
 function stageFiles(s, pid){
   if (!s.files || !s.files.length) return '';
-  const url = n => s.file_base + n.split('/').map(encodeURIComponent).join('/');
+  const url = n => pultUrl(s.file_base) + n.split('/').map(encodeURIComponent).join('/');
   return s.files.map(g => {
     if (g.kind === 'image') return `<div style="display:flex;flex-wrap:wrap;gap:5px;
       margin-top:7px">${g.names.map(n => thumb(url(n) + '?w=120', url(n), n, 52,
@@ -7927,13 +7990,13 @@ async function viewProject(id){
 
 function fileCard(d, g){
   const p = d.project;
-  const url = n => d.file_base + n.split('/').map(encodeURIComponent).join('/');
+  const url = n => pultUrl(d.file_base) + n.split('/').map(encodeURIComponent).join('/');
     // Содержимое — в .secbody (правило батча A, отступ 18px): без него миниатюры,
     // плеер и ссылки шли вплотную к рамке карточки (Issue 6, review-feedback-F4
     // цикл 1). Заголовок и кнопка «Скачать архивом» остаются в .sec как есть.
     const card = $(`<div class="card" style="margin-bottom:16px">
       <div class="sec">${esc(g.title)} · ${g.count}
-        <a class="ghost" href="${d.zip_base}${esc(g.code)}"
+        <a class="ghost" href="${pultUrl(d.zip_base)}${esc(g.code)}"
            style="float:right;padding:3px 10px;border:1px solid var(--line);
                   border-radius:6px;text-decoration:none;font-size:12px"
            >Скачать архивом</a></div>
@@ -7987,7 +8050,7 @@ function wireThumbScroll(card, d, g){
   const mark = card.querySelector('.more-mark');
   if (!box || !mark) return;
   const p = d.project;
-  const url = n => d.file_base + n.split('/').map(encodeURIComponent).join('/');
+  const url = n => pultUrl(d.file_base) + n.split('/').map(encodeURIComponent).join('/');
   let loaded = g.names.length;
   let total = g.count;
   let busy = false;
@@ -12054,6 +12117,21 @@ function leaveAsk(target){
       }});
 }
 
+// Откуда пришли на страницу выпуска — туда и ведёт «назад» (владелец 03.10.2026: «нажимаю
+// „ко всем выпускам“ — и меня перекидывает в Каналы, а я пришёл из проектов»). Помним
+// последний экран, который не страница выпуска.
+let CAME_FROM = '';
+function backFrom(h){
+  h = h || '';
+  if (h === '#/releases') return [h, 'ко всем выпускам'];
+  if (h.startsWith('#/project/')) return [h, 'к проекту'];
+  if (h.startsWith('#/channel/')) return [h, 'к каналу'];
+  if (h === '#/queue') return [h, 'к очереди'];
+  if (h === '#/digest') return [h, 'к сводке'];
+  // Страница выпуска живёт во вкладке «Проекты» — по умолчанию туда.
+  return ['#/projects', 'ко всем проектам'];
+}
+
 async function render(){
   if (LEAVE_BACK){ LEAVE_BACK = false; return; }
   if (LEAVE_GUARD){
@@ -12085,6 +12163,7 @@ async function render(){
   // историю браузера, и кнопка «назад» из сводки возвращала бы в сводку же.
   const h = location.hash || homeHash();
   const hit = ROUTES.find(r => r[1](h));
+  if (!h.startsWith('#/release/')) CAME_FROM = h;
   // Экранов больше, чем вкладок: «Выпуски», «Текст», «Обложки» и «Админ» живут внутри
   // каналов, проектов и профиля. Подсвечиваем ту вкладку, в чей раздел попал маршрут.
   // «Профиль» среди них — это имя человека справа: отдельной вкладки у него больше

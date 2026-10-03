@@ -59,6 +59,14 @@ SCENARIO = r"""
       {...base, release_id: 'u1', channel_id: 9, channel: 'Тёмные Тайны', donor_title: 'Чужое',
        phase: 'upload_running', blocked_reason: 'зависло на шаге «upload_running»',
        block: {}, plan_item_id: 14},
+      // Идёт, но канал не настроен: пресета текста нет — сценарий на умолчаниях.
+      {...base, release_id: 'g1', channel_id: 10, channel: 'Tajemství prvků', donor_title: 'СВИНЕЦ',
+       status: 'running', phase: 'created', phase_title: 'заведён', phase_index: 0,
+       blocked_reason: '', block: {}, plan_item_id: 15,
+       gaps: [{kind: 'channel', tag: 'Настройка канала', level: 'warn',
+               title: 'у канала не выбран пресет текста',
+               what: 'Сценарий пишется на умолчаниях рерайта: без имени ведущего.',
+               fix: 'Выберите пресет текста в настройках канала.'}]},
     ];
     window.api = async (p) => {
       if (p === '/ui/me') return ME;
@@ -70,11 +78,11 @@ SCENARIO = r"""
       if (p === '/ui/channels') return {channels: [
         {id: 7, name: 'Nocne Biografie', handle: '@nb', lang: 'PL', status: 'active', niche: '',
          uc: 'UC1', tags: [], tz: 'Europe/Warsaw', horizon_days: 14, lead_days: 3, per_day: 7,
-         has_profile: true, has_uc: true, has_cover_preset: false,
+         has_profile: true, has_uc: true, has_cover_preset: false, has_text_preset: false,
          supply: {known: true, items: 5, days: 5, covered: true}},
         {id: 8, name: 'Mroczne Akta', handle: '@ma', lang: 'PL', status: 'active', niche: '',
          uc: 'UC2', tags: [], tz: 'Europe/Warsaw', horizon_days: 14, lead_days: 3, per_day: 7,
-         has_profile: true, has_uc: true, has_cover_preset: true,
+         has_profile: true, has_uc: true, has_cover_preset: true, has_text_preset: true,
          supply: {known: true, items: 5, days: 5, covered: true}}]};
       return {};
     };
@@ -84,15 +92,42 @@ SCENARIO = r"""
     // ── список выпусков ──
     location.hash = '#/releases';
     await sleep(400);
-    const heads = [...document.querySelectorAll('tr.grp')].map(txt);
+    const heads = [...document.querySelectorAll('.grpcard .grpbar')].map(txt);
     out.заголовки = heads;
-    const grpCh = [...document.querySelectorAll('tr.grp')].find(tr => /Настройка канала/.test(txt(tr)));
-    out.ссылкиКаналов = grpCh ? [...grpCh.querySelectorAll('a')].map(a => a.getAttribute('href')) : [];
+    const grpCh = [...document.querySelectorAll('.grpcard')].find(el => /Настройка канала/.test(txt(el.querySelector('.grpbar'))));
+    out.ссылкиКаналов = grpCh ? [...grpCh.querySelectorAll('.grpbar a')].map(a => a.getAttribute('href')) : [];
+    out.классКарточки = grpCh ? grpCh.className : '';
+    out.строкиКарточки = grpCh ? [...grpCh.querySelectorAll('tr.row')].map(tr => tr.dataset.id) : [];
+    out.остальные = [...document.querySelectorAll('#rel-rest tr.row')].map(tr => tr.dataset.id);
+    out.подписьОстальных = txt(document.querySelector('#rel-rest .restcap'));
     const rowD = document.querySelector('tr.row[data-id="d1"]');
     out.меткаДонора = txt(rowD && rowD.querySelector('.blktag.donor'));
     out.строкаДонора = txt(rowD && rowD.querySelector('.note'));
     const rowU = document.querySelector('tr.row[data-id="u1"]');
     out.чужаяКрасная = txt(rowU && rowU.querySelector('.note.bad'));
+    const rowG = document.querySelector('tr.row[data-id="g1"]');
+    out.строкаНедосмотра = txt(rowG && rowG.querySelector('.note'));
+
+    // ── карточка: идёт, но канал не настроен; «назад» — в список выпусков ──
+    location.hash = '#/release/g1';
+    await sleep(400);
+    const gap = document.querySelector('.blk.gap');
+    out.недосмотр = txt(gap);
+    out.недосмотрКуда = gap && gap.querySelector('a') ? gap.querySelector('a').getAttribute('href') : '';
+    out.недосмотрБлокаОстановки = !!document.querySelector('#blk');
+    const back = document.querySelector('a.back');
+    out.назадИзСписка = back ? [back.getAttribute('href'), txt(back)] : [];
+    // Пришли из проектов — туда же и назад (страница выпуска сама CAME_FROM не трогает).
+    CAME_FROM = '#/projects';
+    location.hash = '#/release/c1';
+    await sleep(400);
+    const back2 = document.querySelector('a.back');
+    out.назадИзПроектов = back2 ? [back2.getAttribute('href'), txt(back2)] : [];
+    CAME_FROM = '';
+    location.hash = '#/release/d1';
+    await sleep(400);
+    const back3 = document.querySelector('a.back');
+    out.назадПрямо = back3 ? [back3.getAttribute('href'), txt(back3)] : [];
 
     // ── карточка: донор ──
     location.hash = '#/release/d1';
@@ -159,6 +194,14 @@ def main() -> int:
           any("Настройка канала: у канала не выбран пресет обложек" in h for h in heads), True)
     check("в группе названы каналы, ссылками в их настройки",
           res.get("ссылкиКаналов"), ["#/channel/7/nastroyki", "#/channel/8/nastroyki"])
+    check("группа — отдельная карточка с кромкой «настройка канала»",
+          "grpcard" in (res.get("классКарточки") or "") and "channel" in res.get("классКарточки"),
+          True)
+    check("в карточке ровно её выпуски", res.get("строкиКарточки"), ["c1", "c2"])
+    check("остальные — в своей карточке", res.get("остальные"), ["d1", "u1", "g1"])
+    check("и она подписана", res.get("подписьОстальных"), "Остальные выпуски — 3")
+    check("недосмотр канала виден в строке выпуска",
+          res.get("строкаНедосмотра"), "Настройка канала у канала не выбран пресет текста")
     check("у донора метка «Проблема в доноре»", res.get("меткаДонора"), "Проблема в доноре")
     check("и смысл вместо имени исключения",
           res.get("строкаДонора"), "Проблема в доноре ролик удалён или закрыт автором")
@@ -191,6 +234,21 @@ def main() -> int:
           res.get("каналВернуть"), True)
     check("«Подтвердить руками» нет", res.get("каналРуками"), False)
 
+    print("\nКарточка выпуска: идёт, но канал не настроен")
+    t = res.get("недосмотр") or ""
+    check("сказано, чья недоработка", "Настройка канала у канала не выбран пресет текста" in t, True)
+    check("и что это предупреждение, выпуск идёт", "выпуск идёт, это предупреждение" in t, True)
+    check("и что делать", "Что делать: Выберите пресет текста" in t, True)
+    check("ссылка — в настройки этого канала", res.get("недосмотрКуда"), "#/channel/10/nastroyki")
+    check("блока остановки нет — выпуск не остановлен", res.get("недосмотрБлокаОстановки"), False)
+
+    print("\n«Назад» — туда, откуда пришёл")
+    check("из списка выпусков — в список выпусков",
+          res.get("назадИзСписка"), ["#/releases", "← ко всем выпускам"])
+    check("из проектов — в проекты", res.get("назадИзПроектов"), ["#/projects", "← ко всем проектам"])
+    check("открыли выпуск напрямую — в проекты (вкладка выпуска — «Проекты»)",
+          res.get("назадПрямо"), ["#/projects", "← ко всем проектам"])
+
     print("\nКарточка выпуска: незнакомая причина — как было")
     check("нового блока нет", res.get("чужойБлок"), False)
     check("обе прежние кнопки на месте",
@@ -200,6 +258,8 @@ def main() -> int:
     print("\nПлитки каналов")
     check("без пресета обложек — плашка", "нет пресета обложек" in (res.get("плиткаБез") or ""), True)
     check("с пресетом — плашки нет", "нет пресета обложек" in (res.get("плиткаС") or ""), False)
+    check("без пресета текста — своя плашка", "нет пресета текста" in (res.get("плиткаБез") or ""), True)
+    check("с ним — нет", "нет пресета текста" in (res.get("плиткаС") or ""), False)
 
     print()
     if FAILS:

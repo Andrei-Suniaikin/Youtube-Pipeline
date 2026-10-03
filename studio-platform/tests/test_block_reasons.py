@@ -175,6 +175,20 @@ def main() -> int:
     check("незнакомая причина — как раньше, текстом движка",
           out and out[0]["why"], "зависло на шаге «x»")
 
+    print("\nНедосмотры канала: когда о них говорить")
+    G = lambda *a, **k: [g["title"] for g in B.channel_gaps(*a, **k)]
+    check("нет текста — пока текст не написан", G("", "X", phase="created", status="running"),
+          ["у канала не выбран пресет текста"])
+    check("текст уже написан — о нём поздно", G("", "X", phase="source_ready", status="running"), [])
+    check("нет обложек — пока до обложки не дошли",
+          G("X", "", phase="media_ready", status="running"), ["у канала не выбран пресет обложек"])
+    check("уже на обложке — не о чем предупреждать", G("X", "", phase="cover_ready", status="running"), [])
+    check("остановлен этой же причиной — не дублируем",
+          G("X", "", phase="media_ready", status="blocked",
+            block=B.explain(B.COVER_PRESET_MISSING)), [])
+    check("готовый/отменённый — молчим", G("", "", phase="created", status="done"), [])
+    check("всё выбрано — пусто", G("X", "Y", phase="created", status="pending"), [])
+
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
         for f in FAILS:

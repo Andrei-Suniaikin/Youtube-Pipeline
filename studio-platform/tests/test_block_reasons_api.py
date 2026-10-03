@@ -83,12 +83,15 @@ def release(n, ch, status, phase, reason):
 
 без = channel(1)
 с = channel(2, preset_cover="Default RU")
+_c.execute("UPDATE pub_channels SET preset_rewrite='Базовый' WHERE id=?", (с,))
 release(1, без, "blocked", "media_ready", "у канала не выбран пресет обложек")
 release(2, с, "blocked", "created", "у ролика нет субтитров (TranscriptsDisabled)")
 release(3, с, "pending", "created", "ждём: все выходы исчерпали квоту, ближайший через 15 мин")
 release(4, с, "blocked", "upload_running", "зависло на шаге «upload_running»")
 # Выпуск уже в работе, а старая причина в поле осталась: приговором это не показываем.
 release(5, с, "running", "created", "у ролика нет субтитров (TranscriptsDisabled)")
+# Идёт на канале без пресетов: ни текста, ни обложек.
+release(6, без, "running", "created", "")
 _c.commit()
 _c.close()
 
@@ -123,6 +126,16 @@ def main() -> int:
     check("незнакомая причина — пусто, экран покажет как есть", rels["rel-4"]["block"], {})
     check("выпуск в работе — старая причина приговором не показывается",
           rels["rel-5"]["block"], {})
+
+    print("\nНедосмотры настройки канала, которые выпуск не останавливают")
+    gaps = lambda rid: [g["title"] for g in rels[rid]["gaps"]]
+    check("канал без пресетов, выпуск на тексте: оба недосмотра",
+          gaps("rel-6"), ["у канала не выбран пресет текста", "у канала не выбран пресет обложек"])
+    check("и оба — «настройка канала», предупреждением",
+          {(g["kind"], g["level"]) for g in rels["rel-6"]["gaps"]}, {("channel", "warn")})
+    check("уже стоит на обложке — второй раз о ней не говорим, о тексте поздно",
+          gaps("rel-1"), [])
+    check("канал настроен — недосмотров нет", gaps("rel-3"), [])
     check("строка плана отдана — «убрать ссылку» есть чем делать",
           rels["rel-2"]["plan_item_id"], 2)
     check("сырая причина на месте — для разбора",
@@ -145,6 +158,8 @@ def main() -> int:
     tiles = {t["id"]: t for t in W.ui_channels()["channels"]}
     check("без пресета обложек — признак ложь", tiles[без]["has_cover_preset"], False)
     check("с пресетом — истина", tiles[с]["has_cover_preset"], True)
+    check("пресет текста: нет — ложь", tiles[без]["has_text_preset"], False)
+    check("есть — истина", tiles[с]["has_text_preset"], True)
 
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

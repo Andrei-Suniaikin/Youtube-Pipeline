@@ -543,12 +543,18 @@ class PubServices:
         """
         job_id = str(known["remote_job_id"] or "")
         state = str(info.get("status") or "").lower()
-        сказал = str(info.get("progress_detail") or info.get("error") or "").strip()
-        words = "прервал задачу" if state == "interrupted" else f"задача в «{state}»"
+        # Словами человека, а не соседа. `progress_detail` у рерайта — его счётчик
+        # ФАЙЛОВ («1/1 — mzyZGlue_r_0e1ec6aba2.txt (Polish)»), а не кусков: в журнале
+        # выпуска он читался как загадка (владелец 03.10.2026: «что это значит?»).
+        # «interrupted» рерайт ставит только своей задаче, шедшей в момент его
+        # перезапуска (job_queue.reap_stale_running) — так и пишем.
+        words = ("задача рерайта прервалась — рерайт перезапускали, пока он писал текст"
+                 if state == "interrupted"
+                 else f"рерайт не довёл задачу до конца (у него она «{state}»)")
         done = self._resumes(known)
         if done >= REWRITE_MAX_RESUMES:
-            reason = (f"рерайт {words}" + (f": {сказал}" if сказал else "")
-                      + f"; возобновлял {done} раз(а) подряд — дальше нужен разбор")
+            reason = (f"{words}; продолжал её {done} раз(а) подряд и не довёл — "
+                      f"нужен разбор")
             self._close_text_call(c, rel, error=reason)
             self._finish_remote(c, rel["release_id"], "rewrite", "error", reason)
             raise ItemFailed(reason)
@@ -570,9 +576,9 @@ class PubServices:
             self._finish_remote(c, rel["release_id"], "rewrite", "error", reason)
             raise ItemFailed(reason) from exc
         log_line(c, rel["release_id"], "рерайт",
-                 f"рерайт {words}" + (f": {сказал}" if сказал else "")
-                 + f" — возобновил её же (попытка {done + 1} из {REWRITE_MAX_RESUMES}): "
-                 f"готовые куски не переделываются и второй раз не оплачиваются",
+                 f"{words}. Студия продолжила ту же задачу с места остановки: уже "
+                 f"написанные куски текста не переписываются и второй раз не оплачиваются "
+                 f"(продолжение {done + 1} из {REWRITE_MAX_RESUMES})",
                  level="warn")
         return {"wait": True}
 

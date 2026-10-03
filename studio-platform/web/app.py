@@ -19,6 +19,7 @@ import zoneinfo
 import hashlib
 import json
 import os
+import mimetypes
 import re
 import secrets
 import sqlite3
@@ -36,7 +37,8 @@ SERVER = os.path.join(BASE, "server")
 sys.path.insert(0, SERVER)
 
 from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile  # noqa: E402
-from fastapi.responses import FileResponse, JSONResponse, Response  # noqa: E402
+from fastapi.responses import (FileResponse, JSONResponse, Response,  # noqa: E402
+                               StreamingResponse)
 from starlette.concurrency import run_in_threadpool                # noqa: E402
 from pydantic import BaseModel, StrictInt                         # noqa: E402
 
@@ -52,6 +54,7 @@ import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
 from pub_engine import channel_presets                            # noqa: E402
 from block_reasons import explain as explain_block               # noqa: E402
+from block_reasons import channel_gaps                            # noqa: E402
 from pub_remote import (COVER_BASE, LANG_TO_RU, REWRITE_BASE,     # noqa: E402
                         YT_ID_RE, donor_cache_put_title, donor_cache_title,
                         donor_subs, donor_text, get_key, subs_exits_state,
@@ -262,6 +265,7 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
            "       r.blocked_reason, r.video_id, r.project_id, r.plan_item_id,"
            "       r.hand_confirmed, r.hand_by,"
            "       ch.id ch_id, ch.name ch_name, ch.lang lang,"
+           "       ch.preset_vsgen_id ch_pv, ch.preset_rewrite ch_rew, ch.preset_cover ch_cov,"
            "       p.donor_url, p.donor_title "
            "FROM pub_releases r "
            "JOIN pub_channels ch ON ch.id = r.channel_id "
@@ -282,9 +286,14 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
     now = time.time()
     rows = list(c.execute(sql, args))
     bars = _stage_bars(c, rows)
+    presets_of = {}        # канал → (пресет текста, пресет обложек): каналы повторяются
     out = []
     for r in rows:
         ph = r["phase"] or "created"
+        if r["ch_id"] not in presets_of:
+            presets_of[r["ch_id"]] = channel_presets(c, r["ch_pv"], r["ch_rew"] or "",
+                                                     r["ch_cov"] or "")
+        block = explain_block(r["blocked_reason"]) if r["status"] == "blocked" else {}
         out.append({
             "release_id": r["release_id"],
             "channel_id": r["ch_id"],
@@ -303,7 +312,12 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
             "blocked_reason": r["blocked_reason"] or "",
             # Чья это беда и что делать — словами (block_reasons, 03.10.2026). Пусто —
             # причину не узнали, экран покажет её как есть.
-            "block": explain_block(r["blocked_reason"]) if r["status"] == "blocked" else {},
+            "block": block,
+            # Недосмотры настройки канала, которые выпуск не останавливают, но портят
+            # (нет пресета текста — сценарий на умолчаниях): чтобы было видно, что это
+            # на стороне того, кто ведёт каналы (владелец 03.10.2026).
+            "gaps": channel_gaps(*presets_of[r["ch_id"]], phase=ph,
+                                 status=r["status"] or "", block=block),
             # Строка плана — чтобы «убрать ссылку» на выпуске с негодным донором вела в
             # тот же `/ui/plan/{id}/cancel`, что и календарь канала.
             "plan_item_id": r["plan_item_id"],
@@ -429,7 +443,7 @@ def _stages(c, rel: dict) -> list:
             ready = mod._project_status(TENANT, pid) or {}
         except Exception:                                          # noqa: BLE001
             ready = {}
-    file_base = f"/p/{urllib.parse.quote(pid)}/file/" if pid else ""
+    file_base = f"/ui/projects/{urllib.parse.quote(pid)}/file/" if pid else ""
     # Какой этап каким материалом доказывается. «Готово» без файла — не готово.
     STAGE_FILES = {"tts": ("audio",), "images": ("images",), "video": ("clips",),
                    "render": ("renders", "subs", "chapters")}
@@ -622,11 +636,19 @@ def ui_release(release_id: str):
         c.close()
 
 
-def _preset_cover_of(c, memo: dict, preset_vsgen_id) -> str:
-    """Пресет обложек из пресета производства — один раз на пресет, а не на канал."""
+def _preset_pair_of(c, memo: dict, preset_vsgen_id) -> tuple:
+    """(пресет текста, пресет обложек) из пресета производства — один раз на пресет."""
     if preset_vsgen_id not in memo:
-        memo[preset_vsgen_id] = channel_presets(c, preset_vsgen_id, "", "")[1]
+        memo[preset_vsgen_id] = channel_presets(c, preset_vsgen_id, "", "")
     return memo[preset_vsgen_id]
+
+
+def _preset_cover_of(c, memo: dict, preset_vsgen_id) -> str:
+    return _preset_pair_of(c, memo, preset_vsgen_id)[1]
+
+
+def _preset_text_of(c, memo: dict, preset_vsgen_id) -> str:
+    return _preset_pair_of(c, memo, preset_vsgen_id)[0]
 
 
 @app.get("/ui/channels")
@@ -674,6 +696,8 @@ def ui_channels():
                 # тем же `channel_presets`, что и обложка: пресет производства, потом канал.
                 "has_cover_preset": bool(_preset_cover_of(c, cover_of, ch["preset_vsgen_id"])
                                          or (ch["preset_cover"] or "")),
+                "has_text_preset": bool(_preset_text_of(c, cover_of, ch["preset_vsgen_id"])
+                                        or (ch["preset_rewrite"] or "")),
                 # Запас: `known=false` — «не знаем» (нет расписания), это НЕ ноль.
                 "supply": {"known": supply["known"], "items": supply["items"],
                            "days": supply["days"], "covered": supply["covered"]},
@@ -7956,10 +7980,11 @@ def ui_project(pid: str):
                     "planned": planned},
         "ready": st, "jobs": jobs, "files": groups, "paid": paid, "source": source,
         "origin": origin,
-        # Ссылки на файлы и архивы — кабинета: он отдаёт их с проверкой, что путь
-        # не выводит за пределы проекта, и с миниатюрами по ?w=.
-        "file_base": f"/p/{urllib.parse.quote(pid)}/file/",
-        "zip_base": f"/api/projects/{urllib.parse.quote(pid)}/download/",
+        # Ссылки на файлы и архивы — пульта (`ui_project_file`, `ui_project_download`).
+        # До 03.10.2026 они вели в кабинет, а он ищет проект в тенанте ВОШЕДШЕГО: всё,
+        # что не владелец, получало 404 — видео не играло, кадры не показывались.
+        "file_base": f"/ui/projects/{urllib.parse.quote(pid)}/file/",
+        "zip_base": f"/ui/projects/{urllib.parse.quote(pid)}/download/",
         "scheduler": _scheduler_state(),
     }
 
@@ -8081,6 +8106,77 @@ def ui_project_files_page(pid: str, code: str, request: Request,
             "names": [rel for _full, rel in items[offset:offset + limit]],
             "offset": offset,
             "more": max(0, len(items) - (offset + limit))}
+
+
+def _cabinet_project_dir(pid: str) -> str:
+    """Папка проекта ТОГО тенанта, который показывает пульт. 404 — проекта у него нет."""
+    c = db()
+    try:
+        _project_or_404(c, pid)
+    finally:
+        c.close()
+    mod = sys.modules.get("main")
+    if mod is None or not hasattr(mod, "_project_dir"):
+        raise HTTPException(503, "сервер студии не поднят")
+    return os.path.abspath(mod._project_dir(TENANT, pid))
+
+
+@app.get("/ui/projects/{pid}/file/{fpath:path}")
+def ui_project_file(pid: str, fpath: str, w: str = ""):
+    """Файл проекта: видео, озвучка, кадр (по ?w= — миниатюра), субтитры.
+
+    03.10.2026, «нажал плей на видосе, но он не запустился». Ссылки вели в кабинет
+    (`/p/{pid}/file/…`), а кабинет ищет проект в тенанте ВОШЕДШЕГО человека. Пульт же
+    показывает всем один тенант — тот, что задан ему при запуске (`TENANT`). Владелец
+    живёт в нём и видел всё; любой другой вошедший (на бою — `grind`, тенант 5) видел
+    карточку проекта, но получал 404 на каждый файл: видео не играло, кадры и озвучка
+    не грузились, архивы не качались.
+
+    Отдаём здесь, по тому же тенанту, что и всё остальное на экране, и теми же
+    средствами кабинета: путь не выходит за папку проекта, миниатюры — его
+    `_thumbnail`. FileResponse отвечает на Range — двухчасовой ролик перематывается,
+    а не качается целиком.
+    """
+    pdir = _cabinet_project_dir(pid)
+    full = os.path.abspath(os.path.join(pdir, fpath))
+    if not (full == pdir or full.startswith(pdir + os.sep)) or not os.path.isfile(full):
+        raise HTTPException(404, "файла нет")
+    mod = sys.modules.get("main")
+    if w.isdigit() and hasattr(mod, "_thumbnail"):
+        tp = mod._thumbnail(pdir, fpath, full, w)
+        if tp:
+            return FileResponse(tp, media_type="image/jpeg",
+                                headers={"Cache-Control": "private, max-age=604800"})
+    kind = mimetypes.guess_type(full)[0] or "application/octet-stream"
+    return FileResponse(full, media_type=kind,
+                        headers={"Cache-Control": "private, max-age=86400"})
+
+
+@app.get("/ui/projects/{pid}/download/{what}")
+def ui_project_download(pid: str, what: str):
+    """Материалы проекта одним архивом — тем же `_dl_items`/`_zip_stream` кабинета, но по
+    тенанту пульта (см. `ui_project_file`: кабинет ищет проект у вошедшего)."""
+    pdir = _cabinet_project_dir(pid)
+    mod = sys.modules.get("main")
+    if what not in getattr(mod, "_DL_CATS", {}):
+        raise HTTPException(404, "нет такой категории")
+    items = mod._dl_items(pdir, what)
+    if not items:
+        raise HTTPException(404, f"скачивать нечего — {mod._DL_CATS[what]} в проекте нет")
+    c = db()
+    try:
+        row = c.execute("SELECT name FROM projects WHERE id=? AND tenant_id=?",
+                        (pid, TENANT)).fetchone()
+    finally:
+        c.close()
+    base = re.sub(r"[^\w\-]+", "_", (row["name"] if row else "") or "").strip("_")[:60] or pid
+    items = [(f, f"{base}/{arc}") for f, arc in items]
+    fname = f"{base}_{what}.zip"
+    q = urllib.parse.quote(fname)
+    cd = (f'attachment; filename="{fname}"' if q == fname
+          else f"attachment; filename*=utf-8''{q}")
+    return StreamingResponse(mod._zip_stream(items), media_type="application/zip",
+                             headers={"Content-Disposition": cd, "Cache-Control": "no-store"})
 
 
 class ProjectNew(BaseModel):

@@ -224,11 +224,14 @@ SCENARIO = r"""
     rel(7, 'running', '')]};
 
   await viewReleases();
-  const rheads = [...document.querySelectorAll('tr.grp')];
+  // С 03.10.2026 группа выпусков — отдельная карточка, а не строка общей таблицы.
+  const rheads = [...document.querySelectorAll('.grpcard')];
   out.групп_выпусков = rheads.length;
   out.сводки_выпусков = rheads.map(tr => (tr.querySelector('.grpsum') || {}).textContent
     ? tr.querySelector('.grpsum').textContent.replace(/\s+/g, ' ').trim() : '');
-  out.клеток_в_заголовке_выпусков = rheads.map(tr => tr.children.length);
+  out.одиночные_отдельно = [...document.querySelectorAll('#rel-rest tr.row')]
+    .map(tr => tr.dataset.id);
+  out.строк_групп_в_общей = [...document.querySelectorAll('#rel-rest tr.grp-item')].length;
   out.видно_выпусков_свёрнутым = [...document.querySelectorAll('table tbody tr')]
     .filter(tr => !tr.hidden).length;
   // Раскрытие в списке выпусков не должно уводить в выпуск: строка сама кликабельна.
@@ -341,12 +344,14 @@ def main() -> int:
     check("оно не выдаётся за код ответа",
           "код" in ((res.get("ключи") or {}).get("странное") or ""), False)
 
-    check("заголовок группы занимает строку целиком",
-          res.get("клеток_в_заголовке_выпусков"), [1, 1])
-    # 7 выпусков + 2 заголовка = 9 строк; видно 2 заголовка и 2 одиночных выпуска.
-    check("свёрнутым видно 4 строки вместо 7", res.get("видно_выпусков_свёрнутым"), 4)
+    # Владелец 03.10.2026: в общей таблице группа и обычные строки под ней сливались.
+    check("одиночные выпуски — своей карточкой, отдельно от групп",
+          res.get("одиночные_отдельно"), ["r4", "r7"])
+    check("строк групп в карточке остальных нет", res.get("строк_групп_в_общей"), 0)
+    # 7 выпусков: 5 в двух свёрнутых карточках, 2 одиночных видно сразу.
+    check("свёрнутым видно 2 строки вместо 7", res.get("видно_выпусков_свёрнутым"), 2)
     check("раскрытие не уводит в выпуск", res.get("адрес_не_изменился"), True)
-    check("после раскрытия видно 7 строк", res.get("видно_выпусков_после"), 7)
+    check("после раскрытия первой карточки видно 5 строк", res.get("видно_выпусков_после"), 5)
 
     print("\nПРОВАЛЕНО:" if FAILS else "\nвсе проверки прошли")
     for f in FAILS:
