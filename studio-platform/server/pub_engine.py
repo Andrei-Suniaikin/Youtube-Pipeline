@@ -694,7 +694,9 @@ def _authoritative_work_alive(c, rel, now: float) -> bool:
             "WHERE j.release_id=? AND j.service='vsgen'",
             (rid,),
         ).fetchall()
-        return any((row["status"] or "") in ("queued", "running") for row in rows)
+        if any((row["status"] or "") in ("queued", "running") for row in rows):
+            return True
+        return _project_between_stages(c, rel, now)
 
     if phase in ("cover_ready", "upload_pending", "upload_running"):
         row = c.execute(
@@ -710,6 +712,38 @@ def _authoritative_work_alive(c, rel, now: float) -> bool:
             and row["heartbeat"]
             and now - row["heartbeat"] < ALIVE_SILENCE
         )
+    return False
+
+
+def _project_between_stages(c, rel, now: float) -> bool:
+    """Производство ролика идёт, даже если ровно сейчас ни одной задачи нет в очереди.
+
+    03.10.2026, четыре выпуска в разборе с «зависло на шаге project_ready, попытки
+    исчерпаны» — у всех озвучка, сборка и главы ГОТОВЫ. Фаза «проект готов» длится часами
+    (озвучка, кадры, сборка, главы — этап за этапом), а её срок — 15 минут от входа. Пока
+    этап стоит в очереди, работа «живая»; но в те секунды, когда один этап только что
+    закончился, а следующий ещё не поставлен, задачи нет — и движок засчитывал зависание.
+    Три успешных перехода между этапами — три «попытки» — и выпуск уезжал в разбор.
+
+    Поэтому живой считаем и работу проекта, которую движок не ставил сам (главы кабинет
+    ставит после сборки без нас), и этап, закончившийся меньше ALIVE_SILENCE назад: это
+    переход, а не тишина. Настоящая тишина — когда и в очереди пусто, и последний этап
+    кончился давно.
+    """
+    pid = rel["project_id"] if "project_id" in rel.keys() else None
+    if not pid:
+        return False
+    try:
+        rows = c.execute("SELECT status, finished FROM queue_tasks WHERE project_id=?",
+                         (pid,)).fetchall()
+    except Exception:                              # noqa: BLE001 — база без колонки
+        return False
+    for row in rows:
+        st = row["status"] or ""
+        if st in ("queued", "running"):
+            return True
+        if st == "done" and row["finished"] and now - float(row["finished"]) < ALIVE_SILENCE:
+            return True
     return False
 
 

@@ -734,6 +734,15 @@ class PubServices:
         for kind in MEDIA_STAGES:
             known = jobs.get(kind)
             if known is None:
+                adopted = self._adopt_stage(c, rel, kind, jobs)
+                if adopted:
+                    self._remember_job(c, rel["release_id"], kind, adopted, rel["updated"])
+                    log_line(c, rel["release_id"], "ролик",
+                             f"этап «{kind}» уже стоит в очереди (задача {adopted}, "
+                             f"поставлен сам после сборки) — беру его, второй не ставлю")
+                    jobs = self._jobs(c, rel["release_id"])
+                    known = jobs.get(kind)
+            if known is None:
                 uid = self._uid(c, rel["tenant_id"])
                 if not uid:
                     raise ResourceDown("студия", "не найден владелец проекта для постановки")
@@ -782,6 +791,36 @@ class PubServices:
                          "первая задача картинок оказалась промптами — ставлю сами картинки")
                 return {"wait": True}
         return {}
+
+    def _adopt_stage(self, c, rel, kind: str, jobs: dict) -> str:
+        """Этап, который уже поставил кабинет сам, — номер его задачи. "" — такого нет.
+
+        03.10.2026: у каждого выпуска главы делались дважды. Кабинет после сборки сам
+        ставит главы (`auto_chapters` в main.py), а движок про эту задачу не знал и ставил
+        свою: очередь отказывала, пока первая не кончится («ждём: очередь не приняла
+        этап chapters» — до ста повторов), а потом принимала — и та же работа шла второй
+        раз.
+
+        Берём только задачу НОВЕЕ всех этапов, уже записанных за выпуском: старая задача
+        того же вида — прошлый заход, и выдать её за сегодняшний этап нельзя. Без
+        записанных этапов не берём ничего — первый этап ставит только движок.
+        """
+        floor = 0
+        for row in (jobs or {}).values():
+            try:
+                floor = max(floor, int(row["remote_job_id"]))
+            except (TypeError, ValueError, KeyError, IndexError):
+                continue
+        if not floor or not rel["project_id"]:
+            return ""
+        try:
+            row = c.execute(
+                "SELECT job_id FROM queue_tasks WHERE project_id=? AND kind=? AND job_id>? "
+                "AND status NOT IN ('error','cancelled') ORDER BY job_id DESC LIMIT 1",
+                (rel["project_id"], kind, floor)).fetchone()
+        except Exception:                                          # noqa: BLE001
+            return ""
+        return str(row["job_id"]) if row else ""
 
     def _images_exist(self, rel) -> bool:
         import glob as _g
