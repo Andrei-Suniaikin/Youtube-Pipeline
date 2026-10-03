@@ -1050,6 +1050,15 @@ def download(job: Job, gen: dict, b: Block) -> None:
                 pass
 
 
+# Отказ генерации, за которым нет ни звука, ни вины текста: у FastGen кончились свободные
+# аккаунты. Такой заказ не считается в MAX_ORDERS_PER_BLOCK (см. process_block).
+NO_CAPACITY_MARKS = ("no accounts available",)
+
+
+def _no_capacity(e: Exception) -> bool:
+    return any(m in str(e).lower() for m in NO_CAPACITY_MARKS)
+
+
 def process_block(job: Job, b: Block, audio_dir: str) -> None:
     last: Optional[Exception] = None
     for attempt in range(ATTEMPTS):
@@ -1087,6 +1096,22 @@ def process_block(job: Job, b: Block, audio_dir: str) -> None:
             if problem:
                 raise Terminal(gid, "звук не похож на текст", problem)
         except Terminal as e:
+            if _no_capacity(e):
+                # 03.10.2026, студия: FastGen отвечал «No accounts available, please try again
+                # later» часами. Такой отказ — не «годного звука нет»: генерацию провайдер не
+                # делал вовсе, и к тексту блока это отношения не имеет. Раньше он шёл в счёт
+                # MAX_ORDERS_PER_BLOCK, и автоповтор задачи через 10 минут упирался в «заказан
+                # уже 4 раза — новый заказ не создаю»: повтор был, а заказа — нет. Теперь счёт
+                # не растёт, новые заказы в этом запуске не шлём (свободных аккаунтов нет и у
+                # соседних блоков), а задача выходит словами FastGen — по ним студия узнаёт
+                # простой и повторяет сама (main._provider_down_line).
+                b.orders = max(0, b.orders - 1)
+                save_receipt(job, b, "terminal", gid, str(e.status), error=str(e)[:300])
+                if not job.service_down.is_set():
+                    job.service_down.set()
+                    say("FastGen: у провайдера нет свободных аккаунтов — новые заказы в этом запуске "
+                        "не отправляю, студия повторит задачу сама", "WARNING")
+                raise RuntimeError(f"блок {b.idx}: {e}") from None
             save_receipt(job, b, "terminal", gid, str(e.status), error=str(e)[:300])
             last = e
             say(f"FastGen: блок {b.idx}: {e}" + (" — заказываю заново" if attempt + 1 < ATTEMPTS else ""),
