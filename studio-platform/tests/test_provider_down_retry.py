@@ -67,6 +67,11 @@ def main() -> int:
         ("провайдер ответил HTTP 503", "только код 503"),
         ("Сервис на технических работах, зайдите позже", "только слова про работы"),
         ("Идут техработы до 18:00", "только корень «техработ»"),
+        # 03.10.2026, бой: пять озвучек FastGen встали в разбор с этим ответом.
+        ("⚠️ FastGen: блок 8: генерация gen_0432d0f5f93946a08f55453d6896469f — failed: "
+         "No accounts available, please try again later", "FastGen: нет свободных аккаунтов"),
+        ("No accounts available", "только «нет аккаунтов»"),
+        ("upstream busy, please try again later", "только «try again later»"),
     ]
     for строка, почему in живое:
         check(f"узнан простой ({почему})", bool(M._provider_down_line(строка)), True)
@@ -81,6 +86,7 @@ def main() -> int:
         ("HTTP 401 Unauthorized", "ключ отвергнут"),
         ("HTTP 403 Forbidden", "нет прав"),
         ("HTTP 429: quota exceeded", "квота"),
+        ("quota exceeded, please try again later", "квота, хоть и «try again later»"),
         ("ЛИМИТ АККАУНТА ПРОВАЙДЕРА исчерпан", "лимит аккаунта"),
         ("ключ истёк", "про ключ"),
         ("", "пустая строка"),

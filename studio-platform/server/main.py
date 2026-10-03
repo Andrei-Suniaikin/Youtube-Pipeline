@@ -11559,6 +11559,10 @@ _PROVIDER_DOWN_MARKS = (
     "http 502", "http 503", "http 504",
     "техработ", "temporarily unavailable", "service unavailable",
     "service temporarily", "bad gateway", "gateway timeout",
+    # 03.10.2026, FastGen: «No accounts available, please try again later» — у
+    # провайдера кончились свободные аккаунты. Пять озвучек за день встали в разбор
+    # сразу, хотя это ровно «подождите и повторите», и денег за них не списано.
+    "no accounts available", "please try again later",
 )
 # Пары «оба корня рядом» — для случаев, где одного слова мало: «технический» сам по себе
 # встречается и в безобидных строках.
