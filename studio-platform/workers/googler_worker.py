@@ -7323,6 +7323,14 @@ def googler_request_v6(endpoint: str, method: str = "POST", data: Optional[dict]
             # подряд отвечает тем же самым, а до правки он уходил в raise_for_status и
             # приезжал наверх как «HTTPError: 401 Client Error» БЕЗ тела ответа — то есть
             # без единственного места, где провайдер называет причину.
+            # 404 добавлен 03.10.2026. Для GET generations/{id} это ОПРЕДЕЛЁННЫЙ ответ:
+            # «такого заказа у меня нет». Провайдер чистит старые операции, и у заказов
+            # 14–17-часовой давности это штатный исход, а не сбой. Раньше 404 уходил в
+            # raise_for_status и крутился тремя попытками — три одинаковых ответа и
+            # потерянное время вместо ясного вывода.
+            if sc == 404:
+                return {"_error": f"HTTP 404: заказ или адрес не найден: "
+                                  f"{str(response.text or '').strip()[:200]}"}
             if sc in (400, 401, 402, 403, 422):  # bad request / мёртвый ключ / нет кредитов / auth / валидация
                 try:
                     detail = json.dumps(response.json(), ensure_ascii=False)
@@ -11013,8 +11021,35 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                         save_base64_to_file(_jrn_data, output_path)
                     print_user(f"✅ [{index+1}] Журнал: результат забран у уже оплаченного заказа", "SUCCESS")
                     return (index, _jrn_data)
+                # Спрашиваем ОДИН раз напрямую: нам нужна не картинка, а причина. 404
+                # здесь — это «провайдер потерял заказ», и он отличается от «заказ ещё
+                # не готов» тем, что ждать больше нечего никогда.
+                _jrn_why = ""
+                try:
+                    _jrn_probe = googler_request_v6(
+                        f"generations/{_jrn.remote_order_id}", method="GET")
+                    _jrn_why = str((_jrn_probe or {}).get("_error") or "")
+                except Exception as _jpe:                          # noqa: BLE001
+                    _jrn_why = f"{type(_jpe).__name__}: {_jpe}"
+                if "404" in _jrn_why:
+                    # Деньги за этот заказ потеряны и невозвратны. Разрешаем повтор:
+                    # рядом лежат уже оплаченные кадры этого же проекта, и держать их
+                    # из-за одного недостающего дороже, чем заказать его заново.
+                    _jrn_j = _journal()
+                    if _jrn_j is not None:
+                        _jrn_j.failed(
+                            _jrn.call_id,
+                            f"провайдер потерял заказ {_jrn.remote_order_id} (404) — "
+                            f"результата не будет, кадр можно заказать заново",
+                            ordered=True, lost=True)
+                    print_user(f"🧹 [{index+1}] Журнал: провайдер потерял заказ "
+                               f"{_jrn.remote_order_id} (404). Деньги за него уже ушли и "
+                               f"не вернутся; следующий прогон закажет кадр заново — это "
+                               f"дешевле, чем держать остальные оплаченные кадры", "WARNING")
+                    return (index, None)
                 print_user(f"❌ [{index+1}] Журнал: оплаченный заказ {_jrn.remote_order_id} "
-                           f"результата не дал — кадр пропущен без нового платного запроса", "ERROR")
+                           f"результата не дал — кадр пропущен без нового платного запроса"
+                           + (f" ({_jrn_why[:90]})" if _jrn_why else ""), "ERROR")
                 return (index, None)
             print_user(f"⛔ [{index+1}] Журнал: заказ уже создавался"
                        f"{' (id ' + str(_jrn.remote_order_id) + ')' if _jrn.remote_order_id else ' (id неизвестен)'}, "

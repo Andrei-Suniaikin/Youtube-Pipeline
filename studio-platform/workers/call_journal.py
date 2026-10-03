@@ -129,14 +129,19 @@ class CallJournal:
         return self._quiet(call_id, "delivered",
                            {"result_path": str(result_path), "cost": cost})
 
-    def failed(self, call_id, error, ordered=False) -> bool:
+    def failed(self, call_id, error, ordered=False, lost=False) -> bool:
         """`ordered=True` — заказ уже был создан: строка останется «спросить провайдера».
 
         `ordered=False` — провайдер отказал ДО создания заказа (явный 429, отказ
         валидации): денег нет, повтор безопасен.
+
+        `lost=True` — заказ был создан и оплачен, но провайдер его ПОТЕРЯЛ (404 на
+        вопрос о заказе). Повтор разрешается: результата не будет никогда, а рядом
+        лежат уже оплаченные кадры, которым недостающий не даёт поехать дальше.
         """
         return self._quiet(call_id, "failed",
-                           {"error": str(error)[:500], "ordered": bool(ordered)})
+                           {"error": str(error)[:500], "ordered": bool(ordered),
+                            "lost": bool(lost)})
 
     def _quiet(self, call_id, verb, payload) -> bool:
         if not self.enabled or not call_id:

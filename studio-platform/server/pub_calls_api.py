@@ -18,7 +18,7 @@
     POST /api/calls/reserve          заявить вызов ДО обращения к провайдеру
     POST /api/calls/{id}/ordered     заказ создан, известен его идентификатор
     POST /api/calls/{id}/delivered   результат получен и лежит на диске
-    POST /api/calls/{id}/failed      вызов не удался (ordered решает, можно ли повторять)
+    POST /api/calls/{id}/failed      вызов не удался (ordered/lost решают, можно ли повторять)
 """
 
 from __future__ import annotations
@@ -151,7 +151,8 @@ def register_calls_routes(app, ctx):
         try:
             _call_of(c, call_id, job)
             pc.mark_failed(c, call_id, str(body.get("error") or "")[:500],
-                           ordered=bool(body.get("ordered")), now=_now())
+                           ordered=bool(body.get("ordered")),
+                           lost=bool(body.get("lost")), now=_now())
             c.commit()
         finally:
             c.close()
