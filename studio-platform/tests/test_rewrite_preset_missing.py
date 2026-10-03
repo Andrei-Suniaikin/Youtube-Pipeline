@@ -143,7 +143,7 @@ def main() -> int:
     saved = (pub_services.RewriteClient, pub_services.donor_text,
              pub_services.rewrite_preset_config)
     pub_services.RewriteClient = TextClient
-    pub_services.donor_text = lambda url: DONOR
+    pub_services.donor_text = lambda url, **_kw: DONOR
     try:
         print("Пресет выбран, а сосед его не знает")
         c, store = run(REL, {})

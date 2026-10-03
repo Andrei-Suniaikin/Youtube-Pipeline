@@ -387,6 +387,11 @@ DOWN_NO_LIB = "no_lib"     # на сервере нет youtube-transcript-api
 DOWN_OURS = "ours"         # наша поломка: ни ролик, ни выход не виноваты
 DOWN_BUDGET = "budget"     # не успели за отведённое время — про ролик ничего не узнали
 FAIL_NO_SUBS = "no_subs"   # у ролика действительно нет дорожки — приговор ролику
+DOWN_ASR = "asr"           # дорожки нет, речь донора распознаётся на минской машине (03.10)
+# Чем библиотека говорит «ролик на месте, но дорожек нет» — тогда текст можно добыть
+# распознаванием речи (donor_asr). Скрытый/удалённый ролик и возрастное ограничение сюда
+# не входят: звук такого ролика тоже не скачать.
+_ASR_FIXABLE = ("TranscriptsDisabled", "NoTranscriptFound", "NoTranscriptAvailable")
 FAIL_NOT_YT = "not_youtube"
 FAIL_THIN = "thin"         # дорожка есть, но это обрывок
 
@@ -1037,17 +1042,76 @@ def _pick_track(tracks: list):
     return tracks[0]
 
 
-def donor_text(url: str) -> str:
+def donor_text(url: str, asr: bool = False) -> str:
     """Текст донорского ролика из субтитров YouTube.
 
     Тонкая обёртка над `donor_subs`: движку выпусков нужен только текст, и менять ему
-    вызов ради полей, которые он не читает, не за что.
+    вызов ради полей, которые он не читает, не за что. `asr=True` — у ролика нет
+    дорожки, но он на месте: текст добывается распознаванием речи (только выпуск).
     """
-    return donor_subs(url)["text"]
+    return donor_subs(url, asr=asr)["text"]
+
+
+def _asr_wait(vid: str) -> ResourceDown:
+    """Выпуск ждёт распознавания речи донора — это не сбой и не приговор."""
+    try:
+        import donor_asr                                           # noqa: PLC0415
+        where = donor_asr.settings()["label"]
+    except Exception:                                              # noqa: BLE001
+        where = "минской машине"
+    down = ResourceDown("распознавание речи",
+                        f"у ролика нет субтитров — распознаём речь донора на {where}, "
+                        f"это несколько минут")
+    down.kind = DOWN_ASR
+    return down
+
+
+def _no_track(vid: str, url: str, asr: bool, message: str) -> Exception:
+    """Ролик на месте, а дорожек нет. Для выпуска — заказ распознавания и ожидание.
+
+    03.10.2026, владелец: «автор отключил субтитры — без нашего участия сразу на минскую
+    машину; не вышло — пускай падает, чтобы ребята по новой искали донора». Проверке
+    ссылки (`asr=False`) распознавание не заказываем: она листает пачки по двести
+    ссылок, а распознавание — видеокарта Минска; ей отдаём факт, что дорожки нет.
+    """
+    bad = _subs_failed(FAIL_NO_SUBS, message)
+    bad.asr = True
+    if not asr:
+        return bad
+    try:
+        import donor_asr                                           # noqa: PLC0415
+        if not donor_asr.enabled():
+            return bad
+        donor_asr.request(vid, url)
+        donor_asr.ensure_worker()
+    except Exception:                                              # noqa: BLE001
+        return bad
+    return _asr_wait(vid)
+
+
+def _asr_gate(vid: str) -> None:
+    """Распознавание уже заказано: ждём его без похода в YouTube, либо честно падаем."""
+    try:
+        import donor_asr                                           # noqa: PLC0415
+        if not donor_asr.enabled():
+            return
+        st = donor_asr.state(vid)
+    except Exception:                                              # noqa: BLE001
+        return
+    if not st:
+        return
+    if st.get("status") in ("queued", "running"):
+        donor_asr.ensure_worker()
+        raise _asr_wait(vid)
+    why = str(st.get("error") or "текста не получилось").strip()
+    bad = _subs_failed(FAIL_NO_SUBS, "у ролика нет субтитров, и распознать речь на минской "
+                                     f"машине не вышло: {why}"[:480])
+    bad.asr = False
+    raise bad
 
 
 def donor_subs(url: str, *, net: bool = True, strict: bool = True,
-               deadline: float = None, max_exits: int = None) -> dict:
+               deadline: float = None, max_exits: int = None, asr: bool = False) -> dict:
     """Расшифровка донора и всё, что известно про неё саму.
 
     Возвращает {"text", "chars", "lang", "seconds", "cached"}. `lang` — код дорожки,
@@ -1085,6 +1149,8 @@ def donor_subs(url: str, *, net: bool = True, strict: bool = True,
         # этот ролик уже качали для соседнего канала
         return {"text": row["text"], "chars": len(row["text"]), "lang": row.get("lang") or "",
                 "seconds": float(row.get("seconds") or 0), "cached": True}
+    if asr:
+        _asr_gate(vid)          # распознавание заказано: ждём его, в YouTube не ходим
     if not net:
         return {}
 
@@ -1118,7 +1184,7 @@ def donor_subs(url: str, *, net: bool = True, strict: bool = True,
             api = _transcript_api(proxy)
             tracks = list(api.list(vid))
             if not tracks:
-                raise _subs_failed(FAIL_NO_SUBS, "у ролика нет субтитров")
+                raise _no_track(vid, url, asr, "у ролика нет субтитров")
             track = _pick_track(tracks)
             lang = _track_code(track)      # язык оригинала — по дорожке, а не по догадке
             fetched = track.fetch()
@@ -1143,6 +1209,9 @@ def donor_subs(url: str, *, net: bool = True, strict: bool = True,
                         DOWN_OURS,
                         f"YouTube не отдал субтитры ({type(exc).__name__}), но ролик на "
                         f"месте — это отказ нам, а не свойство ролика; строка подождёт")
+                if type(exc).__name__ in _ASR_FIXABLE:
+                    raise _no_track(vid, url, asr,
+                                    f"у ролика нет субтитров ({type(exc).__name__})")
                 raise _subs_failed(FAIL_NO_SUBS,
                                    f"у ролика нет субтитров ({type(exc).__name__})")
             # Всё прочее — наша поломка, а не свойство ролика. Одна опечатка в коде

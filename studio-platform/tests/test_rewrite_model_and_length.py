@@ -368,7 +368,7 @@ def part_length():
     saved_client, saved_text = pub_services.RewriteClient, pub_services.donor_text
     saved_preset = pub_services.rewrite_preset_config
     pub_services.RewriteClient = TextClient
-    pub_services.donor_text = lambda url: DONOR
+    pub_services.donor_text = lambda url, **_kw: DONOR
     pub_services.rewrite_preset_config = lambda uid, name: {"model": "terra"}
     try:
         print("\n  длина донора запоминается в момент заказа")

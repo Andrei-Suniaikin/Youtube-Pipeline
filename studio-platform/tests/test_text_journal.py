@@ -167,7 +167,7 @@ def with_real_client() -> None:
     def order(donor: str):
         """Один полный заказ настоящим клиентом. Возвращает (заголовок, тело)."""
         seen.clear()
-        pub_services.donor_text = lambda url: donor
+        pub_services.donor_text = lambda url, **_kw: donor
         svc = services([])
         svc.do_source_ready(fresh(), REL)
         post = [(url, kw) for method, url, kw in seen
@@ -213,7 +213,7 @@ def main() -> int:
     saved_client, saved_text = pub_services.RewriteClient, pub_services.donor_text
     saved_preset = pub_services.rewrite_preset_config
     pub_services.RewriteClient = FakeClient
-    pub_services.donor_text = lambda url: "Исходный текст донора. " * 40
+    pub_services.donor_text = lambda url, **_kw: "Исходный текст донора. " * 40
     pub_services.rewrite_preset_config = lambda uid, name: {"model": "gpt-5"}
     try:
         print("Первый заказ")

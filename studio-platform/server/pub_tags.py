@@ -231,7 +231,7 @@ DONOR_UNKNOWN_WHY = {
 def donor_facts_blank(url: str = "", now: float = 0.0) -> dict:
     """Пустой лист фактов о доноре. Все поля существуют всегда — экрану так проще."""
     return {"url": url, "video_id": "", "title": "", "title_from": "",
-            "has_subs": None, "chars": 0, "lang": "", "lang_ru": "",
+            "has_subs": None, "asr": False, "chars": 0, "lang": "", "lang_ru": "",
             "seconds": 0.0, "minutes": 0.0, "length_from": "", "cached": False,
             "paid": False, "checked_at": float(now), "fail": "", "fail_text": ""}
 
@@ -268,6 +268,12 @@ def donor_verdict(facts: dict, limits: dict = None) -> dict:
     if facts.get("has_subs") is None:
         return out("unknown", "not_checked", DONOR_UNKNOWN_WHY["not_checked"])
     if not facts.get("has_subs"):
+        if facts.get("asr"):
+            # Ставим, но жёлтым: текст будет, только дольше на несколько минут.
+            return out("warn", "asr",
+                       "у ролика нет субтитров — текст возьмём распознаванием речи на "
+                       "минской машине, когда выпуск дойдёт до текста",
+                       ["субтитров нет — речь распознаем сами"])
         return out("reject", "no_subs",
                    "у ролика нет субтитров — текст выпуска брать не из чего")
 
@@ -496,7 +502,16 @@ def _donor_subs_failure(exc, pub_remote) -> dict:
     """
     kind = getattr(exc, "kind", "") or ""
     if kind == pub_remote.FAIL_NO_SUBS:
-        return {"has_subs": False, "fail": "", "fail_text": ""}
+        # 03.10.2026: ролик на месте, а дорожек нет — выпуск сам распознает речь на
+        # минской машине (donor_asr), если она настроена. Тогда это не брак ссылки.
+        asr = False
+        if getattr(exc, "asr", False):
+            try:
+                import donor_asr                                   # noqa: PLC0415
+                asr = donor_asr.enabled()
+            except Exception:                                      # noqa: BLE001
+                asr = False
+        return {"has_subs": False, "asr": asr, "fail": "", "fail_text": ""}
     # Два приговора РОЛИКУ, до которых проверка сегодня не доходит (она зовёт
     # `donor_subs(strict=False)`, а обе причины приходят только из строгого режима).
     # Размечены заранее и не своими словами, а фактами, по которым `donor_verdict` и
