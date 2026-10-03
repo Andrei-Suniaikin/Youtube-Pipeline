@@ -33,6 +33,7 @@ import secrets
 import time
 
 import preset_links
+from block_reasons import COVER_PRESET_MISSING
 from pub_log import add as log_line
 from pub_publish import schedule_iso
 
@@ -847,9 +848,45 @@ def advance(c, rel, services, now: float) -> str:
     return want
 
 
+def revive_cover_preset_chosen(c, now: float) -> list:
+    """Выпуски, стоявшие без пресета обложек, возвращаются в работу, как только он выбран.
+
+    03.10.2026: тринадцать выпусков новых каналов дошли до обложки и встали — у каналов
+    не выбран пресет. Человек, который их настраивает, выберет пресет в карточке канала
+    (или в пресете производства) — и на этом его работа должна кончаться. Без этого шага
+    выпуски так и стояли бы в разборе, пока кто-то не пройдёт по каждому с «Вернуть в
+    работу», и выглядело бы это как «выбрал, а ничего не поменялось».
+
+    Возвращаем ТОЛЬКО остановленные ровно этой причиной и только когда пресет теперь
+    действительно находится — тем же `channel_presets`, которым его ищет обложка.
+    Остальное делает обычный `revive`: фазу не откатывает, из необратимой не возвращает.
+    """
+    rows = c.execute(
+        "SELECT r.release_id, ch.preset_vsgen_id, ch.preset_rewrite, ch.preset_cover "
+        "FROM pub_releases r JOIN pub_channels_live ch ON ch.id=r.channel_id "
+        "WHERE r.status='blocked' AND r.blocked_reason=?",
+        (COVER_PRESET_MISSING,)).fetchall()
+    back = []
+    for r in rows:
+        _rew, cov = channel_presets(c, r["preset_vsgen_id"], r["preset_rewrite"] or "",
+                                    r["preset_cover"] or "")
+        if not cov:
+            continue
+        if revive(c, r["release_id"], now).get("ok"):
+            log_line(c, r["release_id"], "обложка",
+                     f"у канала выбран пресет обложек «{cov}» — выпуск вернулся в работу "
+                     f"сам", now=now)
+            back.append(r["release_id"])
+    return back
+
+
 def tick(c, services, now: float = None) -> dict:
     """Один шаг движка. Ошибка одного выпуска не мешает остальным."""
     now = time.time() if now is None else now
+    try:
+        revive_cover_preset_chosen(c, now)
+    except Exception:                              # noqa: BLE001 — не роняем тик
+        pass
     reflow_slots(c, now)          # ссылки без даты занимают освободившиеся выходы
     reslot_pending_uploads(c, now)   # готовый ролик не теряется из-за прошедшего времени
     made = materialize(c, now)

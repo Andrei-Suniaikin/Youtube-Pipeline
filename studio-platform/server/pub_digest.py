@@ -78,6 +78,7 @@ import pub_alerts
 import pub_calls
 import pub_upload_census
 import pub_verify
+from block_reasons import explain as explain_block
 from channel_supply import channel_supply, supply_facts
 from pub_engine import PHASE_INDEX
 
@@ -496,7 +497,10 @@ def _problems(c, channels, blocked, delayed, supply, now: float, tz_name: str) -
         stuck = blocked.get(cid) or []
         if stuck:
             newest = max(stuck, key=lambda r: r["updated"] or 0)
-            why = (newest["blocked_reason"] or "нужен разбор")
+            # Чья беда — словами, как на экране (block_reasons): «проблема в доноре: …
+            # нужен другой ролик» вместо «у ролика нет субтитров (VideoUnplayable)».
+            why = ((explain_block(newest["blocked_reason"]).get("short"))
+                   or newest["blocked_reason"] or "нужен разбор")
             if len(stuck) > 1:
                 why += f" (и ещё {len(stuck) - 1} в разборе)"
         elif cid in delayed:

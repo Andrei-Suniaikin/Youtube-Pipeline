@@ -51,6 +51,7 @@ from pub_engine import revive as pub_engine_revive                # noqa: E402
 import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
 from pub_engine import channel_presets                            # noqa: E402
+from block_reasons import explain as explain_block               # noqa: E402
 from pub_remote import (COVER_BASE, LANG_TO_RU, REWRITE_BASE,     # noqa: E402
                         YT_ID_RE, donor_cache_put_title, donor_cache_title,
                         donor_subs, donor_text, get_key, subs_exits_state,
@@ -258,7 +259,7 @@ def _state(status) -> str:
 
 def _releases(c, channel=None, phase=None, status=None) -> list:
     sql = ("SELECT r.release_id, r.phase, r.status, r.slot_at, r.attempts, r.updated,"
-           "       r.blocked_reason, r.video_id, r.project_id,"
+           "       r.blocked_reason, r.video_id, r.project_id, r.plan_item_id,"
            "       r.hand_confirmed, r.hand_by,"
            "       ch.id ch_id, ch.name ch_name, ch.lang lang,"
            "       p.donor_url, p.donor_title "
@@ -300,6 +301,12 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
             "status": r["status"],
             "attempts": r["attempts"] or 0,
             "blocked_reason": r["blocked_reason"] or "",
+            # Чья это беда и что делать — словами (block_reasons, 03.10.2026). Пусто —
+            # причину не узнали, экран покажет её как есть.
+            "block": explain_block(r["blocked_reason"]) if r["status"] == "blocked" else {},
+            # Строка плана — чтобы «убрать ссылку» на выпуске с негодным донором вела в
+            # тот же `/ui/plan/{id}/cancel`, что и календарь канала.
+            "plan_item_id": r["plan_item_id"],
             # Полоска по этапам: семь отрезков вместо одной шкалы «сколько процентов».
             # Процент по выпуску — выдумка: этапы разной длины и часть из них
             # необязательна. Отрезок честнее: он говорит, что сделано, что идёт
@@ -615,6 +622,13 @@ def ui_release(release_id: str):
         c.close()
 
 
+def _preset_cover_of(c, memo: dict, preset_vsgen_id) -> str:
+    """Пресет обложек из пресета производства — один раз на пресет, а не на канал."""
+    if preset_vsgen_id not in memo:
+        memo[preset_vsgen_id] = channel_presets(c, preset_vsgen_id, "", "")[1]
+    return memo[preset_vsgen_id]
+
+
 @app.get("/ui/channels")
 def ui_channels():
     """Список каналов со всем, по чему их ищут и раскладывают.
@@ -633,6 +647,7 @@ def ui_channels():
         now = time.time()
         facts = channel_supply.supply_facts(c, TENANT, now)
         out = []
+        cover_of = {}          # пресет производства → его пресет обложек: каналы делят пресеты
         for ch in c.execute("SELECT * FROM pub_channels_live WHERE tenant_id=? ORDER BY name",
                             (TENANT,)):
             try:
@@ -655,6 +670,10 @@ def ui_channels():
                 # Пункт 6.1 ТЗ: канал можно завести без ID — списку нужно как-то
                 # отличить этот случай, чтобы показать плашку «ID пустой».
                 "has_uc": bool(ch["uc"]),
+                # 03.10.2026: без пресета обложек выпуск канала встаёт на обложке. Ищем
+                # тем же `channel_presets`, что и обложка: пресет производства, потом канал.
+                "has_cover_preset": bool(_preset_cover_of(c, cover_of, ch["preset_vsgen_id"])
+                                         or (ch["preset_cover"] or "")),
                 # Запас: `known=false` — «не знаем» (нет расписания), это НЕ ноль.
                 "supply": {"known": supply["known"], "items": supply["items"],
                            "days": supply["days"], "covered": supply["covered"]},
@@ -773,6 +792,8 @@ def _calendar(c, ch, history_days: int) -> list:
             "phase_title": PHASE_TITLE.get(rel["phase"], "") if rel is not None else "",
             "project_id": (rel["project_id"] if rel is not None else "") or "",
             "blocked_reason": (rel["blocked_reason"] if rel is not None else "") or "",
+            "block": (explain_block(rel["blocked_reason"])
+                      if rel is not None and rel["status"] == "blocked" else {}),
             # НОВОЕ (пункт 1 владельца, 22.09.2026): video_id — прямая ссылка на
             # YouTube после честной публикации (см. `calendarFeed`), project_name —
             # подпись строки без похода на отдельный экран проекта. `project_name`

@@ -192,6 +192,18 @@
   .facts{color:var(--muted);font-size:13.5px;margin-top:3px}
   .note{margin-top:4px;font-size:13px;color:var(--muted)}
   .note.bad{color:var(--bad)}
+  /* Причина остановки словами (block_reasons, 03.10.2026): чья беда — цветом метки. */
+  .blktag{display:inline-block;border-radius:var(--r-xs);padding:1px 7px;margin-right:7px;
+    font-size:11.5px;font-weight:600;vertical-align:1px}
+  .blktag.donor{background:var(--wait-bg);color:var(--wait)}
+  .blktag.channel{background:var(--run-bg);color:var(--run)}
+  .blk{margin-top:12px;padding:12px 14px;border-radius:var(--r-sm);border:1px solid var(--line);
+    border-left:3px solid var(--bad);background:var(--well);color:var(--ink);font-weight:400}
+  .blk.donor{border-left-color:var(--wait)}
+  .blk.channel{border-left-color:var(--run)}
+  .blk .blkhead{font-weight:600;color:var(--ink-hi)}
+  .blk p{margin:6px 0 0;font-size:13.5px;line-height:1.45}
+  .blk .blkacts{margin-top:10px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
   /* Строка поиска и отборов над списком каналов. */
   .sieve-row{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
   .sieve .secbody{padding:14px 18px}
@@ -1255,6 +1267,49 @@ function reasonKey(text){
 
    `whyOf` — где в строке лежит причина, `shapeOf` — что ещё группа рисует одно на всех
    (сервис, состояние, действие); строки с разной «формой» в одну группу не идут. */
+// Причина остановки словами — её переводит сервер (block_reasons.explain): чья беда
+// («Проблема в доноре», «Настройка канала»), что случилось и что делать. Не узнал —
+// `block` пуст, и строка показывается как раньше, текстом движка.
+function blockNote(r){
+  const b = (r && r.block) || {};
+  if (!b.kind) return r && r.blocked_reason
+    ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : '';
+  return `<div class="note" style="color:var(--ink)"><span class="blktag ${esc(b.kind)}"
+    >${esc(b.tag)}</span> ${esc(b.title)}</div>`;
+}
+
+function blockLabel(r){
+  const b = (r && r.block) || {};
+  return b.kind ? `${b.tag}: ${b.title}` : ((r && r.blocked_reason) || '');
+}
+
+// Карточка выпуска: объяснение целиком и действие, которое правда лечит. Для донора —
+// не «Вернуть в работу» (повтор даст тот же отказ), а «убрать ссылку» и «поставить
+// другую»; для канала — дорога в его настройки.
+function blockBox(r){
+  const b = (r && r.block) || {};
+  if (!b.kind) return '';
+  const ch = encodeURIComponent(r.channel_id == null ? '' : r.channel_id);
+  const acts = [];
+  if (b.kind === 'channel'){
+    acts.push(`<a href="#/channel/${ch}/nastroyki" id="blk-fix">Открыть настройки канала →</a>`);
+  } else if (b.kind === 'donor'){
+    if (r.plan_item_id) acts.push(`<button class="ghost" id="blk-drop">Убрать ссылку из плана</button>`);
+    acts.push(`<a href="#/channel/${ch}" id="blk-fix">Поставить другой ролик на канал →</a>`);
+    if (r.donor_url) acts.push(`<a href="${esc(r.donor_url)}" target="_blank" rel="noopener"
+      >Открыть донора на YouTube ↗</a>`);
+  }
+  if (b.revive && r.status === 'blocked' && !r.hand_confirmed)
+    acts.push(`<button class="ghost" id="revive">Вернуть в работу</button>`);
+  return `<div class="blk ${esc(b.kind)}" id="blk">
+    <div class="blkhead"><span class="blktag ${esc(b.kind)}">${esc(b.tag)}</span> ${esc(b.title)}</div>
+    <p>${esc(b.what)}</p>
+    <p><b>Что делать:</b> ${esc(b.fix)}</p>
+    <div class="blkacts">${acts.join('')}</div>
+    <p class="muted" style="font-size:12px">Запись движка: ${esc(r.blocked_reason)}</p>
+  </div>`;
+}
+
 function groupByReason(rows, whyOf, shapeOf, prefix){
   const out = [], seen = new Map();
   (rows || []).forEach(r => {
@@ -1389,7 +1444,7 @@ async function viewReleases(){
         ${segs(r)}
       </td>
       <td class="muted">${ago(r.idle_sec)}${r.attempts ? `<div>попыток ${r.attempts}</div>` : ''}
-        ${r.blocked_reason ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : ''}</td>
+        ${blockNote(r)}</td>
     </tr>`;
 
   // Одинаковые причины остановки — одной строкой (см. `groupByReason`). Один упавший
@@ -1398,15 +1453,23 @@ async function viewReleases(){
   // судьбы, и склеивать их под одной причиной нельзя.
   const STATUS_WORD = {blocked:'остановлен', pending:'ожидает', running:'в работе',
                        done:'готово'};
-  const rows = groupByReason(data.releases, r => r.blocked_reason,
+  const rows = groupByReason(data.releases, blockLabel,
                              r => r.status || '', 'rg').map(g => {
     if (g.rows.length < 2) return relRowHtml(g.rows[0], '');
     const st = g.rows[0].status || '';
     const count = `${g.rows.length} ${plural(g.rows.length, 'выпуск', 'выпуска',
                                              'выпусков')}`;
-    return `<tr class="grp"><td colspan="5">${groupHeadHtml(g, count, STATUS_WORD[st]
+    // «Настройка канала» чинится в канале — сразу говорим, в каких, со ссылками.
+    const kind = ((g.rows[0].block) || {}).kind;
+    const где = kind === 'channel'
+      ? [...new Map(g.rows.map(r => [r.channel_id, r.channel])).entries()]
+          .map(([id, name]) => `<a href="#/channel/${encodeURIComponent(id)}/nastroyki"
+            >${esc(name)}</a>`).join(', ')
+      : '';
+    return `<tr class="grp"><td colspan="5">${groupHeadHtml(g, count, (STATUS_WORD[st]
       ? ` <span class="pill s-${st === 'blocked' ? 'error' : 'queued'}"
-            >${esc(STATUS_WORD[st])}</span>` : '')}</td></tr>`
+            >${esc(STATUS_WORD[st])}</span>` : '')
+      + (где ? `<div class="note blk-where">каналы: ${где}</div>` : ''))}</td></tr>`
       + g.rows.map(r => relRowHtml(r, g.id)).join('');
   }).join('');
 
@@ -1444,12 +1507,12 @@ async function viewRelease(id){
           when(r.hand_confirmed)}. Ролик на канале есть; заливка не повторится.
         <span class="muted" style="font-weight:400">Это не машинное подтверждение:
           ответа YouTube Data API по этому выпуску у нас нет.</span></div>` : ''}
-    ${r.blocked_reason ? `<div class="sec" style="color:var(--bad)">
+    ${blockBox(r) || (r.blocked_reason ? `<div class="sec" style="color:var(--bad)">
         Остановлен: ${esc(r.blocked_reason)}
         ${r.status === 'blocked' && !r.hand_confirmed
           ? '<button class="ghost" id="revive" style="margin-left:10px">Вернуть в работу</button>'
             + '<button class="ghost" id="byhand" style="margin-left:8px">Подтвердить руками</button>'
-          : ''}</div>` : ''}
+          : ''}</div>` : '')}
     ${d.stages.map(s => `
       <div class="stage ${s.state === 'off' ? 'off' : ''}">
         <div class="dot ${STATE_CLS[s.state]}">${DOT[s.state] || ''}</div>
@@ -1475,6 +1538,16 @@ async function viewRelease(id){
 
   // Возврат из разбора. Фазу не откатываем: сделанное и оплаченное остаётся сделанным,
   // движок продолжит с того шага, где остановился.
+  const drop = head.querySelector('#blk-drop');
+  if (drop) drop.onclick = () => confirmInline(drop,
+      'Убрать эту ссылку из плана? Выход канала освободится под другой ролик.', async () => {
+    drop.disabled = true;
+    try{
+      await post(`/ui/plan/${encodeURIComponent(r.plan_item_id)}/cancel`);
+      location.hash = '#/channel/' + encodeURIComponent(r.channel_id);
+    }catch(e){ drop.disabled = false; toast(e.message); }
+  });
+
   const rev = head.querySelector('#revive');
   if (rev) rev.onclick = () => confirmInline(rev,
       `Вернуть в работу с фазы «${r.phase_title}»?`, async () => {
@@ -2730,6 +2803,9 @@ async function viewChannels(){
           c.status === 'active' ? 's-done' : c.status === 'problem' ? 's-error' : 's-idle'
         }">${esc(CH_STATUS[c.status] || c.status)}</span>
         ${c.has_uc ? '' : '<span class="pill s-error">ID пустой</span>'}
+        ${c.has_cover_preset === false
+          ? '<span class="pill s-error" title="выпуски этого канала встанут на обложке">нет пресета обложек</span>'
+          : ''}
         ${supplyPill(c.supply)}
       </div>
     </div>`).join('');
@@ -2999,6 +3075,7 @@ async function channelReleases(id, d){
     !ch.uc && 'нет ID YouTube — выпуски не заводятся',
     !Object.keys(ch.schedule || {}).length && 'нет расписания — ссылки встанут без даты',
     !ch.preset_vsgen_id && 'не выбран пресет — выпуску нечем делать озвучку и кадры',
+    !(ch.presets || {}).cover && 'не выбран пресет обложек — выпуски встанут на обложке',
     !ch.profile_id && 'не выбран профиль AdsPower — заливать нечем',
     !ch.host_id && 'не выбрана машина заливки',
   ].filter(Boolean);
@@ -4101,7 +4178,7 @@ function calendarFeed(d){
           ${r.project_name ? ' · ' + esc(r.project_name) : ''}
           ${r.beyond_horizon ? ' · за горизонтом канала' : ''}
         </div>
-        ${r.blocked_reason ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : ''}
+        ${blockNote(r)}
       </div></div>`);
   }
   if (!drawn) rows.push('<div class="today"><span>сейчас</span></div>');
