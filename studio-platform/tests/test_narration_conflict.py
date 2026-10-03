@@ -95,7 +95,7 @@ def main() -> int:
         check("кабинет отдаёт содержимое ENGINE_DIRS", M._ENGINE_AUDIO_DIR, dict(ENGINE_DIRS))
         check("и это не случайное совпадение двух списков",
               M._ENGINE_AUDIO_DIR == dict(ENGINE_DIRS) and set(ENGINE_DIRS) == {
-                  "edge", "voicer", "voicegencore", "tts", "lumean"}, True)
+                  "edge", "voicer", "voicegencore", "tts", "lumean", "fastgen"}, True)
 
         print("\nОдна озвучка — как было")
 

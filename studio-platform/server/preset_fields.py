@@ -566,6 +566,9 @@ PART_EXTRA_KEYS = {
         "auto_pause_enabled", "auto_pause_duration", "auto_pause_frequency",
         # _build_cmd, kind == "tts", ветка Lumean: main.py ≈7506
         "model_uuid",
+        # _build_cmd, kind == "tts", ветка FastGen (03.10.2026): инструкция стиля для
+        # Gemini TTS (--scene воркера). Как в gen; пусто — умолчание воркера.
+        "tts_scene",
         # _build_cmd, kind == "tts": запасной источник движка, main.py ≈7424,
         # если "engine" не задан. Вопрос 2 называл ещё "tts_provider" — этого ключа
         # в коде нет нигде (grep по main.py/pub_services.py/pub_engine.py пуст),

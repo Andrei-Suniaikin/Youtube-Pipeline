@@ -1796,6 +1796,9 @@ SERVER_CREDENTIAL_POOL = _ServerCredentialPool()
 def _provider_credential_family(provider):
     return {
         "recrafter": "googler",
+        # Озвучка Gemini на ТОМ ЖЕ ключе FastGen: lease семейства googler → env GOOGLER_API_KEY.
+        # Второй ключ «для речи» не заводится: речь и картинки у провайдера считаются раздельно.
+        "fastgen_tts": "googler",
         "veo": "veo",
         "openai": "openai",
         "voicer": "voicer",
@@ -1879,6 +1882,14 @@ def _key_budget_retry_sec():
 
 def _key_budget_vendor(provider):
     """Физический вендор ключа этого провайдера. Пусто — в общем счёте не участвует."""
+    # Озвучка FastGen идёт тем же ключом, что картинки, но у провайдера это РАЗНЫЕ
+    # счётчики: речь — speech_threads (20) и 600 кредитов/час, картинки — свои потоки.
+    # Без исключения vendor_of откатывался на семейство googler, и в режимах
+    # observe/enforce каждая задача озвучки занимала бы место картинок. Ёмкость
+    # озвучки держат её собственные лимиты (PROVIDER_LIMITS, _PROVIDER_HARD_JOB_CAPS,
+    # _PROVIDER_CALL_BUDGET_*), а не единицы картинок.
+    if provider == "fastgen_tts":
+        return ""
     if _key_budget is None:
         return ""
     try:
@@ -3308,9 +3319,9 @@ function presetSnapshot(form){
 }
 function engChg(){var r=document.querySelector('input[name=engine]:checked');if(!r)return;var e=r.value;
 var names={edge:'Edge',voicer:'Voicer',voicegencore:'VoiceGenCore',tts:'Lumean (\u0431\u044b\u0432\u0448. ElevenLabs)'};
-names.lumean='Lumean · HeyGen';
+names.lumean='Lumean · HeyGen';names.fastgen='FastGen · Gemini';
 var t=document.getElementById('paramsTitle');if(t)t.textContent='Параметры · '+(names[e]||e);
-['edge','voicer','voicegencore','tts','lumean'].forEach(function(k){var el=document.getElementById('ep-'+k);if(el)el.style.display=(k===e)?'':'none';});
+['edge','voicer','voicegencore','tts','lumean','fastgen'].forEach(function(k){var el=document.getElementById('ep-'+k);if(el)el.style.display=(k===e)?'':'none';});
 var ve=document.getElementById('vp-edge'),vi=document.getElementById('vp-id');
 if(ve)ve.style.display=(e==='edge')?'':'none';if(vi)vi.style.display=(e==='edge')?'none':'';
 var lr=document.querySelectorAll('#vp-id .lrow'),lumean=(e==='lumean');for(var l=0;l<lr.length;l++)lr[l].style.display=(lumean&&lr[l].getAttribute('data-lumean')!=='1')?'none':'flex';
@@ -4374,7 +4385,23 @@ VIDEO_METHODS = {
 # остальных провайдеров, а в списке — одна строка.
 TTS_ENGINES = {"edge": ("Edge", "Быстро, без ключа"), "voicegencore": ("VoiceGenCore", "По ключу"),
                "voicer": ("Voicer", "По ключу"),
-               "lumean": ("Lumean", "свой ключ или серверный")}
+               "lumean": ("Lumean", "свой ключ или серверный"),
+               # 03.10.2026: Lumean лежит с 26.09 («техработы»), каналы стоят без озвучки.
+               # Gemini TTS входит в подписку FastGen: заказ стоит 10 кредитов часа из 600,
+               # денег сверх подписки нет. Ключ тот же, что у картинок (семейство googler).
+               "fastgen": ("FastGen", "Gemini TTS · подписка FastGen")}
+# Голоса Gemini TTS — каталог провайдера (GET /models → options.voice.enum, запрос
+# бесплатный). Вживую проверены algieba, charon, iapetus, enceladus. Имя голоса нужно
+# ДО _build_cmd: по нему же работает обратный страж — имя Gemini не должно уехать в
+# чужой движок, а чужой id (VGC, UUID Lumean) не должен уехать в FastGen.
+FASTGEN_TTS_DEFAULT_VOICE = "algieba"
+FASTGEN_TTS_VOICES = (
+    "algieba", "charon", "iapetus", "enceladus",
+    "achernar", "achird", "algenib", "alnilam", "aoede", "autonoe", "callirrhoe", "despina",
+    "erinome", "fenrir", "gacrux", "kore", "laomedeia", "leda", "orus", "puck",
+    "pulcherrima", "rasalgethi", "sadachbia", "sadaltager", "schedar", "sulafat",
+    "umbriel", "vindemiatrix", "zephyr", "zubenelgenubi",
+)
 # Значение из старых пресетов. В пикере не показывается, но принимается и ведёт себя как
 # «lumean» — иначе сохранённые пресеты перестали бы открываться.
 TTS_ENGINES_LEGACY = {"tts": ("Lumean (бывш. ElevenLabs)", "По ключу")}
@@ -6596,7 +6623,7 @@ GEN_LEASE = int(os.environ.get("GEN_LEASE", "900"))  # gen-воркер без �
 #   видео:    veo / recrafter (flower/flow/grok)
 # recrafter обслуживает И картинки, И flower-видео (один ключ googler → делят лимит); veo — видео И veo-banana.
 _TTS_ENG_PROV = {"edge": "edge", "voicer": "voicer", "voicegencore": "voicegencore",
-                 "tts": "elevenlabs", "lumean": "lumean"}
+                 "tts": "elevenlabs", "lumean": "lumean", "fastgen": "fastgen_tts"}
 
 _LUMEAN_TEMPLATE_ID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
@@ -6766,11 +6793,16 @@ def _preset_project_payload(settings, preset_id):
 # Таблица НЕ переписана здесь руками, а взята из `render/render_narration.ENGINE_DIRS` —
 # того самого модуля, которым и кабинет, и нода выбирают файлы озвучки. Две копии одной
 # таблицы разъезжаются молча: добавили движок в одном месте — в другом его папка стала
-# «чужой», и `_clear_other_audio_dirs` снесла бы свежую оплаченную озвучку. Сам
-# `render_narration.py` не правим ни на байт: он побайтово равен боевому и на VPS, и на
-# минской ноде (live_2026-09-18/код/{кабинет,рендер/нода_минск}/render_narration.py),
-# и это единственное доказательство, что выбор файлов у нас и в бою совпадает. Поэтому
+# «чужой», и `_clear_other_audio_dirs` снесла бы свежую оплаченную озвучку. Поэтому
 # сведение идёт в одну сторону: кабинет читает модуль, а не модуль подстраивается.
+#
+# До 03.10.2026 модуль не правился ни на байт и был побайтово равен ноде — это было
+# доказательством, что выбор файлов у нас и в бою совпадает. С 03.10 равенства НЕТ: в
+# ENGINE_DIRS добавлена пара 'fastgen' → '_FINAL_AUDIO_FASTGEN' (та же правка сделана и
+# в gen). Ноду обновлять для работы не нужно: закреплённый список narration_files
+# уезжает на ноду в cfg (render_claim), а select_narration отдаёт закреплённый список
+# раньше, чем смотрит в ENGINE_DIRS. Держать ли равенство с нодой дальше — решение
+# владельца, вопрос задан.
 # Импорт здесь жёсткий (RENDER_DIR добавлен в sys.path в шапке файла): без этого модуля
 # рендер всё равно не выдаётся ни одной ноде (render_claim → wait_reason="narration"),
 # а тихое пустое умолчание превратило бы «нет модуля» в «перестали чистить чужие папки»,
@@ -7099,6 +7131,10 @@ PROVIDER_LIMITS = {
     "voicegencore": (int(os.environ.get("VGC_G", "4")),    int(os.environ.get("VGC_K", "2"))),
     "elevenlabs":   (int(os.environ.get("EL_G", "4")),     int(os.environ.get("EL_K", "2"))),
     "lumean":       (int(os.environ.get("LUMEAN_G", "10")), int(os.environ.get("LUMEAN_K", "10"))),
+    # Озвучка FastGen: G задач на серверную дорожку × «потоков на проект» (блоков разом)
+    # = потоков речи у ключа. Ключ общий с gen (отпечатки равны, сверено 03.10): gen 8 +
+    # студия 8 = 16 из 20 speech-потоков; манхва ходит своим ключом.
+    "fastgen_tts":  (int(os.environ.get("FASTGEN_TTS_G", "2")), int(os.environ.get("FASTGEN_TTS_K", "2"))),
     "recrafter":    (int(os.environ.get("RECR_G", "4")),   int(os.environ.get("RECR_K", "2"))),
     "veo":          (int(os.environ.get("VEO_G", "4")),    int(os.environ.get("VEO_K", "1"))),
     "openai":       (int(os.environ.get("OAI_G", "4")),    int(os.environ.get("OAI_K", "2"))),
@@ -7127,6 +7163,9 @@ _PROVIDER_HARD_JOB_CAPS = {
     # ключ. Число здесь, а не ссылкой на _PROVIDER_ACCOUNT_LIMITS: та таблица
     # объявлена ниже по файлу, и ссылка на неё роняет импорт всего сервиса.
     "voicegencore": 2,
+    # Озвучка FastGen: воркер только ждёт ответа провайдера (как озвучка вообще), память
+    # не держит. Число как в gen (там 8); ТЗ называло 4 — расхождение отмечено в чате.
+    "fastgen_tts": 8,
     # 25 взвешенных потоков ключа расписаны владельцем: 1 обложкам + 8×3 картинкам.
     # Подъём до 12 проектов давал 12×8=96 потоков при лимите 25 — задачи дрались за
     # потоки у провайдера и висели часами, не завершаясь.
@@ -7157,6 +7196,9 @@ _PROVIDER_ACCOUNT_LIMITS = {
     "veo":       (24, "24 задачи одновременно"),
     "voicer":    (5,  "5 задач на ключ"),
     "lumean":    (10, "10 одновременных HeyGen-задач на ключ"),
+    # Живой GET /usage 03.10.2026: speech_threads_allowed=20, 600 aistudio-кредитов в час,
+    # заказ = 10 кредитов → 60 заказов в час. Речь у провайдера считается отдельно от картинок.
+    "fastgen_tts": (20, "20 потоков речи и 60 заказов в час на ключ"),
 }
 # Взвешенный бюджет ОДНОГО серверного ключа (units, которыми задачи занимают ключ).
 # Код-потолок = реальный предел аккаунта: выше него не поднимает ни env, ни админ-панель.
@@ -7201,6 +7243,21 @@ def _provider_budget_units(prov):
 # попросить меньше, но не способен поднять нагрузку выше server-owned потолка.
 VGC_THREADS_HARD = 64
 VGC_THREADS_PER_JOB = max(1, min(VGC_THREADS_HARD, int(os.environ.get("VGC_THREADS_PER_JOB", "4"))))
+# Озвучка FastGen (Gemini TTS): блоков, которые ОДНА задача заказывает разом (--parallel
+# воркера). Задаёт сервер, клиент не выбирает: сверху админ-настройка
+# (_concurrency.fastgen_tts.threads), потолок HARD и бюджет вызовов ключа (_server_threads_setting).
+FASTGEN_TTS_PARALLEL_HARD = 8
+FASTGEN_TTS_PARALLEL_PER_JOB = max(1, min(FASTGEN_TTS_PARALLEL_HARD,
+                                          int(os.environ.get("FASTGEN_TTS_PARALLEL", "4"))))
+# Модель, размер блока и порог перезаказа читает СЕРВЕР и передаёт воркеру аргументами: env
+# службы до воркера не доходит (_sanitized_worker_env). 6000 знаков ≈ 900 русских слов ≈
+# 7 мин речи — как блок манхвы; заказ в 1300 слов (9,7 мин) прошёл 29.09, длиннее не мерили.
+FASTGEN_TTS_MODEL = (os.environ.get("FASTGEN_TTS_MODEL") or "aistudio/gemini-3.8-flash-tts").strip()
+FASTGEN_TTS_MAX_CHARS = max(1000, min(9000, int(os.environ.get("FASTGEN_TTS_MAX_CHARS", "6000"))))
+# Отправка заказа осталась без ответа FastGen (5xx, обрыв): через столько минут воркер
+# заказывает блок заново — худший случай 10 лишних кредитов. 0 — никогда.
+FASTGEN_TTS_REORDER_UNCONFIRMED_MINUTES = max(0, min(1440, int(
+    os.environ.get("FASTGEN_TTS_REORDER_UNCONFIRMED_MINUTES", "15"))))
 # Один image-job сам запускает ThreadPoolExecutor в googler_worker. У общего
 # FastGen-ключа лимит взвешенных потоков (тяжёлая модель = вес 4), поэтому
 # кабинет не принимает клиентское значение и всегда задаёт серверный потолок.
@@ -7232,6 +7289,7 @@ _SERVER_LIMIT_ROWS = (
     ("voicegencore",  "VoiceGenCore (озвучка)",                True,  False),
     ("elevenlabs",    "Lumean (бывш. ElevenLabs) · озвучка", False, False),
     ("lumean",        "Lumean · только HeyGen · озвучка",      False, False),
+    ("fastgen_tts",   "FastGen · озвучка (Gemini TTS)",         True,  False),
     ("edge",          "Edge TTS (без ключа)",                  False, False),
     ("bing",          "Bing (поиск картинок)",                 True,  False),
     ("prompt_openai", "Промпты · GPT API",                     True,  False),
@@ -7257,8 +7315,10 @@ _SERVER_LIMIT_ROWS = (
 # 4 проекта × 1 поток даёт тот же порядок. bing = 6: ровно сегодняшний дефолт (2 × 3),
 # то есть при дефолтных настройках поведение НЕ меняется, режется только задранное.
 # Поднять можно полем `call_budget` в _concurrency (в границах hard).
-_PROVIDER_CALL_BUDGET_HARD = {"openai": 12, "bing": 12}
-_PROVIDER_CALL_BUDGET_DEFAULT = {"openai": 4, "bing": 6}
+# fastgen_tts: доля студии на общем с gen ключе — 8 потоков речи из 20 (2 задачи × 4
+# блока), потолок 20 = весь speech_threads_allowed. Поднимается на /server-limits без кода.
+_PROVIDER_CALL_BUDGET_HARD = {"openai": 12, "bing": 12, "fastgen_tts": 20}
+_PROVIDER_CALL_BUDGET_DEFAULT = {"openai": 4, "bing": 6, "fastgen_tts": 8}
 
 _SERVER_LIMIT_BOUNDS = {
     "global": (1, 64), "per_tenant": (1, 32), "threads": (1, 64),
@@ -8013,6 +8073,9 @@ def _provider_alloc_report(prov):
                                           SHARED_IMAGE_THREADS_HARD)
     elif prov == "voicegencore":
         per_job = _server_threads_setting(prov, VGC_THREADS_PER_JOB, VGC_THREADS_HARD)
+    elif prov == "fastgen_tts":
+        per_job = _server_threads_setting(prov, FASTGEN_TTS_PARALLEL_PER_JOB,
+                                          FASTGEN_TTS_PARALLEL_HARD)
     elif prov in _PROMPT_PROVIDER_GROUPS:
         per_job = _prompt_threads_setting(prov.removeprefix("prompt_"))
     else:
@@ -8485,6 +8548,8 @@ def _build_cmd(kind, projdir, params, own_threads=None, *, job_id=None, project_
                 voice = ""            # чужой id (VGC/voicer) в edge → сброс → ниже автодетект языка
         elif _is_edge_voice(voice):
             voice = ""                # edge-голос уехал в id-движок (voicer/vgc/tts) → сброс
+        if engine != "fastgen" and voice.lower() in FASTGEN_TTS_VOICES:
+            voice = ""                # имя голоса Gemini (FastGen) уехало в чужой движок → сброс
         uc = _truthy(params.get("use_cache"), default=True)
         if engine == "edge":
             txt = open(src, encoding="utf-8").read() if os.path.exists(src) else ""
@@ -8534,6 +8599,32 @@ def _build_cmd(kind, projdir, params, own_threads=None, *, job_id=None, project_
             if uc:
                 argv.append("--use_cache")
             return "voicegencore_worker.py", argv
+        if engine == "fastgen":
+            # Gemini TTS на ключе FastGen: lease семейства googler → env GOOGLER_API_KEY.
+            # Весь текст одной задачей → ОДИН <audio_dir>/1.mp3; блоки по max_chars воркер
+            # заказывает и склеивает сам, квитанции в .blocks/ не дают оплатить блок дважды;
+            # перезапуск ТОЙ ЖЕ задачи (VS_JOB_ID) добирает недостающее и без --use_cache.
+            # Чужой или пустой голос → algieba.
+            fg_voice = voice.lower()
+            if fg_voice not in FASTGEN_TTS_VOICES:
+                if voice and job_id:
+                    _log_line(job_id, f"ℹ️ FastGen: голос «{voice[:40]}» не из каталога Gemini — "
+                                      f"озвучиваю голосом {FASTGEN_TTS_DEFAULT_VOICE}")
+                fg_voice = FASTGEN_TTS_DEFAULT_VOICE
+            # блоков разом держит сервер: админ-таблица (_concurrency.fastgen_tts.threads) или код
+            fg_parallel = _server_threads_setting("fastgen_tts", FASTGEN_TTS_PARALLEL_PER_JOB,
+                                                  FASTGEN_TTS_PARALLEL_HARD)
+            argv = ["--source_file", src, "--project_dir", projdir, "--speed", speed, "--full_text",
+                    "--voice", fg_voice, "--model", FASTGEN_TTS_MODEL,
+                    "--max_chars", str(FASTGEN_TTS_MAX_CHARS), "--parallel", str(fg_parallel),
+                    "--reorder_unconfirmed_minutes", str(FASTGEN_TTS_REORDER_UNCONFIRMED_MINUTES),
+                    "--audio_dir_name", _ENGINE_AUDIO_DIR["fastgen"]]
+            scene = " ".join(str(params.get("tts_scene") or "").split())
+            if scene:
+                argv += ["--scene", scene[:1000]]
+            if uc:
+                argv.append("--use_cache")
+            return "fastgen_tts_worker.py", argv
         # Lumean. Провайдер один, дорожки две, и выбирает между ними НЕ пользователь
         # в списке движков (там теперь одна строка), а общий механизм своих ключей:
         # own_threads не None ровно тогда, когда задача идёт на СВОЙ ключ юзера

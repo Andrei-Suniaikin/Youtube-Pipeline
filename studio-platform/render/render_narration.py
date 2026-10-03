@@ -2,7 +2,7 @@
 from pathlib import Path
 import re
 
-ENGINE_DIRS={'edge':'_FINAL_AUDIO_EDGETTS','voicer':'_FINAL_AUDIO_VOICER','voicegencore':'_FINAL_AUDIO_VGC','tts':'_FINAL_AUDIO_ELEVENLABS','lumean':'_FINAL_AUDIO_LUMEAN'}
+ENGINE_DIRS={'edge':'_FINAL_AUDIO_EDGETTS','voicer':'_FINAL_AUDIO_VOICER','voicegencore':'_FINAL_AUDIO_VGC','tts':'_FINAL_AUDIO_ELEVENLABS','lumean':'_FINAL_AUDIO_LUMEAN','fastgen':'_FINAL_AUDIO_FASTGEN'}
 EXTENSIONS={'.mp3','.wav','.m4a','.aac','.ogg','.flac'}
 EXCLUDED={'_ASSETS','_RENDER_MEDIA','.remote_jobs','chapters','render','__pycache__'}
 

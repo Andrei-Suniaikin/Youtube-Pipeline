@@ -85,9 +85,27 @@ def main() -> int:
     print("Модуль у нас и в бою — один и тот же файл")
 
     check("боевой кабинет на месте", os.path.isfile(LIVE), True)
-    check("наш файл побайтово равен боевому кабинету", sha_file(OURS), sha_file(LIVE))
-    check("и файлу на ноде", sha_file(OURS), sha_file(NODE))
-    check("и это тот самый sha из квитанции выкладки 14.09", sha_file(OURS), LIVE_SHA)
+    # 03.10.2026: побайтовое равенство снято осознанно — ТЗ «озвучка FastGen», п. 1.4:
+    # в ENGINE_DIRS добавлена пара 'fastgen' → '_FINAL_AUDIO_FASTGEN' (та же правка в gen).
+    # Ноду обновлять для работы не нужно: закреплённый narration_files уезжает в cfg, и
+    # select_narration отдаёт его раньше, чем смотрит в ENGINE_DIRS. Сторож теперь точный:
+    # отличие от боя и от ноды — ровно одна строка, и в ней ровно одна новая пара. Любое
+    # другое расхождение — провал, как и раньше: выбор файлов обязан совпадать.
+    check("боевой кабинет и нода — одно и то же (их мы не трогали)",
+          sha_file(LIVE), sha_file(NODE))
+    check("и это тот самый sha из квитанции выкладки 14.09", sha_file(LIVE), LIVE_SHA)
+    import difflib
+    отличия = [l for l in difflib.unified_diff(
+        open(NODE, encoding="utf-8").read().splitlines(),
+        open(OURS, encoding="utf-8").read().splitlines(), lineterm="", n=0)
+        if (l.startswith("+") or l.startswith("-")) and not l.startswith(("+++", "---"))]
+    check("от ноды отличаемся ровно одной заменённой строкой", len(отличия), 2)
+    check("и это строка ENGINE_DIRS",
+          all(l[1:].startswith("ENGINE_DIRS=") for l in отличия), True)
+    было_ = next((l[1:] for l in отличия if l.startswith("-")), "")
+    стало_ = next((l[1:] for l in отличия if l.startswith("+")), "")
+    check("добавлена ровно пара fastgen, остальное слово в слово",
+          стало_ == было_.replace("}", ",'fastgen':'_FINAL_AUDIO_FASTGEN'}"), True)
 
     from render_narration import ENGINE_DIRS, select_narration
 
