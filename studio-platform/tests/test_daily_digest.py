@@ -277,6 +277,26 @@ def part_no_tag():
     c.close()
 
 
+# ───────────── 1б. про ключ — только когда есть что подтверждать ─────────────
+
+def part_key_note_only_when_relevant():
+    print("\nПро ключ говорим только когда есть что подтверждать")
+    # 03.10.2026: сводка новой студии — «ключа нет, подтверждать нечем» при 11 задержках,
+    # из которых ни одна до канала не дошла (все стояли на рерайте и озвучке).
+    c = fresh()
+    cid = channel(c, "Nocne Biografie")
+    for k in range(3):
+        item = plan(c, cid, NOW - 3600 * (k + 1))
+        release(c, cid, item, NOW - 3600 * (k + 1), "project_ready", status="blocked",
+                blocked=f"этап «tts» завершился со статусом error")
+    d = D.collect(c, TID, now=NOW, have_key=False)
+    check("все три — задержаны", d["today"]["delayed"], 3)
+    check("ключ не обвиняется", any("нет ключа" in w or "ключа YouTube" in w
+                                    for w in d["today"]["why"]), False)
+    check("сказана правда: до канала не дошли",
+          any("до канала не дошёл" in w for w in d["today"]["why"]), True)
+
+
 # ─────────────────────── 2. «не знаем» не равно нулю ───────────────────────
 
 def part_unknown_vs_zero():
@@ -679,6 +699,7 @@ def part_day_bounds():
 
 
 def main() -> int:
+    part_key_note_only_when_relevant()
     part_counters()
     part_no_tag()
     part_unknown_vs_zero()

@@ -234,6 +234,27 @@ def main() -> int:
     check("про оплату сказано прямо", "оплаченные вызовы ЕСТЬ" in (чужое.money or ""), True)
     check("и названо, где смотреть", "Проект 3" in (чужое.money or ""), True)
 
+    print("\nПереставленное падение тревогой не считается")
+    # 03.10.2026: «Lumean недоступен — стоят 67 задач» висело два часа после того, как
+    # все 67 проектов перевели на FastGen и озвучка у них снова шла. Упавшая задача, у
+    # которой есть более новая того же вида в том же проекте, — история, не беда.
+    c = fresh()
+    упала(c, 1, "tts", ЛЮМЕН)
+    check("пока новой задачи нет — тревога есть",
+          len(pub_alerts.check_failed_tasks(c, NOW, tenant=None)), 1)
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,project_id,kind,status,error,"
+              "created,finished) VALUES(2,'t1','p1','tts','queued',NULL,?,NULL)", (NOW - 30,))
+    c.commit()
+    check("поставили заново — тревога ушла",
+          len(pub_alerts.check_failed_tasks(c, NOW, tenant=None)), 0)
+    # Новая задача ДРУГОГО вида старую не отменяет: картинки не чинят озвучку.
+    c.execute("DELETE FROM queue_tasks WHERE job_id=2")
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,project_id,kind,status,error,"
+              "created,finished) VALUES(3,'t1','p1','images','queued',NULL,?,NULL)", (NOW - 30,))
+    c.commit()
+    check("задача другого вида тревогу не снимает",
+          len(pub_alerts.check_failed_tasks(c, NOW, tenant=None)), 1)
+
     print("\nДве беды с одинаковым началом не съедают друг друга")
     # Ключ тревоги режется по длине, чтобы не раздувать состояние. Если бы он был просто
     # обрезанным текстом, две причины с общим длинным началом получили бы ОДИН ключ — и
