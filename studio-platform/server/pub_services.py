@@ -105,6 +105,18 @@ class PubServices:
         self.owner_uid = ctx.get("owner_uid")
         self.default_username = ctx.get("username") or ""
         self.openai_key = ctx.get("openai_key") or (lambda: "")
+        self._title_spent = 0.0      # сколько секунд этот круг движка уже ждал названия
+
+    # 04.10.2026: названия пишет подписка Codex, ответ идёт 1–3 минуты, а движок проходит
+    # выпуски по одному. 28 выпусков ждали название — круг растягивался на час, и все,
+    # у кого срок фазы короче (project_ready — 15 минут), засчитывали попытку каждый
+    # круг, ни разу не дойдя до своего обработчика: третья — разбор. Поэтому названиям
+    # даётся бюджет времени на круг; остальные выпуски ждут следующего круга.
+    TITLE_TICK_BUDGET_SEC = float(os.environ.get("VS_TITLE_TICK_BUDGET_SEC", "120") or 120)
+
+    def begin_tick(self, now: float = 0.0) -> None:
+        """Движок начинает новый круг: бюджет названий — заново."""
+        self._title_spent = 0.0
 
     def _uid(self, c, tenant_id: str):
         """Чьим именем ставить задачи в очередь: владелец этого кабинета."""
@@ -1198,8 +1210,18 @@ class PubServices:
         if (os.environ.get("VS_TITLE_PROVIDER") or "codex").strip().lower() == "openai":
             return make_title(rel["donor_title"] or "", rel["lang"] or "ru",
                               self._openai_key(c))
-        return make_title_codex(rel["donor_title"] or "", rel["lang"] or "ru",
-                                get_key(c, "rewrite"), REWRITE_BASE)
+        if self._title_spent >= self.TITLE_TICK_BUDGET_SEC:
+            raise TitleUnavailable("названия делаются по очереди: подписка Codex отвечает "
+                                   "минутами, а на один круг движка отведено "
+                                   f"{int(self.TITLE_TICK_BUDGET_SEC)} с — этот выпуск "
+                                   "получит название на одном из следующих кругов")
+        import time as _t
+        started = _t.monotonic()
+        try:
+            return make_title_codex(rel["donor_title"] or "", rel["lang"] or "ru",
+                                    get_key(c, "rewrite"), REWRITE_BASE)
+        finally:
+            self._title_spent += _t.monotonic() - started
 
     def _upload_job(self, c, release_id: str):
         return c.execute("SELECT * FROM pub_upload_jobs WHERE release_id=?",

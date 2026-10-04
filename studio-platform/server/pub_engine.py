@@ -986,6 +986,9 @@ def revive_rerun_stages(c, now: float) -> list:
 def tick(c, services, now: float = None) -> dict:
     """Один шаг движка. Ошибка одного выпуска не мешает остальным."""
     now = time.time() if now is None else now
+    begin = getattr(services, "begin_tick", None)
+    if callable(begin):
+        begin(now)               # бюджеты медленных шагов (названия) — на новый круг
     try:
         revive_cover_preset_chosen(c, now)
     except Exception:                              # noqa: BLE001 — не роняем тик
