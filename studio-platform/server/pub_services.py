@@ -1104,6 +1104,14 @@ class PubServices:
                      f"заказал по ссылке донора, пресет «{preset}», задача {job_id}")
             return {"wait": True}
 
+        # Обложку принял человек (экран выпуска, «Взять эту обложку») — она уже лежит в
+        # проекте, и чужой вердикт сверки её не отменяет: без этого возврат в работу
+        # снова спросил бы ту же задачу, увидел «брак» и перезаказал за деньги.
+        cover_file = os.path.join(self.project_dir(rel["tenant_id"], rel["project_id"]),
+                                  "cover.jpg")
+        if known["status"] == "done" and os.path.exists(cover_file):
+            return {"payload": {"cover_bytes": os.path.getsize(cover_file)}}
+
         info = client.job(known["remote_job_id"])
         state = str(info.get("status") or "").lower()
         if state in ("error", "failed", "cancelled"):

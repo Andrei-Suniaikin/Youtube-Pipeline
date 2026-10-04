@@ -248,6 +248,11 @@
   .blk.donor{border-left-color:var(--wait)}
   .blk.channel{border-left-color:var(--run)}
   .blk.cover{border-left-color:var(--muted)}
+  .cvr{display:flex;gap:16px;align-items:flex-start;margin-top:10px;flex-wrap:wrap}
+  .cvr-img img{display:block;width:320px;max-width:100%;border-radius:var(--r-sm);
+    border:1px solid var(--line)}
+  .cvr-body{flex:1;min-width:220px}
+  .cvr-notes{margin:6px 0 0;padding-left:18px;font-size:13px;color:var(--muted)}
   .blk .blkhead{font-weight:600;color:var(--ink-hi)}
   .blk p{margin:6px 0 0;font-size:13.5px;line-height:1.45}
   .blk .blkacts{margin-top:10px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
@@ -1398,9 +1403,6 @@ function blockBox(r){
     acts.push(`<a href="#/channel/${ch}" id="blk-fix">Поставить другой ролик на канал →</a>`);
     if (r.donor_url) acts.push(`<a href="${esc(r.donor_url)}" target="_blank" rel="noopener"
       >Открыть донора на YouTube ↗</a>`);
-  } else if (b.kind === 'cover' && r.project_id){
-    acts.push(`<a href="#/project/${encodeURIComponent(r.project_id)}/cover" id="blk-fix"
-      >Открыть обложку проекта →</a>`);
   }
   if (b.revive && r.status === 'blocked' && !r.hand_confirmed)
     acts.push(`<button class="ghost" id="revive">Вернуть в работу</button>`);
@@ -1414,9 +1416,57 @@ function blockBox(r){
     <div class="blkhead"><span class="blktag ${esc(b.kind)}">${esc(b.tag)}</span> ${esc(b.title)}</div>
     <p>${esc(b.what)}</p>
     <p><b>Что делать:</b> ${esc(b.fix)}</p>
+    ${b.kind === 'cover' ? '<div id="cv-review" class="cvr">Загружаю обложку выпуска…</div>' : ''}
     <div class="blkacts">${acts.join('')}</div>
     <p class="muted" style="font-size:12px">Запись движка: ${esc(r.blocked_reason)}</p>
   </div>`;
+}
+
+/* Обложка выпуска глазами человека (04.10.2026, владелец: «как мне понять, какие
+   обложки не прошли проверку»). Её заказывает движок под ключом студии, во вкладке
+   проекта её не видно — показываем здесь: картинку, что сказала сверка, и два решения. */
+const COVER_VERDICT = {
+  unchecked: 'Сверку надписи сделать не успели — подписка Codex не ответила вовремя. '
+    + 'Сама картинка нарисована и оплачена. Посмотрите надпись: перевод верный и без ошибок?',
+  rejected: 'Сверка не приняла надпись на обложке:',
+  nothing: 'Картинки нет: генератор её не отдал.',
+  ok: 'Сверка надписи прошла.',
+};
+async function fillCoverReview(rid, box, onDone){
+  let d;
+  try { d = await api(`/ui/releases/${encodeURIComponent(rid)}/cover`); }
+  catch (e){ box.innerHTML = `<p class="note bad">${esc(e.message)}</p>`; return; }
+  if (!d.job){ box.innerHTML = '<p class="muted">Обложку для этого выпуска ещё не заказывали.</p>'; return; }
+  if (d.error){ box.innerHTML = `<p class="note bad">${esc(d.error)}</p>`; return; }
+  const notes = (d.notes || []).map(n => `<li>${esc(n.replace(/^[^\wА-Яа-яЁё]+/, ''))}</li>`).join('');
+  box.innerHTML = `
+    ${d.image ? `<a href="${pultUrl(d.image)}" target="_blank" class="cvr-img"><img
+      src="${pultUrl(d.image)}" alt="Обложка выпуска"></a>` : ''}
+    <div class="cvr-body">
+      <p><b>${esc(COVER_VERDICT[d.verdict] || '')}</b></p>
+      ${notes ? `<ul class="cvr-notes">${notes}</ul>` : ''}
+      ${d.blocked ? `<div class="blkacts">
+        ${d.image ? '<button class="ghost" id="cv-accept">Взять эту обложку</button>' : ''}
+        <button class="ghost" id="cv-reorder">Перезаказать — новая обложка, платно</button>
+      </div>` : ''}
+      <p class="muted" style="font-size:12px">Задача обложки ${esc(d.job)}</p>
+    </div>`;
+  const acc = box.querySelector('#cv-accept');
+  if (acc) acc.onclick = () => confirmInline(acc,
+      'Взять эту обложку? Она пойдёт на YouTube как есть — надпись проверили вы.', async () => {
+    acc.disabled = true;
+    try { await post(`/ui/releases/${encodeURIComponent(rid)}/cover/accept`);
+          toast('Обложка взята — выпуск вернулся в работу', 'ok'); onDone && onDone(); }
+    catch (e){ acc.disabled = false; toast(e.message); }
+  });
+  const reo = box.querySelector('#cv-reorder');
+  if (reo) reo.onclick = () => confirmInline(reo,
+      'Нарисовать обложку заново? Это новая платная задача; эта картинка будет забыта.', async () => {
+    reo.disabled = true;
+    try { await post(`/ui/releases/${encodeURIComponent(rid)}/cover/reorder`);
+          toast('Новая обложка заказана — выпуск вернулся в работу', 'ok'); onDone && onDone(); }
+    catch (e){ reo.disabled = false; toast(e.message); }
+  });
 }
 
 function groupByReason(rows, whyOf, shapeOf, prefix){
@@ -1660,6 +1710,8 @@ async function viewRelease(id){
       </div>`).join('')}
   </div>`);
   app.append(head);
+  const cvr = head.querySelector('#cv-review');
+  if (cvr) fillCoverReview(r.release_id, cvr, () => viewRelease(id));
   // Повтор одного этапа не трогает соседние: кнопка обращается ровно к той задаче,
   // на которой этап держится, и в тот сервис, которому она принадлежит.
   wireActions(head);

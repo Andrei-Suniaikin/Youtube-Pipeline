@@ -143,6 +143,9 @@ class ApiJobResponse(BaseModel):
     fallback_files: List[str] = Field(default_factory=list)
     # Подмножество fallback_files: текст на обложке есть, но сверить его не удалось.
     unchecked_files: List[str] = Field(default_factory=list)
+    # Что сказала сверка надписи и генератор — строки журнала задачи (04.10.2026: «как
+    # мне понять, какие обложки не прошли проверку» — студия показывает их человеку).
+    check_notes: List[str] = Field(default_factory=list)
     progress_by_language: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     error: str = ""
 
@@ -409,6 +412,23 @@ def _resolve_file_id(file_id: str, user_id: str, upload_dir: Path) -> Optional[P
     return None
 
 
+# Строки журнала задачи обложек, которые объясняют человеку итог: что сверка увидела в
+# надписи, что сверить не удалось, что генератор не отдал картинку. Только они — весь
+# журнал длинный и технический.
+_CHECK_MARKS = ("❌ Проблема:", "проверка текста не выполнена", "проверка текста не пройдена",
+                "Fast Gen не отдал картинку", "пустой результат от API",
+                "Ошибка генерации изображения")
+
+
+def check_notes_of(log: str, limit: int = 8) -> List[str]:
+    out = []
+    for line in (log or "").splitlines():
+        text = line.strip()
+        if text and any(m in text for m in _CHECK_MARKS):
+            out.append(text[:300])
+    return out[-limit:]
+
+
 def _job_to_response(job: Job) -> ApiJobResponse:
     try:
         out_files = json.loads(job.output_files or "[]")
@@ -423,6 +443,7 @@ def _job_to_response(job: Job) -> ApiJobResponse:
     except Exception:
         unchecked = []
     return ApiJobResponse(
+        check_notes=check_notes_of(job.log or ""),
         id=job.id,
         status=job.status,
         created_at=job.created_at,

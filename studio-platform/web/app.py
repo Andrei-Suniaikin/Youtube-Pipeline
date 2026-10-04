@@ -50,13 +50,14 @@ from channel_slots import (ANY_DAY, DAY_KEYS, _localize, _zone,  # noqa: E402
 from pub_engine import PHASES, PHASE_DEADLINES, IRREVERSIBLE_FROM                   # noqa: E402
 from pub_engine import confirm_by_hand as pub_engine_confirm_by_hand  # noqa: E402
 from pub_engine import revive as pub_engine_revive                # noqa: E402
+from pub_log import add as pub_log_add                           # noqa: E402
 import preset_fields                                             # noqa: E402
 import preset_links                                              # noqa: E402
 from pub_engine import channel_presets                            # noqa: E402
 from block_reasons import explain as explain_block               # noqa: E402
 from block_reasons import channel_gaps                            # noqa: E402
 from pub_remote import (COVER_BASE, LANG_TO_RU, REWRITE_BASE,     # noqa: E402
-                        YT_ID_RE, donor_cache_put_title, donor_cache_title,
+                        CoverClient, YT_ID_RE, donor_cache_put_title, donor_cache_title,
                         donor_subs, donor_text, get_key, subs_exits_state,
                         subs_probe_async, video_id)
 from pub_services import (COLLECT_BATCH, COLLECT_REASONS,        # noqa: E402
@@ -9756,6 +9757,153 @@ def ui_release_revive(release_id: str):
     finally:
         c.close()
     return out
+
+
+# ─────────────── обложка выпуска глазами человека (04.10.2026) ───────────────
+#
+# Владелец: «как мне понять, какие обложки не прошли проверку». Обложку выпуска заказывает
+# движок под ключом студии, и во вкладке «Обложка» проекта её не видно: там только задачи,
+# поставленные с этой вкладки. Здесь — та самая обложка выпуска, что сказала сверка, и два
+# решения: «взять эту» (человек проверил надпись глазами) или «перезаказать» (платно).
+
+def _release_cover_row(c, release_id: str):
+    rel = c.execute(
+        "SELECT r.release_id, r.project_id, r.status, r.phase, r.blocked_reason, "
+        "ch.lang lang FROM pub_releases r JOIN pub_channels ch ON ch.id=r.channel_id "
+        "WHERE r.release_id=? AND r.tenant_id=?", (release_id, TENANT)).fetchone()
+    if rel is None:
+        raise HTTPException(404, "выпуск не найден")
+    job = c.execute("SELECT remote_job_id, status, error FROM pub_release_jobs "
+                    "WHERE release_id=? AND service='cover' AND kind='job'",
+                    (release_id,)).fetchone()
+    return rel, job
+
+
+def _cover_verdict(info: dict) -> str:
+    """ok — сверка прошла; unchecked — не успели сверить; rejected — сверка не приняла;
+    nothing — картинки нет."""
+    files = info.get("output_files") or []
+    if not files:
+        return "nothing"
+    fb = set(info.get("fallback_files") or [])
+    unchk = set(info.get("unchecked_files") or [])
+    if not fb:
+        return "ok"
+    if fb <= unchk:
+        return "unchecked"
+    notes = " ".join(info.get("check_notes") or [])
+    # Задачи до 04.10 не знали unchecked_files: «не смогли сверить» видно только в журнале.
+    if "проверка текста не выполнена" in notes and "Проблема:" not in notes:
+        return "unchecked"
+    return "rejected"
+
+
+@app.get("/ui/releases/{release_id}/cover")
+def ui_release_cover(release_id: str):
+    c = db()
+    try:
+        rel, job = _release_cover_row(c, release_id)
+        key = get_key(c, "cover")
+    finally:
+        c.close()
+    if job is None or not job["remote_job_id"]:
+        return {"job": None}
+    out = {"job": job["remote_job_id"], "mirror": job["status"] or "",
+           "blocked": rel["status"] == "blocked"}
+    if not key:
+        return {**out, "error": "не сохранён ключ доступа к обложкам"}
+    try:
+        info = CoverClient(key).job(job["remote_job_id"])
+    except Exception as exc:                                       # noqa: BLE001
+        return {**out, "error": f"сервис обложек не ответил: {type(exc).__name__}"}
+    verdict = _cover_verdict(info)
+    return {**out, "status": info.get("status") or "", "verdict": verdict,
+            "notes": info.get("check_notes") or [],
+            "image": (f"/ui/releases/{urllib.parse.quote(release_id)}/cover/image"
+                      if verdict != "nothing" else "")}
+
+
+@app.get("/ui/releases/{release_id}/cover/image")
+def ui_release_cover_image(release_id: str):
+    c = db()
+    try:
+        rel, job = _release_cover_row(c, release_id)
+        key = get_key(c, "cover")
+    finally:
+        c.close()
+    if job is None or not job["remote_job_id"] or not key:
+        raise HTTPException(404, "у выпуска нет заказанной обложки")
+    try:
+        data = CoverClient(key).download(job["remote_job_id"], rel["lang"] or "ru")
+    except Exception as exc:                                       # noqa: BLE001
+        raise HTTPException(502, f"сервис обложек не отдал картинку: {type(exc).__name__}")
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "private, max-age=300"})
+
+
+@app.post("/ui/releases/{release_id}/cover/accept")
+def ui_release_cover_accept(release_id: str, request: Request):
+    """Человек посмотрел обложку и берёт её: файл — в проект, выпуск — в работу."""
+    user = getattr(request.state, "user", None)
+    кто = (user["name"] if user is not None else "") or "человек"
+    mod = sys.modules.get("main")
+    c = db()
+    try:
+        rel, job = _release_cover_row(c, release_id)
+        if rel["status"] != "blocked":
+            raise HTTPException(409, "выпуск не в разборе — обложку решает движок")
+        if job is None or not job["remote_job_id"]:
+            raise HTTPException(409, "у выпуска нет заказанной обложки")
+        if mod is None or not hasattr(mod, "_project_dir") or not rel["project_id"]:
+            raise HTTPException(503, "сервер студии не поднят")
+        key = get_key(c, "cover")
+        c.commit()          # сетевой вызов — без открытой записи в базу
+        try:
+            data = CoverClient(key).download(job["remote_job_id"], rel["lang"] or "ru")
+        except Exception as exc:                                   # noqa: BLE001
+            raise HTTPException(502, f"сервис обложек не отдал картинку: {type(exc).__name__}")
+        if len(data) < 5000:
+            raise HTTPException(409, "файл обложки подозрительно мал — возьмите другую")
+        _write_project_cover(mod._project_dir(TENANT, rel["project_id"]), data)
+        now = time.time()
+        c.execute("UPDATE pub_release_jobs SET status='done', error=?, updated=? "
+                  "WHERE release_id=? AND service='cover' AND kind='job'",
+                  (f"принята человеком: {кто}"[:200], now, release_id))
+        pub_log_add(c, release_id, "обложка",
+                    f"обложку взял человек ({кто}): надпись проверена глазами, "
+                    f"файл {len(data) // 1024} КБ — в проекте", now=now)
+        out = pub_engine_revive(c, release_id)
+        if not out["ok"]:
+            raise HTTPException(409, out["why"])
+        c.commit()
+        return out
+    finally:
+        c.close()
+
+
+@app.post("/ui/releases/{release_id}/cover/reorder")
+def ui_release_cover_reorder(release_id: str, request: Request):
+    """Нарисовать обложку заново — новая платная задача. Старый заказ забывается."""
+    user = getattr(request.state, "user", None)
+    кто = (user["name"] if user is not None else "") or "человек"
+    c = db()
+    try:
+        rel, job = _release_cover_row(c, release_id)
+        if rel["status"] != "blocked":
+            raise HTTPException(409, "выпуск не в разборе — обложку решает движок")
+        now = time.time()
+        c.execute("DELETE FROM pub_release_jobs WHERE release_id=? AND service='cover' "
+                  "AND kind='job'", (release_id,))
+        pub_log_add(c, release_id, "обложка",
+                    f"обложку перезаказал человек ({кто}); прежняя задача "
+                    f"{job['remote_job_id'] if job else '—'} забыта", now=now)
+        out = pub_engine_revive(c, release_id)
+        if not out["ok"]:
+            raise HTTPException(409, out["why"])
+        c.commit()
+        return out
+    finally:
+        c.close()
 
 
 @app.post("/ui/releases/{release_id}/confirm-by-hand")

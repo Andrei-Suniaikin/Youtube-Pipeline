@@ -56,6 +56,11 @@ SCENARIO = r"""
       {...base, release_id: 'd1', channel_id: 9, channel: 'Тёмные Тайны', donor_title: 'Донор',
        phase: 'created', phase_title: 'заведён', phase_index: 0,
        blocked_reason: 'у ролика нет субтитров (VideoUnplayable)', block: ДОНОР, plan_item_id: 13},
+      {...base, release_id: 'k1', channel_id: 7, channel: 'Nocne Biografie', donor_title: 'Обложка-брак',
+       blocked_reason: 'обложка деградировала дважды: текст наложен поверх картинки',
+       block: {kind: 'cover', tag: 'Обложка', title: 'сверка дважды не приняла надпись на обложке',
+               what: 'Обложка дважды нарисована.', fix: 'Посмотрите обложку на странице выпуска.',
+               revive: false, short: ''}, plan_item_id: 16},
       {...base, release_id: 'u1', channel_id: 9, channel: 'Тёмные Тайны', donor_title: 'Чужое',
        phase: 'upload_running', blocked_reason: 'зависло на шаге «upload_running»',
        block: {}, plan_item_id: 14},
@@ -70,6 +75,10 @@ SCENARIO = r"""
     ];
     window.api = async (p) => {
       if (p === '/ui/me') return ME;
+      if (p === '/ui/releases/k1/cover') return {job: 'cj1', mirror: 'error', blocked: true,
+        status: 'completed_partial', verdict: 'unchecked',
+        notes: ['⚠ проверка текста не выполнена: TimeoutError: timed out'],
+        image: '/ui/releases/k1/cover/image'};
       if (p.startsWith('/ui/releases/')) {
         const id = decodeURIComponent(p.split('/').pop());
         return {release: rels.find(r => r.release_id === id), stages: [], events: [], log: []};
@@ -161,6 +170,24 @@ SCENARIO = r"""
     out.каналВернуть = !!document.querySelector('#revive');
     out.каналРуками = !!document.querySelector('#byhand');
 
+    // ── обложка: картинка, вердикт сверки и два решения (04.10.2026) ──
+    location.hash = '#/release/k1';
+    await sleep(500);
+    const cvr = document.querySelector('#cv-review');
+    out.обложкаЕсть = !!cvr;
+    out.обложкаКартинка = cvr && cvr.querySelector('img') ? cvr.querySelector('img').getAttribute('src') : '';
+    out.обложкаВердикт = txt(cvr);
+    out.обложкаКнопки = cvr ? [...cvr.querySelectorAll('button')].map(txt) : [];
+    out.обложкаВернутьНет = !document.querySelector('#revive');
+    out.обложкаРукамиНет = !document.querySelector('#byhand');
+    const take = document.querySelector('#cv-accept');
+    if (take){
+      take.click(); await sleep(100);
+      const ok = document.querySelector('.ask-ok'); if (ok) ok.click();
+      await sleep(300);
+    }
+    out.обложкаВзята = out.posts.includes('/ui/releases/k1/cover/accept');
+
     // ── карточка: незнакомая причина — как раньше ──
     location.hash = '#/release/u1';
     await sleep(400);
@@ -188,6 +215,17 @@ def main() -> int:
         return 0
     check("ошибок на странице нет", res.get("errs"), [])
 
+    print("Обложка выпуска: картинка, вердикт и решения")
+    check("блок обложки на месте", res.get("обложкаЕсть"), True)
+    check("картинка выпуска", (res.get("обложкаКартинка") or "").endswith("/ui/releases/k1/cover/image"), True)
+    check("вердикт словами", "Сверку надписи сделать не успели" in (res.get("обложкаВердикт") or ""), True)
+    check("строка сверки без значков", "проверка текста не выполнена: TimeoutError" in (res.get("обложкаВердикт") or ""), True)
+    check("два решения", res.get("обложкаКнопки"),
+          ["Взять эту обложку", "Перезаказать — новая обложка, платно"])
+    check("«Вернуть в работу» не предлагается — не лечит", res.get("обложкаВернутьНет"), True)
+    check("«Подтвердить руками» не предлагается", res.get("обложкаРукамиНет"), True)
+    check("«Взять» — после подтверждения уходит на сервер", res.get("обложкаВзята"), True)
+
     print("Список выпусков: причина словами, с меткой")
     heads = res.get("заголовки") or []
     check("одинаковая причина собрана в группу «Настройка канала»",
@@ -198,8 +236,8 @@ def main() -> int:
           "grpcard" in (res.get("классКарточки") or "") and "channel" in res.get("классКарточки"),
           True)
     check("в карточке ровно её выпуски", res.get("строкиКарточки"), ["c1", "c2"])
-    check("остальные — в своей карточке", res.get("остальные"), ["d1", "u1", "g1"])
-    check("и она подписана", res.get("подписьОстальных"), "Остальные выпуски — 3")
+    check("остальные — в своей карточке", res.get("остальные"), ["d1", "k1", "u1", "g1"])
+    check("и она подписана", res.get("подписьОстальных"), "Остальные выпуски — 4")
     check("недосмотр канала виден в строке выпуска",
           res.get("строкаНедосмотра"), "Настройка канала у канала не выбран пресет текста")
     check("у донора метка «Проблема в доноре»", res.get("меткаДонора"), "Проблема в доноре")
@@ -222,7 +260,7 @@ def main() -> int:
     check("и сам донор — посмотреть глазами", res.get("донорСсылка"), ["https://youtu.be/dead"])
     check("убрать — через вопрос", res.get("донорСпросил"), True)
     check("тем же /ui/plan/{id}/cancel, что и календарь",
-          res.get("posts"), ["/ui/plan/13/cancel"])
+          [x for x in res.get("posts") if x.startswith("/ui/plan/")], ["/ui/plan/13/cancel"])
     check("и после — в канал, ставить другой ролик", res.get("послеУбрать"), "#/channel/9")
 
     print("\nКарточка выпуска: пресет обложек")
