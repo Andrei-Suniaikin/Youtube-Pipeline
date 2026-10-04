@@ -33,10 +33,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 
 TIMEOUT = 10
+
+# Сколько ждать, пока кабинет снова начнёт отвечать, прежде чем сдаться и сказать
+# «unknown». 04.10.2026: после перезапуска службы очередь подняла четыре задачи картинок
+# раньше, чем сервер начал принимать соединения, — каждый кадр получил URLError, был
+# пропущен («повторная оплата дороже пропуска»), и задачи упали за 30 секунд с «не хватает
+# 216 кадров из 272». Отказ в соединении значит, что запрос до кабинета не дошёл:
+# повторить его безопасно, а дождаться — дешевле, чем потерять прогон.
+WAIT_SEC = float(os.environ.get("VS_CALLS_WAIT_SEC", "180") or 180)
+# Ответы прокси, когда сам кабинет ещё не поднялся.
+_UNAVAILABLE_HTTP = (502, 503, 504)
 
 # Решения, как их отдаёт кабинет.
 NEW = "new"
@@ -78,6 +89,9 @@ class CallJournal:
         self.job_id = job_id or os.environ.get("VS_JOB_ID") or ""
         self.token = job_token or os.environ.get("VS_JOB_TOKEN") or ""
         self.log = log or (lambda *_a, **_k: None)
+        self.wait_sec = WAIT_SEC
+        self._sleep = time.sleep
+        self._clock = time.monotonic
 
     @property
     def enabled(self) -> bool:
@@ -104,11 +118,44 @@ class CallJournal:
         with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
             return json.loads(resp.read().decode("utf-8") or "{}")
 
+    def _post_patient(self, path: str, payload: dict):
+        """Тот же запрос, но кабинет, который не отвечает, ждём до `wait_sec`.
+
+        Повтор безопасен в обе стороны. Заявку (`reserve`) кабинет сводит по отпечатку:
+        вторая заявка на тот же кадр получит ответ про первую, а не второе разрешение
+        платить. Отчёты (`ordered`, `delivered`, `failed`) повторно пишут то же самое.
+        Платный вызов к провайдеру отсюда не делается никогда — ждём только журнал.
+
+        Отказ по существу (401, 403, 404, 409…) не ждём: кабинет ответил, и ответ не
+        изменится от того, что спросить ещё раз.
+        """
+        deadline = self._clock() + max(0.0, float(self.wait_sec))
+        pause, told = 1.0, False
+        while True:
+            try:
+                return self._post(path, payload)
+            except urllib.error.HTTPError as exc:
+                if exc.code not in _UNAVAILABLE_HTTP:
+                    raise
+                why = f"HTTP {exc.code}"
+                last = exc
+            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as exc:
+                why = type(exc).__name__
+                last = exc
+            if self._clock() + pause > deadline:
+                raise last
+            if not told:
+                self.log(f"[журнал] кабинет не отвечает ({why}) — жду до "
+                         f"{int(self.wait_sec)} с; платить вслепую не буду")
+                told = True
+            self._sleep(pause)
+            pause = min(pause * 2, 15.0)
+
     def reserve(self, *, unit, fingerprint, kind="", provider="", model="") -> Decision:
         if not self.enabled:
             return Decision(OFF)
         try:
-            r = self._post("/api/calls/reserve", {
+            r = self._post_patient("/api/calls/reserve", {
                 "unit": str(unit), "fingerprint": fingerprint,
                 "kind": kind, "provider": provider, "model": model})
         except urllib.error.HTTPError as exc:
@@ -147,7 +194,7 @@ class CallJournal:
         if not self.enabled or not call_id:
             return False
         try:
-            self._post(f"/api/calls/{int(call_id)}/{verb}", payload)
+            self._post_patient(f"/api/calls/{int(call_id)}/{verb}", payload)
             return True
         except Exception as exc:                                   # noqa: BLE001
             # Отчёт не доехал — работу не останавливаем: строка останется незакрытой,

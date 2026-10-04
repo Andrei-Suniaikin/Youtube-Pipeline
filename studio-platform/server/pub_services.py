@@ -789,9 +789,38 @@ class PubServices:
                     continue      # без глав ролик публикуется, просто без таймкодов
                 if kind == "images" and self._requeue_after_prompt_channel(c, rel, known):
                     return {"wait": True}
+                if (kind == "images" and state == "error"
+                        and self._frames_dropped(c, known["remote_job_id"])
+                        and self._requeue_dropped_frames(c, rel, known,
+                                                         known["remote_job_id"])):
+                    return {"wait": True}
                 raise ItemFailed(f"этап «{kind}» завершился со статусом {state}")
             if state not in TERMINAL_OK:
                 return {"wait": True}
+            if kind == "images":
+                later = self._latest_images_task(c, rel, known["remote_job_id"])
+                if later and later[1] in ("queued", "running"):
+                    # Картинки этого проекта ещё делаются (их поставил сам кабинет после
+                    # промптов или человек кнопкой) — сборку не начинаем, ждём их.
+                    mark = str(known["error"] or "")
+                    c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status=?, "
+                              "error=?, updated=? WHERE release_id=? AND service='vsgen' "
+                              "AND kind='images'",
+                              (later[0], later[1],
+                               mark if mark.startswith("images-retry:") else "re-enqueued",
+                               rel["updated"], rel["release_id"]))
+                    log_line(c, rel["release_id"], "ролик",
+                             f"картинки уже стоят в очереди (задача {later[0]}) — жду их")
+                    return {"wait": True}
+                if later and later[1] == "error" and self._frames_dropped(c, later[0]):
+                    # 04.10.2026: задача картинок, поставленная кабинетом, упала с
+                    # «не хватает 216 кадров из 272», а движок смотрел на свою, давно
+                    # сделанную задачу промптов и шёл к сборке — ролик собрался бы с
+                    # дырами. Последний прогон картинок упал — значит, кадров не хватает.
+                    if self._requeue_dropped_frames(c, rel, known, later[0]):
+                        return {"wait": True}
+                    raise ItemFailed(f"кадры выпали и после повторов: задача картинок "
+                                     f"{later[0]} завершилась ошибкой")
             if kind == "images" and not self._images_exist(rel):
                 # Кабинет на «images» мог сначала поставить задачу промптов — она done,
                 # а картинок нет. Один раз ставим этап заново, второй провал — ошибка.
@@ -891,6 +920,83 @@ class PubServices:
                  f"канал промптов отказал (исчерпан счёт или лимит) — картинки поставлены "
                  f"заново, задача {job_id}: промпты пойдут другим каналом "
                  f"(повтор {done + 1} из {self.PROMPT_CHANNEL_RETRIES})", level="warn")
+        return True
+
+    # Сколько раз подряд картинки ставятся заново, если кадры выпали. Дальше — разбор:
+    # два прогона подряд не добрали кадры, и это уже не случайность.
+    IMAGES_RETRIES = 2
+
+    def _latest_images_task(self, c, rel, after) -> tuple:
+        """(job_id, status) самой новой задачи картинок проекта новее `after`. () — нет."""
+        try:
+            after_id = int(after or 0)
+        except (TypeError, ValueError):
+            after_id = 0
+        if not rel["project_id"]:
+            return ()
+        try:
+            row = c.execute(
+                "SELECT job_id, status FROM queue_tasks WHERE project_id=? AND "
+                "kind='images' AND job_id>? ORDER BY job_id DESC LIMIT 1",
+                (rel["project_id"], after_id)).fetchone()
+        except Exception:                                          # noqa: BLE001
+            return ()
+        return (str(row["job_id"]), row["status"]) if row else ()
+
+    # Строки журнала задачи, по которым видно, что прогон упал из-за выпавших кадров, а
+    # не из-за настроек (неверная модель, схема, отказ промптов — от повтора не пройдут).
+    DROPPED_FRAME_MARKS = ("не хватает", "кадр пропущен")
+
+    def _frames_dropped(self, c, job_id) -> bool:
+        """Упала ли задача картинок из-за выпавших кадров (по её журналу)."""
+        try:
+            rows = c.execute("SELECT line FROM job_logs WHERE job_id=? ORDER BY id DESC "
+                             "LIMIT 400", (int(job_id),)).fetchall()
+        except Exception:                                          # noqa: BLE001
+            return False
+        for (line,) in rows:
+            low = str(line or "").lower()
+            if any(m in low for m in self.DROPPED_FRAME_MARKS) and "кадр" in low:
+                return True
+        return False
+
+    def _requeue_dropped_frames(self, c, rel, known, failed_job) -> bool:
+        """Задача картинок упала — поставить картинки заново, не больше IMAGES_RETRIES раз.
+
+        Просьба владельца 04.10.2026: «автоматом запускать, чтобы он фотки переделывал,
+        если какие-то дропались». Повтор дешёвый и безопасный по деньгам:
+          • готовые кадры лежат в проекте и второй раз не рисуются (`--use_cache`);
+          • заказ, который уже создавался, журнал платных вызовов второй раз оплатить
+            не даст — его опросят, а не закажут заново;
+          • заказ, который провайдер потерял (404), журнал как раз разрешает повторить.
+        Рисуются только недостающие кадры. Счёт — в зеркале этапа (`images-retry:N`);
+        «вернуть в работу» его не обнуляет, потому что ставит этап заново и так.
+        """
+        if not rel["project_id"]:
+            return False
+        mark = str(known["error"] or "")
+        done = int(mark.split(":", 1)[1]) if mark.startswith("images-retry:") \
+            and mark.split(":", 1)[1].isdigit() else 0
+        if done >= self.IMAGES_RETRIES:
+            return False
+        uid = self._uid(c, rel["tenant_id"])
+        if not uid:
+            return False
+        c.commit()      # постановка задачи откроет своё соединение — замок отпустить
+        job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], "images",
+                              self._preset_params(c, rel))
+        if not job_id:
+            return False
+        c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', error=?, "
+                  "updated=? WHERE release_id=? AND service='vsgen' AND kind='images'",
+                  (str(job_id), f"images-retry:{done + 1}", rel["updated"],
+                   rel["release_id"]))
+        log_line(c, rel["release_id"], "ролик",
+                 f"часть кадров выпала (задача картинок {failed_job} завершилась ошибкой) — "
+                 f"картинки поставлены заново, задача {job_id}. Готовые кадры остаются, "
+                 f"дорисуются только недостающие; уже оплаченные заказы журнал второй раз "
+                 f"оплатить не даст (повтор {done + 1} из {self.IMAGES_RETRIES})",
+                 level="warn")
         return True
 
     def _adopt_stage(self, c, rel, kind: str, jobs: dict) -> str:
