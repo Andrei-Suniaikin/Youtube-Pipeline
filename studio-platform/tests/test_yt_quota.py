@@ -370,7 +370,12 @@ def test_report_always_has_quota_and_why():
     check("нечего проверять — кошелёк на месте", out["quota"]["day"], pc.quota_day(NOW))
     check("и причина есть, пусть и пустая", out["why"], "")
     c2 = with_releases(1)
+    # С 04.10.2026 без ключа студия проверяет выход по публичной странице ролика
+    # (решение владельца). Здесь проверяется ВЫКЛЮЧЕННЫЙ путь: ключа нет и
+    # проверка по странице отключена — тогда, как и раньше, ничего не выдумываем.
+    V.PAGE_CHECK, _was = False, V.PAGE_CHECK
     out2 = V.run(c2, "dev", NOW, key="")
+    V.PAGE_CHECK = _was
     check("нет ключа — кошелёк всё равно в отчёте", out2["quota"]["waiting"], False)
     check("а причина названа словами", "ключа" in out2["why"], True)
     check("кошелёк отчёта читается как целое", sorted(out2["quota"])[:3],

@@ -208,7 +208,12 @@ def main() -> int:
     # Слот прошёл ДАВНО — терпение (GIVE_UP_SEC, 6 ч) заведомо вышло. Именно здесь
     # соблазн записать «не вышел» максимален, а вывод сделать не из чего.
     rid = add_release(cc, cid, now - 20 * HOUR, "scheduled", "done", video_id="vidY")
+    # С 04.10.2026 без ключа студия проверяет выход по публичной странице ролика
+    # (решение владельца). Здесь проверяется ВЫКЛЮЧЕННЫЙ путь: ключа нет и
+    # проверка по странице отключена — тогда, как и раньше, ничего не выдумываем.
+    V.PAGE_CHECK, _was = False, V.PAGE_CHECK
     out = V.run(cc, "dev", now, fetch=lambda url: {"items": []}, key="")
+    V.PAGE_CHECK = _was
     row = cc.execute("SELECT phase, blocked_reason FROM pub_releases WHERE release_id=?",
                      (rid,)).fetchone()
     logged = cc.execute("SELECT COUNT(*) FROM pub_release_log").fetchone()[0]
@@ -282,7 +287,10 @@ def main() -> int:
 
     env = dict(os.environ)
     env.update({"VS_DEV_DB": DB, "VS_ENV_FILE": EMPTY_ENV,
-                "VS_SERVER_KEYS_PATH": NO_KEYS, "VS_DEV_TENANT": "dev"})
+                "VS_SERVER_KEYS_PATH": NO_KEYS, "VS_DEV_TENANT": "dev",
+                # Выключенный путь: без ключа и без проверки по странице (с 04.10.2026
+                # по умолчанию она включена и ходила бы в настоящий YouTube).
+                "VS_PUBLIC_PAGE_CHECK": "0"})
     env.pop("VS_YT_API_KEY", None)
 
     def run_cli():

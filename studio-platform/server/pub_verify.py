@@ -141,6 +141,115 @@ def _fetch(url: str) -> dict:
         return json.loads(resp.read().decode("utf-8") or "{}")
 
 
+# ── Проверка без ключа: публичная страница ролика ────────────────────────────────
+#
+# Решение владельца 04.10.2026: ключ YouTube Data API не нужен. Выход проверяем так же,
+# как давно и успешно проверяет старый кабинет (/root/ops/ww2_sheet/published_check.py,
+# 432 подтверждения из 434): публичный oEmbed отвечает 200 только на ролик, который
+# сейчас может посмотреть любой. Не ответил — страница ролика своими словами говорит
+# почему: приватный, удалён, «слишком длинный» (канал без подтверждённого телефона).
+#
+# Чего так не видно: oEmbed отвечает 200 и на ролик «доступ по ссылке». Наши ролики
+# льются публичными, так что этот случай — редкий дефект, и ловит его только ключ.
+PAGE_CHECK = (os.environ.get("VS_PUBLIC_PAGE_CHECK", "1") or "1") != "0"
+OEMBED = "https://www.youtube.com/oembed"
+WATCH = "https://www.youtube.com/watch?v="
+PAGE_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+           "(KHTML, like Gecko) Chrome/140.0 Safari/537.36")
+VIA_PAGE = "page"
+VIA_KEY = "key"
+# Дословные причины YouTube → что делать человеку. Ключ — причина в нижнем регистре.
+PAGE_HINTS = {
+    "this video was removed because it was too long":
+        "аккаунт канала не подтверждён телефоном: без этого YouTube не держит ролики "
+        "длиннее 15 минут",
+    "this video is private": "отложка не сработала, ролик остался приватным",
+}
+_PAGE_MARKS = (
+    ("VIDEO_STATUS_REJECTED", "YouTube забраковал файл"),
+    ("This video is private", "ролик приватный — отложка не сработала"),
+    ("LOGIN_REQUIRED", "ролик приватный — отложка не сработала"),
+    ("This video has been removed", "ролик удалён"),
+    ("terminated", "канал отключён"),
+    ("not available in your country", "заблокирован по стране"),
+    ("copyright", "жалоба по правам"),
+    ("Video unavailable", "ролик недоступен (брак файла или удалён)"),
+)
+
+
+def _get_page(url: str):
+    """(код | None, тело). None — до YouTube не достучались: это не улика против ролика."""
+    req = urllib.request.Request(url, headers={"User-Agent": PAGE_UA, "Accept-Language": "en"})
+    try:
+        with urllib.request.urlopen(req, timeout=TIMEOUT) as resp:
+            return resp.status, resp.read(3_000_000).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return exc.code, ""
+    except Exception as exc:                                       # noqa: BLE001 — сеть
+        return None, type(exc).__name__
+
+
+def can_check(c) -> bool:
+    """Можно ли вообще подтверждать выход: есть ключ или включена проверка по странице."""
+    return bool(api_key(c)) or PAGE_CHECK
+
+
+def page_reason(video_id: str, get=None) -> str:
+    """Почему ролик не публичный — словами самого YouTube со страницы ролика.
+
+    Главное — блок playabilityStatus: там человеческий текст. Страница весит под
+    мегабайт, и блок лежит далеко от начала, поэтому читаем её целиком.
+    """
+    code, body = (get or _get_page)(WATCH + urllib.parse.quote(video_id, safe=""))
+    if code is None:
+        return f"страница ролика не открылась ({body})"
+    spot = re.search(r'"playabilityStatus":\{.{0,600}', body or "")
+    if spot:
+        said = re.search(r'"description":\{"content":"([^"]{3,200})"', spot.group(0))
+        why = re.search(r'"reason":"([^"]{3,200})"', spot.group(0))
+        text = (said.group(1) if said else "") or (why.group(1) if why else "")
+        if text:
+            hint = PAGE_HINTS.get(text.lower())
+            return f"YouTube: «{text}»" + (f" → {hint}" if hint else "")
+    low = (body or "").lower()
+    for needle, human in _PAGE_MARKS:
+        if needle.lower() in low:
+            return human
+    return f"страница ответила {code}, причина не опознана"
+
+
+def check_page(video_id: str, get=None) -> dict:
+    """Один ролик без ключа. Тот же вид ответа, что у `check`, плюс via='page'.
+
+    Квоты у этого пути нет и единиц он не тратит (cost=0). Причину «почему не
+    публичный» сюда не тянем: это вторая, тяжёлая страница, и нужна она только когда
+    терпение кончилось (см. `run`).
+    """
+    if not video_id:
+        return {"state": UNKNOWN, "error": "нет video_id", "cost": 0, "via": VIA_PAGE}
+    code, body = (get or _get_page)(
+        OEMBED + "?" + urllib.parse.urlencode(
+            {"format": "json", "url": f"https://youtu.be/{video_id}"}))
+    if code == 200:
+        title = ""
+        try:
+            title = str(json.loads(body or "{}").get("title") or "")
+        except Exception:                                          # noqa: BLE001
+            pass
+        return {"state": PUBLIC, "privacy": "public", "upload": "", "cost": 0,
+                "published_at": "", "title": title, "error": "", "via": VIA_PAGE}
+    if code is None:
+        return {"state": UNKNOWN, "error": f"YouTube не ответил: {body}", "cost": 0,
+                "via": VIA_PAGE}
+    if 400 <= int(code) < 500:
+        # Как у проверенного старого кабинета: любой отказ 4xx — «публично не видно»
+        # (401 приватный, 404 удалён, 400 на недоступный ролик). Почему именно — скажет
+        # страница ролика, когда кончится терпение. 5xx — сбой YouTube, вывода нет.
+        return {"state": NOT_PUBLIC, "privacy": "", "upload": "", "cost": 0,
+                "error": f"публично ролика не видно (oEmbed {code})", "via": VIA_PAGE}
+    return {"state": UNKNOWN, "error": f"oEmbed ответил {code}", "cost": 0, "via": VIA_PAGE}
+
+
 def _named(names, low: str) -> bool:
     """Встречается ли имя причины ЦЕЛИКОМ — с границей слова, а не подстрокой.
 
@@ -393,7 +502,7 @@ def хорошая_новость(c, вышли) -> str:
     return "\n".join(строки)
 
 
-def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
+def run(c, tenant=None, now=None, fetch=None, key=None, log=None, page=None) -> dict:
     """Один поздний проход. Возвращает счётчики и не бросает наружу.
 
     Что делает с каждым исходом:
@@ -436,9 +545,13 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
            # с KeyError ровно там, где всё в порядке.
            "why": "", "quota": pub_calls.quota_state(c, now=now)}
     rows = due(c, tenant, now)
+    # Без ключа — по публичной странице (решение владельца 04.10.2026). `page` — транспорт
+    # этого пути для тестов; его передача сама по себе включает путь.
+    by_page = not key and (page is not None or PAGE_CHECK)
+    out["via"] = VIA_PAGE if by_page else VIA_KEY
     if not rows:
         return out
-    if not key:
+    if not key and not by_page:
         out["unknown"] = len(rows)
         out["why"] = ("нет ключа YouTube Data API: вставить на экране «Ключи», "
                       "строка «YouTube Data API» — или задать переменной "
@@ -462,7 +575,8 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
             continue
         # Свой бюджет проверяем ПЕРЕД вызовом: когда единицы кончились по нашему же
         # счёту, идти за чужим 403 незачем — ответ известен заранее.
-        allow = pub_calls.quota_allow(c, CONSUMER, COST, now=now)
+        allow = ({"ok": True} if by_page
+                 else pub_calls.quota_allow(c, CONSUMER, COST, now=now))
         if not allow["ok"]:
             out["quota_wait"] += len(rows) - idx
             out["why"] = allow["why"]
@@ -488,7 +602,8 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
         # выпуск: пока ждём ответ googleapis (до TIMEOUT=15 с), замок записи SQLite не
         # должен быть наш, иначе кабинет и пульт на это время теряют базу.
         c.commit()
-        res = check(rel["video_id"], key, fetch=fetch, c=c, now=now)
+        res = (check_page(rel["video_id"], get=page) if by_page
+               else check(rel["video_id"], key, fetch=fetch, c=c, now=now))
         asked += 1
         if res["state"] == QUOTA:
             # 403 по квоте — это «повторить позже», а НЕ ошибка ролика: фазу не
@@ -508,6 +623,12 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
             pub_log.add(c, rid, "публикация", out["why"], level="warn", now=now)
             break
         out["checked"] += 1
+        if (by_page and res["state"] == NOT_PUBLIC
+                and now >= float(rel["slot_at"] or now) + GIVE_UP_SEC):
+            # Терпение кончилось — теперь стоит открыть страницу ролика: только она
+            # говорит, приватный он, удалён или снят за длину. Раньше незачем: это
+            # вторая, тяжёлая страница, а до срока «не виден» — обычное ожидание.
+            res = dict(res, reason=page_reason(rel["video_id"], get=page))
         payload = dict(res, video_id=rel["video_id"])
         _note(c, rid, payload, now)
 
@@ -544,13 +665,22 @@ def run(c, tenant=None, now=None, fetch=None, key=None, log=None) -> dict:
             if late < 0:
                 out["waiting"] += 1
                 continue
-            c.execute("UPDATE pub_releases SET blocked_reason=?, updated=? WHERE id=?",
-                      ("выход не подтверждён: ключ API ролика не видит", now, rel["id"]))
-            pub_log.add(c, rid, "публикация",
-                        f"прошло {int((now - float(rel['slot_at'] or now)) / 3600)} ч "
-                        f"после слота, а ролик {rel['video_id']} ключом API не виден. "
-                        f"Он либо ещё приватный, либо удалён — ключ этого не различает, "
-                        f"нужен OAuth-токен канала.", level="warn", now=now)
+            hours = int((now - float(rel["slot_at"] or now)) / 3600)
+            if by_page:
+                reason = res.get("reason") or "причина не получена"
+                c.execute("UPDATE pub_releases SET blocked_reason=?, updated=? WHERE id=?",
+                          (f"выход не подтверждён: {reason}"[:500], now, rel["id"]))
+                pub_log.add(c, rid, "публикация",
+                            f"прошло {hours} ч после слота, а ролик {rel['video_id']} "
+                            f"публично не виден. {reason}", level="warn", now=now)
+            else:
+                c.execute("UPDATE pub_releases SET blocked_reason=?, updated=? WHERE id=?",
+                          ("выход не подтверждён: ключ API ролика не видит", now, rel["id"]))
+                pub_log.add(c, rid, "публикация",
+                            f"прошло {hours} ч "
+                            f"после слота, а ролик {rel['video_id']} ключом API не виден. "
+                            f"Он либо ещё приватный, либо удалён — ключ этого не различает, "
+                            f"нужен OAuth-токен канала.", level="warn", now=now)
             out["stale"] += 1
             log(f"  {rid}: не подтверждён")
         else:

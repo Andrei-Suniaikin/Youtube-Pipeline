@@ -258,12 +258,14 @@ def _confirm_state(rel, checked: dict, now: float, have_key: bool, quota: dict) 
         # Терпение кончилось: ключ не видит ролика дольше `GIVE_UP_SEC`. До этого срока
         # тот же ответ — ещё ожидание, а не задержка, и смешивать их нельзя: иначе сводка
         # объявит сорванным каждый выход через полчаса после слота.
-        return "delayed", ("ключ API ролика не видит: он либо ещё приватный, "
+        if (answer or {}).get("reason"):
+            return "delayed", str(answer["reason"])
+        return "delayed", ("YouTube не показывает ролик публично: он либо ещё приватный, "
                            "либо удалён")
     # Всё остальное — «не знаем», и каждому виду незнания своя причина.
     if not have_key:
-        return "unknown", ("нет ключа YouTube Data API — подтвердить выход нечем; "
-                           "ключ вставляется на экране «Ключи»")
+        return "unknown", ("проверка выхода выключена: нет ключа YouTube Data API, "
+                           "и проверка по странице ролика отключена (VS_PUBLIC_PAGE_CHECK=0)")
     if quota:
         return "unknown", pub_calls.quota_why(quota)
     if now < slot + pub_verify.GRACE_SEC:
@@ -336,7 +338,7 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None,
     tags = _tags_by_channel(c, tenant_id)
 
     if have_key is None:
-        have_key = bool(pub_verify.api_key(c))
+        have_key = pub_verify.can_check(c)
     quota = pub_calls.quota_wait(c, now=now)
 
     # ── строки плана: что ещё впереди и что ожидалось сегодня ──

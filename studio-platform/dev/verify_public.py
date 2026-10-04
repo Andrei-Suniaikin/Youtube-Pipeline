@@ -103,7 +103,9 @@ def main() -> int:
             return 0
 
         key = args.key or V.api_key(c)
-        print(f"ключ: {mask(key) if key else 'нет — проверка невозможна'}")
+        print(f"ключ: {mask(key)}" if key else
+              ("ключа нет — проверяю по публичной странице ролика" if V.PAGE_CHECK
+               else "ключа нет, проверка по странице выключена — проверка невозможна"))
         now = time.time()
         rows = V.due(c, TENANT, now, args.grace)
         print(f"пора спросить: {len(rows)} (слот прошёл больше "
@@ -115,7 +117,7 @@ def main() -> int:
             if rows:
                 print("\nэто только показ. Чтобы спросить YouTube: --run")
             return 0
-        if not key:
+        if not key and not V.PAGE_CHECK:
             print("\nбез ключа спрашивать нечем: вставить на экране «Ключи», строка "
                   "«YouTube Data API», или задать VS_YT_API_KEY на сервере")
             # Провал — только когда ключа не хватило для настоящей работы. Пустая
