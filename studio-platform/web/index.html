@@ -1444,7 +1444,11 @@ async function fillCoverReview(rid, box, onDone){
     ${d.image ? `<a href="${pultUrl(d.image)}" target="_blank" class="cvr-img"><img
       src="${pultUrl(d.image)}" alt="Обложка выпуска"></a>` : ''}
     <div class="cvr-body">
-      <p><b>${esc(COVER_VERDICT[d.verdict] || '')}</b></p>
+      <p><b>${esc(d.verdict === 'rejected' && !notes
+        // Задачу перезапускали — журнал начался заново, и строк сверки в нём нет.
+        ? 'Сверка не приняла надпись на обложке; подробностей не сохранилось (задачу '
+          + 'перезапускали). Посмотрите надпись сами.'
+        : (COVER_VERDICT[d.verdict] || ''))}</b></p>
       ${notes ? `<ul class="cvr-notes">${notes}</ul>` : ''}
       ${d.blocked && d.verdict !== 'running' ? `<div class="blkacts">
         ${d.image ? '<button class="ghost cv-accept">Взять эту обложку</button>' : ''}

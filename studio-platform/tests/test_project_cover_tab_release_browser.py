@@ -63,6 +63,20 @@ SCENARIO = r"""
               const ok = document.querySelector('.ask-ok'); if (ok) ok.click(); await pause(300); }
     out.перезаказ = out.posts.includes('/ui/releases/r9/cover/reorder');
 
+    // Строк сверки нет (задачу перезапускали) — не «…не приняла надпись:» с пустотой.
+    window.api = async p => {
+      if (p === '/ui/releases/r7/cover') return {job: 'cj7', mirror: 'error', blocked: true,
+        status: 'completed_partial', verdict: 'rejected', notes: [],
+        image: '/ui/releases/r7/cover/image'};
+      if (p.startsWith('/ui/covers')) return COVERS;
+      return {};
+    };
+    app.innerHTML = '';
+    await renderCoverTab({project: {id: 'p7', name: 'Перезапускали', release_id: 'r7'},
+                          files: [], jobs: [], origin: null});
+    await pause(300);
+    out.безСтрок = (app.querySelector('[data-cvr]') || {}).textContent || '';
+
     app.innerHTML = '';
     await renderCoverTab({project: {id: 'p8', name: 'Без выпуска'}, files: [], jobs: [],
                           origin: null});
@@ -88,6 +102,8 @@ def main() -> int:
     check("и решения", r.get("кнопки"), ["Взять эту обложку", "Перезаказать — новая обложка, платно"])
     check("«Перезаказать» уходит на сервер", r.get("перезаказ"), True)
     check("у проекта без выпуска карточки нет", r.get("безВыпуска"), False)
+    check("строк сверки нет — так и сказано, без пустого двоеточия",
+          "подробностей не сохранилось" in (r.get("безСтрок") or ""), True)
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
