@@ -58,6 +58,48 @@ if [ "${1:-}" = "--rollback" ]; then
     exit 0
 fi
 
+# ── Идущие заливки: перезапуск их рвёт ───────────────────────────────────────
+#
+# 04.10.2026: выкатка в 13:04 перезапустила студию, пока минская машина забирала файл
+# ролика, — нода получила 502 и сорвала заливку («нода: HTTP Error 502: Bad Gateway»).
+# Посреди передачи было бы хуже: ролик ушёл бы в YouTube, а отчёт о нём — нет, и выпуск
+# встал бы на ручную сверку. Поэтому ДО перехода на новый код ждём, пока заливки
+# закончатся (до STUDIO_UPLOAD_WAIT_SEC), а не дождались — выкатку не делаем: код на
+# диске и работающий процесс не должны расходиться. STUDIO_FORCE_RESTART=1 — без ожидания.
+UPLOAD_DB="${STUDIO_DB:-$ROOT/data/vsgen.db}"
+UPLOAD_WAIT="${STUDIO_UPLOAD_WAIT_SEC:-900}"
+UPLOAD_POLL="${STUDIO_UPLOAD_POLL_SEC:-10}"
+uploads_running() {
+    [ -f "$UPLOAD_DB" ] || { echo 0; return; }
+    sqlite3 -readonly -cmd ".timeout 8000" "$UPLOAD_DB" \
+        "SELECT COUNT(*) FROM pub_upload_jobs WHERE status='running'" 2>/dev/null || echo "?"
+}
+wait_uploads() {
+    if [ "${STUDIO_FORCE_RESTART:-}" = "1" ]; then
+        say "перезапуск без ожидания заливок (STUDIO_FORCE_RESTART=1)"
+        return 0
+    fi
+    local n waited=0
+    n="$(uploads_running)"
+    while [ "$n" != "0" ]; do
+        if [ "$n" = "?" ]; then
+            say "не смог спросить базу, идут ли заливки ($UPLOAD_DB) — выкатываю без ожидания"
+            return 0
+        fi
+        if [ "$waited" -ge "$UPLOAD_WAIT" ]; then
+            say "заливок в работе: $n, ждал $waited с — выкатку НЕ делаю, код не тронут."
+            say "повторите позже или с STUDIO_FORCE_RESTART=1 (сорвёт идущую заливку)"
+            return 1
+        fi
+        [ "$waited" -eq 0 ] && say "идёт заливка ($n) — жду, пока закончится, до $UPLOAD_WAIT с"
+        sleep "$UPLOAD_POLL"
+        waited=$((waited + UPLOAD_POLL))
+        n="$(uploads_running)"
+    done
+    return 0
+}
+wait_uploads || exit 2
+
 TARGET="${1:-}"
 CURRENT="$(git rev-parse HEAD)"
 echo "$CURRENT" > "$PREV_FILE"

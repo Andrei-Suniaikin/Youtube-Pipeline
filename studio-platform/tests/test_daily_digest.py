@@ -739,6 +739,22 @@ def part_period_and_blockers():
           two["today"]["expected"] >= day["today"]["expected"], True)
     c.close()
 
+    print("\n«Проблемы» — про сегодня, даже когда числа за период")
+    c = fresh()
+    x = channel(c, "Вчерашний", {"*": ["10:00"]})
+    plan(c, x, day_at(10, day=6))                 # вчерашний выход, ролика не было
+    a, b = D.period_bounds("2026-10-06", "2026-10-07", "UTC")
+    per = D.collect(c, TID, now=NOW, have_key=False, since=a, until=b)
+    check("в числах периода вчерашний выход задержан", per["today"]["delayed"], 1)
+    # Канал может быть в проблемах по другой причине (кончился запас) — это правда;
+    # проверяем, что его не держит там ВЧЕРАШНИЙ пропущенный выход.
+    check("а вчерашний пропуск в проблемы не попал",
+          [p_["why"] for p_ in per["problems"]
+           if p_["channel"] == "Вчерашний" and "не заводился" in p_["why"]], [])
+    check("пояснение не про «сегодняшний»",
+          any("сегодняшний" in w for w in per["today"]["why"]), False)
+    c.close()
+
     print("\nБлокеры — по смыслу причины и по тому, кто чинит")
     c = fresh()
     a1 = channel(c, "Альфа", {"*": ["10:00"]})

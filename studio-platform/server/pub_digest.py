@@ -370,13 +370,17 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None,
     today = {"expected": len(today_items), "ahead": ahead_today, "confirmed": 0,
              "by_hand": 0, "delayed": 0, "unknown": 0, "why": []}
     delayed_by_channel: dict = {}
+    # «Проблемы» — про сегодня, даже когда числа экрана за месяц (04.10.2026): иначе каждый
+    # пропущенный с первого числа выход делал канал «проблемным», и список тонул в
+    # прошлом — включая канал, чей сегодняшний ролик уже стоит в расписании.
+    day_since, day_until = day_bounds(now, tz_name)
     for item in today_items:
         rel = releases.get(item["id"])
         kind, why = _confirm_state(rel, checked, now, have_key, quota)
         today[kind] += 1
         if kind == "unknown" and why and why not in today["why"]:
             today["why"].append(why)
-        if kind == "delayed":
+        if kind == "delayed" and day_since <= float(item["slot_at"]) < day_until:
             delayed_by_channel.setdefault(item["channel_id"], why)
 
     # Чем подтверждать нечего — говорим ВСЕГДА, а не только когда осталось «не знаем».
@@ -399,8 +403,8 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None,
         if gap not in today["why"]:
             today["why"].append(gap)
     elif not have_key and today_items and today["delayed"] == len(today_items):
-        gap = ("ни один сегодняшний выпуск до канала не дошёл — подтверждать нечего, "
-               "ключ тут ни при чём")
+        gap = ("ни один выпуск, чьё время уже наступило, до канала не дошёл — "
+               "подтверждать нечего, ключ тут ни при чём")
         if gap not in today["why"]:
             today["why"].append(gap)
     elif quota:
