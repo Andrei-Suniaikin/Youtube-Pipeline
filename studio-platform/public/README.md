@@ -77,3 +77,14 @@ application's home page».
 взятого с потолка: Google сверяет страницы с тем, что приложение делает на самом деле, а
 несовпадение — повод для отказа. Всё, что нельзя было взять из кода студии, оставлено
 подстановкой.
+
+## Как выложено (04.10.2026)
+
+Домен — **vovastudio.work** (Cloudflare). Значения подстановок — в `site.json`, сборка:
+
+    .venv/bin/python public/build_pages.py --out /srv/studio/public
+
+На сервере Caddy отдаёт `https://vovastudio.work/`, `/privacy`, `/terms` из
+`/srv/studio/public` без входа; остальное на этом домене — студия (`/studio/`);
+`www.vovastudio.work` перенаправляет на основной адрес. Почта `support@vovastudio.work`
+работает через Cloudflare Email Routing (пересылка на ящик владельца).
