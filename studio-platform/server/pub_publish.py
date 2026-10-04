@@ -42,6 +42,32 @@ SYSTEM = (
 )
 
 
+# Начало ответа, которым модель ОТКАЗЫВАЕТСЯ писать, а не пишет. 04.10.2026 на канал ВВ2
+# «Ημερολόγια του Μετώπου» вышел ролик fMYByvfhsQU с названием «I can't help rewrite titles
+# that use sexual violence…»: ответ был длиннее 10 знаков, и проверка длины его пропустила.
+# Ищем только в НАЧАЛЕ строки: честное название может содержать «sorry» в середине.
+TITLE_REFUSAL_RE = re.compile(
+    r"^\s*(?:"
+    r"i\s+(?:can['’]?t|cannot|can\s+not|won['’]?t|will\s+not|am\s+(?:not\s+able|unable|sorry))\b"
+    r"|i['’]m\s+(?:not\s+able|unable|sorry)\b"
+    r"|sorry\b|unfortunately,?\s+i\b|as\s+an\s+ai\b"
+    r"|извини(?:те)?\b|простите\b|к\s+сожалению,?\s+(?:я|не)\b"
+    r"|я\s+не\s+(?:могу|буду|стану)\s+(?:помочь|переписать|написать|выполнить|создать)\b"
+    r"|не\s+могу\s+(?:помочь|переписать|написать|выполнить)\b"
+    r")",
+    re.I)
+
+
+def refusal_in(title: str) -> bool:
+    """Похоже ли «название» на отказ модели. Тогда это не название, а повод остановиться."""
+    return bool(TITLE_REFUSAL_RE.search(title or ""))
+
+
+def refused(title: str) -> "TitleError":
+    return TitleError(f"модель отказалась писать название: «{title[:80]}» — нужен другой "
+                      f"донор или название вручную")
+
+
 class TitleError(RuntimeError):
     """Название сделать не удалось по вине ЭТОЙ строки (нет исходного названия и т.п.)."""
 
@@ -98,6 +124,8 @@ def make_title(donor_title: str, lang: str, api_key: str, model: str = "gpt-4.1-
     except Exception:
         raise TitleError("не разобрал ответ модели")
     title = clean_title(text)
+    if refusal_in(title):
+        raise refused(title)
     if len(title) < 10:
         raise TitleError(f"модель вернула слишком короткое название: {title!r}")
     return title
@@ -152,6 +180,8 @@ def make_title_codex(donor_title: str, lang: str, rewrite_key: str, base: str,
     except ValueError:
         raise TitleUnavailable("не разобрал ответ сервиса текста")
     title = clean_title(text)
+    if refusal_in(title):
+        raise refused(title)
     if len(title) < 10:
         raise TitleUnavailable(f"подписка вернула слишком короткое название: {title!r}")
     return title
