@@ -125,6 +125,20 @@ def test_journal_waits() -> None:
     check("ждали не дольше срока", clock.t <= 30, True)
     check("и ждали, а не сдались сразу", clock.t >= 15, True)
 
+    print("\n  не дождались целиком — следующие запросы не ждут, пока кабинет не ответит")
+    j, clock, lines, calls = journal([refused()], wait=30)
+    j.reserve(unit="001", fingerprint="f")
+    waited = clock.t
+    d = j.reserve(unit="002", fingerprint="f")
+    check("второй кадр — сразу unknown, без новых трёх минут", (d.action, clock.t), ("unknown", waited))
+    j._post = lambda path, payload: {"action": "new", "call_id": 3}
+    check("кабинет ответил", j.reserve(unit="003", fingerprint="f").action, "new")
+    seq = [refused(), {"action": "new", "call_id": 4}]
+    j._post = lambda path, payload: (lambda x: (_ for _ in ()).throw(x) if isinstance(x, BaseException) else x)(seq.pop(0))
+    t0 = clock.t
+    check("после ответа снова ждём при обрыве", j.reserve(unit="004", fingerprint="f").action, "new")
+    check("...и правда ждали", clock.t > t0, True)
+
     print("\n  отказ по существу (401) — сразу, без ожидания")
     j, clock, lines, calls = journal([http_err(401)])
     d = j.reserve(unit="001", fingerprint="f")
@@ -225,7 +239,8 @@ def fresh(images_status="error", images_mark=None, logs=DROPPED, mirror_job=12,
 
 REL = {"release_id": "rel-1", "tenant_id": "dev", "project_id": "proj-1", "lang": "pl",
        "preset_cover": "", "donor_url": "https://youtu.be/aaa", "updated": NOW}
-PDIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "_tmp_dropped_frames")
+import tempfile                                                   # noqa: E402
+PDIR = tempfile.mkdtemp(prefix="dropped-frames-")
 os.makedirs(os.path.join(PDIR, "googler"), exist_ok=True)
 open(os.path.join(PDIR, "googler", "001.jpg"), "wb").write(b"x")
 

@@ -174,6 +174,9 @@ def main() -> int:
     print("\nКабинет недоступен — платить не разрешаем")
     down = CallJournal(base="http://127.0.0.1:1", job_id=jid, job_token=token,
                        log=lambda m: None)
+    # С 04.10.2026 клиент сперва ждёт кабинет (до 180 с, см. test_images_dropped_frames);
+    # здесь проверяется только итог — «unknown», поэтому ждём секунду, а не три минуты.
+    down.wait_sec = 1
     d_down = down.reserve(unit="test-z", fingerprint=fp)
     check("решение unknown", d_down.action, "unknown")
     check("обращаться к провайдеру НЕЛЬЗЯ", d_down.may_call, False)

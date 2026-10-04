@@ -90,6 +90,10 @@ class CallJournal:
         self.token = job_token or os.environ.get("VS_JOB_TOKEN") or ""
         self.log = log or (lambda *_a, **_k: None)
         self.wait_sec = WAIT_SEC
+        # Кабинет уже не дождались целиком — дальше не ждём, пока он снова не ответит.
+        # Иначе при долгом простое каждый кадр ждал бы по три минуты подряд, и задача
+        # на 266 кадров висела бы часами, вместо того чтобы честно кончиться.
+        self._gave_up = False
         self._sleep = time.sleep
         self._clock = time.monotonic
 
@@ -129,11 +133,14 @@ class CallJournal:
         Отказ по существу (401, 403, 404, 409…) не ждём: кабинет ответил, и ответ не
         изменится от того, что спросить ещё раз.
         """
-        deadline = self._clock() + max(0.0, float(self.wait_sec))
+        wait = 0.0 if self._gave_up else max(0.0, float(self.wait_sec))
+        deadline = self._clock() + wait
         pause, told = 1.0, False
         while True:
             try:
-                return self._post(path, payload)
+                answer = self._post(path, payload)
+                self._gave_up = False
+                return answer
             except urllib.error.HTTPError as exc:
                 if exc.code not in _UNAVAILABLE_HTTP:
                     raise
@@ -143,6 +150,8 @@ class CallJournal:
                 why = type(exc).__name__
                 last = exc
             if self._clock() + pause > deadline:
+                if wait > 0:
+                    self._gave_up = True
                 raise last
             if not told:
                 self.log(f"[журнал] кабинет не отвечает ({why}) — жду до "
