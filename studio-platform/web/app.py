@@ -486,10 +486,20 @@ def _stages(c, rel: dict) -> list:
                 if job["remote_job_id"]:
                     row["facts"].append(f'задача {job["remote_job_id"]}')
                     # Этап делает сосед — значит и отменять/повторять его должен он.
-                    row["job"] = {"service": service, "id": job["remote_job_id"],
-                                  "status": job["status"] or ""}
+                    # Кроме обложки (04.10.2026, владелец: «нажимаю стрелочку по кругу —
+                    # страница обновляется, а обложка по новой не начинает делаться»):
+                    # «повторить» уходил прямо в сервис обложек мимо движка — тот
+                    # перерисовывал (платно), а выпуск так и стоял в разборе, и о новой
+                    # картинке движок не узнавал. Решения по обложке выпуска — в рамке
+                    # остановки: «Взять эту обложку» и «Перезаказать».
+                    if service != "cover":
+                        row["job"] = {"service": service, "id": job["remote_job_id"],
+                                      "status": job["status"] or ""}
                 if job["error"]:
                     row["note"] = job["error"]
+                if service == "cover" and rel.get("status") == "blocked":
+                    row["note"] = ("обложку решает человек — выше: «Взять эту обложку» "
+                                   "или «Перезаказать»")
 
         elif source.startswith("queue:"):
             kind = source.split(":", 1)[1]

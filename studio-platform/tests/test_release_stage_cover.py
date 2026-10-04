@@ -94,6 +94,13 @@ def main() -> int:
           [("covers", "image", ["cover.jpg"])])
     check("адрес файлов — пульта", cov["file_base"], "/ui/projects/p1/file/")
     check("этап готов", cov["state"], "done")
+    check("у этапа обложки нет своих «повторить/отменить» — они шли мимо движка",
+          cov["job"], None)
+    c = db()
+    blocked = {s_["key"]: s_ for s_ in W._stages(c, {"release_id": "r1", "project_id": "p1",
+                                                     "status": "blocked"})}["cover"]
+    c.close()
+    check("у выпуска в разборе — куда жать", "«Взять эту обложку»" in blocked["note"], True)
     check("кадры обложку к себе не забрали",
           [f["code"] for f in stages["images"]["files"]], ["images"])
 
