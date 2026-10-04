@@ -648,6 +648,12 @@ REQUEST_TIMEOUT = 200
 VIDEO_POLL_TIMEOUT = int(os.environ.get("VS_VIDEO_POLL_TIMEOUT", "3000") or 3000)  # было 300
 IMAGE_POLL_TIMEOUT = int(os.environ.get("VS_IMAGE_POLL_TIMEOUT", "10000") or 10000)  # было 1000
 VIDEO_POLL_INTERVAL = 5   # Интервал опроса статуса
+# Сколько секунд подряд провайдер должен отвечать «такого заказа нет» (404), чтобы опрос
+# перестал ждать. 04.10.2026: шесть заказов, потерянных провайдером, держали оба места
+# картинок с 12:25 — опрос считал 404 «статус неизвестен» и ждал полный таймаут кадра
+# (10 000 с), а каждый перезапуск студии начинал этот отсчёт заново. Пауза, а не первый
+# же ответ: только что созданный заказ на мгновение может быть ещё не виден.
+V6_LOST_GRACE_SEC = int(os.environ.get("VS_V6_LOST_GRACE_SEC", "120") or 120)
 # VeoNonStop: провайдер предупредил «сильно медленнее» (рекапча стороннего вендора),
 # их таск-таймаут 30 мин. Даём 20 мин на задачу, опрос каждые 10с (по их рекомендации).
 VEO_POLL_TIMEOUT = int(os.environ.get("VS_VEO_POLL_TIMEOUT", "12000") or 12000)  # было 1200
@@ -7366,6 +7372,7 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
     if timeout is None:
         timeout = VIDEO_POLL_TIMEOUT
     start = time.time(); hb = 0.0
+    lost_since = None          # с какого момента провайдер подряд отвечает «заказа нет»
     while time.time() - start < timeout:
         r = googler_request_v6(f"generations/{gen_id}", method="GET")
         st = r.get("status", "unknown")
@@ -7411,6 +7418,21 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
                 # запоминаем: мёртвый ключ отвечает отказом на КАЖДЫЙ опрос, и без этого
                 # наверх уезжал голый «таймаут операции» без единого слова почему.
                 _set_provider_refusal(str(r["_error"]))
+            # Исключение одно: провайдер сам говорит, что заказа у него нет («not found
+            # or expired»). Результата по нему не будет никогда, и ждать полный таймаут
+            # кадра — значит держать место картинок часами. Решает вызывающий: ветка
+            # журнала помечает заказ потерянным, и кадр заказывается заново.
+            if str(r.get("_error") or "").startswith("HTTP 404"):
+                now = time.time()
+                if lost_since is None:
+                    lost_since = now
+                elif now - lost_since >= V6_LOST_GRACE_SEC:
+                    print_user(f"❌ [{index}] v6: провайдер не знает заказ {gen_id} — "
+                               f"{int(now - lost_since)}с подряд отвечает 404 "
+                               f"(«не найден или истёк»), ждать нечего", "ERROR")
+                    return None
+            else:
+                lost_since = None
             el = time.time() - start
             if el - hb >= 15:
                 print_user(f"v6 операция [{index}]: {int(el)}с ({st})...", "PROCESS")
