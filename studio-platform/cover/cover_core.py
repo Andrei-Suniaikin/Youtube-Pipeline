@@ -677,7 +677,15 @@ def _subscription_call(provider: str, messages: list, model: str = "",
 
 def _subscription_vision(images_list, prompt: str, provider: str, model: str) -> str:
     """Анализ картинки подпиской. Картинки уходят теми же PNG-base64, что и в OpenAI."""
-    blobs = [image_to_base64(im, "PNG") for im in images_list]
+    # 04.10.2026: две картинки PNG в полном размере (обложка 1376x768 + превью донора)
+    # весят ~4 МБ в base64 — сервис текста отвечал 413 (REWRITE_MAX_JSON_BODY_BYTES), и
+    # сверка надписи не выполнялась ни разу: каждая обложка студии шла в брак. Для чтения
+    # надписи хватает 1024 точек по длинной стороне.
+    blobs = []
+    for im in images_list:
+        small = im.copy()
+        small.thumbnail((1024, 1024))
+        blobs.append(image_to_base64(small, "PNG"))
     return _subscription_call(provider, [{"role": "user", "content": prompt}],
                               model=model, images=blobs)
 

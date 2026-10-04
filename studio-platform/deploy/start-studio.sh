@@ -132,6 +132,27 @@ if [ -n "$_coverkey" ]; then
   export COVER_ALT_MODEL="${COVER_ALT_MODEL:-gpt-5.6-terra}"
   export VS_ALT_LLM_KEY="${VS_ALT_LLM_KEY:-$_coverkey}"
 fi
+# --- ключ FastGen для модуля обложек (04.10.2026) -----------------------------------
+# Без него /cover/api/v1/jobs отвечает 503 «нет доступных ключей провайдера», и выпуски
+# стоят на шаге обложки. Берём ключи семейства googler (основной + пул) — те же, что у
+# картинок студии; одна копия секрета — в файле ключей.
+if [ -z "${COVER_FAST_GEN_KEYS:-}" ] && [ -z "${COVER_FAST_GEN_KEY:-}" ]; then
+  _fgkeys="$("$PY" - "$VS_SERVER_KEYS_PATH" <<'CFGK'
+import json, sys
+try:
+    data = json.load(open(sys.argv[1]))
+except Exception:
+    raise SystemExit
+keys = []
+for v in [data.get("googler")] + list(data.get("googler_pool") or []):
+    if isinstance(v, str) and v.strip() and v.strip() not in keys:
+        keys.append(v.strip())
+print(",".join(keys))
+CFGK
+)"
+  [ -n "$_fgkeys" ] && export COVER_FAST_GEN_KEYS="$_fgkeys"
+  unset _fgkeys
+fi
 unset _altkey _coverkey
 
 cd "$APP"

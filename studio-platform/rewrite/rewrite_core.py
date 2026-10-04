@@ -9259,6 +9259,7 @@ def call_codex_subscription(
                         model=model,
                         log_queue=log_queue,
                         task_info=task_info,
+                        images=images,  # 04.10.2026: картинки терялись на этом повороте
                         _credential_leased=True,
                         _codex_home_override="",
                     )
@@ -9278,6 +9279,7 @@ def call_codex_subscription(
                 model=model,
                 log_queue=log_queue,
                 task_info=task_info,
+                images=images,  # 04.10.2026: картинки терялись на этом повороте
                 _credential_leased=True,
                 _codex_home_override=codex_home,
             )
@@ -9340,6 +9342,12 @@ def call_codex_subscription(
                 with open(image_path, "wb") as fh:
                     fh.write(blob)
                 cmd += ["-i", image_path]
+            # 04.10.2026: `-i/--image <FILE>...` принимает НЕСКОЛЬКО значений и съедал
+            # следующий `-` как ещё одну картинку — модель отвечала «картинки не
+            # переданы», и сверка надписи обложек не работала ни разу. `--` закрывает
+            # список флагов, после него `-` снова значит «задание из stdin».
+            if images:
+                cmd.append("--")
             cmd.append("-")
             cmd = _wrap_codex_linux_sandbox(
                 cmd,
