@@ -35,6 +35,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 from api_auth import get_api_user
 from job_queue import Job, JobQueue, JobStatus, JobType
 from rewrite_core import (
+    HOST_BUDGET_WAIT_PREFIX,
     LANGUAGES,
     call_codex_subscription,
     call_claude_subscription,
@@ -109,6 +110,39 @@ _LEGACY_SHORT_CODES: Dict[str, str] = {
     "po": "Portuguese (legacy short code, not ISO 'pt'; both 'po' and 'pt' accepted on input, response uses 'po')",
 }
 
+
+
+# 04.10.2026: названия роликов и сверка обложек не проходили. Общий предел подписки
+# (VIDEO_STUDIO_CREDENTIAL_BUDGET_CODEX) почти всегда занят шестью задачами рерайта, а
+# аренда ключа ждёт свободного места всего 2 с и отвечает «HOST_BUDGET_WAIT». Задачу
+# рерайта такой ответ не роняет — её откладывает и повторяет своя очередь. У одноразового
+# вызова очереди нет: он получал 502 за 2 с и проигрывал рерайту почти каждый раз.
+# Поэтому одноразовый вызов сам ждёт места, но не дольше REWRITE_CHAT_ONCE_WAIT_SEC.
+CHAT_ONCE_WAIT_SEC = float(os.environ.get("REWRITE_CHAT_ONCE_WAIT_SEC", "150") or 150)
+
+
+def wait_for_slot(call: Callable[[], Tuple[bool, str]], wait_sec: Optional[float] = None,
+                  sleep: Optional[Callable[[float], None]] = None,
+                  clock: Optional[Callable[[], float]] = None) -> Tuple[bool, str]:
+    """Повторять `call()`, пока подписка отвечает «общий лимит занят», — до срока.
+
+    Любой другой отказ (лимит окна, ошибка модели, нет подписки) возвращается сразу:
+    от ожидания он не пройдёт. Платного здесь ничего нет — это подписка, а повтор
+    начинается только с отказа ДО вызова провайдера.
+    """
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    limit = CHAT_ONCE_WAIT_SEC if wait_sec is None else max(0.0, float(wait_sec))
+    deadline = clock() + limit
+    pause = 1.0
+    while True:
+        ok, text = call()
+        if ok or not str(text or "").startswith(HOST_BUDGET_WAIT_PREFIX):
+            return ok, text
+        if clock() + pause > deadline:
+            return ok, text
+        sleep(pause)
+        pause = min(pause * 2, 8.0)
 
 def resolve_lang_input(raw: str) -> Tuple[Optional[str], List[str]]:
     """
@@ -709,12 +743,12 @@ def build_api_router(
         if not messages:
             raise HTTPException(status_code=400, detail="нечего спрашивать")
         if provider == "codex":
-            ok, text = call_codex_subscription(
+            ok, text = wait_for_slot(lambda: call_codex_subscription(
                 messages=messages, model=body.model or "gpt-5.1-codex-max",
-                task_info="chat-once", images=images or None)
+                task_info="chat-once", images=images or None))
         else:
-            ok, text = call_claude_subscription(
-                messages, None, "chat-once", body.model or "", "")
+            ok, text = wait_for_slot(lambda: call_claude_subscription(
+                messages, None, "chat-once", body.model or "", ""))
         if not ok:
             # Причину отдаём как есть: она уже очищена от секретов на стороне вызова.
             raise HTTPException(status_code=502, detail=str(text)[:400])
