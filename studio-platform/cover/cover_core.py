@@ -2176,6 +2176,10 @@ def _generate_simple_edit(
     max_attempts = max(1, getattr(preset_lang, "max_generation_retries", 5))
 
     generated = None
+    # 04.10.2026: последняя картинка, которую провайдер ОТДАЛ. Раньше пустой ответ на
+    # второй попытке затирал оплаченную первую (не прошедшую сверку), и задача кончалась
+    # «все попытки вернули пустой результат» — оплаченная картинка выбрасывалась.
+    last_paid = None
     for attempt in range(max_attempts):
         if cancelled():
             result.error = "Отменено пользователем"
@@ -2200,6 +2204,8 @@ def _generate_simple_edit(
             note=f"simple/attempt{attempt + 1}",
             log=log,
         )
+        if generated:
+            last_paid = generated
         if cancelled():
             result.error = "Отменено пользователем"
             return result
@@ -2236,6 +2242,7 @@ def _generate_simple_edit(
             return result
         log(f"   ❌ Проблема: {details.get('issues', '')}")
 
+    generated = generated or last_paid
     if not generated:
         result.error = f"Ошибка генерации изображения (все {max_attempts} попыток вернули пустой результат)"
         return result
@@ -2330,6 +2337,7 @@ def _generate_for_language(
             return result
 
         generated = None
+        last_paid = None          # см. _generate_simple_edit: пустой ответ не затирает оплаченный
         max_attempts = max(1, getattr(preset_lang, "max_generation_retries", 5))
         debug_log = log_fn if getattr(preset_lang, "debug_mode", False) else None
         gen_failures = 0
@@ -2357,6 +2365,8 @@ def _generate_for_language(
                 note=f"{mode}/attempt{attempt + 1}",
                 log=log,
             )
+            if generated:
+                last_paid = generated
             if cancelled():
                 result.error = "Отменено пользователем"
                 return result
@@ -2392,6 +2402,7 @@ def _generate_for_language(
             log(f"   ❌ Проблема: {check_details.get('issues', '')}")
 
         # Все попытки исчерпаны
+        generated = generated or last_paid
         if not generated:
             result.error = f"Ошибка генерации изображения (все {max_attempts} попыток вернули пустой результат)"
             return result
