@@ -591,7 +591,7 @@ def part_screen():
     # С 03.10.2026 между ними стоит «Выпуски» — проверяем, что «Сводка» в списке подсветки.
     check("вкладка подсвечивается", "for (const id of ['digest', " in src, True)
     check("экран нарисован своей функцией", "async function viewDigest(){" in src, True)
-    check("экран берёт данные с сервера", "api('/ui/digest')" in src, True)
+    check("экран берёт данные с сервера", "api('/ui/digest' + (chosen" in src, True)
     # Текст отчёта копируется ТОТ ЖЕ, что уходит в телеграм: если экран соберёт свой,
     # два отчёта разойдутся молча, и обнаружится это у заказчика.
     check("копируется текст с сервера, а не разметка",
@@ -699,6 +699,78 @@ def part_day_bounds():
     c.close()
 
 
+# ─────────────── период экрана и блокеры по смыслу (04.10.2026) ───────────────
+
+def part_period_and_blockers():
+    """Владелец 04.10.2026: «не понятно, за какой период — календарь, по умолчанию
+    текущий месяц»; «24 блокера — что за блокеры, разгребём, что наше, что не наше»."""
+    print("Период экрана: даты «с» и «по» включительно, по умолчанию — текущий месяц")
+    check("месяц по умолчанию", D.month_bounds(NOW, "UTC"), ("2026-10-01", "2026-10-31"))
+    feb = dt.datetime(2028, 2, 10, 12, tzinfo=dt.timezone.utc).timestamp()
+    check("високосный февраль", D.month_bounds(feb, "UTC"), ("2028-02-01", "2028-02-29"))
+    a, b = D.period_bounds("2026-10-06", "2026-10-07", "UTC")
+    check("начало — полночь первого дня", a, day_at(0, day=6))
+    check("конец — полночь дня после последнего", b, day_at(0, day=8))
+    a, b = D.period_bounds("2026-10-25", "2026-10-25", "Europe/Warsaw")
+    check("сутки перевода часов — 25 часов, а не 24", (b - a) / HOUR, 25.0)
+    for bad, why in ((("2026-10-07", "2026-10-06"), "раньше"), (("7.10.2026", "8.10.2026"),
+                     "ГГГГ-ММ-ДД"), (("2025-01-01", "2026-10-01"), "400")):
+        try:
+            D.period_bounds(*bad, "UTC")
+            got = "принято"
+        except ValueError as exc:
+            got = why in str(exc)
+        check(f"отказ: {why}", got, True)
+
+    print("\nПринято за период — по всем дням периода, а не за сутки")
+    c, _ = base()
+    day = D.collect(c, TID, now=NOW, have_key=False)
+    a, b = D.period_bounds("2026-10-06", "2026-10-07", "UTC")
+    two = D.collect(c, TID, now=NOW, have_key=False, since=a, until=b)
+    a, b = D.period_bounds("2026-10-01", "2026-10-05", "UTC")
+    early = D.collect(c, TID, now=NOW, have_key=False, since=a, until=b)
+    check("сутки — как раньше", day["production"]["accepted"], 2)
+    check("два дня — и вчерашняя приёмка", two["production"]["accepted"], 3)
+    check("дни без приёмки — ноль", early["production"]["accepted"], 0)
+    check("период назван в ответе", two["period"], {"from": "2026-10-06", "to": "2026-10-07"})
+    check("сутки без периода — те же сутки", day["period"],
+          {"from": "2026-10-07", "to": "2026-10-07"})
+    check("ожидалось за два дня больше, чем за сутки",
+          two["today"]["expected"] >= day["today"]["expected"], True)
+    c.close()
+
+    print("\nБлокеры — по смыслу причины и по тому, кто чинит")
+    c = fresh()
+    a1 = channel(c, "Альфа", {"*": ["10:00"]})
+    b1 = channel(c, "Бета", {"*": ["10:00"]})
+    n = 100
+    for cid, why in ((a1, "у ролика нет субтитров (VideoUnplayable)"),
+                     (b1, "у ролика нет субтитров (VideoUnplayable)"),
+                     (a1, "account recovery needs the owner: no exact account binding "
+                          "for this profile+channel"),
+                     (a1, "задача рерайта прервалась — рерайт перезапускали"),
+                     (b1, "задача рерайта прервалась — рерайт перезапускали"),
+                     (b1, "задача рерайта прервалась — рерайт перезапускали"),
+                     (a1, "обложка деградировала дважды: текст наложен поверх картинки"),
+                     (b1, "что-то совсем новое")):
+        n += 1
+        release(c, cid, plan(c, cid, day_at(10, day=n % 20 + 1)), day_at(10), "created",
+                status="blocked", blocked=why)
+    out = D.collect(c, TID, now=NOW, have_key=False)
+    bl = out["blockers"]
+    check("сначала наша беда, потом канал, обложка, донор, незнакомое",
+          [x["kind"] for x in bl], ["studio", "channel", "cover", "donor", ""])
+    check("одинаковые причины сложены", [x["count"] for x in bl], [3, 1, 1, 2, 1])
+    check("каналы перечислены без повторов", bl[0]["channels"], ["Бета", "Альфа"]
+          if bl[0]["channels"][0] == "Бета" else ["Альфа", "Бета"])
+    check("у нашей беды — что делать", "Вернуть в работу" in bl[0]["fix"], True)
+    check("незнакомое — как есть, под «Прочее»", (bl[-1]["tag"], bl[-1]["title"]),
+          ("Прочее", "что-то совсем новое"))
+    check("сумма блокеров — все выпуски в разборе",
+          sum(x["count"] for x in bl), 8)
+    c.close()
+
+
 def main() -> int:
     part_key_note_only_when_relevant()
     part_counters()
@@ -714,6 +786,7 @@ def main() -> int:
     part_screen()
     part_telegram()
     part_day_bounds()
+    part_period_and_blockers()
     print("Про отсутствие ключа сводка говорит даже когда все ответы уже есть")
     # Перестановка порядка (сохранённый ответ выше отсутствия ключа) закрыла ложь «не
     # знаем» вместо полученного ответа — но вместе с ней пропало и честное «подтверждать

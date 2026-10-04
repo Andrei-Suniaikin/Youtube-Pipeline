@@ -36,7 +36,7 @@ BASE = os.path.abspath(os.path.join(HERE, ".."))
 SERVER = os.path.join(BASE, "server")
 sys.path.insert(0, SERVER)
 
-from fastapi import FastAPI, File, HTTPException, Request, Response, UploadFile  # noqa: E402
+from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile  # noqa: E402
 from fastapi.responses import (FileResponse, JSONResponse, Response,  # noqa: E402
                                StreamingResponse)
 from starlette.concurrency import run_in_threadpool                # noqa: E402
@@ -122,6 +122,14 @@ STAGES = (
     ("cover", "Обложка", "remote:cover"),
     ("upload", "Публикация", "upload"),
 )
+
+# Шаги заливки, как их сообщает машина, — по-русски (ТЗ §13).
+UPLOAD_STEP_TITLE = {
+    "preflight": "проверка", "profile_opened": "профиль открыт",
+    "upload_started": "файл передаётся", "video_id_known": "ролик создан",
+    "details_filled": "описание заполнено", "scheduled": "в расписании",
+}
+VERDICT_TITLE = {"scheduled": "в расписании", "published": "вышел", "failed": "не залит"}
 
 # Виды задач по-русски. ТЗ §13: внутренние слова наружу не показываются.
 KIND_TITLE = {
@@ -445,8 +453,11 @@ def _stages(c, rel: dict) -> list:
             ready = {}
     file_base = f"/ui/projects/{urllib.parse.quote(pid)}/file/" if pid else ""
     # Какой этап каким материалом доказывается. «Готово» без файла — не готово.
+    # 04.10.2026, владелец: «не показывается обложка на странице, где галочка возле
+    # готового видео, хотя картинки и всё остальное видно». У этапа обложки не было
+    # своей группы файлов — строка писала «готово · задача …» без самой картинки.
     STAGE_FILES = {"tts": ("audio",), "images": ("images",), "video": ("clips",),
-                   "render": ("renders", "subs", "chapters")}
+                   "render": ("renders", "subs", "chapters"), "cover": ("covers",)}
 
     out = []
     for key, title, source in STAGES:
@@ -529,14 +540,26 @@ def _stages(c, rel: dict) -> list:
                 row["note"] = "не начато"
             else:
                 row["state"] = _state(upload["status"])
+                # Шаг машина присылает JSON-строкой ({"phase": "...", ...}); на экран —
+                # только имя шага, а не сырой JSON (04.10.2026: строка «Публикация»
+                # уезжала за край карточки).
+                step = upload["phase"] or ""
+                if step.startswith("{"):
+                    try:
+                        step = str((json.loads(step) or {}).get("phase") or "")
+                    except ValueError:
+                        step = ""
                 for label, value in (("канал", upload["uc"]),
                                      ("профиль", upload["profile_id"]),
                                      ("машина", upload["host"]),
-                                     ("шаг", upload["phase"]),
-                                     ("ролик", upload["video_id"]),
-                                     ("вердикт", upload["verdict"])):
+                                     ("шаг", UPLOAD_STEP_TITLE.get(step, step)),
+                                     ("вердикт", VERDICT_TITLE.get(upload["verdict"] or "",
+                                                                   upload["verdict"]))):
                     if value:
                         row["facts"].append(f"{label} {value}")
+                if upload["video_id"]:
+                    row["link"] = {"href": "https://youtu.be/" + urllib.parse.quote(
+                        str(upload["video_id"])), "text": "ролик " + str(upload["video_id"])}
                 if upload["error"]:
                     row["note"] = upload["error"]
         # Только из «не начато»: если задача стоит в очереди или идёт, файлы на диске
@@ -3033,17 +3056,27 @@ def ui_alert_threshold(body: AlertLimitIn, request: Request):
 
 
 @app.get("/ui/digest")
-def ui_digest():
-    """Ежедневная сводка в формате заказчика — одной страницей.
+def ui_digest(date_from: str = Query("", alias="from"), date_to: str = Query("", alias="to")):
+    """Сводка в формате заказчика — одной страницей, за выбранный период.
 
     Готовый текст отдаётся вместе с числами намеренно: отчёт заказчику уходит именно
     текстом, и он обязан быть тем же самым, что уходит в телеграм. Собирай экран этот
     текст сам из чисел — два представления разошлись бы при первой же правке, и никто
     бы этого не заметил до тех пор, пока заказчик не сверит два отчёта.
+
+    Период (04.10.2026, владелец: «не понятно, за какой период — календарь, а так пусть
+    показывает текущий месяц»): `from`/`to` — даты ГГГГ-ММ-ДД включительно в поясе
+    сводки; без них — текущий месяц. Утренний отчёт в телеграм по-прежнему за сутки.
     """
     c = db()
     try:
-        data = pub_digest.collect(c, TENANT)
+        if not date_from or not date_to:
+            date_from, date_to = pub_digest.month_bounds(time.time())
+        try:
+            since, until = pub_digest.period_bounds(date_from, date_to)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        data = pub_digest.collect(c, TENANT, since=since, until=until)
         return {"digest": data, "text": pub_digest.render(data),
                 "settings": pub_digest.settings(c)}
     finally:

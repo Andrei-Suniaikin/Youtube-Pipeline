@@ -281,16 +281,51 @@ def _fmt_moment(stamp: float, tz_name: str) -> str:
     return dt.datetime.fromtimestamp(float(stamp), _zone(tz_name)).strftime("%d.%m %H:%M")
 
 
-def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None) -> dict:
-    """Сводка за сутки. Ничего не пишет и ни во что не ходит — только читает базу.
+def period_bounds(first: str, last: str, tz_name: str = None) -> tuple:
+    """Даты «с» и «по» включительно (ГГГГ-ММ-ДД, в поясе сводки) → (начало, конец) epoch.
+
+    04.10.2026, владелец: «не совсем понятно, за какой период — давай календарь, а так
+    пусть показывает текущий месяц». Конец — начало дня ПОСЛЕ «по», тем же приёмом, что в
+    `day_bounds`: в день перевода часов сутки не 24 часа.
+    """
+    zone = _zone(tz_name or DIGEST_TZ)
+    try:
+        a = dt.datetime.strptime(str(first), "%Y-%m-%d").replace(tzinfo=zone)
+        b = dt.datetime.strptime(str(last), "%Y-%m-%d").replace(tzinfo=zone)
+    except ValueError:
+        raise ValueError("даты периода — в виде ГГГГ-ММ-ДД")
+    if b < a:
+        raise ValueError("конец периода раньше начала")
+    if (b - a).days > 400:
+        raise ValueError("период длиннее 400 дней — выберите короче")
+    end = (b + dt.timedelta(days=1, hours=12)).replace(hour=0, minute=0, second=0,
+                                                        microsecond=0)
+    return a.timestamp(), end.timestamp()
+
+
+def month_bounds(now: float, tz_name: str = None) -> tuple:
+    """Текущий календарный месяц в поясе сводки: даты «с» и «по» (ГГГГ-ММ-ДД)."""
+    zone = _zone(tz_name or DIGEST_TZ)
+    local = dt.datetime.fromtimestamp(float(now), zone)
+    first = local.replace(day=1)
+    nxt = (first + dt.timedelta(days=32)).replace(day=1)
+    return first.strftime("%Y-%m-%d"), (nxt - dt.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None,
+            since: float = None, until: float = None) -> dict:
+    """Сводка за сутки или за период. Ничего не пишет и ни во что не ходит — только читает.
 
     `have_key` подменяется в тестах: наличие ключа YouTube Data API решает, будет ли
     «подтверждено» числом или честным «не знаем», и проверять это надо без настоящего
-    ключа на машине.
+    ключа на машине. `since`/`until` — период экрана (см. `period_bounds`); без них —
+    календарные сутки, как у утреннего отчёта в телеграм.
     """
     now = time.time() if now is None else float(now)
     tz_name = tz_name or DIGEST_TZ
-    since, until = day_bounds(now, tz_name)
+    if since is None or until is None:
+        since, until = day_bounds(now, tz_name)
+    since, until = float(since), float(until)
     pub_alerts.load_limits(c)          # порог запаса — тот же, что у тревоги §14
 
     where, args = _where(tenant_id)
@@ -420,6 +455,7 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None) -> 
 
     problems = _problems(c, channels, blocked_by_channel, delayed_by_channel,
                          supply_by_channel, now, tz_name)
+    blockers = _blockers(blocked_by_channel, by_id)
     alerts, alerts_why = _alerts(c, now, tenant_id)
 
     return {
@@ -443,7 +479,42 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None) -> 
         # никто не откроет.
         "uploads": pub_upload_census.since(c, since, until),
         "alerts": alerts, "alerts_why": alerts_why,
+        # Блокеры — СЕЙЧАС, а не за период: выпуск в разборе стоит, пока его не разберут,
+        # и ответ на «что держит» не зависит от того, за какие дни смотреть числа.
+        "blockers": blockers,
+        "period": {"from": dt.datetime.fromtimestamp(since, _zone(tz_name)).strftime("%Y-%m-%d"),
+                   "to": dt.datetime.fromtimestamp(until - 1, _zone(tz_name)).strftime("%Y-%m-%d")},
     }
+
+
+# Порядок групп блокеров: сначала наша беда, её чинит студия; потом те, что чинят люди
+# за каналами, донорами и обложками; незнакомое — последним.
+_BLOCKER_ORDER = {"studio": 0, "channel": 1, "cover": 2, "donor": 3, "": 4}
+
+
+def _blockers(blocked_by_channel: dict, by_id: dict) -> list:
+    """Выпуски в разборе, сложенные по смыслу причины: чья беда, что случилось, сколько.
+
+    04.10.2026, владелец: «на сводке 24 блокера — что за блокеры, давай разбираться, что
+    наше, что не наше». Причину понимаем тем же переводчиком, что и экран выпуска
+    (`block_reasons.explain`); не узнанную — показываем как есть, без выдумки.
+    """
+    groups: dict = {}
+    for cid, rels in blocked_by_channel.items():
+        name = by_id[cid]["name"] if cid in by_id else str(cid)
+        for rel in rels:
+            raw = (rel["blocked_reason"] or "").strip()
+            b = explain_block(raw)
+            key = (b.get("kind") or "", b.get("title") or raw[:160] or "без причины")
+            g = groups.setdefault(key, {
+                "kind": b.get("kind") or "", "tag": b.get("tag") or "Прочее",
+                "title": key[1], "fix": b.get("fix") or "", "revive": bool(b.get("revive")),
+                "count": 0, "channels": []})
+            g["count"] += 1
+            if name not in g["channels"]:
+                g["channels"].append(name)
+    return sorted(groups.values(),
+                  key=lambda g: (_BLOCKER_ORDER.get(g["kind"], 4), -g["count"], g["title"]))
 
 
 def _alerts(c, now: float, tenant_id: str) -> tuple:

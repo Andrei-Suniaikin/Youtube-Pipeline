@@ -197,10 +197,57 @@
     font-size:11.5px;font-weight:600;vertical-align:1px}
   .blktag.donor{background:var(--wait-bg);color:var(--wait)}
   .blktag.channel{background:var(--run-bg);color:var(--run)}
+  /* Сбой студии — наша беда: красная метка; обложка — нейтральная (04.10.2026). */
+  .blktag.studio{background:var(--bad-bg);color:var(--bad)}
+  /* Календарь периода сводки (04.10.2026). Всплывает поверх страницы, в тех же цветах,
+     что карточки: подложка карточки, выбранный отрезок — приглушённым акцентом, края
+     отрезка — акцентом, сегодня — обводкой. */
+  .pp-btn{display:inline-flex;align-items:center;gap:8px}
+  .pp-ico{font-size:13px;color:var(--muted)}
+  .pp-car{font-size:11px;color:var(--muted)}
+  .pp-pop{position:absolute;z-index:45;display:flex;gap:6px;padding:12px;
+    background:var(--card);border:1px solid var(--line-2);
+    box-shadow:0 18px 44px -16px rgba(0,0,0,.75)}
+  .pp-presets{display:flex;flex-direction:column;gap:2px;padding-right:10px;
+    border-right:1px solid var(--line);min-width:128px}
+  .pp-preset{background:transparent;color:var(--ink);text-align:left;font-weight:500;
+    padding:7px 10px;border-radius:var(--r-xs)}
+  .pp-preset:hover,.pp-preset:focus-visible{background:var(--card-2);color:var(--ink-hi)}
+  .pp-preset.on{background:var(--acc-dim);color:var(--ink-hi)}
+  .pp-cal{padding-left:8px;width:300px}
+  .pp-nav{display:flex;align-items:center;justify-content:space-between;margin-bottom:8px}
+  .pp-nav b{font-weight:650;color:var(--ink-hi)}
+  .pp-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:2px}
+  .pp-wd{font-size:11.5px;color:var(--muted);text-align:center;padding:4px 0}
+  .pp-day{background:transparent;color:var(--ink);padding:0;height:34px;font-weight:500;
+    border-radius:var(--r-xs);font-variant-numeric:tabular-nums;border:1px solid transparent}
+  .pp-day:hover{background:var(--card-2);color:var(--ink-hi)}
+  .pp-day.out{color:var(--off)}
+  /* «now», а не «today»: глобальный .today — это пунктирная черта «сейчас» на ленте
+     канала (height:0; border-top), и она резала клетку сегодняшнего дня. */
+  .pp-day.now{box-shadow:inset 0 0 0 1px var(--line-2)}
+  .pp-day.in{background:var(--acc-dim);color:var(--ink-hi);border-radius:0}
+  .pp-day.lo,.pp-day.hi{background:var(--acc);color:var(--on-acc);font-weight:700}
+  .pp-day.lo{border-radius:var(--r-xs) 0 0 var(--r-xs)}
+  .pp-day.hi{border-radius:0 var(--r-xs) var(--r-xs) 0}
+  .pp-day.lo.hi{border-radius:var(--r-xs)}
+  .pp-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;
+    margin-top:10px;padding-top:10px;border-top:1px solid var(--line);font-size:12.5px}
+  .pp-foot button{padding:6px 12px}
+  .pp-foot .pp-sel{flex:1;min-width:0}
+  .pp-foot>span:last-child{display:flex;gap:6px;flex:none}
+  @media (max-width:640px){
+    .pp-pop{flex-direction:column;left:8px!important;right:8px;width:auto}
+    .pp-presets{flex-direction:row;flex-wrap:wrap;border-right:0;border-bottom:1px solid var(--line);
+      padding:0 0 8px;min-width:0}
+    .pp-cal{width:auto;padding-left:0}
+  }
+  .blktag.cover{background:var(--acc-dim);color:var(--ink-hi)}
   .blk{margin-top:12px;padding:12px 14px;border-radius:var(--r-sm);border:1px solid var(--line);
     border-left:3px solid var(--bad);background:var(--well);color:var(--ink);font-weight:400}
   .blk.donor{border-left-color:var(--wait)}
   .blk.channel{border-left-color:var(--run)}
+  .blk.cover{border-left-color:var(--muted)}
   .blk .blkhead{font-weight:600;color:var(--ink-hi)}
   .blk p{margin:6px 0 0;font-size:13.5px;line-height:1.45}
   .blk .blkacts{margin-top:10px;display:flex;gap:12px;flex-wrap:wrap;align-items:center}
@@ -237,6 +284,11 @@
   .ev:last-child{border-bottom:0}
   .ev time{color:var(--muted);flex:0 0 112px;font-variant-numeric:tabular-nums}
   .ev .step{flex:0 0 112px;color:var(--muted)}
+  /* Текст строки ленты занимает остаток и переносится даже без пробелов: ответ заливщика
+     — это длинный JSON одной «строкой», и он растягивал карточку и всю страницу вбок
+     (04.10.2026, «текст ошибки разъезжается»). */
+  .ev>div:last-child{flex:1 1 auto;min-width:0;overflow-wrap:anywhere}
+  .stage .facts,.stage .note{overflow-wrap:anywhere}
   .empty{padding:44px 18px;text-align:center;color:var(--muted)}
   .empty .why{color:var(--ink);font-size:14.5px}
   .empty .means{margin-top:5px;font-size:13px;max-width:52ch;
@@ -367,6 +419,13 @@
      задачи, отступ у раскрытых — говорит, что они внутри него, а не рядом. */
   tr.grp>td{background:var(--card-2)}
   .grphead{display:flex;gap:10px;align-items:flex-start}
+  /* 04.10.2026, владелец: «везде, где текст ошибки, оно немного разъезжается». Кнопка
+     свёртки — 30 px, строка текста — 20 px, а ячейки таблицы прижаты к верху: значок
+     сидел ниже текста, плашка вида в соседней ячейке — выше. Первая строка текста
+     теперь по центру кнопки (5 px сверху), ячейки строки группы — по центру. */
+  .grphead>div{padding-top:5px;line-height:20px}
+  .grphead .pill{vertical-align:1px}
+  tr.grp>td{vertical-align:middle}
   .grphead .grpsum{font-size:13.5px}
   .grphead .why{color:var(--bad)}
   .iconbtn.fold svg{transition:transform .12s}
@@ -378,6 +437,7 @@
   .grpcard{margin-bottom:12px;border-left:3px solid var(--bad);overflow:hidden}
   .grpcard.donor{border-left-color:var(--wait)}
   .grpcard.channel{border-left-color:var(--run)}
+  .grpcard.cover{border-left-color:var(--muted)}
   .grpcard.pending{border-left-color:var(--wait)}
   .grpcard>.grpbar{padding:12px 16px;background:var(--card-2)}
   .grpcard.pending .grphead .why{color:var(--wait)}
@@ -1338,9 +1398,18 @@ function blockBox(r){
     acts.push(`<a href="#/channel/${ch}" id="blk-fix">Поставить другой ролик на канал →</a>`);
     if (r.donor_url) acts.push(`<a href="${esc(r.donor_url)}" target="_blank" rel="noopener"
       >Открыть донора на YouTube ↗</a>`);
+  } else if (b.kind === 'cover' && r.project_id){
+    acts.push(`<a href="#/project/${encodeURIComponent(r.project_id)}/cover" id="blk-fix"
+      >Открыть обложку проекта →</a>`);
   }
   if (b.revive && r.status === 'blocked' && !r.hand_confirmed)
     acts.push(`<button class="ghost" id="revive">Вернуть в работу</button>`);
+  // Заливку могли сделать руками, пока выпуск стоял на заливке, — отметить это должно быть чем,
+  // как и в прежней красной строке (04.10.2026: причины канала и студии теперь тоже
+  // объясняются словами, и кнопка не должна была при этом пропасть).
+  if ((b.kind === 'channel' || b.kind === 'studio') && r.status === 'blocked'
+      && !r.hand_confirmed && ['upload_pending', 'upload_running'].includes(r.phase))
+    acts.push(`<button class="ghost" id="byhand">Подтвердить руками</button>`);
   return `<div class="blk ${esc(b.kind)}" id="blk">
     <div class="blkhead"><span class="blktag ${esc(b.kind)}">${esc(b.tag)}</span> ${esc(b.title)}</div>
     <p>${esc(b.what)}</p>
@@ -1578,7 +1647,9 @@ async function viewRelease(id){
           <div class="name">${esc(s.title)}
             <span class="pill ${STATE_CLS[s.state]}" style="margin-left:6px">${STATE_TITLE[s.state]}</span>
           </div>
-          ${s.facts.length ? `<div class="facts">${s.facts.map(esc).join(' · ')}</div>` : ''}
+          ${s.facts.length || s.link ? `<div class="facts">${s.facts.map(esc).join(' · ')}${
+            s.link ? `${s.facts.length ? ' · ' : ''}<a href="${esc(s.link.href)}"
+              target="_blank" rel="noopener">${esc(s.link.text)}</a>` : ''}</div>` : ''}
           ${s.note ? `<div class="note ${s.state === 'error' ? 'bad' : 'muted'}"
             >${esc(s.note)}</div>` : ''}
           ${stageFiles(s, r.project_id)}
@@ -5132,6 +5203,10 @@ function stageFiles(s, pid){
   if (!s.files || !s.files.length) return '';
   const url = n => pultUrl(s.file_base) + n.split('/').map(encodeURIComponent).join('/');
   return s.files.map(g => {
+    // Обложка — одна картинка, и её надо разглядеть: крупнее кадров и без «переделать»
+    // (перерисовывают её на вкладке «Обложка» проекта, а не как кадр).
+    if (g.code === 'covers') return `<div style="margin-top:7px">${g.names.slice(0, 1)
+      .map(n => thumb(url(n) + '?w=480', url(n), n, 135, '')).join('')}</div>`;
     if (g.kind === 'image') return `<div style="display:flex;flex-wrap:wrap;gap:5px;
       margin-top:7px">${g.names.map(n => thumb(url(n) + '?w=120', url(n), n, 52,
         pid)).join('')}
@@ -11591,9 +11666,158 @@ function digestGreetButton(){
   return box;
 }
 
+/* ── период сводки (04.10.2026, владелец: «не совсем понятно, за какой период — давай
+   приятный календарь для выбора в нашем стиле, а так будет показывать за текущий
+   месяц») ──
+   Выбор живёт в sessionStorage: вернулся на сводку в той же вкладке — тот же период;
+   новая вкладка — снова текущий месяц. Хранилище может быть недоступно (приватный
+   режим) — тогда просто текущий месяц. */
+const DIGEST_PERIOD_KEY = 'digestPeriod';
+function digestPeriod(){
+  try {
+    const v = JSON.parse(sessionStorage.getItem(DIGEST_PERIOD_KEY) || 'null');
+    return v && /^\d{4}-\d{2}-\d{2}$/.test(v.from) && /^\d{4}-\d{2}-\d{2}$/.test(v.to) ? v : null;
+  } catch (_e){ return null; }
+}
+function setDigestPeriod(v){
+  try { v ? sessionStorage.setItem(DIGEST_PERIOD_KEY, JSON.stringify(v))
+          : sessionStorage.removeItem(DIGEST_PERIOD_KEY); } catch (_e){}
+}
+
+const MONTHS_GEN = ['января', 'февраля', 'марта', 'апреля', 'мая', 'июня', 'июля',
+                    'августа', 'сентября', 'октября', 'ноября', 'декабря'];
+const MONTHS_NOM = ['Январь', 'Февраль', 'Март', 'Апрель', 'Май', 'Июнь', 'Июль',
+                    'Август', 'Сентябрь', 'Октябрь', 'Ноябрь', 'Декабрь'];
+const isoDay = d => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${
+  String(d.getDate()).padStart(2, '0')}`;
+const fromIso = s => { const [y, m, d] = s.split('-').map(Number); return new Date(y, m - 1, d); };
+
+// «1–31 октября 2026», «4 октября 2026», «28 сентября – 4 октября 2026».
+function periodLabel(p){
+  if (!p) return 'текущий месяц';
+  const a = fromIso(p.from), b = fromIso(p.to);
+  const y = d => d.getFullYear(), m = d => d.getMonth();
+  if (p.from === p.to) return `${a.getDate()} ${MONTHS_GEN[m(a)]} ${y(a)}`;
+  if (y(a) === y(b) && m(a) === m(b))
+    return `${a.getDate()}–${b.getDate()} ${MONTHS_GEN[m(a)]} ${y(a)}`;
+  if (y(a) === y(b))
+    return `${a.getDate()} ${MONTHS_GEN[m(a)]} – ${b.getDate()} ${MONTHS_GEN[m(b)]} ${y(b)}`;
+  return `${a.getDate()} ${MONTHS_GEN[m(a)]} ${y(a)} – ${b.getDate()} ${MONTHS_GEN[m(b)]} ${y(b)}`;
+}
+
+function periodPresets(){
+  const t = new Date(); t.setHours(0, 0, 0, 0);
+  const shift = (d, n) => { const x = new Date(d); x.setDate(x.getDate() + n); return x; };
+  const first = new Date(t.getFullYear(), t.getMonth(), 1);
+  const last = new Date(t.getFullYear(), t.getMonth() + 1, 0);
+  const pFirst = new Date(t.getFullYear(), t.getMonth() - 1, 1);
+  const pLast = new Date(t.getFullYear(), t.getMonth(), 0);
+  return [
+    ['Сегодня', t, t], ['Вчера', shift(t, -1), shift(t, -1)],
+    ['7 дней', shift(t, -6), t], ['30 дней', shift(t, -29), t],
+    ['Этот месяц', first, last], ['Прошлый месяц', pFirst, pLast],
+  ].map(([name, a, b]) => ({name, from: isoDay(a), to: isoDay(b)}));
+}
+
+// Кнопка с периодом и всплывающий календарь: слева готовые периоды, справа месяц, где
+// первый щелчок — начало, второй — конец. Esc и щелчок мимо — закрыть без изменений.
+function periodPicker(cur, onPick){
+  // `$` отдаёт обёртку-div; берём сам элемент — иначе классы, обработчики и координаты
+  // всплывающего окна достались бы обёртке.
+  const btn = $(`<button class="ghost pp-btn" type="button" aria-haspopup="dialog">
+    <span class="pp-ico" aria-hidden="true">▦</span> ${esc(periodLabel(cur))}
+    <span class="pp-car" aria-hidden="true">▾</span></button>`).firstElementChild;
+  let pop = null;
+  const close = () => {
+    if (!pop) return;
+    pop.remove(); pop = null;
+    document.removeEventListener('mousedown', outside, true);
+    document.removeEventListener('keydown', onKey, true);
+  };
+  const outside = ev => { if (pop && !pop.contains(ev.target) && !btn.contains(ev.target)) close(); };
+  const onKey = ev => { if (ev.key === 'Escape'){ ev.preventDefault(); close(); btn.focus(); } };
+  btn.onclick = () => {
+    if (pop){ close(); return; }
+    let a = cur ? cur.from : null, b = cur ? cur.to : null, hover = null;
+    let view = fromIso(a || isoDay(new Date())); view.setDate(1);
+    const todayIso = isoDay(new Date());
+    pop = $(`<div class="pp-pop card" role="dialog" aria-label="Период сводки">
+      <div class="pp-presets"></div>
+      <div class="pp-cal">
+        <div class="pp-nav"><button type="button" class="iconbtn pp-prev" aria-label="Предыдущий месяц">‹</button>
+          <b class="pp-month"></b>
+          <button type="button" class="iconbtn pp-next" aria-label="Следующий месяц">›</button></div>
+        <div class="pp-grid"></div>
+        <div class="pp-foot"><span class="pp-sel muted"></span>
+          <span><button type="button" class="ghost pp-cancel">Отмена</button>
+          <button type="button" class="pp-ok">Показать</button></span></div>
+      </div></div>`).firstElementChild;
+    const presets = pop.querySelector('.pp-presets');
+    periodPresets().forEach(pr => {
+      const x = $(`<button type="button" class="pp-preset">${esc(pr.name)}</button>`)
+        .firstElementChild;
+      if (cur && cur.from === pr.from && cur.to === pr.to) x.classList.add('on');
+      x.onclick = () => { close(); onPick({from: pr.from, to: pr.to}); };
+      presets.append(x);
+    });
+    const grid = pop.querySelector('.pp-grid');
+    const draw = () => {
+      pop.querySelector('.pp-month').textContent = `${MONTHS_NOM[view.getMonth()]} ${view.getFullYear()}`;
+      const lo = a && (b || hover) ? [a, b || hover].sort()[0] : a;
+      const hi = a && (b || hover) ? [a, b || hover].sort()[1] : a;
+      const start = new Date(view); start.setDate(1 - ((view.getDay() + 6) % 7));
+      grid.innerHTML = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+        .map(w => `<span class="pp-wd">${w}</span>`).join('');
+      for (let i = 0; i < 42; i++){
+        const d = new Date(start); d.setDate(start.getDate() + i);
+        const iso = isoDay(d), out = d.getMonth() !== view.getMonth();
+        const cls = ['pp-day', out ? 'out' : '', iso === todayIso ? 'now' : '',
+          lo && hi && iso >= lo && iso <= hi ? 'in' : '',
+          iso === lo ? 'lo' : '', iso === hi ? 'hi' : ''].filter(Boolean).join(' ');
+        grid.insertAdjacentHTML('beforeend',
+          `<button type="button" class="${cls}" data-d="${iso}">${d.getDate()}</button>`);
+      }
+      pop.querySelector('.pp-sel').textContent = a
+        ? periodLabel({from: lo, to: hi}) + (b ? '' : ' — выберите конец') : 'выберите начало';
+      pop.querySelector('.pp-ok').disabled = !(a && b);
+    };
+    grid.onclick = ev => {
+      const day = ev.target.closest('[data-d]'); if (!day) return;
+      if (!a || b){ a = day.dataset.d; b = null; } else { b = day.dataset.d; }
+      draw();
+    };
+    grid.onmouseover = ev => {
+      const day = ev.target.closest('[data-d]');
+      if (a && !b && day && day.dataset.d !== hover){ hover = day.dataset.d; draw(); }
+    };
+    pop.querySelector('.pp-prev').onclick = () => { view.setMonth(view.getMonth() - 1); draw(); };
+    pop.querySelector('.pp-next').onclick = () => { view.setMonth(view.getMonth() + 1); draw(); };
+    pop.querySelector('.pp-cancel').onclick = () => { close(); btn.focus(); };
+    pop.querySelector('.pp-ok').onclick = () => {
+      if (!(a && b)) return;
+      const [lo, hi] = [a, b].sort();
+      close(); onPick({from: lo, to: hi});
+    };
+    draw();
+    document.body.append(pop);
+    const r = btn.getBoundingClientRect();
+    const w = pop.offsetWidth;
+    pop.style.top = (r.bottom + window.scrollY + 6) + 'px';
+    pop.style.left = Math.max(8, Math.min(r.right + window.scrollX - w,
+                                          window.scrollX + innerWidth - w - 8)) + 'px';
+    document.addEventListener('mousedown', outside, true);
+    document.addEventListener('keydown', onKey, true);
+    (pop.querySelector('.pp-day.lo') || pop.querySelector('.pp-day.now')
+      || pop.querySelector('.pp-day')).focus();
+  };
+  return btn;
+}
+
 async function viewDigest(){
   let d;
-  try { d = await api('/ui/digest'); }
+  const chosen = digestPeriod();
+  try { d = await api('/ui/digest' + (chosen
+    ? `?from=${encodeURIComponent(chosen.from)}&to=${encodeURIComponent(chosen.to)}` : '')); }
   catch (e){
     if (e instanceof NeedLogin) throw e;      // «войдите снова» разбирает роутер
     // Сводка встречает при входе, и её поломка не имеет права запирать студию на
@@ -11612,13 +11836,19 @@ async function viewDigest(){
     return;
   }
   const g = d.digest, t = g.today, p = g.production;
+  const per = g.period || null;
   app.innerHTML = '';
   const head = $(`<div class="head">
-    <div><h1>Сводка за ${esc(g.day)} ${hintDot(
-      'Сутки календарные, по поясу ' + g.tz + '. Всё, что здесь есть, посчитано из базы: '
-      + 'план, выпуски, заливки, подтверждённые выходы, запас каналов и тревоги.')}</h1>
-    <p class="sub">Часовой пояс отчёта: ${esc(g.tz)}</p></div>
+    <div><h1>Сводка ${hintDot(
+      'Числа — за выбранный период, дни календарные, по поясу ' + g.tz + '. Блокеры и '
+      + 'проблемы — на сейчас: выпуск в разборе стоит, пока его не разберут. Всё '
+      + 'посчитано из базы: план, выпуски, заливки, подтверждённые выходы, запас каналов '
+      + 'и тревоги.')}</h1>
+    <p class="sub">За ${esc(periodLabel(per))} · часовой пояс ${esc(g.tz)}</p></div>
     <div class="head-acts"></div></div>`);
+  head.querySelector('.head-acts').append(periodPicker(per, v => {
+    setDigestPeriod(v); viewDigest().catch(e => toast(e.message));
+  }));
   head.querySelector('.head-acts').append(digestGreetButton());
   app.append(head);
   // Скрытую сводку человек открыл вкладкой — и должен видеть, почему она больше не
@@ -11641,11 +11871,17 @@ async function viewDigest(){
   const confirmText = (t.unknown && known <= 0) ? 'не знаем'
     : String((t.confirmed || 0) + руками);
   app.append($(`<div class="card" style="margin-bottom:16px">
-    <div class="sec">Сегодня</div>
+    <div class="sec">За период</div>
     <table><tbody>
-      <tr><td>Ожидалось выходов</td>
+      <tr><td>Залито в расписание ${hintDot(
+        'Ролик загружен на канал, и YouTube Studio подтвердила его отложенную публикацию '
+        + '— он ждёт своего часа. Это ещё не «вышел»: выход ниже, отдельной строкой. '
+        + 'Считается по дню, когда Studio подтвердила расписание.')}</td>
+          <td style="text-align:right;font-weight:600;color:var(--ok)">${p.accepted}</td></tr>
+      <tr><td>Ожидалось выходов ${hintDot(
+        'Выходы из плана каналов, чьё время в этом периоде уже наступило.')}</td>
           <td style="text-align:right;font-weight:600">${t.expected}</td></tr>
-      <tr><td>Подтверждён выход на YouTube ${hintDot(
+      <tr><td>Вышло на YouTube, подтверждено ${hintDot(
         'Подтверждение — это ответ YouTube Data API о том, что ролик публичный. '
         + 'Статус «готово» в базе значит только подтверждённое расписание и '
         + 'подтверждением выхода не является.')}</td>
@@ -11663,7 +11899,7 @@ async function viewDigest(){
       ${t.unknown ? `<tr><td class="muted">Про столько выходов ответа нет</td>
           <td style="text-align:right;font-weight:600" class="muted">${t.unknown}</td></tr>`
         : ''}
-      ${t.ahead ? `<tr><td class="muted">Ещё впереди сегодня</td>
+      ${t.ahead ? `<tr><td class="muted">Ещё впереди в этом периоде</td>
           <td style="text-align:right" class="muted">${t.ahead}</td></tr>` : ''}
     </tbody></table>
     ${(t.why || []).length ? `<div class="secbody">${(t.why || []).map(w =>
@@ -11695,7 +11931,7 @@ async function viewDigest(){
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Производство</div>
     <table><tbody>
-      <tr><td>Принято новых роликов за сутки ${hintDot(
+      <tr><td>Залито в расписание за период ${hintDot(
         'Принят — значит YouTube Studio подтвердила расписание ролика на канале. '
         + 'Это не «вышел»: выход подтверждается отдельно и позже.')}</td>
           <td style="text-align:right;font-weight:600">${p.accepted}</td></tr>
@@ -11719,7 +11955,7 @@ async function viewDigest(){
       <td style="text-align:right;font-weight:600${плохо ? ';color:var(--bad)' : ''}"${
         плохо ? '' : ' class="muted"'}>${u[ключ]}</td></tr>` : '');
     app.append($(`<div class="card" style="margin-bottom:16px">
-      <div class="sec">Срывы заливки за сутки ${hintDot(
+      <div class="sec">Срывы заливки за период ${hintDot(
         'Одна строка на каждый сорвавшийся выпуск. Разбор на классы делается в момент '
         + 'срыва: позже ответить, уходил ли файл в YouTube, уже нечем.')}</div>
       <table><tbody>
@@ -11740,6 +11976,31 @@ async function viewDigest(){
       </tbody></table>
     </div>`));
   }
+
+  /* ── блокеры: что держит выпуски сейчас и чья это беда (владелец 04.10.2026: «24
+     блокера — что за блокеры, давай разбираться, что наше, что не наше») ── */
+  const bl = g.blockers || [];
+  const blTotal = bl.reduce((n, x) => n + x.count, 0);
+  app.append($(`<div class="card" style="margin-bottom:16px" id="digest-blockers">
+    <div class="sec">Блокеры сейчас${blTotal ? ` — ${blTotal}` : ''} ${hintDot(
+      'Выпуски в разборе, сложенные по причине. Метка — кто чинит: «сбой студии» — '
+      + 'наша сторона, «настройка канала» — человек за каналами и профилями, '
+      + '«обложка» — пресет и генератор обложек, «проблема в доноре» — нужен другой '
+      + 'ролик-донор.')}</div>
+    ${bl.length ? `<table>
+      <thead><tr><th>Чья беда</th><th>Что случилось</th>
+        <th style="text-align:right">Выпусков</th><th>Каналы</th></tr></thead>
+      <tbody>${bl.map(x => `<tr>
+        <td><span class="blktag ${esc(x.kind)}">${esc(x.tag)}</span></td>
+        <td>${esc(x.title)}${x.fix ? `<div class="note muted">${esc(x.fix)}</div>` : ''}</td>
+        <td style="text-align:right;font-weight:600">${x.count}</td>
+        <td class="muted">${esc(x.channels.slice(0, 4).join(', '))}${
+          x.channels.length > 4 ? ` и ещё ${x.channels.length - 4}` : ''}</td>
+      </tr>`).join('')}</tbody></table>
+      <div class="secbody"><a href="#/releases">Открыть выпуски — там у каждого кнопка
+        действия →</a></div>`
+      : '<div class="empty">Ни одного выпуска в разборе.</div>'}
+  </div>`));
 
   /* ── проблемы ── */
   app.append($(`<div class="card" style="margin-bottom:16px">
