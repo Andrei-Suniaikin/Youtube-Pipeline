@@ -240,6 +240,25 @@ def reflow_slots(c, now: float) -> int:
 
 
 
+# Сколько времени до выхода нужно машине на заливку. Ворота выдачи отказывают за 30 мин
+# (pub_upload_api), поэтому переносим заранее — за 40.
+UPLOAD_LEAD_SEC = 2400
+# Как далеко искать свободный выход для ГОТОВОГО ролика, если горизонт канала занят.
+# 04.10.2026: ролик дошёл до заливки, а все выходы в горизонте заняты планом — задание
+# погибало у ворот «к времени выхода не успели», готовое видео не выходило вовсе.
+# Ролик выйдет позже, но выйдет.
+RESLOT_MAX_DAYS = 30
+
+
+def ready_slot_horizon(ch) -> int:
+    """Сколько дней вперёд искать выход для готового ролика: не меньше RESLOT_MAX_DAYS."""
+    try:
+        own = int(ch["horizon_days"] or 3)
+    except (KeyError, IndexError, TypeError, ValueError):
+        own = 3
+    return max(own, RESLOT_MAX_DAYS)
+
+
 def reslot_pending_uploads(c, now: float) -> int:
     """Перенести выходы у заданий заливки, до которых уже не успеть.
 
@@ -256,7 +275,7 @@ def reslot_pending_uploads(c, now: float) -> int:
         "SELECT u.id, u.release_id, u.channel_id, u.slot_at, r.plan_item_id "
         "FROM pub_upload_jobs u JOIN pub_releases r ON r.release_id=u.release_id "
         "WHERE u.status='queued' AND u.schedule_iso!='' AND u.slot_at <= ?",
-        (now + 2400,)).fetchall()
+        (now + UPLOAD_LEAD_SEC,)).fetchall()
     moved = 0
     for row in rows:
         ch = c.execute("SELECT * FROM pub_channels_live WHERE id=?", (row["channel_id"],)).fetchone()
@@ -266,7 +285,7 @@ def reslot_pending_uploads(c, now: float) -> int:
             schedule = _json.loads(ch["schedule"] or "{}")
             if not schedule:
                 continue
-            slots = upcoming_slots(schedule, ch["tz"], int(ch["horizon_days"] or 3),
+            slots = upcoming_slots(schedule, ch["tz"], ready_slot_horizon(ch),
                                    dt.datetime.fromtimestamp(now, dt.timezone.utc))
         except (ScheduleError, ValueError):
             continue
@@ -276,7 +295,7 @@ def reslot_pending_uploads(c, now: float) -> int:
             (row["channel_id"],)).fetchall() if r["slot_at"]}
         for point in slots:
             stamp = round(point.timestamp())
-            if stamp in busy or point.timestamp() <= now + 2400:
+            if stamp in busy or point.timestamp() <= now + UPLOAD_LEAD_SEC:
                 continue
             iso = schedule_iso(stamp, ch["tz"])
             c.execute("UPDATE pub_upload_jobs SET slot_at=?, schedule_iso=?, updated=? "

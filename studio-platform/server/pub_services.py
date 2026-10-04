@@ -31,6 +31,7 @@ from pub_engine import ItemFailed, ResourceDown
 # Охрана по статусу («владелец мог отменить выпуск, пока мы ходили в сеть») обязана
 # быть одна на всех, поэтому берём ту же функцию, а не переписываем UPDATE рядом.
 from pub_engine import DEFAULT_DEADLINE, PHASE_DEADLINES, log_phase
+from pub_engine import RESLOT_MAX_DAYS, UPLOAD_LEAD_SEC, ready_slot_horizon
 from pub_engine import _set as set_release_fields
 from pub_log import add as log_line
 from pub_neighbors import rewrite_preset_config
@@ -1125,7 +1126,7 @@ class PubServices:
             if not schedule:
                 return ""
             now = dt.datetime.fromtimestamp(self._clock(), dt.timezone.utc)
-            slots = upcoming_slots(schedule, ch["tz"], int(ch["horizon_days"] or 3), now)
+            slots = upcoming_slots(schedule, ch["tz"], ready_slot_horizon(ch), now)
         except (ScheduleError, ValueError):
             return ""
         busy = {round(r["slot_at"]) for r in c.execute(
@@ -1134,7 +1135,7 @@ class PubServices:
             (rel["channel_id"],)).fetchall() if r["slot_at"]}
         for point in slots:
             stamp = round(point.timestamp())
-            if stamp in busy or point.timestamp() <= self._clock() + 1800:
+            if stamp in busy or point.timestamp() <= self._clock() + UPLOAD_LEAD_SEC:
                 continue
             c.execute("UPDATE pub_plan_items SET slot_at=?, updated=? WHERE id=?",
                       (stamp, self._clock(), rel["plan_item_id"]))
@@ -1164,11 +1165,14 @@ class PubServices:
         # Раньше здесь выпуск останавливался и ждал, пока владелец переставит его руками —
         # то есть готовый ролик пропадал из-за того, что производство заняло дольше, чем
         # предполагал план. Переставляем сами на ближайший свободный выход канала.
-        if deferred and rel["slot_at"] <= self._clock() + 600:
+        # Запас — как у переноса в очереди (UPLOAD_LEAD_SEC): раньше здесь стояли 10 мин,
+        # а ворота выдачи отказывают уже за 30, и задание с выходом через полчаса
+        # погибало у ворот, не дождавшись переноса (04.10.2026).
+        if deferred and rel["slot_at"] <= self._clock() + UPLOAD_LEAD_SEC:
             moved = self._reslot(c, rel)
             if not moved:
-                raise ItemFailed("к времени выхода не успели, и свободных выходов "
-                                 "в горизонте канала нет — добавьте времена выхода")
+                raise ItemFailed(f"к времени выхода не успели, и свободных выходов на "
+                                 f"{RESLOT_MAX_DAYS} дней вперёд нет — добавьте времена выхода")
             log_line(c, rel["release_id"], "движок",
                      f"к прежнему времени не успели — перенёс выход на {moved}")
             return {"wait": True}
