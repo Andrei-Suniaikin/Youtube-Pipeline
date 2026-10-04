@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import sqlite3
 
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -48,6 +49,14 @@ UPLOAD_LEASE_SEC = 45 * 60
 # Успешные исходы Studio. Всё остальное — не успех, даже если video_id получен.
 OK_STATES = ("SCHEDULED",)
 PUBLISHED_STATES = ("PUBLIC",)
+
+
+def _agent_profile(serial):
+    """Серийный номер AdsPower в том виде, в каком его ждёт нода, или None."""
+    text = str(serial or "").strip()
+    if not text:
+        return None
+    return int(text) if text.isdigit() else text
 
 
 def register_upload_routes(app, ctx):
@@ -147,6 +156,30 @@ def register_upload_routes(app, ctx):
             return (f"профиль {shown} сейчас открыт на машине «{hname}» не нами: "
                     f"жду, пока освободится, профиль не трогаю"), ""
         return "", ""
+
+    def _profile_for_agent(c, profile_id):
+        """Номер профиля, который понимает нода: серийный номер AdsPower.
+
+        04.10.2026: из 10 заданий студии ни одно не залилось. Нода открывает AdsPower по
+        полю `profile` как по серийному номеру (`upload_worker._ads_param`: цифры —
+        serial_number), а студия отдавала туда СВОЙ номер строки `pub_profiles.id`. В
+        старом кабинете таблицы профилей нет, и номер канала там и есть серийный; в
+        студии они разошлись (канал «Tichá Obloha»: профиль 43 = AdsPower №24, а нода
+        открыла №43 — чужой аккаунт, в переключателе другие каналы). Заливщик честно
+        не находил канал и останавливался — ни один ролик не ушёл не туда.
+
+        Строки в `pub_profiles` нет — номер вписан руками по-старому, это и есть серийный.
+        """
+        if profile_id is None:
+            return None
+        try:
+            row = c.execute("SELECT serial FROM pub_profiles WHERE id=?",
+                            (profile_id,)).fetchone()
+        except sqlite3.OperationalError:
+            row = None                      # база старше таблицы профилей
+        if row is None:
+            return profile_id
+        return _agent_profile(row["serial"] if hasattr(row, "keys") else row[0])
 
     def _remember_block(c, r, why: str, unknown: str, now: float) -> None:
         """Запомнить или снять «задание стоит из-за чужого профиля».
@@ -276,7 +309,7 @@ def register_upload_routes(app, ctx):
             # Только задания ЖИВЫХ выпусков: отменённый или карантинный выпуск мог оставить
             # своё задание в очереди — заливать его значит заливать ролик без хозяина.
             rows = c.execute(
-                "SELECT u.*, p.serial ads_serial, p.adspower_user_id ads_uid, "
+                "SELECT u.*, p.id ads_pid, p.serial ads_serial, p.adspower_user_id ads_uid, "
                 "p.default_host_id ads_host FROM pub_upload_jobs u JOIN pub_releases r "
                 "ON r.release_id=u.release_id AND r.status IN ('pending','running') "
                 "LEFT JOIN pub_profiles p ON p.id=u.profile_id "
@@ -302,6 +335,14 @@ def register_upload_routes(app, ctx):
                     pub_upload_census.note(
                         c, r["release_id"], "время выхода прошло, пока стояло в очереди",
                         now=now, stale=True)
+                    continue
+                if r["ads_pid"] is not None and _agent_profile(r["ads_serial"]) is None:
+                    # Без номера AdsPower нода откроет профиль по нашему внутреннему
+                    # номеру — то есть ЧУЖОЙ профиль (см. `_agent_profile`). Ждём сверки.
+                    _remember_block(c, r, (
+                        f"у профиля {r['profile_id']} нет номера AdsPower — нажмите "
+                        "«Обновить список профилей» у машины; без номера машина открыла "
+                        "бы чужой профиль"), "", now)
                     continue
                 ours = r["profile_id"] in busy_profiles
                 # (5) Чужим считаем профиль, только если он НЕ занят нами: наша же идущая
@@ -349,7 +390,9 @@ def register_upload_routes(app, ctx):
             fresh = c.execute("SELECT * FROM pub_upload_jobs WHERE id=?", (task["id"],)).fetchone()
             log_line(c, fresh["release_id"], "заливка",
                      f"выдал задание машине {host}, место {worker}, профиль "
-                     f"{fresh['profile_id']}, выход {fresh['schedule_iso'] or 'сразу'}", now=now)
+                     f"{fresh['profile_id']} (AdsPower №"
+                     f"{_profile_for_agent(c, fresh['profile_id'])}), "
+                     f"выход {fresh['schedule_iso'] or 'сразу'}", now=now)
             if unknown_why:
                 # Выдали, НЕ проверив занятость. Молчать об этом нельзя: если в профиль
                 # в этот момент кто-то зашёл руками, разбираться с порванными куками
@@ -368,7 +411,7 @@ def register_upload_routes(app, ctx):
         return {"task": {
             "release_id": row["release_id"],
             "claim_token": row["claim_token"],
-            "profile": row["profile_id"],
+            "profile": _profile_for_agent(c, row["profile_id"]),
             "channel_url": row["channel_url"],
             "title": row["title"],
             "description": row["description"],
