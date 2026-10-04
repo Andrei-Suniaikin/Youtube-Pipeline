@@ -827,6 +827,12 @@ class PubServices:
                     return {"wait": True}
                 raise ItemFailed(f"этап «{kind}» завершился со статусом {state}")
             if state not in TERMINAL_OK:
+                if kind in OPTIONAL_STAGES:
+                    why = self._chapters_overdue(c, rel, known)
+                    if why:
+                        log_line(c, rel["release_id"], "ролик",
+                                 f"таймкоды не дождались ({why}) — ролик уходит без них")
+                        continue
                 return {"wait": True}
             if kind == "images":
                 later = self._latest_images_task(c, rel, known["remote_job_id"])
@@ -883,6 +889,45 @@ class PubServices:
                          "первая задача картинок оказалась промптами — ставлю сами картинки")
                 return {"wait": True}
         return {}
+
+    # Сколько готовый ролик ждёт таймкоды и за сколько до слота перестаёт ждать.
+    # Решение владельца 04.10.2026 (тест решений, А4): «до 6 часов, но если до слота
+    # меньше 3 часов — лить без таймкодов». В тот день восемь готовых роликов ждали
+    # таймкоды с 09:25 до ночи за промптами новых проектов и опоздали к слотам; мост ВВ2
+    # старого кабинета ждёт те же 6 часов (PUB_BRIDGE_CHAPTERS_WAIT_H).
+    CHAPTERS_WAIT_SEC = float(os.environ.get("VS_CHAPTERS_WAIT_SEC") or 6 * 3600)
+    CHAPTERS_SLOT_MARGIN_SEC = float(os.environ.get("VS_CHAPTERS_SLOT_MARGIN_SEC") or 3 * 3600)
+
+    def _chapters_overdue(self, c, rel, known) -> str:
+        """Почему таймкоды больше не ждём — или "" (ждём дальше).
+
+        Ожидание считаем от постановки задачи таймкодов: от её строки в очереди, а если
+        строки нет — от того, когда выпуск её запомнил.
+        """
+        now = self._clock()
+        since = None
+        try:
+            row = c.execute("SELECT created FROM queue_tasks WHERE job_id=?",
+                            (known["remote_job_id"],)).fetchone()
+            since = float(row["created"]) if row and row["created"] else None
+        except Exception:                                          # noqa: BLE001
+            since = None
+        if since is None:
+            try:
+                since = float(known["created"] or 0) or None
+            except (KeyError, IndexError, TypeError, ValueError):
+                since = None
+        try:
+            slot = float(rel["slot_at"] or 0) if "slot_at" in rel.keys() else 0.0
+        except (TypeError, ValueError):
+            slot = 0.0
+        if slot and slot - now < self.CHAPTERS_SLOT_MARGIN_SEC:
+            left = max(0, int((slot - now) / 60))
+            return f"до слота {left} мин — меньше {int(self.CHAPTERS_SLOT_MARGIN_SEC // 3600)} ч"
+        if since and now - since >= self.CHAPTERS_WAIT_SEC:
+            return (f"ждали {int((now - since) // 3600)} ч из "
+                    f"{int(self.CHAPTERS_WAIT_SEC // 3600)}")
+        return ""
 
     def _newer_stage_task(self, c, rel, kind: str, after) -> tuple:
         """(job_id, status) самой новой живой или сделанной задачи этапа новее `after`."""
