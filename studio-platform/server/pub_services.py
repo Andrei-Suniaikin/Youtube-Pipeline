@@ -864,6 +864,10 @@ class PubServices:
                 if known["error"] == "re-enqueued":
                     raise ItemFailed("этап картинок завершился, а картинок в проекте нет")
                 uid = self._uid(c, rel["tenant_id"])
+                if not uid:
+                    # 02.10.2026 здесь не было проверки, и десять задач картинок встали в
+                    # очередь без владельца — их не берёт ни один шедулер.
+                    raise ResourceDown("студия", "не найден владелец проекта для постановки")
                 c.commit()      # то же: чужое соединение не должно ждать наш замок
                 job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], "images",
                                       self._preset_params(c, rel))
