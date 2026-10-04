@@ -42,10 +42,12 @@ from pub_publish import (
     find_video,
     make_description,
     make_title,
+    make_title_codex,
     read_chapters,
     schedule_iso,
 )
 from pub_remote import (
+    REWRITE_BASE,
     CoverClient,
     RemoteJobMissing,
     RewriteClient,
@@ -769,6 +771,18 @@ class PubServices:
                           "AND service='vsgen' AND kind=?",
                           (state, rel["release_id"], kind))
             if state in TERMINAL_BAD:
+                newer = self._newer_stage_task(c, rel, kind, known["remote_job_id"])
+                if newer:
+                    # Этап перезапустили руками (кнопкой «Повторить» в проекте) — новая
+                    # задача и есть сегодняшний этап. Раньше выпуск падал по старой.
+                    c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status=?, "
+                              "error=NULL, updated=? WHERE release_id=? AND service='vsgen' "
+                              "AND kind=?", (newer[0], newer[1], rel["updated"],
+                                             rel["release_id"], kind))
+                    log_line(c, rel["release_id"], "ролик",
+                             f"этап «{kind}» перезапущен (задача {newer[0]}, {newer[1]}) — "
+                             f"беру её вместо упавшей {known['remote_job_id']}")
+                    return {"wait": True}
                 if kind in OPTIONAL_STAGES:
                     continue      # без глав ролик публикуется, просто без таймкодов
                 if kind == "images" and self._requeue_after_prompt_channel(c, rel, known):
@@ -786,6 +800,18 @@ class PubServices:
                 job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], "images",
                                       self._preset_params(c, rel))
                 if not job_id:
+                    # Отказ очереди почти всегда значит «картинки этого проекта уже
+                    # стоят» (их поставил сам сервер после промптов). Берём стоящую задачу
+                    # и честно пишем, что ждём её, — а не «очередь не приняла» без конца.
+                    newer = self._newer_stage_task(c, rel, "images", known["remote_job_id"])
+                    if newer and newer[1] in ("queued", "running"):
+                        c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status=?, "
+                                  "error='re-enqueued', updated=? WHERE release_id=? AND "
+                                  "service='vsgen' AND kind='images'",
+                                  (newer[0], newer[1], rel["updated"], rel["release_id"]))
+                        log_line(c, rel["release_id"], "ролик",
+                                 f"картинки уже стоят в очереди (задача {newer[0]}) — жду их")
+                        return {"wait": True}
                     raise ResourceDown("images", "очередь не приняла повторный этап картинок")
                 c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', "
                           "error='re-enqueued', updated=? WHERE release_id=? "
@@ -795,6 +821,23 @@ class PubServices:
                          "первая задача картинок оказалась промптами — ставлю сами картинки")
                 return {"wait": True}
         return {}
+
+    def _newer_stage_task(self, c, rel, kind: str, after) -> tuple:
+        """(job_id, status) самой новой живой или сделанной задачи этапа новее `after`."""
+        try:
+            after_id = int(after or 0)
+        except (TypeError, ValueError):
+            return ()
+        if not rel["project_id"] or not after_id:
+            return ()
+        try:
+            row = c.execute(
+                "SELECT job_id, status FROM queue_tasks WHERE project_id=? AND kind=? AND "
+                "job_id>? AND status IN ('queued','running','done') ORDER BY job_id DESC "
+                "LIMIT 1", (rel["project_id"], kind, after_id)).fetchone()
+        except Exception:                                          # noqa: BLE001
+            return ()
+        return (str(row["job_id"]), row["status"]) if row else ()
 
     # Сколько раз подряд картинки ставятся заново из-за отказа КАНАЛА промптов. Дальше —
     # разбор: значит, нет ни одного рабочего канала, и это уже не случайность.
@@ -1032,6 +1075,18 @@ class PubServices:
 
     # ── заливка ──
 
+    def _make_title(self, c, rel) -> str:
+        """Название ролика. По умолчанию — подписка Codex (сервис текста, ключ рерайта).
+
+        VS_TITLE_PROVIDER=openai возвращает прежний путь через ключ OpenAI — на случай,
+        если счёт пополнят и захотят вернуть; сейчас он пуст и отвечает 429.
+        """
+        if (os.environ.get("VS_TITLE_PROVIDER") or "codex").strip().lower() == "openai":
+            return make_title(rel["donor_title"] or "", rel["lang"] or "ru",
+                              self._openai_key(c))
+        return make_title_codex(rel["donor_title"] or "", rel["lang"] or "ru",
+                                get_key(c, "rewrite"), REWRITE_BASE)
+
     def _upload_job(self, c, release_id: str):
         return c.execute("SELECT * FROM pub_upload_jobs WHERE release_id=?",
                          (release_id,)).fetchone()
@@ -1142,8 +1197,7 @@ class PubServices:
             cover = ""
 
         try:
-            title = make_title(rel["donor_title"] or "", rel["lang"] or "ru",
-                               self._openai_key(c))
+            title = self._make_title(c, rel)
             chapters = ""
             if chapters_enabled(self._preset_settings(c, rel["preset_vsgen_id"])):
                 chapters = read_chapters(proj)

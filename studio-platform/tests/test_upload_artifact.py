@@ -158,6 +158,7 @@ pub_adspower.active_profiles = boom
 # Генератор названий ходит в модель за деньги. Подменяем целиком: проверяем допуск,
 # а не заголовок, и платить за это тест не должен.
 S.make_title = lambda *a, **k: TITLE
+S.make_title_codex = S.make_title   # 04.10.2026: названия по умолчанию — подписка Codex
 S.chapters_enabled = lambda *a, **k: False
 
 app = FastAPI()

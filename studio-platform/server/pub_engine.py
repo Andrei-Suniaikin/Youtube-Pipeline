@@ -914,11 +914,65 @@ def revive_cover_preset_chosen(c, now: float) -> list:
     return back
 
 
+_STAGE_FAILED_RE = re.compile(r"^этап «(\w+)» завершился со статусом")
+
+
+def revive_rerun_stages(c, now: float) -> list:
+    """Выпуск в разборе из-за упавшего этапа, а этап перезапустили, — выпуск в работу.
+
+    04.10.2026, владелец: «давай фиксить полностью». Этап производства в проекте
+    перезапускают руками (кнопка «Повторить» — та же задача или новая), а выпуск про это
+    не знал и стоял в разборе, пока кто-то не нажмёт «вернуть в работу» и у него. Так
+    стояли Záhady dávnověku (картинки давно готовы) и Wymazane Zwoje (картинки в очереди).
+
+    Возвращаем, когда задача этапа ЖИВА или СДЕЛАНА: та же (повтор на месте) или новее
+    (новая задача того же вида). Дальше движок сам возьмёт её (`_newer_stage_task`).
+    """
+    try:
+        rows = c.execute(
+            "SELECT r.release_id, r.project_id, r.blocked_reason, j.remote_job_id "
+            "FROM pub_releases r JOIN pub_release_jobs j ON j.release_id=r.release_id "
+            "AND j.service='vsgen' WHERE r.status='blocked' AND r.blocked_reason LIKE "
+            "'этап «%» завершился со статусом %'").fetchall()
+    except Exception:                              # noqa: BLE001 — база без нужных таблиц
+        return []
+    back = []
+    for r in rows:
+        m = _STAGE_FAILED_RE.match(r["blocked_reason"] or "")
+        if not m or not r["project_id"]:
+            continue
+        kind = m.group(1)
+        job = c.execute("SELECT remote_job_id FROM pub_release_jobs WHERE release_id=? AND "
+                        "service='vsgen' AND kind=?", (r["release_id"], kind)).fetchone()
+        if not job or str(job["remote_job_id"] or "") != str(r["remote_job_id"] or ""):
+            continue                               # строка другого этапа — пропустим
+        try:
+            job_id = int(job["remote_job_id"] or 0)
+        except (TypeError, ValueError):
+            continue
+        alive = c.execute(
+            "SELECT job_id, status FROM queue_tasks WHERE project_id=? AND kind=? AND "
+            "job_id>=? AND status IN ('queued','running','done') ORDER BY job_id DESC LIMIT 1",
+            (r["project_id"], kind, job_id)).fetchone()
+        if not alive:
+            continue
+        if revive(c, r["release_id"], now).get("ok"):
+            log_line(c, r["release_id"], "движок",
+                     f"этап «{kind}» перезапущен (задача {alive['job_id']}, "
+                     f"{alive['status']}) — выпуск вернулся в работу сам", now=now)
+            back.append(r["release_id"])
+    return back
+
+
 def tick(c, services, now: float = None) -> dict:
     """Один шаг движка. Ошибка одного выпуска не мешает остальным."""
     now = time.time() if now is None else now
     try:
         revive_cover_preset_chosen(c, now)
+    except Exception:                              # noqa: BLE001 — не роняем тик
+        pass
+    try:
+        revive_rerun_stages(c, now)
     except Exception:                              # noqa: BLE001 — не роняем тик
         pass
     reflow_slots(c, now)          # ссылки без даты занимают освободившиеся выходы

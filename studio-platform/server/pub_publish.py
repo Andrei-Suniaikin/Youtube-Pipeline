@@ -58,6 +58,8 @@ def clean_title(text: str) -> str:
     line = " ".join((text or "").split())
     line = line.strip().strip('"').strip("«»").strip("'").strip()
     line = re.sub(r"^(название|title)\s*[:—-]\s*", "", line, flags=re.I).strip()
+    # После пометки «Название:» модель часто ставит кавычки ещё раз — снимаем и их.
+    line = line.strip('"').strip("«»").strip("'").strip()
     if len(line) > MAX_TITLE:
         cut = line[:MAX_TITLE]
         if " " in cut:
@@ -98,6 +100,55 @@ def make_title(donor_title: str, lang: str, api_key: str, model: str = "gpt-4.1-
     title = clean_title(text)
     if len(title) < 10:
         raise TitleError(f"модель вернула слишком короткое название: {title!r}")
+    return title
+
+
+# Модель Codex для названий: та же, что пишет тексты рерайта (решение владельца 02.10).
+TITLE_CODEX_MODEL = os.environ.get("VS_TITLE_CODEX_MODEL", "gpt-5.6-sol")
+
+
+def make_title_codex(donor_title: str, lang: str, rewrite_key: str, base: str,
+                     model: str = "") -> str:
+    """Название на языке канала — подпиской Codex через сервис текста (chat-once).
+
+    04.10.2026: 33 готовых ролика стояли перед заливкой с «модель временно недоступна:
+    429». Названия писал OpenAI напрямую (`make_title`), а счёт OpenAI пуст с 21.09:
+    ответ «нет денег» тоже 429, и выпуск ждал вечно. Владелец: «промпты должны улетать
+    в подписку Codex». Подпиской распоряжается сервис текста (пулы, аренда, лимиты) —
+    сюда, как и у обложек, ходим только его же входом `chat-once`.
+    """
+    source = " ".join((donor_title or "").split())
+    if not source:
+        raise TitleError("у донора нет названия — не из чего делать заголовок")
+    if not rewrite_key:
+        raise TitleUnavailable("нет ключа сервиса текста — ждём настройки")
+    language = LANG_NAMES.get((lang or "").lower(), lang or "русский")
+    payload = {"provider": "codex", "model": model or TITLE_CODEX_MODEL, "images": [],
+               "messages": [{"role": "system", "content": SYSTEM},
+                            {"role": "user", "content":
+                             f"Язык канала: {language}.\nНазвание оригинала: {source}"}]}
+    try:
+        resp = requests.post(base.rstrip("/") + "/api/v1/chat-once", json=payload,
+                             headers={"Authorization": f"Bearer {rewrite_key}"}, timeout=240)
+    except requests.RequestException as exc:
+        raise TitleUnavailable(f"сервис текста не ответил: {type(exc).__name__}")
+    if resp.status_code != 200:
+        try:
+            detail = str((resp.json() or {}).get("detail") or "")
+        except ValueError:
+            detail = resp.text[:160]
+        # Любой отказ подписки — повод подождать, а не хоронить готовый ролик: лимит
+        # окна, занятая учётка, сбой CLI проходят сами. Битым здесь может быть только
+        # донор, а его мы проверили выше.
+        raise TitleUnavailable(f"подписка Codex не дала название ({resp.status_code}): "
+                               f"{detail[:160]}")
+    try:
+        text = str((resp.json() or {}).get("text") or "")
+    except ValueError:
+        raise TitleUnavailable("не разобрал ответ сервиса текста")
+    title = clean_title(text)
+    if len(title) < 10:
+        raise TitleUnavailable(f"подписка вернула слишком короткое название: {title!r}")
     return title
 
 

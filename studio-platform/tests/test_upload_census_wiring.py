@@ -116,6 +116,7 @@ def boom(*_a, **_kw):
 
 pub_adspower.active_profiles = boom
 S.make_title = lambda *a, **k: "Название ролика"
+S.make_title_codex = S.make_title   # 04.10.2026: названия по умолчанию — подписка Codex
 S.chapters_enabled = lambda *a, **k: False
 
 app = FastAPI()

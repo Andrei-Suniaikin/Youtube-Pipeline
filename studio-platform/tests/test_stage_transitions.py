@@ -218,9 +218,83 @@ def services_part():
     check("озвучка из прошлого захода не выдана за сегодняшнюю", placed, ["tts"])
 
 
+def rerun_part():
+    print("\nЭтап перезапустили руками — выпуск из разбора возвращается сам")
+    c = engine_db()
+    c.execute("UPDATE pub_releases SET status='blocked', phase='project_ready', blocked_reason="
+              "'этап «images» завершился со статусом error' WHERE release_id='rel-1'")
+    c.execute("INSERT INTO pub_release_jobs(release_id,service,kind,remote_job_id,status,"
+              "created,updated) VALUES('rel-1','vsgen','images','12','error',?,?)", (NOW, NOW))
+    task(c, 12, "images", "error", finished=NOW - 600)
+    check("упавшая задача так и лежит — не трогаем", E.revive_rerun_stages(c, NOW), [])
+    task(c, 15, "images", "queued")
+    check("поставили новую задачу картинок — выпуск вернулся", E.revive_rerun_stages(c, NOW),
+          ["rel-1"])
+    check("он в работе", rel(c)["status"], "pending")
+    msg = c.execute("SELECT message FROM pub_release_log WHERE release_id='rel-1' "
+                    "AND message LIKE '%вернулся в работу сам%'").fetchone()
+    check("и сказано почему", bool(msg) and "задача 15" in msg[0], True)
+
+    c = engine_db()
+    c.execute("UPDATE pub_releases SET status='blocked', phase='project_ready', blocked_reason="
+              "'этап «images» завершился со статусом error' WHERE release_id='rel-1'")
+    c.execute("INSERT INTO pub_release_jobs(release_id,service,kind,remote_job_id,status,"
+              "created,updated) VALUES('rel-1','vsgen','images','12','error',?,?)", (NOW, NOW))
+    task(c, 12, "images", "done", finished=NOW - 60)
+    check("повтор на месте (та же задача стала done) — тоже возвращается",
+          E.revive_rerun_stages(c, NOW), ["rel-1"])
+
+    c = engine_db()
+    c.execute("UPDATE pub_releases SET status='blocked', blocked_reason='зависло на шаге «x»' "
+              "WHERE release_id='rel-1'")
+    task(c, 15, "images", "queued")
+    check("другая причина разбора — не наш случай", E.revive_rerun_stages(c, NOW), [])
+    import inspect
+    check("тик зовёт это каждый раз",
+          "revive_rerun_stages(c, now)" in inspect.getsource(E.tick), True)
+
+    print("\nДвижок берёт перезапущенную или уже стоящую задачу, а не роняет выпуск")
+    c = svc_db()
+    c.execute("UPDATE queue_tasks SET status='error' WHERE job_id=12")
+    c.execute("INSERT INTO queue_tasks VALUES(14,'dev','proj-1','render','running')")
+    c.commit()
+    placed = []
+    out = services(placed).do_media_ready(c, REL)
+    check("упал рендер, но новый уже идёт — ждём его, не разбор", out, {"wait": True})
+    row = c.execute("SELECT remote_job_id, status FROM pub_release_jobs WHERE kind='render'").fetchone()
+    check("за выпуском — новая задача", (row["remote_job_id"], row["status"]), ("14", "running"))
+    check("новой не ставили", placed, [])
+
+    c = svc_db()
+    c.execute("UPDATE queue_tasks SET status='error' WHERE job_id=12")
+    c.commit()
+    try:
+        services([]).do_media_ready(c, REL)
+        check("упал и ничего нового — разбор, как раньше", "не упало", "ItemFailed")
+    except pub_services.ItemFailed:
+        check("упал и ничего нового — разбор, как раньше", True, True)
+
+    print("\n  картинки уже стоят в очереди — «жду их», а не «очередь не приняла»")
+    empty = tempfile.mkdtemp(prefix="stage-empty-")
+    c = svc_db()
+    c.execute("INSERT INTO queue_tasks VALUES(20,'dev','proj-1','images','queued')")
+    c.commit()
+    svc = pub_services.PubServices({
+        "create_project": lambda *a, **k: "proj-1",
+        "enqueue": lambda *a, **k: None,                      # очередь отказывает
+        "project_dir": lambda *a, **k: empty})                # картинок на диске нет
+    out = svc.do_media_ready(c, REL)
+    check("ждём стоящие картинки", out, {"wait": True})
+    row = c.execute("SELECT remote_job_id, error FROM pub_release_jobs WHERE kind='images'").fetchone()
+    check("и они записаны за выпуском", (row["remote_job_id"], row["error"]), ("20", "re-enqueued"))
+    msg = c.execute("SELECT message FROM pub_release_log ORDER BY id DESC LIMIT 1").fetchone()[0]
+    check("в журнале — «жду их»", "уже стоят в очереди" in msg, True)
+
+
 def main() -> int:
     engine_part()
     services_part()
+    rerun_part()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
         for f in FAILS:
