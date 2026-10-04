@@ -771,6 +771,8 @@ class PubServices:
             if state in TERMINAL_BAD:
                 if kind in OPTIONAL_STAGES:
                     continue      # без глав ролик публикуется, просто без таймкодов
+                if kind == "images" and self._requeue_after_prompt_channel(c, rel, known):
+                    return {"wait": True}
                 raise ItemFailed(f"этап «{kind}» завершился со статусом {state}")
             if state not in TERMINAL_OK:
                 return {"wait": True}
@@ -793,6 +795,58 @@ class PubServices:
                          "первая задача картинок оказалась промптами — ставлю сами картинки")
                 return {"wait": True}
         return {}
+
+    # Сколько раз подряд картинки ставятся заново из-за отказа КАНАЛА промптов. Дальше —
+    # разбор: значит, нет ни одного рабочего канала, и это уже не случайность.
+    PROMPT_CHANNEL_RETRIES = 2
+
+    def _requeue_after_prompt_channel(self, c, rel, known) -> bool:
+        """Картинки упали, потому что отказал канал промптов, — поставить их заново.
+
+        04.10.2026: 13 выпусков стояли в разборе с «этап images завершился со статусом
+        error». Причина у всех одна: промпты ушли в канал OpenAI, где пустой счёт (с
+        21.09). Канал запасной — задача попадает туда, когда Codex занят; пометка
+        «канал мёртв» живёт 10 минут и только в памяти службы, так что после каждого
+        перезапуска и раз в 10 минут очередная задача снова пробует пустой счёт.
+
+        Сам отказ денег не стоит: ни промптов, ни картинок не сделано. Поэтому ставим
+        картинки заново — канал промптов выбирается при постановке, и свежая пометка
+        уводит его на рабочий. Не больше PROMPT_CHANNEL_RETRIES раз подряд.
+        """
+        if not rel["project_id"]:
+            return False
+        try:
+            row = c.execute("SELECT error FROM queue_tasks WHERE project_id=? AND "
+                            "kind='prompts' ORDER BY job_id DESC LIMIT 1",
+                            (rel["project_id"],)).fetchone()
+        except Exception:                                          # noqa: BLE001
+            return False
+        said = str((row["error"] if row else "") or "").lower()
+        if not ("канал" in said and "промптов" in said
+                and ("исчерпан" in said or "недоступен" in said)):
+            return False
+        mark = str(known["error"] or "")
+        done = int(mark.split(":", 1)[1]) if mark.startswith("prompt-channel:") \
+            and mark.split(":", 1)[1].isdigit() else 0
+        if done >= self.PROMPT_CHANNEL_RETRIES:
+            return False
+        uid = self._uid(c, rel["tenant_id"])
+        if not uid:
+            return False
+        c.commit()      # постановка задачи откроет своё соединение — замок отпустить
+        job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], "images",
+                              self._preset_params(c, rel))
+        if not job_id:
+            return False
+        c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', error=?, "
+                  "updated=? WHERE release_id=? AND service='vsgen' AND kind='images'",
+                  (str(job_id), f"prompt-channel:{done + 1}", rel["updated"],
+                   rel["release_id"]))
+        log_line(c, rel["release_id"], "ролик",
+                 f"канал промптов отказал (исчерпан счёт или лимит) — картинки поставлены "
+                 f"заново, задача {job_id}: промпты пойдут другим каналом "
+                 f"(повтор {done + 1} из {self.PROMPT_CHANNEL_RETRIES})", level="warn")
+        return True
 
     def _adopt_stage(self, c, rel, kind: str, jobs: dict) -> str:
         """Этап, который уже поставил кабинет сам, — номер его задачи. "" — такого нет.
