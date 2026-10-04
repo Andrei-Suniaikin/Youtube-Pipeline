@@ -1416,7 +1416,7 @@ function blockBox(r){
     <div class="blkhead"><span class="blktag ${esc(b.kind)}">${esc(b.tag)}</span> ${esc(b.title)}</div>
     <p>${esc(b.what)}</p>
     <p><b>Что делать:</b> ${esc(b.fix)}</p>
-    ${b.kind === 'cover' ? '<div id="cv-review" class="cvr">Загружаю обложку выпуска…</div>' : ''}
+    ${b.kind === 'cover' ? '<p><a href="#" class="cv-jump">Посмотреть обложку и решить ↓</a></p>' : ''}
     <div class="blkacts">${acts.join('')}</div>
     <p class="muted" style="font-size:12px">Запись движка: ${esc(r.blocked_reason)}</p>
   </div>`;
@@ -1426,6 +1426,7 @@ function blockBox(r){
    обложки не прошли проверку»). Её заказывает движок под ключом студии, во вкладке
    проекта её не видно — показываем здесь: картинку, что сказала сверка, и два решения. */
 const COVER_VERDICT = {
+  running: 'Обложка ещё рисуется — картинка появится здесь, когда будет готова.',
   unchecked: 'Сверку надписи сделать не успели — подписка Codex не ответила вовремя. '
     + 'Сама картинка нарисована и оплачена. Посмотрите надпись: перевод верный и без ошибок?',
   rejected: 'Сверка не приняла надпись на обложке:',
@@ -1445,13 +1446,13 @@ async function fillCoverReview(rid, box, onDone){
     <div class="cvr-body">
       <p><b>${esc(COVER_VERDICT[d.verdict] || '')}</b></p>
       ${notes ? `<ul class="cvr-notes">${notes}</ul>` : ''}
-      ${d.blocked ? `<div class="blkacts">
-        ${d.image ? '<button class="ghost" id="cv-accept">Взять эту обложку</button>' : ''}
-        <button class="ghost" id="cv-reorder">Перезаказать — новая обложка, платно</button>
+      ${d.blocked && d.verdict !== 'running' ? `<div class="blkacts">
+        ${d.image ? '<button class="ghost cv-accept">Взять эту обложку</button>' : ''}
+        <button class="ghost cv-reorder">Перезаказать — новая обложка, платно</button>
       </div>` : ''}
       <p class="muted" style="font-size:12px">Задача обложки ${esc(d.job)}</p>
     </div>`;
-  const acc = box.querySelector('#cv-accept');
+  const acc = box.querySelector('.cv-accept');
   if (acc) acc.onclick = () => confirmInline(acc,
       'Взять эту обложку? Она пойдёт на YouTube как есть — надпись проверили вы.', async () => {
     acc.disabled = true;
@@ -1459,7 +1460,7 @@ async function fillCoverReview(rid, box, onDone){
           toast('Обложка взята — выпуск вернулся в работу', 'ok'); onDone && onDone(); }
     catch (e){ acc.disabled = false; toast(e.message); }
   });
-  const reo = box.querySelector('#cv-reorder');
+  const reo = box.querySelector('.cv-reorder');
   if (reo) reo.onclick = () => confirmInline(reo,
       'Нарисовать обложку заново? Это новая платная задача; эта картинка будет забыта.', async () => {
     reo.disabled = true;
@@ -1703,6 +1704,7 @@ async function viewRelease(id){
           ${s.note ? `<div class="note ${s.state === 'error' ? 'bad' : 'muted'}"
             >${esc(s.note)}</div>` : ''}
           ${stageFiles(s, r.project_id)}
+          ${s.review ? '<div class="cvr" data-cvr="1">Загружаю обложку выпуска…</div>' : ''}
         </div>
         <div style="white-space:nowrap;align-self:center">${
           s.job ? actions({service: s.job.service, id: s.job.id,
@@ -1710,8 +1712,14 @@ async function viewRelease(id){
       </div>`).join('')}
   </div>`);
   app.append(head);
-  const cvr = head.querySelector('#cv-review');
-  if (cvr) fillCoverReview(r.release_id, cvr, () => viewRelease(id));
+  head.querySelectorAll('[data-cvr]').forEach(box =>
+    fillCoverReview(r.release_id, box, () => viewRelease(id)));
+  const jump = head.querySelector('.cv-jump');
+  if (jump) jump.onclick = ev => {
+    ev.preventDefault();
+    const box = head.querySelector('[data-cvr]');
+    if (box) box.scrollIntoView({behavior: 'smooth', block: 'center'});
+  };
   // Повтор одного этапа не трогает соседние: кнопка обращается ровно к той задаче,
   // на которой этап держится, и в тот сервис, которому она принадлежит.
   wireActions(head);
@@ -7744,6 +7752,17 @@ async function refreshCoverJobs(box, pid){
 async function renderCoverTab(d){
   const p = d.project;
   const st = coverState(p.id);
+  // Обложку выпуска заказывает движок — в задачах этой вкладки её нет (04.10.2026,
+  // владелец: «нажимаю посмотреть обложки и её не вижу»). Показываем её первой.
+  if (p.release_id){
+    const rc = $(`<div class="card" style="margin-bottom:16px">
+      <div class="sec">Обложка выпуска <a href="#/release/${encodeURIComponent(p.release_id)}"
+        style="font-weight:400">${esc(p.release_id)}</a></div>
+      <div class="secbody"><div class="cvr" data-cvr="1">Загружаю обложку выпуска…</div></div>
+    </div>`);
+    app.append(rc);
+    fillCoverReview(p.release_id, rc.querySelector('[data-cvr]'), () => viewProject(p.id));
+  }
   const cd = await api('/ui/covers');
 
   // Заголовок называет само действие, а не слово «Действие»: под ним стояла ещё и

@@ -81,7 +81,10 @@ SCENARIO = r"""
         image: '/ui/releases/k1/cover/image'};
       if (p.startsWith('/ui/releases/')) {
         const id = decodeURIComponent(p.split('/').pop());
-        return {release: rels.find(r => r.release_id === id), stages: [], events: [], log: []};
+        const stages = id === 'k1' ? [{key: 'cover', title: 'Обложка', state: 'error',
+          facts: ['задача cj1'], note: 'посмотрите обложку и решите', job: null, files: [],
+          file_base: '', review: true}] : [];
+        return {release: rels.find(r => r.release_id === id), stages, events: [], log: []};
       }
       if (p.startsWith('/ui/releases')) return {releases: rels, phases: []};
       if (p === '/ui/channels') return {channels: [
@@ -173,14 +176,17 @@ SCENARIO = r"""
     // ── обложка: картинка, вердикт сверки и два решения (04.10.2026) ──
     location.hash = '#/release/k1';
     await sleep(500);
-    const cvr = document.querySelector('#cv-review');
+    // Обложка — в строке этапа «Обложка» (04.10.2026: «пишется, что с обложкой что-то
+    // не так, а обложку не вижу»), а в рамке остановки — ссылка к ней.
+    out.ссылкаКОбложке = !!document.querySelector('#blk .cv-jump');
+    const cvr = document.querySelector('.stage [data-cvr]');
     out.обложкаЕсть = !!cvr;
     out.обложкаКартинка = cvr && cvr.querySelector('img') ? cvr.querySelector('img').getAttribute('src') : '';
     out.обложкаВердикт = txt(cvr);
     out.обложкаКнопки = cvr ? [...cvr.querySelectorAll('button')].map(txt) : [];
     out.обложкаВернутьНет = !document.querySelector('#revive');
     out.обложкаРукамиНет = !document.querySelector('#byhand');
-    const take = document.querySelector('#cv-accept');
+    const take = document.querySelector('.stage .cv-accept');
     if (take){
       take.click(); await sleep(100);
       const ok = document.querySelector('.ask-ok'); if (ok) ok.click();
@@ -216,7 +222,8 @@ def main() -> int:
     check("ошибок на странице нет", res.get("errs"), [])
 
     print("Обложка выпуска: картинка, вердикт и решения")
-    check("блок обложки на месте", res.get("обложкаЕсть"), True)
+    check("обложка — прямо в строке этапа «Обложка»", res.get("обложкаЕсть"), True)
+    check("в рамке остановки — ссылка к ней", res.get("ссылкаКОбложке"), True)
     check("картинка выпуска", (res.get("обложкаКартинка") or "").endswith("/ui/releases/k1/cover/image"), True)
     check("вердикт словами", "Сверку надписи сделать не успели" in (res.get("обложкаВердикт") or ""), True)
     check("строка сверки без значков", "проверка текста не выполнена: TimeoutError" in (res.get("обложкаВердикт") or ""), True)

@@ -497,9 +497,15 @@ def _stages(c, rel: dict) -> list:
                                       "status": job["status"] or ""}
                 if job["error"]:
                     row["note"] = job["error"]
-                if service == "cover" and rel.get("status") == "blocked":
-                    row["note"] = ("обложку решает человек — выше: «Взять эту обложку» "
-                                   "или «Перезаказать»")
+                if service == "cover":
+                    # Обложку выпуска показываем прямо в строке этапа (04.10.2026, владелец:
+                    # «пишется, что с обложкой что-то не так, а обложку не вижу»), пока она
+                    # не легла в проект: тогда её покажет группа файлов «обложка».
+                    row["review"] = bool(job["remote_job_id"]) and not (
+                        job["status"] == "done" and groups.get("covers"))
+                    if rel.get("status") == "blocked":
+                        row["note"] = ("посмотрите обложку и решите: «Взять эту обложку» "
+                                       "или «Перезаказать»")
 
         elif source.startswith("queue:"):
             kind = source.split(":", 1)[1]
@@ -9826,11 +9832,13 @@ def ui_release_cover(release_id: str):
         info = CoverClient(key).job(job["remote_job_id"])
     except Exception as exc:                                       # noqa: BLE001
         return {**out, "error": f"сервис обложек не ответил: {type(exc).__name__}"}
-    verdict = _cover_verdict(info)
+    state = str(info.get("status") or "").lower()
+    verdict = ("running" if state in ("pending", "queued", "running", "resetting")
+               else _cover_verdict(info))
     return {**out, "status": info.get("status") or "", "verdict": verdict,
             "notes": info.get("check_notes") or [],
             "image": (f"/ui/releases/{urllib.parse.quote(release_id)}/cover/image"
-                      if verdict != "nothing" else "")}
+                      if verdict not in ("nothing", "running") else "")}
 
 
 @app.get("/ui/releases/{release_id}/cover/image")

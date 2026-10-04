@@ -169,6 +169,13 @@ def main() -> int:
     check("картинка отдаётся", (img.media_type, len(img.body)), ("image/jpeg", 9002))
     check("язык канала — для скачивания", FakeCover.calls[-1], ("download", "cj1", "pl"))
 
+    print("\n  обложка ещё рисуется — так и сказано, картинки и решений нет")
+    FakeCover.info = {"status": "running", "output_files": []}
+    d = W.ui_release_cover("r1")
+    check("вердикт «рисуется»", (d["verdict"], d["image"]), ("running", ""))
+    FakeCover.info = {"status": "completed_partial", "output_files": [f], "fallback_files": [f],
+                      "check_notes": ["❌ Проблема: EKSKLUZYWNY -> EKSKLUZYWNE"]}
+
     print("\n«Взять эту обложку»")
     out = W.ui_release_cover_accept("r1", Req())
     c = W.db()

@@ -101,6 +101,15 @@ def main() -> int:
                                                      "status": "blocked"})}["cover"]
     c.close()
     check("у выпуска в разборе — куда жать", "«Взять эту обложку»" in blocked["note"], True)
+    check("обложка лежит в проекте и задача сделана — второй раз не показываем",
+          cov.get("review"), False)
+    c = db()
+    c.execute("UPDATE pub_release_jobs SET status='error'")
+    c.commit()
+    err = {s_["key"]: s_ for s_ in W._stages(c, {"release_id": "r1", "project_id": "p1",
+                                                 "status": "blocked"})}["cover"]
+    c.close()
+    check("обложка не принята — показываем её в строке этапа", err.get("review"), True)
     check("кадры обложку к себе не забрали",
           [f["code"] for f in stages["images"]["files"]], ["images"])
 
