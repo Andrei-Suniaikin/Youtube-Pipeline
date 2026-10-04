@@ -141,6 +141,8 @@ class ApiJobResponse(BaseModel):
     results_count: int = 0
     output_files: List[str] = Field(default_factory=list)
     fallback_files: List[str] = Field(default_factory=list)
+    # Подмножество fallback_files: текст на обложке есть, но сверить его не удалось.
+    unchecked_files: List[str] = Field(default_factory=list)
     progress_by_language: Dict[str, Dict[str, Any]] = Field(default_factory=dict)
     error: str = ""
 
@@ -416,6 +418,10 @@ def _job_to_response(job: Job) -> ApiJobResponse:
         fb_files = json.loads(job.fallback_files or "[]")
     except Exception:
         fb_files = []
+    try:
+        unchecked = json.loads(getattr(job, "unchecked_files", "") or "[]")
+    except Exception:
+        unchecked = []
     return ApiJobResponse(
         id=job.id,
         status=job.status,
@@ -427,6 +433,7 @@ def _job_to_response(job: Job) -> ApiJobResponse:
         results_count=job.results_count,
         output_files=out_files,
         fallback_files=fb_files,
+        unchecked_files=unchecked,
         progress_by_language=_compute_progress_by_language(job),
         error=job.error or "",
     )
@@ -911,6 +918,7 @@ def build_api_router(
             # Полный wipe — как POST /jobs/{id}/retry
             job.output_files = "[]"
             job.fallback_files = "[]"
+            job.unchecked_files = "[]"
             job.results_count = 0
 
         ensure_server_keys_for_job(job)

@@ -634,7 +634,10 @@ def _alt_chat_route():
 # Codex; второй распорядитель той же подписки означал бы потерянный одноразовый токен
 # обновления и разлогиненную подписку. Поэтому обложки просят вызов, а не делают его.
 SUBSCRIPTION_PROVIDERS = ("codex", "claude")
-SUBSCRIPTION_TIMEOUT = float(os.environ.get("COVER_SUBSCRIPTION_TIMEOUT", "300"))
+# 04.10.2026: 300 с не хватало. Подписка Codex общая с рерайтом, промптами картинок и
+# названиями; под нагрузкой ответ из одного слова шёл 124 с, сверка двух картинок
+# не укладывалась в 300 с — и каждую обложку студия перезаказывала за деньги.
+SUBSCRIPTION_TIMEOUT = float(os.environ.get("COVER_SUBSCRIPTION_TIMEOUT", "900"))
 
 
 def _subscription_call(provider: str, messages: list, model: str = "",
@@ -1987,6 +1990,10 @@ class CoverResult:
     image_no_text: Optional[Image.Image] = None  # картинка без текста (если генерировалась для fallback)
     adapted_text: str = ""
     used_fallback: bool = False
+    # Текст на картинке есть, но сверить его не удалось (контролёр не ответил). Для
+    # человека это тоже «не готово до конца» (used_fallback), но не брак: перерисовка
+    # за деньги тут ничего не исправит — сломан контролёр, а не картинка.
+    unchecked: bool = False
     analysis: Dict = field(default_factory=dict)
     check_result: Dict = field(default_factory=dict)
     error: str = ""
@@ -2221,6 +2228,7 @@ def _generate_simple_edit(
                 log("   Картинка сохранена: она уже оплачена, и выбрасывать её "
                     "из-за неработающего контролёра нельзя.")
                 result.used_fallback = True
+                result.unchecked = True
             else:
                 log("   ✅ Проверка пройдена")
             result.image = generated
@@ -2457,6 +2465,7 @@ def _process_batch_title_mode(
     fallback_files: Optional[List[str]] = None,
     max_threads: int = 1,
     progress_cb=None,
+    unchecked_files: Optional[List[str]] = None,
 ) -> List[CoverResult]:
     """v1.0.4 — title-mode пайплайн (без YouTube URL). Один scene на job, потом цикл по языкам.
     progress_cb(done, total) (v1.3.2) — прогресс по мере готовности языков."""
@@ -2640,6 +2649,8 @@ def _process_batch_title_mode(
                 out_files.append(rel_path)
             if getattr(r, "used_fallback", False) and fallback_files is not None and rel_path not in fallback_files:
                 fallback_files.append(rel_path)
+            if getattr(r, "unchecked", False) and unchecked_files is not None and rel_path not in unchecked_files:
+                unchecked_files.append(rel_path)
         results.append(r)
 
     return results
@@ -2894,6 +2905,7 @@ def process_batch(
     seeds_per_lang: Optional[Dict[str, str]] = None,
     n_variants: int = 3,
     progress_cb=None,
+    unchecked_files: Optional[List[str]] = None,
 ) -> List[CoverResult]:
     """Пакетная генерация обложек. cancel_check — callable, возвращает True если задание отменено.
     progress_cb(done, total) (v1.3.2) — вызывается по мере готовности обложек для прогресс-бара.
@@ -2934,6 +2946,7 @@ def process_batch(
             fallback_files=fallback_files,
             max_threads=max_threads,
             progress_cb=progress_cb,
+            unchecked_files=unchecked_files,
         )
     # ─── URL-MODE (существующая логика — не трогаю) ───
     if languages:
@@ -2967,6 +2980,8 @@ def process_batch(
         # Отмечаем fallback-обложки (сгенерированы без текста после провала проверки)
         if getattr(r, "used_fallback", False) and fallback_files is not None and rel not in fallback_files:
             fallback_files.append(rel)
+        if getattr(r, "unchecked", False) and unchecked_files is not None and rel not in unchecked_files:
+            unchecked_files.append(rel)
         if r.image_no_text:
             safe_name = _safe_video_name_for_file(video_title, vid)
             no_text_path = os.path.join(out_folder, f"No text_{safe_name}.jpg")

@@ -1649,6 +1649,18 @@ def cover_degraded(job: dict) -> bool:
     """
     if not isinstance(job, dict):
         return False
-    if job.get("fallback_count"):
+    # Сверка не состоялась (контролёр не ответил) — не брак. Перезаказ здесь платный и
+    # ничего не чинит: 04.10.2026 13 выпусков ушли в разбор с «деградировала дважды»,
+    # хотя обе картинки были нарисованы, а не дождались ответа только проверки.
+    unchecked = {str(x) for x in (job.get("unchecked_files") or [])}
+    bad = [f for f in (job.get("fallback_files") or []) if str(f) not in unchecked]
+    if bad:
         return True
-    return bool(job.get("fallback_files"))
+    if unchecked:
+        return False
+    return bool(job.get("fallback_count"))
+
+
+def cover_unchecked(job: dict) -> bool:
+    """Обложка нарисована, но текст на ней автоматически никто не сверил."""
+    return isinstance(job, dict) and bool(job.get("unchecked_files"))

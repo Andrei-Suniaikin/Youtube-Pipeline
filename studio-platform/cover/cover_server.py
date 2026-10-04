@@ -371,6 +371,7 @@ def _execute_cover_job(job: Job):
             try:
                 job.output_files = json.dumps(out_files, ensure_ascii=False)
                 job.fallback_files = json.dumps(fallback_files, ensure_ascii=False)
+                job.unchecked_files = json.dumps(unchecked_files, ensure_ascii=False)
                 pct = int(done * 99 / total) if total else 0  # 100 — только финал
                 job.progress_percent = pct
                 job.progress_detail = f"{done}/{total} обложек"
@@ -383,6 +384,8 @@ def _execute_cover_job(job: Job):
         skip_existing = len(existing_output) > 0
         out_files = list(existing_output) if skip_existing else []
         fallback_files = list(existing_fallback) if skip_existing else []
+        existing_unchecked = json.loads(getattr(job, "unchecked_files", "") or "[]")
+        unchecked_files = list(existing_unchecked) if skip_existing else []
 
         # v1.0.4: title-mode передаёт titles_per_lang + extra_prompt, urls пустой.
         job_mode = getattr(job, "mode", "url") or "url"
@@ -420,11 +423,13 @@ def _execute_cover_job(job: Job):
             seeds_per_lang=seeds_per_lang,
             n_variants=n_variants,
             progress_cb=progress_cb,
+            unchecked_files=unchecked_files,
         )
         total = len(results)
         job.results_count = sum(1 for r in results if getattr(r, "success", False))
         job.output_files = json.dumps(out_files, ensure_ascii=False)
         job.fallback_files = json.dumps(fallback_files, ensure_ascii=False)
+        job.unchecked_files = json.dumps(unchecked_files, ensure_ascii=False)
         job.progress_percent = 100
         fb_count = len(fallback_files)
         if fb_count > 0:
@@ -1421,7 +1426,7 @@ def _job_public_dict(job: Job) -> dict:
         "id", "status", "created_at", "started_at", "finished_at",
         "mode", "languages", "n_variants",
         "progress_percent", "progress_detail", "log", "error",
-        "results_count", "output_files", "fallback_files",
+        "results_count", "output_files", "fallback_files", "unchecked_files",
     )
     return {name: getattr(job, name) for name in safe_fields}
 
@@ -1843,6 +1848,7 @@ def _resume_with_fallback_regeneration(
         ensure_ascii=False,
     )
     job.fallback_files = "[]"
+    job.unchecked_files = "[]"
     try:
         updated = queue.update_job(
             job,

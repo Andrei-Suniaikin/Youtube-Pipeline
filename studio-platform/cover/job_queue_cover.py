@@ -68,6 +68,7 @@ class Job:
     results_count: int = 0      # успешных
     output_files: str = "[]"    # JSON list относительных путей (для сервера)
     fallback_files: str = "[]"  # JSON list путей обложек сохранённых через fallback (без текста)
+    unchecked_files: str = "[]"  # JSON list: текст есть, но сверка не состоялась (подмножество fallback)
 
 
 _JOB_FIELDS = None

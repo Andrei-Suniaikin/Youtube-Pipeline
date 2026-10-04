@@ -53,6 +53,7 @@ from pub_remote import (
     RemoteJobMissing,
     RewriteClient,
     cover_degraded,
+    cover_unchecked,
     donor_text,
     get_key,
 )
@@ -1039,6 +1040,12 @@ class PubServices:
             raise
         self._finish_remote(c, rel["release_id"], "cover", "done")
         log_line(c, rel["release_id"], "обложка", f"файл получен, {len(data) // 1024} КБ")
+        if cover_unchecked(info):
+            log_line(c, rel["release_id"], "обложка",
+                     "надпись на обложке не сверена: проверка через подписку Codex не "
+                     "дождалась ответа. Картинка нарисована и принята — перерисовка за "
+                     "деньги тут ничего не исправит. Посмотрите обложку глазами",
+                     level="warn")
         return {"payload": {"cover_bytes": len(data)}}
 
     def _title(self, c, rel) -> str:
