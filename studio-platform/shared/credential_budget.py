@@ -327,6 +327,32 @@ def try_acquire_ex(family, value, units=1):
         _close(gate)
 
 
+def try_acquire_leaving(family, value, keep_free=0):
+    """Одно место — но только если после него останется свободными ещё `keep_free`.
+
+    Так длинные задачи (рерайт кусками по несколько минут) не забирают ПОСЛЕДНИЕ места
+    ключа, и короткий вызов (название ролика, сверка обложки) находит место сразу, а
+    не ждёт, пока освободится кусок рерайта и его тут же перехватит соседний кусок.
+    Проверка и захват — под тем же .gate, что и try_acquire: между «посчитали» и
+    «заняли» никто не влезет. Лишние места, занятые для подсчёта, отдаются сразу.
+    """
+    keep_free = max(0, int(keep_free or 0))
+    if keep_free == 0:
+        return try_acquire(family, value, 1)
+    if keep_free + 1 > capacity(family):
+        return None
+    lease = try_acquire(family, value, keep_free + 1)
+    if lease is None:
+        return None
+    with lease._lock:
+        fds = lease._fds
+        keep, spare = fds[:1], fds[1:]
+        lease._fds = keep
+    for fd in spare:
+        _close(fd)
+    return lease
+
+
 def can_acquire(family, value, units=1):
     lease = try_acquire(family, value, units)
     if lease is None:

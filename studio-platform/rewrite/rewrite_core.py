@@ -941,7 +941,9 @@ class ServerCredentialPool:
                     for chosen in ordered:
                         entry = self._entries[chosen]
                         family = {"openai":"openai", "claude":"claude_oauth", "codex":"codex"}.get(self.provider)
-                        host = (_host_budget.try_acquire(family, entry.value, 1)
+                        reserve = short_call_reserve(family, job_id)
+                        host = ((_host_budget.try_acquire_leaving(family, entry.value, reserve)
+                                 if reserve else _host_budget.try_acquire(family, entry.value, 1))
                                 if family else _host_budget.Lease())
                         if host is None:
                             host_blocked = True
@@ -7981,6 +7983,23 @@ def _call_claude_subscription_impl(
 
 
 HOST_BUDGET_WAIT_PREFIX = "HOST_BUDGET_WAIT:"
+
+
+# Места подписки Codex, которые задачи рерайта НЕ занимают: их ждут короткие вызовы без
+# задачи — название ролика и сверка обложки (chat-once). 04.10.2026 все четыре места на
+# каждой учётке держали куски длинных рерайтов: освободившееся место тут же перехватывал
+# соседний кусок, а название ждало до пяти минут и падало, и готовые ролики стояли перед
+# заливкой. Резерв меньше потолка всегда хотя бы на одно место: иначе рерайт встал бы.
+SHORT_CALL_RESERVE = int(os.environ.get("REWRITE_SHORT_CALL_RESERVE", "1") or 0)
+
+
+def short_call_reserve(family, job_id) -> int:
+    """Сколько мест оставить свободными, занимая место для этого вызова. Только Codex и
+    только для вызова изнутри задачи рерайта; короткому вызову без задачи — ноль."""
+    if family != "codex" or not job_id or SHORT_CALL_RESERVE <= 0:
+        return 0
+    cap = _host_budget.capacity(family) or 1
+    return max(0, min(SHORT_CALL_RESERVE, cap - 1))
 _JOB_HOST_BUDGET_WAITS = {}
 _JOB_HOST_BUDGET_STREAK: Dict[str, int] = {}
 _HOST_BUDGET_WAIT_LOCK = threading.Lock()
