@@ -90,9 +90,11 @@ def прогон(running: int, wait="3", poll="1", force=False, finish_after=Non
                     "STUDIO_UPLOAD_WAIT_SEC": wait, "STUDIO_UPLOAD_POLL_SEC": poll})
         if force:
             окр["STUDIO_FORCE_RESTART"] = "1"
+        drain_seen = []
         if finish_after is not None:
             def finish():
                 time.sleep(finish_after)
+                drain_seen.append(os.path.exists(os.path.join(корень, "data", "upload-drain")))
                 cc = sqlite3.connect(db)
                 cc.execute("UPDATE pub_upload_jobs SET status='done'")
                 cc.commit()
@@ -102,6 +104,8 @@ def прогон(running: int, wait="3", poll="1", force=False, finish_after=Non
                              capture_output=True, text=True, env=окр, timeout=120, cwd=код)
         git_log = os.path.join(tmp, "git.log")
         return {"код": out.returncode, "вывод": out.stdout + out.stderr,
+                "флаг_во_время": drain_seen[:1],
+                "флаг_после": os.path.exists(os.path.join(корень, "data", "upload-drain")),
                 "перезапуск": os.path.exists(os.path.join(tmp, "перезапуск")),
                 "git": io.open(git_log).read() if os.path.exists(git_log) else ""}
 
@@ -112,6 +116,7 @@ def main() -> int:
     check("выход с отказом", r["код"], 2)
     check("перезапуска не было", r["перезапуск"], False)
     check("на новый код не переходили", "fetch" in r["git"] or "checkout" in r["git"], False)
+    check("и при отказе флаг убран — заливка не стоит", r["флаг_после"], False)
     check("сказано почему и что делать",
           "выкатку НЕ делаю" in r["вывод"] and "STUDIO_FORCE_RESTART=1" in r["вывод"], True)
 
@@ -120,6 +125,8 @@ def main() -> int:
     check("выкатка прошла", r["код"], 0)
     check("перезапуск был", r["перезапуск"], True)
     check("сказано, что ждали", "идёт заливка (1) — жду" in r["вывод"], True)
+    check("пока ждали — новых заданий не выдавать (флаг стоял)", r["флаг_во_время"], [True])
+    check("после выкатки флаг убран", r["флаг_после"], False)
 
     print("\nЗаливок нет — сразу")
     r = прогон(running=0)

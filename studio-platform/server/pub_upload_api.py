@@ -32,6 +32,7 @@ import json
 import os
 import secrets
 import sqlite3
+import time
 
 from fastapi import HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -49,6 +50,30 @@ UPLOAD_LEASE_SEC = 45 * 60
 # Успешные исходы Studio. Всё остальное — не успех, даже если video_id получен.
 OK_STATES = ("SCHEDULED",)
 PUBLISHED_STATES = ("PUBLIC",)
+
+
+# Флаг «новых заданий не выдавать»: его ставит выкатка (deploy/update.sh) рядом с базой.
+# Старше DRAIN_MAX_SEC — не верим: упавшая выкатка не должна останавливать заливку навсегда.
+DRAIN_MAX_SEC = 1800
+
+
+def _drain_file() -> str:
+    explicit = os.environ.get("VS_UPLOAD_DRAIN_FILE")
+    if explicit:
+        return explicit
+    db_path = os.environ.get("VS_SERVER_DB") or os.environ.get("VS_DEV_DB") or ""
+    return os.path.join(os.path.dirname(db_path), "upload-drain") if db_path else ""
+
+
+def _draining(now: float = None) -> bool:
+    path = _drain_file()
+    if not path:
+        return False
+    try:
+        age = (time.time() if now is None else now) - os.path.getmtime(path)
+    except OSError:
+        return False
+    return 0 <= age < DRAIN_MAX_SEC
 
 
 def _agent_profile(serial):
@@ -300,6 +325,13 @@ def register_upload_routes(app, ctx):
             if mine is not None:
                 c.commit()
                 return JSONResponse(_task_payload(c, mine, repeat=True))
+
+            # Идёт выкатка: она ждёт, пока доливаются идущие заливки, и просит НОВЫХ не
+            # выдавать (04.10.2026: при потоке заливок «ноль идущих» не наступал, и
+            # выкатка ждала зря). Своё уже взятое задание нода получает и сейчас — выше.
+            if _draining():
+                c.commit()
+                return JSONResponse({"task": None})
 
             # (2) Профили, по которым сейчас уже льют, — исключаем целиком.
             running = c.execute(

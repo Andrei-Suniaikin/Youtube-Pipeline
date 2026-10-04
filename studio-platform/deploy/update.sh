@@ -98,6 +98,13 @@ wait_uploads() {
     done
     return 0
 }
+# Пока ждём — новых заданий заливки не выдавать (студия смотрит на этот файл в
+# /api/upload/claim): при потоке заливок «ноль идущих» иначе не наступает. Файл
+# убирается при любом выходе скрипта — и после перезапуска, и при отказе.
+DRAIN="$(dirname "$UPLOAD_DB")/upload-drain"
+if [ -d "$(dirname "$UPLOAD_DB")" ]; then
+    touch "$DRAIN" 2>/dev/null && trap 'rm -f "$DRAIN"' EXIT
+fi
 wait_uploads || exit 2
 
 TARGET="${1:-}"

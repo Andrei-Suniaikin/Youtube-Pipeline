@@ -224,6 +224,27 @@ def main() -> int:
     t = claim()
     check("номер отдан как есть", (t or {}).get("profile"), 4321)
 
+    print("\nВыкатка просит новых не выдавать — нода ждёт, своё взятое получает")
+    run("UPDATE pub_upload_jobs SET status='done'")
+    drain = os.path.join(TMP, "upload-drain")
+    os.environ["VS_UPLOAD_DRAIN_FILE"] = drain
+    job("rel-drain", profile("41", "k1drain"))
+    open(drain, "w").close()
+    check("новое задание не выдано", claim(), None)
+    check("оно ждёт в очереди", sql("SELECT status FROM pub_upload_jobs "
+                                    "WHERE release_id='rel-drain'")[0]["status"], "queued")
+    old = time.time() - 2 * 3600
+    os.utime(drain, (old, old))
+    t = claim()
+    check("старый флаг (упавшая выкатка) не держит заливку", (t or {}).get("release_id"), "rel-drain")
+    open(drain, "w").close()
+    t2 = claim()
+    check("своё уже взятое задание нода получает и во время выкатки",
+          (t2 or {}).get("release_id"), "rel-drain")
+    os.remove(drain)
+    os.environ.pop("VS_UPLOAD_DRAIN_FILE", None)
+    run("UPDATE pub_upload_jobs SET status='done' WHERE release_id='rel-drain'")
+
     print("\nВспомогательная функция")
     check("цифры — числом", U._agent_profile(" 24 "), 24)
     check("пусто — None", U._agent_profile(""), None)
