@@ -15,6 +15,36 @@ import time
 from typing import Optional, Tuple
 
 
+# Плановый перезапуск — выкатка. deploy/update.sh ставит рядом с базой студии флаг
+# «новых заливок не выдавать» (upload-drain) ДО перезапуска и снимает его, когда новая
+# версия ответила. Значит, на старте процесса свежий флаг означает: нас перезапустила
+# выкатка, а не падение. 04.10.2026 четыре выкатки за сорок минут израсходовали лимит
+# продолжений у всех идущих рерайтов, и два выпуска ушли в разбор «рерайт перезапускали»,
+# хотя сами задачи ни разу не падали. Лимит нужен против задачи, которая роняет сервер
+# сама, — выкатка к этому отношения не имеет и попыткой не считается.
+PLANNED_RESTART_MAX_SEC = 1800      # как DRAIN_MAX_SEC у выдачи заливок
+
+
+def _planned_restart_file() -> str:
+    explicit = os.environ.get("VS_PLANNED_RESTART_FILE") or os.environ.get("VS_UPLOAD_DRAIN_FILE")
+    if explicit:
+        return explicit
+    db_path = os.environ.get("VS_SERVER_DB") or os.environ.get("VS_DEV_DB") or ""
+    return os.path.join(os.path.dirname(db_path), "upload-drain") if db_path else ""
+
+
+def planned_restart(now: Optional[float] = None) -> bool:
+    """Идёт ли выкатка: флаг есть и он свежий. Забытый флаг старше получаса не в счёт."""
+    path = _planned_restart_file()
+    if not path:
+        return False
+    try:
+        age = (time.time() if now is None else now) - os.path.getmtime(path)
+    except OSError:
+        return False
+    return 0 <= age < PLANNED_RESTART_MAX_SEC
+
+
 def migrate_001_api_v1(sessions_db_path: str, jobs_db_path: str,
                        requeue_running: bool = False) -> Tuple[int, int, str]:
     """
@@ -71,15 +101,25 @@ def migrate_001_api_v1(sessions_db_path: str, jobs_db_path: str,
                 limit = max(0, int(os.environ.get("REWRITE_RESTART_RESUME_LIMIT", "2") or 2))
             except (TypeError, ValueError):
                 limit = 2
-            cur = conn.execute(
-                "UPDATE jobs SET status='pending', run_token='', cancel_requested=0, "
-                "resume_count = COALESCE(resume_count,0) + 1, "
-                "log = COALESCE(log,'') || ? "
-                "WHERE status='running' AND COALESCE(cancel_requested,0)=0 "
-                "AND COALESCE(resume_count,0) < ?",
-                (f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] [migrate 001] возвращено в очередь "
-                 f"после рестарта — продолжит с места обрыва", limit)
-            )
+            if planned_restart():
+                # Выкатка: возвращаем ВСЕ идущие задачи и попытку не засчитываем.
+                cur = conn.execute(
+                    "UPDATE jobs SET status='pending', run_token='', cancel_requested=0, "
+                    "log = COALESCE(log,'') || ? "
+                    "WHERE status='running' AND COALESCE(cancel_requested,0)=0",
+                    (f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] [migrate 001] возвращено в очередь "
+                     f"после выкатки — продолжит с места обрыва, попытка не засчитана",)
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE jobs SET status='pending', run_token='', cancel_requested=0, "
+                    "resume_count = COALESCE(resume_count,0) + 1, "
+                    "log = COALESCE(log,'') || ? "
+                    "WHERE status='running' AND COALESCE(cancel_requested,0)=0 "
+                    "AND COALESCE(resume_count,0) < ?",
+                    (f"\n[{time.strftime('%Y-%m-%d %H:%M:%S')}] [migrate 001] возвращено в очередь "
+                     f"после рестарта — продолжит с места обрыва", limit)
+                )
             requeued = cur.rowcount
         # всё, что не прошло фильтр (отменённые, исчерпавшие лимит), хороним как раньше.
         # ТОЛЬКО при requeue_running — то есть только со старта сервера. Раньше этот UPDATE
