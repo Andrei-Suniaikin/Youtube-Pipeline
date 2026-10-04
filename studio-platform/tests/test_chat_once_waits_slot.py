@@ -13,11 +13,11 @@
 каждый раз.
 
 Что проверяется:
-  • «общий лимит занят» — ждём и повторяем, паузы растут, до срока;
+  • «общий лимит занят» — ждём и стучимся каждую секунду, до срока;
   • любой другой отказ (лимит окна, модель) — сразу, без ожидания;
   • срок не превышен, после него — честный отказ;
   • ручка `/api/v1/chat-once` пользуется ожиданием и для Codex, и для Claude;
-  • срок по умолчанию оставляет запас под сам вызов внутри таймаута названия (240 с).
+  • срок по умолчанию оставляет запас под сам вызов внутри таймаута названия.
 
     .venv/bin/python tests/test_chat_once_waits_slot.py
 """
@@ -81,7 +81,7 @@ def main() -> int:
     got = A.wait_for_slot(call, wait_sec=150, sleep=clk.sleep, clock=clk.now)
     check("дождались ответа", got, (True, "Tichá obloha"))
     check("три попытки", len(calls), 3)
-    check("паузы растут", clk.slept, [1.0, 2.0])
+    check("стучимся каждую секунду", clk.slept, [1.0, 1.0])
 
     print("\n  другой отказ — сразу")
     clk = Clock()
@@ -97,7 +97,7 @@ def main() -> int:
     check("честный отказ «лимит занят»", got, BUSY)
     check("ждали не дольше срока", clk.t <= 30, True)
     check("и ждали, а не сдались сразу", clk.t >= 15, True)
-    check("паузы не больше 8 с", max(clk.slept) <= 8.0, True)
+    check("паузы по секунде", set(clk.slept), {1.0})
 
     print("\nРучка chat-once ждёт места")
     router = A.build_api_router(queue=None, upload_dir=Path("/tmp"), output_dir=Path("/tmp"),
@@ -132,10 +132,12 @@ def main() -> int:
         (A.call_codex_subscription, A.call_claude_subscription, A.credential_source,
          time.sleep) = saved
 
-    print("\nСрок по умолчанию")
-    check("150 с", A.CHAT_ONCE_WAIT_SEC, 150.0)
-    check("остаётся минимум минута на сам вызов внутри 240 с названия",
-          A.CHAT_ONCE_WAIT_SEC <= 240 - 60, True)
+    print("\nСроки по умолчанию")
+    import pub_publish as P
+    check("ожидание места — 300 с", A.CHAT_ONCE_WAIT_SEC, 300.0)
+    check("студия ждёт название 480 с", P.TITLE_TIMEOUT_SEC, 480.0)
+    check("после ожидания места на сам вызов остаётся минимум 2 минуты",
+          P.TITLE_TIMEOUT_SEC - A.CHAT_ONCE_WAIT_SEC >= 120, True)
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

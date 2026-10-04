@@ -118,7 +118,15 @@ _LEGACY_SHORT_CODES: Dict[str, str] = {
 # рерайта такой ответ не роняет — её откладывает и повторяет своя очередь. У одноразового
 # вызова очереди нет: он получал 502 за 2 с и проигрывал рерайту почти каждый раз.
 # Поэтому одноразовый вызов сам ждёт места, но не дольше REWRITE_CHAT_ONCE_WAIT_SEC.
-CHAT_ONCE_WAIT_SEC = float(os.environ.get("REWRITE_CHAT_ONCE_WAIT_SEC", "150") or 150)
+#
+# Вторая половина того же дня: места подписки делят ВСЕ службы машины (замки в
+# /run/video-studio-credential-budget) — старый кабинет держал 3 места из 4 на одной
+# учётке и 2 на другой. Студии оставалось по одному, и на 150 с с паузами до 8 с
+# одноразовый вызов почти не успевал его поймать. Поэтому стучимся каждую секунду
+# (замок пробуется без ожидания, это дёшево) и ждём до 5 минут: название — последний
+# шаг перед заливкой готового ролика, ему уступить место правильно.
+CHAT_ONCE_WAIT_SEC = float(os.environ.get("REWRITE_CHAT_ONCE_WAIT_SEC", "300") or 300)
+CHAT_ONCE_POLL_SEC = 1.0
 
 
 def wait_for_slot(call: Callable[[], Tuple[bool, str]], wait_sec: Optional[float] = None,
@@ -134,7 +142,7 @@ def wait_for_slot(call: Callable[[], Tuple[bool, str]], wait_sec: Optional[float
     clock = clock or time.monotonic
     limit = CHAT_ONCE_WAIT_SEC if wait_sec is None else max(0.0, float(wait_sec))
     deadline = clock() + limit
-    pause = 1.0
+    pause = CHAT_ONCE_POLL_SEC
     while True:
         ok, text = call()
         if ok or not str(text or "").startswith(HOST_BUDGET_WAIT_PREFIX):
@@ -142,7 +150,6 @@ def wait_for_slot(call: Callable[[], Tuple[bool, str]], wait_sec: Optional[float
         if clock() + pause > deadline:
             return ok, text
         sleep(pause)
-        pause = min(pause * 2, 8.0)
 
 def resolve_lang_input(raw: str) -> Tuple[Optional[str], List[str]]:
     """

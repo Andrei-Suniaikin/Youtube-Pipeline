@@ -105,18 +105,24 @@ class PubServices:
         self.owner_uid = ctx.get("owner_uid")
         self.default_username = ctx.get("username") or ""
         self.openai_key = ctx.get("openai_key") or (lambda: "")
-        self._title_spent = 0.0      # сколько секунд этот круг движка уже ждал названия
+        # Названия пишутся в фоне: выпуск → {"thread", "title", "error", "fatal"}.
+        import threading as _threading
+        self._titles = {}
+        self._titles_lock = _threading.Lock()
 
-    # 04.10.2026: названия пишет подписка Codex, ответ идёт 1–3 минуты, а движок проходит
-    # выпуски по одному. 28 выпусков ждали название — круг растягивался на час, и все,
-    # у кого срок фазы короче (project_ready — 15 минут), засчитывали попытку каждый
-    # круг, ни разу не дойдя до своего обработчика: третья — разбор. Поэтому названиям
-    # даётся бюджет времени на круг; остальные выпуски ждут следующего круга.
-    TITLE_TICK_BUDGET_SEC = float(os.environ.get("VS_TITLE_TICK_BUDGET_SEC", "120") or 120)
+    # 04.10.2026: названия пишет подписка Codex. Её места делят все службы машины, и
+    # ответ шёл 4–8 минут (ожидание места плюс сам вызов). Внутри круга движка это
+    # останавливало все остальные выпуски: у кого срок фазы короче (project_ready — 15
+    # минут), засчитывали попытку каждый круг, не дойдя до своего обработчика. Сначала
+    # был бюджет времени на круг; этого мало — один вызов длиннее любого бюджета. Теперь
+    # круг только заказывает название и забирает готовое, а пишется оно в фоне, не больше
+    # TITLE_WORKERS одновременно.
+    TITLE_WORKERS = int(os.environ.get("VS_TITLE_WORKERS", "2") or 2)
+    # Быстрый ответ (место в подписке свободно) забираем в том же круге, не откладывая.
+    TITLE_GRACE_SEC = float(os.environ.get("VS_TITLE_GRACE_SEC", "2") or 2)
 
     def begin_tick(self, now: float = 0.0) -> None:
-        """Движок начинает новый круг: бюджет названий — заново."""
-        self._title_spent = 0.0
+        """Движок начинает новый круг. Названиям бюджет больше не нужен — они в фоне."""
 
     def _uid(self, c, tenant_id: str):
         """Чьим именем ставить задачи в очередь: владелец этого кабинета."""
@@ -1210,18 +1216,51 @@ class PubServices:
         if (os.environ.get("VS_TITLE_PROVIDER") or "codex").strip().lower() == "openai":
             return make_title(rel["donor_title"] or "", rel["lang"] or "ru",
                               self._openai_key(c))
-        if self._title_spent >= self.TITLE_TICK_BUDGET_SEC:
-            raise TitleUnavailable("названия делаются по очереди: подписка Codex отвечает "
-                                   "минутами, а на один круг движка отведено "
-                                   f"{int(self.TITLE_TICK_BUDGET_SEC)} с — этот выпуск "
-                                   "получит название на одном из следующих кругов")
-        import time as _t
-        started = _t.monotonic()
-        try:
-            return make_title_codex(rel["donor_title"] or "", rel["lang"] or "ru",
-                                    get_key(c, "rewrite"), REWRITE_BASE)
-        finally:
-            self._title_spent += _t.monotonic() - started
+        rid = rel.get("release_id") if hasattr(rel, "get") else rel["release_id"]
+        with self._titles_lock:
+            job = self._titles.get(rid)
+            if job is not None and not job["thread"].is_alive():
+                return self._title_result(rid, job)
+            if job is not None:
+                raise TitleUnavailable("название пишется подпиской Codex — ждём ответа")
+            busy = sum(1 for j in self._titles.values() if j["thread"].is_alive())
+            if busy >= self.TITLE_WORKERS:
+                raise TitleUnavailable(f"названия пишутся по очереди: сейчас в работе {busy} — "
+                                       "этот выпуск следующий")
+            import threading as _threading
+            # Ключ читаем здесь: соединение с базой принадлежит кругу движка, в фон его
+            # отдавать нельзя.
+            args = (rel["donor_title"] or "", rel["lang"] or "ru", get_key(c, "rewrite"),
+                    REWRITE_BASE)
+            job = {"title": "", "error": "", "fatal": False}
+
+            def work(job=job, args=args):
+                try:
+                    job["title"] = make_title_codex(*args)
+                except TitleError as exc:
+                    job["error"], job["fatal"] = str(exc), True
+                except TitleUnavailable as exc:
+                    job["error"] = str(exc)
+                except Exception as exc:                       # noqa: BLE001
+                    job["error"] = f"название не получено: {type(exc).__name__}"
+            job["thread"] = _threading.Thread(target=work, daemon=True,
+                                              name=f"title-{rid}")
+            self._titles[rid] = job
+            job["thread"].start()
+        job["thread"].join(self.TITLE_GRACE_SEC)
+        with self._titles_lock:
+            if not job["thread"].is_alive() and self._titles.get(rid) is job:
+                return self._title_result(rid, job)
+        raise TitleUnavailable("заказал название подписке Codex — ждём ответа")
+
+    def _title_result(self, rid, job) -> str:
+        """Готовый фоновый заказ названия: забрать и убрать. Зовётся под _titles_lock."""
+        self._titles.pop(rid, None)
+        if job["title"]:
+            return job["title"]
+        if job["fatal"]:
+            raise TitleError(job["error"])
+        raise TitleUnavailable(job["error"] or "название не получено")
 
     def _upload_job(self, c, release_id: str):
         return c.execute("SELECT * FROM pub_upload_jobs WHERE release_id=?",

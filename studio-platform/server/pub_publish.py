@@ -105,6 +105,10 @@ def make_title(donor_title: str, lang: str, api_key: str, model: str = "gpt-4.1-
 
 # Модель Codex для названий: та же, что пишет тексты рерайта (решение владельца 02.10).
 TITLE_CODEX_MODEL = os.environ.get("VS_TITLE_CODEX_MODEL", "gpt-5.6-sol")
+# Сколько ждать ответа сервиса текста. Он сам ждёт места в подписке до 5 минут
+# (REWRITE_CHAT_ONCE_WAIT_SEC), плюс сам вызов: 04.10 название пришло за 244 с и было
+# выброшено таймаутом в 240 с.
+TITLE_TIMEOUT_SEC = float(os.environ.get("VS_TITLE_TIMEOUT_SEC", "480") or 480)
 
 
 def make_title_codex(donor_title: str, lang: str, rewrite_key: str, base: str,
@@ -129,7 +133,8 @@ def make_title_codex(donor_title: str, lang: str, rewrite_key: str, base: str,
                              f"Язык канала: {language}.\nНазвание оригинала: {source}"}]}
     try:
         resp = requests.post(base.rstrip("/") + "/api/v1/chat-once", json=payload,
-                             headers={"Authorization": f"Bearer {rewrite_key}"}, timeout=240)
+                             headers={"Authorization": f"Bearer {rewrite_key}"},
+                             timeout=TITLE_TIMEOUT_SEC)
     except requests.RequestException as exc:
         raise TitleUnavailable(f"сервис текста не ответил: {type(exc).__name__}")
     if resp.status_code != 200:
