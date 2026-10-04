@@ -3596,6 +3596,11 @@ def ui_action(service: str, job_id: str, action: str, request: Request):
             detail = (json.loads(raw or "{}") or {}).get("detail") or raw[:200]
         except ValueError:
             detail = raw[:200]
+        if "retry available only for" in (detail or ""):
+            # Ответ сервиса текста по-английски; по смыслу — задача уже не упавшая:
+            # её подняли раньше, и она стоит в очереди или идёт (04.10.2026).
+            detail = ("повторить нельзя: задача уже не упавшая — она стоит в очереди или "
+                      "идёт. Обновите страницу через минуту")
         raise HTTPException(exc.code if exc.code in (400, 401, 403, 404, 409) else 502,
                             detail or f"сервис ответил {exc.code}")
     except Exception as exc:                                     # noqa: BLE001

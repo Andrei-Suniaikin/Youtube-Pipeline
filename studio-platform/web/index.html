@@ -4987,10 +4987,15 @@ function wireActions(root){
         // одному слову и растягивала строку — ровно то, от чего уходили.
         const row = b.closest('tr');
         const cell = (row && row.querySelector('td.st')) || b.parentElement;
-        const box = document.createElement('div');
-        box.className = 'note bad';
+        // Одна строка отказа на кнопку, а не по строке на каждое нажатие (04.10.2026:
+        // восемь одинаковых «retry available only…» столбиком).
+        let box = cell.querySelector(':scope > .note.bad.act-err');
+        if (!box){
+          box = document.createElement('div');
+          box.className = 'note bad act-err';
+          cell.appendChild(box);
+        }
         box.textContent = e.message;
-        cell.appendChild(box);
       }
     };
   });

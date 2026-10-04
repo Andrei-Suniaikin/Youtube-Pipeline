@@ -461,6 +461,19 @@ class PubServices:
             self._finish_remote(c, rel["release_id"], "rewrite", "error", reason)
             raise ItemFailed(reason)
         if state not in ("done", "completed", "finished", "success"):
+            if (state in ("pending", "queued", "running", "processing")
+                    and (known["status"] or "") not in ("running", "queued")):
+                # Задачу подняли снова (возвратом в работу или кнопкой «повторить»), и
+                # она уже стоит у сервиса текста. Зеркало держало старое «error» с
+                # прежней причиной — экран показывал «ошибка» и значок «повторить», а
+                # сервис на каждое нажатие отвечал «повтор только для упавших»
+                # (04.10.2026, владелец: «почему не могу запустить»).
+                c.execute("UPDATE pub_release_jobs SET status='running', error=NULL, "
+                          "updated=? WHERE release_id=? AND service='rewrite' AND kind='job'",
+                          (self._clock(), rel["release_id"]))
+                log_line(c, rel["release_id"], "рерайт",
+                         f"задача {known['remote_job_id']} снова в работе у сервиса текста "
+                         f"(«{state}»): дописывает недописанные куски, написанное не теряется")
             return {"wait": True}
 
         donor_chars = self._donor_chars(known)
