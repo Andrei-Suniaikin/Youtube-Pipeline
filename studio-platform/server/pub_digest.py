@@ -660,7 +660,7 @@ def legacy_feed(now: float, path: str = None, tz_name: str = None) -> dict:
     """
     tz_name = tz_name or DIGEST_TZ
     path = legacy_path() if path is None else path
-    out = {"state": "missing", "why": "выгрузки старого кабинета нет", "at": None,
+    out = {"state": "missing", "why": "выгрузки старой студии нет", "at": None,
            "at_text": "", "day": "", "streams": []}
     if not path or not os.path.isfile(path):
         return out
@@ -668,38 +668,38 @@ def legacy_feed(now: float, path: str = None, tz_name: str = None) -> dict:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
     except (OSError, ValueError):
-        out.update(state="broken", why="файл выгрузки старого кабинета не читается")
+        out.update(state="broken", why="файл выгрузки старой студии не читается")
         return out
     version = data.get("schema_version") if isinstance(data, dict) else None
     if version != LEGACY_SCHEMA_VERSION:
         out.update(state="broken",
-                   why=f"выгрузка старого кабинета в незнакомом формате (версия {version!r})")
+                   why=f"выгрузка старой студии в незнакомом формате (версия {version!r})")
         return out
     try:
         at = float(data.get("at"))
     except (TypeError, ValueError):
-        out.update(state="broken", why="в выгрузке старого кабинета нет времени выгрузки")
+        out.update(state="broken", why="в выгрузке старой студии нет времени выгрузки")
         return out
     streams = data.get("streams")
     if not isinstance(streams, list) or not all(isinstance(x, dict) for x in streams):
-        out.update(state="broken", why="в выгрузке старого кабинета нет строк потоков")
+        out.update(state="broken", why="в выгрузке старой студии нет строк потоков")
         return out
     out.update(at=at, at_text=_fmt_moment(at, tz_name), day=str(data.get("day") or ""))
     if now - at > LEGACY_STALE_SEC:
         out.update(state="stale",
-                   why=f"данные старого кабинета от {out['at_text']} — устарели")
+                   why=f"данные старой студии от {out['at_text']} — устарели")
         return out
     out.update(state="ok", why="", streams=streams)
     return out
 
 
 def _legacy_lines(legacy: dict) -> list:
-    """Блок «Старый кабинет» для текста сводки."""
+    """Блок «Старая студия» для текста сводки."""
     if not legacy:
         return []
     if legacy.get("state") != "ok":
-        return ["", "Старый кабинет:", f"· ВВ2 и манхва: {legacy.get('why') or 'данных нет'}"]
-    lines = ["", f"Старый кабинет (выгрузка {legacy['at_text']}, числа за эти сутки):"]
+        return ["", "Старая студия:", f"· ВВ2 и манхва: {legacy.get('why') or 'данных нет'}"]
+    lines = ["", f"Старая студия (выгрузка {legacy['at_text']}, числа за эти сутки):"]
     for s in legacy["streams"]:
         пауза = f" (на паузе {s.get('paused', 0)})" if s.get("paused") else ""
         главное = "; ".join(f"{r.get('why')} — {r.get('count')}" for r in s.get("reasons") or [])

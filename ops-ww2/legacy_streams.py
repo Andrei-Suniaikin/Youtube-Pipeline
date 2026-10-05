@@ -101,7 +101,7 @@ def connect_ro(path: str) -> sqlite3.Connection:
     """Только чтение: режим `ro` у самого файла и `query_only` у соединения. Старый
     кабинет — чужой production, писать в него этому скрипту нечего и нельзя."""
     if not os.path.isfile(path):
-        raise FileNotFoundError(f"базы старого кабинета нет: {path}")
+        raise FileNotFoundError(f"базы старой студии нет: {path}")
     c = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
     c.row_factory = sqlite3.Row
     c.execute("PRAGMA busy_timeout=30000")
@@ -214,7 +214,7 @@ def stream(c: sqlite3.Connection, niche: str, now: float, since: float, until: f
                                 "AND phase='public_check' LIMIT 1",
                                 (rel["release_id"],)).fetchone()
             why = ("проверка выхода ответила, но вышедшим ролик не подтверждён" if checked
-                   else "в старом кабинете выход ролика не проверяется — только расписание")
+                   else "в старой студии выход ролика не проверяется — только расписание")
             if why not in today["why"]:
                 today["why"].append(why)
 

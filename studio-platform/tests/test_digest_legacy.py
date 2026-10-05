@@ -80,7 +80,7 @@ def feed(at, **over):
                              {"why": "AdsPower: Check Proxy Fail", "count": 4}],
                  "today": {"expected": 4, "ahead": 2, "confirmed": 0, "reached": 3,
                            "delayed": 1, "unknown": 3,
-                           "why": ["в старом кабинете выход ролика не проверяется — "
+                           "why": ["в старой студии выход ролика не проверяется — "
                                    "только расписание"]},
                  "uploaded": 2, "last_new_release": NOW - 12 * 24 * HOUR},
                 {"key": "манхва", "name": "Манхва", "channels": 20, "paused": 3, "plan": 0,
@@ -115,7 +115,7 @@ print("\nФайла нет")
 lg = D.legacy_feed(NOW)
 check("состояние", lg["state"], "missing")
 text = "\n".join(D._legacy_lines(lg))
-check("одна строка «выгрузки нет»", "· ВВ2 и манхва: выгрузки старого кабинета нет" in text, True)
+check("одна строка «выгрузки нет»", "· ВВ2 и манхва: выгрузки старой студии нет" in text, True)
 check("и никаких нулей вместо неё", "каналов 0" in text, False)
 
 print("\nСвежий файл")
@@ -124,7 +124,7 @@ lg = D.legacy_feed(NOW)
 check("состояние", lg["state"], "ok")
 text = "\n".join(D._legacy_lines(lg))
 check("заголовок с временем выгрузки",
-      "Старый кабинет (выгрузка 07.10 19:00, числа за эти сутки):" in text, True)
+      "Старая студия (выгрузка 07.10 19:00, числа за эти сутки):" in text, True)
 check("строка ВВ2 в формате сводки",
       "· ВВ2: каналов 62 (на паузе 10), в плане 7, принято 3, блокеры 171 — главное: "
       "к времени выхода не успели — 90; AdsPower: Check Proxy Fail — 4" in text, True)
@@ -132,7 +132,7 @@ check("строка «сегодня» ВВ2",
       "  сегодня: ожидалось 4 выхода, подтверждено 0, дошло до канала 3, задержано 1, "
       "не знаем 3; ещё впереди 2." in text, True)
 check("причина незнания названа",
-      "    не знаем потому, что в старом кабинете выход ролика не проверяется" in text, True)
+      "    не знаем потому, что в старой студии выход ролика не проверяется" in text, True)
 check("залито и последний новый выпуск",
       "  залито за сутки 2; последний новый выпуск 25.09 20:00." in text, True)
 check("манхва: ноль не спрятан",
@@ -145,22 +145,22 @@ put(json.dumps(feed(NOW - 4 * HOUR), ensure_ascii=False))
 lg = D.legacy_feed(NOW)
 check("состояние", lg["state"], "stale")
 text = "\n".join(D._legacy_lines(lg))
-check("«устарели» с временем", "данные старого кабинета от 07.10 16:00 — устарели" in text, True)
+check("«устарели» с временем", "данные старой студии от 07.10 16:00 — устарели" in text, True)
 check("чужие сутки за сегодня не выдаются", "· ВВ2:" in text or lg["streams"] != [], False)
 
 print("\nБитый файл")
 put("{не json")
-check("не читается", D.legacy_feed(NOW)["why"], "файл выгрузки старого кабинета не читается")
+check("не читается", D.legacy_feed(NOW)["why"], "файл выгрузки старой студии не читается")
 put(json.dumps(feed(NOW, schema_version=2)))
 check("чужая версия названа", D.legacy_feed(NOW)["why"],
-      "выгрузка старого кабинета в незнакомом формате (версия 2)")
+      "выгрузка старой студии в незнакомом формате (версия 2)")
 put(json.dumps(feed(None)))
 check("без времени выгрузки", D.legacy_feed(NOW)["state"], "broken")
 put(json.dumps(feed(NOW, streams="ВВ2")))
 check("без строк потоков", D.legacy_feed(NOW)["why"],
-      "в выгрузке старого кабинета нет строк потоков")
+      "в выгрузке старой студии нет строк потоков")
 check("битое в тексте тоже сказано",
-      "· ВВ2 и манхва: в выгрузке старого кабинета нет строк потоков"
+      "· ВВ2 и манхва: в выгрузке старой студии нет строк потоков"
       in "\n".join(D._legacy_lines(D.legacy_feed(NOW))), True)
 
 print("\nКонтракт с выгрузкой")
@@ -185,11 +185,11 @@ data = D.collect(c, "t1", now=NOW, have_key=True)
 check("в данных экрана есть блок", data["legacy"]["state"], "ok")
 text = D.render(data)
 check("render печатает блок после групп",
-      text.index("Группы каналов:") < text.index("Старый кабинет (выгрузка") < text.index("Сегодня:"),
+      text.index("Группы каналов:") < text.index("Старая студия (выгрузка") < text.index("Сегодня:"),
       True)
 os.unlink(FEED)
 check("без файла render не падает и говорит об этом",
-      "выгрузки старого кабинета нет" in D.render(D.collect(c, "t1", now=NOW, have_key=True)), True)
+      "выгрузки старой студии нет" in D.render(D.collect(c, "t1", now=NOW, have_key=True)), True)
 
 print(f"\nпровалов: {len(FAILS)}")
 sys.exit(1 if FAILS else 0)
