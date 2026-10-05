@@ -3652,9 +3652,11 @@ IMG_RENDER_MIN_RATIO = 0.70   # авто/отложенный рендер не 
 
 
 def _numbered_googler_scene_id(path):
-    """Scene id из штатного googler-имени (001.jpg / 001_variant.png)."""
+    """Scene id из штатного googler-имени (001.jpg / 001_variant.png / 1000.jpg).
+
+    С тысячной сцены формат :03d даёт четыре цифры — это тоже штатное имя."""
     stem = os.path.splitext(os.path.basename(path))[0]
-    match = re.match(r"^(\d{3})(?:_|$)", stem)
+    match = re.match(r"^(\d{3,})(?:_|$)", stem)
     if not match:
         return None
     scene_id = int(match.group(1))
@@ -3747,7 +3749,10 @@ def _images_gap_report(tid, pid):
         proj = _project_dir(tid, pid)
         nums = set()
         for f in glob.glob(os.path.join(proj, "googler", "*.*")):
-            m = re.match(r"^(\d{3})(?:_|$)", os.path.splitext(os.path.basename(f))[0])
+            # Три цифры и больше: у длинного ролика сцены 1000+ называются 1000.jpg.
+            # Ровно три цифры (05.10.2026) делали из сцен 1000–1209 «дыру» в 210
+            # кадров, и рендер готового проекта не выдавался никогда.
+            m = re.match(r"^(\d{3,})(?:_|$)", os.path.splitext(os.path.basename(f))[0])
             if m:
                 nums.add(int(m.group(1)))
         if not nums:

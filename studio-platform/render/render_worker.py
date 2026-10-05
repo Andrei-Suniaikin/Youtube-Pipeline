@@ -318,21 +318,60 @@ class SyncedVideoRetimeError(RuntimeError):
 def _scene_index_from_filename(path):
     """Извлекает 0-based индекс сцены из имени файла картинки.
     googler_worker сохраняет сцену i (0-based) в файл f"{i+1:03d}.jpg" → имя 1-based.
-    '047.jpg' и '047_video.webm' → сцена 46. Сценовый префикс — ровно три
-    цифры, после которых идёт ``_`` или конец stem; год вроде ``1945 Berlin``
+    '047.jpg' и '047_video.webm' → сцена 46. Сценовый префикс — три цифры и
+    больше, после которых идёт ``_`` или конец stem; год вроде ``1945 Berlin``
     не считается номером сцены.
+    С тысячной сцены формат ``:03d`` даёт четыре цифры (``1000.jpg``). Ровно три
+    цифры здесь значили, что у длинного ролика сцены 1000+ ни к чему не
+    привязаны, и синхрон отдавал их время 999-й картинке (05.10.2026, 1209 сцен).
     Возвращает int (0-based) или None, если строгого префикса нет.
     """
     if not path:
         return None
     base = os.path.basename(str(path))
     stem = os.path.splitext(base)[0]
-    m = _re_sync.match(r"^(\d{3})(?:_|$)", stem)
+    m = _re_sync.match(r"^(\d{3,})(?:_|$)", stem)
     if not m:
         return None
     num = int(m.group(1))
     # Имена 1-based (001 = первая сцена). 0 на всякий случай не уводим в -1.
     return num - 1 if num >= 1 else 0
+
+
+_SCENE_SORT_PREFIX_RE = _re_sync.compile(r"^(\d{3,})(?=[_.]|$)")
+# Так формат :03d называет сцены с тысячной: четыре цифры и больше, без ведущего нуля.
+_LONG_SCENE_NAME_RE = _re_sync.compile(r"^[1-9]\d{3,}(?=[_.]|$)")
+_SCENE_SORT_WIDTH = 6
+
+
+def _has_long_scene_names(paths):
+    """Есть ли среди файлов сцена с номером 1000 и больше (1000.jpg)."""
+    return any(_LONG_SCENE_NAME_RE.match(os.path.basename(str(path))) for path in paths or [])
+
+
+def _scene_sort_key(path):
+    """Ключ сортировки, при котором номер сцены сравнивается как число.
+
+    Строковая сортировка ставит ``1000.jpg`` между ``100.jpg`` и ``101.jpg``.
+    Номер в начале имени дополняется нулями, остальное сравнивается как было.
+    """
+    text = str(path)
+    head, base = os.path.split(text)
+    m = _SCENE_SORT_PREFIX_RE.match(base)
+    if not m:
+        return (text, text)
+    padded = m.group(1).zfill(_SCENE_SORT_WIDTH) + base[m.end():]
+    return (os.path.join(head, padded), text)
+
+
+def _sorted_media(paths, key=None):
+    """Сортировка медиа. Без сцен 1000+ — ровно прежняя строковая, порядок старых
+    проектов не меняется ни в одном случае; со сценами 1000+ — по номеру сцены."""
+    key = key or (lambda p: p)
+    paths = list(paths or [])
+    if not _has_long_scene_names(paths):
+        return sorted(paths, key=key)
+    return sorted(paths, key=lambda p: _scene_sort_key(key(p)))
 
 
 def _partition_scene_mapped_videos(videos):
@@ -3808,7 +3847,7 @@ class VideoRenderer:
         elif self.material_order == 'manual':
             ordered = [p for p in all_media if p in videos_set or (p in images_set and p in image_to_safe)]
         else:  # alphabetical
-            ordered = sorted(videos_ordered + images_ordered, key=lambda x: os.path.basename(x).lower())
+            ordered = _sorted_media(videos_ordered + images_ordered, key=lambda x: os.path.basename(x).lower())
 
         # NNN_parser.mp4 — не обычный stock, а материал конкретной сцены. Он
         # заменяет NNN-картинку и остаётся между соседними сценами при любом
@@ -5288,9 +5327,9 @@ class VideoRenderer:
                         self.log(f"⚠️ Не удалось загрузить ручной порядок: {e}")
                 else:
                     self.log("⚠️ Ручной порядок выбран, но файл manual_media_order.json не найден — использую алфавитный порядок")
-                    all_media.sort()
+                    all_media = _sorted_media(all_media)
             else:
-                all_media.sort()
+                all_media = _sorted_media(all_media)
             
             # Полный рандом: перемешиваем всё, чтобы не было "сначала доп папка, потом проект"
             if self.material_order == 'random':
