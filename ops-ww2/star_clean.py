@@ -114,6 +114,19 @@ def swap_in_clean(path: str, clean_tmp: str) -> dict:
     return write_mark(path, original_size, "delogo + h264_nvenc на Минске")
 
 
+def video_bitrate(path: str, runner=subprocess.run) -> int:
+    """Битрейт видео исходника, бит/с. Исходники ВВ2 сжаты сильно (220–330 кбит/с): в режиме
+    «качество» (cq) кодировщик видеокарты раздувал файл втрое (05.10: 116 → 368 МБ),
+    поэтому целимся в битрейт исходника."""
+    out = runner(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+                  "stream=bit_rate:format=bit_rate", "-of", "default=nw=1:nk=1", path],
+                 capture_output=True, text=True, timeout=120).stdout.split()
+    for x in out:
+        if x.isdigit() and int(x) > 0:
+            return int(x)
+    return 0
+
+
 def duration(path: str, runner=subprocess.run) -> float:
     out = runner(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of",
                   "csv=p=0", path], capture_output=True, text=True, timeout=120).stdout.strip()
@@ -125,11 +138,15 @@ def clean_one(pid, job, path, runner=subprocess.run) -> str:
     rin, rout = f"{REMOTE_DIR}/{job}.in.mp4", f"{REMOTE_DIR}/{job}.out.mp4"
     tmp = path + ".clean.tmp"
     t0 = time.time()
+    # +30%: при ровно исходном битрейте мелкие детали (трещины на стекле) чуть мылились
+    # (проба 05.10); файл при этом остаётся размером с оригинал (116 → ~105 МБ).
+    br = int((video_bitrate(path, runner) or 400000) * 1.3)
+    rate = f"-rc vbr -b:v {br} -maxrate {br * 2} -bufsize {br * 4}"
     runner(ssh + [f"mkdir -p {REMOTE_DIR}"], check=True, timeout=60)
     runner(["scp", "-q", "-o", "BatchMode=yes", "-P", MINSK_PORT, path, f"{MINSK}:{rin}"],
            check=True, timeout=3600)
     runner(ssh + [f"nice -n 15 ffmpeg -v error -y -i {rin} -vf delogo={BOX} -c:v h264_nvenc "
-                  f"-preset p5 -rc vbr -cq 24 -b:v 0 -c:a copy {rout}"], check=True, timeout=4 * 3600)
+                  f"-preset p5 {rate} -c:a copy {rout}"], check=True, timeout=4 * 3600)
     runner(["scp", "-q", "-o", "BatchMode=yes", "-P", MINSK_PORT, f"{MINSK}:{rout}", tmp],
            check=True, timeout=3600)
     runner(ssh + [f"rm -f {rin} {rout}"], timeout=60)

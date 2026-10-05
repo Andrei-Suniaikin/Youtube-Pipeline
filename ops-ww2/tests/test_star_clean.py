@@ -51,7 +51,9 @@ class FakeRun:
         if cmd[0] == "scp" and cmd[-1].endswith(".clean.tmp"):
             open(cmd[-1], "wb").write(self.clean)
         out = ""
-        if cmd[0] == "ffprobe":
+        if cmd[0] == "ffprobe" and any("bit_rate" in x for x in cmd):
+            out = "333017\n482390"
+        elif cmd[0] == "ffprobe":
             out = str(self.durations.pop(0))
         return subprocess.CompletedProcess(cmd, 0, stdout=out, stderr="")
 
@@ -69,6 +71,8 @@ def main() -> int:
           any("delogo=" in " ".join(c) and "h264_nvenc" in " ".join(c) and "nice -n 15" in " ".join(c)
               for c in run.calls), True)
     check("временные файлы на Минске убраны", any("rm -f" in " ".join(c) for c in run.calls), True)
+    check("кодирование — в битрейт исходника, а не «по качеству» (раздувало втрое)",
+          any("-b:v 432922" in " ".join(c) and "-cq" not in " ".join(c) for c in run.calls), True)
 
     print("\nДлительность не совпала — файл не трогаем")
     p = render()
