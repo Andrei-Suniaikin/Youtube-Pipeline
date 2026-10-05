@@ -7366,6 +7366,64 @@ def googler_request_v6(endpoint: str, method: str = "POST", data: Optional[dict]
     return {"_error": _last or "нет ответа после ретраев"}
 
 
+# ── Кадры, которые не дались (владелец 05.10.2026) ──────────────────────────────────
+#
+# «Что минимально повлияет на контент»: «попробуйте позже» — повторить позже; отказ
+# фильтра после смягчений и остаток — соседний кадр (рендер сам отдаёт время сцены без
+# картинки предыдущей: render_worker._collapse_missing_images); больше 2% ролика — это уже
+# не случайный кадр, а беда всей темы, и задача падает, как раньше.
+#
+# Подмена честная: файл сцены не подделывается и квитанция ему не выписывается. Сцена
+# записывается в googler/image_gaps.json с причиной и исключается из проверки квитанций.
+IMAGE_GAPS_FILE = "image_gaps.json"
+IMAGE_GAP_MAX_SHARE = float(os.environ.get("VS_IMAGE_GAP_MAX_SHARE", "0.02") or 0.02)
+IMAGE_LATE_RETRY_SEC = int(os.environ.get("VS_IMAGE_LATE_RETRY_SEC", "900") or 900)
+IMAGE_LATE_RETRY_ROUNDS = int(os.environ.get("VS_IMAGE_LATE_RETRY_ROUNDS", "3") or 3)
+GAP_FILTER = "фильтр"       # провайдер отказал фильтром безопасности и после смягчений
+GAP_LATER = "позже"         # «Generation failed, please try again later»
+GAP_OTHER = "сбой"          # всё прочее: попытки исчерпаны, заказ не дал результата
+_FRAME_GIVEUP: dict = {}          # номер кадра → (вид, причина)
+_FRAME_GIVEUP_LOCK = threading.Lock()
+
+
+def _note_frame_giveup(index: int, kind: str, why: str) -> None:
+    """Запомнить, почему кадр сдался: от этого зависит, повторять ли его позже."""
+    with _FRAME_GIVEUP_LOCK:
+        _FRAME_GIVEUP[int(index)] = (kind, " ".join(str(why or "").split())[:160])
+
+
+def _giveup_kind(error: str) -> str:
+    return GAP_LATER if "try again later" in str(error or "").lower() else GAP_OTHER
+
+
+def image_gaps_allowed(total: int) -> int:
+    """Сколько сцен ролика можно отдать соседнему кадру: 2%, но не меньше одной."""
+    return max(1, int(int(total) * IMAGE_GAP_MAX_SHARE))
+
+
+def late_retry_indices(gaps, giveup=None) -> list:
+    """Кадры, которые имеет смысл повторить позже: всё, кроме отказа фильтра."""
+    giveup = _FRAME_GIVEUP if giveup is None else giveup
+    return [i for i in gaps if (giveup.get(i) or (GAP_OTHER, ""))[0] != GAP_FILTER]
+
+
+def write_image_gaps(output_dir: str, gaps, giveup=None) -> list:
+    """Записать (или убрать) список сцен, отданных соседнему кадру. Возвращает строки."""
+    giveup = _FRAME_GIVEUP if giveup is None else giveup
+    path = os.path.join(output_dir, IMAGE_GAPS_FILE)
+    rows = []
+    for i in sorted(gaps):
+        kind, why = giveup.get(i) or (GAP_OTHER, "")
+        rows.append({"scene": i + 1, "kind": kind,
+                     "reason": why or "кадр не получен",
+                     "fallback": "соседний кадр (предыдущая сцена)"})
+    if rows:
+        _atomic_write_json(path, {"schema_version": 1, "at": int(time.time()), "frames": rows})
+    elif os.path.exists(path):
+        os.remove(path)
+    return rows
+
+
 def order_never_delivers(probe) -> str:
     """Почему по уже созданному заказу результата не будет НИКОГДА — или "".
 
@@ -10115,7 +10173,8 @@ def _expected_image_output_contract(expected_output_names: List[str]) -> List[Tu
 
 
 def _validate_authoritative_image_set(output_dir: str, receipts: dict,
-                                      expected_output_names: List[str]) -> dict:
+                                      expected_output_names: List[str],
+                                      skip_frames=()) -> dict:
     """Strict success gate for a complete, hash-bound schema-v2 image set.
 
     The returned mapping is keyed by the exact output filename and contains the
@@ -10143,7 +10202,12 @@ def _validate_authoritative_image_set(output_dir: str, receipts: dict,
         )
 
     verified = {}
+    skip = set(skip_frames or ())
     for frame_key, filename in expected:
+        if frame_key in skip:
+            # Сцена отдана соседнему кадру (image_gaps.json): файла нет, квитанции нет —
+            # проверять нечего. Есть ли устаревший файл — решает уборка в reconcile.
+            continue
         frame = frames.get(frame_key)
         if not isinstance(frame, dict):
             raise ref_contract.ReferenceContractError(
@@ -10199,12 +10263,15 @@ def _validate_authoritative_image_set(output_dir: str, receipts: dict,
 
 
 def _authoritative_receipt_projection(receipts: dict,
-                                      expected_output_names: List[str]) -> dict:
+                                      expected_output_names: List[str],
+                                      skip_frames=()) -> dict:
     expected = _expected_image_output_contract(expected_output_names)
+    skip = set(skip_frames or ())
     projected = dict(receipts)
     projected["frames"] = {
         frame_key: dict(receipts["frames"][frame_key])
         for frame_key, _filename in expected
+        if frame_key not in skip
     }
     return projected
 
@@ -10403,7 +10470,8 @@ def _stale_numeric_image_rows(output_dir: str,
 
 def _reconcile_authoritative_image_set(project_dir: str, receipt_path: str,
                                        receipts: dict,
-                                       expected_output_names: List[str]) -> dict:
+                                       expected_output_names: List[str],
+                                       skip_frames=()) -> dict:
     """Publish one authoritative output set and quarantine older numbered files.
 
     No file is moved until all expected rows are exact fresh/trusted-legacy cache
@@ -10417,10 +10485,11 @@ def _reconcile_authoritative_image_set(project_dir: str, receipt_path: str,
             "image-set reconciliation requires the canonical receipt path"
         )
     _recover_incomplete_image_set_transactions(project_dir, output_dir)
+    skip = set(skip_frames or ())
     verified = _validate_authoritative_image_set(
-        output_dir, receipts, expected_output_names
+        output_dir, receipts, expected_output_names, skip
     )
-    projected = _authoritative_receipt_projection(receipts, expected_output_names)
+    projected = _authoritative_receipt_projection(receipts, expected_output_names, skip)
     receipt_before = _regular_file_bytes(exact_receipt_path, confined_to=output_dir)
     try:
         receipt_on_disk = json.loads(receipt_before.decode("utf-8"))
@@ -10433,7 +10502,11 @@ def _reconcile_authoritative_image_set(project_dir: str, receipt_path: str,
             "canonical image receipt changed before reconciliation"
         )
 
-    stale_rows = _stale_numeric_image_rows(output_dir, expected_output_names)
+    # Файл пропущенной сцены, если он есть, — устаревший (квитанции у него нет): в карантин,
+    # иначе рендер показал бы его вместо соседнего кадра.
+    stale_rows = _stale_numeric_image_rows(
+        output_dir, [n for n in expected_output_names if n[:-4] not in skip]
+    )
     if not stale_rows:
         try:
             _atomic_write_json(exact_receipt_path, projected)
@@ -10473,6 +10546,7 @@ def _reconcile_authoritative_image_set(project_dir: str, receipt_path: str,
         "expected_files": [
             {"name": name, "sha256": verified[name]}
             for name in expected_output_names
+            if name in verified
         ],
         "files": stale_rows,
     }
@@ -11635,6 +11709,8 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                     print_user(f"🩹 [{index+1}] Контент-фильтр: промпт смягчён локально (раунд {_soften_rounds}/3), пробую снова", "WARNING")
                     continue
                 _note_soften_exhausted()   # копим статистику: сюжет режется устойчиво
+                _note_frame_giveup(index, GAP_FILTER,
+                                   f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds})")
                 print_user(f"⛔ [{index+1}] Контент-фильтр провайдера — пропускаю картинку (смягчений: {_soften_rounds})", "ERROR")
                 return (index, None)
 
@@ -11703,6 +11779,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                                    f"({str(error)[:80]}) — пробую со смягчённым промптом", "WARNING")
                         time.sleep(RETRY_DELAY)
                         continue
+                _note_frame_giveup(index, _giveup_kind(error), error)
                 print_user(f"❌ [{index+1}] Все {max_attempts + _extra_attempts} попыток исчерпаны "
                            f"({api_label}): {error[:200]}", "ERROR")
                 return (index, None)
@@ -13979,6 +14056,46 @@ def cmd_full_pipeline(args):
                 except Exception as _e:
                     print_debug(f"Добивка [{_i+1}] не удалась: {_e}")
 
+    # ПОВТОР ПОЗЖЕ (владелец 05.10.2026): «попробуйте позже» и прочие сбои повторяем через
+    # 15 минут, до трёх раз — но только когда недостаёт немного (не больше 2% ролика) и
+    # аккаунт провайдера жив. Отказ фильтра после смягчений позже не повторяем: он уйдёт
+    # соседнему кадру ниже. Место очереди картинок на это время занято — дешевле, чем
+    # новый прогон, который ждал бы очереди часами.
+    if not _account_limit_hit(_model_provider_group(GOOGLER_MODEL)):
+        for _late_round in range(1, IMAGE_LATE_RETRY_ROUNDS + 1):
+            _gaps_now = [i for i in range(total)
+                         if not _receipt_cache_hit(
+                             image_receipts, f"{i + 1:03d}",
+                             os.path.join(output_dir, f"{i + 1:03d}.jpg"),
+                         )]
+            _later = late_retry_indices(_gaps_now)
+            if not _later or len(_gaps_now) > image_gaps_allowed(total):
+                break
+            print_user(f"⏳ Повтор позже (раунд {_late_round}/{IMAGE_LATE_RETRY_ROUNDS}): "
+                       f"{len(_later)} кадр(ов) — сцены "
+                       f"{', '.join(str(i + 1) for i in _later[:12])}; жду "
+                       f"{IMAGE_LATE_RETRY_SEC // 60} мин", "WARNING")
+            time.sleep(IMAGE_LATE_RETRY_SEC)
+            for _i in _later:
+                _kw = dict(scene_data=scenes[_i], style=style,
+                           output_path=os.path.join(output_dir, f"{_i+1:03d}.jpg"),
+                           aspect_ratio=aspect_ratio, seed=fixed_seed, index=_i,
+                           use_legacy=getattr(args, 'use_legacy', False),
+                           reference_bundle=reference_runtime["scenes"][_i])
+                if smart_mode:
+                    _kw['full_text'] = full_text
+                try:
+                    _idx, _data = generate_image(**_kw)
+                    _out = os.path.join(output_dir, f"{_idx+1:03d}.jpg")
+                    if _data is not None and save_base64_to_file(_data, _out):
+                        _mark_receipt_success(
+                            receipt_path, image_receipts, f"{_idx + 1:03d}", _out
+                        )
+                        saved_files.append(_out)
+                        print_user(f"✅ [{_idx+1}] Кадр получен при повторе позже", "SUCCESS")
+                except Exception as _e:
+                    print_debug(f"Повтор позже [{_i+1}] не удался: {_e}")
+
     # Финальный прогресс — по ФАКТУ сохранённого, а не «всегда 100%»
     # (раньше при 269/287 в лог всё равно уходило «100% — изображений: 287/287»,
     #  и потеря 18 кадров нигде не всплывала)
@@ -14038,9 +14155,27 @@ def cmd_full_pipeline(args):
     # reference artifacts intentionally remain available for refill/regen.
     _account_limit_raise_if_hit(GOOGLER_MODEL, _have, total)
 
+    _final_gaps = [i for i in range(total)
+                   if not _receipt_cache_hit(
+                       image_receipts, f"{i + 1:03d}",
+                       os.path.join(output_dir, f"{i + 1:03d}.jpg"),
+                   )]
+    _accepted = []
+    if _final_gaps and len(_final_gaps) <= image_gaps_allowed(total):
+        _accepted = _final_gaps
+        for _row in write_image_gaps(output_dir, _accepted):
+            print_user(f"🧩 [{_row['scene']}] Сцена {_row['scene']} заменена соседним кадром: "
+                       f"{_row['reason']}", "WARNING")
+    else:
+        write_image_gaps(output_dir, [])
+        if _final_gaps:
+            print_user(f"⛔ Недостающих кадров {len(_final_gaps)} из {total} — больше "
+                       f"{image_gaps_allowed(total)} (2%): соседними не заменяю, нужен разбор",
+                       "ERROR")
     reconciliation = _reconcile_authoritative_image_set(
         project_dir, receipt_path, image_receipts,
         [f"{index + 1:03d}.jpg" for index in range(total)],
+        skip_frames={f"{index + 1:03d}" for index in _accepted},
     )
     if reconciliation["quarantined"]:
         print_user(
@@ -14049,7 +14184,8 @@ def cmd_full_pipeline(args):
             "INFO",
         )
 
-    print_user(f"✅ Полный пайплайн завершен! Подтверждено receipts: {_have}/{total} изображений", "SUCCESS")
+    print_user(f"✅ Полный пайплайн завершен! Подтверждено receipts: {_have}/{total} изображений"
+               + (f"; заменено соседними: {len(_accepted)}" if _accepted else ""), "SUCCESS")
 
 
 def cmd_check_usage(args):
