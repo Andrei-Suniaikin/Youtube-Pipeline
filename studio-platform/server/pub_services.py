@@ -59,6 +59,8 @@ from pub_remote import (
 )
 
 # Этапы кабинета, из которых собирается ролик, в порядке запуска.
+# Отказ сервиса обложек «очередь заполнена» — ожидание, а не брак (см. do_cover_ready).
+COVER_QUEUE_FULL = "очередь заполнена"
 MEDIA_STAGES = ("tts", "images", "render", "chapters")
 
 # Этапы, без которых ролик всё равно можно публиковать: их сбой не останавливает выпуск.
@@ -1177,7 +1179,20 @@ class PubServices:
         info = client.job(known["remote_job_id"])
         state = str(info.get("status") or "").lower()
         if state in ("error", "failed", "cancelled"):
-            reason = "обложка не сделалась: " + str(info.get("error") or state)
+            said = str(info.get("error") or "")
+            if COVER_QUEUE_FULL in said.lower():
+                # Не брак обложки: сервис обложек после перезапуска вернул прерванные задачи
+                # в очередь, а у владельца уже стояло 40 ждущих — лишние он пометил
+                # «очередь заполнена, повторите позже». 05.10.2026 после выкатки так ушли в
+                # разбор три выпуска. Задачу забываем и закажем обложку заново, когда в
+                # очереди будет место (сервис сам ответит 429 — это ожидание, не провал).
+                c.execute("DELETE FROM pub_release_jobs WHERE release_id=? AND service='cover' "
+                          "AND kind='job'", (rel["release_id"],))
+                log_line(c, rel["release_id"], "обложка",
+                         f"сервис обложек не принял задачу {known['remote_job_id']} обратно "
+                         f"(«{said[:80]}») — закажу заново, когда освободится место")
+                raise ResourceDown("обложки", "очередь сервиса обложек заполнена — повторю заказ")
+            reason = "обложка не сделалась: " + (said or state)
             self._finish_remote(c, rel["release_id"], "cover", "error", reason)
             raise ItemFailed(reason)
         # Завершение опознаём по семейству статуса, а не по точному списку: сосед умеет
