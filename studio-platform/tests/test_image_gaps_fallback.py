@@ -90,7 +90,7 @@ def main() -> int:
     check("сцена 3 записана с причиной и видом",
           (data["frames"][0]["scene"], data["frames"][0]["kind"], "фильтр" in data["frames"][0]["reason"]),
           (3, G.GAP_FILTER, True))
-    check("и то, чем заменена", "соседний" in data["frames"][0]["fallback"], True)
+    check("и то, чем заменена", "предыдущей сцены" in data["frames"][0]["fallback"], True)
     check("функция вернула те же строки", rows == data["frames"], True)
     G.write_image_gaps(out, [])
     check("пропусков нет — файл убран", os.path.exists(os.path.join(out, G.IMAGE_GAPS_FILE)), False)
@@ -153,7 +153,7 @@ def main() -> int:
         ts REAL, level TEXT, step TEXT, message TEXT, repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
     """)
     c.execute("INSERT INTO job_logs(job_id, ts, line) VALUES(7, 1, ?)",
-              ("[08:46:47.938] ⚠️ 🧩 [25] Сцена 25 заменена соседним кадром: провайдер отказал "
+              ("[08:46:47.938] ⚠️ 🧩 [25] Сцена 25 заменена кадром предыдущей сцены: провайдер отказал "
                "фильтром безопасности (смягчений: 3)",))
     c.execute("INSERT INTO job_logs(job_id, ts, line) VALUES(7, 2, 'прочее')")
     svc = S.PubServices({"create_project": None, "enqueue": None, "project_dir": None})
@@ -162,7 +162,7 @@ def main() -> int:
     again = svc._note_image_gaps(c, rel, "7")
     msgs = [r[0] for r in c.execute("SELECT message FROM pub_release_log")]
     check("одна строка в журнале выпуска", (first, again, len(msgs)), (1, 0, 1))
-    check("со сценой и причиной", msgs and msgs[0].startswith("сцена 25 заменена соседним кадром: провайдер"), True)
+    check("со сценой и причиной", msgs and msgs[0].startswith("сцена 25 заменена кадром предыдущей сцены: провайдер"), True)
 
     print()
     if FAILS:

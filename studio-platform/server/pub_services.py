@@ -906,14 +906,14 @@ class PubServices:
     CHAPTERS_WAIT_SEC = float(os.environ.get("VS_CHAPTERS_WAIT_SEC") or 6 * 3600)
     CHAPTERS_SLOT_MARGIN_SEC = float(os.environ.get("VS_CHAPTERS_SLOT_MARGIN_SEC") or 3 * 3600)
 
-    # Строка воркера картинок про сцену, отданную соседнему кадру (googler_worker:
-    # «🧩 [N] Сцена N заменена соседним кадром: <причина>»).
-    GAP_LINE_MARK = "заменена соседним кадром"
+    # Строка воркера картинок про сцену без своего кадра (googler_worker:
+    # «🧩 [N] Сцена N заменена кадром предыдущей сцены: <причина>»).
+    GAP_LINE_MARK = "заменена кадром предыдущей сцены"
 
     def _note_image_gaps(self, c, rel, job_id) -> int:
-        """Сцены, отданные соседнему кадру, — в журнал выпуска, по одной строке на сцену.
+        """Сцены, показанные кадром предыдущей сцены, — в журнал выпуска, по одной строке на сцену.
 
-        Владелец 05.10.2026: подмена допустима, но должна быть видна там, где смотрят
+        Владелец 05.10.2026: замена допустима, но должна быть видна там, где смотрят
         выпуск, а не только в журнале задачи картинок. Строку пишем один раз: движок
         проходит здесь на каждом круге, пока ждёт рендер.
         """
@@ -925,10 +925,10 @@ class PubServices:
             return 0
         added = 0
         for line in lines:
-            m = re.search(r"Сцена (\d+) заменена соседним кадром: (.+)$", str(line))
+            m = re.search(r"Сцена (\d+) заменена кадром предыдущей сцены: (.+)$", str(line))
             if not m:
                 continue
-            text = (f"сцена {m.group(1)} заменена соседним кадром: {m.group(2).strip()[:160]}")
+            text = (f"сцена {m.group(1)} заменена кадром предыдущей сцены: {m.group(2).strip()[:160]}")
             seen = c.execute("SELECT 1 FROM pub_release_log WHERE release_id=? AND message=?",
                              (rel["release_id"], text)).fetchone()
             if seen:

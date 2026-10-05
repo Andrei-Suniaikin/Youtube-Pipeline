@@ -7416,7 +7416,7 @@ def write_image_gaps(output_dir: str, gaps, giveup=None) -> list:
         kind, why = giveup.get(i) or (GAP_OTHER, "")
         rows.append({"scene": i + 1, "kind": kind,
                      "reason": why or "кадр не получен",
-                     "fallback": "соседний кадр (предыдущая сцена)"})
+                     "fallback": "кадр предыдущей сцены"})
     if rows:
         _atomic_write_json(path, {"schema_version": 1, "at": int(time.time()), "frames": rows})
     elif os.path.exists(path):
@@ -14164,13 +14164,13 @@ def cmd_full_pipeline(args):
     if _final_gaps and len(_final_gaps) <= image_gaps_allowed(total):
         _accepted = _final_gaps
         for _row in write_image_gaps(output_dir, _accepted):
-            print_user(f"🧩 [{_row['scene']}] Сцена {_row['scene']} заменена соседним кадром: "
+            print_user(f"🧩 [{_row['scene']}] Сцена {_row['scene']} заменена кадром предыдущей сцены: "
                        f"{_row['reason']}", "WARNING")
     else:
         write_image_gaps(output_dir, [])
         if _final_gaps:
             print_user(f"⛔ Недостающих кадров {len(_final_gaps)} из {total} — больше "
-                       f"{image_gaps_allowed(total)} (2%): соседними не заменяю, нужен разбор",
+                       f"{image_gaps_allowed(total)} (2%): кадрами предыдущих сцен не заменяю, нужен разбор",
                        "ERROR")
     reconciliation = _reconcile_authoritative_image_set(
         project_dir, receipt_path, image_receipts,
@@ -14185,7 +14185,7 @@ def cmd_full_pipeline(args):
         )
 
     print_user(f"✅ Полный пайплайн завершен! Подтверждено receipts: {_have}/{total} изображений"
-               + (f"; заменено соседними: {len(_accepted)}" if _accepted else ""), "SUCCESS")
+               + (f"; заменено кадрами предыдущих сцен: {len(_accepted)}" if _accepted else ""), "SUCCESS")
 
 
 def cmd_check_usage(args):
