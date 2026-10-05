@@ -995,6 +995,7 @@ class VideoRenderer:
         self.end_track_volume = config.get('end_track_volume', 1.0)
         
         # НОВОЕ: Переходы
+        self.auto_sound = config.get('auto_sound', False) is True
         self.enable_fade = config.get('enable_fade', True)
         self.fade_duration = config.get('fade_duration', 0.5)
         # Для картинка→картинка: макс 0.7с (1с съедал всё время), адаптивно уменьшается при нехватке
@@ -2181,6 +2182,90 @@ class VideoRenderer:
     def get_vintage_filter(self):
         return "noise=alls=45:allf=t+u,eq=contrast=0.80:brightness=-0.15,hue=s=0"
 
+    def _load_sound_plan(self, audio_duration):
+        """План автозвука из проекта. None — фичи нет, работаем как раньше."""
+        import json as _json
+        plan_path = os.path.join(self.project_dir, "_RENDER_MEDIA", "sfx", "sound_plan.json")
+        if not os.path.exists(plan_path):
+            return None
+        try:
+            with open(plan_path, "r", encoding="utf-8") as f:
+                plan = _json.load(f)
+        except Exception as e:
+            self.log(f"   ⚠️ Автозвук: план не читается ({e}) — пропускаю")
+            return None
+        beds = []
+        base = os.path.join(self.project_dir, "_RENDER_MEDIA", "sfx")
+        for item in (plan.get("beds") or []):
+            try:
+                start = max(0.0, float(item.get("start", 0)))
+                end = min(float(audio_duration), float(item.get("end", 0)))
+                if end - start < 3.0:          # огрызки короче трёх секунд не кладём
+                    continue
+                path = item.get("file") or ""
+                path = path if os.path.isabs(path) else os.path.join(base, os.path.basename(path))
+                if not os.path.exists(path):
+                    self.log(f"   ⚠️ Автозвук: нет файла {os.path.basename(path)} — отрезок пропущен")
+                    continue
+                beds.append({"file": path, "start": start, "end": end,
+                             "gain": float(item.get("gain", 1.0))})
+            except (TypeError, ValueError):
+                continue
+        if not beds:
+            return None
+        beds.sort(key=lambda b: b["start"])
+        return beds
+
+    def _apply_auto_sound(self, narration_audio, current_audio, audio_duration, temp_dir):
+        """Подмешать фоновую дорожку, приседающую под голосом. Возвращает путь или None.
+
+        Ключ сайдчейна — ЧИСТАЯ озвучка (`narration_audio`), а не текущий микс:
+        иначе фон приседал бы ещё и под музыкой.
+        """
+        beds = self._load_sound_plan(audio_duration)
+        if not beds:
+            return None
+        try:
+            # wav, а не mp3: перекодирование в mp3 стоило +54 с на 75-минутном ролике,
+            # а дальше mux всё равно жмёт дорожку в aac.
+            out_path = os.path.join(temp_dir, "auto_sound.wav")
+            cmd = [FFMPEG_EXE, "-y", "-i", current_audio, "-i", narration_audio]
+            parts, labels = [], []
+            fade = 1.5
+            for i, bed in enumerate(beds):
+                length = bed["end"] - bed["start"]
+                fi = min(fade, length / 3.0)
+                cmd += ["-stream_loop", "-1", "-i", bed["file"]]
+                idx = 2 + i
+                lab = f"b{i}"
+                parts.append(
+                    f"[{idx}:a]atrim=0:{length:.3f},asetpts=PTS-STARTPTS,"
+                    f"afade=t=in:st=0:d={fi:.2f},afade=t=out:st={max(0.0, length - fi):.3f}:d={fi:.2f},"
+                    f"volume={bed['gain']:.3f},adelay={int(bed['start'] * 1000)}|{int(bed['start'] * 1000)}[{lab}]"
+                )
+                labels.append(f"[{lab}]")
+            if len(labels) > 1:
+                parts.append("".join(labels) + f"amix=inputs={len(labels)}:duration=longest:"
+                                               "dropout_transition=0:normalize=0[bedraw]")
+            else:
+                parts.append(f"{labels[0]}anull[bedraw]")
+            # приседание фона под речью: порог -34 dBFS ловит голос, но не дыхание
+            parts.append("[1:a]aformat=channel_layouts=stereo[key]")
+            parts.append("[bedraw][key]sidechaincompress=threshold=0.02:ratio=6:attack=20:"
+                         "release=350:makeup=1:knee=4:detection=rms[bed]")
+            parts.append(f"[0:a][bed]amix=inputs=2:duration=first:dropout_transition=0:normalize=0[out]")
+            cmd += ["-filter_complex", ";".join(parts), "-map", "[out]",
+                    "-t", str(audio_duration), "-c:a", "pcm_s16le", "-ar", "44100", out_path]
+            self.log(f"   🎧 Автозвук: {len(beds)} отрезк(а/ов) фона, собираю дорожку...")
+            self.run_ffmpeg_command(cmd)
+            if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+                self.log(f"✅ Автозвук: фон добавлен ({os.path.getsize(out_path) // 1024} КБ)")
+                return out_path
+            self.log("   ⚠️ Автозвук: файл не собрался — остаюсь на прежней дорожке")
+        except Exception as e:
+            self.log(f"   ⚠️ Автозвук отключён из-за ошибки: {e}")
+        return None
+
     def _apply_color_grade(self, video_path, temp_dir, ffmpeg_args):
         """F. Единый grade поверх собранного видеоряда (пресет self.color_grade).
 
@@ -2615,6 +2700,7 @@ class VideoRenderer:
             cache = getattr(self, '_whisper_words_cache', None)
             if cache is not None and cache.get('audio') == audio_file:
                 return cache.get('words')
+            print("__RENDER_PHASE__|whisper_start", flush=True)
             # device по РЕАЛЬНОМУ наличию CUDA, а не self.gpu_available — он True и для
             # ffmpeg-VideoToolbox на Mac, где CUDA нет → whisper.load_model("base", device="cuda")
             # падал мгновенно → синхрон И субтитры молча не работали на Mac.
@@ -2666,6 +2752,8 @@ class VideoRenderer:
             import traceback
             print_debug(traceback.format_exc())
             return None
+        finally:
+            print("__RENDER_PHASE__|whisper_end", flush=True)
 
     def create_subtitle_file_from_audio(self, audio_file):
         if not WHISPER_AVAILABLE:
@@ -4529,91 +4617,12 @@ class VideoRenderer:
             print_progress(1, 4, "этапов рендера")
             self.log("\n--- 🎵 ШАГ 1/4: Аудио ---")
             
-            audio_files = []
-            # Нормализуем путь проекта
+            from render_narration import select_narration
             project_dir_normalized = os.path.normpath(os.path.abspath(self.project_dir))
-            
-            self.log(f"📁 Директория проекта: {project_dir_normalized}")
-            self.log(f"   Существует: {os.path.exists(project_dir_normalized)}")
-            
-            # Ищем аудио файлы рекурсивно по всей папке проекта
-            self.log(f"🔍 Ищу аудио файлы рекурсивно по всей папке проекта...")
-            
-            # Служебные папки для исключения
-            assets_dir = os.path.join(project_dir_normalized, "_ASSETS")
-            assets_dir_normalized = os.path.normpath(assets_dir)
-            
-            # Поддерживаемые форматы аудио
-            SUPPORTED_AUDIO_FORMATS = ['.mp3', '.wav', '.m4a', '.aac', '.ogg', '.flac']
-            
-            try:
-                for root, dirs, files in os.walk(project_dir_normalized):
-                    # Пропускаем служебные папки
-                    root_normalized = os.path.normpath(root)
-                    if root_normalized == assets_dir_normalized:
-                        dirs[:] = []  # Не заходим в _ASSETS
-                        continue
-                    
-                    # Исключаем служебные папки из дальнейшего обхода
-                    dirs[:] = [
-                        d for d in dirs
-                        if not _is_render_scan_temporary_name(d) and d != '_ASSETS'
-                    ]
-                    
-                    for f in files:
-                        if (_is_render_scan_temporary_name(f)
-                                or 'final_video' in f.lower()):
-                            continue
-                        ext = os.path.splitext(f)[1].lower()
-                        if ext in SUPPORTED_AUDIO_FORMATS:
-                            full = os.path.normpath(os.path.join(root, f))
-                            # Проверяем существование файла
-                            if os.path.exists(full) and os.path.isfile(full):
-                                file_size = os.path.getsize(full)
-                                if file_size > 0:
-                                    # Проверяем, что это не фоновое аудио
-                                    skip = False
-                                    if self.background_audio_file and os.path.exists(self.background_audio_file):
-                                        try:
-                                            if os.path.samefile(full, self.background_audio_file):
-                                                skip = True
-                                        except OSError:
-                                            # Если samefile не работает (разные диски), сравниваем пути
-                                            if os.path.normpath(full) == os.path.normpath(self.background_audio_file):
-                                                skip = True
-                                    
-                                    # Проверяем, что это не трек в конце
-                                    if not skip and self.end_track_file and os.path.exists(self.end_track_file):
-                                        try:
-                                            if os.path.samefile(full, self.end_track_file):
-                                                skip = True
-                                        except OSError:
-                                            if os.path.normpath(full) == os.path.normpath(self.end_track_file):
-                                                skip = True
-                                    
-                                    if not skip:
-                                        audio_files.append(full)
-                                        rel_path = os.path.relpath(full, project_dir_normalized)
-                                        self.log(f"   ✅ Найден: {rel_path} ({file_size} байт)")
-                                else:
-                                    rel_path = os.path.relpath(full, project_dir_normalized)
-                                    self.log(f"   ⚠️ Пропущен (пустой): {rel_path}")
-            except (OSError, PermissionError) as e:
-                self.log(f"   ❌ Ошибка при поиске аудио: {e}")
-            
-            # Сортируем по номеру в имени файла
-            def get_file_number(path):
-                basename = os.path.basename(path)
-                numbers = re.findall(r'\d+', basename)
-                if numbers:
-                    try:
-                        return int(numbers[0])
-                    except ValueError:
-                        return 0
-                return 0
-            
-            audio_files.sort(key=get_file_number)
-            
+            selected = select_narration(project_dir_normalized, self.config)
+            audio_files = [os.path.join(project_dir_normalized, rel) for rel in selected]
+            self.log(f"Основная озвучка: {len(audio_files)} файлов")
+
             audio_duration = 0.0
             final_audio = os.path.join(temp_dir, "final_audio.mp3")
             
@@ -5754,6 +5763,15 @@ class VideoRenderer:
                     ])
                     final_audio_to_use = adjusted
 
+            # 🎧 Автозвук: непрерывный фон по плану + приседание под голосом.
+            # План кладёт сервер до постановки задачи (сети тут нет). Любая ошибка —
+            # тихо остаёмся на прежней дорожке: звук не имеет права уронить рендер.
+            if self.auto_sound and audio_duration > 0:
+                _auto = self._apply_auto_sound(final_audio, final_audio_to_use,
+                                               audio_duration, temp_dir)
+                if _auto:
+                    final_audio_to_use = _auto
+
             # 🔉 «Звук из видео»: подмешиваем аудио ведущих клипов в их позициях таймлайна.
             # amix normalize=0 — озвучка НЕ приглушается добавлением входов. Интро-видео идут
             # первыми в ролике → все события сдвигаются на их суммарную длину (минус xfade-стыки).
@@ -6089,6 +6107,27 @@ def _run_self_test():
             return 1
 
 
+def _persist_render_completion(project_dir, output):
+    """Crash recovery marker: publish only after the completed MP4 is durable."""
+    if not output or not os.path.isfile(output) or os.path.getsize(output) < 1024:
+        raise RuntimeError("render output is missing or empty")
+    with open(output, "rb") as handle:
+        os.fsync(handle.fileno())
+    target = os.path.join(project_dir, "_render_completion.json")
+    temporary = target + ".tmp"
+    with open(temporary, "w", encoding="utf-8") as handle:
+        json.dump({"output": os.path.abspath(output), "size": os.path.getsize(output)}, handle)
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, target)
+    if hasattr(os, "O_DIRECTORY"):
+        fd = os.open(project_dir, os.O_DIRECTORY)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--project_dir", required=False)
@@ -6106,7 +6145,8 @@ def main():
         config = json.loads(args.config)
         renderer = VideoRenderer(args.project_dir, config)
         output = renderer.render_video()
-        print(f"\n__RENDER_SUCCESS__|{output}")
+        _persist_render_completion(args.project_dir, output)
+        print(f"\n__RENDER_SUCCESS__|{output}", flush=True)
         sys.exit(0)
     except Exception as e:
         print(f"\n__RENDER_ERROR__|{str(e)}")
