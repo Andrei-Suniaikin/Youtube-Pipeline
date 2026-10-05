@@ -299,6 +299,10 @@ def native_pairs(blocks_json_path: str, storyboard_path: str, total_seconds: flo
     return pairs, NATIVE_SOURCE
 
 
+TINY_RUN = 3          # сколько кадров короче секунды подряд — уже не монтаж, а нет речи
+START_TOL = 1.0       # допуск тишины до первого слова (см. check)
+
+
 def check(pairs: List[tuple], total_seconds: float, tol: float = 0.5) -> dict:
     """Машинная приёмка тайминга: дыр нет, нахлёстов нет, конец сходится."""
     probs = []
@@ -309,16 +313,35 @@ def check(pairs: List[tuple], total_seconds: float, tol: float = 0.5) -> dict:
             probs.append(f"дыра перед кадром {i+1}: {pairs[i][0]-pairs[i-1][1]:.2f}s")
     if pairs and abs(pairs[-1][1] - total_seconds) > tol:
         probs.append(f"конец не сходится: {pairs[-1][1]:.2f} против {total_seconds:.2f}")
-    # Кадры короче секунды подряд — признак, что речи под ними нет (обрубок TTS,
+    # Кадры короче секунды ПОДРЯД — признак, что речи под ними нет (обрубок TTS,
     # блок 32 ролика 09.09: 13 кадров по 0.26 с), а не «быстрый монтаж».
-    tiny = [i + 1 for i, (a, b) in enumerate(pairs) if b - a < 1.0]
-    if len(tiny) >= 3:
-        probs.append(f"кадров короче 1 с: {len(tiny)} ({tiny[:8]}…) — под ними нет речи?")
+    # 05.10.2026: считались такие кадры по всему ролику, а не подряд, — и четыре
+    # нормальных ролика (Хару, Dragoste, Manhwa o Lásce: 3–4 короткие реплики по
+    # 0,8–0,98 с в разных местах) не прошли приёмку. Выпавший кусок озвучки всегда
+    # даёт серию: 11–14 кадров подряд по 0,2–0,4 с.
+    runs, run = [], []
+    for i, (a, b) in enumerate(pairs):
+        if b - a < 1.0:
+            run.append(i + 1)
+            continue
+        if len(run) >= TINY_RUN:
+            runs.append(run)
+        run = []
+    if len(run) >= TINY_RUN:
+        runs.append(run)
+    if runs:
+        longest = max(runs, key=len)
+        probs.append(f"кадров короче 1 с подряд: {len(longest)} (с кадра {longest[0]}"
+                     + (f", серий {len(runs)}" if len(runs) > 1 else "")
+                     + ") — под ними нет речи?")
     # 27.09.2026, аудит (align.check): 30 с пустоты в начале и кадр (0, 0) проходили с ok.
     # Замер на 78 готовых роликах: начало везде 0,0 с (тишина в начале звука ≤ 0,36 с); самый
     # короткий кадр нормального ролика 0,7 с. Короче 0,3 с — вспышка: ccb6b7af кадр 728 0,12 с
     # (распознавание потеряло фразу), 3632631d кадр 665 0,2 с («Charlotte» → «Şarlot»).
-    if pairs and pairs[0][0] > tol:
+    # Начало — свой допуск: сборка растягивает первый клип от нуля, так что тишина до
+    # первого слова пустотой в ролике не становится (df0981c1, 05.10: 0,56 с при допуске
+    # 0,5 — первый клип 3,75 с, сумма клипов равна длине звука). Ловим настоящую пустоту.
+    if pairs and pairs[0][0] > max(tol, START_TOL):
         probs.append(f"пустота в начале: первый кадр с {pairs[0][0]:.2f}s")
     вспышки = [i + 1 for i, (a, b) in enumerate(pairs) if round(b - a, 3) < 0.3]
     if вспышки:

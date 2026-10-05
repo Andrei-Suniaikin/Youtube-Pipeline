@@ -95,6 +95,13 @@ ATTEMPTS = 2          # заказов на блок за проход: втор
 CREDITS = 10          # единиц часа за заказ (каталог /models, 29.09)
 # Звук не похож на текст: быстрее 200 сл/мин — обрубок, медленнее 60 — тишина или повторы.
 FASTEST_WPM, SLOWEST_WPM = 200.0, 60.0
+# Блок заметно быстрее СВОЕГО ролика — FastGen выкинул кусок текста (05.10.2026: три ролика
+# из 20 — блоки в 1,12–1,21 раза быстрее медианы ролика, под выпавшим текстом 11–14 кадров
+# по 0,2–0,4 с, приёмка раскладки их отбила). Абсолютный порог в 200 сл/мин такое не видит:
+# темп 183–196 при медиане 157–176. У нормальных роликов самый быстрый блок — до 1,07 медианы
+# (95-й перцентиль), максимум 1,118. Перезаказ один раз и стоит 10 единиц часа подписки,
+# поэтому порог с запасом в сторону лишнего перезаказа. 0 — проверка выключена.
+TEMPO_RATIO = float(os.environ.get("MANGA_FASTGEN_TTS_TEMPO_RATIO", "1.10") or 0)
 SUCCESS = {"succeeded"}
 TERMINAL_FAILURE = {"failed", "cancelled", "canceled", "expired"}
 _VOICE = re.compile(r"^[a-z][a-z0-9_-]{1,31}$")
@@ -603,6 +610,40 @@ def audio_problem(text: str, seconds: float) -> Optional[str]:
     return None
 
 
+def tempo_outliers(blocks: List[VO.Block], ratio: float = None) -> List[Tuple[VO.Block, float, float]]:
+    """Блоки быстрее медианы своего ролика больше чем в `ratio` раз: [(блок, темп, медиана)].
+
+    Блоки, уже перезаказанные по этой причине (метка в .voice.json), не повторяются:
+    второй заказ тоже быстрый — значит, так читается сам текст.
+    """
+    ratio = TEMPO_RATIO if ratio is None else ratio
+    if not ratio or len(blocks) < 3:
+        return []
+    tempo = []
+    for b in blocks:
+        words = len(b.text.split())
+        seconds = VO.duration(b.path)
+        if words >= 20 and seconds > 5:
+            tempo.append((b, words / seconds * 60))
+    if len(tempo) < 3:
+        return []
+    ordered = sorted(t for _, t in tempo)
+    median = ordered[len(ordered) // 2] if len(ordered) % 2 else \
+        (ordered[len(ordered) // 2 - 1] + ordered[len(ordered) // 2]) / 2
+    out = []
+    for b, t in tempo:
+        if t <= median * ratio:
+            continue
+        try:
+            with open(b.path + ".voice.json", encoding="utf-8") as f:
+                if json.load(f).get("tempo_reordered"):
+                    continue
+        except (OSError, ValueError):
+            pass
+        out.append((b, t, median))
+    return out
+
+
 # ---------- синтез ----------
 def block_ready(b: VO.Block, voice: str) -> bool:
     try:
@@ -700,6 +741,24 @@ def synth(blocks: List[VO.Block], out_dir: str, lang: str, log: Callable = print
                                + (f" (из них {skipped} не заказаны: отказ сервиса, общий перерыв или "
                                   "лимит часа)" if skipped else "")
                                + f": {first}") from first
+    for b, t, median in tempo_outliers(blocks):
+        # Квитанция блока в состоянии «done» — `generation_to_resume` отдаст '', и `one`
+        # закажет новую генерацию, а не скачает старую.
+        log(f"  FastGen: блок {b.idx}: {t:.0f} сл/мин при медиане ролика {median:.0f} — похоже, "
+            f"озвучка пропустила кусок текста; заказываю блок заново ({CREDITS} единиц часа)")
+        one(b)
+        fp = VO.voice_fingerprint(b.text, voice_id(voice), "+0%")
+        state = {"fingerprint": fp, "status": "complete", "tempo_reordered": True}
+        try:
+            with open(b.path + ".voice.json", encoding="utf-8") as f:
+                state = {**json.load(f), "tempo_reordered": True}
+        except (OSError, ValueError):
+            pass
+        atomic_json(b.path + ".voice.json", state)
+        again = len(b.text.split()) / max(VO.duration(b.path), 0.001) * 60
+        if again > median * TEMPO_RATIO:
+            log(f"  FastGen: блок {b.idx}: и новый заказ быстрый ({again:.0f} сл/мин) — значит, так "
+                "читается сам текст; оставляю, решит приёмка раскладки")
     for b in blocks:
         b.seconds = VO.duration(b.path)
         log(f"  блок {b.idx:3d}: {b.seconds:6.1f}s  {len(b.text.split()):4d} слов")
