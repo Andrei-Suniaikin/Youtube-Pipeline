@@ -1575,6 +1575,21 @@ def _prompt_cfg(u, shared=False, provider_override=None):
             _first_credential(k, "claude_oauth"), thr)
 
 
+def _project_codex_model(tid, pid):
+    """Модель Codex для промптов ОДНОГО проекта или ''.
+
+    Проба владельца 05.10.2026: sol вместо terra на двух-трёх проектах, чтобы сравнить
+    скорость и качество на одной очереди. Поле `prompt_codex_model` в настройках
+    проекта; принимается только модель из CODEX_MODELS — опечатка не должна уводить
+    оплаченный прогон в 400 от провайдера. Пусто — модель сервера, как у всех."""
+    try:
+        p = _get_project(tid, pid)
+    except Exception:                                              # noqa: BLE001
+        return ""
+    model = str((_psettings(p) if p else {}).get("prompt_codex_model") or "").strip()
+    return model if model in CODEX_MODELS else ""
+
+
 def _key_env(u, shared=False, credential_overrides=None, prompt_provider=None):
     """Окружение worker-процесса.
 
@@ -7147,7 +7162,7 @@ PROVIDER_LIMITS = {
     # его потолок держит только rate limit аккаунта (его делят три сервиса).
     "prompt_openai": (int(os.environ.get("PROMPT_OPENAI_G", "4")),
                       int(os.environ.get("PROMPT_OPENAI_K", "4"))),
-    "prompt_codex":  (int(os.environ.get("PROMPT_CODEX_G", "2")),
+    "prompt_codex":  (int(os.environ.get("PROMPT_CODEX_G", "3")),
                       int(os.environ.get("PROMPT_CODEX_K", "2"))),
     "prompt_claude": (int(os.environ.get("PROMPT_CLAUDE_G", "2")),
                       int(os.environ.get("PROMPT_CLAUDE_K", "2"))),
@@ -7181,7 +7196,11 @@ _PROVIDER_HARD_JOB_CAPS = {
     # границу одновременных вызовов канала: выше не поднимут ни env, ни /server-limits.
     # Сверяется с замеренным бюджетом памяти тестом (см. _prompt_memory_estimate_mb).
     "prompt_openai": 4,
-    "prompt_codex": 2,
+    # 05.10.2026, решение владельца: три задачи разом вместо двух. Очередь промптов
+    # (35 задач) — главное узкое место конвейера, а таймкоды держат одно место из
+    # дорожки. Память это выдерживает с запасом: бой ходит по 4 потока на задачу,
+    # 3 × 4 × 166 МБ ≈ 2 ГБ при бюджете канала ≈ 6.8 ГБ (_prompt_channel_max_calls).
+    "prompt_codex": 3,
     "prompt_claude": 2,
 }
 # Физический предел АККАУНТА провайдера (замеры 30.07). Аккаунт делят три сервиса
@@ -11053,6 +11072,12 @@ def _run_task(t):
         job_env["VS_CALLS_URL"] = CALLS_BASE_URL
         job_env["VS_JOB_ID"] = str(jid)
         job_env["VS_JOB_TOKEN"] = str(claim_token or "")
+        if t["kind"] == "prompts" and prompt_provider == "codex" and not own_credential:
+            _trial_model = _project_codex_model(t["tenant_id"], t["project_id"])
+            if _trial_model and _trial_model != job_env.get("VS_CODEX_MODEL"):
+                _log_line(jid, f"🧪 Промпты этого проекта пишет {_trial_model} "
+                               f"(у остальных {job_env.get('VS_CODEX_MODEL') or DEFAULT_CODEX_MODEL}) — проба")
+                job_env["VS_CODEX_MODEL"] = _trial_model
 
         if t["kind"] == "cards":
             # Defense in depth: _task_provider already hard-locks the queue lane and
