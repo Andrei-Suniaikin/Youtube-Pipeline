@@ -3749,7 +3749,7 @@ function analyticsHowTo(id){
     обычного браузера гугл-аккаунт канала входить не должен.
     <br>1. Открыть в профиле служебную страницу Google OAuth Playground.
     <br>2. В настройках (шестерёнка) включить «Use your own OAuth credentials» и вписать
-    наши идентификатор и секрет приложения — те, что заданы на странице «Ключи».
+    наши Client ID и Client secret приложения — те, что заданы на странице «Ключи».
     <br>3. Запросить <b>оба</b> доступа: <code>yt-analytics.readonly</code>
     <b>и</b> <code>youtube.readonly</code>. Без второго отчёт не придёт, хотя токен
     выдастся. Галочки на экране согласия <b>не снимать</b> — согласие дробное, и снятая
@@ -3818,8 +3818,8 @@ function analyticsKeyBlock(id, acc){
       connected ? (dead ? 'Выдать новый ключ этому каналу' : 'Заменить ключ этого канала')
                 : 'Как получить ключ для этого канала'}</summary>
     ${acc.client === false ? `<div class="note bad" style="margin-top:10px">
-      Сначала впишите идентификатор и секрет приложения Google на странице
-      «Ключи» — без них токен обновлять нечем.</div>` : ''}
+      Сначала впишите Client ID и Client secret приложения Google на странице
+      «Ключи» (в начале списка общих ключей) — без них токен обновлять нечем.</div>` : ''}
     <div style="margin-top:10px">
       <input id="tok" style="width:100%;font-family:var(--mono);font-size:12px"
         placeholder="refresh token из OAuth Playground" autocomplete="off"></div>

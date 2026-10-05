@@ -35,6 +35,11 @@ from typing import Any, Dict, List, Optional, Tuple
 # Список намеренно закрытый: файл ключей — не свалка, и запись в произвольное поле
 # позволила бы через форму подменить, например, правила выбора канала промптов.
 EDITABLE = (
+    # Наверху и словами самого Google (05.10.2026, владелец: «не вижу полей гугл и секрет
+    # приложения»): в Google Cloud → Clients они называются Client ID и Client secret, а
+    # внизу длинного списка под «идентификатором» их не нашли.
+    ("yt_oauth_client_id", "Google — Client ID приложения (Google Cloud → Clients)"),
+    ("yt_oauth_client_secret", "Google — Client secret приложения (Google Cloud → Clients)"),
     ("googler", "FastGen — картинки и видео"),
     ("openai", "OpenAI — картинки gpt-image"),
     ("elevenlabs", "Lumean (бывш. ElevenLabs) — озвучка"),
@@ -50,8 +55,6 @@ EDITABLE = (
     # Ключ YouTube Data API: им живут публичные числа каналов и роликов, поздняя
     # проверка выхода ролика и ночной обход. Один на всю студию, кошелёк общий.
     ("youtube_api_key", "YouTube Data API — статистика и проверка выхода"),
-    ("yt_oauth_client_id", "Google — идентификатор приложения (статистика каналов)"),
-    ("yt_oauth_client_secret", "Google — секрет приложения (статистика каналов)"),
 )
 EDITABLE_KEYS = tuple(name for name, _ in EDITABLE)
 # Пул того же семейства: если он есть, ключей несколько и работают они по кругу.

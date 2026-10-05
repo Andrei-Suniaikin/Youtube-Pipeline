@@ -127,6 +127,20 @@ def main_() -> int:
     check("и следующий промпт по старшинству", claim(), [(980002, "prompts")])
     finish(980002)
 
+    print("\nДва места: таймкодам — одно, второе — промптам (05.10.2026)")
+    was = main.PROVIDER_LIMITS[PROVIDER]
+    main.PROVIDER_LIMITS[PROVIDER] = (2, 2)
+    try:
+        seed([(980021, "prompts", 3600), (980022, "prompts", 1800),
+              (980023, "chapters", 60), (980024, "chapters", 30)])
+        got = sorted(claim())
+        check("один таймкод и один промпт, а не два таймкода", got,
+              [(980021, "prompts"), (980023, "chapters")])
+        for jid, _kind in got:
+            finish(jid)
+    finally:
+        main.PROVIDER_LIMITS[PROVIDER] = was
+
     print("\nБез таймкодов порядок прежний")
     seed([(980011, "prompts", 900), (980012, "prompts", 300)])
     check("старший промпт первым", claim(), [(980011, "prompts")])

@@ -13272,6 +13272,12 @@ def _prompt_provider_paused(provider_or_channel):
     return provider in _queue_pause_state()["providers"]
 
 
+# Сколько мест дорожки промптов разом могут занять таймкоды, пока ждут промпты новых
+# проектов. 05.10.2026: таймкоды стояли головой очереди (97f37e6) и у роликов на 2–3 часа
+# шли по 25–100 минут — оба места дорожки были ими заняты, промптов за 6 часов: ноль.
+CHAPTERS_LANE_MAX = int(os.environ.get("VS_CHAPTERS_LANE_MAX", "1") or 1)
+
+
 def _claim_fair_tasks(c, claim_now=None):
     """Атомарно заполнить свободные provider slots честным uid round-robin.
 
@@ -13307,6 +13313,7 @@ def _claim_fair_tasks(c, claim_now=None):
         run_prov_units = {}
         run_uid_jobs = {}            # (provider, uid) -> сколько задач юзера уже идёт
         run_uid_prompt = {}          # uid -> задач промптов юзера ВО ВСЕХ каналах
+        run_chapters = {}            # provider -> сколько таймкодов идёт (см. CHAPTERS_LANE_MAX)
         for r in c.execute(
                 "SELECT kind,params,uid,provider,prompt_failover,lane FROM queue_tasks "
                 "WHERE status='running' AND kind!='render'").fetchall():
@@ -13354,6 +13361,8 @@ def _claim_fair_tasks(c, claim_now=None):
             run_uid_jobs[(prov, r["uid"])] = run_uid_jobs.get((prov, r["uid"]), 0) + 1
             if prov in _PROMPT_PROVIDER_GROUPS:
                 run_uid_prompt[r["uid"]] = run_uid_prompt.get(r["uid"], 0) + 1
+            if r["kind"] == "chapters":
+                run_chapters[prov] = run_chapters.get(prov, 0) + 1
 
         # Кто ещё стоит в очереди — ВЕСЬ список, без фильтра по retry_after. Нужен
         # только уборщику троттлинга: отложенная задача не видна выборке ниже, и без
@@ -13498,6 +13507,14 @@ def _claim_fair_tasks(c, claim_now=None):
                         continue
                     # FIFO per uid: если oldest task сейчас не помещается, более
                     # новые этого uid не обгоняют её; пробуем следующего uid.
+                    if (jobs[0]["kind"] == "chapters"
+                            and run_chapters.get(prov, 0) >= CHAPTERS_LANE_MAX
+                            and any(j["kind"] != "chapters" for j in jobs)):
+                        # Таймкодам — не больше CHAPTERS_LANE_MAX мест дорожки, пока ждут
+                        # промпты: иначе длинные таймкоды (25–100 мин у ролика на 2–3 часа)
+                        # держат все места часами (05.10.2026: 0 промптов за 6 часов).
+                        _k = next(i for i, j in enumerate(jobs) if j["kind"] != "chapters")
+                        jobs.insert(0, jobs.pop(_k))
                     t = jobs[0]
                     try:
                         task_params = json.loads(t["params"] or "{}")
@@ -13602,6 +13619,8 @@ def _claim_fair_tasks(c, claim_now=None):
                         jobs.pop(0)
                         if not jobs:
                             by_uid.pop(uid, None)
+                        if t["kind"] == "chapters":
+                            run_chapters[prov] = run_chapters.get(prov, 0) + 1
                         # Задача стартовала → её резерв (если был) больше не нужен,
                         # дорожка снова раздаёт ёмкость всем.
                         _drop_queue_reservation(prov, lane, t["job_id"],
