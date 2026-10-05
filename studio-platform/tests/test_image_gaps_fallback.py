@@ -141,6 +141,29 @@ def main() -> int:
           "late_retry_indices(_gaps_now)" in late and "image_gaps_allowed(total)" in late, True)
     check("и с паузой между раундами", "time.sleep(IMAGE_LATE_RETRY_SEC)" in late, True)
 
+    print("\nДвижок переносит подмену в журнал выпуска — один раз")
+    import sqlite3
+    sys.path.insert(0, os.path.join(BASE, "server"))
+    import pub_services as S
+    c = sqlite3.connect(":memory:")
+    c.row_factory = sqlite3.Row
+    c.executescript("""
+      CREATE TABLE job_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, ts REAL, line TEXT);
+      CREATE TABLE pub_release_log(id INTEGER PRIMARY KEY AUTOINCREMENT, release_id TEXT,
+        ts REAL, level TEXT, step TEXT, message TEXT, repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
+    """)
+    c.execute("INSERT INTO job_logs(job_id, ts, line) VALUES(7, 1, ?)",
+              ("[08:46:47.938] ⚠️ 🧩 [25] Сцена 25 заменена соседним кадром: провайдер отказал "
+               "фильтром безопасности (смягчений: 3)",))
+    c.execute("INSERT INTO job_logs(job_id, ts, line) VALUES(7, 2, 'прочее')")
+    svc = S.PubServices({"create_project": None, "enqueue": None, "project_dir": None})
+    rel = {"release_id": "r1"}
+    first = svc._note_image_gaps(c, rel, "7")
+    again = svc._note_image_gaps(c, rel, "7")
+    msgs = [r[0] for r in c.execute("SELECT message FROM pub_release_log")]
+    check("одна строка в журнале выпуска", (first, again, len(msgs)), (1, 0, 1))
+    check("со сценой и причиной", msgs and msgs[0].startswith("сцена 25 заменена соседним кадром: провайдер"), True)
+
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

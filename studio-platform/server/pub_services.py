@@ -20,6 +20,7 @@ import preset_links
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import time
 
@@ -837,6 +838,7 @@ class PubServices:
                         continue
                 return {"wait": True}
             if kind == "images":
+                self._note_image_gaps(c, rel, known["remote_job_id"])
                 later = self._latest_images_task(c, rel, known["remote_job_id"])
                 if later and later[1] in ("queued", "running"):
                     # Картинки этого проекта ещё делаются (их поставил сам кабинет после
@@ -903,6 +905,37 @@ class PubServices:
     # старого кабинета ждёт те же 6 часов (PUB_BRIDGE_CHAPTERS_WAIT_H).
     CHAPTERS_WAIT_SEC = float(os.environ.get("VS_CHAPTERS_WAIT_SEC") or 6 * 3600)
     CHAPTERS_SLOT_MARGIN_SEC = float(os.environ.get("VS_CHAPTERS_SLOT_MARGIN_SEC") or 3 * 3600)
+
+    # Строка воркера картинок про сцену, отданную соседнему кадру (googler_worker:
+    # «🧩 [N] Сцена N заменена соседним кадром: <причина>»).
+    GAP_LINE_MARK = "заменена соседним кадром"
+
+    def _note_image_gaps(self, c, rel, job_id) -> int:
+        """Сцены, отданные соседнему кадру, — в журнал выпуска, по одной строке на сцену.
+
+        Владелец 05.10.2026: подмена допустима, но должна быть видна там, где смотрят
+        выпуск, а не только в журнале задачи картинок. Строку пишем один раз: движок
+        проходит здесь на каждом круге, пока ждёт рендер.
+        """
+        try:
+            lines = [r[0] for r in c.execute(
+                "SELECT line FROM job_logs WHERE job_id=? AND line LIKE ? ORDER BY id",
+                (int(job_id), f"%{self.GAP_LINE_MARK}%")).fetchall()]
+        except Exception:                                          # noqa: BLE001
+            return 0
+        added = 0
+        for line in lines:
+            m = re.search(r"Сцена (\d+) заменена соседним кадром: (.+)$", str(line))
+            if not m:
+                continue
+            text = (f"сцена {m.group(1)} заменена соседним кадром: {m.group(2).strip()[:160]}")
+            seen = c.execute("SELECT 1 FROM pub_release_log WHERE release_id=? AND message=?",
+                             (rel["release_id"], text)).fetchone()
+            if seen:
+                continue
+            log_line(c, rel["release_id"], "ролик", text, level="warn")
+            added += 1
+        return added
 
     def _chapters_overdue(self, c, rel, known) -> str:
         """Почему таймкоды больше не ждём — или "" (ждём дальше).
