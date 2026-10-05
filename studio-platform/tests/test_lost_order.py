@@ -175,7 +175,12 @@ def main() -> int:
     src = io.open(os.path.join(BASE, "workers", "googler_worker.py"),
                   encoding="utf-8").read()
     ветка = src[src.find('_jrn_why = ""'):src.find('_jrn_why = ""') + 2000]
-    check("404 в ветке опознаётся", '"404" in _jrn_why' in ветка, True)
+    # 05.10.2026 опознание вынесено в order_never_delivers (там же — отклонённый заказ,
+    # status=failed); поведение helper'а проверяет tests/test_order_never_delivers.py.
+    check("404 в ветке опознаётся",
+          "order_never_delivers(_jrn_probe)" in ветка
+          and '"404" in err' in src[src.find("def order_never_delivers"):
+                                     src.find("def order_never_delivers") + 1500], True)
     check("и журналу говорится именно lost", "lost=True" in ветка, True)
     check("вместе с ordered=True — деньги-то ушли", "ordered=True, lost=True" in ветка, True)
     check("и человеку сказано, что перезаказ дешевле",

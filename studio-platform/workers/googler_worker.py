@@ -7366,6 +7366,32 @@ def googler_request_v6(endpoint: str, method: str = "POST", data: Optional[dict]
     return {"_error": _last or "нет ответа после ретраев"}
 
 
+def order_never_delivers(probe) -> str:
+    """Почему по уже созданному заказу результата не будет НИКОГДА — или "".
+
+    Два определённых ответа провайдера на вопрос о заказе:
+      * 404 — заказа у него нет (потерял или вычистил старые операции, 03.10);
+      * status=failed — он сам отклонил заказ, чаще всего фильтром безопасности
+        («Request blocked by provider safety filters»). 05.10.2026 из-за этого пять
+        выпусков встали в разбор: в каждом не хватало 5 кадров из 1184, журнал считал
+        такой заказ «оплаченным без результата» и кадр не перезаказывал никогда, хотя
+        обычный путь генерации умеет смягчать промпт именно на этот отказ.
+    Всё прочее (сеть, 5xx, «ещё в работе») — не вывод: ждать или спросить позже.
+    """
+    if not isinstance(probe, dict):
+        return ""
+    err = str(probe.get("_error") or "")
+    if "404" in err:
+        return "провайдер потерял заказ (404)"
+    if str(probe.get("status") or "").lower() == "failed":
+        why = probe.get("error") or probe.get("message") or ""
+        if isinstance(why, dict):
+            why = why.get("message") or json.dumps(why, ensure_ascii=False)
+        why = " ".join(str(why or "").split())[:160]
+        return "провайдер отклонил заказ" + (f": {why}" if why else "")
+    return ""
+
+
 def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Optional[str]:
     """Поллит GET /api/v6/generations/{id} до succeeded/failed. Возвращает base64 (картинка/видео) или None.
     Контракт возврата как у poll_v4_operation (base64-строка → save_base64_to_file)."""
@@ -11047,27 +11073,31 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 # здесь — это «провайдер потерял заказ», и он отличается от «заказ ещё
                 # не готов» тем, что ждать больше нечего никогда.
                 _jrn_why = ""
+                _jrn_probe = None
                 try:
                     _jrn_probe = googler_request_v6(
                         f"generations/{_jrn.remote_order_id}", method="GET")
                     _jrn_why = str((_jrn_probe or {}).get("_error") or "")
                 except Exception as _jpe:                          # noqa: BLE001
                     _jrn_why = f"{type(_jpe).__name__}: {_jpe}"
-                if "404" in _jrn_why:
-                    # Деньги за этот заказ потеряны и невозвратны. Разрешаем повтор:
-                    # рядом лежат уже оплаченные кадры этого же проекта, и держать их
-                    # из-за одного недостающего дороже, чем заказать его заново.
+                _jrn_final = order_never_delivers(_jrn_probe)
+                if _jrn_final:
+                    # Результата по этому заказу не будет никогда (потерян или отклонён).
+                    # Разрешаем повтор: рядом лежат уже оплаченные кадры этого же проекта,
+                    # и держать их из-за одного недостающего дороже, чем заказать его
+                    # заново. Повтор идёт обычным путём генерации — там, где смягчается
+                    # промпт на отказ фильтра.
                     _jrn_j = _journal()
                     if _jrn_j is not None:
                         _jrn_j.failed(
                             _jrn.call_id,
-                            f"провайдер потерял заказ {_jrn.remote_order_id} (404) — "
-                            f"результата не будет, кадр можно заказать заново",
+                            f"{_jrn_final} — заказ {_jrn.remote_order_id}; результата не "
+                            f"будет, кадр можно заказать заново",
                             ordered=True, lost=True)
-                    print_user(f"🧹 [{index+1}] Журнал: провайдер потерял заказ "
-                               f"{_jrn.remote_order_id} (404). Деньги за него уже ушли и "
-                               f"не вернутся; следующий прогон закажет кадр заново — это "
-                               f"дешевле, чем держать остальные оплаченные кадры", "WARNING")
+                    print_user(f"🧹 [{index+1}] Журнал: {_jrn_final} "
+                               f"({_jrn.remote_order_id}). Ждать нечего; следующий прогон "
+                               f"закажет кадр заново — это дешевле, чем держать остальные "
+                               f"оплаченные кадры", "WARNING")
                     return (index, None)
                 print_user(f"❌ [{index+1}] Журнал: оплаченный заказ {_jrn.remote_order_id} "
                            f"результата не дал — кадр пропущен без нового платного запроса"
