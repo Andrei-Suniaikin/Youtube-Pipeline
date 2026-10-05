@@ -52,3 +52,34 @@ def ensure_project_link(tenants_dir: str, project_tenant, channel_tenant, pid: s
     os.makedirs(os.path.dirname(place), exist_ok=True)
     os.symlink(target, place)
     return ""
+
+
+# ── Рендеры со звездой Gemini (А6 владельца, 05.10.2026) ────────────────────────────
+#
+# Рендеры ВВ2 до 19.09 несут звезду Gemini в правом нижнем углу; мост их отсекает по дате
+# рендера (MIN_RENDER_AT). Владелец: «убирать звезду фильтром и лить». Звезду убирает
+# star_clean.py: очищенный файл встаёт на место render/<job>.mp4 (движок берёт ровно его),
+# оригинал остаётся рядом как <job>.mp4.star, а рядом — отметка <job>.star_removed.json.
+# Отметка верна, только пока файл на месте тот самый: размер и время изменения совпадают.
+STAR_MARK_SUFFIX = ".star_removed.json"
+
+
+def star_mark_path(mp4_path: str) -> str:
+    return mp4_path[:-4] + STAR_MARK_SUFFIX if mp4_path.endswith(".mp4") else mp4_path + STAR_MARK_SUFFIX
+
+
+def star_cleaned(mp4_path: str) -> dict:
+    """Отметка очистки, если она относится к файлу, который лежит сейчас; иначе {}."""
+    import json
+    try:
+        mark = json.load(open(star_mark_path(mp4_path), encoding="utf-8"))
+        st = os.stat(mp4_path)
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(mark, dict):
+        return {}
+    if int(mark.get("clean_size") or -1) != st.st_size:
+        return {}
+    if abs(float(mark.get("clean_mtime") or 0) - st.st_mtime) > 2:
+        return {}
+    return mark

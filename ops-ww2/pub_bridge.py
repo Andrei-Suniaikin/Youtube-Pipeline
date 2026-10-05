@@ -224,7 +224,11 @@ def check_project(c, pid, tid, now, chapters_on: bool, min_render_at: float = 0.
     if not renders:
         raise Skip("no_render", "готового рендера нет")
     render = max(renders, key=lambda t: (t["finished"] or 0, t["job_id"]))
-    if min_render_at and float(render["started"] or 0) < min_render_at:
+    # Звезду Gemini убрал star_clean.py (А6 владельца, 05.10.2026): старый рендер годится,
+    # пока на месте лежит ровно очищенный файл (отметка сверяется по размеру и времени).
+    star = bridge_link.star_cleaned(os.path.join(proj, render["output_rel"] or "")) \
+        if render["output_rel"] else {}
+    if min_render_at and float(render["started"] or 0) < min_render_at and not star:
         raise Skip("render_old", f"последний рендер {render['job_id']} начат "
                                  f"{fmt_local(render['started'] or 0, 'Europe/Berlin')}, раньше отсечки "
                                  f"{fmt_local(min_render_at, 'Europe/Berlin')} — жду перерендер", wait=True)
@@ -233,7 +237,7 @@ def check_project(c, pid, tid, now, chapters_on: bool, min_render_at: float = 0.
     if not rel or not os.path.isfile(mp4):
         raise Skip("no_mp4", f"рендер {render['job_id']} done, но файла {rel or '(пусто)'} нет")
     size = os.path.getsize(mp4)
-    if render["render_size"] and int(render["render_size"]) != size:
+    if render["render_size"] and int(render["render_size"]) != size and not star:
         raise Skip("size", f"размер {rel} {size} ≠ записанного {render['render_size']} — файл подменён")
     # Движок при заливке берёт файл сам (find_video): если в render/ лежит другой, более
     # свежий mp4, уедет не тот ролик. Сверяем, что он выберет ровно наш.
