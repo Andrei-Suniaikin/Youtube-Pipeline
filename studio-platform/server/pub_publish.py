@@ -80,8 +80,14 @@ class TitleUnavailable(RuntimeError):
 
 
 def clean_title(text: str) -> str:
-    """Убрать кавычки, переносы и служебный мусор из ответа модели."""
-    line = " ".join((text or "").split())
+    """Убрать кавычки, переносы и служебный мусор из ответа модели.
+
+    Название — только ПЕРВАЯ непустая строка. 05.10.2026 на пробе чата FastGen модели
+    дописывали второй строкой реплику («Czy chcesz, żebym przygotował…», «Rozwiń temat…»),
+    а склейка строк уносила её в название ролика.
+    """
+    text = next((ln for ln in str(text or "").splitlines() if ln.strip()), "")
+    line = " ".join(text.split())
     line = line.strip().strip('"').strip("«»").strip("'").strip()
     line = re.sub(r"^(название|title)\s*[:—-]\s*", "", line, flags=re.I).strip()
     # После пометки «Название:» модель часто ставит кавычки ещё раз — снимаем и их.

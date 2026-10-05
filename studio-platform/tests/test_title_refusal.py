@@ -96,6 +96,13 @@ def main() -> int:
     for t in TITLES:
         check(t[:60], P.refusal_in(t), False)
 
+    print("\nНазвание — только первая строка ответа")
+    check("реплика второй строкой отрезана",
+          P.clean_title("Dlaczego niemieccy żołnierze bali się zimy 1941 roku\nCzy chcesz, żebym przygotował wersję?"),
+          "Dlaczego niemieccy żołnierze bali się zimy 1941 roku")
+    check("пустые строки в начале пропускаются",
+          P.clean_title("\n\n  «Soldatul care a supraviețuit»\nmai mult"), "Soldatul care a supraviețuit")
+
     print("\nНазвание подпиской Codex")
     kind, text = via_codex(REFUSALS[0])
     check("отказ — это ошибка строки, а не «подождать»", kind, "error")
