@@ -49,6 +49,9 @@ from pub_log import add as log_line   # noqa: E402
 from pub_publish import chapters_enabled, find_video   # noqa: E402
 from pub_tags import taken_slots   # noqa: E402
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import bridge_link   # noqa: E402  — проект из кабинета Гринда для канала кабинета testpartner
+
 # ─────────────────────────── настройки ───────────────────────────
 
 SHEET_ID = os.environ.get("WW2_SHEET_ID", "1wio2te9wkWkIJ1n-caPlzpzSuYM8ajlOHvuzNvEwjPE")
@@ -392,7 +395,11 @@ def plan(c, qrows, chrows, now, all_notes=False, what_if=False, retry=()) -> lis
             else:
                 issues = channel_issues(ch)
                 if ch["tenant_id"] != prj["tenant_id"]:
-                    raise Skip("tenant", f"канал в кабинете {ch['tenant_id']}, проект — в {prj['tenant_id']}")
+                    # А5 владельца 04.10: готовые ролики Гринда (свой кабинет) идут на каналы
+                    # кабинета testpartner — через ссылку на папку проекта (bridge_link).
+                    if not bridge_link.foreign_allowed(prj["tenant_id"], ch["tenant_id"]):
+                        raise Skip("tenant", f"канал в кабинете {ch['tenant_id']}, проект — в {prj['tenant_id']}")
+                    item["link_from"] = str(prj["tenant_id"])
                 sheet_prof = re.sub(r"\D", "", srow["profile"])
                 if CHECK_PROFILE and sheet_prof and ch["profile_id"] and str(ch["profile_id"]) != sheet_prof:
                     issues.append(f"профиль в движке {ch['profile_id']}, а в «Каналах» {srow['profile']} — "
@@ -433,7 +440,8 @@ def plan(c, qrows, chrows, now, all_notes=False, what_if=False, retry=()) -> lis
                            wait=True)
             busy_cache[ch["id"]].add(slot)
             item.update({"decision": "create", "code": "ok", "reason": "", "wait": False,
-                         "tenant_id": prj["tenant_id"], "channel_id": ch["id"], "slot_at": slot,
+                         # Выпуск — в кабинете КАНАЛА: движок ведёт его вместе с каналом.
+                         "tenant_id": ch["tenant_id"], "channel_id": ch["id"], "slot_at": slot,
                          "slot_local": fmt_local(slot, ch["tz"]) + " " + ch["tz"],
                          "donor_title": title, "render_job": chk["render"]["job_id"],
                          "render_finished": chk["render"]["finished"],
@@ -468,6 +476,13 @@ def create_release(c, it, now: float, retry=()) -> str:
         if not ch or channel_issues(ch) or ch["uc"] != it["uc"]:
             c.execute("ROLLBACK")
             return ""
+        if it.get("link_from"):
+            why = bridge_link.ensure_project_link(TENANTS_DIR, it["link_from"], ch["tenant_id"],
+                                                  it["pid"])
+            if why:
+                c.execute("ROLLBACK")
+                it["link_error"] = why
+                return ""
         note = f"мост «Очередь»: строка {it['row']}, проект {it['pid']}"
         cur = c.execute(
             "INSERT INTO pub_plan_items(tenant_id,channel_id,version,donor_url,donor_title,position,"
@@ -501,6 +516,9 @@ def create_release(c, it, now: float, retry=()) -> str:
         log_phase(c, rid, "media_ready", now, payload={
             "source": "bridge", "project_id": it["pid"], "render_job": it["render_job"],
             "mp4": it["mp4"], "chapters": it["chapters"]})
+        if it.get("link_from"):
+            log_line(c, rid, "мост", f"проект из кабинета {it['link_from']} — движок видит его "
+                     f"через ссылку в кабинете канала {ch['tenant_id']}", now=now)
         log_line(c, rid, "мост",
                  f"взял готовый проект {it['pid']} из «Очереди» (строка {it['row']}): рендер "
                  f"{it['render_job']}, {it['mp4_mb']} МБ, главы — {it['chapters']}; выход {it['slot_local']}",
@@ -570,6 +588,10 @@ def main(argv=None):
             if rid:
                 it.update({"decision": "created", "release_id": rid})
                 made.append(rid)
+            elif it.get("link_error"):
+                it.update({"decision": "skip", "code": "link",
+                           "reason": "ссылка на проект из чужого кабинета не легла: "
+                                     + it["link_error"]})
             else:
                 it.update({"decision": "skip", "code": "race",
                            "reason": "выпуск/выход заняли в эту же секунду — повторю в следующий запуск"})
