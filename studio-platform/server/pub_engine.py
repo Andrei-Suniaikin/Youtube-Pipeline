@@ -526,11 +526,35 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
     c.execute("UPDATE pub_plan_items SET status='running', updated=? WHERE id=? "
               "AND status='error'", (now, rel["plan_item_id"]))
     reset_rewrite_resumes(c, release_id)
+    if not keep_attempts:
+        # Возврат вслепую (keep_attempts) счёт повторов не обнуляет: иначе автоматический
+        # возврат мог бы гонять платные прогоны картинок по кругу.
+        reset_stage_retries(c, release_id)
     log_line(c, release_id, "движок",
              f"возвращён в работу с фазы «{phase}»"
              + ("" if keep_attempts else ", счётчик попыток обнулён"), now=now)
     log_phase(c, release_id, "revived", now, payload={"from_phase": rel["phase"]})
     return {"ok": True, "phase": phase}
+
+
+def reset_stage_retries(c, release_id: str) -> int:
+    """Обнулить счёт повторов этапа картинок, которые движок делает сам.
+
+    Движок ставит картинки заново не больше IMAGES_RETRIES раз (выпали кадры) и не
+    больше PROMPT_CHANNEL_RETRIES раз (отказал канал промптов) — пометкой в зеркале
+    задачи: «images-retry:N», «prompt-channel:N». 05.10.2026 после исправления
+    перезаказа отклонённых кадров семь выпусков вернули в работу — и движок на первом же
+    тике уронил их обратно: пометка «images-retry:2» осталась исчерпанной. Человек,
+    вернувший выпуск, решил, что причина устранена, — счёт начинается заново, как и
+    `attempts` с возобновлениями рерайта.
+    """
+    try:
+        cur = c.execute("UPDATE pub_release_jobs SET error=NULL WHERE release_id=? "
+                        "AND service='vsgen' AND kind='images' AND (error LIKE 'images-retry:%' "
+                        "OR error LIKE 'prompt-channel:%')", (release_id,))
+    except Exception:                                              # noqa: BLE001
+        return 0
+    return cur.rowcount or 0
 
 
 def reset_rewrite_resumes(c, release_id: str) -> bool:
