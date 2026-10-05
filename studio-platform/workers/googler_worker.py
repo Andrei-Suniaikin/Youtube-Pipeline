@@ -7424,6 +7424,86 @@ def write_image_gaps(output_dir: str, gaps, giveup=None) -> list:
     return rows
 
 
+# ── Откат на другую модель после отказа фильтра (05.10.2026) ─────────────────────────────
+# Кадр, который провайдер режет фильтром безопасности и после трёх смягчений, раньше
+# сразу уходил в «пропуск» (подмена предыдущим кадром до 2% ролика, сверх — разбор).
+# Выпуск №101: 6 кадров из 175 про реального человека и марку — больше 2%, и ни повтор,
+# ни «вернуть в работу» его не лечили: фильтр отвечает одинаково. У моделей одного ключа
+# FastGen фильтры разные — тот же приём уже спасает обложки
+# (cover_core.COVER_SAFETY_FALLBACK_PROVIDER = flower).
+#
+# Правила:
+#   * ровно ОДИН дополнительный заказ на кадр за прогон и только на отказе фильтра после
+#     исчерпанных смягчений (404, потерянный заказ, «try again later» идут своими путями);
+#   * откатная модель любой неудачей заканчивает кадр — повторов на ней нет, иначе каждый
+#     повтор был бы ещё одной оплатой;
+#   * журнал платных вызовов: строка основной модели закрывается отказом, откат идёт
+#     своей строкой со своей моделью и провайдером — видно, кто взял кредиты;
+#   * квитанция кадра (image_receipts.v1.json) остаётся квитанцией КОНТРАКТА кадра
+#     (сцена, стиль, референсы): набор её полей сервер сверяет строго, а отпечаток с
+#     другой моделью сделал бы кадр «устаревшим», и следующий прогон перезаказывал бы его
+#     по кругу (основная модель → фильтр → откат). Фактическая модель кадра пишется
+#     рядом, в image_model_fallbacks.json; кадр, позже перерисованный основной моделью,
+#     оттуда убирается.
+#
+# FLOWER — та же Nano Banana 2, что и основная NARWHAL_LITE, через тот же
+# /api/v6/generations и тот же ключ: кадр не выпадает из ролика по стилю; 1 кредит.
+# Пусто / «off» — отката нет.
+IMAGE_SAFETY_FALLBACK_MODEL = (os.environ.get("VS_IMAGE_SAFETY_FALLBACK_MODEL", "FLOWER")
+                               or "").strip().upper()
+# flower принимает ровно одну картинку на вход (так же решено у обложек) — откату на неё
+# отдаём только первый референс кадра.
+IMAGE_FALLBACK_MAX_INPUTS = {"FLOWER": 1}
+IMAGE_MODEL_FALLBACKS_FILE = "image_model_fallbacks.json"
+_SAFETY_FALLBACK_USED: set = set()      # кадры, уже получившие откат в этом прогоне
+_SAFETY_FALLBACK_LOCK = threading.Lock()
+_FRAME_FALLBACK = threading.local()     # откат текущего кадра (поток = кадр)
+
+
+def safety_fallback_model(model: str) -> str:
+    """Какой моделью заказать кадр после отказа фильтра — или "" (отката нет)."""
+    fallback = IMAGE_SAFETY_FALLBACK_MODEL
+    if not fallback or fallback in ("OFF", "NONE", "0", "НЕТ"):
+        return ""
+    if fallback == str(model or "").strip().upper():
+        return ""
+    if fallback not in GOOGLER_AVAILABLE_MODELS:
+        return ""
+    return fallback
+
+
+def claim_safety_fallback(frame_key: str) -> bool:
+    """Откат для кадра — один раз за прогон: добивки пропущенных и повтор позже снова
+    зовут генерацию, и без этой отметки каждый их круг оплачивал бы ещё один откат."""
+    key = str(frame_key)
+    with _SAFETY_FALLBACK_LOCK:
+        if key in _SAFETY_FALLBACK_USED:
+            return False
+        _SAFETY_FALLBACK_USED.add(key)
+        return True
+
+
+def record_model_fallback(output_path: Optional[str], scene: int,
+                          entry: Optional[dict]) -> None:
+    """Записать (entry) или убрать (None) фактическую модель кадра в image_model_fallbacks.json."""
+    if not output_path:
+        return
+    path = os.path.join(os.path.dirname(os.path.abspath(output_path)), IMAGE_MODEL_FALLBACKS_FILE)
+    if not entry and not os.path.exists(path):
+        return                           # убирать нечего — обычный кадр, обычный прогон
+    with _SAFETY_FALLBACK_LOCK:
+        data = _load_json_object(path) if os.path.exists(path) else None
+        rows = [row for row in ((data or {}).get("frames") or [])
+                if isinstance(row, dict) and row.get("scene") != int(scene)]
+        if entry:
+            rows.append(dict(entry, scene=int(scene)))
+        rows.sort(key=lambda row: int(row.get("scene") or 0))
+        if rows:
+            _atomic_write_json(path, {"schema_version": 1, "at": int(time.time()), "frames": rows})
+        elif os.path.exists(path):
+            os.remove(path)
+
+
 def order_never_delivers(probe) -> str:
     """Почему по уже созданному заказу результата не будет НИКОГДА — или "".
 
@@ -10695,19 +10775,20 @@ def _journal():
     return _JOURNAL_SINGLETON
 
 
-def _journal_provider() -> str:
+def _journal_provider(model: Optional[str] = None) -> str:
     """Кто именно берёт деньги за этот кадр (цена и лимиты у них разные)."""
-    if GOOGLER_MODEL in IMAGE_MODEL_V6:
+    model = model or GOOGLER_MODEL
+    if model in IMAGE_MODEL_V6:
         return "recrafter"
-    if GOOGLER_MODEL in VEO_BANANA_MODELS:
+    if model in VEO_BANANA_MODELS:
         return "veo"
-    if GOOGLER_MODEL == "GPT_IMAGE2":
+    if model == "GPT_IMAGE2":
         return "openai"
     return "googler"
 
 
 def _journal_reserve_frame(unit, prompt, seed, aspect_ratio, reference_bundle,
-                           output_path):
+                           output_path, model: Optional[str] = None):
     """Заявка на платный вызов ДО обращения к провайдеру.
 
     В отпечаток входит ровно то, что определяет результат и цену: модель, финальный
@@ -10726,12 +10807,15 @@ def _journal_reserve_frame(unit, prompt, seed, aspect_ratio, reference_bundle,
             row.get("slot_id") or "",
             artifact.get("sha256") or artifact.get("fingerprint") or "",
         ))
+    # model — модель именно этого заказа: у кадра, ушедшего в откат после фильтра, она
+    # другая, и строка журнала обязана называть ту, что реально взяла кредиты.
+    model = model or GOOGLER_MODEL
     fingerprint = journal.fingerprint(
-        model=GOOGLER_MODEL, prompt=prompt, seed=seed,
+        model=model, prompt=prompt, seed=seed,
         aspect=aspect_ratio, refs=sorted(refs),
     )
     decision = journal.reserve(unit=str(unit), fingerprint=fingerprint, kind="images",
-                               provider=_journal_provider(), model=GOOGLER_MODEL)
+                               provider=_journal_provider(model), model=model)
     # skip — строка уже закрыта кабинетом; повторный отчёт о доставке ей не нужен.
     if decision.call_id and decision.action != "skip":
         _JOURNAL_FRAME.state = {
@@ -10921,6 +11005,31 @@ def _journal_frame_call(function):
     return _wrapped
 
 
+def _model_fallback_call(function):
+    """Фактическая модель кадра — на выходе из generate_image (см. IMAGE_SAFETY_FALLBACK_MODEL).
+
+    Кадр, полученный откатом, записывается в image_model_fallbacks.json; кадр, полученный
+    основной моделью, оттуда убирается (его перерисовали — пометка устарела).
+    """
+    @functools.wraps(function)
+    def _wrapped(*args, **kwargs):
+        _FRAME_FALLBACK.info = None      # пул переиспользует потоки: чужой откат недопустим
+        result = function(*args, **kwargs)
+        info = getattr(_FRAME_FALLBACK, "info", None)
+        _FRAME_FALLBACK.info = None
+        data = result[1] if isinstance(result, tuple) and len(result) > 1 else None
+        output_path = kwargs.get("output_path") or (args[4] if len(args) > 4 else None)
+        if (data and output_path and isinstance(result[0], int)
+                and _canonical_numeric_image_name(os.path.basename(str(output_path)))):
+            try:
+                record_model_fallback(output_path, result[0] + 1, info)
+            except Exception as exc:                               # noqa: BLE001
+                print_debug(f"[откат модели] пометка не записана: {exc}")
+        return result
+    return _wrapped
+
+
+@_model_fallback_call  # 05.10.2026: фактическая модель кадра после отката фильтра
 @_journal_frame_call   # 03.09.2026: журнал платных вызовов, см. блок выше
 def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] = None,
                    user_refs: List[str] = None, output_path: str = None,
@@ -10946,6 +11055,10 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
         full_text: Полный текст сценария (для контекста в Smart Mode)
         previous_images: Список путей к предыдущим изображениям (для визуального контекста в Smart Mode)
     """
+    # Модель ЭТОГО кадра. Обычно это GOOGLER_MODEL, но после отказа фильтра кадр один раз
+    # заказывается другой моделью (IMAGE_SAFETY_FALLBACK_MODEL), а кадры рисуются параллельно —
+    # глобальную менять нельзя, поэтому внутри функции модель только локальная.
+    _model = GOOGLER_MODEL
     print_user(f"🎨 [{index+1}] Генерация изображения...", "PROCESS")
     
     # Поддержка старого и нового формата scene_data
@@ -11038,7 +11151,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
         # suffix in this rare raw recovery branch.  Non-empty exact copy remains
         # protected byte-for-byte; normal/protected prompts keep the full contract.
         omit_openai_empty_copy_suffix = (
-            str(GOOGLER_MODEL).strip().upper() == "OPENAI"
+            str(_model).strip().upper() == "OPENAI"
             and scene_data.get("visible_text") == []
         )
         raw_visible_text_suffix = (
@@ -11103,7 +11216,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
     _jrn = _journal_reserve_frame(
         unit=(journal_unit or f"{index + 1:03d}"),
         prompt=prompt, seed=seed, aspect_ratio=aspect_ratio,
-        reference_bundle=reference_bundle, output_path=output_path,
+        reference_bundle=reference_bundle, output_path=output_path, model=_model,
     )
     if _jrn.action == "skip":
         # Кадр уже оплачен и получен раньше — второй заказ создавать нельзя.
@@ -11127,9 +11240,9 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             # либо опрашиваем существующий id, либо пропускаем кадр (его доберут две
             # существующие добивки пропущенных).
             _jrn_poll = (
-                poll_v6_generation if GOOGLER_MODEL in IMAGE_MODEL_V6
-                else poll_v4_operation if (GOOGLER_MODEL in FLOW_GENERATE_MODELS
-                                           or GOOGLER_MODEL in ("FLOWER", "GROK",
+                poll_v6_generation if _model in IMAGE_MODEL_V6
+                else poll_v4_operation if (_model in FLOW_GENERATE_MODELS
+                                           or _model in ("FLOWER", "GROK",
                                                                 "GROK_SPEED", "OPENAI"))
                 else None
             )
@@ -11173,6 +11286,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                         unit=(journal_unit or f"{index + 1:03d}"),
                         prompt=prompt, seed=seed, aspect_ratio=aspect_ratio,
                         reference_bundle=reference_bundle, output_path=output_path,
+                        model=_model,
                     )
                     if not _jrn.may_call:
                         print_user(f"🧹 [{index+1}] Журнал: {_jrn_final} ({_jrn_old}). Новый "
@@ -11201,25 +11315,30 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
     # v2 endpoint dead — only v3/v4 attempts, no legacy fallback
     # VEO_BANANA (NonStop) — столько же попыток, сколько у veo-видео (VEO_MAX_ATTEMPTS); остальным моделям 5.
     # Per-key оверрайд из кабинета (GOOGLER_MAX_RETRIES) заменяет дефолт, если задан.
-    max_attempts = _gen_attempts(VEO_MAX_ATTEMPTS if GOOGLER_MODEL in VEO_BANANA_MODELS else 5)
+    max_attempts = _gen_attempts(VEO_MAX_ATTEMPTS if _model in VEO_BANANA_MODELS else 5)
     use_legacy_now = False  # v2 endpoint dead, no fallback
     _soften_rounds = 0  # раундов GPT-смягчения промпта после контент-фильтра (макс 3)
     _acct_limit_hits = 0  # сколько раз ЭТОТ кадр получил «лимит аккаунта исчерпан»
     _acct_limit_owner = False  # этот кадр — первооткрыватель: делает подтверждающую вторую попытку
-    _provider_group = _model_provider_group(GOOGLER_MODEL)
+    _provider_group = _model_provider_group(_model)
     # FastGen/openai-image generic terminal failures are paid terminal operations, not
     # transport retries.  Keep their budget per frame/job separate from the generic
     # max_attempts setting (which may be 15 in the cabinet).
     _v6_generic_terminal_hits = 0
     _v6_generic_frame_key = (
-        _v6_generic_terminal_frame_key(GOOGLER_MODEL, prompt, output_path, index)
-        if GOOGLER_MODEL == "OPENAI" else None
+        _v6_generic_terminal_frame_key(_model, prompt, output_path, index)
+        if _model == "OPENAI" else None
     )
     # «Смягчение последним шансом»: часть отказов приходит БЕЗ признака контент-фильтра
     # (recrafter v6: «Generation failed, please try again later»), и кадр терялся, ни разу
     # не пройдя смягчение. Даём ровно ОДНУ дополнительную попытку со смягчённым промптом.
     _last_chance_used = False
     _extra_attempts = 0
+    # Откат на другую модель после отказа фильтра (см. IMAGE_SAFETY_FALLBACK_MODEL): один
+    # заказ, и он последний — откатной модели повторов нет.
+    _fallback_used = False
+    _fallback_orders = 0
+    _fallback_reason = ""
 
     # while вместо for: последний шанс добавляет попытку уже ПОСЛЕ входа в цикл, а range()
     # фиксируется на старте. attempt увеличивается первым делом, поэтому все `continue`
@@ -11229,6 +11348,15 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
         attempt += 1
         if attempt >= max_attempts + _extra_attempts:
             break
+        if _fallback_used:
+            _fallback_orders += 1
+            if _fallback_orders > 1:
+                _fb_last = " ".join(str(_last_gen_error() or "результата нет").split())[:120]
+                _note_frame_giveup(index, GAP_FILTER,
+                                   f"{_fallback_reason}; откат на модель {_model} не дал кадр: {_fb_last}")
+                print_user(f"⛔ [{index+1}] Откат на {GOOGLER_MODEL_LABELS.get(_model, _model)} "
+                           f"не дал кадр ({_fb_last}) — пропускаю картинку", "ERROR")
+                return (index, None)
         if _v6_generic_terminal_frame_blocked(_v6_generic_frame_key):
             print_user(
                 f"⛔ [{index+1}] FastGen/openai-image: кадр уже получил два generic "
@@ -11290,22 +11418,22 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                     "parameters": params
                 }
                 result = googler_request_v2("images", data=data)
-        elif GOOGLER_MODEL in IMAGE_MODEL_V6:
+        elif _model in IMAGE_MODEL_V6:
             # v6 unified: ВСЕ recrafter-картинки через POST /api/v6/generations (миграция 2026-06-27,
             # старые /api/v4/*/image/* = 404). inputs=reference_images (data-uri), seed теперь работает.
             v6_ar = "16:9" if ar in ("landscape", "IMAGE_ASPECT_RATIO_LANDSCAPE", "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE") else \
                     "9:16" if ar in ("portrait", "IMAGE_ASPECT_RATIO_PORTRAIT", "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR") else "1:1"
-            v6_q = "speed" if GOOGLER_MODEL == "GROK_SPEED" else None
-            _lbl = GOOGLER_MODEL_LABELS.get(GOOGLER_MODEL, GOOGLER_MODEL)
+            v6_q = "speed" if _model == "GROK_SPEED" else None
+            _lbl = GOOGLER_MODEL_LABELS.get(_model, _model)
             # Live v6 capability: grok-image accepts 1..5 named inputs, but
             # aspect_ratio is valid only with exactly one input.
             v6_request_ar = (
-                None if GOOGLER_MODEL in ("GROK", "GROK_SPEED")
+                None if _model in ("GROK", "GROK_SPEED")
                 and len(reference_images) > 1 else v6_ar
             )
             _v6_image_call = functools.partial(
                 googler_v6_generate,
-                IMAGE_MODEL_V6[GOOGLER_MODEL],
+                IMAGE_MODEL_V6[_model],
                 prompt,
                 aspect_ratio=v6_request_ar,
                 inputs=(reference_images or None),
@@ -11314,7 +11442,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 index=index,
                 timeout=IMAGE_POLL_TIMEOUT,
             )
-            if GOOGLER_MODEL == "OPENAI" and exact_preflight.raw_provider_prompt:
+            if _model == "OPENAI" and exact_preflight.raw_provider_prompt:
                 image_data = _run_openai_exact_raw_serialized(_v6_image_call)
             else:
                 image_data = _v6_image_call()
@@ -11329,7 +11457,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             result = {"success": False, "error": _gen_failure_error(_lbl)}
             api_label = _lbl
 
-        elif GOOGLER_MODEL == "WHISK_IMAGEN4":
+        elif _model == "WHISK_IMAGEN4":
             # Whisk API (Imagen 4) через v3/image/from-text (без model param)
             if reference_images:
                 request_data = {
@@ -11352,7 +11480,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 result = googler_request_v3("image/from-text", data=request_data)
             api_label = "Whisk (Imagen 4)"
         
-        elif GOOGLER_MODEL == "FLOWER":
+        elif _model == "FLOWER":
             # Flower API (v4, async) - Nano Banana 2 via Flower
             flower_ar = "16:9" if ar in ("landscape", "IMAGE_ASPECT_RATIO_LANDSCAPE", "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE") else \
                         "9:16" if ar in ("portrait", "IMAGE_ASPECT_RATIO_PORTRAIT", "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR") else "16:9"
@@ -11376,11 +11504,11 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             result = {"success": False, "error": error}
             api_label = "Flower (Nano Banana 2)"
 
-        elif GOOGLER_MODEL in ("GROK", "GROK_SPEED"):
+        elif _model in ("GROK", "GROK_SPEED"):
             # Grok image. quality='quality' (4 variant) или 'speed' (6 variant).
             # If reference provided → grok/image/edit (img2img).
             # Otherwise → grok/image/generate (text-to-image).
-            grok_quality = "speed" if GOOGLER_MODEL == "GROK_SPEED" else "quality"
+            grok_quality = "speed" if _model == "GROK_SPEED" else "quality"
             grok_ar = "16:9" if ar in ("landscape", "IMAGE_ASPECT_RATIO_LANDSCAPE", "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE") else \
                       "9:16" if ar in ("portrait", "IMAGE_ASPECT_RATIO_PORTRAIT", "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR") else "16:9"
             if reference_images:
@@ -11406,12 +11534,12 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             result = {"success": False, "error": error}
             api_label = _grok_label
 
-        elif GOOGLER_MODEL in FLOW_GENERATE_MODELS:
+        elif _model in FLOW_GENERATE_MODELS:
             # Flow v4 (async): NARWHAL / GEM_PIX_2 (Nano Banana Pro) / IMAGEN_3_5 (Imagen 4).
             # Все три — один эндпоинт flow/image/generate с параметром model=<ID>.
             # v3-эндпоинт эти модели не принимает (мёртв) — только v4 flow. Generate-only.
-            flow_label = GOOGLER_MODEL_LABELS.get(GOOGLER_MODEL, GOOGLER_MODEL)
-            request_data = {"prompt": prompt, "aspect_ratio": ar, "model": GOOGLER_MODEL}
+            flow_label = GOOGLER_MODEL_LABELS.get(_model, _model)
+            request_data = {"prompt": prompt, "aspect_ratio": ar, "model": _model}
             if reference_images:
                 ref_list = [_reference_input_value(row) for row in reference_images]
                 request_data["reference_images"] = ref_list
@@ -11431,13 +11559,13 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             result = {"success": False, "error": error}
             api_label = flow_label
 
-        elif GOOGLER_MODEL in VEO_BANANA_MODELS:
+        elif _model in VEO_BANANA_MODELS:
             # VeoNonStop Nano Banana (veononstop.org, ключ veo). СИНХРОННО: ответ сразу
             # содержит data.media[].fifeUrl (без operation_id-поллинга как у recrafter).
             banana_ar = "16:9" if ar in ("landscape", "IMAGE_ASPECT_RATIO_LANDSCAPE", "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE") else \
                         "9:16" if ar in ("portrait", "IMAGE_ASPECT_RATIO_PORTRAIT", "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR") else "16:9"
             request_data = {"prompt": prompt, "aspect_ratio": banana_ar}
-            _bkey = VEO_BANANA_MODEL_KEYS.get(GOOGLER_MODEL)
+            _bkey = VEO_BANANA_MODEL_KEYS.get(_model)
             if _bkey:
                 request_data["model_key"] = _bkey   # HARBOR_SEAL(Lite)/NARWHAL(2)/GEM_PIX_2(Pro)
             if reference_images:
@@ -11495,7 +11623,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                           "account_limit": bool(v_res.get("account_limit")) if isinstance(v_res, dict) else False}
             api_label = "Nano Banana (Veo)"
 
-        elif GOOGLER_MODEL == "GPT_IMAGE2":
+        elif _model == "GPT_IMAGE2":
             # OpenAI GPT_IMAGE_MODEL ("gpt-image-2.5-sunburst") НАПРЯМУЮ — 💲ПЛАТНО
             # с твоего openai-ключа. Отдельно от "OPENAI" (тот идёт через recrafter-кредиты).
             # quality=low, output jpeg. Цена ~$0.006/шт снята под старую "gpt-image-2" и
@@ -11559,7 +11687,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                           "error": (v_res.get("error") if isinstance(v_res, dict) else "GPT Image 2.5: пустой data/b64_json"),
                           "skip_retry": (v_res.get("skip_retry") if isinstance(v_res, dict) else False)}
 
-        elif GOOGLER_MODEL == "OPENAI":
+        elif _model == "OPENAI":
             # OpenAI ChatGPT image flow (v4, async)
             openai_ar = "16:9" if ar in ("landscape", "IMAGE_ASPECT_RATIO_LANDSCAPE", "IMAGE_ASPECT_RATIO_LANDSCAPE_FOUR_THREE") else \
                         "9:16" if ar in ("portrait", "IMAGE_ASPECT_RATIO_PORTRAIT", "IMAGE_ASPECT_RATIO_PORTRAIT_THREE_FOUR") else "1:1"
@@ -11583,7 +11711,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
 
         else:
             # Flow API v3 (GEM_PIX_2 / IMAGEN_3_5)
-            flow_model = GOOGLER_MODEL
+            flow_model = _model
             if reference_images:
                 request_data = {
                     "provider": "google_fx",
@@ -11622,6 +11750,13 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 return (index, image_data)
         else:
             error = result.get("error", "Unknown error")
+            if _fallback_used:
+                _fb_last = " ".join(str(_last_gen_error() or error).split())[:120]
+                _note_frame_giveup(index, GAP_FILTER,
+                                   f"{_fallback_reason}; откат на модель {_model} не дал кадр: {_fb_last}")
+                print_user(f"⛔ [{index+1}] Откат на {GOOGLER_MODEL_LABELS.get(_model, _model)} "
+                           f"не дал кадр ({_fb_last}) — пропускаю картинку", "ERROR")
+                return (index, None)
             if "InputIsImproper" in str(error):
                 _soften_rounds += 1
                 _softened = (
@@ -11709,6 +11844,66 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                     print_user(f"🩹 [{index+1}] Контент-фильтр: промпт смягчён локально (раунд {_soften_rounds}/3), пробую снова", "WARNING")
                     continue
                 _note_soften_exhausted()   # копим статистику: сюжет режется устойчиво
+                _fb_model = safety_fallback_model(_model)
+                if _fb_model and claim_safety_fallback(output_path or f"#{index}"):
+                    _fb_from = _model
+                    _fallback_reason = (f"фильтр модели {_fb_from} после смягчений "
+                                        f"({_soften_rounds})")
+                    print_user(f"🛟 [{index+1}] Сцена {index+1}: фильтр модели "
+                               f"{GOOGLER_MODEL_LABELS.get(_fb_from, _fb_from)} — заказ моделью "
+                               f"{GOOGLER_MODEL_LABELS.get(_fb_model, _fb_model)}", "WARNING")
+                    # Заказ основной модели оплачен и кадра не дал — его строка журнала
+                    # закрывается отказом; откат пойдёт своей строкой со своей моделью.
+                    _journal_close_frame(None, error=(
+                        f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds}) "
+                        f"— кадр заказан моделью {_fb_model}"))
+                    _model = _fb_model
+                    _fallback_used = True
+                    _provider_group = _model_provider_group(_model)
+                    _fb_inputs = IMAGE_FALLBACK_MAX_INPUTS.get(_model)
+                    if _fb_inputs and reference_images and len(reference_images) > _fb_inputs:
+                        reference_images = list(reference_images)[:_fb_inputs]
+                    _FRAME_FALLBACK.info = {"model": _model, "instead_of": _fb_from,
+                                            "reason": _fallback_reason, "at": int(time.time())}
+                    _jrn = _journal_reserve_frame(
+                        unit=(journal_unit or f"{index + 1:03d}"),
+                        prompt=prompt, seed=seed, aspect_ratio=aspect_ratio,
+                        reference_bundle=reference_bundle, output_path=output_path,
+                        model=_model,
+                    )
+                    if _jrn.action == "skip":
+                        _fb_done = _jrn.result_path or output_path or ""
+                        if _fb_done and os.path.exists(_fb_done):
+                            print_user(f"♻️ [{index+1}] Журнал: откатный кадр уже получен — "
+                                       f"платный запрос не нужен", "INFO")
+                            try:
+                                with open(_fb_done, "rb") as _fbf:
+                                    return (index, base64.b64encode(_fbf.read()).decode("ascii"))
+                            except OSError as _fbe:
+                                print_user(f"⚠️ [{index+1}] Журнал: готовый откатный файл не "
+                                           f"читается ({_fbe})", "ERROR")
+                    elif (_jrn.action == "verify" and _jrn.remote_order_id
+                          and _model in IMAGE_MODEL_V6):
+                        # Откатный заказ с этим же промптом уже создавался прошлым прогоном.
+                        # Второй не создаём: забираем результат первого или сдаёмся.
+                        _journal_note_order(_jrn.remote_order_id, post=False)
+                        _fb_data = poll_v6_generation(_jrn.remote_order_id, index,
+                                                      timeout=IMAGE_POLL_TIMEOUT)
+                        if _fb_data:
+                            if output_path:
+                                save_base64_to_file(_fb_data, output_path)
+                            print_user(f"✅ [{index+1}] Журнал: откатный кадр забран у уже "
+                                       f"оплаченного заказа", "SUCCESS")
+                            return (index, _fb_data)
+                    if not _jrn.may_call:
+                        _note_frame_giveup(index, GAP_FILTER,
+                                           f"{_fallback_reason}; откатный заказ журнал не разрешил "
+                                           f"({_jrn.error or _jrn.action})")
+                        print_user(f"⛔ [{index+1}] Журнал не разрешил откатный заказ "
+                                   f"({_jrn.error or _jrn.action}) — пропускаю картинку", "ERROR")
+                        return (index, None)
+                    _extra_attempts += 1          # откату — свой заказ сверх исчерпанных попыток
+                    continue
                 _note_frame_giveup(index, GAP_FILTER,
                                    f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds})")
                 print_user(f"⛔ [{index+1}] Контент-фильтр провайдера — пропускаю картинку (смягчений: {_soften_rounds})", "ERROR")
@@ -11720,7 +11915,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             # deterministic rewrite and one confirmation generation; after the second
             # generic terminal result remember this frame so both refill rounds are free.
             if (
-                GOOGLER_MODEL == "OPENAI"
+                _model == "OPENAI"
                 and _is_generic_v6_terminal_error(_last_gen_error())
             ):
                 _v6_generic_terminal_hits += 1
@@ -11749,7 +11944,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 return (index, None)
             
             if attempt < max_attempts - 1:
-                if GOOGLER_MODEL in VEO_BANANA_MODELS:
+                if _model in VEO_BANANA_MODELS:
                     wait_time = VEO_BANANA_RETRY_DELAY   # капча у VeoNonStop, backoff не помогает → плоско 3с
                 else:
                     wait_time = RETRY_DELAY * (attempt + 1)
