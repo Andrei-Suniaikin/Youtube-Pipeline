@@ -2102,6 +2102,38 @@ def _download_and_analyze_url(
     return thumbnail, analysis, style_from_thumbnail
 
 
+# 05.10.2026: обложки в img2img (превью донора → модель редактирует) упирались в фильтр
+# безопасности: 13 из 262 за три дня, и выпуск уходил в разбор «обложка не нарисовалась
+# дважды» (Záhady Zvířat, донор «Why Do Sperm Whales TERRIFY Orca?»). Фильтр режет само
+# превью — кровь, драка хищников. У моделей одного ключа FastGen фильтры разные, поэтому
+# после первого такого отказа остальные попытки идут в запасную модель того же ключа.
+COVER_SAFETY_FALLBACK_PROVIDER = os.environ.get("COVER_SAFETY_FALLBACK_PROVIDER", "flower") or "flower"
+
+
+def _is_safety_block(err) -> bool:
+    s = str(err or "").lower()
+    return "safety" in s and ("block" in s or "filter" in s)
+
+
+def safety_fallback_provider(current: str, n_refs: int = 1) -> str:
+    """Запасная модель того же ключа после отказа фильтра — или "" (запасной нет).
+
+    flower принимает ровно одну картинку на вход: при двух (обложка + референс стиля)
+    вместо него flow. Другая семья ключа запрещена — платить не тем ключом нельзя.
+    """
+    want = canonical_generation_provider(COVER_SAFETY_FALLBACK_PROVIDER)
+    if want == "flower" and n_refs > 1:
+        want = "flow"
+    if want == canonical_generation_provider(current):
+        want = "flow" if want != "flow" else "flower"
+        if want == "flower" and n_refs > 1:
+            return ""
+    try:
+        return effective_simple_mode_provider(current, want)
+    except Exception:                                              # noqa: BLE001
+        return ""
+
+
 def _generate_simple_edit(
     thumbnail: "Image.Image",
     preset_lang: Preset,
@@ -2180,6 +2212,7 @@ def _generate_simple_edit(
     # второй попытке затирал оплаченную первую (не прошедшую сверку), и задача кончалась
     # «все попытки вернули пустой результат» — оплаченная картинка выбрасывалась.
     last_paid = None
+    safety_switched = False
     for attempt in range(max_attempts):
         if cancelled():
             result.error = "Отменено пользователем"
@@ -2215,6 +2248,12 @@ def _generate_simple_edit(
                 short = last_err[:240] + ("..." if len(last_err) > 240 else "")
                 log(f"   ⚠ Попытка {attempt + 1}/{max_attempts}: Fast Gen не отдал картинку — {short}")
                 _last_fastgen_error.value = None
+                if _is_safety_block(last_err) and not safety_switched:
+                    alt = safety_fallback_provider(provider, len(reference_images))
+                    if alt and alt != provider:
+                        log(f"   🔀 Фильтр безопасности {provider} — дальше пробую моделью {alt} "
+                            f"(тот же ключ FastGen, фильтр у неё свой)")
+                        provider, model, safety_switched = alt, "", True
             else:
                 log(f"   ⚠ Попытка {attempt + 1}/{max_attempts}: пустой результат от API, повтор...")
             _interruptible_sleep(2 + attempt * 2, cancel_check)
