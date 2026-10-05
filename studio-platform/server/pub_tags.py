@@ -39,16 +39,37 @@ def donor_title(url: str) -> str:
     `pub_calls.quota_allow()` / `quota_spend()` под именем потребителя «donor»,
     иначе общий кошелёк снова будет опустошать тот, кто про него не знает.
     """
+    return donor_lookup(url)[1]
+
+
+# Ответы oembed, которые значат «ролика нет ни для кого»: удалён (400/404) или закрыт
+# (401/403). Всё остальное — сеть, 429, 5xx — «не знаем», а не приговор.
+OEMBED_GONE = (400, 401, 403, 404)
+
+
+def donor_lookup(url: str) -> tuple:
+    """(«alive» | «gone» | «unknown», название). Тот же oembed, что у `donor_title`.
+
+    05.10.2026: `donor_title` отдавал пусто и на удалённый ролик, и на обрыв сети, и на
+    429 — а `pub_remote._video_really_gone` читал пусто как «удалён». Его же докстринг
+    обещает обратное («не смогли спросить — False»): при сбое сети исправный донор ушёл
+    бы в разбор с приговором. Теперь три ответа вместо двух.
+    """
     if not any(h in (url or "") for h in YT_HOSTS):
-        return ""          # не YouTube — спрашивать не у кого, в сеть не ходим
+        return "unknown", ""   # не YouTube — спрашивать не у кого, в сеть не ходим
     try:
         import requests
         r = requests.get(OEMBED, params={"url": url, "format": "json"}, timeout=6)
-        if r.status_code != 200:
-            return ""
-        return (r.json().get("title") or "").strip()[:300]
     except Exception:
-        return ""
+        return "unknown", ""
+    if r.status_code in OEMBED_GONE:
+        return "gone", ""
+    if r.status_code != 200:
+        return "unknown", ""
+    try:
+        return "alive", (r.json().get("title") or "").strip()[:300]
+    except Exception:
+        return "unknown", ""
 
 URL_RE = re.compile(r"https?://\S+")
 

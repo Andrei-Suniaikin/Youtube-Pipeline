@@ -324,8 +324,8 @@ def _video_really_gone(vid: str) -> bool:
     if not vid:
         return False
     try:
-        from pub_tags import donor_title                           # noqa: PLC0415
-        return not donor_title(f"https://www.youtube.com/watch?v={vid}")
+        from pub_tags import donor_lookup                          # noqa: PLC0415
+        return donor_lookup(f"https://www.youtube.com/watch?v={vid}")[0] == "gone"
     except Exception:                                              # noqa: BLE001
         return False
 
