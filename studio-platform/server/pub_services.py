@@ -140,7 +140,10 @@ class PubServices:
     def _jobs(self, c, release_id: str) -> dict:
         # error нужен наравне с остальными: по нему do_media_ready отличает первый
         # заход от повторной постановки картинок. Без поля Row кидает "No item with that key".
-        rows = c.execute("SELECT kind, remote_job_id, status, error FROM pub_release_jobs "
+        # created — с 05.10.2026: от него `_chapters_overdue` считает срок таймкодов после
+        # повтора. До этого запасной путь «от того, когда выпуск её запомнил» тихо падал
+        # на отсутствующем поле и не работал никогда.
+        rows = c.execute("SELECT kind, remote_job_id, status, error, created FROM pub_release_jobs "
                          "WHERE release_id=? AND service='vsgen'", (release_id,)).fetchall()
         return {r["kind"]: r for r in rows}
 
@@ -820,6 +823,8 @@ class PubServices:
                              f"беру её вместо упавшей {known['remote_job_id']}")
                     return {"wait": True}
                 if kind in OPTIONAL_STAGES:
+                    if self._retry_chapters(c, rel, known):
+                        return {"wait": True}
                     continue      # без глав ролик публикуется, просто без таймкодов
                 if kind == "images" and self._requeue_after_prompt_channel(c, rel, known):
                     return {"wait": True}
@@ -945,12 +950,20 @@ class PubServices:
         """
         now = self._clock()
         since = None
+        if str(known["error"] or "").startswith("chapters-retry:"):
+            # Повтор после перегрузки Codex — часы не сбрасываем: срок считается от
+            # первой задачи, которую выпуск запомнил, а не от повторной.
+            try:
+                since = float(known["created"] or 0) or None
+            except (KeyError, IndexError, TypeError, ValueError):
+                since = None
         try:
-            row = c.execute("SELECT created FROM queue_tasks WHERE job_id=?",
-                            (known["remote_job_id"],)).fetchone()
-            since = float(row["created"]) if row and row["created"] else None
+            row = None if since else c.execute(
+                "SELECT created FROM queue_tasks WHERE job_id=?",
+                (known["remote_job_id"],)).fetchone()
+            since = since or (float(row["created"]) if row and row["created"] else None)
         except Exception:                                          # noqa: BLE001
-            since = None
+            since = since or None
         if since is None:
             try:
                 since = float(known["created"] or 0) or None
@@ -1035,6 +1048,59 @@ class PubServices:
                  f"канал промптов отказал (исчерпан счёт или лимит) — картинки поставлены "
                  f"заново, задача {job_id}: промпты пойдут другим каналом "
                  f"(повтор {done + 1} из {self.PROMPT_CHANNEL_RETRIES})", level="warn")
+        return True
+
+    # Таймкоды, упавшие на перегрузке Codex, ставятся заново (05.10.2026). 03–05.10 так
+    # упало десять задач («Selected model is at capacity», 429), и девять роликов ушли
+    # без таймкодов, хотя Codex освободился через минуты. Повтор стоит только места в
+    # подписке, денег не стоит. Не раньше паузы и не больше двух раз, и только пока
+    # таймкоды можно ждать (`_chapters_overdue` считает срок от первой задачи).
+    CHAPTERS_RETRIES = 2
+    CHAPTERS_RETRY_PAUSE_SEC = 900
+    CHAPTERS_TRANSIENT_RE = re.compile(
+        r"at capacity|\b429\b|rate.?limit|too many requests|SUBSCRIPTION_LIMIT|"
+        r"temporarily|try again later", re.I)
+
+    def _retry_chapters(self, c, rel, known) -> bool:
+        """Таймкоды упали на временной перегрузке Codex — поставить их заново."""
+        if not rel["project_id"]:
+            return False
+        try:
+            row = c.execute("SELECT error FROM queue_tasks WHERE job_id=?",
+                            (known["remote_job_id"],)).fetchone()
+        except Exception:                                          # noqa: BLE001
+            return False
+        said = str((row["error"] if row else "") or "")
+        if not self.CHAPTERS_TRANSIENT_RE.search(said):
+            return False
+        mark = str(known["error"] or "")
+        done = int(mark.split(":", 1)[1]) if mark.startswith("chapters-retry:") \
+            and mark.split(":", 1)[1].isdigit() else 0
+        if done >= self.CHAPTERS_RETRIES:
+            return False
+        if self._chapters_overdue(c, rel, known):
+            return False
+        uid = self._uid(c, rel["tenant_id"])
+        if not uid:
+            return False
+        c.commit()      # постановка задачи откроет своё соединение — замок отпустить
+        job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], "chapters",
+                              self._preset_params(c, rel))
+        if not job_id:
+            return False
+        try:
+            c.execute("UPDATE queue_tasks SET retry_after=? WHERE job_id=? AND status='queued'",
+                      (self._clock() + self.CHAPTERS_RETRY_PAUSE_SEC, job_id))
+        except Exception:                                          # noqa: BLE001
+            pass        # без паузы повтор всё равно честный — просто раньше
+        c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', error=?, "
+                  "updated=? WHERE release_id=? AND service='vsgen' AND kind='chapters'",
+                  (str(job_id), f"chapters-retry:{done + 1}", rel["updated"],
+                   rel["release_id"]))
+        log_line(c, rel["release_id"], "ролик",
+                 f"таймкоды упали на перегрузке Codex ({said[:80]}) — поставлены заново через "
+                 f"{self.CHAPTERS_RETRY_PAUSE_SEC // 60} мин, задача {job_id} "
+                 f"(повтор {done + 1} из {self.CHAPTERS_RETRIES})", level="warn")
         return True
 
     # Сколько раз подряд картинки ставятся заново, если кадры выпали. Дальше — разбор:
