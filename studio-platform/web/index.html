@@ -12007,6 +12007,42 @@ async function viewDigest(){
       : '<div class="empty">Каналов нет.</div>'}
   </div>`));
 
+  /* ── старый кабинет: ВВ2 и манхва (решение владельца А10, 04.10.2026) ── */
+  // Числа приходят выгрузкой `ops-ww2/legacy_streams.py` раз в час и всегда за сегодняшние
+  // сутки. Нет выгрузки или устарела — карточка так и говорит, а не прячет потоки.
+  const lg = g.legacy || null;
+  if (lg){
+    const lgRows = (lg.streams || []).map(x => {
+      const t = x.today || {};
+      const главное = (x.reasons || []).map(r => `${esc(r.why)} — ${r.count}`).join('; ');
+      return `<tr>
+        <td>${esc(x.name || x.key)}</td>
+        <td style="text-align:right">${x.channels}${x.paused ? ` <span class="muted">(пауза ${x.paused})</span>` : ''}</td>
+        <td style="text-align:right">${x.plan}</td>
+        <td style="text-align:right">${x.accepted}</td>
+        <td style="text-align:right${x.blocked ? ';color:var(--bad)' : ''}">${x.blocked}</td>
+        <td style="text-align:right">${t.expected || 0} / ${t.reached || 0} / ${
+          t.delayed ? `<span style="color:var(--bad)">${t.delayed}</span>` : 0}</td>
+        <td style="text-align:right">${x.uploaded}</td>
+      </tr>${главное ? `<tr><td></td><td colspan="6" class="muted">главное в блокерах: ${главное}</td></tr>` : ''}`;
+    }).join('');
+    app.append($(`<div class="card" style="margin-bottom:16px" id="digest-legacy">
+      <div class="sec">Старый кабинет ${hintDot(
+        'ВВ2 и манхва живут в старом кабинете. Их числа приходят выгрузкой раз в час и '
+        + 'всегда за сегодняшние сутки, какой бы период ни был выбран выше. Выход ролика '
+        + 'старый кабинет не проверяет — только расписание.')}</div>
+      ${lg.state !== 'ok' ? `<div class="empty">${esc(lg.why)}</div>` : `
+      <p class="sub">Выгрузка ${esc(lg.at_text)}</p>
+      <table>
+        <thead><tr><th>Поток</th><th style="text-align:right">Каналов</th>
+          <th style="text-align:right">В плане</th><th style="text-align:right">Принято</th>
+          <th style="text-align:right">Блокеры</th>
+          <th style="text-align:right">Сегодня: ожидалось / дошло / задержано</th>
+          <th style="text-align:right">Залито</th></tr></thead>
+        <tbody>${lgRows}</tbody></table>`}
+    </div>`));
+  }
+
   /* ── производство ── */
   app.append($(`<div class="card" style="margin-bottom:16px">
     <div class="sec">Производство</div>

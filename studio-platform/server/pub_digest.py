@@ -488,6 +488,9 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None,
         # Блокеры — СЕЙЧАС, а не за период: выпуск в разборе стоит, пока его не разберут,
         # и ответ на «что держит» не зависит от того, за какие дни смотреть числа.
         "blockers": blockers,
+        # ВВ2 и манхва из старого кабинета (А10) — всегда за сегодняшние сутки выгрузки,
+        # какой бы период ни был выбран: выгрузка считает только «сейчас».
+        "legacy": legacy_feed(now, tz_name=tz_name),
         "period": {"from": dt.datetime.fromtimestamp(since, _zone(tz_name)).strftime("%Y-%m-%d"),
                    "to": dt.datetime.fromtimestamp(until - 1, _zone(tz_name)).strftime("%Y-%m-%d")},
     }
@@ -623,6 +626,106 @@ def _confirmed_text(today: dict) -> str:
     return f"подтверждено {today['confirmed'] + руками}{хвост}"
 
 
+# ───────────────────── старый кабинет: ВВ2 и манхва (решение А10) ─────────────────────
+#
+# Решение владельца А10 (тест решений, 04.10.2026): одна сводка на три потока, ВВ2 и
+# манхва — из старого кабинета. Своей базы старого кабинета сводка НЕ читает: студия,
+# которая сама лезет в чужую SQLite, — это анти-контракт `pub_neighbors.py`. Шов один и
+# видимый: `ops-ww2/legacy_streams.py` раз в час кладёт файл с версией схемы, а здесь он
+# только читается. Нет файла, устарел, битый — сводка так и пишет, а не молчит и не
+# показывает вчерашние числа как сегодняшние.
+LEGACY_SCHEMA_VERSION = 1
+LEGACY_STALE_SEC = 3 * 3600
+
+
+def legacy_path() -> str:
+    """Где лежит выгрузка: VS_LEGACY_STREAMS_FILE, иначе `feeds/` рядом с базой студии.
+
+    Базу берём из VS_SERVER_DB, а если её нет — из VS_DEV_DB: утреннюю сводку шлёт
+    `studio-alerts.service`, а у него в окружении только VS_DEV_DB (05.10.2026). Без
+    второго имени сводка в телеграме вечно писала бы «выгрузки нет»."""
+    explicit = (os.environ.get("VS_LEGACY_STREAMS_FILE") or "").strip()
+    if explicit:
+        return explicit
+    db = (os.environ.get("VS_SERVER_DB") or os.environ.get("VS_DEV_DB") or "").strip()
+    return os.path.join(os.path.dirname(db), "feeds", "legacy_streams.json") if db else ""
+
+
+def legacy_feed(now: float, path: str = None, tz_name: str = None) -> dict:
+    """Строки ВВ2 и манхвы для сводки: {state, why, at, at_text, day, streams}.
+
+    `state`: `ok` — свежая выгрузка; `missing` — файла нет; `stale` — старше
+    LEGACY_STALE_SEC; `broken` — не читается или в незнакомом формате. Числа отдаются
+    только при `ok`: устаревшее «сегодня» — это чужие сутки.
+    """
+    tz_name = tz_name or DIGEST_TZ
+    path = legacy_path() if path is None else path
+    out = {"state": "missing", "why": "выгрузки старого кабинета нет", "at": None,
+           "at_text": "", "day": "", "streams": []}
+    if not path or not os.path.isfile(path):
+        return out
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        out.update(state="broken", why="файл выгрузки старого кабинета не читается")
+        return out
+    version = data.get("schema_version") if isinstance(data, dict) else None
+    if version != LEGACY_SCHEMA_VERSION:
+        out.update(state="broken",
+                   why=f"выгрузка старого кабинета в незнакомом формате (версия {version!r})")
+        return out
+    try:
+        at = float(data.get("at"))
+    except (TypeError, ValueError):
+        out.update(state="broken", why="в выгрузке старого кабинета нет времени выгрузки")
+        return out
+    streams = data.get("streams")
+    if not isinstance(streams, list) or not all(isinstance(x, dict) for x in streams):
+        out.update(state="broken", why="в выгрузке старого кабинета нет строк потоков")
+        return out
+    out.update(at=at, at_text=_fmt_moment(at, tz_name), day=str(data.get("day") or ""))
+    if now - at > LEGACY_STALE_SEC:
+        out.update(state="stale",
+                   why=f"данные старого кабинета от {out['at_text']} — устарели")
+        return out
+    out.update(state="ok", why="", streams=streams)
+    return out
+
+
+def _legacy_lines(legacy: dict) -> list:
+    """Блок «Старый кабинет» для текста сводки."""
+    if not legacy:
+        return []
+    if legacy.get("state") != "ok":
+        return ["", "Старый кабинет:", f"· ВВ2 и манхва: {legacy.get('why') or 'данных нет'}"]
+    lines = ["", f"Старый кабинет (выгрузка {legacy['at_text']}, числа за эти сутки):"]
+    for s in legacy["streams"]:
+        пауза = f" (на паузе {s.get('paused', 0)})" if s.get("paused") else ""
+        главное = "; ".join(f"{r.get('why')} — {r.get('count')}" for r in s.get("reasons") or [])
+        lines.append(f"· {s.get('name') or s.get('key')}: каналов {s.get('channels', 0)}{пауза}, "
+                     f"в плане {s.get('plan', 0)}, принято {s.get('accepted', 0)}, "
+                     f"блокеры {s.get('blocked', 0)}"
+                     + (f" — главное: {главное}" if главное else ""))
+        t = s.get("today") or {}
+        ожидалось = int(t.get("expected") or 0)
+        txt = (f"  сегодня: ожидалось {ожидалось} "
+               f"{_plural(ожидалось, 'выход', 'выхода', 'выходов')}, "
+               f"подтверждено {t.get('confirmed', 0)}, дошло до канала {t.get('reached', 0)}, "
+               f"задержано {t.get('delayed', 0)}")
+        if t.get("unknown"):
+            txt += f", не знаем {t['unknown']}"
+        if t.get("ahead"):
+            txt += f"; ещё впереди {t['ahead']}"
+        lines.append(txt + ".")
+        for why in t.get("why") or []:
+            lines.append(f"    не знаем потому, что {why}")
+        last = s.get("last_new_release")
+        lines.append(f"  залито за сутки {s.get('uploaded', 0)}; последний новый выпуск "
+                     + (_fmt_moment(last, DIGEST_TZ) if last else "не заводился") + ".")
+    return lines
+
+
 def render(data: dict) -> str:
     """Сводка человеческим текстом — то, что копируют в отчёт и шлют в телеграм."""
     lines = [f"Сводка за {data['day']} ({data['tz']})", ""]
@@ -636,6 +739,7 @@ def render(data: dict) -> str:
     if any(g["tag"] != NO_TAG for g in data["groups"]):
         lines.append("  (канал с несколькими тегами считается в каждой своей группе — "
                      "строки не складываются)")
+    lines += _legacy_lines(data.get("legacy"))
 
     today = data["today"]
     lines += ["", f"Сегодня: ожидалось {today['expected']} "
