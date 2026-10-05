@@ -54,8 +54,49 @@ EDITABLE = (
     # проще вписать оба в одном месте.
     # Ключ YouTube Data API: им живут публичные числа каналов и роликов, поздняя
     # проверка выхода ролика и ночной обход. Один на всю студию, кошелёк общий.
-    ("youtube_api_key", "YouTube Data API — статистика и проверка выхода"),
+    ("youtube_api_key", "YouTube Data API — ключ API (AIza…): статистика и проверка выхода, необязательный"),
 )
+
+# Три поля Google легко перепутать: все берутся в одном Google Cloud и все длинные.
+# 05.10.2026 Client secret попал в поле ключа YouTube Data API — YouTube ответил «API key
+# not valid», а проверка выхода роликов, увидев «ключ есть», перестала ходить по
+# публичной странице. Форма теперь узнаёт чужое значение и говорит, куда его нести.
+_CLIENT_ID_END = ".apps.googleusercontent.com"
+_GOOGLE_WHERE = {
+    "yt_oauth_client_id": "«Google — Client ID приложения»",
+    "yt_oauth_client_secret": "«Google — Client secret приложения»",
+    "youtube_api_key": "«YouTube Data API — ключ API»",
+}
+
+
+def _google_kind(value: str) -> str:
+    if value.endswith(_CLIENT_ID_END):
+        return "yt_oauth_client_id"
+    if value.startswith("GOCSPX-"):
+        return "yt_oauth_client_secret"
+    if value.startswith("AIza"):
+        return "youtube_api_key"
+    return ""
+
+
+def _check_google(family: str, value: str) -> None:
+    """Значение из чужого поля Google — отказ с подсказкой, куда его вставить."""
+    if family not in _GOOGLE_WHERE:
+        return
+    kind = _google_kind(value)
+    if kind and kind != family:
+        what = {"yt_oauth_client_id": "Client ID приложения",
+                "yt_oauth_client_secret": "Client secret приложения",
+                "youtube_api_key": "ключ API"}[kind]
+        raise KeyError_(f"Это {what} Google — его место в строке {_GOOGLE_WHERE[kind]}, "
+                        f"а не здесь.")
+    if family == "yt_oauth_client_id" and not value.endswith(_CLIENT_ID_END):
+        raise KeyError_("Client ID приложения Google кончается на "
+                        f"«{_CLIENT_ID_END}» — проверьте, то ли скопировано.")
+    if family == "youtube_api_key" and not value.startswith("AIza"):
+        raise KeyError_("Ключ YouTube Data API начинается с «AIza»: Google Cloud → APIs & "
+                        "Services → Credentials → API key. Он необязателен — без него выход "
+                        "роликов проверяется по их публичным страницам.")
 EDITABLE_KEYS = tuple(name for name, _ in EDITABLE)
 # Пул того же семейства: если он есть, ключей несколько и работают они по кругу.
 POOL_SUFFIX = "_pool"
@@ -160,6 +201,7 @@ def set_value(family: str, value: str) -> Dict[str, Any]:
     if family not in EDITABLE_KEYS:
         raise KeyError_("такой ключ отсюда не меняется")
     value = _check(value)
+    _check_google(family, value)
     data = _load()
     previous = _values(data, family)
     if value in previous:
