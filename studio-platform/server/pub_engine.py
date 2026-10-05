@@ -1014,6 +1014,156 @@ def revive_rerun_stages(c, now: float) -> list:
     return back
 
 
+# ───────────── автовозврат временных сбоев (А13, 05.10.2026) ─────────────
+#
+# Владелец 04.10 (тест решений, А13 «а»): «когда провайдер снова отвечает, выпуски с этой
+# причиной возвращаются сами». 05.10: «думать, как сделать, чтобы без нашего участия
+# перезапускалось». Причина того же сорта, что у двух проходов выше: выпуск ушёл в
+# разбор по сбою, который прошёл сам, а вернуть его мог только человек. За 10 дней так
+# остановилось около 150 выпусков: упавшая озвучка (Lumean лежал), картинки, зависший
+# шаг, пустая обложка, сбой рерайта, 502 ноды.
+#
+# Возвращаем не по таймеру, а по УЛИКЕ: после остановки этого выпуска тот же провайдер
+# снова доделал чью-то работу. Таймер вслепую гонял бы выпуск в упавший провайдер, а
+# каждый круг картинок или озвучки — это кредиты подписки. Сверху два предохранителя:
+# пауза после остановки и не больше AUTO_REVIVE_MAX автовозвратов на выпуск за всю жизнь
+# (их считает журнал фаз). Возврат человеком предохранители не трогают.
+#
+# Чего здесь НЕТ, и это нарочно: доступы к каналу, мёртвый донор, наложенный текст на
+# обложке, не выбранная модель — их чинят люди, и повтор только жёг бы деньги.
+AUTO_REVIVE_MAX = 2
+AUTO_REVIVE_PAUSE = 1800
+AUTO_REVIVE_PHASE = "auto_revive"
+
+_TRANSIENT = (
+    (re.compile(r"^этап «(tts|images|render|video|prompts)» завершился со статусом"), "stage"),
+    (re.compile(r"^зависло на шаге «(\w+)» и попытки исчерпаны"), "stall"),
+    (re.compile(r"^обложка не нарисовалась дважды"), "cover"),
+    (re.compile(r"^обложка не сделалась: .*очередь заполнена"), "cover"),
+    (re.compile(r"^рерайт не справился"), "rewrite"),
+    (re.compile(r"^задача рерайта прервалась"), "rewrite"),
+    (re.compile(r"^нода: HTTP Error 5\d\d"), "node"),
+)
+
+
+def transient_kind(reason: str):
+    """(вид, подробность) для причины, которая проходит сама, иначе None."""
+    for rx, kind in _TRANSIENT:
+        m = rx.match(reason or "")
+        if not m:
+            continue
+        detail = m.group(1) if m.groups() else ""
+        if kind == "stall" and PHASE_INDEX.get(detail, len(PHASES)) >= PHASE_INDEX["upload_pending"]:
+            return None        # зависла заливка — это разбор человеком, не повтор
+        return kind, detail
+    return None
+
+
+def _blocked_at(c, release_id: str):
+    row = c.execute("SELECT MAX(created) FROM pub_release_events WHERE release_id=? "
+                    "AND phase='blocked'", (release_id,)).fetchone()
+    return float(row[0]) if row and row[0] else None
+
+
+def auto_revives(c, release_id: str) -> int:
+    row = c.execute("SELECT COUNT(*) FROM pub_release_events WHERE release_id=? AND phase=?",
+                    (release_id, AUTO_REVIVE_PHASE)).fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def _hhmm(stamp: float) -> str:
+    return time.strftime("%d.%m %H:%M", time.localtime(float(stamp)))
+
+
+def provider_back(c, rel, kind: str, detail: str, since: float) -> str:
+    """Улика, что сбой прошёл: словами, иначе ''. Только чтение базы студии."""
+    rid = rel["release_id"]
+    if kind == "stage":
+        job = c.execute("SELECT q.provider FROM pub_release_jobs j LEFT JOIN queue_tasks q "
+                        "ON q.job_id=CAST(j.remote_job_id AS INTEGER) WHERE j.release_id=? "
+                        "AND j.service='vsgen' AND j.kind=?", (rid, detail)).fetchone()
+        provider = (job[0] if job else "") or ""
+        sql = ("SELECT job_id, provider, finished FROM queue_tasks WHERE kind=? AND "
+               "status='done' AND finished>?")
+        args = [detail, since]
+        if provider:
+            sql += " AND provider=?"
+            args.append(provider)
+        row = c.execute(sql + " ORDER BY finished LIMIT 1", args).fetchone()
+        if row:
+            return (f"после остановки этап «{detail}» снова выполняется: задача "
+                    f"{row[0]}{' (' + row[1] + ')' if row[1] else ''} готова {_hhmm(row[2])}")
+        return ""
+    if kind == "node":
+        row = c.execute("SELECT MIN(updated) FROM pub_upload_jobs WHERE status='done' "
+                        "AND updated>?", (since,)).fetchone()
+        return f"нода снова заливает: заливка завершена {_hhmm(row[0])}" if row and row[0] else ""
+    phase = {"stall": next_phase(detail) if detail in PHASE_INDEX else "",
+             "cover": "cover_ready", "rewrite": "source_ready"}.get(kind, "")
+    if not phase:
+        return ""
+    row = c.execute("SELECT MIN(created) FROM pub_release_events WHERE phase=? AND "
+                    "created>? AND release_id!=?", (phase, since, rid)).fetchone()
+    if row and row[0]:
+        return f"после остановки другие выпуски снова проходят шаг «{phase}» ({_hhmm(row[0])})"
+    return ""
+
+
+def _forget_failed(c, release_id: str, kind: str, detail: str) -> None:
+    """Забыть упавшую работу, иначе движок тем же тиком уронит выпуск по ней снова.
+
+    Без строки зеркала движок сам возьмёт идущую задачу проекта или поставит этап
+    заново (`do_media_ready` → `_adopt_stage`). Уже доставленное не оплачивается дважды:
+    кадры и блоки озвучки берутся из журнала и кэша.
+    """
+    if kind == "stage":
+        c.execute("DELETE FROM pub_release_jobs WHERE release_id=? AND service='vsgen' "
+                  "AND kind=?", (release_id, detail))
+    elif kind == "cover":
+        c.execute("DELETE FROM pub_release_jobs WHERE release_id=? AND service='cover' "
+                  "AND kind='job'", (release_id,))
+
+
+def revive_transient(c, now: float) -> list:
+    """Вернуть в работу выпуски, остановленные временным сбоем, когда сбой прошёл."""
+    try:
+        rows = c.execute("SELECT * FROM pub_releases WHERE status='blocked'").fetchall()
+    except Exception:                              # noqa: BLE001 — база без нужных таблиц
+        return []
+    back = []
+    for rel in rows:
+        tk = transient_kind(rel["blocked_reason"] or "")
+        if tk is None:
+            continue
+        kind, detail = tk
+        rid = rel["release_id"]
+        since = _blocked_at(c, rid) or float(rel["updated"] or now)
+        if now - since < AUTO_REVIVE_PAUSE:
+            continue
+        done = auto_revives(c, rid)
+        if done >= AUTO_REVIVE_MAX:
+            continue
+        evidence = provider_back(c, rel, kind, detail, since)
+        if not evidence:
+            continue
+        # Попытку считаем ДО возврата: отказ `revive` (загрузка уже начиналась, выпуск
+        # подтверждён руками) тоже исчерпывает счёт — иначе проход спрашивал бы каждый тик.
+        log_phase(c, rid, AUTO_REVIVE_PHASE, now,
+                  payload={"n": done + 1, "reason": (rel["blocked_reason"] or "")[:200],
+                           "evidence": evidence})
+        out = revive(c, rid, now)
+        if not out.get("ok"):
+            log_line(c, rid, "движок", f"автовозврат не сделан: {out.get('why')}",
+                     level="warn", now=now)
+            continue
+        _forget_failed(c, rid, kind, detail)
+        log_line(c, rid, "движок",
+                 f"сбой был временным — {evidence}; вернул в работу сам "
+                 f"(автовозврат {done + 1} из {AUTO_REVIVE_MAX})", now=now)
+        back.append(rid)
+    return back
+
+
 def tick(c, services, now: float = None) -> dict:
     """Один шаг движка. Ошибка одного выпуска не мешает остальным."""
     now = time.time() if now is None else now
@@ -1026,6 +1176,10 @@ def tick(c, services, now: float = None) -> dict:
         pass
     try:
         revive_rerun_stages(c, now)
+    except Exception:                              # noqa: BLE001 — не роняем тик
+        pass
+    try:
+        revive_transient(c, now)
     except Exception:                              # noqa: BLE001 — не роняем тик
         pass
     reflow_slots(c, now)          # ссылки без даты занимают освободившиеся выходы
