@@ -11083,10 +11083,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 _jrn_final = order_never_delivers(_jrn_probe)
                 if _jrn_final:
                     # Результата по этому заказу не будет никогда (потерян или отклонён).
-                    # Разрешаем повтор: рядом лежат уже оплаченные кадры этого же проекта,
-                    # и держать их из-за одного недостающего дороже, чем заказать его
-                    # заново. Повтор идёт обычным путём генерации — там, где смягчается
-                    # промпт на отказ фильтра.
+                    # Повтор дешевле, чем держать остальные оплаченные кадры проекта.
                     _jrn_j = _journal()
                     if _jrn_j is not None:
                         _jrn_j.failed(
@@ -11094,23 +11091,38 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                             f"{_jrn_final} — заказ {_jrn.remote_order_id}; результата не "
                             f"будет, кадр можно заказать заново",
                             ordered=True, lost=True)
-                    print_user(f"🧹 [{index+1}] Журнал: {_jrn_final} "
-                               f"({_jrn.remote_order_id}). Ждать нечего; следующий прогон "
-                               f"закажет кадр заново — это дешевле, чем держать остальные "
-                               f"оплаченные кадры", "WARNING")
+                    # 05.10.2026: заказываем заново сразу, в этом же прогоне (владелец: «чтобы
+                    # студия сама запрашивала кадры, которые не дослали») — обычным путём,
+                    # где на отказ фильтра смягчается промпт.
+                    _jrn_old = _jrn.remote_order_id
+                    _jrn = _journal_reserve_frame(
+                        unit=(journal_unit or f"{index + 1:03d}"),
+                        prompt=prompt, seed=seed, aspect_ratio=aspect_ratio,
+                        reference_bundle=reference_bundle, output_path=output_path,
+                    )
+                    if not _jrn.may_call:
+                        print_user(f"🧹 [{index+1}] Журнал: {_jrn_final} ({_jrn_old}). Новый "
+                                   f"заказ журнал сейчас не разрешил ({_jrn.error or _jrn.action}) "
+                                   f"— кадр закажет следующий прогон", "WARNING")
+                        return (index, None)
+                    print_user(f"🔁 [{index+1}] Журнал: {_jrn_final} ({_jrn_old}) — заказываю "
+                               f"кадр заново в этом же прогоне: это дешевле, чем держать "
+                               f"остальные оплаченные кадры", "WARNING")
+                else:
+                    print_user(f"❌ [{index+1}] Журнал: оплаченный заказ {_jrn.remote_order_id} "
+                               f"результата не дал — кадр пропущен без нового платного запроса"
+                               + (f" ({_jrn_why[:90]})" if _jrn_why else ""), "ERROR")
                     return (index, None)
-                print_user(f"❌ [{index+1}] Журнал: оплаченный заказ {_jrn.remote_order_id} "
-                           f"результата не дал — кадр пропущен без нового платного запроса"
-                           + (f" ({_jrn_why[:90]})" if _jrn_why else ""), "ERROR")
+            else:
+                print_user(f"⛔ [{index+1}] Журнал: заказ уже создавался"
+                           f"{' (id ' + str(_jrn.remote_order_id) + ')' if _jrn.remote_order_id else ' (id неизвестен)'}, "
+                           f"опросить его нечем — пропускаю кадр без повторной оплаты", "ERROR")
                 return (index, None)
-            print_user(f"⛔ [{index+1}] Журнал: заказ уже создавался"
-                       f"{' (id ' + str(_jrn.remote_order_id) + ')' if _jrn.remote_order_id else ' (id неизвестен)'}, "
-                       f"опросить его нечем — пропускаю кадр без повторной оплаты", "ERROR")
+        else:
+            # unknown: кабинет не ответил, и мы не знаем, не оплачен ли кадр уже. Платить нельзя.
+            print_user(f"⛔ [{index+1}] Журнал недоступен ({_jrn.error or _jrn.action}) — "
+                       f"кадр пропущен: повторная оплата дороже пропуска", "ERROR")
             return (index, None)
-        # unknown: кабинет не ответил, и мы не знаем, не оплачен ли кадр уже. Платить нельзя.
-        print_user(f"⛔ [{index+1}] Журнал недоступен ({_jrn.error or _jrn.action}) — "
-                   f"кадр пропущен: повторная оплата дороже пропуска", "ERROR")
-        return (index, None)
 
     # v2 endpoint dead — only v3/v4 attempts, no legacy fallback
     # VEO_BANANA (NonStop) — столько же попыток, сколько у veo-видео (VEO_MAX_ATTEMPTS); остальным моделям 5.

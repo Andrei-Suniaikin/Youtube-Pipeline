@@ -62,10 +62,22 @@ def main() -> int:
 
     print("\nВетка журнала кадра пользуется этим выводом и разрешает перезаказ")
     src = open(os.path.join(BASE, "workers", "googler_worker.py"), encoding="utf-8").read()
-    m = re.search(r"_jrn_final = order_never_delivers\(_jrn_probe\)\n(.{0,1200}?)return \(index, None\)",
+    m = re.search(r"_jrn_final = order_never_delivers\(_jrn_probe\)\n(.{0,8000}?)# v2 endpoint dead",
                   src, re.S)
     check("решение в ветке — по order_never_delivers", m is not None, True)
     check("и строка журнала помечается потерянной", bool(m and "lost=True" in m.group(1)), True)
+
+    print("\nНедоставленный кадр заказывается заново в ЭТОМ ЖЕ прогоне (владелец 05.10)")
+    tail = src[src.find("_jrn_final = order_never_delivers(_jrn_probe)"):]
+    tail = tail[:tail.find("# v2 endpoint dead")]
+    i_lost = tail.find("lost=True")
+    i_rereserve = tail.find("_jrn = _journal_reserve_frame(")
+    check("после пометки «потерян» — новая заявка в журнал", 0 < i_lost < i_rereserve, True)
+    check("и между ними выхода нет — заявка действительно делается",
+          "return (index, None)" in tail[i_lost:i_rereserve], False)
+    seg = tail[i_rereserve:tail.find("else:", i_rereserve)]
+    check("если журнал разрешил — дальше обычная генерация, без выхода",
+          "if not _jrn.may_call:" in seg and seg.count("return (index, None)") == 1, True)
 
     print()
     if FAILS:
