@@ -743,18 +743,24 @@ def _authoritative_work_alive(c, rel, now: float) -> bool:
 
     if phase in ("cover_ready", "upload_pending", "upload_running"):
         row = c.execute(
-            "SELECT status, heartbeat FROM pub_upload_jobs WHERE release_id=?",
+            "SELECT status, verdict, heartbeat, claimed FROM pub_upload_jobs "
+            "WHERE release_id=?",
             (rid,),
         ).fetchone()
         if not row:
             return False
-        if (row["status"] or "") == "queued":
+        status = row["status"] or ""
+        if status == "queued":
             return True
-        return bool(
-            (row["status"] or "") == "running"
-            and row["heartbeat"]
-            and now - row["heartbeat"] < ALIVE_SILENCE
-        )
+        if status == "done" and (row["verdict"] or "") in ("scheduled", "published"):
+            # Работа уже сделана и подтверждена — выпуску осталось только шагнуть дальше.
+            return True
+        # Только что выданное задание пульса ещё не слало: первый придёт через минуту.
+        # 06.10.2026 три выпуска простояли в очереди дольше срока фазы (одно место на
+        # Минске на всю ночь), и в секунды между выдачей и первым пульсом движок видел
+        # «running без признаков жизни» — и убирал в разбор уже взятую в работу заливку.
+        beat = row["heartbeat"] or row["claimed"]
+        return bool(status == "running" and beat and now - beat < ALIVE_SILENCE)
     return False
 
 
@@ -818,6 +824,22 @@ def work_alive(c, rel, now: float) -> bool:
     return bool(pending and pending["n"])
 
 
+def _own_upload_in_flight(c, rid: str) -> bool:
+    """Улики начатой загрузки принадлежат ТЕКУЩЕМУ заданию, а не прошлому.
+
+    Запрет «загрузка уже начиналась» нужен против второй заливки. Если задание этого
+    выпуска взято машиной и идёт или уже подтверждено, перейти в «идёт заливка» —
+    значит просто следить за ним: новой заливки этот шаг не начинает.
+    """
+    row = c.execute("SELECT status, verdict FROM pub_upload_jobs WHERE release_id=?",
+                    (rid,)).fetchone()
+    if not row:
+        return False
+    status = row["status"] or ""
+    return status == "running" or (
+        status == "done" and (row["verdict"] or "") in ("scheduled", "published"))
+
+
 def is_stuck(c, rel, now: float) -> bool:
     """Выпуск завис: срок вышел И никаких признаков идущей работы нет."""
     deadline = rel["deadline"]
@@ -877,7 +899,8 @@ def advance(c, rel, services, now: float) -> str:
         return "done"
 
     want = next_phase(phase)
-    if want == "upload_running" and reached_irreversible(c, rid):
+    if want == "upload_running" and reached_irreversible(c, rid) \
+            and not _own_upload_in_flight(c, rid):
         # Загрузка уже начиналась: повторять её нельзя ни при каких обстоятельствах.
         quarantine(c, rel, now, "загрузка уже начиналась — повтор запрещён, нужен разбор")
         return "quarantined"

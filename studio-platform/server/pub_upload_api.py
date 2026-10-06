@@ -584,14 +584,19 @@ def register_upload_routes(app, ctx):
                 (verdict["state"], verdict["kind"], verdict["video_id"],
                  json.dumps(verdict["evidence"], ensure_ascii=False) if verdict["evidence"] else None,
                  verdict["error"], now, now, rel["id"]))
-            if rel["status"] == "error" and verdict["kind"] in ("scheduled", "published"):
-                # Поздний успех живой ноды: выпуск мог уже уехать в разбор — поднимаем его.
-                c.execute("UPDATE pub_releases SET status='running', blocked_reason=NULL, "
-                          "updated=? WHERE release_id=? AND status='blocked'",
-                          (now, release_id))
-                log_line(c, release_id, "заливка",
-                         "нода домолчалась до успеха: ролик подтверждён, снимаю разбор",
-                         now=now)
+            if verdict["kind"] in ("scheduled", "published"):
+                # Поздний успех: выпуск мог уже уехать в разбор — и по молчанию ноды
+                # (задание в error), и по таймеру движка, пока задание ещё шло
+                # (06.10.2026: ролик встал в расписание через 6 минут после разбора,
+                # а выпуск так и висел «попытки исчерпаны»). Подтверждение Studio
+                # сильнее любого нашего таймера — поднимаем выпуск.
+                lifted = c.execute(
+                    "UPDATE pub_releases SET status='running', blocked_reason=NULL, "
+                    "deadline=?, updated=? WHERE release_id=? AND status='blocked'",
+                    (now + 1800, now, release_id)).rowcount
+                if lifted:
+                    log_line(c, release_id, "заливка",
+                             "ролик подтверждён после разбора: снимаю разбор", now=now)
             level = {"scheduled": "info", "published": "info"}.get(verdict["kind"], "error")
             if verdict["kind"] not in ("scheduled", "published"):
                 # Класс берётся уликами, а не словом вердикта: `needs_repair` означает,
