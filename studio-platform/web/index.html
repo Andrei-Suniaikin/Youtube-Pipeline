@@ -447,6 +447,8 @@
   .grpcard>.grpbar{padding:12px 16px;background:var(--card-2)}
   .grpcard.pending .grphead .why{color:var(--wait)}
   .grpcard tr.grp-item>td:first-child{padding-left:16px}
+  .qgbar{display:flex;align-items:center;gap:10px}
+  .qgbar>.grphead{flex:1;min-width:0}
   .restcap{padding:12px 16px 4px;font-size:13px;color:var(--muted)}
   /* Колонка действий одной ширины во всех строках: иначе «в работе» (есть кнопка) и
      «готово» (кнопки нет) двигали бы таблицу друг относительно друга при каждом
@@ -4837,10 +4839,7 @@ async function viewQueue(){
       «не дочитано» — это не «причины нет». У Видео и Выпусков дочитывать нечего: их этап
       и причину пишет сама студия, и пустое место там значит «не записано».</div>`));
 
-  const card = $(`<div class="card"><table>
-    <thead><tr><th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th>
-      <th class="acts"></th></tr></thead>
-    <tbody>${queueBodyHtml(d.rows)}</tbody></table></div>`);
+  const card = $(`<div>${queueBodyHtml(d.rows)}</div>`);
   app.append(card);
   wireActions(card);
   wireReleaseDrop(card);
@@ -4865,7 +4864,10 @@ function queueRowHtml(r, of){
       </tr>`;
 }
 
-/* Тело очереди: одинаковые причины — одной строкой (см. `groupByReason`).
+/* Тело очереди: задачи одной причины — своей карточкой сверху, остальные — общей
+   карточкой под ними (владелец 06.10.2026: «на странице очередь та же проблема, что
+   была с выпусками, ошибочные склеены» — заголовок группы в общей таблице сливался с
+   обычными строками под ним; выпуски так же разведены 03.10, см. список выпусков).
 
    В ключ группы, кроме самой причины, входит всё, что заголовок рисует ОДНО на всех:
    сервис (его плашка), состояние (его плашка) и наличие «повторить» (действие на
@@ -4875,25 +4877,41 @@ function queueRowHtml(r, of){
    Клетку «Создана» группа не занимает вовсе: у сорока строк сорок разных времён, и
    любое одно число на всех было бы выдумкой. Раскрытие показывает настоящие. */
 function queueBodyHtml(rows){
-  return groupByReason(rows, r => r.error,
-      r => [r.service, r.state, canRetry(r) ? 'retry' : ''].join('|'), 'qg')
-    .map(g => {
-      if (g.rows.length < 2) return queueRowHtml(g.rows[0], '');
-      const r0 = g.rows[0], n = g.rows.length;
-      const count = `${n} ${r0.service === 'release'
-        ? plural(n, 'выпуск', 'выпуска', 'выпусков')
-        : plural(n, 'задача', 'задачи', 'задач')}`;
-      const label = 'Повторить все — ' + count;
-      return `<tr class="grp">
-        <td><span class="pill s-idle">${esc(SVC_TITLE[r0.service] || r0.service)}</span></td>
-        <td colspan="4">${groupHeadHtml(g, count, ` <span class="pill ${
-          STATE_CLS[r0.state]}">${STATE_TITLE[r0.state]}</span>`)}</td>
-        <td class="acts">${canRetry(r0)
+  const THEAD = of => `<thead><tr ${of ? `data-of="${esc(of)}" hidden` : ''}>
+    <th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th>
+    <th class="acts"></th></tr></thead>`;
+  const groups = groupByReason(rows, r => r.error,
+      r => [r.service, r.state, canRetry(r) ? 'retry' : ''].join('|'), 'qg');
+  const singles = groups.filter(g => g.rows.length < 2).map(g => g.rows[0]);
+  const many = groups.filter(g => g.rows.length >= 2);
+  // Сначала то, что упало, потом ждущее, потом идущее.
+  const RANK = {error: 0, blocked: 0, queued: 1};
+  many.sort((a, b) => (RANK[a.rows[0].state] ?? 2) - (RANK[b.rows[0].state] ?? 2));
+  const cards = many.map(g => {
+    const r0 = g.rows[0], n = g.rows.length;
+    const count = `${n} ${r0.service === 'release'
+      ? plural(n, 'выпуск', 'выпуска', 'выпусков')
+      : plural(n, 'задача', 'задачи', 'задач')}`;
+    const label = 'Повторить все — ' + count;
+    const bad = RANK[r0.state] === 0;
+    return `<div class="card grpcard ${bad ? '' : 'pending'}" data-grp="${esc(g.id)}">
+      <div class="grpbar"><div class="qgbar">
+        <span class="pill s-idle">${esc(SVC_TITLE[r0.service] || r0.service)}</span>
+        ${groupHeadHtml(g, count, ` <span class="pill ${
+          STATE_CLS[r0.state]}">${STATE_TITLE[r0.state]}</span>`)}
+        ${canRetry(r0)
           ? `<button class="iconbtn retry-all" data-grp="${esc(g.id)}"
                data-count="${esc(count)}" title="${esc(label)}"
-               aria-label="${esc(label)}">${ICON.retry}</button>` : ''}</td>
-      </tr>` + g.rows.map(r => queueRowHtml(r, g.id)).join('');
-    }).join('');
+               aria-label="${esc(label)}">${ICON.retry}</button>` : ''}
+      </div></div>
+      <table>${THEAD(g.id)}<tbody>${g.rows.map(r => queueRowHtml(r, g.id)).join('')}</tbody></table>
+    </div>`;
+  });
+  const rest = singles.length ? `<div class="card">
+      ${cards.length ? `<div class="restcap">Остальные задачи — ${singles.length}</div>` : ''}
+      <table>${THEAD('')}<tbody>${singles.map(r => queueRowHtml(r, '')).join('')}</tbody></table>
+    </div>` : '';
+  return cards.join('') + rest;
 }
 
 /* Повтор всей группы. Одиночное «повторить» спрашивает молча, а здесь вопрос
