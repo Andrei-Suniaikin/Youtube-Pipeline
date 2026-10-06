@@ -987,6 +987,50 @@ def revive_cover_preset_chosen(c, now: float) -> list:
     return back
 
 
+COVER_BEST_OF_THREE_FLAG = "pub_revive_cover_best_of_three"
+
+
+def revive_cover_degraded_once(c, now: float) -> list:
+    """Разово: выпуски с «обложка деградировала дважды» — в работу с новой обложкой.
+
+    06.10.2026 владелец: «делаем три обложки; не прошли проверку — ИИ оценивает от 0 до
+    10, выигрывает лучшая. После обновы нужно оживить выпуски». На этот день в разборе
+    стояли 40 выпусков с этой причиной. Модуль обложек теперь сам выбирает лучшую из
+    трёх, и такой выбор браком не считается, — значит, каждому из них нужен новый заказ
+    обложки. Делаем это ОДИН раз после выкатки (пометка в admin_state): если позже
+    выпуск снова встанет с этой причиной, значит, контролёр не смог оценить ни одной
+    картинки, и решать уже человеку.
+
+    Старый заказ забываем, как кнопка «Перезаказать обложку»; дальше — обычный `revive`.
+    """
+    try:
+        done = c.execute("SELECT v FROM admin_state WHERE k=?",
+                         (COVER_BEST_OF_THREE_FLAG,)).fetchone()
+    except Exception:                              # noqa: BLE001 — база без admin_state
+        return []
+    if done:
+        return []
+    rows = c.execute(
+        "SELECT release_id FROM pub_releases WHERE status='blocked' "
+        "AND blocked_reason LIKE 'обложка деградировала дважды%'").fetchall()
+    back = []
+    for r in rows:
+        rid = r["release_id"]
+        old = c.execute("SELECT remote_job_id FROM pub_release_jobs WHERE release_id=? "
+                        "AND service='cover' AND kind='job'", (rid,)).fetchone()
+        c.execute("DELETE FROM pub_release_jobs WHERE release_id=? AND service='cover' "
+                  "AND kind='job'", (rid,))
+        if revive(c, rid, now).get("ok"):
+            log_line(c, rid, "обложка",
+                     "обложки теперь выбираются из трёх по оценке ИИ — заказываю заново "
+                     f"(прежняя задача {old['remote_job_id'] if old else '—'} забыта)",
+                     now=now)
+            back.append(rid)
+    c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES(?,?,?)",
+              (COVER_BEST_OF_THREE_FLAG, str(len(back)), now))
+    return back
+
+
 _STAGE_FAILED_RE = re.compile(r"^этап «(\w+)» завершился со статусом")
 
 
@@ -1195,6 +1239,10 @@ def tick(c, services, now: float = None) -> dict:
         begin(now)               # бюджеты медленных шагов (названия) — на новый круг
     try:
         revive_cover_preset_chosen(c, now)
+    except Exception:                              # noqa: BLE001 — не роняем тик
+        pass
+    try:
+        revive_cover_degraded_once(c, now)
     except Exception:                              # noqa: BLE001 — не роняем тик
         pass
     try:

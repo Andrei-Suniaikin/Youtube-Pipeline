@@ -1979,6 +1979,80 @@ def check_simple_result(
     return passed, result
 
 
+
+# ════════════════════════════════════════════════════════
+#  ТРИ КАНДИДАТА И ОЦЕНКА 0–10 (владелец 06.10.2026)
+# ════════════════════════════════════════════════════════
+#
+# «Делаем три обложки; если ни одна не прошла проверку — ИИ оценивает каждую от 0 до 10,
+# выигрывает лучшая, при равной высшей оценке — первая». Раньше после неудачных попыток
+# сохранялась ПОСЛЕДНЯЯ картинка с пометкой брака (или рисовался вариант без текста), и
+# студия уводила выпуск в разбор: 06.10 так стояли 40 выпусков. Теперь все оплаченные
+# картинки — кандидаты, и выбор между ними делает тот же контролёр, что их проверял.
+#
+# COVER_CANDIDATES=0 возвращает число попыток из пресета.
+COVER_CANDIDATES = int(os.environ.get("COVER_CANDIDATES", "3") or 0)
+
+_SCORE_PROMPT = (
+    "Video title (context only): {video_title}\n\n"
+    "Rate this YouTube cover from 0 to 10. The text ON THE COVER should be: "
+    "\"{expected_text}\".\n"
+    "10 = text is exactly right, readable, no artifacts, attractive composition. "
+    "0 = text is missing, wrong or gibberish.\n"
+    "Text correctness and readability matter most; composition breaks ties.\n\n"
+    "Return ONLY JSON: {\"score\": <integer 0-10>, \"why\": \"one short sentence\"}")
+_SIMPLE_SCORE_PROMPT = (
+    "You are given TWO YouTube thumbnails. The FIRST image is the ORIGINAL. The SECOND "
+    "image is a generated version whose text should be the ORIGINAL text translated "
+    "into {language}.\n"
+    "Rate the SECOND image from 0 to 10. 10 = text is a correct, readable {language} "
+    "translation with no artifacts and the picture keeps the original's idea. 0 = text "
+    "is missing, in the wrong language, gibberish or means something else.\n"
+    "Text correctness and readability matter most; picture quality breaks ties.\n\n"
+    "Return ONLY JSON: {\"score\": <integer 0-10>, \"why\": \"one short sentence\"}")
+
+
+def _attempts_for(preset_lang) -> int:
+    if COVER_CANDIDATES > 0:
+        return COVER_CANDIDATES
+    return max(1, getattr(preset_lang, "max_generation_retries", 5))
+
+
+def _score_one(images, prompt, provider, model, openai_api_key):
+    """Оценка 0–10 одной картинки. Не ответил или ответ не разобрался — None."""
+    try:
+        raw = _call_vision(images, prompt, provider, model, "", openai_api_key)
+    except Exception:                                              # noqa: BLE001
+        return None, ""
+    data = _parse_json_response(raw or "") or {}
+    try:
+        score = float(data.get("score"))
+    except (TypeError, ValueError):
+        return None, ""
+    return max(0.0, min(10.0, score)), str(data.get("why") or "")[:160]
+
+
+def pick_best_candidate(candidates, score_fn, log) -> Optional[int]:
+    """Номер лучшей картинки по оценке 0–10; при равенстве — первая из лучших.
+
+    `score_fn(image)` → (оценка или None, пояснение). Кандидат без оценки не участвует.
+    Ни одной оценки — None: вызывающий поступает по-старому.
+    """
+    best, best_score, parts = None, None, []
+    for i, img in enumerate(candidates):
+        score, why = score_fn(img)
+        if score is None:
+            parts.append(f"№{i + 1} — без оценки")
+            continue
+        parts.append(f"№{i + 1} — {score:g}/10" + (f" ({why})" if why else ""))
+        if best_score is None or score > best_score:     # строго больше: при равенстве — первая
+            best, best_score = i, score
+    if best is None:
+        log("   ⚠ Оценить кандидатов не удалось: " + "; ".join(parts))
+        return None
+    log("   🏁 Оценки ИИ: " + "; ".join(parts) + f" — беру №{best + 1}")
+    return best
+
 # ════════════════════════════════════════════════════════
 #  ПАЙПЛАЙН: ПОЛНЫЙ ЦИКЛ ОДНОЙ ОБЛОЖКИ
 # ════════════════════════════════════════════════════════
@@ -1994,6 +2068,9 @@ class CoverResult:
     # человека это тоже «не готово до конца» (used_fallback), но не брак: перерисовка
     # за деньги тут ничего не исправит — сломан контролёр, а не картинка.
     unchecked: bool = False
+    # Проверку не прошёл ни один вариант, и картинку выбрал ИИ по оценке 0–10 из
+    # нескольких оплаченных. Это не брак: выбор сделан, выпуск идёт дальше.
+    scored: bool = False
     analysis: Dict = field(default_factory=dict)
     check_result: Dict = field(default_factory=dict)
     error: str = ""
@@ -2205,7 +2282,8 @@ def _generate_simple_edit(
     prompt = template.replace("{language}", language)
     model = preset_lang.generation_model
     debug_log = log_fn if getattr(preset_lang, "debug_mode", False) else None
-    max_attempts = max(1, getattr(preset_lang, "max_generation_retries", 5))
+    max_attempts = _attempts_for(preset_lang)
+    candidates = []         # оплаченные картинки, не прошедшие сверку — по порядку
 
     generated = None
     # 04.10.2026: последняя картинка, которую провайдер ОТДАЛ. Раньше пустой ответ на
@@ -2280,11 +2358,30 @@ def _generate_simple_edit(
             result.success = True
             return result
         log(f"   ❌ Проблема: {details.get('issues', '')}")
+        candidates.append(generated)
 
     generated = generated or last_paid
     if not generated:
         result.error = f"Ошибка генерации изображения (все {max_attempts} попыток вернули пустой результат)"
         return result
+
+    if candidates:
+        log(f"   ⚖ Проверку не прошёл ни один из {len(candidates)} вариантов — "
+            f"прошу ИИ оценить каждый от 0 до 10")
+        score_prompt = ((_active_prompts().get("simple_score_prompt_template")
+                         or get_default_prompt("simple_score_prompt_template")
+                         or _SIMPLE_SCORE_PROMPT).replace("{language}", language))
+        best = pick_best_candidate(
+            candidates,
+            lambda img: _score_one([thumbnail, img], score_prompt,
+                                   preset_lang.analysis_provider,
+                                   preset_lang.analysis_model, openai_api_key),
+            log)
+        if best is not None:
+            result.image = candidates[best]
+            result.success = True
+            result.scored = True
+            return result
 
     # Текст неидеален, но картинка есть — сохраняем последний вариант (анти cost-drain)
     log(f"   ⚠ После {max_attempts} попыток проверка текста не пройдена — сохраняю последний результат")
@@ -2377,7 +2474,8 @@ def _generate_for_language(
 
         generated = None
         last_paid = None          # см. _generate_simple_edit: пустой ответ не затирает оплаченный
-        max_attempts = max(1, getattr(preset_lang, "max_generation_retries", 5))
+        max_attempts = _attempts_for(preset_lang)
+        candidates = []     # оплаченные картинки, не прошедшие проверку — по порядку
         debug_log = log_fn if getattr(preset_lang, "debug_mode", False) else None
         gen_failures = 0
         for attempt in range(max_attempts):
@@ -2439,12 +2537,35 @@ def _generate_for_language(
                 result.success = True
                 return result
             log(f"   ❌ Проблема: {check_details.get('issues', '')}")
+            candidates.append(generated)
 
         # Все попытки исчерпаны
         generated = generated or last_paid
         if not generated:
             result.error = f"Ошибка генерации изображения (все {max_attempts} попыток вернули пустой результат)"
             return result
+
+        if candidates:
+            log(f"   ⚖ Проверку не прошёл ни один из {len(candidates)} вариантов — "
+                f"прошу ИИ оценить каждый от 0 до 10")
+            score_prompt = ((_active_prompts().get("score_prompt_template")
+                             or get_default_prompt("score_prompt_template")
+                             or _SCORE_PROMPT)
+                            .replace("{video_title}",
+                                     (analysis.get("video_title") or "").strip()
+                                     or "(not provided)")
+                            .replace("{expected_text}", adapted_text))
+            best = pick_best_candidate(
+                candidates,
+                lambda img: _score_one(img, score_prompt,
+                                       preset_lang.analysis_provider,
+                                       preset_lang.analysis_model, openai_api_key),
+                log)
+            if best is not None:
+                result.image = candidates[best]
+                result.success = True
+                result.scored = True
+                return result
 
         # После max_attempts проверки текста — генерируем чистую версию без текста
         log(f"   ⚠ После {max_attempts} попыток проверка текста не пройдена — генерирую вариант без текста...")
