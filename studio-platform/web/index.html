@@ -243,6 +243,13 @@
     .pp-cal{width:auto;padding-left:0}
   }
   .blktag.cover{background:var(--acc-dim);color:var(--ink-hi)}
+  /* Ролик, возможно, уже на канале — нужен взгляд человека (09.10.2026). */
+  .blktag.check{background:var(--wait-bg);color:var(--ink-hi)}
+  .blk.check{border-left-color:var(--wait)}
+  /* Причина остановки с полным объяснением при наведении (09.10.2026). */
+  .whytip{cursor:help;text-decoration:underline dotted;text-underline-offset:3px;
+    text-decoration-color:var(--line-2)}
+  .qbox.wide{max-width:min(460px,calc(100vw - 16px));white-space:pre-line}
   .blk{margin-top:12px;padding:12px 14px;border-radius:var(--r-sm);border:1px solid var(--line);
     border-left:3px solid var(--bad);background:var(--well);color:var(--ink);font-weight:400}
   .blk.donor{border-left-color:var(--wait)}
@@ -1363,7 +1370,20 @@ function blockNote(r){
   if (!b.kind) return r && r.blocked_reason
     ? `<div class="note bad">${esc(r.blocked_reason)}</div>` : '';
   return `<div class="note" style="color:var(--ink)"><span class="blktag ${esc(b.kind)}"
-    >${esc(b.tag)}</span> ${esc(b.title)}</div>`;
+    >${esc(b.tag)}</span> ${whyTipHtml(b.title, blockTip(r))}</div>`;
+}
+
+// Полное объяснение причины — что случилось, что делать и запись движка как есть. Его
+// показывает наведение на причину сразу, без захода в выпуск (владелец 09.10.2026).
+function blockTip(r, raw){
+  const b = (r && r.block) || {};
+  const rec = raw != null ? raw : ((r && (r.blocked_reason || r.error)) || '');
+  if (!b.kind) return '';
+  return `${b.what}\n\nЧто делать: ${b.fix}` + (rec ? `\n\nЗапись движка: ${rec}` : '');
+}
+function whyTipHtml(text, tip){
+  return tip ? `<span class="whytip" data-hint="${esc(tip)}" tabindex="0"
+    >${esc(text)}</span>` : esc(text);
 }
 
 // Недосмотр настройки канала, который выпуск не остановил (нет пресета текста — текст
@@ -1387,7 +1407,7 @@ function gapBoxes(r){
 
 function blockLabel(r){
   const b = (r && r.block) || {};
-  return b.kind ? `${b.tag}: ${b.title}` : ((r && r.blocked_reason) || '');
+  return b.kind ? `${b.tag}: ${b.title}` : ((r && (r.blocked_reason || r.error)) || '');
 }
 
 // Карточка выпуска: объяснение целиком и действие, которое правда лечит. Для донора —
@@ -1411,7 +1431,7 @@ function blockBox(r){
   // Заливку могли сделать руками, пока выпуск стоял на заливке, — отметить это должно быть чем,
   // как и в прежней красной строке (04.10.2026: причины канала и студии теперь тоже
   // объясняются словами, и кнопка не должна была при этом пропасть).
-  if ((b.kind === 'channel' || b.kind === 'studio') && r.status === 'blocked'
+  if (['channel', 'studio', 'check'].includes(b.kind) && r.status === 'blocked'
       && !r.hand_confirmed && ['upload_pending', 'upload_running'].includes(r.phase))
     acts.push(`<button class="ghost" id="byhand">Подтвердить руками</button>`);
   return `<div class="blk ${esc(b.kind)}" id="blk">
@@ -1501,7 +1521,7 @@ function groupHeadHtml(g, count, tail){
             aria-expanded="false" title="${esc(label)}" aria-label="${esc(label)}"
       >${ICON.expand}</button>
     <div><span class="grpsum"><b>${esc(count)}</b> · <span class="why"
-      >${esc(g.why)}</span></span>${tail || ''}</div>
+      >${whyTipHtml(g.why, g.tip || '')}</span></span>${tail || ''}</div>
   </div>`;
 }
 
@@ -1628,6 +1648,7 @@ async function viewReleases(){
   const THEAD = of => `<thead><tr ${of ? `data-of="${esc(of)}" hidden` : ''}>
     <th>Выпуск</th><th>Канал</th><th>Выход</th><th>Фаза</th><th>Без движения</th></tr></thead>`;
   const groups = groupByReason(data.releases, blockLabel, r => r.status || '', 'rg');
+  groups.forEach(g => { g.tip = blockTip(g.rows[0]); });
   const singles = groups.filter(g => g.rows.length < 2).map(g => g.rows[0]);
   const many = groups.filter(g => g.rows.length >= 2);
   const RANK = {blocked: 0, pending: 1};
@@ -4723,6 +4744,9 @@ function taskCellHtml(r){
    Последнее — не «причины нет»: сосед её отдаёт, это мы не стали спрашивать (бюджет
    показа, см. `details`). Ради этой честности вся правка и делалась. */
 function whyHtml(r){
+  if (r.block && r.block.kind) return `<div class="note" style="color:var(--ink)"
+    ><span class="blktag ${esc(r.block.kind)}">${esc(r.block.tag)}</span> ${
+    whyTipHtml(r.block.title, blockTip(r, r.error))}</div>`;
   if (r.error) return `<div class="note bad">${esc(r.error)}</div>`;
   if (r.warning) return `<div class="note warn">${esc(r.warning)}</div>`;
   if (r.reason_pending)
@@ -4880,8 +4904,9 @@ function queueBodyHtml(rows){
   const THEAD = of => `<thead><tr ${of ? `data-of="${esc(of)}" hidden` : ''}>
     <th>Сервис</th><th>Задача</th><th>Этап</th><th>Состояние</th><th>Создана</th>
     <th class="acts"></th></tr></thead>`;
-  const groups = groupByReason(rows, r => r.error,
+  const groups = groupByReason(rows, r => (r.block && r.block.kind) ? blockLabel(r) : r.error,
       r => [r.service, r.state, canRetry(r) ? 'retry' : ''].join('|'), 'qg');
+  groups.forEach(g => { g.tip = blockTip(g.rows[0], g.rows[0].error); });
   const singles = groups.filter(g => g.rows.length < 2).map(g => g.rows[0]);
   const many = groups.filter(g => g.rows.length >= 2);
   // Сначала то, что упало, потом ждущее, потом идущее.
@@ -9063,7 +9088,7 @@ function hintShow(btn, pinned){
   if (HINT && HINT.btn === btn){ HINT.pinned = HINT.pinned || pinned; return; }
   hintHide();
   const box = document.createElement('div');
-  box.className = 'qbox';
+  box.className = btn.classList.contains('whytip') ? 'qbox wide' : 'qbox';
   box.setAttribute('aria-hidden', 'true');
   box.textContent = btn.dataset.hint || '';
   document.body.append(box);
@@ -9086,7 +9111,7 @@ function hintShow(btn, pinned){
 }
 
 const hintAt = ev => (ev.target instanceof Element)
-  ? ev.target.closest('.q[data-hint]') : null;
+  ? ev.target.closest('.q[data-hint], .whytip[data-hint]') : null;
 
 document.addEventListener('mouseover', ev => {
   const b = hintAt(ev);

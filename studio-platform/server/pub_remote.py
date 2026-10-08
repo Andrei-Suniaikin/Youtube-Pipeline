@@ -1212,6 +1212,13 @@ def donor_subs(url: str, *, net: bool = True, strict: bool = True,
                 if type(exc).__name__ in _ASR_FIXABLE:
                     raise _no_track(vid, url, asr,
                                     f"у ролика нет субтитров ({type(exc).__name__})")
+                if type(exc).__name__ in _AMBIGUOUS_UNAVAILABLE:
+                    # 09.10.2026, владелец: запись «нет субтитров» здесь вводит в
+                    # заблуждение — субтитры ни при чём, ролика нет совсем (проверено
+                    # выше: YouTube отвечает «Video unavailable» всем, не только нам).
+                    raise _subs_failed(FAIL_NO_SUBS,
+                                       f"ролик-донор удалён или скрыт на YouTube "
+                                       f"({type(exc).__name__})")
                 raise _subs_failed(FAIL_NO_SUBS,
                                    f"у ролика нет субтитров ({type(exc).__name__})")
             # Всё прочее — наша поломка, а не свойство ролика. Одна опечатка в коде

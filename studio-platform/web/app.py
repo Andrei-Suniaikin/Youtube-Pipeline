@@ -7814,6 +7814,10 @@ def _live_release_rows(c) -> list:
             "status": r["status"] or "", "state": _state(r["status"]),
             "progress": None, "stage": PHASE_TITLE.get(ph, ph), "provider": "",
             "created": r["updated"], "error": r["blocked_reason"] or "",
+            # Причина словами + что делать (09.10.2026): экран показывает её вместо
+            # записи движка, а целиком — при наведении.
+            "block": (explain_block(r["blocked_reason"])
+                      if r["status"] == "blocked" else {}),
             "warning": "", "reason_pending": False,
             # У выпуска нет «взят в работу»: он не задача, а цепочка задач, и его
             # время — это время последнего движения. Поэтому «ждёт с …», а не «идёт»:

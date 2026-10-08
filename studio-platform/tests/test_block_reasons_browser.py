@@ -115,6 +115,17 @@ SCENARIO = r"""
     const rowD = document.querySelector('tr.row[data-id="d1"]');
     out.меткаДонора = txt(rowD && rowD.querySelector('.blktag.donor'));
     out.строкаДонора = txt(rowD && rowD.querySelector('.note'));
+    // Наведение на причину — сразу полное объяснение (владелец 09.10.2026)
+    const tipD = rowD && rowD.querySelector('.whytip');
+    if (tipD) tipD.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+    const boxD = document.querySelector('.qbox.wide');
+    out.подсказкаДонора = boxD ? boxD.textContent : '';
+    if (tipD) tipD.dispatchEvent(new MouseEvent('mouseout', {bubbles: true}));
+    out.подсказкаУшла = !document.querySelector('.qbox');
+    const tipG = document.querySelector('.grpsum .whytip');
+    if (tipG) tipG.dispatchEvent(new MouseEvent('mouseover', {bubbles: true}));
+    out.подсказкаГруппы = (document.querySelector('.qbox.wide') || {}).textContent || '';
+    if (tipG) tipG.dispatchEvent(new MouseEvent('mouseout', {bubbles: true}));
     const rowU = document.querySelector('tr.row[data-id="u1"]');
     out.чужаяКрасная = txt(rowU && rowU.querySelector('.note.bad'));
     const rowG = document.querySelector('tr.row[data-id="g1"]');
@@ -250,6 +261,14 @@ def main() -> int:
     check("у донора метка «Проблема в доноре»", res.get("меткаДонора"), "Проблема в доноре")
     check("и смысл вместо имени исключения",
           res.get("строкаДонора"), "Проблема в доноре ролик удалён или закрыт автором")
+    t = res.get("подсказкаДонора") or ""
+    check("наведение на причину: что случилось", "Это не сбой студии." in t, True)
+    check("   что делать", "Что делать: Уберите ссылку" in t, True)
+    check("   и запись движка как есть",
+          "Запись движка: у ролика нет субтитров (VideoUnplayable)" in t, True)
+    check("уход курсора подсказку закрывает", res.get("подсказкаУшла"), True)
+    check("у заголовка группы — то же объяснение",
+          "Что делать: Выберите пресет обложки" in (res.get("подсказкаГруппы") or ""), True)
     check("незнакомая причина — красной строкой, как раньше",
           res.get("чужаяКрасная"), "зависло на шаге «upload_running»")
 

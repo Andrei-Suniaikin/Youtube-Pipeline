@@ -81,8 +81,11 @@ def main() -> int:
 
     print("\nДонор — «проблема в доноре», имя исключения переведено")
     реальные = {   # дословно из pub_releases.blocked_reason на VPS 03.10.2026
-        "у ролика нет субтитров (VideoUnplayable)": "автор скрыл видео — достать субтитры невозможно",
-        "у ролика нет субтитров (VideoUnavailable)": "автор скрыл видео — достать субтитры невозможно",
+        # 09.10.2026, владелец: показывать настоящую ошибку — ролика нет, а не субтитров.
+        "у ролика нет субтитров (VideoUnplayable)": "ролик-донор удалён или скрыт на YouTube",
+        "у ролика нет субтитров (VideoUnavailable)": "ролик-донор удалён или скрыт на YouTube",
+        "ролик-донор удалён или скрыт на YouTube (VideoUnplayable)":
+            "ролик-донор удалён или скрыт на YouTube",
         "у ролика нет субтитров (TranscriptsDisabled)": "автор ролика отключил субтитры",
         "у ролика нет субтитров (NoTranscriptFound)": "у ролика нет субтитров ни на одном языке",
         "у ролика нет субтитров (AgeRestricted)":
@@ -103,7 +106,42 @@ def main() -> int:
     check("и что делать: другой ролик", "другой ролик-донор" in b["fix"], True)
     check("«вернуть в работу» не предлагается", b["revive"], False)
     check("строка для сводки", b["short"],
-          "проблема в доноре: автор скрыл видео — достать субтитры невозможно — нужен другой ролик")
+          "проблема в доноре: ролик-донор удалён или скрыт на YouTube — нужен другой ролик")
+    check("сказано, что Минск не поможет", "минской машине" in b["what"], True)
+
+    print("\nЗаливка: вход в Google и AdsPower — словами и с тем, что делать (09.10.2026)")
+    вход = {   # дословно из pub_releases.blocked_reason на VPS 08.10.2026
+        "AdsPower: [k1bouve5] is being used by [vova04.2007@gmail.com] and is not allowed to open":
+            "профиль AdsPower открыт у другого участника команды",
+        "not logged in / no access: https://studio.youtube.com/channel/UCDrgZuUJTA-USD4jiFrmHdA/ "
+        "| account recovery blocked: RecoveryBlocked":
+            "в профиле AdsPower нет входа в Google-аккаунт канала",
+        "Studio не отдала рабочее состояние канала (доступ не подтверждён): "
+        "https://studio.youtube.com/channel/UCWazqTA6b8zOMS7SyrzPbaA/ | account recovery "
+        "blocked: RecoveryBlocked": "YouTube Studio канала не открылась — вход не подтверждён",
+        "account recovery needs the owner: Google requires an additional sign-in step":
+            "Google просит дополнительное подтверждение входа",
+        "dedup не выполнен: состояние канала не прочитано — заливку не начинаю":
+            "заливщик не прочитал ролики канала — заливать не стал",
+        "account recovery needs the owner: no exact account binding for this profile+channel":
+            "для автовхода нет данных аккаунта этого канала",
+    }
+    for сырая, смысл in вход.items():
+        b = B.explain(сырая)
+        check(f"«{сырая[:44]}» → канал", (b.get("kind"), b.get("title")), ("channel", смысл))
+        check("   есть что делать и возврат в работу", (bool(b.get("fix")), b.get("revive")),
+              (True, True))
+    b = B.explain(next(iter(вход)))
+    check("в объяснении названа учётка, у которой открыт профиль",
+          "vova04.2007@gmail.com" in b["what"], True)
+    b = B.explain("Studio не отдала рабочее состояние канала (доступ не подтверждён): x | "
+                  "account recovery blocked: RecoveryBlocked")
+    check("про заблокированный автовход сказано", "Автовход" in b["what"], True)
+    for сырая in ("SCHEDULED, но нет точного подтверждения Studio (только строковое)",
+                  "ролик залит, но Studio показывает «неизвестно»"):
+        b = B.explain(сырая)
+        check(f"«{сырая[:40]}» → проверить на YouTube, без возврата",
+              (b.get("kind"), b.get("revive")), ("check", False))
 
     print("\nНаша беда, беда канала и обложки — словами (04.10.2026: «разгребём, что наше»)")
     for сырая, вид in (("зависло на шаге «upload_running» и попытки исчерпаны", "studio"),
