@@ -1502,6 +1502,109 @@ class PubServices:
             return point.strftime("%d.%m %H:%M")
         return ""
 
+    def _yields_slot(self, c, item) -> bool:
+        """Может ли строка плана уступить свой выход готовому ролику.
+
+        Уступает только то, чего в YouTube точно нет: строка без выпуска или выпуск, который
+        до заливки не дошёл (в производстве; либо в разборе с мёртвым заданием, которое
+        «Вернуть в работу» всё равно аннулирует). Ролик, у которого есть живое задание,
+        начатая загрузка или подтверждение руками, держит свой выход — сдвинуть его значит
+        разойтись с расписанием, уже стоящим в Studio.
+        """
+        from pub_engine import reached_irreversible
+        if item["status"] not in ("planned", "running", "error"):
+            return False
+        if (item["slot_mode"] or "auto") != "auto":
+            return False
+        rels = c.execute("SELECT release_id, status, hand_confirmed FROM pub_releases "
+                         "WHERE plan_item_id=? AND status!='cancelled'", (item["id"],)).fetchall()
+        if not rels:
+            # Карантинная строка без выпуска держит выход: её ролик может стоять в Studio.
+            return item["status"] == "planned"
+        for r in rels:
+            if r["status"] not in ("pending", "running", "blocked") or r["hand_confirmed"]:
+                return False
+            if reached_irreversible(c, r["release_id"]):
+                return False
+            job = self._upload_job(c, r["release_id"])
+            if job is not None and not (
+                    r["status"] == "blocked" and (job["status"] or "") != "running"
+                    and not job["claim_token"] and not job["video_id"]):
+                return False
+        return True
+
+    def _pull_forward(self, c, rel) -> str:
+        """Готовый ролик — на ближайший выход, который держит ещё не готовый. Возвращает время или ''.
+
+        08.10.2026: выходы раздаются на горизонт канала (18 дней) в момент появления строки
+        плана, и ролик заливался ровно в свой. Ближние выпуски застряли (вход в профиль),
+        а готовые ушли в отложку на 17–18.10 — неделя без роликов, хотя ролики есть.
+        Теперь готовый занимает ближайший свободный выход либо меняется выходом с тем, кто
+        его держит, но сам ещё не готов (тот уезжает на прежнее время готового).
+        """
+        import datetime as dt
+        import json as _json
+        from channel_slots import upcoming_slots, ScheduleError
+
+        item = c.execute("SELECT * FROM pub_plan_items WHERE id=?",
+                         (rel["plan_item_id"],)).fetchone()
+        if not item or (item["slot_mode"] or "auto") != "auto":
+            return ""
+        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=?", (rel["channel_id"],)).fetchone()
+        if not ch:
+            return ""
+        try:
+            schedule = _json.loads(ch["schedule"] or "{}")
+            if not schedule:
+                return ""
+            now = self._clock()
+            slots = upcoming_slots(schedule, ch["tz"], ready_slot_horizon(ch),
+                                   dt.datetime.fromtimestamp(now, dt.timezone.utc))
+        except (ScheduleError, ValueError):
+            return ""
+        mine = round(float(rel["slot_at"]))
+        for point in slots:
+            stamp = round(point.timestamp())
+            if stamp >= mine:
+                return ""
+            if point.timestamp() <= now + UPLOAD_LEAD_SEC:
+                continue
+            holder = c.execute(
+                "SELECT * FROM pub_plan_items WHERE channel_id=? AND slot_at=? AND id!=? "
+                "AND status IN ('planned','frozen','running','done','error')",
+                (rel["channel_id"], stamp, item["id"])).fetchone()
+            if holder is not None and not self._yields_slot(c, holder):
+                continue
+            # Меняемся через пустое состояние: уникальный индекс не даёт двум строкам
+            # одновременно указывать на один выход.
+            if holder is not None:
+                c.execute("UPDATE pub_plan_items SET slot_at=NULL, updated=? WHERE id=?",
+                          (now, holder["id"]))
+            c.execute("UPDATE pub_plan_items SET slot_at=?, updated=? WHERE id=?",
+                      (stamp, now, item["id"]))
+            c.execute("UPDATE pub_releases SET slot_at=?, updated=? WHERE release_id=?",
+                      (stamp, now, rel["release_id"]))
+            when = point.strftime("%d.%m %H:%M")
+            if holder is not None:
+                c.execute("UPDATE pub_plan_items SET slot_at=?, updated=? WHERE id=?",
+                          (mine, now, holder["id"]))
+                for r in c.execute("SELECT release_id FROM pub_releases WHERE plan_item_id=? "
+                                   "AND status IN ('pending','running','blocked')",
+                                   (holder["id"],)).fetchall():
+                    c.execute("UPDATE pub_releases SET slot_at=?, updated=? WHERE release_id=?",
+                              (mine, now, r["release_id"]))
+                    # Мёртвое задание остановленного выпуска: время в нём тоже сдвигаем,
+                    # чтобы ни одна запись не показывала уступленный выход.
+                    c.execute("UPDATE pub_upload_jobs SET slot_at=?, schedule_iso=CASE "
+                              "WHEN schedule_iso!='' THEN ? ELSE '' END, updated=? "
+                              "WHERE release_id=? AND status!='running'",
+                              (mine, schedule_iso(mine, ch["tz"]), now, r["release_id"]))
+                    log_line(c, r["release_id"], "движок",
+                             f"уступил выход {when} готовому ролику канала — мой выход теперь "
+                             f"{schedule_iso(mine, ch['tz'])[:16].replace('T', ' ')}", now=now)
+            return when
+        return ""
+
     def do_upload_pending(self, c, rel):
         """Собрать комплект и поставить задание машине с профилем.
 
@@ -1534,6 +1637,12 @@ class PubServices:
             log_line(c, rel["release_id"], "движок",
                      f"к прежнему времени не успели — перенёс выход на {moved}")
             return {"wait": True}
+        if deferred:
+            earlier = self._pull_forward(c, rel)
+            if earlier:
+                log_line(c, rel["release_id"], "движок",
+                         f"ролик готов раньше своего выхода — поставил на ближайший: {earlier}")
+                return {"wait": True}
         if deferred and not self._deferred_room(c, rel):
             raise ResourceDown("отложка",
                                f"в отложке канала уже {rel['deferred_limit']} роликов — ждём места")
