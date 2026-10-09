@@ -95,6 +95,16 @@ def main() -> int:
     c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished) VALUES(2,'dev','tts','done',?,?)",
               (NOW - 60 * 60, NOW - 5 * 60))
     check("недавнее завершение снимает повод", keys(c), [])
+    # 09.10.2026: картинки на 1000+ кадров шли час и писали кадр в секунду — тревога
+    # «очередь встала» была ложной.
+    c = fresh()
+    c.execute("CREATE TABLE job_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, ts REAL, line TEXT)")
+    c.execute("INSERT INTO queue_tasks(job_id,tenant_id,kind,status,created,finished) VALUES(1,'dev','images','running',?,NULL)",
+              (NOW - 60 * 60,))
+    c.execute("INSERT INTO job_logs(job_id,ts,line) VALUES(1,?,'кадр')", (NOW - 30 * 60,))
+    check("долгая задача молчит 30 минут — повод", keys(c), ["queue_stalled"])
+    c.execute("INSERT INTO job_logs(job_id,ts,line) VALUES(1,?,'кадр')", (NOW - 20,))
+    check("долгая задача пишет журнал — не повод", keys(c), [])
 
     print("\nПовод 2 — провайдер на паузе")
     c = fresh()

@@ -82,6 +82,7 @@ import re
 import sys
 import os
 import shutil
+import sqlite3
 import time
 
 STATE_KEY = "alerts_state"
@@ -287,6 +288,21 @@ EXHAUSTED_WORDS = (
 )
 
 
+# Идущая задача, писавшая в журнал за это время, — живая, даже если долгая.
+LOG_ALIVE_SEC = _sec("VS_ALERT_LOG_ALIVE_SEC", 10 * 60)
+
+
+def _running_wrote_recently(c, now, where, args) -> bool:
+    try:
+        row = c.execute(
+            f"SELECT 1 FROM queue_tasks q WHERE q.status='running'{where} AND EXISTS("
+            f"SELECT 1 FROM job_logs l WHERE l.job_id=q.job_id AND l.ts > ?) LIMIT 1",
+            (*args, now - LOG_ALIVE_SEC)).fetchone()
+    except sqlite3.OperationalError:
+        return False                 # журнала задач нет — судим по завершениям, как раньше
+    return row is not None
+
+
 def check_queue_stalled(c, now, tenant=None) -> list:
     """§1. Очередь не пустая, но за 30 минут ничего не завершилось.
 
@@ -305,6 +321,11 @@ def check_queue_stalled(c, now, tenant=None) -> list:
         f"SELECT MAX(finished) FROM queue_tasks WHERE finished IS NOT NULL{where}",
         args).fetchone()[0]
     if last and now - last < STALL_SEC:
+        return []
+    if _running_wrote_recently(c, now, where, args):
+        # 09.10.2026: картинки на 1000+ кадров шли час, кадр в секунду, а тревога «очередь
+        # встала» ушла: за 30 минут ничего не ЗАВЕРШИЛОСЬ. Живая задача пишет журнал —
+        # это и есть движение.
         return []
     quiet = (f"последняя завершилась {_human(now - last)} назад" if last
              else "ни одна задача ещё не завершалась")
