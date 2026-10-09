@@ -854,6 +854,17 @@ def is_stuck(c, rel, now: float) -> bool:
     return not work_alive(c, rel, now)
 
 
+def _upload_verdict_reason(c, release_id: str, phase: str) -> str:
+    """Текст отказа заливщика, если он уже вынес вердикт по этому выпуску. Нет — пусто."""
+    if phase not in ("upload_pending", "upload_running", "scheduled"):
+        return ""
+    row = c.execute("SELECT status, error FROM pub_upload_jobs WHERE release_id=?",
+                    (release_id,)).fetchone()
+    if row is None or (row["status"] or "") not in ("repair", "error"):
+        return ""
+    return (row["error"] or "").strip()
+
+
 def next_phase(current: str) -> str:
     idx = PHASE_INDEX.get(current, 0)
     return PHASES[idx + 1] if idx + 1 < len(PHASES) else current
@@ -882,7 +893,11 @@ def advance(c, rel, services, now: float) -> str:
         except Exception:
             pass
         if attempts >= MAX_ATTEMPTS or reached_irreversible(c, rid):
-            quarantine(c, rel, now, f"зависло на шаге «{phase}» и попытки исчерпаны")
+            # Заливщик уже ответил отказом или «залит, но не подтверждён» — в разбор идёт
+            # его текст, а не «зависло»: 06.10.2026 ролик остался черновиком, а в разборе
+            # стояло «шаг завис трижды, вернуть в работу», и возврат был запрещён.
+            quarantine(c, rel, now, _upload_verdict_reason(c, rid, phase)
+                       or f"зависло на шаге «{phase}» и попытки исчерпаны")
             return "quarantined"
         _set(c, rid, now, attempts=attempts, status="pending",
              deadline=now + PHASE_DEADLINES.get(phase, DEFAULT_DEADLINE))

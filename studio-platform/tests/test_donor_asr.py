@@ -160,7 +160,7 @@ def main() -> int:
         check("и причина Минска в тексте", "403" in str(exc), True)
         b = block_reasons.explain(str(exc))
         check("экран: проблема в доноре", (b.get("kind"), b.get("title")),
-              ("donor", "субтитров нет, и распознать речь донора не вышло"))
+              ("donor", "не распознали речь донора"))
         check("и что делать — другой донор", "другой ролик-донор" in b.get("fix", ""), True)
     except ResourceDown as exc:
         check("выпуск падает", f"ResourceDown: {exc}", "ItemFailed")

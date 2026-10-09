@@ -185,6 +185,32 @@ def main() -> int:
     c.close()
     check("в разбор", step(rid), "quarantined")
 
+    print("\nЗалит черновиком, вердикт пришёл, срок вышел — в разбор с текстом заливщика")
+    draft = ("мастер не дошёл до шага Visibility (шаг=состояние недоступно) — ролик "
+             "остался черновиком, нужен проход FINALIZE")
+    rid = setup(claimed_ago=400, job_status="repair")
+    c = conn()
+    c.execute("UPDATE pub_upload_jobs SET video_id='ju9V-TY1neI', verdict='needs_repair', "
+              "error=?, claim_token=NULL WHERE release_id=?", (draft, rid))
+    c.commit()
+    c.close()
+    check("в разбор", step(rid), "quarantined")
+    reason = rel_row(rid)["blocked_reason"] or ""
+    check("причина — слова заливщика, не «зависло»", reason, draft)
+    import block_reasons
+    b = block_reasons.explain(reason)
+    check("на экране: проверить на YouTube, черновик, возврат запрещён",
+          (b.get("kind"), "черновиком" in b.get("title", ""), b.get("revive")),
+          ("check", True, False))
+    c = conn()
+    check("«Вернуть в работу» отказывает", E.revive(c, rid, NOW).get("ok"), False)
+    c.close()
+
+    print("\nВердикта нет — по-прежнему «зависло»")
+    rid = setup(claimed_ago=720)
+    step(rid)
+    check("причина «зависло»", (rel_row(rid)["blocked_reason"] or "").startswith("зависло"), True)
+
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
