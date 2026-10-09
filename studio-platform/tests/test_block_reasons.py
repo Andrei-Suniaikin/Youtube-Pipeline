@@ -121,6 +121,9 @@ def main() -> int:
         "blocked: RecoveryBlocked": "Studio канала не открылась — нет входа",
         "account recovery needs the owner: Google requires an additional sign-in step":
             "Google просит подтвердить вход",
+        # 09.10.2026: так заливщик отвечает на каждую следующую попытку после первой.
+        "account recovery needs the owner: owner help already requested for this account "
+        "recently": "автовход ждёт человека",
         "dedup не выполнен: состояние канала не прочитано — заливку не начинаю":
             "не прочитан список роликов канала",
         "account recovery needs the owner: no exact account binding for this profile+channel":
