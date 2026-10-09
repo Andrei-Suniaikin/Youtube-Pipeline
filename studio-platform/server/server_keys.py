@@ -69,6 +69,17 @@ _GOOGLE_WHERE = {
 }
 
 
+def clean_client_id(value: str) -> str:
+    """Client ID без мусора вокруг. 09.10.2026 он лежал как «https://…apps.googleusercontent
+    .com» — скопирован вместе со схемой, — и Google отвечал «OAuth client was not found»
+    на каждое подключение канала."""
+    value = (value or "").strip()
+    for scheme in ("https://", "http://"):
+        if value.lower().startswith(scheme):
+            value = value[len(scheme):]
+    return value.strip().rstrip("/")
+
+
 def _google_kind(value: str) -> str:
     if value.endswith(_CLIENT_ID_END):
         return "yt_oauth_client_id"
@@ -201,6 +212,8 @@ def set_value(family: str, value: str) -> Dict[str, Any]:
     if family not in EDITABLE_KEYS:
         raise KeyError_("такой ключ отсюда не меняется")
     value = _check(value)
+    if family == "yt_oauth_client_id":
+        value = clean_client_id(value)
     _check_google(family, value)
     data = _load()
     previous = _values(data, family)

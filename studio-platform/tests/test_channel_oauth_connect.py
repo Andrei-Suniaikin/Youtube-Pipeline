@@ -203,6 +203,15 @@ def main() -> int:
           [(u, f.get("token")) for u, f in GOOGLE["calls"]],
           [(O.REVOKE_URL, "1//refresh-токен-канала-abcd")])
 
+    print("\nClient ID сохранён со схемой «https://» — в Google уходит чистый")
+    raw = os.environ["VS_YT_OAUTH_CLIENT_ID"]
+    os.environ["VS_YT_OAUTH_CLIENT_ID"] = "https://" + raw + "/"
+    _r, url2, q = begin()
+    check("client_id без схемы", q.get("client_id"), raw)
+    os.environ["VS_YT_OAUTH_CLIENT_ID"] = raw
+    import server_keys
+    check("и при сохранении ключа", server_keys.clean_client_id(" https://" + raw), raw)
+
     print("\nАдрес возврата переопределяется окружением")
     os.environ["VS_YT_OAUTH_REDIRECT"] = "http://localhost:8090/oauth/callback"
     _r, _u, q = begin()

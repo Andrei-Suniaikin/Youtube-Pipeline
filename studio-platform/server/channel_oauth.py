@@ -130,14 +130,16 @@ def client() -> tuple:
     оператор добывает токен, с ЧУЖИМИ (её собственными) реквизитами выданный токен
     отзывается через сутки. Со своими — живёт, пока не отзовут.
     """
-    cid = (os.environ.get("VS_YT_OAUTH_CLIENT_ID") or "").strip()
+    import server_keys
+    cid = server_keys.clean_client_id(os.environ.get("VS_YT_OAUTH_CLIENT_ID") or "")
     sec = (os.environ.get("VS_YT_OAUTH_CLIENT_SECRET") or "").strip()
     if cid and sec:
         return cid, sec
     try:
-        import server_keys
         data = server_keys._load()   # noqa: SLF001 — читаем тот же файл ключей
-        cid = cid or str(data.get("yt_oauth_client_id") or "").strip()
+        # Уже сохранённое со схемой («https://…») чистим при чтении: пересохранять
+        # ключ руками ради этого никто не должен.
+        cid = cid or server_keys.clean_client_id(str(data.get("yt_oauth_client_id") or ""))
         sec = sec or str(data.get("yt_oauth_client_secret") or "").strip()
     except Exception:                                      # noqa: BLE001
         pass
