@@ -110,6 +110,9 @@ SCENARIO = r"""
     await go();
     out.неПодключено = (card() || {}).textContent || '';
     out.полеЕсть = !!(card() || document.body).querySelector('#tok');
+    // 09.10.2026: основной путь — кнопка Google; ручная вставка свёрнута ниже.
+    out.кнопкаGoogle = (((card() || document.body).querySelector('#google') || {})
+                        .textContent || '').trim();
 
     // Вставляем токен и смотрим, что ушло на сервер и не осело на экране.
     const input = card().querySelector('#tok');
@@ -207,6 +210,8 @@ def main() -> int:
     has("предупреждён выбор канала", off, "какой канал")
     has("предупреждён экран «не проверено»", off, "не проверено")
     check("поле для токена есть", res.get("полеЕсть"), True)
+    check("кнопка «Подключить через Google» есть", res.get("кнопкаGoogle"),
+          "Подключить через Google")
 
     print("Токен уходит на сервер и не остаётся на экране")
     check("ушёл нужный маршрут", res.get("ушлоНаСервер"), ["/ui/channels/1/analytics"])

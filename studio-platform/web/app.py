@@ -38,7 +38,7 @@ sys.path.insert(0, SERVER)
 
 from fastapi import FastAPI, File, HTTPException, Query, Request, Response, UploadFile  # noqa: E402
 from fastapi.responses import (FileResponse, JSONResponse, Response,  # noqa: E402
-                               StreamingResponse)
+                               RedirectResponse, StreamingResponse)
 from starlette.concurrency import run_in_threadpool                # noqa: E402
 from pydantic import BaseModel, StrictInt                         # noqa: E402
 
@@ -7338,45 +7338,108 @@ class ChannelTokenIn(BaseModel):
     token: str = ""
 
 
+def _analytics_connect(c, ch, token: str) -> dict:
+    """Положить долгий токен канала → ПРОВЕРИТЬ, что он от этого канала → забрать прошлое.
+
+    Общий путь для вставки руками и для кнопки «Подключить через Google». Проверка
+    живым запросом обязательна: у заказчика каждый канал на своём гугл-аккаунте, и
+    «вошёл не тем аккаунтом» — вопрос времени. Без проверки чужие числа молча легли бы
+    в карточку этого канала. Не сошлось — токен НЕ остаётся лежать: полуподключённый
+    канал хуже неподключённого, он выглядит рабочим.
+    """
+    channel_oauth.set_token(ch["id"], token)
+    check = pub_analytics.verify(ch["id"], ch["uc"])
+    if not check["ok"]:
+        channel_oauth.drop(ch["id"])
+        raise channel_oauth.OAuthError(check["why"])
+    got = pub_analytics.collect_channel(c, ch["id"], ch["uc"])
+    _audit(f'статистика канала «{ch["name"]}» подключена')
+    return got
+
+
+def _analytics_channel(c, cid: int):
+    ch = c.execute("SELECT id, uc, name FROM pub_channels WHERE id=? AND tenant_id=?",
+                   (cid, TENANT)).fetchone()
+    if ch is None:
+        raise HTTPException(404, "канала нет")
+    if not (ch["uc"] or "").strip():
+        raise HTTPException(400, "у канала не заполнен ID YouTube — без него нельзя "
+                                 "проверить, что доступ выдан именно этим каналом")
+    if not channel_oauth.client_ready():
+        raise HTTPException(400, "не заданы реквизиты приложения Google — впишите их "
+                                 "на странице «Ключи», иначе обновить доступ нечем")
+    return ch
+
+
 @app.post("/ui/channels/{cid:int}/analytics")
 def ui_channel_analytics_connect(cid: int, body: ChannelTokenIn, request: Request):
-    """Подключить канал к подробной статистике вставленным токеном.
-
-    Три шага в одном нажатии, и порядок важен: запомнить → ПРОВЕРИТЬ, что токен именно
-    от этого канала → забрать прошлое. Проверка живым запросом обязательна: у заказчика
-    каждый канал на своём гугл-аккаунте, токены вставляются руками сотню раз подряд, и
-    «вставил не в ту строку» — не гипотеза, а вопрос времени. Без проверки чужие числа
-    молча легли бы в карточку этого канала.
-
-    Не сошлось — токен НЕ остаётся лежать: полуподключённый канал хуже неподключённого,
-    он выглядит рабочим.
-    """
+    """Подключить канал к подробной статистике вставленным токеном (запасной путь)."""
     _require_admin(request)
     c = db()
     try:
-        ch = c.execute("SELECT id, uc, name FROM pub_channels WHERE id=? AND tenant_id=?",
-                       (cid, TENANT)).fetchone()
-        if ch is None:
-            raise HTTPException(404, "канала нет")
-        if not (ch["uc"] or "").strip():
-            raise HTTPException(400, "у канала не заполнен ID YouTube — без него нельзя "
-                                     "проверить, что токен от этого канала")
-        if not channel_oauth.client_ready():
-            raise HTTPException(400, "не заданы реквизиты приложения Google — впишите их "
-                                     "на странице «Ключи», иначе обновить доступ нечем")
+        ch = _analytics_channel(c, cid)
         try:
-            channel_oauth.set_token(cid, body.token)
+            got = _analytics_connect(c, ch, body.token)
         except channel_oauth.OAuthError as exc:
             raise HTTPException(400, str(exc))
-        check = pub_analytics.verify(cid, ch["uc"])
-        if not check["ok"]:
-            channel_oauth.drop(cid)
-            raise HTTPException(400, check["why"])
-        got = pub_analytics.collect_channel(c, cid, ch["uc"])
-        _audit(f'статистика канала «{ch["name"]}» подключена')
         return {"access": channel_oauth.state(cid), "loaded_days": got["days"],
                 "why": got["why"],
                 "analytics": pub_analytics.channel_state(c, cid)}
+    finally:
+        c.close()
+
+
+@app.post("/ui/channels/{cid:int}/analytics/google")
+def ui_channel_analytics_google(cid: int, request: Request):
+    """Начать подключение кнопкой: адрес окна согласия Google для этого канала."""
+    user = _require_admin(request)
+    c = db()
+    try:
+        _analytics_channel(c, cid)
+    finally:
+        c.close()
+    try:
+        return {"url": channel_oauth.start(cid, user["id"])}
+    except channel_oauth.OAuthError as exc:
+        raise HTTPException(400, str(exc))
+
+
+@app.get("/oauth/callback", include_in_schema=False)
+def oauth_callback(request: Request, state: str = "", code: str = "", error: str = ""):
+    """Сюда Google возвращает человека после окна согласия.
+
+    Путь вне /ui/, поэтому вход проверяем сами: ответ Google принимает только тот же
+    вошедший администратор, который нажал кнопку (`state` привязан к нему). Итог — назад
+    на вкладку статистики канала, словами в адресе: экран покажет его и уберёт.
+    """
+    def back(cid, ok: bool, msg: str):
+        q = urllib.parse.urlencode({"oauth": "ok" if ok else "err", "msg": msg})
+        where = f"#/channel/{cid}/statistika" if cid else "#/channels"
+        # «../» от …/oauth/callback — корень пульта, с префиксом /studio и без него.
+        return RedirectResponse(f"../?{q}{where}", 303)
+
+    c = db()
+    try:
+        user = auth.who(c, request.cookies.get(auth.COOKIE) or "")
+        role = (user["role"] if user is not None and "role" in user.keys() else "") or ""
+        if role != "admin":
+            return back(0, False, "войдите в студию администратором и подключите заново")
+        try:
+            cid = channel_oauth.pending_channel(state, user["id"])
+        except channel_oauth.OAuthError as exc:
+            return back(0, False, str(exc))
+        if error or not code:
+            why = ("вы отменили доступ на экране Google" if error == "access_denied"
+                   else f"Google вернул отказ: {error or 'без кода'}")
+            return back(cid, False, why)
+        try:
+            ch = _analytics_channel(c, cid)
+            got = _analytics_connect(c, ch, channel_oauth.exchange(code))
+        except HTTPException as exc:
+            return back(cid, False, str(exc.detail))
+        except channel_oauth.OAuthError as exc:
+            return back(cid, False, str(exc))
+        return back(cid, True, f"канал подключён, забрано дней: {got['days']}")
     finally:
         c.close()
 
@@ -7395,6 +7458,9 @@ def ui_channel_analytics_off(cid: int, request: Request):
                        (cid, TENANT)).fetchone()
         if ch is None:
             raise HTTPException(404, "канала нет")
+        # Отзываем и у Google: «Отключить» значит, что доступа у студии больше нет,
+        # а не только что мы забыли токен (так обещает политика конфиденциальности).
+        channel_oauth.revoke(cid)
         channel_oauth.drop(cid)
         _audit(f'статистика канала «{ch["name"]}» отключена')
         return {"access": channel_oauth.state(cid)}

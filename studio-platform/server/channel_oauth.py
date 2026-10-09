@@ -285,3 +285,112 @@ def forget_cache(channel_id: int | None = None) -> None:
             _CACHE.clear()
         else:
             _CACHE.pop(int(channel_id), None)
+
+
+# ───────────────────────────── подключение кнопкой ─────────────────────────────
+#
+# 09.10.2026. Раньше токен добывали на служебной странице Google (OAuth Playground) и
+# вставляли руками. Для проверки приложения Google это не годится: адрес возврата
+# должен быть на нашем подтверждённом домене, а демо-видео — показывать наш поток
+# согласия. Теперь кнопка «Подключить через Google» уводит в окно согласия, Google
+# возвращает код на наш адрес, мы меняем его на тот же долгий токен.
+
+AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+REVOKE_URL = "https://oauth2.googleapis.com/revoke"
+# Ровно пара только для чтения — почему именно она, см. `analyticsHowTo` в пульте.
+SCOPES = ("https://www.googleapis.com/auth/yt-analytics.readonly",
+          "https://www.googleapis.com/auth/youtube.readonly")
+# Адрес возврата обязан побайтно совпадать с внесённым в «Authorized redirect URIs».
+DEFAULT_REDIRECT = "https://vovastudio.work/studio/oauth/callback"
+PENDING_SEC = 15 * 60
+
+_PENDING: Dict[str, Dict] = {}     # state → {"channel": id, "user": id, "until": ...}
+
+
+def redirect_uri() -> str:
+    return (os.environ.get("VS_YT_OAUTH_REDIRECT") or "").strip() or DEFAULT_REDIRECT
+
+
+def start(channel_id: int, user_id, now: Optional[float] = None) -> str:
+    """Адрес окна согласия Google для этого канала.
+
+    `state` — одноразовый и привязан к человеку, который нажал кнопку: чужой ответ
+    Google (или подделанная ссылка) не положит токен в наш канал.
+    """
+    import secrets
+    cid, _sec = client()
+    if not cid:
+        raise OAuthError("не заданы реквизиты приложения Google — впишите их на "
+                         "странице «Ключи»")
+    now = time.time() if now is None else now
+    token = secrets.token_urlsafe(24)
+    with _LOCK:
+        for k in [k for k, v in _PENDING.items() if v["until"] < now]:
+            _PENDING.pop(k, None)
+        _PENDING[token] = {"channel": int(channel_id), "user": user_id,
+                           "until": now + PENDING_SEC}
+    return AUTH_URL + "?" + urllib.parse.urlencode({
+        "client_id": cid,
+        "redirect_uri": redirect_uri(),
+        "response_type": "code",
+        "scope": " ".join(SCOPES),
+        # offline + consent: без них Google не выдаёт долгий токен повторно.
+        "access_type": "offline",
+        "prompt": "select_account consent",
+        "include_granted_scopes": "false",
+        "state": token,
+    })
+
+
+def pending_channel(state_token: str, user_id, now: Optional[float] = None) -> int:
+    """Канал, для которого начато подключение. Одноразово: второй раз — отказ."""
+    now = time.time() if now is None else now
+    with _LOCK:
+        got = _PENDING.pop(str(state_token or ""), None)
+    if got is None or got["until"] < now:
+        raise OAuthError("ссылка подключения устарела или уже использована — нажмите "
+                         "«Подключить через Google» ещё раз")
+    if got["user"] != user_id:
+        raise OAuthError("подключение начато другим пользователем студии")
+    return got["channel"]
+
+
+def exchange(code: str, post=None) -> str:
+    """Код из ответа Google → долгий токен. Проверяет, что выданы ОБА права."""
+    post = post or _post
+    cid, sec = client()
+    try:
+        out = post(TOKEN_URL, {"code": code, "client_id": cid, "client_secret": sec,
+                               "redirect_uri": redirect_uri(),
+                               "grant_type": "authorization_code"})
+    except urllib.error.HTTPError as exc:
+        try:
+            why = json.loads(exc.read().decode("utf-8") or "{}").get("error") or exc.code
+        except Exception:                                  # noqa: BLE001
+            why = exc.code
+        raise OAuthError(f"Google не обменял код на токен ({why}) — попробуйте ещё раз")
+    except Exception as exc:                               # noqa: BLE001
+        raise OAuthError(f"Google не ответил: {type(exc).__name__}")
+    granted = set(str(out.get("scope") or "").split())
+    missing = [s.rsplit("/", 1)[-1] for s in SCOPES if s not in granted]
+    if missing:
+        # Согласие дробное: снятая галочка даёт рабочий с виду токен без отчётов.
+        raise OAuthError("на экране Google сняли галочку: не выдано " + ", ".join(missing)
+                         + " — подключите заново и оставьте обе галочки")
+    refresh = str(out.get("refresh_token") or "")
+    if not refresh:
+        raise OAuthError("Google не выдал долгий токен — подключите ещё раз")
+    return refresh
+
+
+def revoke(channel_id: int, post=None) -> bool:
+    """Отозвать согласие у Google (кнопка «Отключить»). Сбой — не повод не отключать."""
+    data = _read(channel_id)
+    refresh = data.get("refresh") or ""
+    if not refresh:
+        return False
+    try:
+        (post or _post)(REVOKE_URL, {"token": refresh})
+        return True
+    except Exception:                                      # noqa: BLE001
+        return False

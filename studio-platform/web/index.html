@@ -3861,22 +3861,48 @@ function analyticsKeyBlock(id, acc){
   const dead = acc.state === 'dead';
   // Раскрыт тогда, когда ключ нужен прямо сейчас. У работающего канала — свёрнут.
   const open = (!connected || dead) ? ' open' : '';
+  // 09.10.2026: основной путь — кнопка, окно согласия Google и возврат к нам. Вставка
+  // токена из OAuth Playground осталась запасной, свёрнутой ниже.
   return `<details class="keyblock" style="margin-top:12px"${open}>
     <summary style="cursor:pointer;font-weight:600;font-size:13px">${
-      connected ? (dead ? 'Выдать новый ключ этому каналу' : 'Заменить ключ этого канала')
-                : 'Как получить ключ для этого канала'}</summary>
+      connected ? (dead ? 'Подключить канал заново' : 'Переподключить канал')
+                : 'Подключить канал'}</summary>
     ${acc.client === false ? `<div class="note bad" style="margin-top:10px">
       Сначала впишите Client ID и Client secret приложения Google на странице
-      «Ключи» (в начале списка общих ключей) — без них токен обновлять нечем.</div>` : ''}
-    <div style="margin-top:10px">
-      <input id="tok" style="width:100%;font-family:var(--mono);font-size:12px"
-        placeholder="refresh token из OAuth Playground" autocomplete="off"></div>
-    <div style="margin-top:10px"><button id="on" class="small">${
-      connected ? 'Заменить' : 'Подключить'}</button></div>
-    ${analyticsHowTo(id)}
+      «Ключи» (в начале списка общих ключей) — без них подключать нечем.</div>` : ''}
+    <div style="margin-top:10px"><button id="google">${
+      connected ? 'Переподключить через Google' : 'Подключить через Google'}</button></div>
+    <div class="note muted" style="margin-top:10px;line-height:1.7">
+      Нажимать <b>внутри профиля AdsPower, где залогинен этот канал</b>. Google спросит
+      аккаунт — выбрать владельца канала; если спросит канал — именно этот. На экране
+      согласия <b>оставить обе галочки</b>. Экран «приложение не проверено» —
+      «Дополнительно» → продолжить. После «Разрешить» студия сама проверит, что доступ
+      выдан этим каналом, и заберёт статистику.</div>
+    <details style="margin-top:12px">
+      <summary style="cursor:pointer;font-size:12px" class="muted">Вставить токен вручную
+        (OAuth Playground)</summary>
+      <div style="margin-top:10px">
+        <input id="tok" style="width:100%;font-family:var(--mono);font-size:12px"
+          placeholder="refresh token из OAuth Playground" autocomplete="off"></div>
+      <div style="margin-top:10px"><button id="on" class="small ghost">${
+        connected ? 'Заменить' : 'Подключить'}</button></div>
+      ${analyticsHowTo(id)}
+    </details>
   </details>`;
 }
 
+/* Итог подключения кнопкой: Google вернул человека на /oauth/callback, тот — сюда, с
+   итогом в адресе (`?oauth=ok|err&msg=…`). Показать и убрать из адреса, чтобы
+   обновление страницы не повторяло сообщение. */
+function oauthReturnNotice(){
+  let q;
+  try { q = new URLSearchParams(location.search); } catch(e) { return; }
+  const st = q.get('oauth');
+  if (!st) return;
+  toast(q.get('msg') || (st === 'ok' ? 'Канал подключён' : 'Подключить не вышло'),
+        st === 'ok' ? 'ok' : undefined);
+  try { history.replaceState(null, '', location.pathname + location.hash); } catch(e) {}
+}
 
 function channelStatsTab(id, d){
   app.append(channelStatsCard(id, d.stats || {}));
@@ -3925,9 +3951,17 @@ function channelStatsTab(id, d){
       await render();
     }catch(e){ toast(e.message); on.disabled = false; }
   };
+  const g = card.querySelector('#google');
+  if (g) g.onclick = async () => {
+    g.disabled = true;
+    try{
+      const out = await post(`/ui/channels/${encodeURIComponent(id)}/analytics/google`, {});
+      location.href = out.url;
+    }catch(e){ toast(e.message); g.disabled = false; }
+  };
   const off = card.querySelector('#off');
   if (off) off.onclick = () => confirmModal('Отключить подробную статистику?',
-    'Согласие будет забыто. Уже собранные числа останутся — их не теряем.',
+    'Доступ будет отозван и у Google. Уже собранные числа останутся — их не теряем.',
     async () => {
       try{
         await api(`/ui/channels/${encodeURIComponent(id)}/analytics`, {method: 'DELETE'});
@@ -12722,6 +12756,7 @@ function busyOff(){
 sfindWatch();                      // длинные списки получают поиск сами
 addEventListener('hashchange', render);
 render();
+oauthReturnNotice();
 </script>
 </body>
 </html>

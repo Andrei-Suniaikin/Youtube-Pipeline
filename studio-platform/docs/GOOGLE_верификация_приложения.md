@@ -23,7 +23,7 @@
 | Подтверждение домена в Search Console | ❓ проверить (шаг 1) |
 | Логотип 120×120 | ❌ нужен |
 | Демо-видео | ❌ нужно снять (шаг 6) |
-| Свой адрес возврата после согласия | ⚠️ сейчас OAuth Playground — см. «Главный риск» |
+| Свой адрес возврата после согласия | ✅ `https://vovastudio.work/studio/oauth/callback` (кнопка «Подключить через Google», 09.10) |
 
 Права, которые просим, — **ровно два**, оба «чувствительные» (sensitive), не
 «ограниченные» (restricted). Поэтому платного аудита безопасности (CASA) **не будет**,
@@ -46,7 +46,8 @@
 
 Что нужно: кнопка «Подключить канал» в студии, которая сама открывает окно согласия
 Google и принимает ответ на нашем адресе, например
-`https://vovastudio.work/oauth/callback`. Тогда:
+`https://vovastudio.work/studio/oauth/callback` (сделано 09.10.2026, путь с `/studio` —
+пульт на домене живёт под ним). Тогда:
 - адрес Playground из «Authorized redirect URIs» убирается;
 - демо-видео снимается на нашем собственном потоке, а не на служебной странице Google;
 - ребятам не нужно копировать refresh token руками.
@@ -170,14 +171,14 @@ Google и принимает ответ на нашем адресе, напри
 | 1 | Открыть `https://vovastudio.work/` | «Vova Studio — dashboard for our own YouTube channels» |
 | 2 | Прокрутить вниз, кликнуть Privacy Policy, затем Terms | показать, что страницы открываются |
 | 3 | Войти в студию, открыть список каналов, выбрать канал | «Each owner connects their own channel» |
-| 4 | Нажать «Подключить канал / Connect channel» | — |
+| 4 | Вкладка «Статистика» канала → «Подключить через Google» | — |
 | 5 | **Окно Google: выбор аккаунта** → выбрать аккаунт-владелец канала | — |
 | 6 | **Экран согласия:** видно `Vova Studio`, оба права. **Курсором показать адресную строку** с `client_id=…apps.googleusercontent.com` | «Consent screen: app name and the two read-only scopes» |
 | 7 | Если вылез экран «Google hasn't verified this app» — это нормально до проверки, пройти «Advanced → Go to Vova Studio» | — |
 | 8 | Нажать «Allow / Разрешить», вернуться в студию на свой домен | показать адресную строку `vovastudio.work/...` |
 | 9 | Вкладка статистики канала: график по дням, просмотры, время просмотра, досмотр, подписчики | «This is the data from yt-analytics.readonly» — назвать метрики вслух/подписью |
 | 10 | Показать, что записать что-либо в канал нельзя (нет кнопок загрузки/правки, только чтение) | «youtube.readonly is required by reports.query; no write access» |
-| 11 | Показать «Отключить канал» и что данные удаляются | «Owner can disconnect at any time, data is deleted» |
+| 11 | Нажать «Отключить» | «Owner can disconnect at any time: access is revoked at Google; collected history is deleted on request, as the privacy policy says» |
 
 **Что НЕ показывать:** пароли, refresh token, секреты 2FA, чужие каналы, внутренние
 адреса серверов. Перед записью закрыть лишние вкладки и уведомления.
