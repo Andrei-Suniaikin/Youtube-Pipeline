@@ -121,7 +121,7 @@ def main() -> int:
     print("Список выпусков")
     check("пресет обложек → настройка канала", rels["rel-1"]["block"].get("kind"), "channel")
     check("донор → проблема в доноре", rels["rel-2"]["block"].get("kind"), "donor")
-    check("и смысл словами", rels["rel-2"]["block"].get("title"), "автор ролика отключил субтитры")
+    check("и смысл словами", rels["rel-2"]["block"].get("title"), "у донора отключены субтитры")
     check("живой выпуск с «ждём: …» — не приговор, перевода нет", rels["rel-3"]["block"], {})
     check("незнакомая причина — пусто, экран покажет как есть", rels["rel-4"]["block"], {})
     check("выпуск в работе — старая причина приговором не показывается",
@@ -130,7 +130,7 @@ def main() -> int:
     print("\nНедосмотры настройки канала, которые выпуск не останавливают")
     gaps = lambda rid: [g["title"] for g in rels[rid]["gaps"]]
     check("канал без пресетов, выпуск на тексте: оба недосмотра",
-          gaps("rel-6"), ["у канала не выбран пресет текста", "у канала не выбран пресет обложек"])
+          gaps("rel-6"), ["не выбран пресет текста", "не выбран пресет обложек"])
     check("и оба — «настройка канала», предупреждением",
           {(g["kind"], g["level"]) for g in rels["rel-6"]["gaps"]}, {("channel", "warn")})
     check("уже стоит на обложке — второй раз о ней не говорим, о тексте поздно",
@@ -143,7 +143,7 @@ def main() -> int:
 
     print("\nКарточка выпуска")
     d = W.ui_release("rel-1")
-    check("в карточке тот же перевод", d["release"]["block"].get("tag"), "Настройка канала")
+    check("в карточке тот же перевод", d["release"]["block"].get("tag"), "Настройки канала")
 
     print("\nКалендарь канала")
     import asyncio
@@ -160,6 +160,20 @@ def main() -> int:
     check("с пресетом — истина", tiles[с]["has_cover_preset"], True)
     check("пресет текста: нет — ложь", tiles[без]["has_text_preset"], False)
     check("есть — истина", tiles[с]["has_text_preset"], True)
+    check("у каналов без доноров впереди — «мало доноров»",
+          (tiles[без]["supply"]["low"], tiles[с]["supply"]["low"]), (True, True))
+
+    print("\nВосклицательные знаки (09.10.2026)")
+    a = W.ui_attention()
+    # У обоих каналов ближайший выход (сегодня или завтра в 18:00) пустой.
+    check("мало доноров — оба канала, в том же порядке, что у тревоги",
+          sorted(x["id"] for x in a["low_supply"]), sorted([без, с]))
+    check("порог — тот же, что у тревоги", a["supply_min_days"], 3.0)
+    check("в разборе — три выпуска", a["blocked"], 3)
+    sides = {s["kind"]: s["count"] for s in a["blocked_sides"]}
+    check("по сторонам: канал, донор, незнакомая", sides, {"channel": 1, "donor": 1, "": 1})
+    check("у узнанной стороны сказано, кто чинит",
+          all(s["who"] for s in a["blocked_sides"] if s["kind"]), True)
 
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

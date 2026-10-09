@@ -708,6 +708,7 @@ def ui_channels():
     try:
         now = time.time()
         facts = channel_supply.supply_facts(c, TENANT, now)
+        порог = _supply_threshold(c)
         out = []
         cover_of = {}          # пресет производства → его пресет обложек: каналы делят пресеты
         for ch in c.execute("SELECT * FROM pub_channels_live WHERE tenant_id=? ORDER BY name",
@@ -740,9 +741,62 @@ def ui_channels():
                                         or (ch["preset_rewrite"] or "")),
                 # Запас: `known=false` — «не знаем» (нет расписания), это НЕ ноль.
                 "supply": {"known": supply["known"], "items": supply["items"],
-                           "days": supply["days"], "covered": supply["covered"]},
+                           "days": supply["days"], "covered": supply["covered"],
+                           # «мало доноров» — по порогу тревоги §14; пауза не в счёт
+                           "low": bool(ch["status"] == "active" and supply["known"]
+                                       and supply["days"] < порог),
+                           "text": supply["text"], "min_days": порог},
             })
         return {"channels": out}
+    finally:
+        c.close()
+
+
+def _supply_threshold(c) -> float:
+    """Порог «мало доноров» — тот же, что у тревоги §14 (правится на экране «Админ»)."""
+    try:
+        pub_alerts.load_limits(c)
+    except Exception:                                              # noqa: BLE001
+        pass
+    return float(pub_alerts.SUPPLY_MIN_DAYS)
+
+
+@app.get("/ui/attention")
+def ui_attention():
+    """Что требует людей прямо сейчас — для восклицательных знаков в верхней панели.
+
+    09.10.2026, владелец: «если есть каналы, на которых не хватает ссылок на донора, в
+    топбаре показывать восклицательный знак, и на канале тоже плашку; та же идея на
+    вкладке с ошибками». Один лёгкий запрос на все вкладки: каналы без запаса (тот же
+    счёт и порог, что у тревоги §14 — разойтись им нельзя) и выпуски в разборе по
+    сторонам (`block_reasons`). Канал на паузе и без расписания не считается: ему
+    доноры не нужны или судить не по чему.
+    """
+    c = db()
+    try:
+        now = time.time()
+        порог = _supply_threshold(c)
+        facts = channel_supply.supply_facts(c, TENANT, now)
+        low = []
+        for ch in c.execute("SELECT * FROM pub_channels_live WHERE tenant_id=? "
+                            "AND status='active' ORDER BY name", (TENANT,)):
+            sup = channel_supply.channel_supply(ch, facts.get(ch["id"]), now=now)
+            if sup["known"] and sup["days"] < порог:
+                low.append({"id": ch["id"], "name": ch["name"],
+                            "days": round(sup["days"], 1), "text": sup["text"]})
+        low.sort(key=lambda x: (x["days"], x["name"]))
+        sides: dict = {}
+        blocked = 0
+        for r in c.execute("SELECT blocked_reason FROM pub_releases WHERE tenant_id=? "
+                           "AND status='blocked'", (TENANT,)):
+            blocked += 1
+            b = explain_block(r["blocked_reason"])
+            key = b.get("kind") or ""
+            s = sides.setdefault(key, {"kind": key, "tag": b.get("tag") or "Прочее",
+                                       "who": b.get("who") or "", "count": 0})
+            s["count"] += 1
+        return {"supply_min_days": порог, "low_supply": low, "blocked": blocked,
+                "blocked_sides": sorted(sides.values(), key=lambda s: -s["count"])}
     finally:
         c.close()
 

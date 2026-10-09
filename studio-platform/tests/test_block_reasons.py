@@ -72,29 +72,29 @@ def release(c, n, reason, status="blocked", phase="media_ready", preset_cover=""
 def main() -> int:
     print("Пресет обложек — «настройка канала», и сказано, где чинить")
     b = B.explain("у канала не выбран пресет обложек")
-    check("чья беда", (b["kind"], b["tag"]), ("channel", "Настройка канала"))
+    check("чья беда", (b["kind"], b["tag"]), ("channel", "Настройки канала"))
     check("что делать — настройки канала", "настройках канала" in b["fix"], True)
     check("и что выпуски вернутся сами", "вернутся в работу сами" in b["fix"], True)
     check("возврат в работу имеет смысл", b["revive"], True)
     check("строка для сводки", b["short"],
-          "настройка канала: у канала не выбран пресет обложек — выбрать в настройках канала")
+          "настройки канала: не выбран пресет обложек — выбрать в настройках канала")
 
     print("\nДонор — «проблема в доноре», имя исключения переведено")
     реальные = {   # дословно из pub_releases.blocked_reason на VPS 03.10.2026
         # 09.10.2026, владелец: показывать настоящую ошибку — ролика нет, а не субтитров.
-        "у ролика нет субтитров (VideoUnplayable)": "ролик-донор удалён или скрыт на YouTube",
-        "у ролика нет субтитров (VideoUnavailable)": "ролик-донор удалён или скрыт на YouTube",
+        "у ролика нет субтитров (VideoUnplayable)": "донор удалён или скрыт на YouTube",
+        "у ролика нет субтитров (VideoUnavailable)": "донор удалён или скрыт на YouTube",
         "ролик-донор удалён или скрыт на YouTube (VideoUnplayable)":
-            "ролик-донор удалён или скрыт на YouTube",
-        "у ролика нет субтитров (TranscriptsDisabled)": "автор ролика отключил субтитры",
-        "у ролика нет субтитров (NoTranscriptFound)": "у ролика нет субтитров ни на одном языке",
+            "донор удалён или скрыт на YouTube",
+        "у ролика нет субтитров (TranscriptsDisabled)": "у донора отключены субтитры",
+        "у ролика нет субтитров (NoTranscriptFound)": "у донора нет субтитров",
         "у ролика нет субтитров (AgeRestricted)":
-            "у ролика ограничение по возрасту — YouTube не отдаёт его субтитры",
-        "у ролика нет субтитров": "у ролика нет субтитров",
-        "у ролика нет субтитров (ЧтоТоНовое)": "у ролика нет субтитров",
+            "донор 18+ — YouTube не отдаёт субтитры",
+        "у ролика нет субтитров": "у донора нет субтитров",
+        "у ролика нет субтитров (ЧтоТоНовое)": "у донора нет субтитров",
         "субтитры донора слишком короткие или пустые":
-            "у ролика только обрывок субтитров — текста на выпуск не хватит",
-        "не разобрал ссылку на ролик: https://example.com/x": "ссылка не ведёт на ролик YouTube",
+            "у донора обрывок субтитров — на текст не хватит",
+        "не разобрал ссылку на ролик: https://example.com/x": "ссылка не на ролик YouTube",
     }
     for сырая, смысл in реальные.items():
         b = B.explain(сырая)
@@ -106,34 +106,41 @@ def main() -> int:
     check("и что делать: другой ролик", "другой ролик-донор" in b["fix"], True)
     check("«вернуть в работу» не предлагается", b["revive"], False)
     check("строка для сводки", b["short"],
-          "проблема в доноре: ролик-донор удалён или скрыт на YouTube — нужен другой ролик")
+          "донор: донор удалён или скрыт на YouTube — нужен другой ролик")
     check("сказано, что Минск не поможет", "минской машине" in b["what"], True)
 
     print("\nЗаливка: вход в Google и AdsPower — словами и с тем, что делать (09.10.2026)")
     вход = {   # дословно из pub_releases.blocked_reason на VPS 08.10.2026
         "AdsPower: [k1bouve5] is being used by [vova04.2007@gmail.com] and is not allowed to open":
-            "профиль AdsPower открыт у другого участника команды",
+            "профиль AdsPower открыт у vova04.2007@gmail.com",
         "not logged in / no access: https://studio.youtube.com/channel/UCDrgZuUJTA-USD4jiFrmHdA/ "
         "| account recovery blocked: RecoveryBlocked":
-            "в профиле AdsPower нет входа в Google-аккаунт канала",
+            "в профиле нет входа в Google",
         "Studio не отдала рабочее состояние канала (доступ не подтверждён): "
         "https://studio.youtube.com/channel/UCWazqTA6b8zOMS7SyrzPbaA/ | account recovery "
-        "blocked: RecoveryBlocked": "YouTube Studio канала не открылась — вход не подтверждён",
+        "blocked: RecoveryBlocked": "Studio канала не открылась — нет входа",
         "account recovery needs the owner: Google requires an additional sign-in step":
-            "Google просит дополнительное подтверждение входа",
+            "Google просит подтвердить вход",
         "dedup не выполнен: состояние канала не прочитано — заливку не начинаю":
-            "заливщик не прочитал ролики канала — заливать не стал",
+            "не прочитан список роликов канала",
         "account recovery needs the owner: no exact account binding for this profile+channel":
-            "для автовхода нет данных аккаунта этого канала",
+            "нет почты канала для автовхода",
     }
     for сырая, смысл in вход.items():
         b = B.explain(сырая)
-        check(f"«{сырая[:44]}» → канал", (b.get("kind"), b.get("title")), ("channel", смысл))
+        check(f"«{сырая[:44]}» → вход и профиль", (b.get("kind"), b.get("title")), ("access", смысл))
+        check("   сказано, кто чинит", bool(b.get("who")), True)
         check("   есть что делать и возврат в работу", (bool(b.get("fix")), b.get("revive")),
               (True, True))
     b = B.explain(next(iter(вход)))
     check("в объяснении названа учётка, у которой открыт профиль",
           "vova04.2007@gmail.com" in b["what"], True)
+    check("и она же — кто чинит", b["who"].startswith("vova04.2007@gmail.com"), True)
+    print("\nУ каждой узнанной причины сказано, кто её чинит (09.10.2026)")
+    for сырая in ("у ролика нет субтитров (VideoUnplayable)", "у канала не выбран пресет обложек",
+                  "зависло на шаге «x» и попытки исчерпаны", "AdsPower: Check Proxy Fail",
+                  "обложка не нарисовалась дважды: 0/1", "ролик залит, но Studio показывает «неизвестно»"):
+        check(f"«{сырая[:40]}» → кто чинит", bool(B.explain(сырая).get("who")), True)
     b = B.explain("Studio не отдала рабочее состояние канала (доступ не подтверждён): x | "
                   "account recovery blocked: RecoveryBlocked")
     check("про заблокированный автовход сказано", "Автовход" in b["what"], True)
@@ -150,9 +157,9 @@ def main() -> int:
                        ("этап «images» завершился со статусом error", "studio"),
                        ("к времени выхода не успели — задание состарилось в очереди", "studio"),
                        ("account recovery needs the owner: no exact account binding for "
-                        "this profile+channel", "channel"),
-                       ("AdsPower: Check Proxy Fail", "channel"),
-                       ("PHONE_VERIFICATION_REQUIRED_LONG_VIDEO: канал UCx не подтверждён", "channel"),
+                        "this profile+channel", "access"),
+                       ("AdsPower: Check Proxy Fail", "access"),
+                       ("PHONE_VERIFICATION_REQUIRED_LONG_VIDEO: канал UCx не подтверждён", "access"),
                        ("обложка деградировала дважды: текст наложен поверх картинки", "cover"),
                        ("обложка не нарисовалась дважды: 0/1 обложек", "cover")):
         b = B.explain(сырая)
@@ -226,7 +233,7 @@ def main() -> int:
     chans = [{"id": ch, "name": "Канал 6"}]
     out = pub_digest._problems(c, chans, {ch: rows}, {}, {}, NOW, "Europe/Warsaw")
     check("донор назван донором",
-          out and out[0]["why"].startswith("проблема в доноре: автор ролика отключил субтитры"),
+          out and out[0]["why"].startswith("донор: у донора отключены субтитры"),
           True)
     c.execute("UPDATE pub_releases SET blocked_reason='зависло на шаге «x»'")
     rows = list(c.execute("SELECT * FROM pub_releases WHERE release_id=?", (rid,)))
@@ -237,10 +244,10 @@ def main() -> int:
     print("\nНедосмотры канала: когда о них говорить")
     G = lambda *a, **k: [g["title"] for g in B.channel_gaps(*a, **k)]
     check("нет текста — пока текст не написан", G("", "X", phase="created", status="running"),
-          ["у канала не выбран пресет текста"])
+          ["не выбран пресет текста"])
     check("текст уже написан — о нём поздно", G("", "X", phase="source_ready", status="running"), [])
     check("нет обложек — пока до обложки не дошли",
-          G("X", "", phase="media_ready", status="running"), ["у канала не выбран пресет обложек"])
+          G("X", "", phase="media_ready", status="running"), ["не выбран пресет обложек"])
     check("уже на обложке — не о чем предупреждать", G("X", "", phase="cover_ready", status="running"), [])
     check("остановлен этой же причиной — не дублируем",
           G("X", "", phase="media_ready", status="blocked",

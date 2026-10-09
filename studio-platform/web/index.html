@@ -199,6 +199,18 @@
   .blktag.channel{background:var(--run-bg);color:var(--run)}
   /* Сбой студии — наша беда: красная метка; обложка — нейтральная (04.10.2026). */
   .blktag.studio{background:var(--bad-bg);color:var(--bad)}
+  /* Вход в Google, профиль AdsPower, прокси — своя сторона (09.10.2026). */
+  .blktag.access{background:var(--run-bg);color:var(--ink-hi)}
+  .blk.access{border-left-color:var(--run)}
+  /* «!» — нужны люди (09.10.2026): на вкладке верхней панели, на карточке и на канале. */
+  .attn{display:inline-flex;align-items:center;justify-content:center;min-width:16px;
+    height:16px;padding:0 4px;margin-left:5px;border-radius:8px;background:var(--bad);
+    color:#fff;font-size:11px;font-weight:700;line-height:1;vertical-align:2px}
+  .attn.whytip,.pill.whytip{text-decoration:none}
+  .attnbar{display:flex;gap:8px 14px;flex-wrap:wrap;align-items:center;margin:0 0 14px;
+    padding:9px 12px;border-radius:var(--r-sm);border:1px solid var(--line);
+    border-left:3px solid var(--bad);background:var(--bad-bg);font-size:13.5px}
+  .attnbar b{color:var(--bad)}
   /* Календарь периода сводки (04.10.2026). Всплывает поверх страницы, в тех же цветах,
      что карточки: подложка карточки, выбранный отрезок — приглушённым акцентом, края
      отрезка — акцентом, сегодня — обводкой. */
@@ -1379,7 +1391,10 @@ function blockTip(r, raw){
   const b = (r && r.block) || {};
   const rec = raw != null ? raw : ((r && (r.blocked_reason || r.error)) || '');
   if (!b.kind) return '';
-  return `${b.what}\n\nЧто делать: ${b.fix}` + (rec ? `\n\nЗапись движка: ${rec}` : '');
+  // Первой строкой — кто чинит (владелец 09.10.2026: «понятно, на чьей это стороне»).
+  return (b.who ? `Кто чинит: ${b.who}\n\n` : '')
+    + `Что случилось: ${b.what}\n\nЧто делать: ${b.fix}`
+    + (rec ? `\n\nЗапись движка: ${rec}` : '');
 }
 function whyTipHtml(text, tip){
   return tip ? `<span class="whytip" data-hint="${esc(tip)}" tabindex="0"
@@ -1431,11 +1446,12 @@ function blockBox(r){
   // Заливку могли сделать руками, пока выпуск стоял на заливке, — отметить это должно быть чем,
   // как и в прежней красной строке (04.10.2026: причины канала и студии теперь тоже
   // объясняются словами, и кнопка не должна была при этом пропасть).
-  if (['channel', 'studio', 'check'].includes(b.kind) && r.status === 'blocked'
+  if (['channel', 'access', 'studio', 'check'].includes(b.kind) && r.status === 'blocked'
       && !r.hand_confirmed && ['upload_pending', 'upload_running'].includes(r.phase))
     acts.push(`<button class="ghost" id="byhand">Подтвердить руками</button>`);
   return `<div class="blk ${esc(b.kind)}" id="blk">
     <div class="blkhead"><span class="blktag ${esc(b.kind)}">${esc(b.tag)}</span> ${esc(b.title)}</div>
+    ${b.who ? `<p><b>Кто чинит:</b> ${esc(b.who)}</p>` : ''}
     <p>${esc(b.what)}</p>
     <p><b>Что делать:</b> ${esc(b.fix)}</p>
     ${b.kind === 'cover' ? '<p><a href="#" class="cv-jump">Посмотреть обложку и решить ↓</a></p>' : ''}
@@ -1559,6 +1575,11 @@ async function viewReleases(){
     'Выпуск — ролик в расписании канала: путь от донорской ссылки до подтверждённой '
     + 'публикации. Производство самого ролика (текст, озвучка, кадры, сборка) — его '
     + 'проект во вкладке «Проекты»; там же проекты, заведённые руками, без канала.')}</h1>`));
+  const att = await attention();
+  if (att.blocked) app.append($(`<div class="attnbar" id="rel-attn"><b>! В разборе ${
+    att.blocked}</b>${att.blocked_sides.map(s => `<span><span class="blktag ${esc(s.kind)}"
+    >${esc(s.tag)}</span>${s.who ? whyTipHtml(String(s.count), 'Кто чинит: ' + s.who)
+      : s.count}</span>`).join('')}</div>`));
 
   const bar = $(`<div class="toolbar">
     <select id="f-ch"><option value="">все каналы</option>${
@@ -3576,6 +3597,10 @@ async function viewChannel(id){
     <p class="sub">${[c.handle, c.lang, c.niche].filter(Boolean).map(esc).join(' · ')}</p>
     ${c.uc ? '' : `<span class="pill s-error">ID пустой — выпуски на этом канале
       не заводятся. Вписать во вкладке «Настройки» ниже — один раз</span>`}`));
+  const мало = ((await attention()).low_supply || []).find(x => String(x.id) === String(id));
+  if (мало) app.append($(`<div class="attnbar" id="ch-low"><b>!</b> Мало доноров:
+    ${esc(мало.text)}. ${whyTipHtml('Что делать?', lowSupplyTip(мало.text,
+      ATTN.supply_min_days))}</div>`));
   app.append(channelTopLine(d));
 
   // Две вкладки: «Ролики» — то, чем занимаются каждый день, «Настройки» — то, что
@@ -4183,10 +4208,21 @@ function supplyPill(sup){
   // не по чему», и красным его красить нельзя: канал не сломан, он просто не настроен.
   if (!sup) return '';
   if (!sup.known) return '<span class="pill s-idle">запас неизвестен</span>';
+  // Меньше порога тревоги — «!» и подсказка, что делать (владелец 09.10.2026).
+  if (sup.low) return `<span class="pill s-error whytip" tabindex="0" data-hint="${esc(
+    lowSupplyTip(sup.text, sup.min_days))}">! мало доноров${sup.items
+      ? ` · ${Math.floor(sup.days || 0)} дн` : ''}</span>`;
   if (!sup.items) return '<span class="pill s-error">запаса нет</span>';
   const d = Math.floor(sup.days || 0);
   if (d < 3) return `<span class="pill s-queued">запас ${d} дн</span>`;
   return `<span class="pill s-idle">запас ${d} дн</span>`;
+}
+
+function lowSupplyTip(text, min){
+  return `Донорских ссылок не хватает: ${text || 'ближайший выход пустой'}. `
+    + `Порог — ${min} дн (тот же, что у тревоги; правится в «Админ»).\n\n`
+    + 'Кто чинит: оператор канала.\n\nЧто делать: вставить ссылки на доноров на '
+    + 'экране канала — они сами разложатся по свободным выходам.';
 }
 
 function sieveSaved(){
@@ -5164,6 +5200,44 @@ function viewLogin(why){
    нажатии на логин в топбаре»). Оно же носит id вкладки `tab-profile`: подсветку раздела
    ставит render() по той же таблице ROUTES, что и остальным вкладкам, — второй механизм
    подсветки заводить не нужно. */
+/* Восклицательные знаки в верхней панели (владелец 09.10.2026): «Каналы» — если у
+   каналов мало донорских ссылок, «Выпуски» — если есть выпуски в разборе. Один запрос
+   на обе вкладки; держим ответ минуту, чтобы переходы между экранами не дёргали сервер. */
+let ATTN = null, ATTN_AT = 0;
+async function attention(force){
+  if (!force && ATTN && Date.now() - ATTN_AT < 60000) return ATTN;
+  try { ATTN = await api('/ui/attention'); ATTN_AT = Date.now(); }
+  catch (e){ if (e instanceof NeedLogin) throw e; ATTN = ATTN || {}; }
+  return ATTN;
+}
+function attnBadges(){
+  const a = ATTN || {};
+  const put = (id, n, tip) => {
+    const tab = document.getElementById(id);
+    if (!tab) return;
+    let el = tab.querySelector('.attn');
+    if (!n){ if (el) el.remove(); return; }
+    if (!el){ el = document.createElement('span'); el.className = 'attn whytip';
+              el.tabIndex = 0; tab.append(el); }
+    el.textContent = '!';
+    el.dataset.hint = tip;
+  };
+  const low = a.low_supply || [];
+  put('tab-channels', low.length, `Мало донорских ссылок — ${low.length} ${plural(low.length,
+      'канал', 'канала', 'каналов')} (запас меньше ${a.supply_min_days} дн):\n`
+    + low.slice(0, 12).map(x => `· ${x.name}: ${x.text}`).join('\n')
+    + (low.length > 12 ? `\nи ещё ${low.length - 12}` : '')
+    + '\n\nКто чинит: оператор канала — вставить ссылки на доноров на экране канала.');
+  put('tab-releases', a.blocked || 0, `В разборе ${a.blocked} ${plural(a.blocked || 0,
+      'выпуск', 'выпуска', 'выпусков')}:\n`
+    + (a.blocked_sides || []).map(s => `· ${s.tag}: ${s.count}${s.who ? ' — чинит ' + s.who : ''}`)
+      .join('\n'));
+}
+function refreshAttention(force){
+  attention(force).then(attnBadges).catch(() => {});
+}
+setInterval(() => { if (ME) refreshAttention(true); }, 60000);
+
 function showWho(){
   const el = document.getElementById('who');
   el.innerHTML = ME
@@ -12142,10 +12216,10 @@ async function viewDigest(){
   const blTotal = bl.reduce((n, x) => n + x.count, 0);
   app.append($(`<div class="card" style="margin-bottom:16px" id="digest-blockers">
     <div class="sec">Блокеры сейчас${blTotal ? ` — ${blTotal}` : ''} ${hintDot(
-      'Выпуски в разборе, сложенные по причине. Метка — кто чинит: «сбой студии» — '
-      + 'наша сторона, «настройка канала» — человек за каналами и профилями, '
-      + '«обложка» — пресет и генератор обложек, «проблема в доноре» — нужен другой '
-      + 'ролик-донор.')}</div>
+      'Выпуски в разборе, сложенные по причине. Метка — чья сторона: «Студия» — наша, '
+      + '«Вход и профиль» — профили AdsPower, прокси и входы в Google, «Настройки '
+      + 'канала» и «Обложка» — оператор канала, «Донор» — нужен другой ролик-донор, '
+      + '«Проверить на YouTube» — посмотреть ролик в Studio.')}</div>
     ${bl.length ? `<table>
       <thead><tr><th>Чья беда</th><th>Что случилось</th>
         <th style="text-align:right">Выпусков</th><th>Каналы</th></tr></thead>
@@ -12600,6 +12674,7 @@ async function render(){
   }
   document.querySelector('nav').style.visibility = '';
   showWho();
+  refreshAttention();
   // Пустой адрес — это вход в студию, и встречает на нём сводка (см. homeHash).
   // Адрес при этом не переписываем: подмена `location.hash` на входе добавила бы шаг в
   // историю браузера, и кнопка «назад» из сводки возвращала бы в сводку же.

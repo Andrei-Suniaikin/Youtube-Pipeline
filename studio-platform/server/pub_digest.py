@@ -498,7 +498,7 @@ def collect(c, tenant_id: str, now=None, tz_name: str = None, have_key=None,
 
 # Порядок групп блокеров: сначала наша беда, её чинит студия; потом те, что чинят люди
 # за каналами, донорами и обложками; незнакомое — последним.
-_BLOCKER_ORDER = {"studio": 0, "channel": 1, "cover": 2, "donor": 3, "": 4}
+_BLOCKER_ORDER = {"studio": 0, "access": 1, "channel": 1, "check": 2, "cover": 2, "donor": 3, "": 4}
 
 
 def _blockers(blocked_by_channel: dict, by_id: dict) -> list:
