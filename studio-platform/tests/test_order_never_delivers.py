@@ -62,15 +62,20 @@ def main() -> int:
 
     print("\nВетка журнала кадра пользуется этим выводом и разрешает перезаказ")
     src = open(os.path.join(BASE, "workers", "googler_worker.py"), encoding="utf-8").read()
-    m = re.search(r"_jrn_final = order_never_delivers\(_jrn_probe\)\n(.{0,8000}?)# v2 endpoint dead",
-                  src, re.S)
-    check("решение в ветке — по order_never_delivers", m is not None, True)
-    check("и строка журнала помечается потерянной", bool(m and "lost=True" in m.group(1)), True)
+    помощник = src[src.find("def _order_lost_reason"):src.find("def _journal_close_frame")]
+    check("решение в ветке — по order_never_delivers",
+          "order_never_delivers(probe)" in помощник
+          and "_jrn_final, _jrn_why = _order_lost_reason(" in src, True)
+    check("и строка журнала помечается потерянной",
+          "lost=True" in помощник and "_journal_retire_lost(_jrn, _jrn_final)" in src, True)
+
+    def путь(начало, конец):
+        tail = src[src.find(начало):]
+        return tail[:tail.find(конец)]
 
     print("\nНедоставленный кадр заказывается заново в ЭТОМ ЖЕ прогоне (владелец 05.10)")
-    tail = src[src.find("_jrn_final = order_never_delivers(_jrn_probe)"):]
-    tail = tail[:tail.find("# v2 endpoint dead")]
-    i_lost = tail.find("lost=True")
+    tail = путь("_jrn_final, _jrn_why = _order_lost_reason(", "# v2 endpoint dead")
+    i_lost = tail.find("_journal_retire_lost(")
     i_rereserve = tail.find("_jrn = _journal_reserve_frame(")
     check("после пометки «потерян» — новая заявка в журнал", 0 < i_lost < i_rereserve, True)
     check("и между ними выхода нет — заявка действительно делается",
@@ -78,6 +83,17 @@ def main() -> int:
     seg = tail[i_rereserve:tail.find("else:", i_rereserve)]
     check("если журнал разрешил — дальше обычная генерация, без выхода",
           "if not _jrn.may_call:" in seg and seg.count("return (index, None)") == 1, True)
+
+    print("\nОткатный кадр (после фильтра) — тоже заказывается заново (владелец 09.10)")
+    tail = путь("_fb_final = _order_lost_reason(", "_extra_attempts += 1          # откату")
+    i_lost = tail.find("_journal_retire_lost(_jrn, _fb_final)")
+    i_rereserve = tail.find("_jrn = _journal_reserve_frame(")
+    check("потерянный откатный заказ закрывается «результата не будет»", i_lost > 0, True)
+    check("и сразу новая заявка в журнал", 0 < i_lost < i_rereserve, True)
+    check("выхода между ними нет",
+          "return (index, None)" in tail[i_lost:i_rereserve], False)
+    check("заявка тем же откатным кадром (модель отката)",
+          "model=_model" in tail[i_rereserve:i_rereserve + 400], True)
 
     print()
     if FAILS:

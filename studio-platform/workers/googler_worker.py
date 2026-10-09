@@ -7472,6 +7472,36 @@ def safety_fallback_model(model: str) -> str:
     return fallback
 
 
+def release_safety_fallback(frame_key: str) -> None:
+    """Вернуть кадру право на откат: откатная модель была временно недоступна.
+
+    09.10.2026, задача 993: откат на Flower трижды получил «No accounts available, please
+    try again later» — провайдер занят, кадр он не рассматривал. Право на откат при этом
+    сгорало, добивки снова шли в основную модель, её снова резал фильтр, и сцены уходили
+    соседнему кадру. Временный отказ — не ответ модели отката, его повторяют позже.
+    """
+    with _SAFETY_FALLBACK_LOCK:
+        _SAFETY_FALLBACK_USED.discard(str(frame_key))
+
+
+def _fallback_gave_up(index: int, model: str, reason: str, last: str,
+                      frame_key: str) -> None:
+    """Откат не дал кадр. Временный сбой провайдера — «повторить позже» и право на откат
+    сохраняется; ответ самой модели (фильтр, отказ) — окончательно, как раньше."""
+    label = GOOGLER_MODEL_LABELS.get(model, model)
+    if _is_transient_gen_error(last):
+        release_safety_fallback(frame_key)
+        _note_frame_giveup(index, GAP_LATER,
+                           f"{reason}; откат на модель {model} временно недоступен: {last}")
+        print_user(f"⏳ [{index+1}] Откат на {label} временно недоступен ({last}) — "
+                   f"кадр повторится откатом в добивке", "WARNING")
+        return
+    _note_frame_giveup(index, GAP_FILTER,
+                       f"{reason}; откат на модель {model} не дал кадр: {last}")
+    print_user(f"⛔ [{index+1}] Откат на {label} не дал кадр ({last}) — пропускаю картинку",
+               "ERROR")
+
+
 def claim_safety_fallback(frame_key: str) -> bool:
     """Откат для кадра — один раз за прогон: добивки пропущенных и повтор позже снова
     зовут генерацию, и без этой отметки каждый их круг оплачивал бы ещё один откат."""
@@ -10844,6 +10874,35 @@ def _journal_note_order(order_id, post: bool = True) -> None:
         state["journal"].ordered(state["call_id"], order_id)
 
 
+def _order_lost_reason(order_id, why: bool = False):
+    """Один прямой вопрос провайдеру о заказе: «результата не будет никогда» — или "".
+
+    Нужна не картинка, а причина: 404 (потерял) и status=failed (отклонил) отличаются от
+    «ещё в работе» тем, что ждать больше нечего (`order_never_delivers`). С why=True
+    отдаёт ещё и сырой ответ — для строки «кадр пропущен (…)».
+    """
+    probe, raw = None, ""
+    try:
+        probe = googler_request_v6(f"generations/{order_id}", method="GET")
+        raw = str((probe or {}).get("_error") or "")
+    except Exception as exc:                                       # noqa: BLE001
+        raw = f"{type(exc).__name__}: {exc}"
+    final = order_never_delivers(probe)
+    return (final, raw) if why else final
+
+
+def _journal_retire_lost(decision, final: str) -> None:
+    """Закрыть строку журнала с потерянным заказом так, чтобы кадр можно было заказать
+    снова: `lost=True` — оплачен ли он, решает провайдер, а результата не будет."""
+    journal = _journal()
+    if journal is not None:
+        journal.failed(
+            decision.call_id,
+            f"{final} — заказ {decision.remote_order_id}; результата не будет, кадр "
+            f"можно заказать заново",
+            ordered=True, lost=True)
+
+
 def _journal_close_frame(image_data, error: str = "") -> None:
     state = getattr(_JOURNAL_FRAME, "state", None)
     _JOURNAL_FRAME.state = None          # пул переиспользует потоки: чужой остаток недопустим
@@ -11259,25 +11318,11 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 # Спрашиваем ОДИН раз напрямую: нам нужна не картинка, а причина. 404
                 # здесь — это «провайдер потерял заказ», и он отличается от «заказ ещё
                 # не готов» тем, что ждать больше нечего никогда.
-                _jrn_why = ""
-                _jrn_probe = None
-                try:
-                    _jrn_probe = googler_request_v6(
-                        f"generations/{_jrn.remote_order_id}", method="GET")
-                    _jrn_why = str((_jrn_probe or {}).get("_error") or "")
-                except Exception as _jpe:                          # noqa: BLE001
-                    _jrn_why = f"{type(_jpe).__name__}: {_jpe}"
-                _jrn_final = order_never_delivers(_jrn_probe)
+                _jrn_final, _jrn_why = _order_lost_reason(_jrn.remote_order_id, why=True)
                 if _jrn_final:
                     # Результата по этому заказу не будет никогда (потерян или отклонён).
                     # Повтор дешевле, чем держать остальные оплаченные кадры проекта.
-                    _jrn_j = _journal()
-                    if _jrn_j is not None:
-                        _jrn_j.failed(
-                            _jrn.call_id,
-                            f"{_jrn_final} — заказ {_jrn.remote_order_id}; результата не "
-                            f"будет, кадр можно заказать заново",
-                            ordered=True, lost=True)
+                    _journal_retire_lost(_jrn, _jrn_final)
                     # 05.10.2026: заказываем заново сразу, в этом же прогоне (владелец: «чтобы
                     # студия сама запрашивала кадры, которые не дослали») — обычным путём,
                     # где на отказ фильтра смягчается промпт.
@@ -11352,10 +11397,8 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             _fallback_orders += 1
             if _fallback_orders > 1:
                 _fb_last = " ".join(str(_last_gen_error() or "результата нет").split())[:120]
-                _note_frame_giveup(index, GAP_FILTER,
-                                   f"{_fallback_reason}; откат на модель {_model} не дал кадр: {_fb_last}")
-                print_user(f"⛔ [{index+1}] Откат на {GOOGLER_MODEL_LABELS.get(_model, _model)} "
-                           f"не дал кадр ({_fb_last}) — пропускаю картинку", "ERROR")
+                _fallback_gave_up(index, _model, _fallback_reason, _fb_last,
+                                  output_path or f"#{index}")
                 return (index, None)
         if _v6_generic_terminal_frame_blocked(_v6_generic_frame_key):
             print_user(
@@ -11752,10 +11795,8 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             error = result.get("error", "Unknown error")
             if _fallback_used:
                 _fb_last = " ".join(str(_last_gen_error() or error).split())[:120]
-                _note_frame_giveup(index, GAP_FILTER,
-                                   f"{_fallback_reason}; откат на модель {_model} не дал кадр: {_fb_last}")
-                print_user(f"⛔ [{index+1}] Откат на {GOOGLER_MODEL_LABELS.get(_model, _model)} "
-                           f"не дал кадр ({_fb_last}) — пропускаю картинку", "ERROR")
+                _fallback_gave_up(index, _model, _fallback_reason, _fb_last,
+                                  output_path or f"#{index}")
                 return (index, None)
             if "InputIsImproper" in str(error):
                 _soften_rounds += 1
@@ -11895,6 +11936,25 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                             print_user(f"✅ [{index+1}] Журнал: откатный кадр забран у уже "
                                        f"оплаченного заказа", "SUCCESS")
                             return (index, _fb_data)
+                        # 09.10.2026, владелец: «не хватило картинок, и мы не пошли в сервис
+                        # ещё раз». Провайдер теряет и откатные заказы (404 на опрос), а эта
+                        # ветка, в отличие от обычной, на потерю сдавалась: строка журнала
+                        # оставалась «заказ был» и запрещала новый — кадр пропускался в
+                        # каждом прогоне навсегда. Теперь как у обычного пути: потерянный
+                        # заказ закрывается «результата не будет», и откат заказывается заново.
+                        _fb_final = _order_lost_reason(_jrn.remote_order_id)
+                        if _fb_final:
+                            _fb_old = _jrn.remote_order_id
+                            _journal_retire_lost(_jrn, _fb_final)
+                            _jrn = _journal_reserve_frame(
+                                unit=(journal_unit or f"{index + 1:03d}"),
+                                prompt=prompt, seed=seed, aspect_ratio=aspect_ratio,
+                                reference_bundle=reference_bundle, output_path=output_path,
+                                model=_model,
+                            )
+                            if _jrn.may_call:
+                                print_user(f"🔁 [{index+1}] Журнал: {_fb_final} ({_fb_old}) — "
+                                           f"заказываю откатный кадр заново", "WARNING")
                     if not _jrn.may_call:
                         _note_frame_giveup(index, GAP_FILTER,
                                            f"{_fallback_reason}; откатный заказ журнал не разрешил "

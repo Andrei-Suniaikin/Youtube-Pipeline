@@ -199,6 +199,64 @@ out, prov, lines, _j, _d = run({LITE: "ok"}, out_dir=d3)
 check("кадр 1 перерисован, пометка кадра 7 осталась",
       [r["scene"] for r in (sidecar(d3) or {}).get("frames", [])], [7])
 
+print("\nОткатный заказ прошлого прогона потерян провайдером (404) — заказывается заново "
+      "(09.10.2026)")
+# Живой случай «Istoria din Farfurie», задача 937: журнал помнил откатный заказ (verify),
+# провайдер на опрос отвечал 404, и кадр пропускался в каждом прогоне без нового заказа.
+from call_journal import Decision                                 # noqa: E402
+retired, saved = [], (G._journal_reserve_frame, G.poll_v6_generation, G.googler_request_v6,
+                      G._journal_retire_lost)
+answers = iter([Decision("verify", call_id=7, remote_order_id="gen_lost"),
+                Decision("retry", call_id=7)])
+
+
+def reserve_fb(*a, **kw):
+    if kw.get("model") == "FLOWER":
+        return next(answers)
+    return G._JOURNAL_OFF
+
+
+G._journal_reserve_frame = reserve_fb
+G.poll_v6_generation = lambda *a, **k: None
+G.googler_request_v6 = lambda path, **k: {"_error": "HTTP 404: not found or expired"}
+G._journal_retire_lost = lambda decision, final: retired.append((decision.remote_order_id, final))
+try:
+    out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: "ok"}, scene=4)
+finally:
+    (G._journal_reserve_frame, G.poll_v6_generation, G.googler_request_v6,
+     G._journal_retire_lost) = saved
+check("потерянный откатный заказ закрыт «результата не будет»",
+      [(o, f.startswith("провайдер потерял заказ")) for o, f in retired], [("gen_lost", True)])
+check("и откатной моделью заказан заново — ровно один раз", prov.count(FLOWER), 1)
+check("кадр получен", out[1] is not None, True)
+check("в журнале задачи сказано, что заказываем заново",
+      any("заказываю откатный кадр заново" in l for l in lines), True)
+check("«журнал не разрешил» больше не пишется",
+      any("Журнал не разрешил откатный заказ" in l for l in lines), False)
+
+print("\nОткатная модель временно занята — право на откат не сгорает (09.10.2026)")
+# Задача 993: «No accounts available, please try again later» на Flower — кадр уходил
+# соседнему, хотя добивка могла бы взять его откатом.
+BUSY = "No accounts available, please try again later"
+d5 = tempfile.mkdtemp(dir=TMP)
+out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: BUSY}, scene=5, out_dir=d5)
+check("первый прогон: кадра нет", out[1] is None, True)
+check("сдался как «позже», а не «фильтр»", (G._FRAME_GIVEUP.get(4) or ("", ""))[0], G.GAP_LATER)
+check("значит, поздний повтор его возьмёт", G.late_retry_indices([4]), [4])
+check("в журнале задачи — «временно недоступен», а не «пропускаю»",
+      (any("временно недоступен" in l for l in lines),
+       any("Откат на" in l and "пропускаю картинку" in l for l in lines)), (True, False))
+out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: "ok"}, scene=5, out_dir=d5, fresh_run=False)
+check("добивка того же прогона: откат заказан снова и кадр получен",
+      (prov.count(FLOWER), out[1] is not None), (1, True))
+
+print("\nОтказ самой откатной модели — по-прежнему окончательно")
+d6 = tempfile.mkdtemp(dir=TMP)
+out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: FILTER}, scene=6, out_dir=d6)
+check("сдался как «фильтр»", (G._FRAME_GIVEUP.get(5) or ("", ""))[0], G.GAP_FILTER)
+out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: "ok"}, scene=6, out_dir=d6, fresh_run=False)
+check("второго отката в том же прогоне нет", prov.count(FLOWER), 0)
+
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nпровалов: {len(FAILS)}")
 sys.exit(1 if FAILS else 0)

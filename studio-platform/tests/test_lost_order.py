@@ -174,15 +174,18 @@ def main() -> int:
     # потому, что мутация «убрать вызов» не гасила НИ ОДНУ другую проверку.
     src = io.open(os.path.join(BASE, "workers", "googler_worker.py"),
                   encoding="utf-8").read()
-    ветка = src[src.find('_jrn_why = ""'):src.find('_jrn_why = ""') + 2000]
+    ветка = src[src.find("_jrn_final, _jrn_why = _order_lost_reason("):][:2500]
+    помощник = src[src.find("def _order_lost_reason"):src.find("def _journal_close_frame")]
     # 05.10.2026 опознание вынесено в order_never_delivers (там же — отклонённый заказ,
     # status=failed); поведение helper'а проверяет tests/test_order_never_delivers.py.
+    # 09.10.2026 опрос и закрытие строки — общие помощники обычной и откатной веток.
     check("404 в ветке опознаётся",
-          "order_never_delivers(_jrn_probe)" in ветка
+          "order_never_delivers(probe)" in помощник
           and '"404" in err' in src[src.find("def order_never_delivers"):
                                      src.find("def order_never_delivers") + 1500], True)
-    check("и журналу говорится именно lost", "lost=True" in ветка, True)
-    check("вместе с ordered=True — деньги-то ушли", "ordered=True, lost=True" in ветка, True)
+    check("и журналу говорится именно lost", "_journal_retire_lost(_jrn, _jrn_final)" in ветка
+          and "lost=True" in помощник, True)
+    check("вместе с ordered=True — деньги-то ушли", "ordered=True, lost=True" in помощник, True)
     check("и человеку сказано, что перезаказ дешевле",
           "дешевле" in ветка, True)
 
