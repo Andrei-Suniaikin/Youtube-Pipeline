@@ -469,10 +469,67 @@ def fallback_title(text):
     return t or "Продолжение"
 
 
-def _numbers_ok(title, chapter_text):
-    """Числа в заголовке должны быть в тексте главы — защита от выдуманных дат."""
+# Язык расшифровки → язык num2words. Хорватского и греческого в библиотеке нет; числа
+# хорватского до тысячи пишутся как сербские, а для греческого проверка остаётся
+# прежней — только цифрами.
+_NUM_WORDS_LANG = {"cs": "cs", "es": "es", "hu": "hu", "pl": "pl", "pt": "pt",
+                   "ro": "ro", "uk": "uk", "ru": "ru", "en": "en", "de": "de",
+                   "fr": "fr", "it": "it", "sk": "sk", "hr": "sr", "sr": "sr"}
+_WORD_RE = re.compile(r"[^\W\d_]+(?:['’][^\W\d_]+)?", re.U)
+
+
+def _spelled(n, lang):
+    """Число словами на языке главы или "" (нет языка, нет библиотеки, слишком большое)."""
+    code = _NUM_WORDS_LANG.get((lang or "").lower()[:2])
+    if not code or len(n) > 4:
+        return ""
+    try:
+        from num2words import num2words
+        return num2words(int(n), lang=code)
+    except Exception:
+        return ""
+
+
+def _said_in_words(n, words, joined, lang):
+    """Число из заголовка произнесено в главе словами — с любым падежным окончанием.
+
+    Текст для озвучки пишет числа словами («тринадцять кулеметів»), и расшифровка
+    повторяет их словами же, а модель в заголовке ставит цифры (11.10.2026: 480 таких
+    отказов, верные заголовки менялись на обрывки фраз). Каждое слово числа должно
+    найтись в главе. Короткое (до 5 букв) — целиком, с окончанием до двух букв: иначе
+    «tři» засчиталось бы по «třicet». Длинное — по основе: без двух последних букв, а у
+    слов длиннее семи — без четырёх («trzynaście» → «trzynastu» меняет «ś» на «s»).
+    Найденное слово не длиннее числа больше чем на три буквы.
+    """
+    spelled = _spelled(n, lang)
+    if not spelled:
+        return False
+    for w in _WORD_RE.findall(spelled.lower()):
+        if len(w) <= 5:
+            stem, room = w, len(w) + 2
+        else:
+            stem, room = (w[:-2] if len(w) <= 7 else w[:-4]), len(w) + 3
+        if any(t.startswith(stem) and len(t) <= room for t in words):
+            continue
+        # Библиотека пишет «devětset» слитно, текст — «devět set»: длинное слово
+        # ищем и в склеенной главе.
+        if len(stem) > 5 and stem in joined:
+            continue
+        return False
+    return True
+
+
+def _numbers_ok(title, chapter_text, lang=""):
+    """Числа в заголовке должны быть в тексте главы — защита от выдуманных дат.
+
+    В тексте число может стоять цифрами или словами (см. `_said_in_words`)."""
     body = _NUM_RE.findall(chapter_text or "")
-    return all(n in body for n in _NUM_RE.findall(title or ""))
+    missing = [n for n in _NUM_RE.findall(title or "") if n not in body]
+    if not missing:
+        return True
+    found = _WORD_RE.findall((chapter_text or "").lower())
+    words, joined = set(found), "".join(found)
+    return all(_said_in_words(n, words, joined, lang) for n in missing)
 
 
 def _detect_lang(text):
@@ -601,6 +658,7 @@ def build_chapters(segs, duration=None, target=TARGET_GAP_SEC, min_gap=MIN_GAP_S
     # ── сборка: заголовки ─────────────────────────────────────────────────────
     chapters = []
     used = set()
+    rejected = 0          # модель ответила, но заголовок не прошёл нашу проверку
     for i, cut in enumerate(cuts):
         end_idx = cuts[i + 1]["idx"] if i + 1 < len(cuts) else len(segs)
         body = _chapter_text(segs, cut["idx"], end_idx)
@@ -615,12 +673,14 @@ def build_chapters(segs, duration=None, target=TARGET_GAP_SEC, min_gap=MIN_GAP_S
             if title:
                 warnings.append(f"глава {i + 1}: заголовок короче {TITLE_MIN_CHARS} символов")
             title, source = fallback_title(body), "fallback"
-        elif not _numbers_ok(title, full):
+        elif not _numbers_ok(title, full, lang):
             warnings.append(f"глава {i + 1}: числа в заголовке не найдены в тексте главы")
             title, source = fallback_title(body), "fallback"
+            rejected += 1
         elif _norm(title) in used:
             warnings.append(f"глава {i + 1}: заголовок повторяется")
             title, source = fallback_title(body), "fallback"
+            rejected += 1
         used.add(_norm(title))
         chapters.append({"index": i + 1, "start": round(cut["sec"], 2),
                          "title": title, "source": source})
@@ -653,8 +713,12 @@ def build_chapters(segs, duration=None, target=TARGET_GAP_SEC, min_gap=MIN_GAP_S
         warnings.append(f"глав получилось {len(chapters)} — YouTube показывает от трёх")
     elif not dry_run and fb > MAX_FALLBACK_SHARE * len(chapters):
         status = "failed"
+        # Причину называем по факту: «канал почти не отвечал» писалось и тогда, когда
+        # модель ответила на все окна, а заголовки отбраковала проверка (11.10.2026).
+        why = ("канал промптов почти не отвечал" if rejected * 2 < fb else
+               "модель ответила, но заголовки не прошли проверку — числа или повторы")
         warnings.append(f"{fb} из {len(chapters)} заголовков — запасные "
-                        f"(канал промптов почти не отвечал); описание не пишу")
+                        f"({why}); описание не пишу")
 
     if not dry_run and lang and status == "ok":
         got_lang = _detect_lang(" ".join(c["title"] for c in chapters
