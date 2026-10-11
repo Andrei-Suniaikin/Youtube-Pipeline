@@ -2477,16 +2477,22 @@ def _generate_for_language(
             r.analysis = analysis
             return r
         adapted_text = ""
+        _adapt_sub = str(getattr(preset_lang, "analysis_provider", "") or "").strip().lower()
+        _adapt_sub = _adapt_sub if _adapt_sub in SUBSCRIPTION_PROVIDERS else ""
         if original_text:
             if skip_adapt:
                 # v1.0.4 title-mode: текст уже на нужном языке (юзер задал per-lang).
                 log(f"✍️ Текст уже на {preset_lang.language} (skip_adapt) — пропускаю LLM-адаптацию")
                 adapted_text = original_text
-            elif openai_api_key:
+            elif openai_api_key or _adapt_sub:
+                # 11.10.2026: разбор превью подпиской (Codex) — и подгонка текста ею же.
+                # Раньше подгонка шла в OpenAI при любом разборе: без ключа текст
+                # оставался непереведённым, с пустым ключом обложка падала на 402.
                 log(f"✍️ Адаптация текста на {preset_lang.language}...")
                 adapted_text = adapt_text(
                     original_text, preset_lang.language, openai_api_key,
                     video_title=analysis.get("video_title", ""),
+                    provider=_adapt_sub,
                 )
                 log(f"   Результат: {adapted_text}")
             else:
