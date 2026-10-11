@@ -267,6 +267,47 @@ def main() -> int:
     # в обратную — повторно оплаченного этапа.
     check("без проекта считаем, что оплачено", M._paid_calls_done("", "tts") > 0, True)
 
+    print("\nПриговор воркера после «try again later» по ходу — он и причина (11.10.2026)")
+    # Бой: картинки падали на «Недостающих кадров 5 из 242 — больше 2%», а в карточку
+    # уезжала промежуточная «[103] Попытка 2 неудачна … please try again later».
+    журнал = [
+        "[03:50:36.011] ⚠️ ⚠️ [103] Попытка 2 неудачна (Nano Banana 2 Lite (Flow)): "
+        "Nano Banana 2 Lite (Flow): Generation failed, please try again later",
+        "[03:58:10.128] ❌ ⛔ [96] Контент-фильтр провайдера — пропускаю картинку (смягчений: 3)",
+        "[03:58:10.821] ⚠️ ⚠️ Не хватает 5 кадров из 242: сцены 22, 28, 94, 95, 96",
+        "[03:58:11.001] ❌ ⛔ Недостающих кадров 5 из 242 — больше 4 (2%): кадрами "
+        "предыдущих сцен не заменяю, нужен разбор",
+        "[03:58:11.097] ❌ Контракт референсов отклонён: authoritative image receipt "
+        "is not exact for frame 022",
+    ]
+    down, verdict = "", ""
+    for строка in журнал:          # тот же порядок, что в _run_task
+        d = M._provider_down_line(строка)
+        if d:
+            down, verdict = d, ""
+        elif down and not verdict:
+            verdict = M._own_verdict_line(строка)
+    err = M._worker_error_text(0, 1, provider_down_msg=M._down_or_verdict(down, verdict))
+    check("причина — итог этапа, а не попытка кадра",
+          err.startswith("Недостающих кадров 5 из 242"), True)
+    check("слова провайдера остались в скобках", "try again later" in err, True)
+    check("строка кадра [N] приговором не считается",
+          M._own_verdict_line(журнал[1]), "")
+    check("итоговая строка сервера — тоже",
+          M._own_verdict_line("❌ ошибка (код 1): rc"), "")
+    check("простой и есть итог — текст прежний",
+          M._down_or_verdict("HTTP 503: техработы", ""), "HTTP 503: техработы")
+    # Простой ПОСЛЕ приговора снова главный: приговор сбрасывается.
+    down, verdict = "", ""
+    for строка in журнал[3:] + ["[04:00:00.000] ❌ Lumean: HTTP 503 Service Unavailable"]:
+        d = M._provider_down_line(строка)
+        if d:
+            down, verdict = d, ""
+        elif down and not verdict:
+            verdict = M._own_verdict_line(строка)
+    check("последним был простой — он и причина",
+          M._down_or_verdict(down, verdict).startswith("[04:00:00.000] ❌ Lumean"), True)
+
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

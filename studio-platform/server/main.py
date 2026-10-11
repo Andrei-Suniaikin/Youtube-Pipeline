@@ -10902,6 +10902,7 @@ def _run_task(t):
     channel_incident = {}
     card_worker_error = ""
     provider_down_msg = ""          # последние слова провайдера про собственный простой
+    own_verdict_msg = ""            # приговор самого воркера ПОСЛЕ этих слов (см. _own_verdict_line)
     stale_receipt_msg = ""          # воркер упёрся в след прошлой попытки
     prompt_channel_msg = ""         # приговор по каналу промптов (деньги, ключ, доступ)
 
@@ -11154,6 +11155,9 @@ def _run_task(t):
             _down = _provider_down_line(clean)
             if _down:
                 provider_down_msg = _down
+                own_verdict_msg = ""
+            elif provider_down_msg and not own_verdict_msg:
+                own_verdict_msg = _own_verdict_line(clean)
             _след = _stale_receipt_line(clean)
             if _след:
                 stale_receipt_msg = _след
@@ -11266,7 +11270,11 @@ def _run_task(t):
                                    "опровергает — разбирает человек")
             if provider_down_msg:
                 оплачено = _paid_calls_done(t["project_id"] or "", t["kind"])
-                if оплачено:
+                if оплачено and own_verdict_msg:
+                    _log_line(jid, "⏸ по ходу провайдер отвечал «занято», но остановился "
+                                   "этап на своей причине; оплачено вызовов: "
+                                   f"{оплачено} — автоповтор запрещён, нужен человек")
+                elif оплачено:
                     _log_line(jid, "⏸ провайдер лежит, но по этапу уже оплачено вызовов: "
                                    f"{оплачено} — автоповтор запрещён, нужен человек")
                 else:
@@ -11296,7 +11304,8 @@ def _run_task(t):
             _limit_wait_clear(jid)
             limit_msg = _gen_limit_reason(jid)
             err = _worker_error_text(jid, rc, _task_key_value(), limit_msg,
-                                     card_worker_error, provider_down_msg,
+                                     card_worker_error,
+                                     _down_or_verdict(provider_down_msg, own_verdict_msg),
                                      prompt_channel_msg)
             card_error_code = None
             if t["kind"] == "cards":
@@ -11656,6 +11665,44 @@ def _provider_down_line(text: str) -> str:
             and not any(all(w in low for w in пара) for пара in _PROVIDER_DOWN_PAIRS):
         return ""
     return " ".join(str(text).split())[:400]
+
+
+# Приговор самого воркера: строка уровня «❌» про этап целиком, а не про отдельный кадр.
+#
+# 11.10.2026, тревоги по «Ultima Scrisoare de pe Front» и «Poslední Dopis z Fronty»:
+# картинки падали на «Недостающих кадров 5 из 242 — больше 2%, нужен разбор» (кадры
+# резал фильтр и у основной модели, и у отката), а в карточку и в тревогу уезжало
+# «[103] Попытка 2 неудачна … please try again later» — промежуточная строка одного
+# кадра, после которой кадр ещё пробовали. Простой провайдера запоминается последней
+# такой строкой, и любое «try again later» по ходу прогона перебивало голый код
+# возврата. Одна и та же беда приходила то с настоящей причиной, то с чужой, и дробилась
+# на разные тревоги.
+#
+# Решение о повторе (простой провайдера → повтор, если не оплачено) не меняем: на
+# сплошном простое воркер тоже пишет итог этапа, и потерять автоповтор дороже. Меняется
+# только текст: приговор после слов провайдера идёт первым, слова провайдера — в скобках.
+_TS_PREFIX = re.compile(r"^\[\d{2}:\d{2}:\d{2}(?:\.\d+)?\]\s*")
+_PER_FRAME = re.compile(r"\[\d+\]")
+
+
+def _own_verdict_line(text: str) -> str:
+    """Строка «❌ …» про этап целиком (не про кадр [N]) — вернёт её без меток и времени."""
+    текст = _TS_PREFIX.sub("", " ".join(str(text or "").split()))
+    if not текст.startswith("❌") or текст.startswith("❌ ошибка (код"):
+        return ""
+    if _PER_FRAME.search(текст[:40]) or _provider_down_line(текст):
+        return ""
+    return текст.lstrip("❌⛔⚠️ \ufe0f").strip()[:300]
+
+
+def _down_or_verdict(provider_down_msg: str, own_verdict_msg: str) -> str:
+    """Что сказать вместо голого кода: приговор воркера важнее «занято» по ходу."""
+    if own_verdict_msg and provider_down_msg:
+        # В карточку уходит 200 знаков: приговор целиком, от провайдера — хвост, где его слова.
+        слова = _TS_PREFIX.sub("", provider_down_msg)
+        слова = слова if len(слова) <= 60 else "…" + слова[-60:].lstrip()
+        return f"{own_verdict_msg[:130]} (по ходу провайдер: {слова})"
+    return provider_down_msg
 
 
 def _paid_calls_done(project_id: str, kind: str) -> int:
