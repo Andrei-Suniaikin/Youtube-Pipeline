@@ -203,9 +203,15 @@
   .blktag.access{background:var(--run-bg);color:var(--ink-hi)}
   .blk.access{border-left-color:var(--run)}
   /* «!» — нужны люди (09.10.2026): на вкладке верхней панели, на карточке и на канале. */
-  .attn{display:inline-flex;align-items:center;justify-content:center;min-width:16px;
-    height:16px;padding:0 4px;margin-left:5px;border-radius:8px;background:var(--bad);
-    color:#fff;font-size:11px;font-weight:700;line-height:1;vertical-align:2px}
+  /* 11.10.2026: «неявный» — белое на светло-розовом --bad сливалось с тёмной панелью.
+     Насыщенный красный, крупнее и с ободком под цвет фона: читается с первого взгляда. */
+  .attn{display:inline-flex;align-items:center;justify-content:center;min-width:19px;
+    height:19px;padding:0 5px;margin-left:6px;border-radius:10px;background:var(--bad-clip);
+    color:#fff;font-size:13px;font-weight:800;line-height:1;vertical-align:1px;
+    box-shadow:0 0 0 2px var(--bg),0 0 0 3px var(--bad-clip),0 0 10px rgba(232,96,77,.55)}
+  /* На карточке канала — в правом верхнем углу, поверх рамки (11.10.2026). */
+  .chcard{position:relative}
+  .attn.corner{position:absolute;top:-8px;right:-8px;margin:0;z-index:1}
   .attn.whytip,.pill.whytip{text-decoration:none}
   .attnbar{display:flex;gap:8px 14px;flex-wrap:wrap;align-items:center;margin:0 0 14px;
     padding:9px 12px;border-radius:var(--r-sm);border:1px solid var(--line);
@@ -3027,6 +3033,7 @@ async function viewChannels(){
                 : 'role="link"'}
       aria-label="Канал ${esc(c.name)}">
       ${picking ? '<span class="chmark">✓</span>' : ''}
+      ${supplyCorner(c.supply)}
       <h3>${esc(c.name)}</h3>
       <div class="meta">${esc(c.handle || '—')} · ${esc(c.lang)}</div>
       <div class="meta" style="margin-top:7px">
@@ -4243,13 +4250,20 @@ function supplyPill(sup){
   if (!sup) return '';
   if (!sup.known) return '<span class="pill s-idle">запас неизвестен</span>';
   // Меньше порога тревоги — «!» и подсказка, что делать (владелец 09.10.2026).
+  // «!» стоит в углу карточки (supplyCorner, 11.10.2026), в плашке остаются слова.
   if (sup.low) return `<span class="pill s-error whytip" tabindex="0" data-hint="${esc(
-    lowSupplyTip(sup.text, sup.min_days))}">! мало доноров${sup.items
+    lowSupplyTip(sup.text, sup.min_days))}">мало доноров${sup.items
       ? ` · ${Math.floor(sup.days || 0)} дн` : ''}</span>`;
   if (!sup.items) return '<span class="pill s-error">запаса нет</span>';
   const d = Math.floor(sup.days || 0);
   if (d < 3) return `<span class="pill s-queued">запас ${d} дн</span>`;
   return `<span class="pill s-idle">запас ${d} дн</span>`;
+}
+
+function supplyCorner(sup){
+  if (!sup || !sup.known || !sup.low) return '';
+  return `<span class="attn corner whytip" tabindex="0" data-hint="${esc(
+    lowSupplyTip(sup.text, sup.min_days))}">!</span>`;
 }
 
 function lowSupplyTip(text, min){

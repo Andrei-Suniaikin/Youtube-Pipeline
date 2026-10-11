@@ -91,7 +91,13 @@ SCENARIO = r"""
     const tile = id => document.querySelector(`.chcard[data-id="${id}"]`);
     out.плиткаМало = txt(tile(7));
     out.плиткаНорма = txt(tile(8));
-    out.подсказкаПлитки = hover(tile(7) && tile(7).querySelector('.whytip'));
+    out.подсказкаПлитки = hover(tile(7) && tile(7).querySelector('.pill.whytip'));
+    const corner = id => tile(id) && tile(id).querySelector('.attn.corner');
+    out.уголМало = txt(corner(7));
+    out.уголНорма = !corner(8);
+    out.подсказкаУгла = hover(corner(7));
+    const cs = corner(7) && getComputedStyle(corner(7));
+    out.уголПоложение = cs ? [cs.position, cs.top, cs.right] : [];
 
     location.hash = '#/channel/7/roliki';
     await sleep(500);
@@ -135,7 +141,11 @@ def main() -> int:
           "Вход и профиль: 4 — чинит кто ведёт профили AdsPower" in t, True)
 
     print("\nКаналы")
-    check("плитка с малым запасом — «! мало доноров»", "! мало доноров" in (res.get("плиткаМало") or ""), True)
+    check("плитка с малым запасом — «мало доноров»", "мало доноров" in (res.get("плиткаМало") or ""), True)
+    check("«!» в углу карточки", res.get("уголМало"), "!")
+    check("   прибит к правому верхнему углу", res.get("уголПоложение"), ["absolute", "-8px", "-8px"])
+    check("   по наведению — что делать", "вставить ссылки на доноров" in (res.get("подсказкаУгла") or ""), True)
+    check("у нормальной в углу знака нет", res.get("уголНорма"), True)
     check("у нормальной — нет", "мало доноров" in (res.get("плиткаНорма") or ""), False)
     t = res.get("подсказкаПлитки") or ""
     check("наведение на плашку: что делать", "вставить ссылки на доноров" in t, True)
