@@ -7446,30 +7446,37 @@ def write_image_gaps(output_dir: str, gaps, giveup=None) -> list:
 #     рядом, в image_model_fallbacks.json; кадр, позже перерисованный основной моделью,
 #     оттуда убирается.
 #
-# FLOWER — та же Nano Banana 2, что и основная NARWHAL_LITE, через тот же
-# /api/v6/generations и тот же ключ: кадр не выпадает из ролика по стилю; 1 кредит.
-# Пусто / «off» — отката нет.
-IMAGE_SAFETY_FALLBACK_MODEL = (os.environ.get("VS_IMAGE_SAFETY_FALLBACK_MODEL", "FLOWER")
+# Порядок моделей отката (11.10.2026, владелец: «Flower по качеству сильно хуже, я бы
+# в последнюю очередь его ставил»): Nano Banana 2 (Flow) → Nano Banana Pro → Flower.
+# Все три — тот же /api/v6/generations и тот же ключ, кадр не выпадает из ролика по
+# стилю. Берётся первая модель списка, отличная от основной; модель, ответившая «занято»
+# (No accounts available), до конца прогона пропускается — следующий откат идёт
+# следующей по списку. Заказ отката на кадр по-прежнему один. Flow-модели — 4 кредита,
+# Flower — 1. Через запятую в VS_IMAGE_SAFETY_FALLBACK_MODEL; пусто / «off» — отката нет.
+IMAGE_SAFETY_FALLBACK_MODEL = (os.environ.get("VS_IMAGE_SAFETY_FALLBACK_MODEL",
+                                              "NARWHAL,GEM_PIX_2,FLOWER")
                                or "").strip().upper()
 # flower принимает ровно одну картинку на вход (так же решено у обложек) — откату на неё
 # отдаём только первый референс кадра.
 IMAGE_FALLBACK_MAX_INPUTS = {"FLOWER": 1}
 IMAGE_MODEL_FALLBACKS_FILE = "image_model_fallbacks.json"
 _SAFETY_FALLBACK_USED: set = set()      # кадры, уже получившие откат в этом прогоне
+_SAFETY_FALLBACK_BUSY: set = set()      # модели отката, ответившие «занято» в этом прогоне
 _SAFETY_FALLBACK_LOCK = threading.Lock()
 _FRAME_FALLBACK = threading.local()     # откат текущего кадра (поток = кадр)
 
 
 def safety_fallback_model(model: str) -> str:
     """Какой моделью заказать кадр после отказа фильтра — или "" (отката нет)."""
-    fallback = IMAGE_SAFETY_FALLBACK_MODEL
-    if not fallback or fallback in ("OFF", "NONE", "0", "НЕТ"):
+    chain = [m.strip() for m in str(IMAGE_SAFETY_FALLBACK_MODEL or "").split(",") if m.strip()]
+    if not chain or chain[0] in ("OFF", "NONE", "0", "НЕТ"):
         return ""
-    if fallback == str(model or "").strip().upper():
-        return ""
-    if fallback not in GOOGLER_AVAILABLE_MODELS:
-        return ""
-    return fallback
+    current = str(model or "").strip().upper()
+    usable = [m for m in chain if m != current and m in GOOGLER_AVAILABLE_MODELS]
+    with _SAFETY_FALLBACK_LOCK:
+        free = [m for m in usable if m not in _SAFETY_FALLBACK_BUSY]
+    # Заняты все — пробуем первую по списку: «занято» временное.
+    return (free or usable or [""])[0]
 
 
 def release_safety_fallback(frame_key: str) -> None:
@@ -7491,6 +7498,8 @@ def _fallback_gave_up(index: int, model: str, reason: str, last: str,
     label = GOOGLER_MODEL_LABELS.get(model, model)
     if _is_transient_gen_error(last):
         release_safety_fallback(frame_key)
+        with _SAFETY_FALLBACK_LOCK:
+            _SAFETY_FALLBACK_BUSY.add(str(model or "").strip().upper())
         _note_frame_giveup(index, GAP_LATER,
                            f"{reason}; откат на модель {model} временно недоступен: {last}")
         print_user(f"⏳ [{index+1}] Откат на {label} временно недоступен ({last}) — "

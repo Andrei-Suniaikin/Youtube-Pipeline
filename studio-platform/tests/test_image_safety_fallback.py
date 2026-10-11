@@ -41,6 +41,11 @@ os.environ.setdefault("VS_TEST_NO_NET", "1")
 
 import googler_worker as G                                        # noqa: E402
 
+# Порядок по умолчанию (11.10.2026) проверяется в конце; сценарии ниже написаны для
+# одной модели отката — Flower.
+DEFAULT_CHAIN = G.IMAGE_SAFETY_FALLBACK_MODEL
+G.IMAGE_SAFETY_FALLBACK_MODEL = "FLOWER"
+
 FAILS = []
 TMP = tempfile.mkdtemp(prefix="image-safety-fallback-")
 PNG = base64.b64encode(b"\x89PNG\r\n\x1a\nfake-frame").decode("ascii")
@@ -78,6 +83,7 @@ def run(answers, *, scene=1, model="NARWHAL_LITE", out_dir=None, fresh_run=True)
     """Один кадр через настоящий generate_image: (результат, провайдер, лог, журнал, папка)."""
     if fresh_run:
         G._SAFETY_FALLBACK_USED.clear()
+        G._SAFETY_FALLBACK_BUSY.clear()
         G._FRAME_GIVEUP.clear()
     out_dir = out_dir or tempfile.mkdtemp(dir=TMP)
     provider = Provider(answers)
@@ -256,6 +262,35 @@ out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: FILTER}, scene=6, out_dir=
 check("сдался как «фильтр»", (G._FRAME_GIVEUP.get(5) or ("", ""))[0], G.GAP_FILTER)
 out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: "ok"}, scene=6, out_dir=d6, fresh_run=False)
 check("второго отката в том же прогоне нет", prov.count(FLOWER), 0)
+
+print("\nПорядок отката: Nano Banana 2 → Pro → Flower последним (11.10.2026)")
+# Владелец: Flower по качеству сильно хуже — в последнюю очередь.
+check("по умолчанию", DEFAULT_CHAIN, "NARWHAL,GEM_PIX_2,FLOWER")
+G.IMAGE_SAFETY_FALLBACK_MODEL = DEFAULT_CHAIN
+NB2, PRO = G.IMAGE_MODEL_V6["NARWHAL"], G.IMAGE_MODEL_V6["GEM_PIX_2"]
+try:
+    G._SAFETY_FALLBACK_BUSY.clear()
+    check("основная Lite → откат Nano Banana 2", G.safety_fallback_model("NARWHAL_LITE"), "NARWHAL")
+    check("основная Nano Banana 2 → откат Pro", G.safety_fallback_model("NARWHAL"), "GEM_PIX_2")
+    out, prov, lines, _j, _d = run({LITE: FILTER, NB2: "ok"}, scene=7)
+    check("кадр получен Nano Banana 2, Flower не звали",
+          (out[1] is not None, prov.count(NB2), prov.count(FLOWER)), (True, 1, 0))
+    d8 = tempfile.mkdtemp(dir=TMP)
+    out, prov, lines, _j, _d = run({LITE: FILTER, NB2: BUSY}, scene=8, out_dir=d8)
+    check("Nano Banana 2 занята — кадр отложен «позже»",
+          (out[1], (G._FRAME_GIVEUP.get(7) or ("", ""))[0]), (None, G.GAP_LATER))
+    out, prov, lines, _j, _d = run({LITE: FILTER, NB2: "ok", PRO: "ok"}, scene=8,
+                                   out_dir=d8, fresh_run=False)
+    check("добивка: откат уже следующей по списку — Pro",
+          (out[1] is not None, prov.count(PRO), prov.count(NB2), prov.count(FLOWER)),
+          (True, 1, 0, 0))
+    G._SAFETY_FALLBACK_BUSY.update({"NARWHAL", "GEM_PIX_2"})
+    check("заняты обе — Flower", G.safety_fallback_model("NARWHAL_LITE"), "FLOWER")
+    G._SAFETY_FALLBACK_BUSY.add("FLOWER")
+    check("заняты все — снова первая по списку", G.safety_fallback_model("NARWHAL_LITE"), "NARWHAL")
+finally:
+    G.IMAGE_SAFETY_FALLBACK_MODEL = "FLOWER"
+    G._SAFETY_FALLBACK_BUSY.clear()
 
 shutil.rmtree(TMP, ignore_errors=True)
 print(f"\nпровалов: {len(FAILS)}")
