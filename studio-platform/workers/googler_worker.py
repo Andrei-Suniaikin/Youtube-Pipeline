@@ -3338,6 +3338,9 @@ def _validated_visible_text(scene: dict, label: str,
     return checked
 
 
+_SCENE_QUOTED_RE = re.compile(r'"[^"\r\n]{1,120}"|“[^”\r\n]{1,120}”|«[^»\r\n]{1,120}»')
+
+
 def _validate_scene_object(scene, chunk_idx: int, chunk_text: str,
                            canon_names: Optional[List[str]] = None,
                            require_visible_text: bool = False) -> dict:
@@ -3354,12 +3357,15 @@ def _validate_scene_object(scene, chunk_idx: int, chunk_text: str,
     if scene["subject_type"] not in _SCENE_SUBJECT_TYPES:
         raise ScenePlanSchemaError(f"{label}: недопустимый subject_type")
     visible_text = _validated_visible_text(scene, label, require_visible_text)
-    if (require_visible_text and re.search(
-            r'"[^"\r\n]{1,120}"|“[^”\r\n]{1,120}”|«[^»\r\n]{1,120}»',
-            scene["visual_prompt"],
-    )):
+    quoted = (_SCENE_QUOTED_RE.findall(scene["visual_prompt"])
+              if require_visible_text else [])
+    if quoted:
+        # Какие именно кавычки — в тексте отказа: из него строится точечный повтор, и
+        # без этой подсказки модель трижды не понимала, что убрать (задача 2095, 11.10).
+        shown = ", ".join(q[:60] for q in quoted[:3])
         raise ScenePlanSchemaError(
-            f"{label}: literal wording запрещён в visual_prompt; используйте visible_text"
+            f"{label}: literal wording запрещён в visual_prompt; используйте visible_text "
+            f"(в кавычках: {shown})"
         )
     if canon_names:
         entities = scene.get("entities")
@@ -4081,11 +4087,20 @@ def _scene_corrective_payload(payload: dict, label: str, reason: str) -> dict:
                 "verbatim into the entities array. Do not substitute another grammatical case, "
                 "spelling, transliteration, or a semantically related alias. "
             )
+    literal_hint = ""
+    if "literal wording" in reason_folded:
+        literal_hint = (
+            "visual_prompt must contain NO quotation marks of any kind (\"…\", “…”, «…»), not "
+            "even around names, nicknames, titles or slogans. If that wording must be readable "
+            "in the image, put it verbatim into visible_text and in visual_prompt only say where "
+            "the writing is (for example, 'a painted name on the nose of the bomber'). If it need "
+            "not be readable, describe it in your own words without quotes. "
+        )
     corrected["messages"].append({
         "role": "user",
         "content": (
             f"CORRECTIVE RETRY for {label}. The previous answer was rejected: {safe_reason}. "
-            f"{canonical_entity_hint}"
+            f"{canonical_entity_hint}{literal_hint}"
             "Regenerate only the requested scene data. Obey the supplied JSON schema exactly: "
             "include every required field, keep required string fields non-empty, use allowed enum "
             "values, and use an empty array only where the contract explicitly allows it (such as "
