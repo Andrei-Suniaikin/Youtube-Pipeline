@@ -216,7 +216,7 @@ def main() -> int:
           'value="${esc(f.value)}"' in field_form, True)
     check("form.read() пропускает disabled-поля — связанная группа не уедет на "
           "сохранение как «свои поля»",
-          "if (!el.disabled) values[el.dataset.key] = el.value;" in field_form, True)
+          "if (!el.disabled && !el.closest('.inpanel')) values[el.dataset.key] = el.value;" in field_form, True)
 
     print("\n«Кто бежит» (presetUsersHtml): обязательная фраза про заморозку задач, "
           "проекты — не больше 20 + остаток, у частичного — целые пресеты и каналы через "

@@ -5206,7 +5206,10 @@ COVER_PAID_PROVIDERS = {"grok_api", "gpt_image2"}
 # Скрытые модели — чёрным списком (решение владельца 17.09.2026: «держим список
 # запрещённых»): новая модель у провайдера появится в списке сама. Гроки через FastGen
 # убраны 18.09 — остаётся только официальный API.
-COVER_HIDDEN = {("grok", "quality"), ("grok", "speed")}
+COVER_HIDDEN = {("grok", "quality"), ("grok", "speed"),
+                # 11.10.2026, владелец: OpenAI напрямую в обложках не предлагать — счёт
+                # пуст. Старые пресеты на нём Cover по-прежнему принимает.
+                ("gpt_image2", "")}
 
 
 def _cover_options(is_admin: bool) -> list:
@@ -5234,6 +5237,9 @@ def _cover_options(is_admin: bool) -> list:
         # берём как есть у соседа, но убираем из него скобку с провайдером, если она уже
         # там есть, — иначе выйдет «… (VeoNonStop) · VeoNonStop».
         name = re.sub(r"\s*\((VeoNonStop|OpenAI)\)\s*$", "", label).strip()
+        if provider == "openai_img":
+            # Рисует FastGen; слово «OpenAI» в начале подписи читалось как прямой ключ.
+            name = re.sub(r"^OpenAI\s*—\s*", "", name).strip()
         shown = f"{name} · {who}" + (" · 💲 платно" if paid else "")
         out.append({"label": shown, "provider": provider, "model": model,
                     "admin_only": provider in admin_only, "paid": paid,
@@ -6174,9 +6180,12 @@ def _neighbour_preset_options(service: str, sid: str, request) -> dict:
         # быть не должно: она картинки не принимает, а предлагать неработающее —
         # это ровно та ложь интерфейса, которую мы убираем. Google мёртв с v1.0.3 и
         # молча мигрируется в OpenAI, поэтому его тоже не предлагаем.
-        analysis = [{"value": "openai|gpt-4.1-mini", "title": "OpenAI · gpt-4.1-mini"},
-                    {"value": "openai|gpt-4o", "title": "OpenAI · gpt-4o"},
-                    {"value": "codex|", "title": "Codex · подписка ChatGPT"}]
+        # 11.10.2026, владелец: «в создании пресета обложки опять затесался OpenAI».
+        # Счёт ключа OpenAI пуст (402 у 107 задач за три дня), а пресеты на Codex
+        # сделали 70 обложек из 70. OpenAI из выбора убран; у старого пресета на нём
+        # форма покажет «нет в списке, но сохранено» — видно, что его пора перевести.
+        analysis = [{"value": "codex|gpt-5.6-sol", "title": "Codex · подписка ChatGPT · gpt-5.6-sol"},
+                    {"value": "codex|", "title": "Codex · подписка ChatGPT · модель подписки"}]
         fallback = [{"value": "auto", "title": "как решит сервис"},
                     {"value": "always_overlay", "title": "всегда накладывать текст"},
                     {"value": "never_overlay", "title": "никогда не накладывать"}]
@@ -6207,8 +6216,8 @@ def _neighbour_preset_options(service: str, sid: str, request) -> dict:
 NEIGHBOUR_PRESET_DEFAULTS = {
     "cover": {"seed_n_variants": 3, "prompt_template": "", "use_auto_style": True,
               "simple_mode": False, "fallback_mode": "auto", "aspect_ratio": "16:9",
-              "max_generation_retries": 5, "analysis_provider": "openai",
-              "analysis_model": "gpt-4.1-mini"},
+              "max_generation_retries": 5, "analysis_provider": "codex",
+              "analysis_model": "gpt-5.6-sol"},
     "rewrite": {"chunk": 3500, "threads": 1, "address": "",
                 "preserve_paragraphs": True, "safe_text": False, "languages": []},
     "rewrite_gen": {"content": "", "target_length_words": ""},

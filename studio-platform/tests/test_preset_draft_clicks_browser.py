@@ -20,7 +20,7 @@
   * удаление строки переживает смену вкладки и перерисовку и уезжает на сервер;
   * добавленная и заполненная строка — тоже;
   * шаблон Lumean, заведённый прямо из формы, — тоже;
-  * пресет соседа, выбранный окном «Завести новый», — тоже;
+  * пресет соседа, заведённый формой прямо на вкладке, — тоже;
   * переименование целого пресета меняет ЗАГОЛОВОК экрана: пресет после записи
     остаётся открытым, и старое имя в шапке человек читает как «не сохранилось».
 
@@ -102,7 +102,7 @@ SCENARIO = r"""
       return {ok: true, templates: [], fields: [
         {key: 'name', kind: 'text', label: 'Название', value: ''},
         {key: 'voice_id', kind: 'text', label: 'ID голоса', value: ''}]};
-    if (p === '/ui/presets/rewrite/new/form') return {fields: []};
+    if (/^\/ui\/presets\/rewrite\/.*\/form$/.test(p)) return {fields: []};
     if (p === '/ui/presets') return {broken: [], groups: []};
     if (p === '/ui/me') return {name: 'dev'};
     return {};
@@ -177,16 +177,16 @@ SCENARIO = r"""
   await tick(300);
   out.шаблон_пережил = val('[data-key="voice_by_lang"]');
 
-  // ── 4. Пресет соседа, выбранный окном «Завести новый» ─────────────────────
+  // ── 4. Пресет соседа, заведённый формой прямо на вкладке ──────────────────
+  // (11.10.2026: окна «Завести новый» больше нет — при пустом выборе форма нового
+  // стоит сразу под ним.)
   location.hash = '#/preset/12/stsenariy';
-  await tick(300);
-  document.querySelector('.np-add').click();
-  await tick(400);
-  const nd = document.querySelector('dialog[open]');
-  out.окно_соседа = !!nd;
+  await tick(500);
+  const nd = document.querySelector('.inpanel');
+  out.окно_соседа = !!(nd && nd.querySelector('#np-name'));
   if (nd){
     nd.querySelector('#np-name').value = 'новый-текстовый';
-    dbtn('Завести').click();
+    nd.querySelector('.m-ok').click();
     await tick(700);
   }
   out.сосед_выбран = val('#f-preset_rewrite');

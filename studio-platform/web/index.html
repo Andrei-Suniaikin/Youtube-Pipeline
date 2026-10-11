@@ -9451,8 +9451,14 @@ function inlinePanel(host, title, bodyHtml, opts){
     finally{ ok.disabled = false; }
   };
   const first = el.querySelector('.mbody input,.mbody textarea,.mbody select');
-  if (first) first.focus();
-  return {el, body: el.querySelector('.mbody'), close: () => {}};
+  if (first && !o.noFocus) first.focus();
+  // Запись по общей кнопке формы (см. PRESET_NEIGHBOUR_FLUSH): ошибка — наверх, а не в тихую.
+  const submit = async () => {
+    err.textContent = '';
+    try{ await o.onOk(el.querySelector('.mbody'), () => {}); }
+    catch(e){ err.textContent = e.message; throw e; }
+  };
+  return {el, body: el.querySelector('.mbody'), close: () => {}, submit};
 }
 
 // Прочитать длинный текст целиком: окном поверх экрана, удобной мерой строки и без
@@ -9712,6 +9718,7 @@ function setFieldValue(el, value){
 // менять её незачем, у вызова и так есть один объект, на который можно повесить
 // необязательное поле.
 function fieldForm(groups){
+  PRESET_NEIGHBOUR_FLUSH = [];
   const onLinkChange = groups.onLinkChange;
   const form = $(`<form></form>`);
   for (const g of groups){
@@ -9820,7 +9827,9 @@ function fieldForm(groups){
   form.read = () => {
     const values = {};
     form.querySelectorAll('[data-key]').forEach(el => {
-      if (!el.disabled) values[el.dataset.key] = el.value;
+      // Поля пресета соседа (`.inpanel` части «Сценарий»/«Обложка») — его, не наши:
+      // их ключи («model» и т. п.) совпали бы с ключами кабинета.
+      if (!el.disabled && !el.closest('.inpanel')) values[el.dataset.key] = el.value;
     });
     return values;
   };
@@ -9848,22 +9857,18 @@ function parseVoiceMapRows(raw){
 // Поле пресета кабинета → сервис соседа, у которого этот пресет живёт.
 const NEIGHBOUR_PRESET_KEYS = {preset_rewrite: 'rewrite', preset_cover: 'cover'};
 
+// Правки части «Сценарий»/«Обложка», набранные прямо в форме целого пресета, уезжают
+// той же кнопкой «Сохранить», что и сам пресет: две кнопки на одно намерение путали.
+let PRESET_NEIGHBOUR_FLUSH = [];
+
 function wireNeighbourPreset(card, f, locked){
   const service = NEIGHBOUR_PRESET_KEYS[f.key];
   const sel = card.querySelector('#f-' + f.key);
   if (!sel || locked) return;
-  const bar = $(`<div style="display:flex;gap:8px;margin-top:6px">
-    <button type="button" class="ghost small np-edit">Настроить</button>
-    <button type="button" class="ghost small np-add">Завести новый</button>
-  </div>`);
-  sel.parentElement.append(bar);
-  // Жалоба 21.09: «создаю частичный пресет для обложки, а мне зачем-то предлагают
-  // выбрать ещё какой-то пресет». Поле не лишнее — оно и ЕСТЬ всё содержимое такой
-  // части: настройки обложки и текста живут в соседних сервисах, а здесь хранится
-  // ссылка на них. Понять это по одной подписи нельзя — поэтому знак вопроса у самой
-  // подписи, а не третья строка текста под полем: в форме пресета таких полей много.
-  // Знак — соседом подписи, а не внутри неё: кнопка внутри подписи дописала бы весь текст
-  // подсказки к имени поля для читалки (см. `.lh`).
+  // 11.10.2026, владелец: «какого черта не показываются сразу настройки, а надо ещё
+  // что-то кликать». Раньше под выбором стояли «Настроить» и «Завести новый», и
+  // настройки открывались только по клику. Теперь они рисуются сразу под выбором:
+  // выбран пресет — его поля; не выбран — форма нового, имя подставлено из целого.
   const lab = sel.parentElement.querySelector('label');
   if (lab && !lab.parentElement.classList.contains('lh')){
     const row = document.createElement('div');
@@ -9873,38 +9878,47 @@ function wireNeighbourPreset(card, f, locked){
     row.append(lab);
     row.insertAdjacentHTML('beforeend', hintDot('Какой пресет '
       + (service === 'cover' ? 'обложки' : 'текста')
-      + ' взять. Его настройки правятся по «Настроить», новый — «Завести новый».'));
+      + ' взять. Его настройки — сразу ниже; не выбран — там же заводится новый.'));
   }
-  const edit = bar.querySelector('.np-edit');
-  const paint = () => { edit.disabled = !sel.value; };
-  sel.addEventListener('change', paint);
-  paint();
-  edit.onclick = () => {
-    if (!sel.value){ toast('Сначала выберите пресет — или заведите новый'); return; }
-    // reload:false — человек стоит в незаполненной форме пресета кабинета, и общая
-    // перерисовка стёрла бы всё, что он успел набрать.
-    neighbourPresetModal(service, sel.value, {reload: false});
-  };
-  bar.querySelector('.np-add').onclick = () => neighbourPresetModal(service, null, {
-    reload: false,
-    // Жалоба 21.09: «в попапе предлагается ввести имя, хотя я его уже ввёл, когда
-    // создавал пресет». Это РАЗНЫЕ объекты — пресет кабинета и пресет соседа, — но
-    // заставлять человека придумывать второе имя незачем: подставляем то же самое,
-    // а он поменяет, если захочет.
-    suggestName: (document.querySelector('#p-name') || {}).value || '',
-    // Заведённый пресет сразу становится выбранным: иначе человек заводит его и тут же
-    // ищет в списке, который ещё не знает о нём.
-    onSaved: name => {
-      if (!name) return;
-      if (![...sel.options].some(o => o.value === name))
-        sel.append(new Option(name, name));
-      // Выбор сделан кодом — форме о нём надо сказать, иначе черновик пресета
-      // кабинета не увидит, что сосед здесь поменялся (см. setFieldValue).
-      setFieldValue(sel, name);
-      paint();
-      toast('Пресет заведён и выбран здесь же', 'ok');
-    },
+  const host = document.createElement('div');
+  host.style.cssText = 'margin-top:12px';
+  card.append(host);
+  const slot = {dirty: false, panel: null};
+  host.addEventListener('input', () => { slot.dirty = true; });
+  host.addEventListener('change', () => { slot.dirty = true; });
+  PRESET_NEIGHBOUR_FLUSH.push(async () => {
+    if (!slot.dirty || !slot.panel || !host.isConnected) return;
+    await slot.panel.submit();
   });
+  let seq = 0;
+  const paint = async () => {
+    const my = ++seq;
+    host.innerHTML = '';
+    slot.dirty = false;
+    slot.panel = null;
+    const name = sel.value || null;
+    const panel = await neighbourPresetModal(service, name, {
+      host, reload: false, noFocus: true,
+      // Пресет соседа — отдельный объект, но второе имя придумывать незачем.
+      suggestName: (document.querySelector('#p-name') || {}).value || '',
+      onSaved: saved => {
+        slot.dirty = false;
+        if (!saved) return;
+        if (!name){
+          if (![...sel.options].some(o => o.value === saved))
+            sel.append(new Option(saved, saved));
+          // Выбор сделан кодом — черновику пресета о нём надо сказать (setFieldValue).
+          setFieldValue(sel, saved);
+          toast('Пресет заведён и выбран здесь же', 'ok');
+          paint();
+        }else toast('Настройки сохранены', 'ok');
+      },
+    });
+    if (my !== seq){ if (panel && panel.el) panel.el.remove(); return; }
+    slot.panel = panel || null;
+  };
+  sel.addEventListener('change', () => paint());
+  paint();
 }
 
 function wireLangMap(card, f, group, locked){
@@ -10494,6 +10508,9 @@ async function viewPreset(id){
   // Частичный — про одну часть: записали и на список.
   const full = d.scope === 'full';
   app.append(saveBar('#/presets', async () => {
+    // Сначала — настройки сценария и обложки, набранные на их вкладках: заведённый там
+    // пресет должен попасть в выбор раньше, чем форма прочитает поля.
+    for (const flush of PRESET_NEIGHBOUR_FLUSH) await flush();
     // Уезжает и то, что набрано на других вкладках: черновик копил правки всего
     // пресета, и записать только открытую вкладку значило бы потерять остальные
     // молча — та же потеря, от которой уходим.
@@ -11309,10 +11326,13 @@ async function neighbourPresetModal(service, name, opts){
            value="${esc((opts && (opts.suggestName || opts.prefillName)) || '')}"></div>`
     : '';
   const panelTitle = opts && opts.host
-    ? (NEIGHBOUR_PART[service] || 'Настройки') : (creating ? 'Новый пресет' : `Пресет «${name}»`);
+    ? (creating ? (NEIGHBOUR_PART[service] || 'Настройки') + ' — новый пресет'
+                : `Настройки пресета «${name}»`)
+    : (creating ? 'Новый пресет' : `Пресет «${name}»`);
   const m = (opts && opts.host ? inlinePanel.bind(null, opts.host) : modal)(panelTitle,
     `<div class="fields" style="padding:0">${nameHtml}${d.fields.map(fieldHtml).join('')}</div>`,
-    {ok: creating ? 'Завести' : 'Сохранить', onOk: async (box, close) => {
+    {ok: creating ? 'Завести' : 'Сохранить', noFocus: !!(opts && opts.noFocus),
+     onOk: async (box, close) => {
       const values = {};
       box.querySelectorAll('[data-key]').forEach(el => {
         const f = d.fields.find(x => x.key === el.dataset.key) || {};
@@ -11395,6 +11415,7 @@ async function neighbourPresetModal(service, name, opts){
     }catch(e){ toast(e.message); }
     finally{ ref.disabled = false; ref.value = ''; }
   };
+  return m;
 }
 
 // Картинку-образец хранит Cover Studio, а не форма: пульт её только передаёт. Вынесено

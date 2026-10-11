@@ -294,8 +294,8 @@ def main() -> int:
           opts["NARWHAL"], "Nano Banana 2 · Flow · 4 кр · FastGen · работает")
     check("модель FastGen, которой нет в снимке, — «статуса нет», а не выдуманное «работает»",
           opts["OPENAI"], "OpenAI · 1 кр · FastGen · статуса нет")
-    check("у GPT Image health-API нет — статус не дописан, но виден провайдер",
-          opts["GPT_IMAGE2"], "GPT Image 2.5 · платно · $ · OpenAI")
+    # 11.10.2026: GPT Image ходит прямым ключом OpenAI, счёт пуст — из выбора убран.
+    check("GPT Image (OpenAI напрямую) в выборе не предлагается", "GPT_IMAGE2" in opts, False)
 
     print("\n  форма открывается и когда снимка нет, и когда провайдер молчит")
 
