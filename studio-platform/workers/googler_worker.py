@@ -7392,6 +7392,12 @@ def googler_request_v6(endpoint: str, method: str = "POST", data: Optional[dict]
 # записывается в googler/image_gaps.json с причиной и исключается из проверки квитанций.
 IMAGE_GAPS_FILE = "image_gaps.json"
 IMAGE_GAP_MAX_SHARE = float(os.environ.get("VS_IMAGE_GAP_MAX_SHARE", "0.02") or 0.02)
+# 11.10.2026, владелец: «если не проходит — заменяем, иначе падает ошибка и требует
+# оператора». Кадр, который фильтр отверг после смягчений и на всех моделях замены,
+# повтор не возьмёт — его отдаём соседнему кадру сверх 2%, но всего пропусков не больше
+# 10% ролика: дальше это уже беда всей темы, и задача падает, как раньше. Прочие сбои
+# по-прежнему укладываются в 2%.
+IMAGE_FILTER_GAP_MAX_SHARE = float(os.environ.get("VS_IMAGE_FILTER_GAP_MAX_SHARE", "0.10") or 0.10)
 IMAGE_LATE_RETRY_SEC = int(os.environ.get("VS_IMAGE_LATE_RETRY_SEC", "900") or 900)
 IMAGE_LATE_RETRY_ROUNDS = int(os.environ.get("VS_IMAGE_LATE_RETRY_ROUNDS", "3") or 3)
 GAP_FILTER = "фильтр"       # провайдер отказал фильтром безопасности и после смягчений
@@ -7414,6 +7420,20 @@ def _giveup_kind(error: str) -> str:
 def image_gaps_allowed(total: int) -> int:
     """Сколько сцен ролика можно отдать соседнему кадру: 2%, но не меньше одной."""
     return max(1, int(int(total) * IMAGE_GAP_MAX_SHARE))
+
+
+def image_filter_gaps_allowed(total: int) -> int:
+    """Сколько сцен всего можно отдать соседнему кадру, если сверх 2% — только отказы фильтра."""
+    return max(image_gaps_allowed(total), int(int(total) * IMAGE_FILTER_GAP_MAX_SHARE))
+
+
+def image_gaps_acceptable(gaps, total: int, giveup=None) -> bool:
+    """Можно ли отдать эти сцены соседним кадрам: прочих сбоев не больше 2%, а вместе с
+    отказами фильтра — не больше 10% ролика."""
+    gaps = list(gaps)
+    other = late_retry_indices(gaps, giveup)
+    return (len(other) <= image_gaps_allowed(total)
+            and len(gaps) <= image_filter_gaps_allowed(total))
 
 
 def late_retry_indices(gaps, giveup=None) -> list:
@@ -14348,7 +14368,7 @@ def cmd_full_pipeline(args):
                              os.path.join(output_dir, f"{i + 1:03d}.jpg"),
                          )]
             _later = late_retry_indices(_gaps_now)
-            if not _later or len(_gaps_now) > image_gaps_allowed(total):
+            if not _later or not image_gaps_acceptable(_gaps_now, total):
                 break
             print_user(f"⏳ Повтор позже (раунд {_late_round}/{IMAGE_LATE_RETRY_ROUNDS}): "
                        f"{len(_later)} кадр(ов) — сцены "
@@ -14440,7 +14460,7 @@ def cmd_full_pipeline(args):
                        os.path.join(output_dir, f"{i + 1:03d}.jpg"),
                    )]
     _accepted = []
-    if _final_gaps and len(_final_gaps) <= image_gaps_allowed(total):
+    if _final_gaps and image_gaps_acceptable(_final_gaps, total):
         _accepted = _final_gaps
         for _row in write_image_gaps(output_dir, _accepted):
             print_user(f"🧩 [{_row['scene']}] Сцена {_row['scene']} заменена кадром предыдущей сцены: "
@@ -14448,9 +14468,12 @@ def cmd_full_pipeline(args):
     else:
         write_image_gaps(output_dir, [])
         if _final_gaps:
-            print_user(f"⛔ Недостающих кадров {len(_final_gaps)} из {total} — больше "
-                       f"{image_gaps_allowed(total)} (2%): кадрами предыдущих сцен не заменяю, нужен разбор",
-                       "ERROR")
+            _filt = len(_final_gaps) - len(late_retry_indices(_final_gaps))
+            print_user(f"⛔ Недостающих кадров {len(_final_gaps)} из {total} (из них отказ фильтра: "
+                       f"{_filt}) — больше допустимого: сбоев не больше "
+                       f"{image_gaps_allowed(total)} (2%), всего не больше "
+                       f"{image_filter_gaps_allowed(total)} (10%); кадрами предыдущих сцен не "
+                       f"заменяю, нужен разбор", "ERROR")
     reconciliation = _reconcile_authoritative_image_set(
         project_dir, receipt_path, image_receipts,
         [f"{index + 1:03d}.jpg" for index in range(total)],

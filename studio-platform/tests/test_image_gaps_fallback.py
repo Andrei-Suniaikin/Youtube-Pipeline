@@ -111,12 +111,29 @@ def main() -> int:
     check("квитанции для сцены 3 не выписано", "003" in receipts["frames"], False)
     check("файла для сцены 3 не появилось", os.path.exists(os.path.join(out, "003.jpg")), False)
 
+    print("\nОтказ фильтра на всех моделях — соседним кадром до 10% (11.10.2026)")
+    # Ultima Scrisoare de pe Front: 5 из 242 под фильтром — раньше «больше 2%, нужен разбор».
+    filt = {i: (G.GAP_FILTER, "фильтр") for i in (21, 27, 93, 94, 95)}
+    check("242 сцены → всего до 24", G.image_filter_gaps_allowed(242), 24)
+    check("5 отказов фильтра из 242 — принимаются",
+          G.image_gaps_acceptable(list(filt), 242, filt), True)
+    late5 = {i: (G.GAP_LATER, "try again later") for i in (1, 2, 3, 4, 5)}
+    check("5 обычных сбоев из 242 — нет, как раньше (2%)",
+          G.image_gaps_acceptable(list(late5), 242, late5), False)
+    mix = dict(filt, **{i: (G.GAP_OTHER, "x") for i in (1, 2, 3, 4)})
+    check("5 фильтра + 4 сбоя — принимаются", G.image_gaps_acceptable(list(mix), 242, mix), True)
+    many = {i: (G.GAP_FILTER, "фильтр") for i in range(25)}
+    check("25 отказов фильтра из 242 (>10%) — нет, нужен разбор",
+          G.image_gaps_acceptable(list(many), 242, many), False)
+    check("маленький ролик: 1 из 40 — да, как раньше",
+          G.image_gaps_acceptable([3], 40, {3: (G.GAP_OTHER, "x")}), True)
+
     print("\nКонец прогона устроен именно так")
     src = open(os.path.join(BASE, "workers", "googler_worker.py"), encoding="utf-8").read()
     tail = src[src.find("_final_gaps = [i for i in range(total)"):]
     tail = tail[:tail.find("def cmd_check_usage")]
-    check("в пределах 2% — сцены принимаются и записываются",
-          "len(_final_gaps) <= image_gaps_allowed(total)" in tail
+    check("в пределах допуска — сцены принимаются и записываются",
+          "image_gaps_acceptable(_final_gaps, total)" in tail
           and "write_image_gaps(output_dir, _accepted)" in tail, True)
     check("и исключаются из проверки квитанций",
           'skip_frames={f"{index + 1:03d}" for index in _accepted}' in tail, True)
@@ -137,8 +154,9 @@ def main() -> int:
         got = str(exc)
     check("сцена 2 не объявлена — падает", got, "authoritative image receipt is not exact for frame 002")
     late = src[src.find("ПОВТОР ПОЗЖЕ (владелец 05.10.2026)"):src.find("_final_gaps = [i for i in range(total)")]
-    check("повтор позже — только кого стоит и только в пределах 2%",
-          "late_retry_indices(_gaps_now)" in late and "image_gaps_allowed(total)" in late, True)
+    check("повтор позже — только кого стоит и только в пределах допуска",
+          "late_retry_indices(_gaps_now)" in late
+          and "image_gaps_acceptable(_gaps_now, total)" in late, True)
     check("и с паузой между раундами", "time.sleep(IMAGE_LATE_RETRY_SEC)" in late, True)
 
     print("\nДвижок переносит подмену в журнал выпуска — один раз")
