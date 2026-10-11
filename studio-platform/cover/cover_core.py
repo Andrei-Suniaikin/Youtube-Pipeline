@@ -891,7 +891,7 @@ def generate_scene_from_title(
 
 
 def adapt_text(original_text: str, target_language: str, api_key: str, video_title: str = "",
-               provider: str = "") -> str:
+               provider: str = "", model: str = "") -> str:
     """Адаптация текста обложки на целевой язык через GPT. video_title — название ролика для контекста.
 
     `provider` — подписка (codex или claude), когда человек выбрал её вместо ключа.
@@ -906,7 +906,10 @@ def adapt_text(original_text: str, target_language: str, api_key: str, video_tit
         return _subscription_call(provider.strip().lower(), [
             {"role": "system", "content": system_content},
             {"role": "user", "content": original_text},
-        ]).strip()
+        # 11.10.2026: без модели сервис текста брал свою gpt-5.1-codex-max, которой у
+        # подписки ChatGPT нет, — и все обложки WW2 падали на подгонке текста. Модель —
+        # та же, что у разбора превью этого пресета.
+        ], model=model or "").strip()
     client, _model, used_key = _chat_route(api_key, GPT_MODEL)
     with _provider_semaphore_for_key("openai", used_key):
         resp = client.chat.completions.create(
@@ -2493,6 +2496,8 @@ def _generate_for_language(
                     original_text, preset_lang.language, openai_api_key,
                     video_title=analysis.get("video_title", ""),
                     provider=_adapt_sub,
+                    model=(str(getattr(preset_lang, "analysis_model", "") or "").strip()
+                           if _adapt_sub else ""),
                 )
                 log(f"   Результат: {adapted_text}")
             else:

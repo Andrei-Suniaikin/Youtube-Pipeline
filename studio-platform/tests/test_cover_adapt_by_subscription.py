@@ -34,18 +34,22 @@ def check(label, got, want):
         FAILS.append(label)
 
 
-def preset(analysis_provider):
+def preset(analysis_provider, analysis_model=""):
     return types.SimpleNamespace(
         language="Чешский", generation_provider="grok_api", generation_model="",
         reference_image="", simple_mode=False, analysis_provider=analysis_provider,
-        analysis_model="", name="ВВ2", aspect_ratio="16:9", fast_gen_base_url="",
+        analysis_model=analysis_model, name="ВВ2", aspect_ratio="16:9", fast_gen_base_url="",
         max_generation_retries=1, debug_mode=False)
 
 
-def run(analysis_provider, openai_key):
+MODELS = []
+
+
+def run(analysis_provider, openai_key, analysis_model=""):
     sub_calls, openai_calls = [], []
     saved = (cc._subscription_call, cc._chat_route, cc.build_generation_prompt)
-    cc._subscription_call = lambda prov, msgs, *a, **k: (sub_calls.append(prov), "PŘELOŽENO")[1]
+    cc._subscription_call = lambda prov, msgs, *a, **k: (
+        sub_calls.append(prov), MODELS.append(k.get("model", "")), "PŘELOŽENO")[2]
 
     def no_openai(*a, **k):
         openai_calls.append(1)
@@ -54,7 +58,8 @@ def run(analysis_provider, openai_key):
     cc.build_generation_prompt = lambda *a, **k: "prompt"
     try:
         r = cc._generate_for_language(Image.new("RGB", (64, 36)), {"text": "LAST LETTER"}, None,
-                                      preset(analysis_provider), "", openai_key, "")
+                                      preset(analysis_provider, analysis_model), "",
+                                      openai_key, "")
     finally:
         cc._subscription_call, cc._chat_route, cc.build_generation_prompt = saved
     return r, sub_calls, openai_calls
@@ -70,6 +75,11 @@ def main() -> int:
     print("\nРазбор подпиской, ключ OpenAI есть, но пуст — в OpenAI всё равно не ходим")
     r, sub, oa = run("codex", "sk-пустой")
     check("подгонка — подпиской", (sub, oa), (["codex"], []))
+
+    print("\nМодель подгонки — та же, что у разбора превью (11.10.2026)")
+    MODELS.clear()
+    run("codex", "", "gpt-5.6-sol")
+    check("в сервис текста ушла gpt-5.6-sol, а не его умолчание", MODELS, ["gpt-5.6-sol"])
 
     print("\nРазбор ключом OpenAI — как раньше, через OpenAI")
     r, sub, oa = run("openai", "sk-ключ")
