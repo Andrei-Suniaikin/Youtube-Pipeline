@@ -120,7 +120,7 @@ def main() -> int:
     late5 = {i: (G.GAP_LATER, "try again later") for i in (1, 2, 3, 4, 5)}
     check("5 обычных сбоев из 242 — нет, как раньше (2%)",
           G.image_gaps_acceptable(list(late5), 242, late5), False)
-    mix = dict(filt, **{i: (G.GAP_OTHER, "x") for i in (1, 2, 3, 4)})
+    mix = {**filt, **{i: (G.GAP_OTHER, "x") for i in (1, 2, 3, 4)}}
     check("5 фильтра + 4 сбоя — принимаются", G.image_gaps_acceptable(list(mix), 242, mix), True)
     many = {i: (G.GAP_FILTER, "фильтр") for i in range(25)}
     check("25 отказов фильтра из 242 (>10%) — нет, нужен разбор",
