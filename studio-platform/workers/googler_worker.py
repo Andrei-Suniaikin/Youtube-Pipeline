@@ -7586,7 +7586,7 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
                 item = results[0]
                 data = item.get("data")
                 if data:  # inline data-uri
-                    print_user(f"✅ [{index}] v6 готово ({elapsed}с, inline)", "SUCCESS")
+                    print_user(f"✅ [{index + 1}] v6 готово ({elapsed}с, inline)", "SUCCESS")
                     return data.split(",", 1)[-1] if (isinstance(data, str) and data.startswith("data:")) else data
                 url = item.get("download_url")
                 if url:
@@ -7596,15 +7596,15 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
                     for _dl_try in range(3):
                         try:
                             b = requests.get(url, timeout=REQUEST_TIMEOUT).content
-                            print_user(f"✅ [{index}] v6 готово ({elapsed}с, {len(b)//1024}КБ)", "SUCCESS")
+                            print_user(f"✅ [{index + 1}] v6 готово ({elapsed}с, {len(b)//1024}КБ)", "SUCCESS")
                             return base64.b64encode(b).decode("ascii")
                         except Exception as e:
                             _dl_err = e
-                            print_debug(f"[{index}] v6 download попытка {_dl_try+1}/3: {str(e)[:120]}")
+                            print_debug(f"[{index + 1}] v6 download попытка {_dl_try+1}/3: {str(e)[:120]}")
                             time.sleep(2 * (_dl_try + 1))
-                    print_user(f"❌ [{index}] v6: не скачался download_url (3 попытки): {str(_dl_err)[:120]}", "ERROR")
+                    print_user(f"❌ [{index + 1}] v6: не скачался download_url (3 попытки): {str(_dl_err)[:120]}", "ERROR")
                     return None
-            print_user(f"⚠️ [{index}] v6 succeeded, но results пусты", "WARNING")
+            print_user(f"⚠️ [{index + 1}] v6 succeeded, но results пусты", "WARNING")
             return None
         elif st == "failed":
             err = r.get("error") or r.get("_error") or json.dumps(r, ensure_ascii=False)[-200:]
@@ -7613,7 +7613,7 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
             # failure gets a private marker used by the OPENAI image retry bound.
             _set_last_gen_error(_typed_v6_terminal_error(err))
             _set_provider_refusal(str(err))     # правда провайдера — в лог и в журнал
-            print_user(f"❌ [{index}] v6 generation failed: {str(err)[:200]}", "ERROR")
+            print_user(f"❌ [{index + 1}] v6 generation failed: {str(err)[:200]}", "ERROR")
             return None
         else:  # queued / running / unknown
             if r.get("_error"):
@@ -7630,7 +7630,7 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
                 if lost_since is None:
                     lost_since = now
                 elif now - lost_since >= V6_LOST_GRACE_SEC:
-                    print_user(f"❌ [{index}] v6: провайдер не знает заказ {gen_id} — "
+                    print_user(f"❌ [{index + 1}] v6: провайдер не знает заказ {gen_id} — "
                                f"{int(now - lost_since)}с подряд отвечает 404 "
                                f"(«не найден или истёк»), ждать нечего", "ERROR")
                     return None
@@ -7638,10 +7638,10 @@ def poll_v6_generation(gen_id: str, index: int = 0, timeout: int = None) -> Opti
                 lost_since = None
             el = time.time() - start
             if el - hb >= 15:
-                print_user(f"v6 операция [{index}]: {int(el)}с ({st})...", "PROCESS")
+                print_user(f"v6 операция [{index + 1}]: {int(el)}с ({st})...", "PROCESS")
                 hb = el
             time.sleep(VIDEO_POLL_INTERVAL)
-    print_error_user_friendly(f"Таймаут v6 операции [{index}] ({timeout}с)")
+    print_error_user_friendly(f"Таймаут v6 операции [{index + 1}] ({timeout}с)")
     return None
 
 
@@ -7980,13 +7980,13 @@ def googler_v6_generate(v6_model: str, prompt: str, aspect_ratio: Optional[str] 
         # («HTTP 401: invalid api key»). Дальше она терялась: наверх уходила обёртка
         # «v6 генерация не удалась», и в карточке с журналом оставалось «rc=3».
         _set_provider_refusal(str(resp["_error"]))
-        print_user(f"❌ [{index}] v6 generation отклонён: "
+        print_user(f"❌ [{index + 1}] v6 generation отклонён: "
                    f"{_humanize_refusal(str(resp['_error']))[:300]}", "ERROR")
         return None
     gid = resp.get("id")
     if not gid:
         _set_provider_refusal(f"ответ без id операции: {str(resp)[:160]}")
-        print_user(f"❌ [{index}] v6: нет id в ответе ({str(resp)[:160]})", "ERROR")
+        print_user(f"❌ [{index + 1}] v6: нет id в ответе ({str(resp)[:160]})", "ERROR")
         return None
     # 03.09.2026: заказ создан и уже оплачен — фиксируем id ДО поллинга. Именно здесь
     # раньше терялись деньги: падение/таймаут во время ожидания и кадр заказывали заново.
