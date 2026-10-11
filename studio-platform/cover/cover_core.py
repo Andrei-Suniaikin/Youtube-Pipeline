@@ -2184,7 +2184,14 @@ def _download_and_analyze_url(
 # дважды» (Záhady Zvířat, донор «Why Do Sperm Whales TERRIFY Orca?»). Фильтр режет само
 # превью — кровь, драка хищников. У моделей одного ключа FastGen фильтры разные, поэтому
 # после первого такого отказа остальные попытки идут в запасную модель того же ключа.
-COVER_SAFETY_FALLBACK_PROVIDER = os.environ.get("COVER_SAFETY_FALLBACK_PROVIDER", "flower") or "flower"
+#
+# 11.10.2026, владелец: «Flower по качеству сильно хуже, я бы в последнюю очередь его
+# ставил». Запасных теперь цепочка: Nano Banana 2 → Nano Banana Pro → Flower. Каждый
+# следующий отказ фильтра переводит оставшиеся попытки на следующую модель цепочки;
+# число попыток (и оплат) прежнее. Через запятую «провайдер/модель» в
+# COVER_SAFETY_FALLBACK_PROVIDER.
+COVER_SAFETY_FALLBACK_PROVIDER = (os.environ.get("COVER_SAFETY_FALLBACK_PROVIDER")
+                                  or "flow/NARWHAL,flow/GEM_PIX_2,flower")
 
 
 def _is_safety_block(err) -> bool:
@@ -2192,23 +2199,47 @@ def _is_safety_block(err) -> bool:
     return "safety" in s and ("block" in s or "filter" in s)
 
 
-def safety_fallback_provider(current: str, n_refs: int = 1) -> str:
-    """Запасная модель того же ключа после отказа фильтра — или "" (запасной нет).
+def safety_fallback_chain(current: str, current_model: str = "", n_refs: int = 1,
+                          tried=()) -> tuple:
+    """Следующая запасная модель того же ключа после отказа фильтра: (провайдер, модель)
+    или ("", "") — запасной нет.
 
-    flower принимает ровно одну картинку на вход: при двух (обложка + референс стиля)
-    вместо него flow. Другая семья ключа запрещена — платить не тем ключом нельзя.
+    flower принимает ровно одну картинку на вход — при двух (обложка + референс стиля)
+    он пропускается. Другая семья ключа запрещена — платить не тем ключом нельзя.
+    tried — уже испробованные (провайдер, модель) этой обложки.
     """
-    want = canonical_generation_provider(COVER_SAFETY_FALLBACK_PROVIDER)
-    if want == "flower" and n_refs > 1:
-        want = "flow"
-    if want == canonical_generation_provider(current):
-        want = "flow" if want != "flow" else "flower"
-        if want == "flower" and n_refs > 1:
-            return ""
-    try:
-        return effective_simple_mode_provider(current, want)
-    except Exception:                                              # noqa: BLE001
-        return ""
+    def norm(prov, model):
+        prov, model = canonical_generation_provider(prov), str(model or "").strip().upper()
+        # flow без явной модели — это Nano Banana Pro (см. _v6_operation).
+        return prov, (model or "GEM_PIX_2") if prov == "flow" else model
+
+    seen = {norm(p, m) for p, m in tried}
+    seen.add(norm(current, current_model))
+    for item in str(COVER_SAFETY_FALLBACK_PROVIDER or "").split(","):
+        prov, _, model = item.strip().partition("/")
+        if not prov:
+            continue
+        try:
+            prov = canonical_generation_provider(prov)
+        except Exception:                                          # noqa: BLE001
+            continue
+        model = model.strip().upper()
+        if prov == "flower" and n_refs > 1:
+            continue
+        if norm(prov, model) in seen:
+            continue
+        try:
+            if effective_simple_mode_provider(current, prov) != prov:
+                continue
+        except Exception:                                          # noqa: BLE001
+            continue
+        return prov, model
+    return "", ""
+
+
+def safety_fallback_provider(current: str, n_refs: int = 1) -> str:
+    """Первая запасная модель (только провайдер) — для старых вызовов."""
+    return safety_fallback_chain(current, "", n_refs)[0]
 
 
 def _generate_simple_edit(
@@ -2290,7 +2321,7 @@ def _generate_simple_edit(
     # второй попытке затирал оплаченную первую (не прошедшую сверку), и задача кончалась
     # «все попытки вернули пустой результат» — оплаченная картинка выбрасывалась.
     last_paid = None
-    safety_switched = False
+    safety_tried = []       # (провайдер, модель), уже упёршиеся в фильтр
     for attempt in range(max_attempts):
         if cancelled():
             result.error = "Отменено пользователем"
@@ -2326,12 +2357,15 @@ def _generate_simple_edit(
                 short = last_err[:240] + ("..." if len(last_err) > 240 else "")
                 log(f"   ⚠ Попытка {attempt + 1}/{max_attempts}: Fast Gen не отдал картинку — {short}")
                 _last_fastgen_error.value = None
-                if _is_safety_block(last_err) and not safety_switched:
-                    alt = safety_fallback_provider(provider, len(reference_images))
-                    if alt and alt != provider:
-                        log(f"   🔀 Фильтр безопасности {provider} — дальше пробую моделью {alt} "
+                if _is_safety_block(last_err):
+                    safety_tried.append((provider, model))
+                    alt, alt_model = safety_fallback_chain(provider, model,
+                                                           len(reference_images), safety_tried)
+                    if alt:
+                        log(f"   🔀 Фильтр безопасности {provider}{'/' + model if model else ''} — "
+                            f"дальше пробую моделью {alt}{'/' + alt_model if alt_model else ''} "
                             f"(тот же ключ FastGen, фильтр у неё свой)")
-                        provider, model, safety_switched = alt, "", True
+                        provider, model = alt, alt_model
             else:
                 log(f"   ⚠ Попытка {attempt + 1}/{max_attempts}: пустой результат от API, повтор...")
             _interruptible_sleep(2 + attempt * 2, cancel_check)

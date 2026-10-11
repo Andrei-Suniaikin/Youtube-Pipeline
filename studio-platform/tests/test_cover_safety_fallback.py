@@ -75,8 +75,8 @@ def run(errors, provider="openai_img"):
 def main() -> int:
     print("Фильтр на первой попытке — вторая другой моделью того же ключа")
     r, calls, logs = run([SAFETY, None])
-    check("первая — модель пресета, вторая — flower с моделью по умолчанию",
-          calls, [("openai_img", "gpt-image"), ("flower", "")])
+    check("первая — модель пресета, вторая — Nano Banana 2",
+          calls, [("openai_img", "gpt-image"), ("flow", "NARWHAL")])
     check("обложка получена", r.image is not None, True)
     check("в журнале сказано, почему сменилась модель", any("🔀" in x for x in logs), True)
 
@@ -85,9 +85,30 @@ def main() -> int:
     check("обе попытки — модель пресета", [c[0] for c in calls], ["openai_img", "openai_img"])
 
     print("\nЗапасная модель")
-    check("обычно flower", cc.safety_fallback_provider("openai_img", 1), "flower")
+    check("первая запасная — flow", cc.safety_fallback_provider("openai_img", 1), "flow")
     check("две картинки на входе — flow", cc.safety_fallback_provider("openai_img", 2), "flow")
     check("уже flower — flow", cc.safety_fallback_provider("flower", 1), "flow")
+
+    print("\nЦепочка: Nano Banana 2 → Pro → Flower последним (11.10.2026)")
+    ch = cc.safety_fallback_chain
+    check("после openai — Nano Banana 2", ch("openai_img", "gpt-image", 1), ("flow", "NARWHAL"))
+    check("после Nano Banana 2 — Pro",
+          ch("flow", "NARWHAL", 1, [("openai_img", "gpt-image")]), ("flow", "GEM_PIX_2"))
+    check("после Pro — Flower",
+          ch("flow", "GEM_PIX_2", 1, [("openai_img", ""), ("flow", "NARWHAL")]), ("flower", ""))
+    check("пресет flow без модели (= Pro) — сначала Nano Banana 2", ch("flow", "", 1), ("flow", "NARWHAL"))
+    check("flow без модели и Nano Banana 2 испробованы — Pro не повторяется, Flower",
+          ch("flow", "NARWHAL", 1, [("flow", "")]), ("flower", ""))
+    check("две картинки и всё flow испробовано — запасной нет",
+          ch("flow", "GEM_PIX_2", 2, [("flow", "NARWHAL")]), ("", ""))
+    check("все испробованы — запасной нет",
+          ch("flower", "", 1, [("flow", "NARWHAL"), ("flow", "GEM_PIX_2")]), ("", ""))
+    check("другая семья ключа (xAI напрямую) — запасной нет", ch("grok_api", "", 1), ("", ""))
+
+    print("\nФильтр дважды — третья попытка уже Pro, оплат не больше попыток")
+    r, calls, logs = run([SAFETY, SAFETY, None])
+    check("цепочка вызовов", calls,
+          [("openai_img", "gpt-image"), ("flow", "NARWHAL"), ("flow", "GEM_PIX_2")])
     check("признак отказа фильтра", (cc._is_safety_block(SAFETY), cc._is_safety_block("rc=1")), (True, False))
 
     print()
