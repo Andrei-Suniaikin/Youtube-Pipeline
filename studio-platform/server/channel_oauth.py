@@ -313,11 +313,12 @@ def redirect_uri() -> str:
     return (os.environ.get("VS_YT_OAUTH_REDIRECT") or "").strip() or DEFAULT_REDIRECT
 
 
-def start(channel_id: int, user_id, now: Optional[float] = None) -> str:
+def start(channel_id: int, user_id, now: Optional[float] = None, link: str = "") -> str:
     """Адрес окна согласия Google для этого канала.
 
     `state` — одноразовый и привязан к человеку, который нажал кнопку: чужой ответ
-    Google (или подделанная ссылка) не положит токен в наш канал.
+    Google (или подделанная ссылка) не положит токен в наш канал. С `link` метка
+    привязана не к человеку, а к ссылке для профиля (см. `make_link`).
     """
     import secrets
     cid, _sec = client()
@@ -330,7 +331,7 @@ def start(channel_id: int, user_id, now: Optional[float] = None) -> str:
         for k in [k for k, v in _PENDING.items() if v["until"] < now]:
             _PENDING.pop(k, None)
         _PENDING[token] = {"channel": int(channel_id), "user": user_id,
-                           "until": now + PENDING_SEC}
+                           "until": now + PENDING_SEC, "link": str(link or "")}
     return AUTH_URL + "?" + urllib.parse.urlencode({
         "client_id": cid,
         "redirect_uri": redirect_uri(),
@@ -344,17 +345,125 @@ def start(channel_id: int, user_id, now: Optional[float] = None) -> str:
     })
 
 
-def pending_channel(state_token: str, user_id, now: Optional[float] = None) -> int:
-    """Канал, для которого начато подключение. Одноразово: второй раз — отказ."""
+def pending(state_token: str, now: Optional[float] = None) -> dict:
+    """Начатое подключение по метке: {"channel", "user", "link"}. Одноразово."""
     now = time.time() if now is None else now
     with _LOCK:
         got = _PENDING.pop(str(state_token or ""), None)
     if got is None or got["until"] < now:
         raise OAuthError("ссылка подключения устарела или уже использована — нажмите "
                          "«Подключить через Google» ещё раз")
-    if got["user"] != user_id:
+    return got
+
+
+def pending_channel(state_token: str, user_id, now: Optional[float] = None) -> int:
+    """Канал, для которого начато подключение кнопкой. Одноразово: второй раз — отказ."""
+    got = pending(state_token, now)
+    if got.get("link") or got["user"] != user_id:
         raise OAuthError("подключение начато другим пользователем студии")
     return got["channel"]
+
+
+# ───────────────────── ссылка для профиля AdsPower (12.10.2026) ─────────────────────
+#
+# Андрей 12.10.2026: каждый профиль AdsPower — отдельный браузер, где в студию никто не
+# входил, и подключать статистику кнопкой в нём неудобно. Ссылка решает это: оператор
+# копирует её в студии у себя, открывает в профиле, и Google по очереди спрашивает
+# согласие за каждый канал из ссылки. Входа в студию в профиле не нужно.
+#
+# Почему это безопасно без входа. Ссылка лишь начинает окно согласия Google; токен
+# ложится в канал, только если живой запрос подтвердил, что он выдан ИМЕННО этим
+# каналом (`_analytics_connect`). Чужой человек со ссылкой может подключить канал лишь
+# собственным согласием его владельца. Метка случайная, живёт сутки и переживает
+# перезапуск (файл рядом с токенами, 0600), иначе выкатка посреди обхода профилей
+# обрывала бы все розданные ссылки.
+
+LINK_SEC = 24 * 3600
+
+
+def _links_path() -> str:
+    return os.path.join(tokens_dir(), "links.json")
+
+
+def _links_read() -> Dict[str, Dict]:
+    try:
+        with open(_links_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _links_write(data: Dict[str, Dict]) -> None:
+    _ensure_dir()
+    fd, tmp = tempfile.mkstemp(dir=tokens_dir(), prefix=".tmp-")
+    try:
+        os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        os.replace(tmp, _links_path())
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def make_link(channel_ids, user_id, now: Optional[float] = None) -> dict:
+    """Ссылка на обход каналов. Порядок сохраняется — в нём Google и спросит."""
+    import secrets
+    now = time.time() if now is None else now
+    ids = []
+    for cid in channel_ids:
+        if int(cid) not in ids:
+            ids.append(int(cid))
+    if not ids:
+        raise OAuthError("подключать нечего: все каналы уже подключены")
+    token = secrets.token_urlsafe(24)
+    with _LOCK:
+        data = {k: v for k, v in _links_read().items() if float(v.get("until") or 0) >= now}
+        data[token] = {"channels": ids, "skip": [], "user": user_id, "until": now + LINK_SEC}
+        _links_write(data)
+    return {"token": token, "until": now + LINK_SEC}
+
+
+def link_url(token: str) -> str:
+    """Короткий адрес у нас (…/oauth/go/<метка>) — рядом с адресом возврата Google."""
+    base = redirect_uri().rsplit("/oauth/callback", 1)[0]
+    return f"{base}/oauth/go/{token}"
+
+
+def link_get(token: str, now: Optional[float] = None) -> dict:
+    now = time.time() if now is None else now
+    got = _links_read().get(str(token or ""))
+    if not got or float(got.get("until") or 0) < now:
+        raise OAuthError("ссылка устарела (живёт сутки) — возьмите в студии новую")
+    return got
+
+
+def link_skip(token: str, channel_id: int, now: Optional[float] = None) -> None:
+    with _LOCK:
+        link_get(token, now)
+        data = _links_read()
+        skip = data[token].setdefault("skip", [])
+        if int(channel_id) not in skip:
+            skip.append(int(channel_id))
+        _links_write(data)
+
+
+def link_left(token: str, now: Optional[float] = None) -> list:
+    """Каналы ссылки, которые ещё ждут согласия: не подключены (или согласие умерло)
+    и не пропущены. Первый в списке — следующий."""
+    got = link_get(token, now)
+    skip = set(int(x) for x in got.get("skip") or [])
+    left = []
+    for cid in got.get("channels") or []:
+        st = state(int(cid))
+        if int(cid) in skip or (st["connected"] and st["state"] != "dead"):
+            continue
+        left.append(int(cid))
+    return left
 
 
 def exchange(code: str, post=None) -> str:

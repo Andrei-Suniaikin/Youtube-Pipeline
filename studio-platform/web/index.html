@@ -2845,6 +2845,7 @@ async function viewChannels(){
   const bar = $(`<div class="head"><div><h1>Каналы ${hintDot(
     'Расписание выходов, план и история. Цвет карточки — состояние канала.')}</h1></div>
     <div class="head-acts">
+      <button class="ghost small" id="stlinks">Подключить статистику</button>
       <button class="ghost small" id="spread">Разложить ссылки</button>
       <button class="ghost small" id="impch">Перенести списком</button>
       <button class="ghost small" id="pickmode">Выбрать</button>
@@ -2854,6 +2855,7 @@ async function viewChannels(){
   // Ссылки приходят общим списком, а каналов полтораста: раскладывать их по одному
   // каналу — полтораста заходов в карточки (владелец 30.09.2026).
   bar.querySelector('#spread').onclick = () => { location.hash = '#/spread'; };
+  bar.querySelector('#stlinks').onclick = () => analyticsLinksCard(bar);
 
   bar.querySelector('#impch').onclick = () => {
     if (document.getElementById('imp-form')) return;
@@ -3847,6 +3849,79 @@ function analyticsNumbers(a){
     </div>`;
 }
 
+/* ────────── ссылка для профиля AdsPower (Андрей 12.10.2026) ──────────
+
+   Профиль AdsPower — отдельный браузер, в студию там никто не входил. Поэтому не
+   кнопка в профиле, а ссылка: копируется здесь, открывается в профиле, и Google по
+   очереди спрашивает согласие за каждый канал профиля. Входить в студию не нужно. */
+async function analyticsCopyLink(ids, btn){
+  const was = btn.textContent;
+  btn.disabled = true;
+  try{
+    const out = await post('/ui/analytics/link', {channels: ids});
+    let copied = false;
+    // Буфер обмена может не ответить вовсе (нет разрешения) — ждём не дольше секунды.
+    try{
+      copied = await Promise.race([
+        navigator.clipboard.writeText(out.url).then(() => true),
+        new Promise(r => setTimeout(() => r(false), 1000))]);
+    }catch(e){}
+    if (copied){
+      btn.textContent = 'Скопировано ✓';
+      toast(`Ссылка скопирована (каналов: ${out.channels}). Открой её в этом профиле `
+            + 'AdsPower — живёт сутки.', 'ok');
+    } else {
+      // Буфер обмена недоступен (http, запрет браузера) — показать саму ссылку.
+      const box = $(`<input class="linkbox" readonly value="${esc(out.url)}"
+        style="width:100%;margin-top:6px;font-family:var(--mono);font-size:12px">`);
+      btn.after(box); box.select();
+    }
+  }catch(e){ toast(e.message); btn.textContent = was; }
+  btn.disabled = false;
+}
+
+async function analyticsLinksCard(bar){
+  const had = document.getElementById('stlinks-card');
+  if (had){ had.remove(); return; }
+  let d;
+  try{ d = await api('/ui/analytics/groups'); }catch(e){ toast(e.message); return; }
+  const waiting = d.groups.filter(g => g.channels.some(ch => !ch.connected));
+  const full = d.groups.length - waiting.length;
+  const row = g => {
+    const left = g.channels.filter(ch => !ch.connected);
+    const prof = g.serial ? `№${esc(g.serial)}` : 'без профиля';
+    return `<div class="strow" style="display:flex;gap:12px;align-items:baseline;
+        padding:8px 0;border-top:1px solid var(--line)">
+      <div style="min-width:64px;font-weight:600">${prof}</div>
+      <div style="flex:1;font-size:13px">${g.channels.map(ch => ch.connected
+          ? `<span class="muted">✓ ${esc(ch.name)}</span>`
+          : `<span${ch.dead ? ' style="color:var(--bad)"' : ''}>${esc(ch.name)}</span>`
+        ).join(' · ')}</div>
+      ${g.serial ? `<button class="small" data-ids="${left.map(ch => ch.id).join(',')}">
+        Ссылка · ${left.length}</button>`
+        : '<span class="muted" style="font-size:12px">впишите профиль каналу</span>'}
+    </div>`;
+  };
+  const card = $(`<div class="card" id="stlinks-card" style="margin-bottom:16px">
+    <div class="sec">Подключить статистику <span class="muted" style="font-weight:400">
+      · подключено ${d.connected} из ${d.total}</span></div>
+    <div class="secbody">
+      ${d.client === false ? `<div class="note bad">Сначала впишите Client ID и Client
+        secret приложения Google на странице «Ключи».</div>` : ''}
+      <div class="note muted">Одна ссылка — один профиль AdsPower. Скопируй, открой в
+        этом профиле и жми «Разрешить»: Google по очереди спросит все его каналы, после
+        каждого будет кнопка «Дальше». Входить в студию в профиле не нужно.</div>
+      ${waiting.length ? waiting.map(row).join('')
+        : '<div class="empty">Все каналы подключены.</div>'}
+      ${full ? `<div class="muted" style="font-size:12px;margin-top:8px">Полностью
+        подключены: ${full} ${plural(full, 'профиль', 'профиля', 'профилей')}.</div>` : ''}
+    </div></div>`);
+  bar.after(card);
+  card.querySelectorAll('button[data-ids]').forEach(b => {
+    b.onclick = () => analyticsCopyLink(b.dataset.ids.split(',').map(Number), b);
+  });
+}
+
 /* ────────── ключ канала: поле, кнопка и гайд рядом, в любом состоянии ──────────
 
    Владелец 01.10.2026: «нужно в каждом канале на уровне ключа выводить гайд, как
@@ -3877,10 +3952,13 @@ function analyticsKeyBlock(id, acc){
     ${acc.client === false ? `<div class="note bad" style="margin-top:10px">
       Сначала впишите Client ID и Client secret приложения Google на странице
       «Ключи» (в начале списка общих ключей) — без них подключать нечем.</div>` : ''}
-    <div style="margin-top:10px"><button id="google">${
+    <div style="margin-top:10px"><button id="glink">Скопировать ссылку для профиля</button>
+      <button id="google" class="ghost">${
       connected ? 'Переподключить через Google' : 'Подключить через Google'}</button></div>
     <div class="note muted" style="margin-top:10px;line-height:1.7">
-      Нажимать <b>внутри профиля AdsPower, где залогинен этот канал</b>. Google спросит
+      <b>Ссылку</b> открыть в профиле AdsPower, где залогинен этот канал, — входить там в
+      студию не нужно, ссылка живёт сутки. Кнопку «Подключить через Google» — если
+      студия открыта прямо в этом профиле. Google спросит
       аккаунт — выбрать владельца канала; если спросит канал — именно этот. На экране
       согласия <b>оставить обе галочки</b>. Экран «приложение не проверено» —
       «Дополнительно» → продолжить. После «Разрешить» студия сама проверит, что доступ
@@ -3958,6 +4036,8 @@ function channelStatsTab(id, d){
       await render();
     }catch(e){ toast(e.message); on.disabled = false; }
   };
+  const gl = card.querySelector('#glink');
+  if (gl) gl.onclick = () => analyticsCopyLink([Number(id)], gl);
   const g = card.querySelector('#google');
   if (g) g.onclick = async () => {
     g.disabled = true;

@@ -7420,6 +7420,9 @@ def oauth_callback(request: Request, state: str = "", code: str = "", error: str
     Путь вне /ui/, поэтому вход проверяем сами: ответ Google принимает только тот же
     вошедший администратор, который нажал кнопку (`state` привязан к нему). Итог — назад
     на вкладку статистики канала, словами в адресе: экран покажет его и уберёт.
+
+    Начато по ссылке для профиля AdsPower (12.10.2026) — входа в этом браузере нет и не
+    нужно: итог показываем своей страничкой, с кнопкой на следующий канал ссылки.
     """
     def back(cid, ok: bool, msg: str):
         q = urllib.parse.urlencode({"oauth": "ok" if ok else "err", "msg": msg})
@@ -7427,20 +7430,26 @@ def oauth_callback(request: Request, state: str = "", code: str = "", error: str
         # «../» от …/oauth/callback — корень пульта, с префиксом /studio и без него.
         return RedirectResponse(f"../?{q}{where}", 303)
 
+    try:
+        got = channel_oauth.pending(state)
+    except channel_oauth.OAuthError as exc:
+        got, stale = None, str(exc)
+    if got is not None and got.get("link"):
+        return _oauth_link_finish(got["link"], got["channel"], code, error)
+
     c = db()
     try:
         user = auth.who(c, request.cookies.get(auth.COOKIE) or "")
         role = (user["role"] if user is not None and "role" in user.keys() else "") or ""
         if role != "admin":
             return back(0, False, "войдите в студию администратором и подключите заново")
-        try:
-            cid = channel_oauth.pending_channel(state, user["id"])
-        except channel_oauth.OAuthError as exc:
-            return back(0, False, str(exc))
+        if got is None:
+            return back(0, False, stale)
+        if got["user"] != user["id"]:
+            return back(0, False, "подключение начато другим пользователем студии")
+        cid = got["channel"]
         if error or not code:
-            why = ("вы отменили доступ на экране Google" if error == "access_denied"
-                   else f"Google вернул отказ: {error or 'без кода'}")
-            return back(cid, False, why)
+            return back(cid, False, _oauth_refusal(error))
         try:
             ch = _analytics_channel(c, cid)
             got = _analytics_connect(c, ch, channel_oauth.exchange(code))
@@ -7451,6 +7460,180 @@ def oauth_callback(request: Request, state: str = "", code: str = "", error: str
         return back(cid, True, f"канал подключён, забрано дней: {got['days']}")
     finally:
         c.close()
+
+
+def _oauth_refusal(error: str) -> str:
+    return ("вы отменили доступ на экране Google" if error == "access_denied"
+            else f"Google вернул отказ: {error or 'без кода'}")
+
+
+# ───────────── ссылка для профиля AdsPower: подключить статистику без входа ─────────────
+
+class AnalyticsLinkIn(BaseModel):
+    channels: list = []
+
+
+def _analytics_rows(c) -> list:
+    """Каналы, которым можно подключить статистику, с профилем AdsPower и машиной."""
+    return c.execute(
+        "SELECT c.id, c.name, c.uc, c.status, c.profile_id, p.serial, p.title AS ptitle,"
+        "       h.title AS htitle, h.code AS hcode"
+        "  FROM pub_channels c LEFT JOIN pub_profiles p ON p.id=c.profile_id"
+        "  LEFT JOIN pub_hosts h ON h.id=COALESCE(c.host_id, p.default_host_id)"
+        " WHERE c.tenant_id=? AND c.status<>'archived' AND COALESCE(c.uc,'')<>''"
+        " ORDER BY CAST(COALESCE(p.serial,'99999') AS INTEGER), c.name",
+        (TENANT,)).fetchall()
+
+
+@app.get("/ui/analytics/groups")
+def ui_analytics_groups(request: Request):
+    """Каналы по профилям AdsPower: сколько подключено, кого ещё ждём."""
+    _require_admin(request)
+    c = db()
+    try:
+        rows = _analytics_rows(c)
+    finally:
+        c.close()
+    groups, by_key = [], {}
+    for r in rows:
+        key = r["profile_id"] or 0
+        g = by_key.get(key)
+        if g is None:
+            g = {"profile_id": key, "serial": r["serial"] or "",
+                 "title": r["ptitle"] or "", "host": r["htitle"] or r["hcode"] or "",
+                 "channels": []}
+            by_key[key] = g
+            groups.append(g)
+        acc = channel_oauth.state(r["id"])
+        g["channels"].append({"id": r["id"], "name": r["name"], "status": r["status"],
+                              "connected": bool(acc["connected"]) and acc["state"] != "dead",
+                              "dead": acc["state"] == "dead"})
+    total = sum(len(g["channels"]) for g in groups)
+    done = sum(1 for g in groups for ch in g["channels"] if ch["connected"])
+    return {"groups": groups, "total": total, "connected": done,
+            "client": channel_oauth.client_ready()}
+
+
+@app.post("/ui/analytics/link")
+def ui_analytics_link(body: AnalyticsLinkIn, request: Request):
+    """Ссылка для профиля: открыть в AdsPower — Google спросит согласие по каждому каналу."""
+    user = _require_admin(request)
+    if not channel_oauth.client_ready():
+        raise HTTPException(400, "не заданы реквизиты приложения Google — впишите их "
+                                 "на странице «Ключи», иначе подключать нечем")
+    want = []
+    for x in body.channels or []:
+        try:
+            want.append(int(x))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "номер канала должен быть числом")
+    c = db()
+    try:
+        known = {r["id"]: r for r in _analytics_rows(c)}
+    finally:
+        c.close()
+    bad = [x for x in want if x not in known]
+    if bad:
+        raise HTTPException(400, "у этих каналов нет ID YouTube или их нет в студии: "
+                                 + ", ".join(map(str, bad)))
+    left = [x for x in want if not (channel_oauth.state(x)["connected"]
+                                    and channel_oauth.state(x)["state"] != "dead")]
+    try:
+        out = channel_oauth.make_link(left, user["id"])
+    except channel_oauth.OAuthError as exc:
+        raise HTTPException(400, str(exc))
+    _audit(f"ссылка на подключение статистики: каналов {len(left)}")
+    return {"url": channel_oauth.link_url(out["token"]), "until": out["until"],
+            "channels": len(left)}
+
+
+def _oauth_page(title: str, text: str, ok: bool, actions: str = "") -> Response:
+    """Страничка итога в профиле AdsPower: студии там нет, показать надо прямо тут."""
+    color = "#1a7f37" if ok else "#c62828"
+    html = f"""<!doctype html><html lang="ru"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Статистика канала</title><style>
+body{{font:16px/1.5 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;margin:0;
+background:#f6f7f9;color:#1d2330}}
+main{{max-width:520px;margin:12vh auto;padding:28px;background:#fff;border-radius:14px;
+box-shadow:0 1px 3px rgba(0,0,0,.08)}}
+h1{{font-size:20px;margin:0 0 8px;color:{color}}} p{{margin:8px 0}}
+a.b{{display:inline-block;margin:14px 10px 0 0;padding:10px 16px;border-radius:9px;
+background:#2563eb;color:#fff;text-decoration:none;font-weight:600}}
+a.g{{background:#eef0f4;color:#1d2330}} .m{{color:#667085;font-size:14px}}
+</style></head><body><main><h1>{esc_html(title)}</h1><p>{text}</p>{actions}</main>
+</body></html>"""
+    return Response(html, media_type="text/html; charset=utf-8",
+                    headers={"Cache-Control": "no-store", "Referrer-Policy": "no-referrer"})
+
+
+def esc_html(s) -> str:
+    import html as _h
+    return _h.escape(str(s or ""))
+
+
+def _channel_name(cid: int) -> str:
+    c = db()
+    try:
+        r = c.execute("SELECT name FROM pub_channels WHERE id=? AND tenant_id=?",
+                      (cid, TENANT)).fetchone()
+        return r["name"] if r else f"канал {cid}"
+    finally:
+        c.close()
+
+
+def _oauth_next(token: str, prefix: str) -> str:
+    """Кнопка на следующий канал ссылки или «все подключены»."""
+    try:
+        left = channel_oauth.link_left(token)
+    except channel_oauth.OAuthError as exc:
+        return f'<p class="m">{esc_html(exc)}</p>'
+    if not left:
+        return '<p class="m">Все каналы этой ссылки пройдены — окно можно закрыть.</p>'
+    nxt = esc_html(_channel_name(left[0]))
+    more = f" (осталось {len(left)})" if len(left) > 1 else ""
+    return (f'<a class="b" href="{prefix}go/{token}">Дальше: «{nxt}» →</a>'
+            f'<p class="m">Google спросит аккаунт — выберите владельца канала «{nxt}»'
+            f'{more}.</p>')
+
+
+def _oauth_link_finish(token: str, cid: int, code: str, error: str) -> Response:
+    name = _channel_name(cid)
+    if error or not code:
+        why = _oauth_refusal(error)
+    else:
+        c = db()
+        try:
+            ch = _analytics_channel(c, cid)
+            got = _analytics_connect(c, ch, channel_oauth.exchange(code))
+            return _oauth_page(f"«{name}» подключён",
+                               f"Статистика забрана: {got['days']} "
+                               f"{'дн.' if got['days'] else 'дней пока нет'}.", True,
+                               _oauth_next(token, ""))
+        except HTTPException as exc:
+            why = str(exc.detail)
+        except channel_oauth.OAuthError as exc:
+            why = str(exc)
+        finally:
+            c.close()
+    actions = (f'<a class="b" href="go/{token}">Повторить «{esc_html(name)}»</a>'
+               f'<a class="b g" href="go/{token}?skip={int(cid)}">Пропустить →</a>')
+    return _oauth_page(f"«{name}» не подключён", esc_html(why), False, actions)
+
+
+@app.get("/oauth/go/{token}", include_in_schema=False)
+def oauth_go(token: str, skip: int = 0):
+    """Ссылка для профиля: следующий канал → окно согласия Google. Входа не нужно."""
+    try:
+        if skip:
+            channel_oauth.link_skip(token, skip)
+        left = channel_oauth.link_left(token)
+        if not left:
+            return _oauth_page("Готово", "Все каналы этой ссылки пройдены — окно можно "
+                               "закрыть.", True)
+        return RedirectResponse(channel_oauth.start(left[0], None, link=token), 303)
+    except channel_oauth.OAuthError as exc:
+        return _oauth_page("Ссылка не работает", esc_html(exc), False)
 
 
 @app.delete("/ui/channels/{cid:int}/analytics")
