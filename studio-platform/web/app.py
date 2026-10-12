@@ -82,6 +82,7 @@ import pub_verify                                                # noqa: E402
 import pub_stats                                                 # noqa: E402
 import pub_digest                                                # noqa: E402
 import pub_analytics                                              # noqa: E402
+import pub_earn                                                   # noqa: E402
 import channel_oauth                                              # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
 
@@ -2898,6 +2899,8 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             # Подробная статистика — из своих же записей. Токен наружу не уходит:
             # `channel_state` отдаёт только «подключено», хвост и состояние.
             "analytics": pub_analytics.channel_state(c, channel_id),
+            # Часы для монетизации — то, что сборщик Минска прочитал на странице Earn.
+            "earn": pub_earn.channel_state(c, channel_id),
         }
     finally:
         c.close()
@@ -7486,6 +7489,38 @@ def _analytics_rows(c) -> list:
         " WHERE c.tenant_id=? AND c.status<>'archived' AND COALESCE(c.uc,'')<>''"
         " ORDER BY CAST(COALESCE(p.serial,'99999') AS INTEGER), c.name",
         (TENANT,)).fetchall()
+
+
+@app.post("/ui/analytics/earn/import")
+async def ui_analytics_earn_import(request: Request, apply: int = Query(0),
+                                   file: UploadFile = File(...)):
+    """Выхлоп сборщика Минска → часы для монетизации по каналам.
+
+    Без `apply` — только отчёт: что прочиталось, по каким каналам, какие UC студии
+    незнакомы. С `apply=1` — дописывает новые чтения; старые не трогает, повтор того
+    же файла ничего не меняет.
+    """
+    _require_admin(request)
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "файл пустой")
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "файл больше 200 МБ — загрузите без скриншотов")
+    try:
+        readings, notes = pub_earn.parse_upload(file.filename or "", data)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    c = db()
+    try:
+        planned = pub_earn.plan(c, TENANT, readings)
+        written = 0
+        if apply:
+            written = pub_earn.apply(c, planned)
+            c.commit()
+    finally:
+        c.close()
+    return {"report": planned["report"], "notes": notes[:50], "applied": bool(apply),
+            "written": written}
 
 
 @app.get("/ui/analytics/groups")

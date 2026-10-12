@@ -2850,6 +2850,7 @@ async function viewChannels(){
     'Расписание выходов, план и история. Цвет карточки — состояние канала.')}</h1></div>
     <div class="head-acts">
       <button class="ghost small" id="stlinks">Подключить статистику</button>
+      <button class="ghost small" id="earnimp">Часы монетизации</button>
       <button class="ghost small" id="spread">Разложить ссылки</button>
       <button class="ghost small" id="impch">Перенести списком</button>
       <button class="ghost small" id="pickmode">Выбрать</button>
@@ -2860,6 +2861,7 @@ async function viewChannels(){
   // каналу — полтораста заходов в карточки (владелец 30.09.2026).
   bar.querySelector('#spread').onclick = () => { location.hash = '#/spread'; };
   bar.querySelector('#stlinks').onclick = () => analyticsLinksCard(bar);
+  bar.querySelector('#earnimp').onclick = () => earnImportCard(bar);
 
   bar.querySelector('#impch').onclick = () => {
     if (document.getElementById('imp-form')) return;
@@ -3884,6 +3886,133 @@ async function analyticsCopyLink(ids, btn){
   btn.disabled = false;
 }
 
+/* ────────── часы для монетизации (13.10.2026) ──────────
+
+   Число, по которому YouTube пускает в партнёрку, — «подходящие часы за 365 дней».
+   Через API его не отдают никому, оно есть только на странице «Монетизация» в Studio.
+   Читает его сборщик на Минске сессией менеджера; сюда загружается его выхлоп.
+   Карточка показывает последнее принятое число и честно — последний сбой, если он
+   свежее: вчерашние часы не стираются, но и сбой не прячется. */
+function earnBar(value, goal, unit){
+  if (value === null || value === undefined) return '<span class="muted">—</span>';
+  const pct = Math.min(100, Math.round(Number(value) / goal * 100));
+  return `<b>${bigNum(value)}</b> <span class="muted">из ${bigNum(goal)} ${unit} · ${pct}%</span>
+    <div style="height:6px;border-radius:3px;background:var(--line);margin-top:6px;max-width:320px">
+      <div style="height:6px;border-radius:3px;width:${pct}%;background:var(${
+        pct >= 100 ? '--ok' : '--run'})"></div></div>`;
+}
+
+function earnCard(e){
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Часы для монетизации ${hintDot(
+      'Подходящие часы просмотра за 365 дней — то, по чему YouTube пускает в партнёрку. ' +
+      'Shorts, скрытые и удалённые ролики сюда не входят, поэтому это число меньше ' +
+      'обычного времени просмотра. Через API его не отдают: читает сборщик на Минске со ' +
+      'страницы «Монетизация» в Studio.')}</div>
+    <div class="secbody" id="earn-body"></div></div>`);
+  const body = card.querySelector('#earn-body');
+  if (!e.last){
+    body.innerHTML = `<div class="note muted">Сбора ещё не было. Числа появятся, когда
+      сборщик Минска пройдёт этот канал и его результат загрузят кнопкой «Часы
+      монетизации» на странице каналов.</div>`;
+    return card;
+  }
+  const g = e.good, last = e.last;
+  const parts = [];
+  if (g){
+    const grow = e.prev && e.prev.hours_365 !== null && g.hours_365 !== null
+      ? g.hours_365 - e.prev.hours_365 : null;
+    parts.push(`<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:14px">
+      <div><div class="muted" style="font-size:12px">Подходящие часы за 365 дней</div>
+        ${earnBar(g.hours_365, e.goal_hours, 'ч')}
+        ${grow !== null ? `<div class="note muted">${grow >= 0 ? '+' : '−'}${bigNum(Math.abs(grow))} ч
+          к прошлому сбору (${esc(when(e.prev.read_at))})</div>` : ''}</div>
+      <div><div class="muted" style="font-size:12px">Подписчики</div>
+        ${earnBar(g.subs, e.goal_subs, '')}</div>
+    </div>
+    <div class="note muted" style="margin-top:8px">Прочитано ${esc(when(g.read_at))}${
+      g.as_of ? ` · Studio: данные на ${esc(g.as_of)}` : ''}${
+      g.shorts_90 !== null ? ` · подходящих просмотров Shorts за 90 дней: ${bigNum(g.shorts_90)}` : ''}</div>`);
+  }
+  if (!g || last.read_at > g.read_at){
+    const bad = last.state !== 'ok' && last.state !== 'partner';
+    parts.push(`<div class="note ${bad ? 'bad' : 'muted'}" style="margin-top:8px">
+      ${g ? 'Последний сбор' : 'Сбор'} ${esc(when(last.read_at))}: ${esc(last.state_title)}${
+      last.reason ? ` — ${esc(last.reason)}` : ''}</div>`);
+  }
+  body.innerHTML = parts.join('');
+  return card;
+}
+
+async function earnSend(file, apply){
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch(API + '/ui/analytics/earn/import' + (apply ? '?apply=1' : ''),
+                        {method: 'POST', body: fd});
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(out.detail || ('HTTP ' + r.status));
+  return out;
+}
+
+function earnReport(out){
+  const rep = out.report || {};
+  const st = rep.states || {};
+  const rows = (rep.rows || []).map(r => `<tr>
+      <td><a href="#/channel/${encodeURIComponent(r.channel_id)}/statistika">${esc(r.channel)}</a></td>
+      <td>${r.hours_365 === null ? '—' : bigNum(r.hours_365)}</td>
+      <td>${r.subs === null ? '—' : bigNum(r.subs)}</td>
+      <td class="${r.state === 'ok' || r.state === 'partner' ? '' : 'bad'}"
+          style="${r.state === 'ok' || r.state === 'partner' ? '' : 'color:var(--bad)'}">${
+        esc(r.state_title)}${r.reason ? ` <span class="muted">— ${esc(r.reason)}</span>` : ''}</td>
+    </tr>`).join('');
+  return `<div class="note">${out.applied
+      ? `Записано новых чтений: <b>${out.written}</b>.`
+      : 'Пробный разбор — ничего не записано.'}
+      Результатов в файле: ${rep.readings || 0}, каналов студии: ${rep.channels || 0},
+      из них прочитано: ${st.ok || 0}${st.partner ? `, уже в партнёрке: ${st.partner}` : ''}.</div>
+    ${(rep.unknown_uc || []).length ? `<div class="note bad">UC, которых нет в студии
+      (${rep.unknown_uc.length}): ${rep.unknown_uc.map(esc).join(', ')}</div>` : ''}
+    ${(out.notes || []).length ? `<div class="note muted">${out.notes.map(esc).join('<br>')}</div>` : ''}
+    ${rows ? `<table style="margin-top:10px"><thead><tr><th>Канал</th><th>Часы за 365 дн</th>
+      <th>Подписчики</th><th>Состояние</th></tr></thead><tbody>${rows}</tbody></table>` : ''}`;
+}
+
+function earnImportCard(bar){
+  const had = document.getElementById('earn-card');
+  if (had){ had.remove(); return; }
+  const card = $(`<div class="card" id="earn-card" style="margin-bottom:16px">
+    <div class="sec">Часы монетизации — загрузить сбор с Минска</div>
+    <div class="secbody">
+      <div class="note muted">Архив папки сборщика (<code>--out</code>) или отдельный
+        <code>reader_result.json</code>. Скриншоты не нужны: хватит
+        <code>find … -name reader_result.json | zip -@ earn.zip</code>. Каналы узнаются
+        по UC; число принимается, только если сборщик подтвердил, что читал именно этот канал.</div>
+      <div style="display:flex;gap:10px;align-items:center;margin-top:10px;flex-wrap:wrap">
+        <input type="file" id="earn-file" accept=".zip,.json">
+        <button class="ghost small" id="earn-check" disabled>Проверить</button>
+        <button class="small" id="earn-apply" disabled>Записать</button>
+      </div>
+      <div id="earn-out" style="margin-top:10px"></div>
+    </div></div>`);
+  bar.after(card);
+  const f = card.querySelector('#earn-file'), chk = card.querySelector('#earn-check'),
+        ap = card.querySelector('#earn-apply'), out = card.querySelector('#earn-out');
+  f.onchange = () => { chk.disabled = !f.files.length; ap.disabled = true; out.innerHTML = ''; };
+  const run = async apply => {
+    chk.disabled = ap.disabled = true;
+    out.innerHTML = '<div class="note muted">Разбираю…</div>';
+    try{
+      const res = await earnSend(f.files[0], apply);
+      out.innerHTML = earnReport(res);
+      ap.disabled = apply;
+      if (apply) toast('Часы записаны', 'ok');
+    }catch(e){ out.innerHTML = `<div class="note bad">${esc(e.message)}</div>`; }
+    finally{ chk.disabled = !f.files.length; }
+  };
+  chk.onclick = () => run(false);
+  ap.onclick = () => run(true);
+}
+
 async function analyticsLinksCard(bar){
   const had = document.getElementById('stlinks-card');
   if (had){ had.remove(); return; }
@@ -3995,6 +4124,7 @@ function oauthReturnNotice(){
 
 function channelStatsTab(id, d){
   app.append(channelStatsCard(id, d.stats || {}));
+  app.append(earnCard(d.earn || {}));
   const a = d.analytics || {};
   const acc = a.access || {};
   const card = $(`<div class="card" style="margin-bottom:16px">
