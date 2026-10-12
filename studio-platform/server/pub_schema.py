@@ -340,6 +340,30 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
         c.execute("ALTER TABLE pub_channels ADD COLUMN preset_channel_id INTEGER")
     except Exception:
         pass   # колонка уже есть
+    # Единый список каналов (12.10.2026, решение команды): кто владелец канала, через
+    # какого менеджера он льётся и приняты ли права менеджера. До этого связка жила в
+    # пяти местах (xlsx, таблица ВВ2, старый кабинет, registry.db, студия) и расходилась.
+    #
+    # Все колонки необязательные: пока они пусты, студия льёт ровно как раньше — из
+    # `profile_id`. Пароли и 2FA сюда НЕ кладутся (отдельный шаг, отдельное хранилище).
+    #   owner_email       — почта владельца канала;
+    #   owner_profile_id  — профиль AdsPower, где залогинен владелец (pub_profiles.id);
+    #   manager_id        — менеджер канала (pub_managers.id);
+    #   mgr_rights        — права менеджера: '' не отправлены, sent, accepted, revoked;
+    #   mgr_rights_at     — когда права последний раз сменили состояние;
+    #   long_ok           — можно ли ролики длиннее 15 минут: 1, 0, NULL — неизвестно.
+    c.execute("CREATE TABLE IF NOT EXISTS pub_managers("
+              "id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, "
+              "num INTEGER NOT NULL, short TEXT, email TEXT, profile_id INTEGER, "
+              "state TEXT NOT NULL DEFAULT 'active', replaced_by INTEGER, note TEXT, "
+              "created REAL NOT NULL, updated REAL NOT NULL, UNIQUE(tenant_id,num))")
+    for _col, _sql in (("owner_email", "TEXT"), ("owner_profile_id", "INTEGER"),
+                       ("manager_id", "INTEGER"), ("mgr_rights", "TEXT NOT NULL DEFAULT ''"),
+                       ("mgr_rights_at", "REAL"), ("long_ok", "INTEGER")):
+        try:
+            c.execute(f"ALTER TABLE pub_channels ADD COLUMN {_col} {_sql}")
+        except Exception:
+            pass   # колонка уже есть
     # Вид создаётся ПОСЛЕ миграции таблицы: та пересобирает `pub_channels` целиком, и
     # вид, созданный раньше, ссылался бы на таблицу, которой на время миграции нет.
     _migrate_channel_uc_optional(c)

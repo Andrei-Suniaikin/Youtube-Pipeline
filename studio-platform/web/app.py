@@ -83,6 +83,7 @@ import pub_stats                                                 # noqa: E402
 import pub_digest                                                # noqa: E402
 import pub_analytics                                              # noqa: E402
 import channel_oauth                                              # noqa: E402
+import registry_import                                            # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
 
 load_env()
@@ -7634,6 +7635,51 @@ def oauth_go(token: str, skip: int = 0):
         return RedirectResponse(channel_oauth.start(left[0], None, link=token), 303)
     except channel_oauth.OAuthError as exc:
         return _oauth_page("Ссылка не работает", esc_html(exc), False)
+
+
+# ───────────── единый список каналов: загрузка раскладки xlsx (12.10.2026) ─────────────
+
+@app.post("/ui/registry/import")
+async def ui_registry_import(request: Request, file: UploadFile = File(...),
+                             apply: int = Query(0)):
+    """Пробный прогон по умолчанию: отчёт без записи. `apply=1` — записать.
+
+    Маршрут заливки (`profile_id`) не меняется ни в каком режиме — см.
+    `registry_import`. Перед записью — копия базы рядом с ней.
+    """
+    _require_admin(request)
+    data = await file.read()
+    if not data:
+        raise HTTPException(400, "файл пустой")
+    try:
+        parsed = registry_import.parse(registry_import.read_xlsx(data))
+    except registry_import.RegistryError as exc:
+        raise HTTPException(400, str(exc))
+    except Exception as exc:                                       # noqa: BLE001
+        raise HTTPException(400, f"не смог прочитать xlsx: {type(exc).__name__}")
+    return await run_in_threadpool(_registry_run, parsed, bool(apply))
+
+
+def _registry_run(parsed: dict, do_apply: bool) -> dict:
+    c = db()
+    try:
+        planned = registry_import.plan(c, TENANT, parsed)
+        out = {"report": planned["report"], "applied": None, "backup": ""}
+        if do_apply:
+            backup = f"{DB}.bak-registry-{time.strftime('%Y%m%d-%H%M%S')}"
+            dst = sqlite3.connect(backup)
+            try:
+                c.backup(dst)
+            finally:
+                dst.close()
+            out["applied"] = registry_import.apply(c, TENANT, planned)
+            c.commit()
+            out["backup"] = os.path.basename(backup)
+            _audit(f"единый список каналов загружен: каналов {out['applied']['channels']}, "
+                   f"менеджеров {out['applied']['managers']}")
+        return out
+    finally:
+        c.close()
 
 
 @app.delete("/ui/channels/{cid:int}/analytics")

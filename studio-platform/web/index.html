@@ -2848,6 +2848,7 @@ async function viewChannels(){
       <button class="ghost small" id="stlinks">Подключить статистику</button>
       <button class="ghost small" id="spread">Разложить ссылки</button>
       <button class="ghost small" id="impch">Перенести списком</button>
+      <button class="ghost small" id="registry">Раскладка xlsx</button>
       <button class="ghost small" id="pickmode">Выбрать</button>
       <button class="small" id="newch">Новый канал</button></div></div>`);
   app.append(bar);
@@ -2856,6 +2857,7 @@ async function viewChannels(){
   // каналу — полтораста заходов в карточки (владелец 30.09.2026).
   bar.querySelector('#spread').onclick = () => { location.hash = '#/spread'; };
   bar.querySelector('#stlinks').onclick = () => analyticsLinksCard(bar);
+  bar.querySelector('#registry').onclick = () => registryCard(bar);
 
   bar.querySelector('#impch').onclick = () => {
     if (document.getElementById('imp-form')) return;
@@ -3847,6 +3849,93 @@ function analyticsNumbers(a){
            Google, суточными выгрузками. Пока не подключено.`}
       · отрезок ${esc(now_.from || '')} — ${esc(now_.to || '')}
     </div>`;
+}
+
+/* ────────── единый список каналов: раскладка xlsx (12.10.2026) ──────────
+
+   Связка «канал → владелец → менеджер → профиль» переезжает в студию из
+   «02 — Профили и каналы.xlsx». Сначала всегда пробный прогон: что поменяется, где
+   xlsx отстал и какие профили спорные. Записать — отдельной кнопкой. Откуда канал
+   льётся сейчас, загрузка не меняет. */
+async function registrySend(file, apply){
+  const fd = new FormData();
+  fd.append('file', file);
+  const r = await fetch(API + '/ui/registry/import' + (apply ? '?apply=1' : ''),
+                        {method: 'POST', body: fd});
+  const out = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(out.detail || ('HTTP ' + r.status));
+  return out;
+}
+
+function registryReport(rep){
+  const prof = d => `<tr><td>${esc(d.channel)}</td><td>№${esc(d.studio || '—')}</td>
+    <td>P${esc(d.xlsx_owner || '—')}</td><td>P${esc(d.xlsx_upload || '—')}</td>
+    <td>${d.uploads_14d}</td></tr>`;
+  const table = (rows, open, title, why) => rows.length ? `<details${open ? ' open' : ''}
+      style="margin-top:12px"><summary style="cursor:pointer;font-weight:600">${title}:
+      ${rows.length}</summary><div class="note muted" style="margin:6px 0">${why}</div>
+      <table class="tbl" style="width:100%;font-size:13px"><tr><th>Канал</th>
+      <th>В студии</th><th>Владелец по xlsx</th><th>Заливка по xlsx</th>
+      <th>Заливок за 14 дн.</th></tr>${rows.map(prof).join('')}</table></details>` : '';
+  const list = (rows, title) => rows.length ? `<details style="margin-top:12px">
+      <summary style="cursor:pointer">${title}: ${rows.length}</summary>
+      <div style="font-size:13px;margin-top:6px">${rows.map(esc).join('<br>')}</div>
+      </details>` : '';
+  return `<div class="res">
+    Каналов изменится: <b>${rep.channels_changed}</b> · без изменений: ${rep.same}
+    · менеджеров новых: <b>${rep.managers_new}</b>, изменится: ${rep.managers_changed}
+    ${table(rep.disputed, true, 'Спорные — проверить руками',
+      'С профиля студии свежих заливок нет, а xlsx называет другой профиль. Владельца '
+      + 'этим каналам НЕ запишем: откройте оба профиля и посмотрите, где канал.')}
+    ${table(rep.xlsx_stale, false, 'xlsx отстал — верим студии',
+      'С профиля студии канал успешно заливался за 14 дней, значит владелец там. '
+      + 'Его и запишем, xlsx стоит поправить.')}
+    ${list(rep.not_in_studio, 'Есть в xlsx, нет в студии')}
+    ${list(rep.not_in_xlsx, 'Есть в студии, нет в xlsx')}
+    ${list(rep.no_profile, 'Профиля нет в студии')}
+  </div>`;
+}
+
+function registryCard(bar){
+  const had = document.getElementById('registry-card');
+  if (had){ had.remove(); return; }
+  const card = $(`<div class="card" id="registry-card" style="margin-bottom:16px">
+    <div class="sec">Единый список каналов: раскладка xlsx</div>
+    <div class="secbody">
+      <div class="note muted">Файл «Профили и каналы» (.xlsx): листы «Каналы» и
+        «Менеджеры». Сначала проверка — ничего не пишет. Откуда каналы льются сейчас,
+        загрузка не меняет.</div>
+      <div style="margin-top:10px"><input type="file" id="rf" accept=".xlsx"></div>
+      <div style="margin-top:10px"><button id="check">Проверить</button>
+        <button id="apply" class="ghost" disabled>Записать</button></div>
+      <div id="rres"></div>
+    </div></div>`);
+  bar.after(card);
+  const input = card.querySelector('#rf');
+  const res = card.querySelector('#rres');
+  const go = card.querySelector('#apply');
+  card.querySelector('#check').onclick = async () => {
+    const f = input.files && input.files[0];
+    if (!f){ toast('Выберите файл .xlsx'); return; }
+    go.disabled = true;
+    try{
+      const out = await registrySend(f, false);
+      res.innerHTML = registryReport(out.report);
+      go.disabled = false;
+    }catch(e){ res.innerHTML = `<div class="err">${esc(e.message)}</div>`; }
+  };
+  input.onchange = () => { go.disabled = true; res.innerHTML = ''; };
+  go.onclick = async () => {
+    const f = input.files && input.files[0];
+    if (!f) return;
+    go.disabled = true;
+    try{
+      const out = await registrySend(f, true);
+      toast(`Записано: каналов ${out.applied.channels}, менеджеров `
+            + `${out.applied.managers}. Копия базы: ${out.backup}`, 'ok');
+      res.innerHTML = registryReport(out.report);
+    }catch(e){ toast(e.message); go.disabled = false; }
+  };
 }
 
 /* ────────── ссылка для профиля AdsPower (Андрей 12.10.2026) ──────────
