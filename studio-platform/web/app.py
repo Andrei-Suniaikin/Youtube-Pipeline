@@ -302,7 +302,10 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
         if r["ch_id"] not in presets_of:
             presets_of[r["ch_id"]] = channel_presets(c, r["ch_pv"], r["ch_rew"] or "",
                                                      r["ch_cov"] or "")
-        block = explain_block(r["blocked_reason"]) if r["status"] == "blocked" else {}
+        # Снятый выпуск с причиной тоже объясняем (владелец 13.10.2026: 18 снятых из‑за
+        # удалённого донора висели жёлтой записью движка «нет субтитров (VideoUnplayable)»).
+        block = (explain_block(r["blocked_reason"])
+                 if r["status"] in ("blocked", "cancelled") else {})
         out.append({
             "release_id": r["release_id"],
             "channel_id": r["ch_id"],
@@ -8129,7 +8132,7 @@ def _live_release_rows(c) -> list:
             # Причина словами + что делать (09.10.2026): экран показывает её вместо
             # записи движка, а целиком — при наведении.
             "block": (explain_block(r["blocked_reason"])
-                      if r["status"] == "blocked" else {}),
+                      if r["status"] in ("blocked", "cancelled") else {}),
             "warning": "", "reason_pending": False,
             # У выпуска нет «взят в работу»: он не задача, а цепочка задач, и его
             # время — это время последнего движения. Поэтому «ждёт с …», а не «идёт»:

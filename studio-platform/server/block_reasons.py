@@ -132,7 +132,8 @@ def explain(reason) -> dict:
     m = _NO_SUBS_RE.match(text)
     if _GONE_RE.match(text) or (m and m.group(1) in ("VideoUnavailable", "VideoUnplayable")):
         b = _donor(GONE_SHORT)
-        b.update(what=_GONE_WHAT, fix=_GONE_FIX)
+        # «gone» — экран рисует красным: ролика больше нет, ждать нечего (13.10.2026).
+        b.update(what=_GONE_WHAT, fix=_GONE_FIX, gone=True)
         return b
     if m:
         return _donor(_NO_SUBS.get(m.group(1) or "", "у донора нет субтитров"))
