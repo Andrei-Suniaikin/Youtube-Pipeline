@@ -3990,6 +3990,84 @@ def short_retry_candidate_ok(first_ratio: float, retry_ratio: float) -> Tuple[bo
     return True, ""
 
 
+def source_is_donor_cta_only(text: str) -> bool:
+    """Recognize a small English promotional tail, never story + a subscribe line.
+
+    Every sentence must match an allowlisted viewer-address form. Unknown forms
+    fail closed; a topic teaser is allowed only next to a promotional statement.
+    This deliberately does not classify arbitrary source languages or speeches.
+    """
+    text = re.sub(r"\s+", " ", (text or "").strip()).replace("’", "'")
+    if not 100 <= len(text) <= 2500 or re.search(r'[\d"“”«»]', text):
+        return False
+    sentences = [s.rstrip(".!?") for s in re.split(r"(?<=[.!?])\s+", text)]
+    requests = (
+        r"(?:hit|click|press) (?:that |the )?like button",
+        r"(?:hit |please )?subscribe(?: and turn on notifications)?",
+        r"(?:drop|leave) a comment(?: right now)?(?: and tell (?:us|me) where you(?:'re| are) watching from)?",
+        r"tell (?:us|me) (?:your location|if someone in your family served|where you(?:'re| are) watching from)",
+        r"just let (?:us|me) know you(?:'re| are) here",
+    )
+    support = (
+        r"if this story moved you(?: the way it moved (?:us|me))?, do (?:me|us) a favor",
+        r"every (?:single )?like tells youtube to show this story to more people",
+        r"we(?:'re| are) rescuing forgotten stories from dusty archives every (?:single )?day",
+        r"real (?:people|stories|history|heroism)(?:, real (?:people|stories|history|heroism))?",
+        r"are you watching from the (?:united states|united kingdom)(?:, (?:united kingdom|canada|australia))*",
+        r"our community stretches across the (?:entire |whole )?world",
+        r"you(?:'re| are) not just a viewer",
+        r"you(?:'re| are) part of keeping these memories alive",
+        r"thank you for watching(?: and thank you for making sure [a-z]+(?: [a-z]+){0,3} doesn't disappear into silence)?",
+        r"these (?:men|people) deserve to be remembered, and you(?:'re| are) helping make that(?: happen)?",
+    )
+    # Topic labels are promotional context, not permission to drop a narrative.
+    # The small vocabulary rejects dates, named places/people and unknown facts.
+    teaser_words = set("fighter pilots soldiers people heroes stories history war battles weapons pistols "
+                       "planes jets oceans archives modified attacked crossed impossible odds and who about".split())
+    request_count = 0
+    for index, sentence in enumerate(sentences):
+        if any(re.fullmatch(pattern, sentence, re.I) for pattern in requests):
+            request_count += 1
+        elif any(re.fullmatch(pattern, sentence, re.I) for pattern in support):
+            continue
+        elif (index > 0 and sentence.lower().startswith("stories about ")
+              and set(sentence.lower().split()) <= teaser_words
+              and re.fullmatch(support[2], sentences[index - 1], re.I)):
+            continue
+        else:
+            return False
+    return request_count >= 2
+
+
+def final_cta_short_output_ok(source: str, output: str, chunk_index: int,
+                              total_chunks: int, channel: str, host: str) -> bool:
+    """Bounded exception for a branded final CTA, never a plan or empty reply."""
+    if chunk_index != total_chunks - 1 or not source_is_donor_cta_only(source):
+        return False
+    output = (output or "").strip()
+    if not 40 <= len(output) <= 600 or len(output) >= len(source) or len(output.split()) < 6:
+        return False
+    if not channel or not host or channel not in output or host not in output:
+        return False
+    if re.search(r"\b(?:i need to|let me|i will|i'll|here is|here's|translation|rewrite|prompt|analysis|planning|"
+                 r"muszę|potrzebuję|przetłumacz|zrobię|przygotuję|dodam|napiszę|"
+                 r"připravím|napíšu|přeložím|přidám|vyzvu|trebuie să|voi traduce|voi rescrie|"
+                 r"я должен|мне нужно|перевод|анализ)\b|<\/?(?:think|analysis)>|```", output, re.I):
+        return False
+    # A direct imperative must begin a sentence/clause. Merely mentioning a
+    # future like/subscribe request in a plan is not an address to the viewer.
+    return bool(re.search(
+        r"(?:^|[.!?]\s+|,\s+)(?:please\s+)?(?:"
+        r"like (?:this|the) (?:video|story)|subscribe\b|hit (?:the |that )?like button|"
+        r"polub(?:cie)?\b|subskrybuj(?:cie)?\b|"
+        r"abonați(?:-vă)?\b|abonează-te\b|apreciați\b|"
+        r"odebírej(?:te)?\b|podpoř(?:te)?\b|dejte (?:like|lajk)\b|"
+        r"suscríb(?:ete|anse)\b|dale (?:a |un )?like\b|"
+        r"inscreva(?:-se)?\b|curta\b|pretplatite(?: se)?\b|"
+        r"iratkozz(?:atok)?\b|kedveld\b|підпиш(?:іться|ись)\b|поставте лайк\b|"
+        r"εγγραφείτε\b|κάντε (?:like|λάικ)\b|tilaa\b|tykkää\b)", output, re.I))
+
+
 def chunk_is_dense_script(text: str) -> bool:
     """Иероглифы / кана / хангыль / тайский: сверка длины по знакам с латиницей бессмысленна."""
     visible = len(re.findall(r"\S", text or ""))
@@ -5906,6 +5984,40 @@ def sanitize_final_text(text: str, lang_name: str) -> str:
 
 # ============== ПРОМПТЫ ==============
 
+def rewrite_target_language_rule(lang_name: str) -> str:
+    """Language purity concerns words, not a blanket ban on the target alphabet."""
+    target = str(lang_name or "").strip()
+    lower = target.lower()
+    if lower == "russian":
+        return "Write natural Russian in its native Cyrillic script; translate foreign source-language words."
+    if lower in ("ukrainian", "belarusian", "bulgarian", "macedonian"):
+        return (f"Write natural {target} in its native Cyrillic script. Cyrillic is REQUIRED, not forbidden. "
+                f"Replace Russian/source-language vocabulary and calques with genuine {target} words; "
+                "preserve correctly written proper names and faithful historical quotations.")
+    return (f"Write only natural {target} in its native script. Replace Russian/source-language "
+            f"vocabulary and transliteration with genuine {target} words; do not copy stray Cyrillic "
+            "from the source. Correctly written proper names and faithful quotations are not language mixing.")
+
+
+def preclean_rewrite_source(text: str) -> Tuple[str, int]:
+    """Remove caption markup and the measured unquoted ASR startup loop only.
+
+    No general repetition filter: repeated testimony, heat in a diary and unknown
+    bracketed annotations must survive. Newlines are retained for 1:1 mode.
+    """
+    original = text or ""
+    tail = re.compile(r"\[music\][ \t]*(?:Heat[.!][ \t]*){2,}\[music\][ \t]*\Z", re.I)
+    without_tail, tails = tail.subn("", original, count=1)
+    cleaned, removed = _REWRITE_CAPTION_TAG_RE.subn("", without_tail)
+    loop = re.compile(
+        r"\A[ \t]*(?:(?:Heat|Жара)[.!][ \t]*){2,}"
+        r"(?:Begin|Let's begin|Here we go|Начинаем|Начинаем работу)[.!]?[ \t]*"
+        r"(?:(?:Heat|Жара)[.!][ \t]*){2,}", re.IGNORECASE,
+    )
+    cleaned, loops = loop.subn("", cleaned, count=1)
+    return cleaned, removed + loops + tails
+
+
 def get_system_prompt(lang_name: str, lang_display: str = "", analysis: Optional[Dict] = None, address_style: str = "", custom_prompt: str = "") -> str:
     """
     Возвращает системный промт для языка.
@@ -6236,7 +6348,7 @@ TECHNICAL REQUIREMENTS ({lang_name}):
 
 CRITICAL RULES:
 
-1. ZERO RUSSIAN: No Cyrillic, no Russian words in Latin script (vachtor, przeleścia, etc.)
+1. TARGET LANGUAGE: {rewrite_target_language_rule(lang_name)}
 
 2. NATIVE LANGUAGE ONLY:
    - Use natural {lang_name} grammar, word order, expressions
@@ -6281,10 +6393,10 @@ CRITICAL RULES:
    - Surnames: MUST decline in {lang_name} (Polish/ Czech surnames decline, not like English)
 
 6. ZERO FOREIGN WORDS - NO LANGUAGE MIXING:
-   - NO Russian words in ANY form (Cyrillic or Latin: "личное дело", "vachtor")
-   - NO Spanish/English/other foreign words (e.g., "tiempo" in Polish text)
-   - NO mixed languages - ONLY pure {lang_name}
-   - If you see foreign word → find {lang_name} equivalent immediately
+   - {rewrite_target_language_rule(lang_name)}
+   - Translate stray words from OTHER languages into {lang_name}; Spanish is correct when the target is Spanish, English is correct when the target is English.
+   - Use native {lang_name} vocabulary and grammar; proper names and faithful quotations retain their meaning.
+   - Do not confuse the target language's own words with foreign-language contamination.
 
 7. PROPER NOUNS - Preserve EXACTLY:
    - Space stations: "Salut 6" (NOT "Szałyt 6", "Szałt 6", "Salit 6")
@@ -6320,6 +6432,7 @@ CRITICAL RULES:
    - Remove the donor's greetings, channel/host self-introduction, like/subscribe/comment requests, sponsor lines and farewells
    - Add only what the branding instructions of this chunk allow: at most one brief introduction, one call-to-action for OUR channel where those instructions ask for it, and the sign-off in the last part; never copy the donor's calls-to-action, never add extra ones and never repeat the introduction
    - Historical first-person testimony, letters, diaries and quotations are content: keep them attributed to their real speakers
+   - The present-day donor's personal experience is NOT our host's biography. Never claim our host bought letters, visited a battlefield, interviewed someone or owns an object merely because the donor did. Preserve useful evidence neutrally ("the surviving letters show...") or attribute it to the original researcher; delete only irrelevant creator asides. Historical witnesses' first-person quotations must remain first-person and attributed.
 
 11. Numbers and dates: {numbers_rule}. ALL dates and centuries IN WORDS in {lang_name} (e.g. nineteenth century, not "19th" or "XIX").
 12. Length: preserve all content. Target 95-115% of the input in characters. The extra room exists ONLY for the connective sentences and the source's own section markers allowed above — never for padding, never for restating what was already said, and never a reason to drop content. Where a PARAGRAPH STRUCTURE 1:1 / HARD CONSTRAINT block appears in the task, that block wins.
@@ -6547,6 +6660,7 @@ def get_rewrite_prompt(lang_name: str, text: str, chunk_index: int, total_chunks
 
 NONCONTENT — REMOVE, NEVER REPLACE:
 - Delete the donor's greeting, the donor's channel/host self-introduction, every request to like / subscribe / comment / share / ring the bell, sponsor and promo-code lines, merch and donation asks, production notes, the creator's present-day personal asides (his editing, coffee, holidays, opinions about his channel) and the farewell / promise of the next episode.
+- Never turn the present-day donor's purchases, travel, interviews, collection or discoveries into OUR host's personal experience. Retain their useful historical evidence in a neutral form ("the letters show...") or attribute it to the original researcher; do not invent an owner or witness. This does NOT apply to attributed historical diaries, letters, testimony or dialogue: preserve those first-person voices.
 - BUT the donor's RETENTION devices are content, not advertising: a tease of what is coming, a promise to return to something later, a direct question to the viewer, a short recap before a new block. KEEP the pull, in the same place, rewritten without the donor's name, channel and links — and WITHOUT any request. Only the request itself is deleted; the pull that carried it stays. This never creates a second call-to-action: asking the viewer for anything is allowed ONLY where the branding rules of THIS part explicitly ask for it.
 - Never copy, translate or paraphrase the donor's calls-to-action or farewell. OUR OWN call-to-action and sign-off exist ONLY where the branding rules of THIS part explicitly ask for them below (exact names given there). Where this part's rules ask for none, a text with NO call-to-action and NO sign-off is CORRECT.
 - Historical testimony STAYS: a witness's "I / we", diary and letter quotations, dialogue between historical people and the witness's own reflections are story content. Keep them in the witness's voice or clearly attributed to the witness. Never turn them into the narrator's own experience and never delete them as "noncontent".
@@ -6560,12 +6674,18 @@ NONCONTENT — REMOVE, NEVER REPLACE:
 INTRODUCTION — EXACTLY ONCE, AFTER THE HOOK:
 - Start with the hook — NO branding inside the hook.
 - After the hook, insert ONE brief, natural introduction of 1-2 sentences that presents {_who}. Use the exact strings above; nothing else is named.
+- The host speaks in FIRST PERSON (the native equivalent of "I am NAME" / "With you is NAME"), never "NAME will tell you" as a third-person announcement. Keep it brief and connected to the story.
 - PLACE IT BY MEANING, NOT BY PERCENTAGE: put it at the FIRST CLEAN SEAM after the hook — the end of a scene, the end of a self-contained thought, or the point just before a new section begins. It MUST still fall inside the FIRST QUARTER of this part.
 - NEVER place it between a set-up and its punchline, between a question and its answer, between a fact and the line that lands it, or anywhere inside a scene, an anecdote or a quotation. If no clean seam has arrived yet, continue the story until one does.
 - FOLD IT INTO THE PROMISE: name {_who} while pointing at what this video is about, instead of stopping the story for an announcement. FORBIDDEN dead formulas: "My name is X and you are listening to channel Y.", "Today we will look at...", "We continue to follow...".
 - Do NOT repeat the introduction anywhere else. The host or channel may appear again ONLY inside the call-to-action / sign-off that the rules of THIS part explicitly ask for below — nowhere else.""" if _who else """
 
 NO BRANDING: no host name, no channel name, no narrator identity anywhere in the text. Do not invent one."""
+
+    if actual_channel_name and lang_name.strip().lower() == "greek":
+        _strict_naming += (f'\n- Greek channel title is an exact QUOTED name: «{actual_channel_name}». '
+                           'Use a natural frame such as στο κανάλι «TITLE»; do not put an extra Η/η '
+                           'immediately before a title that already starts with Η. Never duplicate its article.')
 
     # CONTRACT-C-2026-09-15: свой призыв (лайк+подписка на НАШ канал) — ровно один, в середине;
     # своё прощание с именами + одна просьба — ровно один раз, в самом конце. Только с заданными именами.
@@ -6686,7 +6806,7 @@ MIDDLE PART — NOTHING ADDED:
 ═══════════════════════════════════════════════════════════"""
 
     # Очень жёстко задаём формат вывода: только текст в одних скобках
-    prompt = f"""You are adapting CHUNK {chunk_index+1} of {total_chunks} from Russian into natural, high‑quality {lang_name}.
+    prompt = f"""You are adapting CHUNK {chunk_index+1} of {total_chunks} from the source's language into natural, high‑quality {lang_name}.
 
 {role_note}
 {content_note}
@@ -6702,7 +6822,7 @@ TASK:
 - Follow the NONCONTENT and branding rules above: remove the donor's greetings, self-introductions, calls-to-action, sponsor lines and farewells; add ONLY what the branding rules of this part explicitly ask for (introduction / call-to-action / sign-off, each at most once, exact names), nothing else of that kind.
 - Remove any subtitle markers like [музыка], [music], [muzika], [muzică], [muzyka], etc.
 - Render EVERY number, year, decade, ordinal, range and quantity as fully spelled-out words IN {lang_name} (e.g. {numbers_ex}). The output must contain ZERO digits and ZERO English number-words. Decade phrases like "nineteen-nineties", "the 1990s", "nineteen-twenties" MUST become the {lang_name} words for that decade — never left in English. If you are about to write "nineteen", "twenty", "-nineties", a digit, or "19th" — stop and spell it in {lang_name}.
-- Ensure ZERO Russian words remain (no Cyrillic, no Latin transliteration) – always replace them with natural {lang_name} words.
+- {rewrite_target_language_rule(lang_name)}
 - Avoid literal calques, invented words and wooden syntax as described in the system instructions.
 - UNITS: Convert feet/inches by RECALCULATING: 1 foot = 0.3048 m (1 m = 3.28 ft), 1 inch = 2.54 cm. E.g. 8 ft → ~2.5 m, 10 ft → ~3 m. Write the new value in metric (in words where natural); never keep the same number with "meters"; never use "feet" as body parts.
 - DATES AND CENTURIES: Write ALL dates and centuries IN WORDS in {lang_name} (e.g. "nineteenth century", not "19th" or "XIX"). "1800s" = nineteenth century — translate correctly and in words.
@@ -10081,7 +10201,8 @@ def translate_paragraphs_recursive(
 #   REWRITE_CLEANUP             — общий выключатель (по умолчанию включено)
 #   REWRITE_CLEANUP_PRESERVE    — чистка в режиме сохранения абзацев (по умолчанию включено)
 #   REWRITE_CLEANUP_MODEL       — модель (по умолчанию codex:gpt-5.6-sol)
-#   REWRITE_CLEANUP_MAX_CALLS   — потолок вызовов модели на язык (по умолчанию 3)
+#   REWRITE_CLEANUP_MAX_CALLS   — legacy-потолок (3); mandatory Codex: не меньше числа частей + retry
+#   REWRITE_CLEANUP_RETRIES     — mandatory Codex: 0 или 1 повтор (по умолчанию 1)
 #   REWRITE_CLEANUP_BUDGET_SEC  — потолок времени на язык (по умолчанию 900)
 #   REWRITE_CLEANUP_CHUNK_CHARS — длина куска для одного вызова (по умолчанию 45000)
 #   REWRITE_CLEANUP_MIN_CHARS   — короче этого текст не чистим (по умолчанию 400)
@@ -10133,6 +10254,8 @@ _CLEANUP_FALSE_VALUES = ("0", "false", "no", "off", "нет", "")
 # Память на процесс: чистка один раз на (задача, язык) и общий выключатель на задачу.
 _CLEANUP_STATE_LOCK = threading.Lock()
 _CLEANUP_DONE: Dict[str, float] = {}
+_CLEANUP_VERIFIED: Dict[str, str] = {}
+_QUALITY_JOB_ERRORS: Dict[str, str] = {}
 _CLEANUP_JOB_OFF: Dict[str, str] = {}
 _CLEANUP_STATE_MAX = 2000
 # Отказы, после которых пробовать снова в этой же задаче бессмысленно.
@@ -10147,6 +10270,73 @@ _CLEANUP_FATAL_MARKERS = (
     "Own-only mode",
     "codex CLI not found",
 )
+
+QUALITY_REVIEW_VERSION = "codex-editorial-2026-10-11-v1"
+
+
+class RewriteQualityError(RuntimeError):
+    """A complete paid rewrite remains checkpointed, but is not safe to publish yet."""
+
+
+def remember_quality_review_error(job_id: str, lang_name: str, base_name: str, reason: str) -> None:
+    if job_id:
+        _cleanup_state_put(_QUALITY_JOB_ERRORS, "\x00".join((job_id, lang_name, base_name)), str(reason)[:500])
+
+
+def clear_quality_review_error(job_id: str, lang_name: str, base_name: str) -> None:
+    with _CLEANUP_STATE_LOCK:
+        _QUALITY_JOB_ERRORS.pop("\x00".join((job_id, lang_name, base_name)), None)
+
+
+def pop_quality_review_error(job_id: str) -> str:
+    """The queue finalizer can surface precise QA failure instead of 'no files'."""
+    with _CLEANUP_STATE_LOCK:
+        keys = [key for key in _QUALITY_JOB_ERRORS if key.startswith(str(job_id) + "\x00")]
+        errors = [_QUALITY_JOB_ERRORS.pop(key) for key in keys]
+    return " | ".join(errors)[:1500]
+
+
+def cleanup_quarantine_unverified_output(output_file: str, output_dir: str) -> str:
+    """Keep an old unverified script without exposing it among downloadable .txt outputs."""
+    if not output_file or not os.path.isfile(output_file):
+        return ""
+    root = os.path.realpath(output_dir)
+    if os.path.commonpath((root, os.path.realpath(output_file))) != root:
+        raise RewriteQualityError("QUALITY_REVIEW_FAILED: old output is outside this job directory")
+    quarantine = os.path.join(root, ".unverified")
+    os.makedirs(quarantine, exist_ok=True)
+    suffix = hashlib.sha256((output_file + str(time.time_ns())).encode()).hexdigest()[:12]
+    destination = os.path.join(quarantine, os.path.basename(output_file) + "." + suffix + ".unverified")
+    os.replace(output_file, destination)
+    if os.path.isfile(output_file + ".quality.json"):
+        os.replace(output_file + ".quality.json", destination + ".quality.json")
+    return destination
+
+
+def cleanup_receipt_valid(output_file: str, lang_name: str, channel_name: str, host_name: str) -> bool:
+    try:
+        with open(output_file, "rb") as source:
+            digest = hashlib.sha256(source.read()).hexdigest()
+        with open(output_file + ".quality.json", encoding="utf-8") as source:
+            receipt = json.load(source)
+        return (receipt.get("version") == QUALITY_REVIEW_VERSION
+                and receipt.get("sha256") == digest
+                and receipt.get("language") == lang_name
+                and receipt.get("channel") == channel_name
+                and receipt.get("host") == host_name)
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def cleanup_write_receipt(output_file: str, lang_name: str, channel_name: str, host_name: str) -> None:
+    with open(output_file, "rb") as source:
+        digest = hashlib.sha256(source.read()).hexdigest()
+    receipt = {"version": QUALITY_REVIEW_VERSION, "sha256": digest,
+               "language": lang_name, "channel": channel_name, "host": host_name}
+    temporary = output_file + ".quality.json.tmp"
+    with open(temporary, "w", encoding="utf-8") as target:
+        json.dump(receipt, target, ensure_ascii=False)
+    os.replace(temporary, output_file + ".quality.json")
 
 
 def _cleanup_flag(name: str, default: bool = True) -> bool:
@@ -10177,7 +10367,7 @@ def cleanup_model_name() -> str:
     """Модель чистки. Только подписка Codex: ключа OpenAI на сервере нет."""
     # 02.10.2026 — sol вместо terra, вместе с основной моделью рерайта: владелец на
     # вопрос «вычитку тоже?» ответил «ну если рерайт, то без проблем». Вычитка — это
-    # четыре прохода по уже написанному тексту, то есть тот же рерайт, и держать её на
+    # один редакторский проход по уже написанному тексту, и держать его на
     # другой модели значило бы платить за medium-размышление там, где основной текст
     # уже пишется на low. В окружении переменная не задана нигде, поэтому умолчание
     # здесь и есть действующее значение.
@@ -10187,7 +10377,8 @@ def cleanup_model_name() -> str:
 def _cleanup_state_put(store: Dict[str, Any], key: str, value: Any) -> None:
     """Запоминает факт с ограничением размера — процесс живёт неделями."""
     with _CLEANUP_STATE_LOCK:
-        if key not in store and len(store) >= _CLEANUP_STATE_MAX:
+        max_entries = 64 if store is _CLEANUP_VERIFIED else _CLEANUP_STATE_MAX
+        if key not in store and len(store) >= max_entries:
             try:
                 store.pop(next(iter(store)))
             except StopIteration:
@@ -10333,6 +10524,7 @@ def cleanup_build_prompt(
     lang_name: str,
     suspects: Dict[str, List[str]],
     limit: int = CLEANUP_MAX_FIXES,
+    editorial: bool = False,
 ) -> str:
     """Собирает промпт чистки: список найденных кандидатов + сам текст."""
     titles = {
@@ -10351,6 +10543,8 @@ def cleanup_build_prompt(
         # Для кириллического текста пример с латинским написанием — прямая инструкция
         # завести латиницу в текст для озвучки. Даём пример в целевом алфавите.
         name_example = "«Ирвин Рамль» это «Эрвин Роммель», «Вельзебуб» это «Вельзевул»"
+        if lang_name.strip().lower() == "ukrainian":
+            name_example = "«Ірвін Рамль» це «Ервін Роммель»; виправлення мають бути українською"
         alphabet_rule = (
             "АЛФАВИТ: текст кириллический. Все исправления пиши кириллицей — "
             "латинских букв в тексте для озвучки быть не должно.\n"
@@ -10361,7 +10555,28 @@ def cleanup_build_prompt(
             f"АЛФАВИТ: пиши исправления в том же алфавите, что и текст ({lang_name}), "
             "не вставляй кириллицу.\n"
         )
-    return CLEANUP_PROMPT_TEMPLATE.format(
+    template = CLEANUP_PROMPT_TEMPLATE
+    if editorial:
+        template = template.replace(
+            "Найди и верни замены по категориям:",
+            "Проверь ВЕСЬ переданный текст, включая начало и конец, как носитель языка. "
+            "Это один финальный редакторский проход, НЕ полный рерайт. "
+            "Верни только необходимые точечные исправления по категориям:",
+        ).replace(
+            "   Падежные и родовые окончания НЕ меняй: это грамматика, а не мусор распознавания\n"
+            "   (в чешском «dnešního Polska» — верный родительный падеж).",
+            "6. ЯВНЫЕ ГРАММАТИЧЕСКИЕ ОШИБКИ, неестественные кальки и сломанная связность "
+            "ВНУТРИ предложения. Для грамматики цитируй короткую фразу с контекстом, "
+            "никогда одиночное слово без контекста: разные падежи — не разнобой написаний. "
+            "Не улучшай стиль ради синонимов. Не добавляй фактов и не меняй степень уверенности.\n"
+            "7. ЯВНЫЙ МУСОР РАСПОЗНАВАНИЯ и случайно продублированная одинаковая фраза. "
+            "Не удаляй осмысленные повторы, рефрены, диалоги, дневники или цитаты. "
+            "Удаление допустимо лишь для явной метки [music] либо механического дубля "
+            "точно той же фразы; укажи kind=asr_noise или kind=duplicate.\n"
+            "8. Не присваивай ведущему личный опыт современного донора; исторические "
+            "свидетельства от первого лица и их атрибуцию сохраняй.",
+        )
+    return template.format(
         lang=lang_name,
         name_example=name_example,
         alphabet_rule=alphabet_rule,
@@ -10392,7 +10607,7 @@ def cleanup_split(text: str, limit: int = 0) -> List[str]:
     return parts
 
 
-def cleanup_parse_fixes(raw: str) -> Optional[List[Dict[str, Any]]]:
+def cleanup_parse_fixes(raw: str, strict: bool = False) -> Optional[List[Dict[str, Any]]]:
     """Разбирает ответ модели в список правок.
 
     None — ответ не разобрался (мягкий отказ), [] — модель честно не нашла правок.
@@ -10423,6 +10638,11 @@ def cleanup_parse_fixes(raw: str) -> Optional[List[Dict[str, Any]]]:
                 payload = payload[key]
                 break
     if not isinstance(payload, list):
+        return None
+    if strict and (len(payload) > CLEANUP_MAX_FIXES or any(
+            not isinstance(item, dict) or not isinstance(item.get("old"), str)
+            or not item["old"].strip() or not isinstance(item.get("new"), str)
+            for item in payload)):
         return None
     return [item for item in payload if isinstance(item, dict)]
 
@@ -10592,7 +10812,18 @@ def cleanup_apply_fixes(
         old = str(item.get("old") or "")
         new = str(item.get("new") or "")
         report["предложено"] += 1
-        if not old or not new.strip():
+        kind = str(item.get("kind") or "").strip().lower()
+        if not kind and str(item.get("why") or "").strip().lower() in ("duplicate", "asr_noise"):
+            kind = str(item["why"]).strip().lower()
+        is_caption_deletion = kind == "asr_noise" and not new.strip() and bool(_REWRITE_CAPTION_TAG_RE.fullmatch(old))
+        # Only exact mechanical duplication is removable. Not a licence to shorten a story.
+        is_duplicate = (kind == "duplicate" and len(new.split()) >= 4
+                        and not any(mark in old for mark in ('"', '«', '»', '“', '”'))
+                        and old.strip() == (new.strip() + " " + new.strip()))
+        if kind == "duplicate" and not is_duplicate:
+            _drop(old, "не точный механический дубль либо цитата")
+            continue
+        if not old or (not new.strip() and not is_caption_deletion):
             _drop(old, "пустая замена")
             continue
         if old == new:
@@ -10621,7 +10852,7 @@ def cleanup_apply_fixes(
             continue
         # Срезание — главный риск чистки: так из текста пропадает содержание
         # (и прощание в конце ролика).
-        if len(new) < CLEANUP_MIN_REPLACEMENT_SHARE * len(old) - 8:
+        if len(new) < CLEANUP_MIN_REPLACEMENT_SHARE * len(old) - 8 and not (is_caption_deletion or is_duplicate):
             _drop(old, "замена срезает фрагмент")
             continue
         guard_reason = cleanup_semantic_guard(old, new, out)
@@ -10640,6 +10871,12 @@ def cleanup_apply_fixes(
         if len(matches) > CLEANUP_MAX_OCCURRENCES:
             _drop(old, f"слишком много вхождений ({len(matches)})")
             continue
+        if is_duplicate or is_caption_deletion:
+            quotes = list(re.finditer(r'["«“][^"»”\n]*["»”]', out))
+            if any(m.start() < quote.end() and quote.start() < m.end()
+                   for m in matches for quote in quotes):
+                _drop(old, "мусор/повтор находится в цитате")
+                continue
         spans = cleanup_protected_spans(out, terms)
         if spans and any(
             any(start < span_end and span_start < end for span_start, span_end in spans)
@@ -10722,24 +10959,30 @@ def cleanup_one_piece(
     protected_names: Optional[List[str]] = None,
     task_info: str = "",
     label: str = "",
+    strict: bool = False,
+    stats: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, bool, str]:
     """Чистит один кусок. Возвращает (текст, был_ли_вызов, причина_отказа).
 
-    Любой сбой — вызов не удался, ответ не разобрался, сверка не прошла — возвращает
-    ИСХОДНЫЙ кусок. Задача от чистки не падает никогда.
+    Любой сбой возвращает ИСХОДНЫЙ кусок. strict дополнительно возвращает причину:
+    обязательный Codex gate не выдаст этот непроверенный кусок как готовый.
     """
     if not piece or not piece.strip():
         return piece, False, ""
+    if stats is not None:
+        stats["applied"] = 0
     suspects = cleanup_collect_suspects(piece)
     candidates = sum(len(values) for values in suspects.values())
-    if not suspects and not cleanup_has_proper_names(piece):
+    if not strict and not suspects and not cleanup_has_proper_names(piece):
         log_msg(log_queue, f"🧹 {lang_display}{label}: чистка не нужна — ни кандидатов, ни имён собственных")
         return piece, False, ""
     if STOP_FLAG.is_stopped():
-        return piece, False, ""
+        return piece, False, "CODEX_STOPPED" if strict else ""
 
-    messages = [{"role": "user", "content": cleanup_build_prompt(piece, lang_name, suspects)}]
-    with cleanup_detached_job_id():
+    messages = [{"role": "user", "content": cleanup_build_prompt(piece, lang_name, suspects, editorial=strict)}]
+    # Mandatory Codex QA keeps job identity: the existing queue can park it on
+    # shared-slot/subscription cooldown and later resume the paid rewrite chunks.
+    with (nullcontext() if strict else cleanup_detached_job_id()):
         ok, response = call_codex_subscription(messages, model, log_queue, task_info)
     if not ok:
         reason = str(response)[:200]
@@ -10750,13 +10993,13 @@ def cleanup_one_piece(
         )
         return piece, True, reason
 
-    fixes = cleanup_parse_fixes(response)
+    fixes = cleanup_parse_fixes(response, strict=strict)
     if fixes is None:
         log_msg(
             log_queue,
             f"🧹 {lang_display}{label}: чистка пропущена — ответ не разобрался как JSON; текст оставлен как был"
         )
-        return piece, True, ""
+        return piece, True, "invalid JSON quality response" if strict else ""
     if not fixes:
         log_msg(log_queue, f"🧹 {lang_display}{label}: кандидатов {candidates}, правок модель не нашла")
         return piece, True, ""
@@ -10772,7 +11015,7 @@ def cleanup_one_piece(
             f"🧹 {lang_display}{label}: сверка целостности не прошла ({'; '.join(problems)}) — "
             f"откат, текст оставлен как был"
         )
-        return piece, True, ""
+        return piece, True, ("integrity check failed: " + "; ".join(problems)) if strict else ""
 
     log_msg(
         log_queue,
@@ -10781,6 +11024,8 @@ def cleanup_one_piece(
     )
     if report["причины"]:
         log_msg(log_queue, f"🧹 {lang_display}{label}: отброшено — {'; '.join(report['причины'])}")
+    if stats is not None:
+        stats["applied"] = report["применено"]
     return cleaned, True, ""
 
 
@@ -10928,6 +11173,90 @@ def _cleanup_rewrite_results(
     return [cleaned_full]
 
 
+def _cleanup_strict_rewrite_results(
+    results: List[str], lang_name: str, lang_display: str, log_queue: queue.Queue,
+    channel_name: str, host_name: str, preserve_paragraphs: bool,
+    job_id: str, base_name: str, task_info: str, allow: bool,
+) -> List[str]:
+    """Codex final editorial gate: complete coverage or an observable, retryable failure."""
+    if not allow:  # Incomplete rewrite is handled by the existing chunk-failure gate.
+        return results
+    if not results or any(str(value).startswith("[ОШИБКА:") for value in results):
+        raise RewriteQualityError("QUALITY_REVIEW_FAILED: no complete text to review")
+    if not cleanup_enabled(preserve_paragraphs):
+        raise RewriteQualityError("QUALITY_REVIEW_FAILED: REWRITE_CLEANUP is disabled for Codex")
+    model = cleanup_model_name()
+    if classify_provider(model) != "codex" or model not in get_allowed_codex_models():
+        raise RewriteQualityError("QUALITY_REVIEW_FAILED: configure an allowed Codex cleanup model")
+    joined = "\n\n".join(str(value or "") for value in results)
+    # Also removes the measured edge loop from legacy completed chunks, without
+    # changing the source split plan or redoing any paid rewrite chunk.
+    joined, removed_noise = preclean_rewrite_source(joined)
+    if removed_noise:
+        log_msg(log_queue, f"🧹 {lang_display}: перед финальной редактурой снято ASR-меток/петель {removed_noise}")
+    digest = hashlib.sha256(joined.encode("utf-8")).hexdigest()
+    cache_key = "\x00".join((str(job_id), lang_name, base_name, channel_name, host_name,
+                             QUALITY_REVIEW_VERSION, digest))
+    if job_id:
+        with _CLEANUP_STATE_LOCK:
+            verified = _CLEANUP_VERIFIED.get(cache_key)
+        if verified is not None:
+            log_msg(log_queue, f"🧹 {lang_display}: проверенный результат Codex из кэша (совпадает SHA256)")
+            return [verified]
+    terms = cleanup_protected_terms(channel_name, host_name)
+    protected_names = [name.strip() for name in (channel_name, host_name) if name and name.strip()]
+    pieces = cleanup_split(joined)
+    retries = min(1, _cleanup_int("REWRITE_CLEANUP_RETRIES", 1, 0))
+    calls_left = max(len(pieces), _cleanup_int("REWRITE_CLEANUP_MAX_CALLS", 3, 1)) + retries
+    deadline = time.monotonic() + max(_cleanup_int("REWRITE_CLEANUP_BUDGET_SEC", 900, 60), len(pieces) * 120)
+    cleaned_pieces: List[str] = []
+    calls_made = 0
+    total_applied = 0
+    for index, piece in enumerate(pieces):
+        if not piece.strip():
+            cleaned_pieces.append(piece)
+            continue
+        reason = ""
+        for attempt in range(1 + retries):  # Bounded retries; enough budget to review every piece.
+            if STOP_FLAG.is_stopped():
+                raise RewriteQualityError("QUALITY_REVIEW_FAILED: CODEX_STOPPED")
+            if calls_left <= 0 or time.monotonic() >= deadline:
+                raise RewriteQualityError(
+                    f"QUALITY_REVIEW_FAILED: budget exhausted; reviewed {len(cleaned_pieces)}/{len(pieces)} "
+                    f"pieces, calls {calls_made}; rewrite chunks retained")
+            piece_stats: Dict[str, Any] = {}
+            cleaned, called, reason = cleanup_one_piece(
+                piece, lang_name, lang_display, model, log_queue,
+                terms=terms, protected_names=protected_names,
+                task_info=f"{task_info or 'cleanup'}_{index + 1}_try{attempt + 1}",
+                label=f" часть {index + 1}/{len(pieces)}", strict=True, stats=piece_stats,
+            )
+            if called:
+                calls_left -= 1
+                calls_made += 1
+            if not reason:
+                cleaned_pieces.append(cleaned)
+                total_applied += int(piece_stats.get("applied", 0))
+                break
+            log_msg(log_queue, f"🧹 {lang_display}: проверка части {index + 1} не завершена: {reason[:160]}")
+            if any(marker.lower() in reason.lower() for marker in _CLEANUP_FATAL_MARKERS):
+                break
+        if reason:
+            raise RewriteQualityError(
+                f"QUALITY_REVIEW_FAILED: piece {index + 1}/{len(pieces)}: {reason[:200]}; "
+                "rewrite chunks retained for retry")
+    cleaned_full = "\n\n".join(cleaned_pieces)
+    ok, problems = cleanup_verify(joined, cleaned_full, lang_name, protected_names, max(1, total_applied))
+    if not ok:
+        raise RewriteQualityError("QUALITY_REVIEW_FAILED: full-text integrity: " + "; ".join(problems))
+    if job_id:
+        _cleanup_state_put(_CLEANUP_VERIFIED, cache_key, cleaned_full)
+    log_msg(log_queue, f"✅ {lang_display}: финальная редактура Codex проверена — "
+                      f"{len(pieces)}/{len(pieces)} частей, {calls_made} вызовов, модель {model}, "
+                      f"{len(joined)} → {len(cleaned_full)} знаков")
+    return [cleaned_full]
+
+
 def cleanup_rewrite_results(
     results: List[str],
     lang_name: str,
@@ -10940,14 +11269,19 @@ def cleanup_rewrite_results(
     base_name: str = "",
     task_info: str = "",
     allow: bool = True,
+    strict: bool = False,
 ) -> List[str]:
     """Единственная точка входа чистки — и последняя страховка.
 
-    rewrite_single_language ловит Exception и помечает язык failed, поэтому ни одна
-    ошибка чистки не имеет права вылететь наружу: рерайт уже сделан и оплачен,
-    терять его из-за косметической постобработки нельзя.
+    Legacy providers retain the cosmetic fallback. Mandatory Codex checking raises
+    RewriteQualityError; paid source chunks stay checkpointed for queue recovery.
     """
     try:
+        if strict:
+            return _cleanup_strict_rewrite_results(
+                results, lang_name, lang_display, log_queue, channel_name, host_name,
+                preserve_paragraphs, job_id, base_name, task_info, allow,
+            )
         return _cleanup_rewrite_results(
             results,
             lang_name,
@@ -10962,6 +11296,10 @@ def cleanup_rewrite_results(
             allow=allow,
         )
     except Exception as exc:
+        if strict:
+            if isinstance(exc, RewriteQualityError):
+                raise
+            raise RewriteQualityError(f"QUALITY_REVIEW_FAILED: {type(exc).__name__}: {exc}") from exc
         try:
             log_msg(
                 log_queue,
@@ -11013,10 +11351,29 @@ def rewrite_single_language(
     if use_subscription and not tokens:
         tokens = [oauth_token] if oauth_token else []
     current_token_index = [start_token_index % len(tokens)] if tokens else [0]
+    _is_codex = classify_provider(model) == "codex"
+    _strict_codex = _is_codex and not preserve_paragraphs
     
     try:
+        # Quarantine stale final files before source reading/analysis can fail.
+        _progress_job_id = progress_scope or job_id
+        _uid = get_current_user_id() or (os.path.basename(os.path.normpath(output_dir)) if output_dir else "")
+        if _strict_codex:
+            early_base = output_basename or os.path.splitext(os.path.basename(source_file))[0][:50]
+            early_task = PROGRESS_MANAGER.tasks.get(PROGRESS_MANAGER._task_key(source_file, lang_name, _uid, _progress_job_id))
+            early_outputs = {os.path.join(output_dir, make_output_filename(early_base, lang_name))}
+            if early_task and getattr(early_task, "output_file", ""):
+                early_outputs.add(early_task.output_file)
+            for old_output in early_outputs:
+                if os.path.isfile(old_output) and not cleanup_receipt_valid(old_output, lang_name, channel_name, host_name):
+                    cleanup_quarantine_unverified_output(old_output, output_dir)
+                    if early_task:
+                        PROGRESS_MANAGER.set_task_output(source_file, lang_name, "", user_id=_uid, job_id=_progress_job_id)
+                    log_msg(log_queue, f"🔎 {lang_display}: прежний непроверенный файл сохранён отдельно до повторной проверки")
         # Читаем файл (поддержка txt, docx, pdf, odt, rtf)
         text = read_file_as_text(source_file)
+        # Mandatory QA is scoped to ordinary Codex scripts, the WW2 mode. The
+        # paragraph-preserving workflow retains its existing optional-cleanup contract.
         
         # Анализ текста: кэш по (файл, модель) — один анализ на файл для всех языков
         try:
@@ -11046,7 +11403,7 @@ def rewrite_single_language(
         # Для Claude — крупный chunk (60-80K chars ≈ один кусок на ≤14K слов) и
         # natural reroll (preserve_paragraphs=False) уже передаётся snippet сверху.
         # GPT-путь (preserve=True, мелкий chunk) не трогаем.
-        _is_claude = ("claude" in (model or "").lower()) or use_subscription
+        _is_claude = ("claude" in (model or "").lower()) or (use_subscription and not _is_codex)
         if _is_claude and not preserve_paragraphs:
             original_chunk_size = chunk_size
             chunk_size = int(os.environ.get("CLAUDE_CHUNK_SIZE", "20000"))  # 2026-06-11: 60000->20000, промпт ~35K (opus стабилен; на 65K падал stream-stall #25979)
@@ -11089,9 +11446,19 @@ def rewrite_single_language(
         if (task.status == TaskStatus.COMPLETED.value
                 and getattr(task, "output_file", "")
                 and os.path.isfile(task.output_file)
-                and os.path.getsize(task.output_file) > 0):
+                and os.path.getsize(task.output_file) > 0
+                and (not _strict_codex or cleanup_receipt_valid(task.output_file, lang_name, channel_name, host_name))):
             log_msg(log_queue, f"✅ {lang_display}: уже завершено ранее")
+            if _strict_codex:
+                clear_quality_review_error(job_id, lang_name, output_basename or os.path.splitext(os.path.basename(source_file))[0][:50])
             return (lang_display, True)
+        candidate_base = output_basename or os.path.splitext(os.path.basename(source_file))[0][:50]
+        existing_output = getattr(task, "output_file", "") or os.path.join(output_dir, make_output_filename(candidate_base, lang_name))
+        if (_strict_codex and os.path.isfile(existing_output)
+                and not cleanup_receipt_valid(existing_output, lang_name, channel_name, host_name)):
+            log_msg(log_queue, f"🔎 {lang_display}: сохранённый текст без действующей квитанции проверки — редактура сохранённых частей")
+            cleanup_quarantine_unverified_output(existing_output, output_dir)
+            PROGRESS_MANAGER.set_task_output(source_file, lang_name, "", user_id=_uid, job_id=_progress_job_id)
         
         # Определяем какие чанки нужно обработать
         incomplete_chunks = PROGRESS_MANAGER.get_incomplete_chunks(task)
@@ -11137,6 +11504,12 @@ def rewrite_single_language(
                 return (lang_display, False)
             
             chunk_text = chunks[chunk_idx]
+            if _strict_codex:
+                # Preserve raw 8000-character boundaries and old checkpoint indexes.
+                # Cleaning the full source before splitting would corrupt partial resume.
+                chunk_text, source_noise_removed = preclean_rewrite_source(chunk_text)
+                if source_noise_removed:
+                    log_msg(log_queue, f"🧹 {lang_display}: часть {chunk_idx + 1}, удалено явных ASR-меток/петель {source_noise_removed}")
             
             # Контекст из предыдущих чанков: последние 3 предложения для согласованности имён и стиля
             prev_chunk_context = ""
@@ -11372,13 +11745,18 @@ def rewrite_single_language(
             orig_len = len(chunk_text)
             extracted_len = len(extracted)
             ratio = extracted_len / orig_len if orig_len > 0 else 1.0
+            _cta_short_ok = _strict_codex and final_cta_short_output_ok(
+                chunk_text, extracted, chunk_idx, total_chunks, channel_name, host_name,
+            )
+            if _cta_short_ok and ratio < SHORT_RETRY_RATIO:
+                log_msg(log_queue, f"   ✅ Chunk {chunk_idx+1}: исходная часть целиком CTA донора — принимаю короткое обращение, финальная редактура обязательна")
 
             # Детальное логирование для отладки
             if extracted_len < 100:  # Подозрительно короткий результат
                 log_msg(log_queue, f"   ⚠️ WARNING: Extracted text very short ({extracted_len} chars), response length: {len(response)}")
                 log_msg(log_queue, f"   🔍 Response preview: {response[:200]}...")
 
-            if ratio < SHORT_RETRY_RATIO and not (ratio >= DENSE_SCRIPT_SKIP_FROM and chunk_is_dense_script(extracted)):  # короткий ИЛИ нарратив-преамбула
+            if ratio < SHORT_RETRY_RATIO and not _cta_short_ok and not (ratio >= DENSE_SCRIPT_SKIP_FROM and chunk_is_dense_script(extracted)):  # короткий ИЛИ нарратив-преамбула
                 log_msg(log_queue, f"   ⚠️ Chunk {chunk_idx+1}: SHORT ({ratio:.1%}, {extracted_len}/{orig_len} chars) — анти-нарратив retry...")
                 # FIX-2026-06-28-narration: нарратив opus-4-6 интермиттентный (~17%, детерминированно не убрать).
                 # Лечим ПОВТОРАМИ с жёстким анти-нарратив-промптом (старт с '[', запрет плана/«I need to»/«Let me»).
@@ -11417,6 +11795,11 @@ Now output the full translation, starting with '[':"""
                     extracted_retry = extract_from_brackets(response_retry)
                     retry_len = len(extracted_retry)
                     retry_ratio = retry_len / orig_len if orig_len > 0 else 1.0
+                    if _strict_codex and final_cta_short_output_ok(
+                            chunk_text, extracted_retry, chunk_idx, total_chunks, channel_name, host_name):
+                        best_extracted = extracted_retry
+                        log_msg(log_queue, f"   ✅ анти-нарратив retry {_ratt}/{_NARR_MAX}: принято короткое обращение вместо рекламного CTA донора")
+                        break
                     _cand_ok, _cand_why = short_retry_candidate_ok(ratio, retry_ratio)
                     if not _cand_ok:
                         log_msg(log_queue, f"   ⛔ retry {_ratt}/{_NARR_MAX}: {retry_len} chars отклонён — {_cand_why}")
@@ -11553,12 +11936,13 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
 
             # ПОСТОБРАБОТКА: Удаляем русские слова через 4o-mini
             # Находим предложения с кириллицей и заменяем их через дешевую модель
-            extracted = postprocess_remove_russian_words(
-                extracted,
-                lang_name,
-                get_postprocess_openai_key(),
-                log_queue
-            )
+            if not _is_codex:
+                extracted = postprocess_remove_russian_words(
+                    extracted,
+                    lang_name,
+                    get_postprocess_openai_key(),
+                    log_queue
+                )
 
             # Финальная санитарная очистка перед записью в .txt для TTS
             extracted = sanitize_final_text(extracted, lang_name)
@@ -11600,7 +11984,10 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
             # как completed — помечаем failed, чтобы партнёр НЕ получил огрызок 0.7% в COMPLETED.
             # Порог 0.30 — НЕ ронять компрессирующие языки (cs/de часто 50-60%), но ловить мусор.
             _final_ratio = len(extracted) / orig_len if orig_len > 0 else 1.0
-            if _final_ratio < 0.30:
+            _cta_final_ok = _strict_codex and final_cta_short_output_ok(
+                chunk_text, extracted, chunk_idx, total_chunks, channel_name, host_name,
+            )
+            if _final_ratio < 0.30 and not _cta_final_ok:
                 log_msg(
                     log_queue,
                     f"   ❌ {lang_display}: chunk {chunk_idx+1} вернул {_final_ratio:.1%} от оригинала "
@@ -11641,7 +12028,9 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
             base_name = output_basename or os.path.splitext(os.path.basename(source_file))[0][:50]
             lang_code = lang_name.lower().replace(" ", "_")[:15]  # для логов/постпроцесса
             # При preserve_paragraphs пропускаем pipeline: intro/outro/merge ломают 1:1 структуру
-            if preserve_paragraphs:
+            if _is_codex:
+                log_msg(log_queue, f"🧹 {lang_display}: OpenAI Pass A/B/C/D не используются — одна финальная редактура Codex")
+            elif preserve_paragraphs:
                 log_msg(log_queue, f"📐 {lang_display}: постпроцесс Pass A/B/C/D пропущен (режим сохранения абзацев)")
             elif _is_claude:
                 # Claude rewrite (2026-06-03): OpenAI Pass A/B/C/D отключён (gpt-5-mini
@@ -11700,9 +12089,14 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
                     base_name=base_name,
                     task_info=f"cleanup_{lang_code}",
                     allow=(errors == 0),
+                    strict=_strict_codex,
                 )
             except Exception as _cleanup_exc:
-                # Косметика не имеет права ронять готовый оплаченный рерайт.
+                if _strict_codex:
+                    remember_quality_review_error(job_id, lang_name, base_name, str(_cleanup_exc))
+                    log_msg(log_queue, f"❌ {lang_display}: {_cleanup_exc}; файл не выдаётся, готовые части сохранены")
+                    return (lang_display, False)
+                # Preserve the pre-existing non-Codex fallback contract.
                 log_msg(
                     log_queue,
                     f"🧹 {lang_display}: чистка упала ({type(_cleanup_exc).__name__}: {_cleanup_exc}) — "
@@ -11770,8 +12164,20 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
                         user_id=_uid, job_id=_progress_job_id,
                     )
 
-            with open(output_file, 'w', encoding='utf-8') as f:
-                f.write(final_text)
+            if _strict_codex:
+                pending_file = output_file + ".pending-" + str(time.time_ns())
+                with open(pending_file, 'w', encoding='utf-8') as f:
+                    f.write(final_text)
+                cleanup_write_receipt(pending_file, lang_name, channel_name, host_name)
+                if not cleanup_receipt_valid(pending_file, lang_name, channel_name, host_name):
+                    raise RewriteQualityError("QUALITY_REVIEW_FAILED: output receipt could not be verified")
+                # Only a complete verified payload becomes a downloadable .txt.
+                os.replace(pending_file + ".quality.json", output_file + ".quality.json")
+                os.replace(pending_file, output_file)
+                clear_quality_review_error(job_id, lang_name, base_name)
+            else:
+                with open(output_file, 'w', encoding='utf-8') as f:
+                    f.write(final_text)
 
             PROGRESS_MANAGER.set_task_output(
                 source_file, lang_name, output_file,
@@ -11788,6 +12194,8 @@ TASK: Return a complete adaptation that is NOT longer than {int(MAX_CHUNK_LENGTH
         return (lang_display, False)
         
     except Exception as e:
+        if isinstance(e, RewriteQualityError):
+            remember_quality_review_error(job_id, lang_name, output_basename or os.path.splitext(os.path.basename(source_file))[0][:50], str(e))
         log_msg(log_queue, f"❌ {lang_display}: {e}")
         return (lang_display, False)
 

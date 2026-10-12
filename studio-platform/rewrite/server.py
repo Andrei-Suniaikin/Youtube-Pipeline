@@ -1537,6 +1537,10 @@ def _execute_rewrite_job(job: Job):
                     log_queue.put(f"❌ Ошибка: {e}")
                     completed += 1
         _finalize_job_status(job, total, success_count)
+        from rewrite_core import pop_quality_review_error
+        _quality_reason = pop_quality_review_error(job.id)
+        if _quality_reason:
+            job.error = (job.error or "") + " | " + _quality_reason
         _model_reason = pop_model_unavailable(job.id)
         output_files = []
         # FIX-2026-09-13-short-output: итоговая сверка длины каждого файла против исходника.
