@@ -157,7 +157,10 @@ def main() -> int:
     check("повтор позже — только кого стоит и только в пределах допуска",
           "late_retry_indices(_gaps_now)" in late
           and "image_gaps_acceptable(_gaps_now, total)" in late, True)
-    check("и с паузой между раундами", "time.sleep(IMAGE_LATE_RETRY_SEC)" in late, True)
+    check("и с паузой между раундами", "_wake = time.time() + IMAGE_LATE_RETRY_SEC" in late, True)
+    # 13.10.2026: молчаливая пауза = GEN_LEASE сервера → «завис», перезапуск с раунда 1 по кругу.
+    check("в паузе воркер подаёт голос чаще, чем сервер считает его зависшим",
+          "print_user(f\"⏳ Жду повтора" in late and G.IMAGE_LATE_WAIT_PULSE_SEC < 900, True)
 
     print("\nДвижок переносит подмену в журнал выпуска — один раз")
     import sqlite3

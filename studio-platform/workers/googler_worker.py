@@ -7400,6 +7400,8 @@ IMAGE_GAP_MAX_SHARE = float(os.environ.get("VS_IMAGE_GAP_MAX_SHARE", "0.02") or 
 IMAGE_FILTER_GAP_MAX_SHARE = float(os.environ.get("VS_IMAGE_FILTER_GAP_MAX_SHARE", "0.10") or 0.10)
 IMAGE_LATE_RETRY_SEC = int(os.environ.get("VS_IMAGE_LATE_RETRY_SEC", "900") or 900)
 IMAGE_LATE_RETRY_ROUNDS = int(os.environ.get("VS_IMAGE_LATE_RETRY_ROUNDS", "3") or 3)
+# Во время ожидания воркер раз в 5 минут пишет строку — это его пульс для сервера.
+IMAGE_LATE_WAIT_PULSE_SEC = 300
 GAP_FILTER = "фильтр"       # провайдер отказал фильтром безопасности и после смягчений
 GAP_LATER = "позже"         # «Generation failed, please try again later»
 GAP_OTHER = "сбой"          # всё прочее: попытки исчерпаны, заказ не дал результата
@@ -14374,7 +14376,14 @@ def cmd_full_pipeline(args):
                        f"{len(_later)} кадр(ов) — сцены "
                        f"{', '.join(str(i + 1) for i in _later[:12])}; жду "
                        f"{IMAGE_LATE_RETRY_SEC // 60} мин", "WARNING")
-            time.sleep(IMAGE_LATE_RETRY_SEC)
+            # Молча ждать нельзя: сервер считает gen-воркер без вывода дольше GEN_LEASE
+            # (те же 15 мин) зависшим, убивает и запускает заново — с раунда 1, по кругу
+            # (13.10.2026: Tichá Obloha и Zaklęta Knieja так держали очередь картинок 3 часа).
+            _wake = time.time() + IMAGE_LATE_RETRY_SEC
+            while time.time() < _wake:
+                time.sleep(min(IMAGE_LATE_WAIT_PULSE_SEC, max(0.0, _wake - time.time())))
+                if time.time() < _wake:
+                    print_user(f"⏳ Жду повтора: ещё {int(_wake - time.time()) // 60 + 1} мин", "INFO")
             for _i in _later:
                 _kw = dict(scene_data=scenes[_i], style=style,
                            output_path=os.path.join(output_dir, f"{_i+1:03d}.jpg"),
