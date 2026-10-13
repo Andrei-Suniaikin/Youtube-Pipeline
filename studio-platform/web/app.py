@@ -7642,8 +7642,19 @@ async def api_earn_result(request: Request, req_id: int, file: UploadFile = File
                 f"прочитано {st.get('ok', 0)}"
                 + "".join(f", {pub_earn.STATE_TITLE.get(k, k)}: {v}"
                           for k, v in sorted(st.items()) if k != "ok"))
-        pub_earn.finish_request(c, req_id, claim, bool(readings), note if readings
-                                else "сборщик не прислал ни одного результата")
+        rep = planned["report"]
+        if readings and not rep["channels"]:
+            # 13.10.2026, профиль 32: сборщик прочитал три канала аккаунта, и ни одного из
+            # тех, что студия считает каналами этого профиля. Это не «готово», а расхождение
+            # привязки или обхода — его надо видеть в карточке.
+            ok, note = False, (f"сборщик прочитал {len(readings)} канал(а) профиля, но ни "
+                               f"одного из студии: {', '.join(rep['unknown_uc'][:5])}")
+        else:
+            ok = bool(readings)
+            note = note if readings else "сборщик не прислал ни одного результата"
+            if readings and rep["unknown_uc"]:
+                note += f"; не из студии: {len(rep['unknown_uc'])}"
+        pub_earn.finish_request(c, req_id, claim, ok, note)
         c.commit()
         return {"written": written, "report": planned["report"], "notes": notes[:50]}
     finally:

@@ -284,6 +284,19 @@ as_("s-user")
 check("сбой виден в карточке", client.get(f"/ui/channels/{CID['a']}").json()["earn_request"]["last"]
       ["note"], "AdsPower молчит")
 
+print("Сборщик прочитал профиль, но не наши каналы")
+as_("s-user")
+client.post(f"/ui/channels/{CID['a']}/earn/collect")
+client.cookies.clear()
+j = client.post("/api/earn/claim", json={}, headers=AG).json()["job"]
+stray = result("UC" + "z" * 22, at="2026-10-18T03:00:00+00:00")
+client.post(f"/api/earn/{j['id']}/result", headers={**AG, "X-Earn-Claim": j["token"]},
+            files={"file": ("earn.zip", zipped([stray]), "application/zip")})
+as_("s-user")
+last = client.get(f"/ui/channels/{CID['a']}").json()["earn_request"]["last"]
+check("это не «готово», а расхождение словами",
+      (last["status"], "ни одного из студии" in last["note"]), ("failed", True))
+
 print()
 if FAILS:
     print(f"провалов: {len(FAILS)}")
