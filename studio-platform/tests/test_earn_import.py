@@ -225,6 +225,65 @@ check("чужой профиль отмечен", sorted(ch["channel"] for ch in
                                     if ch["other_profile"]), ["Альфа", "Гамма"])
 check("канал другого тенанта — 404", client.get("/ui/channels/99999/email").status_code, 404)
 
+print("Сбор по кнопке")
+W._earn_agent_token = lambda: "tok-node-1"
+AG = {"X-Upload-Token": "tok-node-1"}
+as_("s-user")
+r = client.post(f"/ui/channels/{CID['a']}/earn/collect")
+check("оператор ставит сбор по своему каналу", (r.status_code, r.json()["queued"]), (200, ["21"]))
+check("карточка видит задание", r.json()["state"]["last"]["status"], "queued")
+check("повтор не задваивает", client.post(f"/ui/channels/{CID['c']}/earn/collect").json()["already"],
+      ["21"])
+check("канал без профиля — отказ словами",
+      client.post(f"/ui/channels/{CID['b']}/earn/collect").status_code, 400)
+check("по всем — только админу", client.post("/ui/analytics/earn/collect").status_code, 403)
+client.cookies.clear()
+check("пуллер без токена — 401", client.post("/api/earn/claim", json={}).status_code, 401)
+check("с чужим токеном — 401", client.post("/api/earn/claim", json={},
+      headers={"X-Upload-Token": "alien"}).status_code, 401)
+job = client.post("/api/earn/claim", json={"host": "minsk"}, headers=AG).json()["job"]
+check("пуллер получил профиль 21", job["profile"], "21")
+check("второго задания нет", client.post("/api/earn/claim", json={}, headers=AG).json()["job"], None)
+H = {**AG, "X-Earn-Claim": job["token"]}
+check("пульс", client.post(f"/api/earn/{job['id']}/beat", json={"note": "профиль 21"},
+      headers=H).status_code, 200)
+check("пульс с чужой меткой — 409", client.post(f"/api/earn/{job['id']}/beat", json={},
+      headers={**AG, "X-Earn-Claim": "x"}).status_code, 409)
+fresh = result(UC["a"], hours=2500, at="2026-10-17T03:00:00+00:00")
+fresh["context"] = {"profile": "21", "email": "m21@example.com"}
+r = client.post(f"/api/earn/{job['id']}/result", headers=H,
+                files={"file": ("earn.zip", zipped([fresh]), "application/zip")})
+check("результат принят и записан", (r.status_code, r.json().get("written")), (200, 1))
+as_("s-user")
+d = client.get(f"/ui/channels/{CID['a']}").json()
+check("карточка: новые часы", d["earn"]["good"]["hours_365"], 2500)
+check("карточка: сбор готов", d["earn_request"]["last"]["status"], "done")
+check("карточка: профиль совпал — без пометки",
+      client.get(f"/ui/channels/{CID['a']}/email").json()["other_profile"], False)
+client.cookies.clear()
+check("повторная отправка результата — 409", client.post(f"/api/earn/{job['id']}/result", headers=H,
+      files={"file": ("earn.zip", zipped([fresh]), "application/zip")}).status_code, 409)
+as_("s-admin")
+allq = client.post("/ui/analytics/earn/collect").json()
+check("по всем: профиль 21 снова, каналы без профиля названы",
+      (allq["queued"], allq["no_profile"]), (["21"], ["Бета", "Дельта"]))
+client.cookies.clear()
+job2 = client.post("/api/earn/claim", json={}, headers=AG).json()["job"]
+_c = sqlite3.connect(DB)
+_c.execute("UPDATE pub_earn_requests SET heartbeat=heartbeat-3600, claimed=claimed-3600 WHERE id=?",
+           (job2["id"],))
+_c.commit(); _c.close()
+job3 = client.post("/api/earn/claim", json={}, headers=AG).json()["job"]
+check("замолчавший пуллер — задание выдаётся заново", (job3["id"], job3["token"] != job2["token"]),
+      (job2["id"], True))
+check("старый пуллер своё уже не закроет", client.post(f"/api/earn/{job2['id']}/fail",
+      json={"note": "x"}, headers={**AG, "X-Earn-Claim": job2["token"]}).status_code, 409)
+check("сбой — словами", client.post(f"/api/earn/{job3['id']}/fail", json={"note": "AdsPower молчит"},
+      headers={**AG, "X-Earn-Claim": job3["token"]}).status_code, 200)
+as_("s-user")
+check("сбой виден в карточке", client.get(f"/ui/channels/{CID['a']}").json()["earn_request"]["last"]
+      ["note"], "AdsPower молчит")
+
 print()
 if FAILS:
     print(f"провалов: {len(FAILS)}")

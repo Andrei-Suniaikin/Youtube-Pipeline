@@ -321,3 +321,138 @@ def email_groups(c: sqlite3.Connection, tenant) -> dict:
     missing = sorted((names[cid][0] for cid in names if cid not in last))
     return {"groups": out, "without": missing,
             "channels": len(last), "emails": len(out)}
+
+
+# ─────────────────────── сбор по кнопке (13.10.2026) ───────────────────────
+#
+# Человек в студии жмёт «Обновить часы» — студия ставит задание на профиль AdsPower,
+# к которому привязан канал. Минский пуллер сбора (`earn_puller.py`) забирает задание,
+# запускает сборщик Володи на этот профиль и присылает `reader_result.json` — их
+# принимает тот же `parse_upload`/`plan`/`apply`, что и ручная загрузка. Сборщик только
+# читает Studio и берёт ту же бронь профиля, что заливка, поэтому повтор безопасен:
+# зависшее задание просто возвращается в очередь.
+
+REQ_STALE_SEC = 20 * 60          # пуллер молчит дольше — задание снова в очереди
+REQ_EXPIRE_SEC = 12 * 3600       # никто не взял за полсуток — снимаем со словами
+REQ_TITLE = {"queued": "поставлен в очередь", "running": "идёт сбор",
+             "done": "готово", "failed": "не вышло"}
+
+
+def ensure_request_schema(c: sqlite3.Connection) -> None:
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS pub_earn_requests("
+        "id INTEGER PRIMARY KEY AUTOINCREMENT, tenant_id TEXT NOT NULL, "
+        "profile TEXT NOT NULL, "            # серийник профиля AdsPower
+        "status TEXT NOT NULL, "             # queued | running | done | failed
+        "created REAL NOT NULL, created_by TEXT, "
+        "claim_token TEXT, host TEXT, claimed REAL, heartbeat REAL, finished REAL, "
+        "attempts INTEGER NOT NULL DEFAULT 0, note TEXT)")
+
+
+def request_collect(c: sqlite3.Connection, tenant, channel_ids=None, by: str = "",
+                    now: float | None = None) -> dict:
+    """Поставить сбор по профилям этих каналов (None — по всем каналам с профилем)."""
+    now = time.time() if now is None else now
+    ensure_request_schema(c)
+    sql = ("SELECT ch.id, ch.name, p.serial FROM pub_channels ch LEFT JOIN pub_profiles p "
+           "ON p.id=ch.profile_id WHERE ch.tenant_id=? AND COALESCE(ch.uc,'')<>''")
+    rows = c.execute(sql, (tenant,)).fetchall()
+    if channel_ids is not None:
+        want = {int(x) for x in channel_ids}
+        rows = [r for r in rows if r[0] in want]
+    no_profile = sorted(r[1] for r in rows if not r[2])
+    serials = sorted({str(r[2]) for r in rows if r[2]}, key=lambda s: (len(s), s))
+    active = {r[0] for r in c.execute(
+        "SELECT profile FROM pub_earn_requests WHERE tenant_id=? AND status IN "
+        "('queued','running')", (tenant,))}
+    queued = []
+    for s in serials:
+        if s in active:
+            continue
+        c.execute("INSERT INTO pub_earn_requests(tenant_id,profile,status,created,created_by) "
+                  "VALUES(?,?,'queued',?,?)", (tenant, s, now, by[:60]))
+        queued.append(s)
+    return {"queued": queued, "already": sorted(set(serials) & active,
+                                                  key=lambda s: (len(s), s)),
+            "no_profile": no_profile}
+
+
+def _sweep_requests(c: sqlite3.Connection, now: float) -> None:
+    c.execute("UPDATE pub_earn_requests SET status='queued', claim_token=NULL, "
+              "note='пуллер замолчал — задание снова в очереди' "
+              "WHERE status='running' AND COALESCE(heartbeat, claimed, 0) < ?",
+              (now - REQ_STALE_SEC,))
+    c.execute("UPDATE pub_earn_requests SET status='failed', finished=?, "
+              "note='за 12 часов сбор никто не взял — пуллер Минска не работает?' "
+              "WHERE status='queued' AND created < ?", (now, now - REQ_EXPIRE_SEC))
+
+
+def claim_request(c: sqlite3.Connection, host: str, now: float | None = None) -> dict | None:
+    """Пуллеру — следующее задание. Один и тот же профиль второй раз не выдаётся."""
+    import secrets
+    now = time.time() if now is None else now
+    ensure_request_schema(c)
+    _sweep_requests(c, now)
+    row = c.execute("SELECT id, tenant_id, profile FROM pub_earn_requests WHERE status='queued' "
+                    "AND profile NOT IN (SELECT profile FROM pub_earn_requests "
+                    "WHERE status='running') ORDER BY created, id LIMIT 1").fetchone()
+    if row is None:
+        return None
+    token = "earn_" + secrets.token_urlsafe(18)
+    cur = c.execute("UPDATE pub_earn_requests SET status='running', claim_token=?, host=?, "
+                    "claimed=?, heartbeat=?, attempts=attempts+1, note='' "
+                    "WHERE id=? AND status='queued'", (token, host[:40], now, now, row[0]))
+    if cur.rowcount != 1:
+        return None
+    return {"id": row[0], "profile": row[2], "token": token}
+
+
+def _own_request(c: sqlite3.Connection, req_id: int, token: str):
+    row = c.execute("SELECT id, tenant_id, status, claim_token FROM pub_earn_requests "
+                    "WHERE id=?", (req_id,)).fetchone()
+    if row is None or row[2] != "running" or not token or row[3] != token:
+        return None
+    return row
+
+
+def beat_request(c: sqlite3.Connection, req_id: int, token: str, note: str = "",
+                 now: float | None = None) -> bool:
+    now = time.time() if now is None else now
+    ensure_request_schema(c)
+    if _own_request(c, req_id, token) is None:
+        return False
+    c.execute("UPDATE pub_earn_requests SET heartbeat=?, note=? WHERE id=?",
+              (now, note[:300], req_id))
+    return True
+
+
+def finish_request(c: sqlite3.Connection, req_id: int, token: str, ok: bool, note: str = "",
+                   now: float | None = None):
+    """Закрыть задание. Возвращает tenant_id или None, если задание не этого пуллера."""
+    now = time.time() if now is None else now
+    ensure_request_schema(c)
+    row = _own_request(c, req_id, token)
+    if row is None:
+        return None
+    c.execute("UPDATE pub_earn_requests SET status=?, finished=?, heartbeat=?, note=?, "
+              "claim_token=NULL WHERE id=?",
+              ("done" if ok else "failed", now, now, note[:500], req_id))
+    return row[1]
+
+
+def channel_request(c: sqlite3.Connection, tenant, channel_id: int) -> dict:
+    """Последнее задание сбора по профилю канала — для карточки."""
+    ensure_request_schema(c)
+    serial = _assigned(c, channel_id)
+    if not serial:
+        return {"profile": "", "can": False,
+                "why": "канал не привязан к профилю AdsPower — собирать не из чего"}
+    row = c.execute("SELECT id, status, created, claimed, finished, note FROM pub_earn_requests "
+                    "WHERE tenant_id=? AND profile=? ORDER BY id DESC LIMIT 1",
+                    (tenant, serial)).fetchone()
+    out = {"profile": serial, "can": True, "why": ""}
+    if row is not None:
+        out["last"] = {"id": row[0], "status": row[1], "title": REQ_TITLE.get(row[1], row[1]),
+                       "created": row[2], "claimed": row[3], "finished": row[4],
+                       "note": row[5] or ""}
+    return out

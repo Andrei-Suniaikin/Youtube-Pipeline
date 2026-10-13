@@ -51,6 +51,8 @@ SCENARIO = r"""
     const good = {read_at: 1791900000, state: 'ok', state_title: 'прочитано', hours_365: 1500,
                   shorts_90: 5000, subs: 321, life_views: null, life_hours: null,
                   as_of: 'Oct 12, 2026', reason: ''};
+    let req = {profile: '21', can: true, why: ''};
+    let posted = '';
     let earn = {last: good, good: good,
                 prev: Object.assign({}, good, {read_at: 1791800000, hours_365: 1234}),
                 goal_hours: 4000, goal_subs: 1000};
@@ -64,7 +66,7 @@ SCENARIO = r"""
       calendar: [], counts: {}, uploads: [], by_day: {}, tz: 'Europe/Warsaw',
       channel_preset: {}, waiting_without_slot: 0, waiting_items: [],
       history_days: 14, stats: {key: false, day: '', delta: {}, series: []},
-      analytics: {access: {}}, earn: earn});
+      analytics: {access: {}}, earn: earn, earn_request: req});
     window.api = async p => {
       if (p === '/ui/me') return ME;
       if (p === '/ui/channels') return {channels: [{id: 1, name: 'Канал', handle: '@ch',
@@ -77,6 +79,9 @@ SCENARIO = r"""
         groups: [{email: 'm07@example.com', channels: [
           {channel_id: 1, channel: 'Канал', profile: '13', assigned_profile: '21', other_profile: true},
           {channel_id: 2, channel: 'Второй', profile: '21', assigned_profile: '21', other_profile: false}]}]};
+      if (p === '/ui/channels/1/earn/collect'){ posted = p; return {queued: ['21'], already: [],
+        no_profile: [], state: {profile: '21', can: true, last: {id: 1, status: 'queued',
+        title: 'поставлен в очередь', created: 1791900000, note: ''}}}; }
       if (p.startsWith('/ui/channels/1')) return channel();
       return {};
     };
@@ -90,8 +95,19 @@ SCENARIO = r"""
 
     await open();
     out.хорошо = (card() || {}).textContent || '';
-    out.почта = (document.getElementById('earn-email') || {}).textContent || '';
     out.сбояНет = !(card() || document.body).querySelector('.note.bad');
+    out.почта = (document.getElementById('earn-email') || {}).textContent || '';
+    const go = document.getElementById('earn-go');
+    out.кнопкаСбора = !!go;
+    if (go){ go.click(); await sleep(300); }
+    out.послеСбора = (document.getElementById('earn-collect') || {}).textContent || '';
+    out.ушлоНа = posted;
+    out.кнопкаЗаперта = (document.getElementById('earn-go') || {}).disabled;
+    req = {profile: '', can: false, why: 'канал не привязан к профилю AdsPower — собирать не из чего'};
+    await open();
+    out.безПрофиля = (document.getElementById('earn-collect') || {}).textContent || '';
+    out.кнопкиНет = !document.getElementById('earn-go');
+    req = {profile: '21', can: true, why: ''};
 
     earn = Object.assign({}, earn, {last: {read_at: 1792000000, state: 'unverified',
       state_title: 'не подтверждено, что читали этот канал — число не принято',
@@ -163,6 +179,13 @@ def main() -> int:
     has("подсказка, что грузить", res.get("загрузка"), "reader_result.json")
     check("без файла «Проверить» заперта", res.get("проверкаЗаперта"), True)
     check("«Записать» — только после проверки", res.get("записьЗаперта"), True)
+    print("Сбор по кнопке")
+    check("кнопка «Обновить часы»", res.get("кнопкаСбора"), True)
+    check("запрос ушёл на канал", res.get("ушлоНа"), "/ui/channels/1/earn/collect")
+    has("статус после нажатия", res.get("послеСбора"), "Сбор по профилю №21: поставлен в очередь")
+    check("пока в очереди — кнопка заперта", res.get("кнопкаЗаперта"), True)
+    has("без профиля — сказано почему", res.get("безПрофиля"), "не привязан к профилю AdsPower")
+    check("и кнопки нет", res.get("кнопкиНет"), True)
     print("Почты")
     t = res.get("почта")
     has("почта в карточке часов", t, "m07@example.com")

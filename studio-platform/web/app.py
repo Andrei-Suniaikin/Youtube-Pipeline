@@ -2901,6 +2901,8 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             "analytics": pub_analytics.channel_state(c, channel_id),
             # Часы для монетизации — то, что сборщик Минска прочитал на странице Earn.
             "earn": pub_earn.channel_state(c, channel_id),
+            # Сбор по кнопке: к какому профилю привязан канал и что с последним заданием.
+            "earn_request": pub_earn.channel_request(c, TENANT, channel_id),
         }
     finally:
         c.close()
@@ -7521,6 +7523,131 @@ async def ui_analytics_earn_import(request: Request, apply: int = Query(0),
         c.close()
     return {"report": planned["report"], "notes": notes[:50], "applied": bool(apply),
             "written": written}
+
+
+@app.post("/ui/channels/{channel_id:int}/earn/collect")
+def ui_channel_earn_collect(request: Request, channel_id: int):
+    """Поставить сбор часов по профилю канала. Сборщик Минска только читает Studio и
+    ждёт, пока профиль свободен от заливки, — ставить может любой, кто вошёл."""
+    user = getattr(request.state, "user", None)
+    c = db()
+    try:
+        if not c.execute("SELECT 1 FROM pub_channels WHERE id=? AND tenant_id=?",
+                         (channel_id, TENANT)).fetchone():
+            raise HTTPException(404, "канал не найден")
+        out = pub_earn.request_collect(c, TENANT, [channel_id],
+                                       by=(user["name"] if user is not None else ""))
+        c.commit()
+        if out["no_profile"]:
+            raise HTTPException(400, "канал не привязан к профилю AdsPower — собирать не из чего")
+        return {**out, "state": pub_earn.channel_request(c, TENANT, channel_id)}
+    finally:
+        c.close()
+
+
+@app.post("/ui/analytics/earn/collect")
+def ui_analytics_earn_collect(request: Request):
+    """Сбор по всем каналам с профилем — это обход всех профилей, поэтому только админу."""
+    who = _require_admin(request)
+    c = db()
+    try:
+        out = pub_earn.request_collect(c, TENANT, None, by=who["name"])
+        c.commit()
+        return out
+    finally:
+        c.close()
+
+
+# ── пуллер сбора на Минске: свой исходящий опрос, токен тот же, что у ноды заливки ──
+
+def _earn_agent_token() -> str:
+    return _cabinet()._upload_token()
+
+
+def _earn_agent(request: Request) -> None:
+    import secrets as _s                                          # noqa: PLC0415
+    want, got = _earn_agent_token() or "", request.headers.get("X-Upload-Token", "")
+    if not want or not got or not _s.compare_digest(want.encode(), got.encode()):
+        raise HTTPException(401, "нужен токен ноды заливки")
+
+
+@app.post("/api/earn/claim")
+async def api_earn_claim(request: Request):
+    _earn_agent(request)
+    body = await request.json() if (await request.body()) else {}
+    c = db()
+    try:
+        job = pub_earn.claim_request(c, str((body or {}).get("host") or "minsk"))
+        c.commit()
+        return {"job": job}
+    finally:
+        c.close()
+
+
+@app.post("/api/earn/{req_id:int}/beat")
+async def api_earn_beat(request: Request, req_id: int):
+    _earn_agent(request)
+    body = await request.json()
+    c = db()
+    try:
+        if not pub_earn.beat_request(c, req_id, request.headers.get("X-Earn-Claim", ""),
+                                     str(body.get("note") or "")):
+            raise HTTPException(409, "задание не ваше или уже закрыто")
+        c.commit()
+        return {"ok": True}
+    finally:
+        c.close()
+
+
+@app.post("/api/earn/{req_id:int}/fail")
+async def api_earn_fail(request: Request, req_id: int):
+    _earn_agent(request)
+    body = await request.json()
+    c = db()
+    try:
+        if pub_earn.finish_request(c, req_id, request.headers.get("X-Earn-Claim", ""), False,
+                                   str(body.get("note") or "сбор не вышел")) is None:
+            raise HTTPException(409, "задание не ваше или уже закрыто")
+        c.commit()
+        return {"ok": True}
+    finally:
+        c.close()
+
+
+@app.post("/api/earn/{req_id:int}/result")
+async def api_earn_result(request: Request, req_id: int, file: UploadFile = File(...)):
+    """Результаты сборщика по заданию → тот же разбор, что у ручной загрузки."""
+    _earn_agent(request)
+    claim = request.headers.get("X-Earn-Claim", "")
+    data = await file.read()
+    if len(data) > 200 * 1024 * 1024:
+        raise HTTPException(413, "архив больше 200 МБ — шлите только reader_result.json")
+    c = db()
+    try:
+        row = c.execute("SELECT tenant_id, status, claim_token FROM pub_earn_requests "
+                        "WHERE id=?", (req_id,)).fetchone() if c.execute(
+            "SELECT 1 FROM sqlite_master WHERE name='pub_earn_requests'").fetchone() else None
+        if row is None or row[1] != "running" or row[2] != claim or not claim:
+            raise HTTPException(409, "задание не ваше или уже закрыто")
+        try:
+            readings, notes = pub_earn.parse_upload(file.filename or "earn.zip", data)
+        except ValueError as exc:
+            pub_earn.finish_request(c, req_id, claim, False, f"результат не разобран: {exc}")
+            c.commit()
+            raise HTTPException(400, str(exc))
+        planned = pub_earn.plan(c, row[0], readings)
+        written = pub_earn.apply(c, planned)
+        st = planned["report"]["states"]
+        note = (f"чтений {len(readings)}, каналов {planned['report']['channels']}, "
+                f"прочитано {st.get('ok', 0)}"
+                + "".join(f", {pub_earn.STATE_TITLE.get(k, k)}: {v}"
+                          for k, v in sorted(st.items()) if k != "ok"))
+        pub_earn.finish_request(c, req_id, claim, bool(readings), note if readings
+                                else "сборщик не прислал ни одного результата")
+        c.commit()
+        return {"written": written, "report": planned["report"], "notes": notes[:50]}
+    finally:
+        c.close()
 
 
 @app.get("/ui/analytics/earn/emails")

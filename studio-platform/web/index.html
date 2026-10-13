@@ -3994,6 +3994,7 @@ function earnImportCard(bar){
         <input type="file" id="earn-file" accept=".zip,.json">
         <button class="ghost small" id="earn-check" disabled>Проверить</button>
         <button class="small" id="earn-apply" disabled>Записать</button>
+        ${ME && ME.role === 'admin' ? '<button class="ghost small" id="earn-all">Собрать по всем каналам</button>' : ''}
       </div>
       <div id="earn-out" style="margin-top:10px"></div>
     </div></div>`);
@@ -4014,6 +4015,19 @@ function earnImportCard(bar){
   };
   chk.onclick = () => run(false);
   ap.onclick = () => run(true);
+  const all = card.querySelector('#earn-all');
+  if (all) all.onclick = async () => {
+    all.disabled = true;
+    try{
+      const r = await api('/ui/analytics/earn/collect', {method: 'POST'});
+      out.innerHTML = `<div class="note">Поставлено профилей: <b>${r.queued.length}</b>${
+        r.already.length ? `, уже в работе: ${r.already.length}` : ''}. Минск пройдёт их по
+        одному, пропуская те, что заняты заливкой; цифры появятся в карточках каналов.${
+        r.no_profile.length ? `<br><span style="color:var(--bad)">Без профиля (${
+          r.no_profile.length}): ${r.no_profile.map(esc).join(', ')}</span>` : ''}</div>`;
+    }catch(e){ toast(e.message); }
+    finally{ all.disabled = false; }
+  };
 }
 
 // Под какой почтой Google открывается канал (13.10.2026). Почту пишет сборщик Минска из
@@ -4031,6 +4045,42 @@ async function earnEmailLine(id, card){
     Открывается под почтой <b>${esc(e.email)}</b>${e.profile ? `, профиль №${esc(e.profile)}` : ''}
     (сбор ${esc(when(e.read_at))})${warn}${(e.earlier || []).length
       ? `<br>Раньше была: ${e.earlier.map(esc).join(', ')}` : ''}</div>`);
+}
+
+// Сбор по кнопке (13.10.2026): студия ставит задание, минский пуллер прогоняет сборщик
+// по профилю канала и присылает результат. Пока профиль заливает — сбор ждёт.
+function earnCollectLine(id, r, card){
+  const body = card.querySelector('#earn-body');
+  if (!body || !r || r.can === undefined) return;
+  const box = document.createElement('div');
+  box.id = 'earn-collect';
+  box.style.cssText = 'margin-top:10px;display:flex;gap:10px;align-items:center;flex-wrap:wrap';
+  const paint = st => {
+    const l = st.last;
+    const busy = l && (l.status === 'queued' || l.status === 'running');
+    const bad = l && l.status === 'failed';
+    box.innerHTML = (st.can
+      ? `<button class="ghost small" id="earn-go"${busy ? ' disabled' : ''}>Обновить часы</button>`
+      : '') + `<span class="note ${bad || !st.can ? 'bad' : 'muted'}" style="margin:0">${
+      !st.can ? esc(st.why)
+      : l ? `Сбор по профилю №${esc(st.profile)}: ${esc(l.title)}${
+          l.status === 'queued' ? ` (${esc(when(l.created))})` : ''}${
+          l.finished ? ` — ${esc(when(l.finished))}` : ''}${l.note ? ` · ${esc(l.note)}` : ''}${
+          busy ? '. Если профиль сейчас заливает, сбор подождёт.' : ''}`
+      : `Профиль №${esc(st.profile)}. Сбор читает все каналы профиля, несколько минут.`}</span>`;
+    const go = box.querySelector('#earn-go');
+    if (go) go.onclick = async () => {
+      go.disabled = true;
+      try{
+        const out = await api('/ui/channels/' + encodeURIComponent(id) + '/earn/collect',
+                              {method: 'POST'});
+        paint(out.state || st);
+        toast(out.queued && out.queued.length ? 'Сбор поставлен' : 'Сбор по профилю уже идёт', 'ok');
+      }catch(e){ toast(e.message); go.disabled = false; }
+    };
+  };
+  paint(r);
+  body.append(box);
 }
 
 async function emailsCard(bar){
@@ -4175,6 +4225,7 @@ function channelStatsTab(id, d){
   const ec = earnCard(d.earn || {});
   app.append(ec);
   earnEmailLine(id, ec);
+  earnCollectLine(id, d.earn_request || {}, ec);
   const a = d.analytics || {};
   const acc = a.access || {};
   const card = $(`<div class="card" style="margin-bottom:16px">
