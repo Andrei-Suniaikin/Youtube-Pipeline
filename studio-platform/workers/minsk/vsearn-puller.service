@@ -1,0 +1,18 @@
+[Unit]
+Description=Сбор часов монетизации по заданиям студии (Минск, сборщик AdsPower)
+After=network-online.target
+
+[Service]
+EnvironmentFile=/home/vova/.vsupload_env
+EnvironmentFile=/home/vova/.vsupload_env_studio
+Environment=ADSPOWER_RATE_LIMIT_DIR=/home/vova/.local/state/video-studio/adspower-rate
+WorkingDirectory=/home/vova/adspower_audit_20261004
+ExecStart=/home/vova/VideoStudio/.venv-upload/bin/python -u /home/vova/earn_puller.py
+Restart=always
+RestartSec=30
+# SIGTERM сборщику — он сам закрывает свой профиль и отпускает бронь.
+KillMode=mixed
+TimeoutStopSec=240
+
+[Install]
+WantedBy=default.target
