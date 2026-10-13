@@ -261,7 +261,7 @@ def overview(c: sqlite3.Connection, tenant) -> dict:
 #
 # Под какой почтой Google открывается канал. Отдельно почту никто не хранит: ни AdsPower,
 # ни профиль браузера. Её пишет сам сборщик — «Signed in as …» живой сессии, — и только
-# подтверждённое чтение (см. `reading`) несёт её сюда. Видна только администратору.
+# подтверждённое чтение (см. `reading`) несёт её сюда. Видят все, кто вошёл в студию.
 
 def _email_rows(c: sqlite3.Connection, tenant, channel_id=None):
     ensure_earn_schema(c)

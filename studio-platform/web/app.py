@@ -7525,9 +7525,8 @@ async def ui_analytics_earn_import(request: Request, apply: int = Query(0),
 
 @app.get("/ui/analytics/earn/emails")
 def ui_analytics_earn_emails(request: Request):
-    """Почта Google → каналы, по подтверждённым сборам Минска. Только администратору:
-    почта — это половина входа в аккаунт."""
-    _require_admin(request)
+    """Почта Google → каналы, по подтверждённым сборам Минска. Видят все, кто вошёл
+    в студию (владелец 13.10.2026: «оператору тоже можно показывать»)."""
     c = db()
     try:
         return pub_earn.email_groups(c, TENANT)
@@ -7537,7 +7536,6 @@ def ui_analytics_earn_emails(request: Request):
 
 @app.get("/ui/channels/{channel_id:int}/email")
 def ui_channel_email(request: Request, channel_id: int):
-    _require_admin(request)
     c = db()
     try:
         if not c.execute("SELECT 1 FROM pub_channels WHERE id=? AND tenant_id=?",

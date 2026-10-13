@@ -209,9 +209,10 @@ other = result(UC["c"], at="2026-10-16T03:00:00+00:00")
 other["context"] = {"profile": "13", "email": "m07@example.com"}
 upload(zipped([other]), apply=1)
 as_("s-user")
-check("оператору почты не отдаются", (client.get(f"/ui/channels/{CID['a']}/email").status_code,
-      client.get("/ui/analytics/earn/emails").status_code), (403, 403))
-check("и в карточке канала почты нет", "m07@example.com" in client.get(f"/ui/channels/{CID['a']}").text, False)
+check("оператору почты тоже видны", (client.get(f"/ui/channels/{CID['a']}/email").status_code,
+      client.get("/ui/analytics/earn/emails").status_code), (200, 200))
+client.cookies.clear()
+check("без входа — нет", client.get("/ui/analytics/earn/emails").status_code, 401)
 as_("s-admin")
 e = client.get(f"/ui/channels/{CID['a']}/email").json()
 check("почта канала — из подтверждённого чтения", (e["email"], e["profile"], e["other_profile"]),

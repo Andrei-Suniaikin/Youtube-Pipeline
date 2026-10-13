@@ -2851,7 +2851,7 @@ async function viewChannels(){
     <div class="head-acts">
       <button class="ghost small" id="stlinks">Подключить статистику</button>
       <button class="ghost small" id="earnimp">Часы монетизации</button>
-      ${ME && ME.role === 'admin' ? '<button class="ghost small" id="emails">Почты</button>' : ''}
+      <button class="ghost small" id="emails">Почты</button>
       <button class="ghost small" id="spread">Разложить ссылки</button>
       <button class="ghost small" id="impch">Перенести списком</button>
       <button class="ghost small" id="pickmode">Выбрать</button>
@@ -4017,7 +4017,7 @@ function earnImportCard(bar){
 }
 
 // Под какой почтой Google открывается канал (13.10.2026). Почту пишет сборщик Минска из
-// живой сессии; приходит она только с подтверждённым чтением. Видит только администратор.
+// живой сессии; приходит она только с подтверждённым чтением.
 async function earnEmailLine(id, card){
   let e;
   try{ e = await api('/ui/channels/' + encodeURIComponent(id) + '/email'); }catch(_){ return; }
@@ -4174,7 +4174,7 @@ function channelStatsTab(id, d){
   app.append(channelStatsCard(id, d.stats || {}));
   const ec = earnCard(d.earn || {});
   app.append(ec);
-  if (ME && ME.role === 'admin') earnEmailLine(id, ec);
+  earnEmailLine(id, ec);
   const a = d.analytics || {};
   const acc = a.access || {};
   const card = $(`<div class="card" style="margin-bottom:16px">
