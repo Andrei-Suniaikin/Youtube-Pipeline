@@ -5,6 +5,7 @@ After=network-online.target
 [Service]
 EnvironmentFile=/home/vova/.vsupload_env
 EnvironmentFile=/home/vova/.vsupload_env_studio
+Environment=VSGEN_SERVER=https://studio.13.140.129.66.sslip.io
 Environment=ADSPOWER_RATE_LIMIT_DIR=/home/vova/.local/state/video-studio/adspower-rate
 WorkingDirectory=/home/vova/adspower_audit_20261004
 ExecStart=/home/vova/VideoStudio/.venv-upload/bin/python -u /home/vova/earn_puller.py
