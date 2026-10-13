@@ -197,6 +197,33 @@ c = sqlite3.connect(DB)
 c.row_factory = sqlite3.Row
 check("сводка по каналам — последнее принятое", E.overview(c, "t1")[CID["a"]]["hours_365"], 1500)
 
+print("Почты каналов")
+r = E.reading(result(UC["a"], verified=False))
+check("неподтверждённое чтение почту не несёт", (r["email"], r["profile"]), ("", ""))
+_c = sqlite3.connect(DB)
+_c.execute("INSERT INTO pub_profiles(tenant_id,serial,title,created) VALUES('t1','21','x',?)", (NOW,))
+_pid = _c.execute("SELECT id FROM pub_profiles WHERE serial='21'").fetchone()[0]
+_c.execute("UPDATE pub_channels SET profile_id=? WHERE id IN (?,?)", (_pid, CID["a"], CID["c"]))
+_c.commit(); _c.close()
+other = result(UC["c"], at="2026-10-16T03:00:00+00:00")
+other["context"] = {"profile": "13", "email": "m07@example.com"}
+upload(zipped([other]), apply=1)
+as_("s-user")
+check("оператору почты не отдаются", (client.get(f"/ui/channels/{CID['a']}/email").status_code,
+      client.get("/ui/analytics/earn/emails").status_code), (403, 403))
+check("и в карточке канала почты нет", "m07@example.com" in client.get(f"/ui/channels/{CID['a']}").text, False)
+as_("s-admin")
+e = client.get(f"/ui/channels/{CID['a']}/email").json()
+check("почта канала — из подтверждённого чтения", (e["email"], e["profile"], e["other_profile"]),
+      ("m07@example.com", "13", True))
+g = client.get("/ui/analytics/earn/emails").json()
+check("одна почта — два канала вместе", [(x["email"], len(x["channels"])) for x in g["groups"]],
+      [("m07@example.com", 2)])
+check("канал без подтверждённых чтений — в «без почты»", g["without"], ["Бета", "Дельта"])
+check("чужой профиль отмечен", sorted(ch["channel"] for ch in g["groups"][0]["channels"]
+                                    if ch["other_profile"]), ["Альфа", "Гамма"])
+check("канал другого тенанта — 404", client.get("/ui/channels/99999/email").status_code, 404)
+
 print()
 if FAILS:
     print(f"провалов: {len(FAILS)}")

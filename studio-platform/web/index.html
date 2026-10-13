@@ -2851,6 +2851,7 @@ async function viewChannels(){
     <div class="head-acts">
       <button class="ghost small" id="stlinks">Подключить статистику</button>
       <button class="ghost small" id="earnimp">Часы монетизации</button>
+      ${ME && ME.role === 'admin' ? '<button class="ghost small" id="emails">Почты</button>' : ''}
       <button class="ghost small" id="spread">Разложить ссылки</button>
       <button class="ghost small" id="impch">Перенести списком</button>
       <button class="ghost small" id="pickmode">Выбрать</button>
@@ -2862,6 +2863,8 @@ async function viewChannels(){
   bar.querySelector('#spread').onclick = () => { location.hash = '#/spread'; };
   bar.querySelector('#stlinks').onclick = () => analyticsLinksCard(bar);
   bar.querySelector('#earnimp').onclick = () => earnImportCard(bar);
+  const em = bar.querySelector('#emails');
+  if (em) em.onclick = () => emailsCard(bar);
 
   bar.querySelector('#impch').onclick = () => {
     if (document.getElementById('imp-form')) return;
@@ -4013,6 +4016,51 @@ function earnImportCard(bar){
   ap.onclick = () => run(true);
 }
 
+// Под какой почтой Google открывается канал (13.10.2026). Почту пишет сборщик Минска из
+// живой сессии; приходит она только с подтверждённым чтением. Видит только администратор.
+async function earnEmailLine(id, card){
+  let e;
+  try{ e = await api('/ui/channels/' + encodeURIComponent(id) + '/email'); }catch(_){ return; }
+  if (!e || !e.email) return;
+  const body = card.querySelector('#earn-body');
+  if (!body) return;
+  const warn = e.other_profile
+    ? ` <span style="color:var(--bad)">— читали из профиля №${esc(e.profile)}, а закреплён №${
+        esc(e.assigned_profile)}</span>` : '';
+  body.insertAdjacentHTML('beforeend', `<div class="note muted" id="earn-email" style="margin-top:8px">
+    Открывается под почтой <b>${esc(e.email)}</b>${e.profile ? `, профиль №${esc(e.profile)}` : ''}
+    (сбор ${esc(when(e.read_at))})${warn}${(e.earlier || []).length
+      ? `<br>Раньше была: ${e.earlier.map(esc).join(', ')}` : ''}</div>`);
+}
+
+async function emailsCard(bar){
+  const had = document.getElementById('emails-card');
+  if (had){ had.remove(); return; }
+  let d;
+  try{ d = await api('/ui/analytics/earn/emails'); }catch(e){ toast(e.message); return; }
+  const rows = d.groups.map(g => `<tr>
+      <td style="white-space:nowrap"><b>${esc(g.email)}</b>${g.channels.length > 1
+        ? `<div class="muted" style="font-size:12px">${g.channels.length} канала(ов) падают вместе</div>` : ''}</td>
+      <td>${g.channels.map(ch => `<a href="#/channel/${encodeURIComponent(ch.channel_id)}/statistika">${
+        esc(ch.channel)}</a>${ch.other_profile
+          ? ` <span style="color:var(--bad)">(профиль №${esc(ch.profile)}, закреплён №${esc(ch.assigned_profile)})</span>`
+          : ''}`).join('<br>')}</td>
+    </tr>`).join('');
+  const card = $(`<div class="card" id="emails-card" style="margin-bottom:16px">
+    <div class="sec">Почты каналов</div>
+    <div class="secbody">
+      <div class="note muted">Под какой почтой Google открывается канал — по подтверждённым
+        сборам Минска (кнопка «Часы монетизации»). Каналы одной почты падают вместе:
+        блокировка или проверка аккаунта касается их всех.</div>
+      <div class="note">Каналов с почтой: <b>${d.channels}</b>, почт: <b>${d.emails}</b>.</div>
+      ${d.without.length ? `<div class="note bad">Без почты (${d.without.length}): ${
+        d.without.map(esc).join(', ')}</div>` : ''}
+      ${rows ? `<table style="margin-top:10px"><thead><tr><th>Почта</th><th>Каналы</th></tr></thead>
+        <tbody>${rows}</tbody></table>` : ''}
+    </div></div>`);
+  bar.after(card);
+}
+
 async function analyticsLinksCard(bar){
   const had = document.getElementById('stlinks-card');
   if (had){ had.remove(); return; }
@@ -4124,7 +4172,9 @@ function oauthReturnNotice(){
 
 function channelStatsTab(id, d){
   app.append(channelStatsCard(id, d.stats || {}));
-  app.append(earnCard(d.earn || {}));
+  const ec = earnCard(d.earn || {});
+  app.append(ec);
+  if (ME && ME.role === 'admin') earnEmailLine(id, ec);
   const a = d.analytics || {};
   const acc = a.access || {};
   const card = $(`<div class="card" style="margin-bottom:16px">

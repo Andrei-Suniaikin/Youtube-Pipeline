@@ -7523,6 +7523,31 @@ async def ui_analytics_earn_import(request: Request, apply: int = Query(0),
             "written": written}
 
 
+@app.get("/ui/analytics/earn/emails")
+def ui_analytics_earn_emails(request: Request):
+    """Почта Google → каналы, по подтверждённым сборам Минска. Только администратору:
+    почта — это половина входа в аккаунт."""
+    _require_admin(request)
+    c = db()
+    try:
+        return pub_earn.email_groups(c, TENANT)
+    finally:
+        c.close()
+
+
+@app.get("/ui/channels/{channel_id:int}/email")
+def ui_channel_email(request: Request, channel_id: int):
+    _require_admin(request)
+    c = db()
+    try:
+        if not c.execute("SELECT 1 FROM pub_channels WHERE id=? AND tenant_id=?",
+                         (channel_id, TENANT)).fetchone():
+            raise HTTPException(404, "канал не найден")
+        return pub_earn.channel_email(c, TENANT, channel_id)
+    finally:
+        c.close()
+
+
 @app.get("/ui/analytics/groups")
 def ui_analytics_groups(request: Request):
     """Каналы по профилям AdsPower: сколько подключено, кого ещё ждём."""

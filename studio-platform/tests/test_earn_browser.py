@@ -71,6 +71,12 @@ SCENARIO = r"""
         lang: 'PL', status: 'active', per_day: 1, horizon_days: 3, lead_days: 2,
         has_profile: true, has_uc: true}]};
       if (p === '/ui/channels/stats') return {channels: []};
+      if (p === '/ui/channels/1/email') return {email: 'm07@example.com', read_at: 1791900000,
+        profile: '13', assigned_profile: '21', other_profile: true, earlier: ['old@example.com']};
+      if (p === '/ui/analytics/earn/emails') return {channels: 2, emails: 1, without: ['Бета'],
+        groups: [{email: 'm07@example.com', channels: [
+          {channel_id: 1, channel: 'Канал', profile: '13', assigned_profile: '21', other_profile: true},
+          {channel_id: 2, channel: 'Второй', profile: '21', assigned_profile: '21', other_profile: false}]}]};
       if (p.startsWith('/ui/channels/1')) return channel();
       return {};
     };
@@ -84,6 +90,7 @@ SCENARIO = r"""
 
     await open();
     out.хорошо = (card() || {}).textContent || '';
+    out.почта = (document.getElementById('earn-email') || {}).textContent || '';
     out.сбояНет = !(card() || document.body).querySelector('.note.bad');
 
     earn = Object.assign({}, earn, {last: {read_at: 1792000000, state: 'unverified',
@@ -109,6 +116,17 @@ SCENARIO = r"""
     out.загрузка = ic ? ic.textContent : '';
     out.проверкаЗаперта = ic ? ic.querySelector('#earn-check').disabled : null;
     out.записьЗаперта = ic ? ic.querySelector('#earn-apply').disabled : null;
+    const eb = document.getElementById('emails');
+    if (eb){ eb.click(); await sleep(300); }
+    out.почты = (document.getElementById('emails-card') || {}).textContent || '';
+
+    ME = {name: 'op', role: 'user'};
+    location.hash = '#/channel/1/statistika'; await sleep(300);
+    location.hash = '#/channels'; await sleep(300);
+    out.кнопкаПочтОператору = !!document.getElementById('emails');
+    earn = {last: good, good: good, prev: null, goal_hours: 4000, goal_subs: 1000};
+    await open();
+    out.почтаОператору = !!document.getElementById('earn-email');
   } catch (e) { out.errs.push(String(e && e.message || e)); }
   document.documentElement.setAttribute('data-result', JSON.stringify(out));
 })();
@@ -145,6 +163,17 @@ def main() -> int:
     has("подсказка, что грузить", res.get("загрузка"), "reader_result.json")
     check("без файла «Проверить» заперта", res.get("проверкаЗаперта"), True)
     check("«Записать» — только после проверки", res.get("записьЗаперта"), True)
+    print("Почты — только администратору")
+    t = res.get("почта")
+    has("почта в карточке часов", t, "m07@example.com")
+    has("чужой профиль назван", t, "читали из профиля №13, а закреплён №21")
+    has("прежняя почта видна", t, "old@example.com")
+    t = res.get("почты")
+    has("почты: сводка", t, "Каналов с почтой: 2, почт: 1")
+    has("каналы одной почты вместе", t, "2 канала(ов) падают вместе")
+    has("без почты названы", t, "Без почты (1): Бета")
+    check("оператору кнопки «Почты» нет", res.get("кнопкаПочтОператору"), False)
+    check("и строки почты в карточке нет", res.get("почтаОператору"), False)
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")

@@ -60,6 +60,10 @@ def ensure_earn_schema(c: sqlite3.Connection) -> None:
         "reason TEXT, "
         "loaded REAL NOT NULL, "
         "PRIMARY KEY(channel_id, read_at))")
+    # 13.10.2026: из какого профиля AdsPower читали — сверка с закреплённым профилем.
+    have = {r[1] for r in c.execute("PRAGMA table_info(pub_channel_earn)")}
+    if "profile" not in have:
+        c.execute("ALTER TABLE pub_channel_earn ADD COLUMN profile TEXT")
 
 
 def _ts(text) -> float | None:
@@ -117,7 +121,10 @@ def reading(doc: dict) -> dict | None:
         "life_views": int(_val(life, "views")) if life_ok and _val(life, "views") is not None else None,
         "life_hours": float(_val(life, "watch_hours")) if life_ok and _val(life, "watch_hours") is not None else None,
         "as_of": str(earn.get("as_of") or "")[:60] if keep else "",
-        "email": str(ctx.get("email") or "")[:120],
+        # Почта и профиль — только когда считыватель подтвердил, что сессия та самая:
+        # иначе это может быть чужой аккаунт, и выводы по нему хуже, чем никаких.
+        "email": str(ctx.get("email") or "")[:120] if verified else "",
+        "profile": str(ctx.get("profile") or "")[:20] if verified else "",
     }
 
 
@@ -207,11 +214,11 @@ def apply(c: sqlite3.Connection, planned: dict, now: float | None = None) -> int
             continue
         cur = c.execute(
             "INSERT OR IGNORE INTO pub_channel_earn(channel_id,read_at,uc,state,hours_365,"
-            "shorts_90,subs,life_views,life_hours,as_of,email,reason,loaded) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "shorts_90,subs,life_views,life_hours,as_of,email,reason,loaded,profile) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (w["channel_id"], w["read_at"], w["uc"], w["state"], w["hours_365"], w["shorts_90"],
              w["subs"], w["life_views"], w["life_hours"], w["as_of"], w["email"], w["reason"],
-             now))
+             now, w.get("profile") or ""))
         n += cur.rowcount
     return n
 
@@ -248,3 +255,69 @@ def overview(c: sqlite3.Connection, tenant) -> dict:
         "  SELECT MAX(read_at) FROM pub_channel_earn x WHERE x.channel_id=e.channel_id "
         "  AND x.state IN ('ok','partner'))", (tenant,)).fetchall()
     return {r["channel_id"]: _row(r) for r in rows}
+
+
+# ─────────────────────────── почты каналов (13.10.2026) ───────────────────────────
+#
+# Под какой почтой Google открывается канал. Отдельно почту никто не хранит: ни AdsPower,
+# ни профиль браузера. Её пишет сам сборщик — «Signed in as …» живой сессии, — и только
+# подтверждённое чтение (см. `reading`) несёт её сюда. Видна только администратору.
+
+def _email_rows(c: sqlite3.Connection, tenant, channel_id=None):
+    ensure_earn_schema(c)
+    sql = ("SELECT e.channel_id, e.email, e.profile, e.read_at FROM pub_channel_earn e "
+           "JOIN pub_channels ch ON ch.id=e.channel_id WHERE ch.tenant_id=? "
+           "AND COALESCE(e.email,'')<>''")
+    args = [tenant]
+    if channel_id is not None:
+        sql += " AND e.channel_id=?"
+        args.append(channel_id)
+    return c.execute(sql + " ORDER BY e.read_at", args).fetchall()
+
+
+def _assigned(c: sqlite3.Connection, channel_id: int) -> str:
+    row = c.execute("SELECT p.serial FROM pub_channels ch LEFT JOIN pub_profiles p "
+                    "ON p.id=ch.profile_id WHERE ch.id=?", (channel_id,)).fetchone()
+    return str(row[0] or "") if row else ""
+
+
+def channel_email(c: sqlite3.Connection, tenant, channel_id: int) -> dict:
+    """Последняя подтверждённая почта канала; смена почты и чужой профиль — словами."""
+    rows = _email_rows(c, tenant, channel_id)
+    if not rows:
+        return {}
+    last = rows[-1]
+    seen = []
+    for r in rows:
+        if r[1] not in seen:
+            seen.append(r[1])
+    assigned = _assigned(c, channel_id)
+    return {"email": last[1], "read_at": last[3], "profile": last[2] or "",
+            "assigned_profile": assigned,
+            "other_profile": bool(last[2] and assigned and last[2] != assigned),
+            "earlier": [e for e in seen if e != last[1]]}
+
+
+def email_groups(c: sqlite3.Connection, tenant) -> dict:
+    """Почта → каналы. Один аккаунт Google падает целиком — видно, какие каналы вместе."""
+    last = {}
+    for r in _email_rows(c, tenant):
+        last[r[0]] = r                      # отсортировано по времени — последнее побеждает
+    names = {r[0]: (r[1], r[2]) for r in c.execute(
+        "SELECT ch.id, ch.name, p.serial FROM pub_channels ch LEFT JOIN pub_profiles p "
+        "ON p.id=ch.profile_id WHERE ch.tenant_id=?", (tenant,))}
+    groups = {}
+    for cid, r in last.items():
+        if cid not in names:
+            continue
+        name, serial = names[cid]
+        groups.setdefault(r[1], []).append({
+            "channel_id": cid, "channel": name, "profile": r[2] or "",
+            "assigned_profile": str(serial or ""), "read_at": r[3],
+            "other_profile": bool(r[2] and serial and r[2] != str(serial))})
+    out = [{"email": e, "channels": sorted(chs, key=lambda x: x["channel"])}
+           for e, chs in groups.items()]
+    out.sort(key=lambda g: (-len(g["channels"]), g["email"]))
+    missing = sorted((names[cid][0] for cid in names if cid not in last))
+    return {"groups": out, "without": missing,
+            "channels": len(last), "emails": len(out)}
