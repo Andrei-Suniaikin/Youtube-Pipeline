@@ -16,6 +16,8 @@
   * тот же кадр в том же прогоне (добивка пропущенных) второй откат не получает;
   * обычный сбой (не фильтр) и откат на ту же модель отката не вызывают;
   * откат выключается настройкой;
+  * openai-image дважды молча отказал («Generation failed») — тот же один заказ откатом
+    (14.10.2026), а добивка основную модель больше не оплачивает;
   * журнал платных вызовов: строка основной модели закрыта отказом, откат заявлен своей
     строкой с моделью отката;
   * фактическая модель кадра — в image_model_fallbacks.json; кадр, позже нарисованный
@@ -72,6 +74,8 @@ class Provider:
         answer = self.answers.get(v6_model, "ok")
         if answer == "ok":
             return PNG
+        # Как опрос v6 на status=failed: причина — и в ретрай-логику, и в журнал.
+        G._set_last_gen_error(G._typed_v6_terminal_error(answer))
         G._set_provider_refusal(answer)
         return None
 
@@ -85,6 +89,7 @@ def run(answers, *, scene=1, model="NARWHAL_LITE", out_dir=None, fresh_run=True)
         G._SAFETY_FALLBACK_USED.clear()
         G._SAFETY_FALLBACK_BUSY.clear()
         G._FRAME_GIVEUP.clear()
+        G._V6_GENERIC_TERMINAL_FRAMES.clear()
     out_dir = out_dir or tempfile.mkdtemp(dir=TMP)
     provider = Provider(answers)
     lines, reserves, closes = [], [], []
@@ -262,6 +267,39 @@ out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: FILTER}, scene=6, out_dir=
 check("сдался как «фильтр»", (G._FRAME_GIVEUP.get(5) or ("", ""))[0], G.GAP_FILTER)
 out, prov, lines, _j, _d = run({LITE: FILTER, FLOWER: "ok"}, scene=6, out_dir=d6, fresh_run=False)
 check("второго отката в том же прогоне нет", prov.count(FLOWER), 0)
+
+print("\nopenai-image дважды отказал без причины — откат (14.10.2026)")
+OPENAI_V6 = G.IMAGE_MODEL_V6["OPENAI"]
+GENERIC = "Generation failed, please try again later"
+out, prov, lines, (reserves, _c), _d = run({OPENAI_V6: GENERIC, FLOWER: "ok"},
+                                           scene=11, model="OPENAI")
+check("кадр получен откатом", out[1] is not None, True)
+check("openai-image — два заказа, откат — один",
+      (prov.count(OPENAI_V6), prov.count(FLOWER)), (2, 1))
+check("в журнале задачи — что отказ без причины",
+      any("🛟" in l and "дважды отказала без причины" in l for l in lines), True)
+check("журнал вызовов: openai, затем откат", reserves[-1], "FLOWER")
+d12 = tempfile.mkdtemp(dir=TMP)
+out, prov, lines, _j, _d = run({OPENAI_V6: GENERIC, FLOWER: GENERIC}, scene=12,
+                               model="OPENAI", out_dir=d12)
+check("откат тоже отказал — кадра нет, заказов 2 + 1",
+      (out[1], prov.count(OPENAI_V6), prov.count(FLOWER)), (None, 2, 1))
+out, prov, lines, _j, _d = run({OPENAI_V6: "ok", FLOWER: "ok"}, scene=12, model="OPENAI",
+                               out_dir=d12, fresh_run=False)
+check("добивка того же прогона ничего не оплачивает", (out[1], len(prov.calls)), (None, 0))
+out, prov, lines, _j, _d = run({OPENAI_V6: "Request blocked by provider safety filters",
+                                FLOWER: "ok"}, scene=13, model="OPENAI")
+check("одиночный generic не нужен: фильтр по-прежнему идёт своим путём",
+      (out[1] is not None, prov.count(FLOWER)), (True, 1))
+saved_fb = G.IMAGE_SAFETY_FALLBACK_MODEL
+G.IMAGE_SAFETY_FALLBACK_MODEL = "OFF"
+try:
+    out, prov, lines, _j, _d = run({OPENAI_V6: GENERIC}, scene=14, model="OPENAI")
+    check("откат выключен — как раньше: два заказа и стоп",
+          (out[1], prov.count(OPENAI_V6),
+           any("дважды вернул generic terminal" in l for l in lines)), (None, 2, True))
+finally:
+    G.IMAGE_SAFETY_FALLBACK_MODEL = saved_fb
 
 print("\nПорядок отката: Nano Banana 2 → Pro → Flower последним (11.10.2026)")
 # Владелец: Flower по качеству сильно хуже — в последнюю очередь.

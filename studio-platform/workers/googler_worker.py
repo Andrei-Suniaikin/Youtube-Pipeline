@@ -11446,7 +11446,8 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 _fallback_gave_up(index, _model, _fallback_reason, _fb_last,
                                   output_path or f"#{index}")
                 return (index, None)
-        if _v6_generic_terminal_frame_blocked(_v6_generic_frame_key):
+        # Блок — для основной модели; откатный заказ этого же кадра им не останавливается.
+        if not _fallback_used and _v6_generic_terminal_frame_blocked(_v6_generic_frame_key):
             print_user(
                 f"⛔ [{index+1}] FastGen/openai-image: кадр уже получил два generic "
                 "terminal отказа в этой задаче — refill без нового платного запроса",
@@ -11913,9 +11914,22 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
             # Контент-фильтр (safety filter и т.п.) детерминирован для ТОГО ЖЕ промпта →
             # не повторяем его как есть, а применяем локальный deterministic safety-pass
             # (до 3 раундов), и только потом пропускаем картинку.
-            if _is_fatal_gen_error(error) or _is_fatal_gen_error(_last_gen_error()):
+            #
+            # 14.10.2026, «Všední Den Středověku»: openai-image три прогона подряд молча
+            # отклонял одни и те же 11 кадров из 481 («Generation failed»), без признака
+            # фильтра. Откат на другую модель был только у фильтра, кадры терялись, и ролик
+            # падал на правиле 2%. Второй такой отказ кадра теперь идёт тем же откатом:
+            # смягчений больше нет (одно уже было), один заказ другой моделью ключа.
+            _generic_again = (
+                _model == "OPENAI" and not _fallback_used
+                and _v6_generic_terminal_hits >= 1
+                and _is_generic_v6_terminal_error(_last_gen_error())
+                and bool(safety_fallback_model(_model))
+            )
+            if (_generic_again or _is_fatal_gen_error(error)
+                    or _is_fatal_gen_error(_last_gen_error())):
                 _changed = False
-                while _soften_rounds < 3 and not _changed:
+                while _soften_rounds < 3 and not _changed and not _generic_again:
                     _soften_rounds += 1
                     _softened = _soften_image_prompt_contract(
                         prompt_contract, _soften_rounds
@@ -11930,20 +11944,32 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 if _changed:
                     print_user(f"🩹 [{index+1}] Контент-фильтр: промпт смягчён локально (раунд {_soften_rounds}/3), пробую снова", "WARNING")
                     continue
-                _note_soften_exhausted()   # копим статистику: сюжет режется устойчиво
+                if not _generic_again:
+                    _note_soften_exhausted()   # копим статистику: сюжет режется устойчиво
                 _fb_model = safety_fallback_model(_model)
                 if _fb_model and claim_safety_fallback(output_path or f"#{index}"):
                     _fb_from = _model
-                    _fallback_reason = (f"фильтр модели {_fb_from} после смягчений "
-                                        f"({_soften_rounds})")
-                    print_user(f"🛟 [{index+1}] Сцена {index+1}: фильтр модели "
-                               f"{GOOGLER_MODEL_LABELS.get(_fb_from, _fb_from)} — заказ моделью "
+                    _fb_label = GOOGLER_MODEL_LABELS.get(_fb_from, _fb_from)
+                    if _generic_again:
+                        # Основную модель для этого кадра больше не зовём: добивка
+                        # пропущенных не должна снова платить за тот же отказ.
+                        _block_v6_generic_terminal_frame(_v6_generic_frame_key)
+                        _fallback_reason = (f"модель {_fb_from} дважды отказала без причины "
+                                            f"(generic terminal)")
+                        _fb_why = f"{_fb_label} дважды отказала без причины"
+                    else:
+                        _fallback_reason = (f"фильтр модели {_fb_from} после смягчений "
+                                            f"({_soften_rounds})")
+                        _fb_why = f"фильтр модели {_fb_label}"
+                    print_user(f"🛟 [{index+1}] Сцена {index+1}: {_fb_why} — заказ моделью "
                                f"{GOOGLER_MODEL_LABELS.get(_fb_model, _fb_model)}", "WARNING")
                     # Заказ основной модели оплачен и кадра не дал — его строка журнала
                     # закрывается отказом; откат пойдёт своей строкой со своей моделью.
                     _journal_close_frame(None, error=(
-                        f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds}) "
-                        f"— кадр заказан моделью {_fb_model}"))
+                        (f"провайдер дважды вернул generic terminal status=failed "
+                         if _generic_again else
+                         f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds}) ")
+                        + f"— кадр заказан моделью {_fb_model}"))
                     _model = _fb_model
                     _fallback_used = True
                     _provider_group = _model_provider_group(_model)
@@ -12010,6 +12036,15 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                         return (index, None)
                     _extra_attempts += 1          # откату — свой заказ сверх исчерпанных попыток
                     continue
+                if _generic_again:
+                    # Отката этому кадру в прогоне уже не положено — как было до 14.10.
+                    _block_v6_generic_terminal_frame(_v6_generic_frame_key)
+                    print_user(
+                        f"⛔ [{index+1}] FastGen/openai-image дважды вернул generic terminal "
+                        "status=failed — останавливаю кадр и исключаю его из refill",
+                        "ERROR",
+                    )
+                    return (index, None)
                 _note_frame_giveup(index, GAP_FILTER,
                                    f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds})")
                 print_user(f"⛔ [{index+1}] Контент-фильтр провайдера — пропускаю картинку (смягчений: {_soften_rounds})", "ERROR")
