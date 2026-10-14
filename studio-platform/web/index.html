@@ -3997,8 +3997,10 @@ function earnImportCard(bar){
         ${ME && ME.role === 'admin' ? '<button class="ghost small" id="earn-all">Собрать по всем каналам</button>' : ''}
       </div>
       <div id="earn-out" style="margin-top:10px"></div>
+      <div id="earn-auto" style="margin-top:12px"></div>
     </div></div>`);
   bar.after(card);
+  earnAutoLine(card.querySelector('#earn-auto'));
   const f = card.querySelector('#earn-file'), chk = card.querySelector('#earn-check'),
         ap = card.querySelector('#earn-apply'), out = card.querySelector('#earn-out');
   f.onchange = () => { chk.disabled = !f.files.length; ap.disabled = true; out.innerHTML = ''; };
@@ -4028,6 +4030,49 @@ function earnImportCard(bar){
     }catch(e){ toast(e.message); }
     finally{ all.disabled = false; }
   };
+}
+
+// Ежедневный сбор (14.10.2026): раз в сутки студия сама ставит сбор по всем каналам.
+// Здесь — включён ли, во сколько, чем кончился последний обход и отвечает ли Мак Володи
+// (без него сборщик не открывает ни одного профиля).
+async function earnAutoLine(box){
+  if (!box) return;
+  let a;
+  try{ a = await api('/ui/analytics/earn/auto'); }catch(_){ return; }
+  const s = a.settings || {}, l = a.last, h = a.host || {};
+  const n = (l && l.counts) || {};
+  const admin = ME && ME.role === 'admin';
+  const lines = [];
+  lines.push(s.on
+    ? `Ежедневный сбор: каждый день в ${String(s.hour).padStart(2, '0')}:00 (${esc(s.tz)}) по всем каналам с профилем.`
+    : 'Ежедневный сбор выключен — часы обновляются только по кнопке.');
+  if (l){
+    const parts = [`поставлено ${l.queued}`];
+    if (n.done) parts.push(`собрано ${n.done}`);
+    if (n.queued || n.running) parts.push(`ещё в очереди ${(n.queued || 0) + (n.running || 0)}`);
+    if (n.skipped) parts.push(`пропущено ${n.skipped}: профиль занят заливкой (№ ${l.skipped_profiles.map(esc).join(', ')}) — соберутся в следующий раз`);
+    if (n.failed) parts.push(`не вышло ${n.failed}`);
+    lines.push(`Последний обход ${esc(when(l.at))}: ${parts.join(', ')}.`);
+    for (const f of (l.failed_reasons || []))
+      lines.push(`<span style="color:var(--bad)">${esc(f.note)} — ${f.n}</span>`);
+  }
+  if (h.peer_ok === false)
+    lines.push(`<span style="color:var(--bad)">Мак Володи не отвечает с ${esc(when(h.since))} — без него сбор не запускается, чтобы не открыть профиль на двух машинах сразу. Задания ждут его.</span>`);
+  box.innerHTML = `<div class="note muted">${lines.join('<br>')}</div>` + (admin
+    ? `<div style="display:flex;gap:10px;align-items:center;margin-top:6px;flex-wrap:wrap">
+        <label><input type="checkbox" id="earn-auto-on"${s.on ? ' checked' : ''}> собирать каждый день</label>
+        <label>в <input type="number" id="earn-auto-hour" min="0" max="23" value="${Number(s.hour) || 0}" style="width:56px">:00</label>
+      </div>` : '');
+  const on = box.querySelector('#earn-auto-on'), hr = box.querySelector('#earn-auto-hour');
+  const save = async () => {
+    try{
+      await post('/ui/analytics/earn/auto', {on: on.checked, hour: Number(hr.value)});
+      toast('Сохранено', 'ok');
+    }catch(e){ toast(e.message); }
+    earnAutoLine(box);
+  };
+  if (on) on.onchange = save;
+  if (hr) hr.onchange = save;
 }
 
 // Под какой почтой Google открывается канал (13.10.2026). Почту пишет сборщик Минска из
@@ -4066,7 +4111,9 @@ function earnCollectLine(id, r, card){
       : l ? `Сбор по профилю №${esc(st.profile)}: ${esc(l.title)}${
           l.status === 'queued' ? ` (${esc(when(l.created))})` : ''}${
           l.finished ? ` — ${esc(when(l.finished))}` : ''}${l.note ? ` · ${esc(l.note)}` : ''}${
-          busy ? '. Если профиль сейчас заливает, сбор подождёт.' : ''}`
+          busy && st.peer_down_since ? `. Мак Володи не отвечает с ${esc(when(st.peer_down_since))
+            } — без него сбор не запускается, задание ждёт его.`
+          : busy ? '. Если профиль сейчас заливает, сбор подождёт.' : ''}`
       : `Профиль №${esc(st.profile)}. Сбор читает все каналы профиля, несколько минут.`}</span>`;
     const go = box.querySelector('#earn-go');
     if (go) go.onclick = async () => {

@@ -7695,6 +7695,40 @@ def ui_analytics_earn_collect(request: Request):
         c.close()
 
 
+class EarnAutoIn(BaseModel):
+    on: bool | None = None
+    hour: int | None = None
+
+
+@app.get("/ui/analytics/earn/auto")
+def ui_analytics_earn_auto(request: Request):
+    """Ежедневный сбор (14.10.2026): включён ли, в котором часу, чем кончился последний
+    обход и отвечает ли Мак Володи. Видят все, кто вошёл, — как и сами часы."""
+    c = db()
+    try:
+        return pub_earn.auto_status(c, TENANT)
+    finally:
+        c.close()
+
+
+@app.post("/ui/analytics/earn/auto")
+def ui_analytics_earn_auto_set(body: EarnAutoIn, request: Request):
+    """Включить/выключить ежедневный сбор и задать час. Только админу: обход открывает
+    по очереди все профили AdsPower на Минске."""
+    who = _require_admin(request)
+    c = db()
+    try:
+        out = pub_earn.set_auto_settings(c, on=body.on, hour=body.hour)
+        c.commit()
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    finally:
+        c.close()
+    _audit(f"ежедневный сбор часов: {'включён' if out['on'] else 'выключен'}, "
+           f"час {out['hour']}, это сделал {who['name']}")
+    return out
+
+
 # ── пуллер сбора на Минске: свой исходящий опрос, токен тот же, что у ноды заливки ──
 
 def _earn_agent_token() -> str:
@@ -7714,7 +7748,13 @@ async def api_earn_claim(request: Request):
     body = await request.json() if (await request.body()) else {}
     c = db()
     try:
-        job = pub_earn.claim_request(c, str((body or {}).get("host") or "minsk"))
+        body = body if isinstance(body, dict) else {}
+        # 14.10.2026: пуллер говорит, отвечает ли Мак; пока не отвечает — берёт только
+        # задания по кнопке (их сразу закрывает словами), ночные ждут Мака в очереди.
+        peer = body.get("peer_ok")
+        job = pub_earn.claim_request(c, str(body.get("host") or "minsk"),
+                                     manual_only=bool(body.get("manual_only")),
+                                     peer_ok=peer if isinstance(peer, bool) else None)
         c.commit()
         return {"job": job}
     finally:
@@ -7742,8 +7782,10 @@ async def api_earn_fail(request: Request, req_id: int):
     body = await request.json()
     c = db()
     try:
+        # skipped — профиль был занят, сборщик его не открывал: не сбой, а «в другой раз».
         if pub_earn.finish_request(c, req_id, request.headers.get("X-Earn-Claim", ""), False,
-                                   str(body.get("note") or "сбор не вышел")) is None:
+                                   str(body.get("note") or "сбор не вышел"),
+                                   skipped=body.get("skipped") is True) is None:
             raise HTTPException(409, "задание не ваше или уже закрыто")
         c.commit()
         return {"ok": True}

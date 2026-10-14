@@ -44,6 +44,7 @@ load_env()
 
 import pub_alerts as A                                            # noqa: E402
 import pub_digest as D                                            # noqa: E402
+import pub_earn as E                                              # noqa: E402
 import pub_tg_personal as P                                       # noqa: E402
 from pub_alerts_tg import Telegram                                # noqa: E402
 
@@ -260,6 +261,17 @@ def main() -> int:
                     print(f"{stamp}  личный отчёт отправлен: учётка {rep['user_id']}")
                 elif rep["why"]:
                     print(f"{stamp}  личный отчёт, учётка {rep['user_id']}: {rep['why']}")
+            # 14.10.2026: ежедневный сбор часов монетизации — на том же таймере и по той
+            # же причине. Его сбой не должен глушить тревоги: тревоги уже ушли выше, а
+            # здесь только печатаем, что не вышло, — следующий проход попробует снова.
+            try:
+                earn = E.daily_tick(c, TENANT, now=time.time())
+                if earn.get("queued"):
+                    print(f"{stamp}  ежедневный сбор часов: поставлено профилей "
+                          f"{len(earn['queued'])}")
+            except Exception as exc:                          # noqa: BLE001
+                c.rollback()
+                print(f"{stamp}  ежедневный сбор часов не поставлен: {exc}")
             if sent:
                 for key, kind, _text in sent:
                     print(f"{stamp}  {kind:<6} {key}")

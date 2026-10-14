@@ -20,6 +20,7 @@ from __future__ import annotations
 import datetime as dt
 import io
 import json
+import os
 import re
 import sqlite3
 import time
@@ -335,7 +336,10 @@ def email_groups(c: sqlite3.Connection, tenant) -> dict:
 REQ_STALE_SEC = 20 * 60          # пуллер молчит дольше — задание снова в очереди
 REQ_EXPIRE_SEC = 12 * 3600       # никто не взял за полсуток — снимаем со словами
 REQ_TITLE = {"queued": "поставлен в очередь", "running": "идёт сбор",
-             "done": "готово", "failed": "не вышло"}
+             "done": "готово", "failed": "не вышло",
+             # 14.10.2026: ежедневный сбор не ждёт занятый профиль — оставляет его на
+             # следующий проход. Это не сбой: число просто не обновилось сегодня.
+             "skipped": "пропущен — профиль был занят"}
 
 
 def ensure_request_schema(c: sqlite3.Connection) -> None:
@@ -347,10 +351,16 @@ def ensure_request_schema(c: sqlite3.Connection) -> None:
         "created REAL NOT NULL, created_by TEXT, "
         "claim_token TEXT, host TEXT, claimed REAL, heartbeat REAL, finished REAL, "
         "attempts INTEGER NOT NULL DEFAULT 0, note TEXT)")
+    # 14.10.2026: задание ежедневного сбора отличается от кнопки. Человек, нажавший
+    # «Обновить часы», ждёт ответа сейчас — его задание идёт первым и ждёт занятый
+    # профиль; ночной обход по всем профилям занятый пропускает до следующих суток.
+    have = {r[1] for r in c.execute("PRAGMA table_info(pub_earn_requests)")}
+    if "auto" not in have:
+        c.execute("ALTER TABLE pub_earn_requests ADD COLUMN auto INTEGER NOT NULL DEFAULT 0")
 
 
 def request_collect(c: sqlite3.Connection, tenant, channel_ids=None, by: str = "",
-                    now: float | None = None) -> dict:
+                    now: float | None = None, auto: bool = False) -> dict:
     """Поставить сбор по профилям этих каналов (None — по всем каналам с профилем)."""
     now = time.time() if now is None else now
     ensure_request_schema(c)
@@ -369,8 +379,8 @@ def request_collect(c: sqlite3.Connection, tenant, channel_ids=None, by: str = "
     for s in serials:
         if s in active:
             continue
-        c.execute("INSERT INTO pub_earn_requests(tenant_id,profile,status,created,created_by) "
-                  "VALUES(?,?,'queued',?,?)", (tenant, s, now, by[:60]))
+        c.execute("INSERT INTO pub_earn_requests(tenant_id,profile,status,created,created_by,"
+                  "auto) VALUES(?,?,'queued',?,?,?)", (tenant, s, now, by[:60], 1 if auto else 0))
         queued.append(s)
     return {"queued": queued, "already": sorted(set(serials) & active,
                                                   key=lambda s: (len(s), s)),
@@ -382,20 +392,77 @@ def _sweep_requests(c: sqlite3.Connection, now: float) -> None:
               "note='пуллер замолчал — задание снова в очереди' "
               "WHERE status='running' AND COALESCE(heartbeat, claimed, 0) < ?",
               (now - REQ_STALE_SEC,))
-    c.execute("UPDATE pub_earn_requests SET status='failed', finished=?, "
-              "note='за 12 часов сбор никто не взял — пуллер Минска не работает?' "
-              "WHERE status='queued' AND created < ?", (now, now - REQ_EXPIRE_SEC))
+    # Пуллер жив, но Мак не отвечал — тогда «пуллер не работает?» было бы неправдой.
+    host = host_state(c)
+    why = ("за 12 часов Мак Володи так и не ответил — без него сбор не запускается"
+           if host.get("peer_ok") is False and now - float(host.get("at") or 0) < 3600
+           else "за 12 часов сбор никто не взял — пуллер Минска не работает?")
+    c.execute("UPDATE pub_earn_requests SET status='failed', finished=?, note=? "
+              "WHERE status='queued' AND created < ?", (now, why, now - REQ_EXPIRE_SEC))
 
 
-def claim_request(c: sqlite3.Connection, host: str, now: float | None = None) -> dict | None:
-    """Пуллеру — следующее задание. Один и тот же профиль второй раз не выдаётся."""
+# Что пуллер в последний раз сказал о второй машине (Маке Володи). Сборщик без её ответа
+# не открывает ни одного профиля (collector.py, `active_everywhere` перед списком
+# профилей), и на нашей стороне это не лечится — но человек в студии должен видеть,
+# почему задание стоит в очереди, а не гадать.
+HOST_KEY = "earn_host"
+PEER_DOWN_NOTE = ("Мак Володи не отвечает — без него сбор не запускается, "
+                  "чтобы не открыть профиль на двух машинах сразу")
+
+
+def _state_get(c: sqlite3.Connection, key: str):
+    c.execute("CREATE TABLE IF NOT EXISTS admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL)")
+    row = c.execute("SELECT v FROM admin_state WHERE k=?", (key,)).fetchone()
+    try:
+        return json.loads(row[0]) if row and row[0] else None
+    except ValueError:
+        return None
+
+
+def _state_put(c: sqlite3.Connection, key: str, value, now: float) -> None:
+    c.execute("CREATE TABLE IF NOT EXISTS admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL)")
+    c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES(?,?,?)",
+              (key, json.dumps(value, ensure_ascii=False), now))
+
+
+def host_state(c: sqlite3.Connection) -> dict:
+    v = _state_get(c, HOST_KEY)
+    return v if isinstance(v, dict) else {}
+
+
+def note_host(c: sqlite3.Connection, host: str, peer_ok, now: float) -> None:
+    """Запомнить, отвечает ли Мак. Пишем смену состояния или раз в 10 минут: пуллер
+    спрашивает задание каждые полминуты, и базе незачем столько одинаковых записей."""
+    if peer_ok is None:
+        return
+    peer_ok = bool(peer_ok)
+    old = host_state(c)
+    same = old.get("peer_ok") is peer_ok
+    if same and now - float(old.get("at") or 0) < 600:
+        return
+    _state_put(c, HOST_KEY, {"host": host[:40], "peer_ok": peer_ok,
+                             "since": (old.get("since") or now) if same else now,
+                             "at": now}, now)
+
+
+def claim_request(c: sqlite3.Connection, host: str, now: float | None = None,
+                  manual_only: bool = False, peer_ok=None) -> dict | None:
+    """Пуллеру — следующее задание. Один и тот же профиль второй раз не выдаётся.
+
+    Задание по кнопке идёт раньше ночного обхода: обход по всем профилям длится часы,
+    и человек не должен ждать его конца ради одного канала. `manual_only` — пуллер
+    знает, что Мак не отвечает: ночные задания пусть ждут Мака в очереди (их срок —
+    полсуток), а кнопочное он возьмёт и сразу ответит словами, почему не вышло.
+    """
     import secrets
     now = time.time() if now is None else now
     ensure_request_schema(c)
+    note_host(c, host, peer_ok, now)
     _sweep_requests(c, now)
-    row = c.execute("SELECT id, tenant_id, profile FROM pub_earn_requests WHERE status='queued' "
-                    "AND profile NOT IN (SELECT profile FROM pub_earn_requests "
-                    "WHERE status='running') ORDER BY created, id LIMIT 1").fetchone()
+    row = c.execute("SELECT id, tenant_id, profile, auto FROM pub_earn_requests "
+                    "WHERE status='queued' " + ("AND auto=0 " if manual_only else "")
+                    + "AND profile NOT IN (SELECT profile FROM pub_earn_requests "
+                    "WHERE status='running') ORDER BY auto, created, id LIMIT 1").fetchone()
     if row is None:
         return None
     token = "earn_" + secrets.token_urlsafe(18)
@@ -404,7 +471,7 @@ def claim_request(c: sqlite3.Connection, host: str, now: float | None = None) ->
                     "WHERE id=? AND status='queued'", (token, host[:40], now, now, row[0]))
     if cur.rowcount != 1:
         return None
-    return {"id": row[0], "profile": row[2], "token": token}
+    return {"id": row[0], "profile": row[2], "token": token, "auto": bool(row[3])}
 
 
 def _own_request(c: sqlite3.Connection, req_id: int, token: str):
@@ -427,16 +494,17 @@ def beat_request(c: sqlite3.Connection, req_id: int, token: str, note: str = "",
 
 
 def finish_request(c: sqlite3.Connection, req_id: int, token: str, ok: bool, note: str = "",
-                   now: float | None = None):
-    """Закрыть задание. Возвращает tenant_id или None, если задание не этого пуллера."""
+                   now: float | None = None, skipped: bool = False):
+    """Закрыть задание. Возвращает tenant_id или None, если задание не этого пуллера.
+    `skipped` — профиль был занят и сборщик его не открывал (ночной обход)."""
     now = time.time() if now is None else now
     ensure_request_schema(c)
     row = _own_request(c, req_id, token)
     if row is None:
         return None
+    status = "done" if ok else ("skipped" if skipped else "failed")
     c.execute("UPDATE pub_earn_requests SET status=?, finished=?, heartbeat=?, note=?, "
-              "claim_token=NULL WHERE id=?",
-              ("done" if ok else "failed", now, now, note[:500], req_id))
+              "claim_token=NULL WHERE id=?", (status, now, now, note[:500], req_id))
     return row[1]
 
 
@@ -451,8 +519,137 @@ def channel_request(c: sqlite3.Connection, tenant, channel_id: int) -> dict:
                     "WHERE tenant_id=? AND profile=? ORDER BY id DESC LIMIT 1",
                     (tenant, serial)).fetchone()
     out = {"profile": serial, "can": True, "why": ""}
+    host = host_state(c)
+    if host.get("peer_ok") is False:
+        out["peer_down_since"] = host.get("since")
     if row is not None:
         out["last"] = {"id": row[0], "status": row[1], "title": REQ_TITLE.get(row[1], row[1]),
                        "created": row[2], "claimed": row[3], "finished": row[4],
                        "note": row[5] or ""}
+    return out
+
+
+# ─────────────────────── ежедневный сбор (14.10.2026) ───────────────────────
+#
+# Владелец 14.10: «стата почему-то должна ждать, когда я тыкаю заказать стату… хотя бы
+# раз в день фетчить всю стату». Раз в сутки, в назначенный час, студия сама ставит
+# сбор по всем каналам с профилем — тем же `request_collect`, что и кнопка «Собрать по
+# всем каналам», только с пометкой «ночной». Пуллер Минска такие задания не держит ради
+# занятого профиля (пропускает до следующих суток), а пока Мак Володи не отвечает —
+# оставляет их в очереди ждать его. Включено по умолчанию; выключается на экране
+# «Часы монетизации» или VS_EARN_AUTO=0.
+#
+# Живёт на том же минутном таймере, что тревоги и сводка (`dev/alerts.py`): своего
+# процесса не заводим — см. там же, почему.
+
+AUTO_KEY = "earn_auto"             # настройка: включено ли и в котором часу
+AUTO_DONE_KEY = "earn_auto_done"   # за какие сутки обход уже ставился (+ «:тенант»)
+AUTO_BY = "ежедневный сбор"
+AUTO_TZ = (os.environ.get("VS_EARN_TZ") or os.environ.get("VS_DIGEST_TZ")
+           or "Europe/Warsaw").strip()
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _zone(tz_name: str):
+    """Опечатка в поясе не должна ронять минутный таймер тревог — тогда UTC."""
+    try:
+        from zoneinfo import ZoneInfo
+        return ZoneInfo(tz_name)
+    except Exception:                    # noqa: BLE001
+        return dt.timezone.utc
+
+
+def auto_settings(c: sqlite3.Connection) -> dict:
+    """Что действует. Нет записи — умолчание из окружения: включено, 04:00 по Варшаве.
+
+    Четыре утра — заливка к этому часу обычно стоит, и к утру цифры уже в карточках.
+    Мак Володи в это время может спать — тогда ночные задания дождутся его в очереди.
+    """
+    saved = _state_get(c, AUTO_KEY)
+    saved = saved if isinstance(saved, dict) else {}
+    on = saved.get("on")
+    if not isinstance(on, bool):
+        on = os.environ.get("VS_EARN_AUTO", "1").strip() != "0"
+    hour = saved.get("hour")
+    if isinstance(hour, bool) or not isinstance(hour, int):
+        hour = _env_int("VS_EARN_HOUR", 4)
+    return {"on": on, "hour": min(23, max(0, hour)), "tz": AUTO_TZ}
+
+
+def set_auto_settings(c: sqlite3.Connection, on=None, hour=None, now=None) -> dict:
+    """Поправить настройку. Возвращает то, что стало действовать."""
+    now = time.time() if now is None else now
+    cur = auto_settings(c)
+    value = {"on": cur["on"], "hour": cur["hour"]}
+    if on is not None:
+        value["on"] = bool(on)
+    if hour is not None:
+        try:
+            if isinstance(hour, bool):
+                raise ValueError
+            hour = int(hour)
+        except (TypeError, ValueError):
+            raise ValueError("час сбора — целое число от 0 до 23")
+        if not 0 <= hour <= 23:
+            raise ValueError("час сбора — целое число от 0 до 23")
+        value["hour"] = hour
+    _state_put(c, AUTO_KEY, value, now)
+    return auto_settings(c)
+
+
+def daily_tick(c: sqlite3.Connection, tenant_id, now=None, tz_name: str = None) -> dict:
+    """Поставить ночной обход, если пора. Безопасно звать хоть каждую минуту.
+
+    Ставится не чаще раза в календарные сутки и только после назначенного часа.
+    Профиль, по которому сбор уже стоит или идёт (кнопка, вчерашний обход, который
+    ждёт Мака), второй раз не ставится — это делает сам `request_collect`.
+    """
+    now = time.time() if now is None else float(now)
+    if not tenant_id:
+        return {"queued": [], "why": "не задан тенант — ставить сбор не для кого"}
+    conf = auto_settings(c)
+    if not conf["on"]:
+        return {"queued": [], "why": "ежедневный сбор выключен настройкой"}
+    local = dt.datetime.fromtimestamp(now, _zone(tz_name or conf["tz"]))
+    day = local.strftime("%Y-%m-%d")
+    if local.hour < conf["hour"]:
+        return {"queued": [], "why": f"ещё рано: сбор в {conf['hour']:02d}:00"}
+    key = f"{AUTO_DONE_KEY}:{tenant_id}"
+    done = _state_get(c, key)
+    if isinstance(done, dict) and done.get("day") == day:
+        return {"queued": [], "why": "за эти сутки обход уже ставился"}
+    out = request_collect(c, tenant_id, None, by=AUTO_BY, now=now, auto=True)
+    _state_put(c, key, {"day": day, "at": now, "queued": len(out["queued"]),
+                        "already": len(out["already"]),
+                        "no_profile": len(out["no_profile"])}, now)
+    c.commit()
+    return {**out, "why": ""}
+
+
+def auto_status(c: sqlite3.Connection, tenant) -> dict:
+    """Для экрана: настройка, последний обход и чем кончились его задания."""
+    ensure_request_schema(c)
+    out = {"settings": auto_settings(c), "last": None, "host": host_state(c)}
+    done = _state_get(c, f"{AUTO_DONE_KEY}:{tenant}")
+    if not isinstance(done, dict) or not done.get("at"):
+        return out
+    rows = c.execute("SELECT status, note, profile FROM pub_earn_requests WHERE tenant_id=? "
+                     "AND auto=1 AND created>=? ORDER BY id", (tenant, done["at"])).fetchall()
+    counts, failed = {}, {}
+    for st, note, _p in rows:
+        counts[st] = counts.get(st, 0) + 1
+        if st == "failed":
+            failed[note or "без причины"] = failed.get(note or "без причины", 0) + 1
+    out["last"] = {"day": done.get("day"), "at": done["at"], "queued": done.get("queued", 0),
+                   "counts": counts,
+                   "skipped_profiles": sorted({str(p) for st, _n, p in rows if st == "skipped"},
+                                              key=lambda s: (len(s), s)),
+                   "failed_reasons": [{"note": k, "n": v} for k, v in
+                                      sorted(failed.items(), key=lambda x: -x[1])][:5]}
     return out
