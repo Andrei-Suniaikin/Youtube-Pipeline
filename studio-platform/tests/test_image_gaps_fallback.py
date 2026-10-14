@@ -70,10 +70,11 @@ def project(n=5, missing=(3,)):
 
 
 def main() -> int:
-    print("Сколько сцен можно отдать соседнему кадру — 2%, но не меньше одной")
-    check("240 сцен → 4", G.image_gaps_allowed(240), 4)
-    check("646 сцен → 12", G.image_gaps_allowed(646), 12)
-    check("40 сцен → 1", G.image_gaps_allowed(40), 1)
+    print("Сколько сцен можно отдать соседнему кадру — 5% (14.10.2026), но не меньше одной")
+    check("240 сцен → 12", G.image_gaps_allowed(240), 12)
+    check("646 сцен → 32", G.image_gaps_allowed(646), 32)
+    check("40 сцен → 2", G.image_gaps_allowed(40), 2)
+    check("10 сцен → 1", G.image_gaps_allowed(10), 1)
 
     print("\nКого повторять позже")
     giveup = {3: (G.GAP_FILTER, "фильтр"), 7: (G.GAP_LATER, "try again later"), 9: (G.GAP_OTHER, "x")}
@@ -117,9 +118,12 @@ def main() -> int:
     check("242 сцены → всего до 24", G.image_filter_gaps_allowed(242), 24)
     check("5 отказов фильтра из 242 — принимаются",
           G.image_gaps_acceptable(list(filt), 242, filt), True)
-    late5 = {i: (G.GAP_LATER, "try again later") for i in (1, 2, 3, 4, 5)}
-    check("5 обычных сбоев из 242 — нет, как раньше (2%)",
-          G.image_gaps_acceptable(list(late5), 242, late5), False)
+    late13 = {i: (G.GAP_LATER, "try again later") for i in range(0, 130, 10)}
+    check("13 обычных сбоев из 242 — нет (больше 5%)",
+          G.image_gaps_acceptable(list(late13), 242, late13), False)
+    late12 = {i: (G.GAP_LATER, "try again later") for i in range(0, 120, 10)}
+    check("12 обычных сбоев из 242 — да (5%)",
+          G.image_gaps_acceptable(list(late12), 242, late12), True)
     mix = {**filt, **{i: (G.GAP_OTHER, "x") for i in (1, 2, 3, 4)}}
     check("5 фильтра + 4 сбоя — принимаются", G.image_gaps_acceptable(list(mix), 242, mix), True)
     many = {i: (G.GAP_FILTER, "фильтр") for i in range(25)}
@@ -128,16 +132,16 @@ def main() -> int:
     check("маленький ролик: 1 из 40 — да, как раньше",
           G.image_gaps_acceptable([3], 40, {3: (G.GAP_OTHER, "x")}), True)
 
-    print("\nИтог решает серия пропусков подряд, а не доля (14.10.2026)")
-    check("11 разрозненных из 481 (Všední Den) — растягиваем",
-          G.image_gaps_stretchable([30, 31, 44, 57, 58, 64, 153, 157, 358, 364, 392], 481), True)
-    check("60 из 242 вразброс (25%) — тоже растягиваем",
-          G.image_gaps_stretchable(list(range(0, 240, 4)), 242), True)
-    check("5 подряд — ещё можно", G.image_gaps_stretchable([10, 11, 12, 13, 14], 242), True)
+    print("\nОкно 5% и не больше 5 подряд (14.10.2026)")
+    check("11 разрозненных сбоев из 481 (Všední Den) — растягиваем",
+          G.image_gaps_stretchable([30, 31, 44, 57, 58, 64, 153, 157, 358, 364, 392], 481, {}), True)
+    check("60 из 242 вразброс (25%) — нет, больше окна",
+          G.image_gaps_stretchable(list(range(0, 240, 4)), 242, {}), False)
+    check("5 подряд — ещё можно", G.image_gaps_stretchable([10, 11, 12, 13, 14], 242, {}), True)
     check("6 подряд — нет, картинка висела бы минутами",
-          G.image_gaps_stretchable([10, 11, 12, 13, 14, 15], 242), False)
-    check("ни одного кадра — нет", G.image_gaps_stretchable([0, 1, 2], 3), False)
-    check("пропусков нет — подменять нечего", G.image_gaps_stretchable([], 10), False)
+          G.image_gaps_stretchable([10, 11, 12, 13, 14, 15], 242, {}), False)
+    check("ни одного кадра — нет", G.image_gaps_stretchable([0, 1, 2], 3, {}), False)
+    check("пропусков нет — подменять нечего", G.image_gaps_stretchable([], 10, {}), False)
     check("серия подряд: 3", G.longest_gap_run([1, 2, 3, 7, 9, 10]), 3)
 
     print("\nКонец прогона устроен именно так")

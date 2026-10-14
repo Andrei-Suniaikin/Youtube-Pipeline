@@ -7391,7 +7391,8 @@ def googler_request_v6(endpoint: str, method: str = "POST", data: Optional[dict]
 # Подмена честная: файл сцены не подделывается и квитанция ему не выписывается. Сцена
 # записывается в googler/image_gaps.json с причиной и исключается из проверки квитанций.
 IMAGE_GAPS_FILE = "image_gaps.json"
-IMAGE_GAP_MAX_SHARE = float(os.environ.get("VS_IMAGE_GAP_MAX_SHARE", "0.02") or 0.02)
+# 14.10.2026, владелец: «давай расширим окно до 5 процентов» — было 2%.
+IMAGE_GAP_MAX_SHARE = float(os.environ.get("VS_IMAGE_GAP_MAX_SHARE", "0.05") or 0.05)
 # 11.10.2026, владелец: «если не проходит — заменяем, иначе падает ошибка и требует
 # оператора». Кадр, который фильтр отверг после смягчений и на всех моделях замены,
 # повтор не возьмёт — его отдаём соседнему кадру сверх 2%, но всего пропусков не больше
@@ -7420,7 +7421,7 @@ def _giveup_kind(error: str) -> str:
 
 
 def image_gaps_allowed(total: int) -> int:
-    """Сколько сцен ролика можно отдать соседнему кадру: 2%, но не меньше одной."""
+    """Сколько сцен ролика можно отдать соседнему кадру: 5%, но не меньше одной."""
     return max(1, int(int(total) * IMAGE_GAP_MAX_SHARE))
 
 
@@ -7438,14 +7439,11 @@ def image_gaps_acceptable(gaps, total: int, giveup=None) -> bool:
             and len(gaps) <= image_filter_gaps_allowed(total))
 
 
-# 14.10.2026, владелец: «ребята сказали просто в таком случае кадры растягивать, которые
-# уже готовы, вместо тех, что не отрисовались». За неделю 29 задач картинок упали на
-# пределах 2% / 10%, хотя рендер и так отдаёт время сцены без картинки предыдущему
-# готовому кадру (render_worker._collapse_missing_images). Теперь итог решает не доля, а
-# самая длинная серия пропусков подряд: разрозненные пропуски растягиваются всегда, а
-# серия длиннее IMAGE_GAP_MAX_RUN — минуты одной картинки — по-прежнему ошибка. Граница
-# та же, что у гейта рендера (main.IMG_RENDER_MAX_GAP = 5). Доли выше остаются для
-# «повтора позже»: ждать и платить повторно имеет смысл, только когда недостаёт немного.
+# 14.10.2026, владелец: «кадры растягивать, которые уже готовы, вместо тех, что не
+# отрисовались», окно — 5% ролика (фильтр — по-прежнему до 10%). Рендер и так отдаёт время
+# сцены без картинки предыдущему готовому кадру (render_worker._collapse_missing_images), но
+# серию длиннее IMAGE_GAP_MAX_RUN подряд не пропускает его же гейт (main.IMG_RENDER_MAX_GAP
+# = 5): это минуты одной картинки. Поэтому серия длиннее — ошибка и здесь, сразу.
 IMAGE_GAP_MAX_RUN = int(os.environ.get("VS_IMAGE_GAP_MAX_RUN", "5") or 5)
 
 
@@ -7460,11 +7458,12 @@ def longest_gap_run(gaps) -> int:
     return best
 
 
-def image_gaps_stretchable(gaps, total: int) -> bool:
-    """Можно ли отдать пропуски готовым кадрам: хоть один кадр есть, и подряд пропущено
-    не больше IMAGE_GAP_MAX_RUN сцен."""
+def image_gaps_stretchable(gaps, total: int, giveup=None) -> bool:
+    """Можно ли отдать пропуски готовым кадрам: в окне долей (image_gaps_acceptable),
+    хоть один кадр есть, и подряд пропущено не больше IMAGE_GAP_MAX_RUN сцен."""
     gaps = list(gaps)
     return (bool(gaps) and len(set(gaps)) < int(total)
+            and image_gaps_acceptable(gaps, total, giveup)
             and longest_gap_run(gaps) <= IMAGE_GAP_MAX_RUN)
 
 
@@ -14544,9 +14543,11 @@ def cmd_full_pipeline(args):
         if _final_gaps:
             _filt = len(_final_gaps) - len(late_retry_indices(_final_gaps))
             print_user(f"⛔ Недостающих кадров {len(_final_gaps)} из {total} (из них отказ фильтра: "
-                       f"{_filt}), подряд пропущено {longest_gap_run(_final_gaps)} сцен — "
-                       f"больше {IMAGE_GAP_MAX_RUN}: растянуть готовые кадры нельзя, "
-                       f"картинка висела бы минутами; нужен разбор", "ERROR")
+                       f"{_filt}, подряд до {longest_gap_run(_final_gaps)}) — больше допустимого: "
+                       f"сбоев не больше {image_gaps_allowed(total)} (5%), всего не больше "
+                       f"{image_filter_gaps_allowed(total)} (10%), подряд не больше "
+                       f"{IMAGE_GAP_MAX_RUN}; кадрами предыдущих сцен не заменяю, нужен разбор",
+                       "ERROR")
     reconciliation = _reconcile_authoritative_image_set(
         project_dir, receipt_path, image_receipts,
         [f"{index + 1:03d}.jpg" for index in range(total)],
