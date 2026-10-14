@@ -55,8 +55,11 @@ def world(mark):
 
 
 def mark(c, kind="images"):
-    return c.execute("SELECT error FROM pub_release_jobs WHERE release_id='r1' AND kind=?",
-                     (kind,)).fetchone()[0]
+    # С 14.10 возврат человеком забывает упавшую задачу этапа целиком — строки нет,
+    # значит, и пометки нет.
+    row = c.execute("SELECT error FROM pub_release_jobs WHERE release_id='r1' AND kind=?",
+                    (kind,)).fetchone()
+    return row[0] if row else None
 
 
 def main() -> int:
@@ -67,10 +70,12 @@ def main() -> int:
         check(f"{m}: выпуск вернулся", out.get("ok"), True)
         check(f"{m}: пометка снята", mark(c), None)
 
-    print("\nДругие пометки зеркала не трогаем")
+    print("\nДругие этапы не трогаем")
     c = world("re-enqueued")
     E.revive(c, "r1", NOW)
-    check("«re-enqueued» осталась", mark(c), "re-enqueued")
+    check("упавшие картинки забыты", mark(c), None)
+    check("озвучка на месте", c.execute("SELECT 1 FROM pub_release_jobs WHERE kind='tts'")
+          .fetchone() is not None, True)
 
     print("\nВозврат вслепую — счёт остаётся")
     c = world("images-retry:2")

@@ -137,6 +137,20 @@ def main() -> int:
     check("400 — не временное", E.transient_kind(
         "обложка не сделалась: Error code: 400 - bad prompt"), None)
 
+    print("\nВозврат человеком забывает упавшую задачу (14.10)")
+    c = world("этап «tts» завершился со статусом error")
+    check("возврат удался", E.revive(c, "r1", NOW)["ok"], True)
+    check("упавшая озвучка забыта", has_job(c, "vsgen", "tts"), False)
+    check("обложка не тронута", has_job(c, "cover", "job"), True)
+    c = world("обложка не сделалась: Error code: 400 - bad prompt")
+    check("возврат с обложкой удался", E.revive(c, "r1", NOW)["ok"], True)
+    check("упавшая обложка забыта", has_job(c, "cover", "job"), False)
+    check("этап не тронут", has_job(c, "vsgen", "tts"), True)
+    c = world("account recovery needs the owner: no exact account binding")
+    E.revive(c, "r1", NOW)
+    check("иная причина — задачи на месте",
+          (has_job(c, "vsgen", "tts"), has_job(c, "cover", "job")), (True, True))
+
     print("\nТо, что чинят люди, — не трогаем")
     for reason in ("обложка деградировала дважды: текст наложен поверх картинки",
                    "у ролика нет субтитров (VideoUnplayable)",

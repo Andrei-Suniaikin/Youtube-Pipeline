@@ -525,6 +525,14 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
                  "и соберём комплект с нуля", now=now)
     c.execute("UPDATE pub_plan_items SET status='running', updated=? WHERE id=? "
               "AND status='error'", (now, rel["plan_item_id"]))
+    # 14.10.2026: возврат выпуска, остановленного упавшим этапом или обложкой, сразу
+    # падал обратно — движок тем же тиком находил ту же упавшую задачу. Человек вернул
+    # выпуск — значит, просит повторить: упавшую работу забываем, движок закажет заново.
+    # Возврат вслепую (keep_attempts) так не делает: у автовозврата своё забывание.
+    forgot = "" if keep_attempts else _forget_on_revive(c, release_id,
+                                                         rel["blocked_reason"] or "")
+    if forgot:
+        log_line(c, release_id, "движок", forgot, now=now)
     reset_rewrite_resumes(c, release_id)
     if not keep_attempts:
         # Возврат вслепую (keep_attempts) счёт повторов не обнуляет: иначе автоматический
@@ -535,6 +543,21 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
              + ("" if keep_attempts else ", счётчик попыток обнулён"), now=now)
     log_phase(c, release_id, "revived", now, payload={"from_phase": rel["phase"]})
     return {"ok": True, "phase": phase}
+
+
+_COVER_FAILED_RE = re.compile(r"^обложка не (?:сделалась|нарисовалась)")
+
+
+def _forget_on_revive(c, release_id: str, reason: str) -> str:
+    """Забыть упавшую задачу этапа или обложки при возврате выпуска. Что забыто — словами."""
+    m = _STAGE_FAILED_RE.match(reason)
+    if m:
+        _forget_failed(c, release_id, "stage", m.group(1))
+        return f"упавшая задача этапа «{m.group(1)}» забыта — движок поставит этап заново"
+    if _COVER_FAILED_RE.match(reason):
+        _forget_failed(c, release_id, "cover", "")
+        return "упавшая задача обложки забыта — движок закажет обложку заново"
+    return ""
 
 
 def reset_stage_retries(c, release_id: str) -> int:
