@@ -24,7 +24,7 @@ OEMBED = "https://www.youtube.com/oembed"
 YT_HOSTS = ("youtube.com", "youtu.be")
 
 
-def donor_title(url: str) -> str:
+def donor_title(url: str, c=None) -> str:
     """Оригинальное название донорского ролика.
 
     Через открытый oembed YouTube — без ключей и квот. Не ответил или ролик закрыт —
@@ -39,15 +39,23 @@ def donor_title(url: str) -> str:
     `pub_calls.quota_allow()` / `quota_spend()` под именем потребителя «donor»,
     иначе общий кошелёк снова будет опустошать тот, кто про него не знает.
     """
-    return donor_lookup(url)[1]
+    return donor_lookup(url, c)[1]
 
 
-# Ответы oembed, которые значат «ролика нет ни для кого»: удалён (400/404) или закрыт
-# (401/403). Всё остальное — сеть, 429, 5xx — «не знаем», а не приговор.
-OEMBED_GONE = (400, 401, 403, 404)
+# Ответы oembed, которые значат «ролика нет ни для кого»: удалён (400/404). Всё
+# остальное — сеть, 429, 5xx — «не знаем», а не приговор.
+OEMBED_GONE = (400, 404)
+# 401/403 — ролик закрыт ЛИБО у живого ролика запрещено встраивание: oembed отвечает
+# на них одинаково. 14.10.2026, «Mrazivé Archivy»: донор живой, с минского адреса
+# открывается, `playableInEmbed: false` — а мы читали 401 как «закрыт», название
+# оставалось пустым, и готовый ролик встал перед заливкой «у донора нет названия».
+# Различает их только YouTube Data API; без соединения с базой (учёт квоты) — «не знаем».
+OEMBED_CLOSED = (401, 403)
+# Под этим именем расход единиц видно в `pub_calls.quota_usage` (см. шапку donor_title).
+DONOR_CONSUMER = "donor"
 
 
-def donor_lookup(url: str) -> tuple:
+def donor_lookup(url: str, c=None) -> tuple:
     """(«alive» | «gone» | «unknown», название). Тот же oembed, что у `donor_title`.
 
     05.10.2026: `donor_title` отдавал пусто и на удалённый ролик, и на обрыв сети, и на
@@ -64,12 +72,41 @@ def donor_lookup(url: str) -> tuple:
         return "unknown", ""
     if r.status_code in OEMBED_GONE:
         return "gone", ""
+    if r.status_code in OEMBED_CLOSED:
+        return _closed_lookup(url, c)
     if r.status_code != 200:
         return "unknown", ""
     try:
         return "alive", (r.json().get("title") or "").strip()[:300]
     except Exception:
         return "unknown", ""
+
+
+def _closed_lookup(url: str, c) -> tuple:
+    """oembed ответил «закрыт» — спросить ключом YouTube Data API (одна единица).
+
+    Ключ видит только публичные и доступные по ссылке ролики: есть строка — донор живой,
+    с названием; нет строки — закрыт или удалён, для нас это одно. Квота общая с
+    проверкой публикаций и статистикой, поэтому без соединения (учёта) не спрашиваем.
+    """
+    vid = video_id(url) if c is not None else ""
+    if not vid:
+        return "unknown", ""
+    try:
+        import pub_calls                                           # noqa: PLC0415
+        import pub_verify                                          # noqa: PLC0415
+        key = pub_verify.api_key(c)
+        if not key or not pub_calls.quota_allow(c, DONOR_CONSUMER)["ok"]:
+            return "unknown", ""
+        res = pub_verify.check(vid, key, c=c, consumer=DONOR_CONSUMER)
+    except Exception:                                              # noqa: BLE001
+        return "unknown", ""
+    if res.get("state") in (pub_verify.PUBLIC, pub_verify.UNLISTED):
+        return "alive", " ".join(str(res.get("title") or "").split())[:300]
+    if res.get("state") == pub_verify.NOT_PUBLIC:
+        return "gone", ""
+    return "unknown", ""
+
 
 URL_RE = re.compile(r"https?://\S+")
 

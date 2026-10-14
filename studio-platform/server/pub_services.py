@@ -1397,9 +1397,9 @@ class PubServices:
         VS_TITLE_PROVIDER=openai возвращает прежний путь через ключ OpenAI — на случай,
         если счёт пополнят и захотят вернуть; сейчас он пуст и отвечает 429.
         """
+        donor = self._donor_title(c, rel)
         if (os.environ.get("VS_TITLE_PROVIDER") or "codex").strip().lower() == "openai":
-            return make_title(rel["donor_title"] or "", rel["lang"] or "ru",
-                              self._openai_key(c))
+            return make_title(donor, rel["lang"] or "ru", self._openai_key(c))
         rid = rel.get("release_id") if hasattr(rel, "get") else rel["release_id"]
         with self._titles_lock:
             job = self._titles.get(rid)
@@ -1414,8 +1414,7 @@ class PubServices:
             import threading as _threading
             # Ключ читаем здесь: соединение с базой принадлежит кругу движка, в фон его
             # отдавать нельзя.
-            args = (rel["donor_title"] or "", rel["lang"] or "ru", get_key(c, "rewrite"),
-                    REWRITE_BASE)
+            args = (donor, rel["lang"] or "ru", get_key(c, "rewrite"), REWRITE_BASE)
             job = {"title": "", "error": "", "fatal": False}
 
             def work(job=job, args=args):
@@ -1436,6 +1435,26 @@ class PubServices:
             if not job["thread"].is_alive() and self._titles.get(rid) is job:
                 return self._title_result(rid, job)
         raise TitleUnavailable("заказал название подписке Codex — ждём ответа")
+
+    def _donor_title(self, c, rel) -> str:
+        """Название донора; пустое в плане — спросить ещё раз и запомнить (14.10.2026).
+
+        При вставке ссылки название тянется открытым oembed, а он на живой ролик с
+        запрещённым встраиванием отвечает 401 — строка плана остаётся без названия, и
+        готовый ролик вставал перед заливкой «у донора нет названия». Здесь есть
+        соединение, поэтому «закрыт» разбирает ключ YouTube Data API с учётом квоты.
+        """
+        title = " ".join(str(rel["donor_title"] or "").split())
+        url = rel["donor_url"] if "donor_url" in rel.keys() else ""
+        if title or not url:
+            return title
+        from pub_tags import donor_lookup                          # noqa: PLC0415
+        state, title = donor_lookup(url, c)
+        if state == "alive" and title:
+            c.execute("UPDATE pub_plan_items SET donor_title=? WHERE id=? "
+                      "AND COALESCE(donor_title,'')=''", (title, rel["plan_item_id"]))
+            return title
+        return ""
 
     def _title_result(self, rid, job) -> str:
         """Готовый фоновый заказ названия: забрать и убрать. Зовётся под _titles_lock."""

@@ -388,7 +388,8 @@ def check(video_id: str, key: str, fetch=None, c=None, now=None,
     state = PUBLIC if privacy == "public" else (
         UNLISTED if privacy == "unlisted" else NOT_PUBLIC)
     return {"state": state, "privacy": privacy, "upload": upload, "cost": COST,
-            "published_at": snippet.get("publishedAt") or "", "error": ""}
+            "published_at": snippet.get("publishedAt") or "",
+            "title": snippet.get("title") or "", "error": ""}
 
 
 def due(c, tenant=None, now=None, grace=None) -> list:

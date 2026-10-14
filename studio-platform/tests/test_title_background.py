@@ -150,6 +150,41 @@ def main() -> int:
         (kind, msg), _ = attempt(s, rel("r5"))
         check("ошибка выпуска", (kind, "нет названия" in msg), ("error", True))
 
+        print("\nВ плане названия нет — спрашиваем донора ещё раз и запоминаем (14.10.2026)")
+        import pub_tags
+        c = sqlite3.connect(":memory:")
+        c.execute("CREATE TABLE pub_plan_items(id INTEGER PRIMARY KEY, donor_title TEXT)")
+        c.execute("INSERT INTO pub_plan_items(id,donor_title) VALUES(605,'')")
+        got = []
+        S.make_title_codex = lambda donor, *a, **k: got.append(donor) or "Mrazivý název"
+        saved_lookup = pub_tags.donor_lookup
+        pub_tags.donor_lookup = lambda url, c_=None: ("alive", "Провёл 66 ЛЕТ в капсуле")
+        try:
+            s = svc()
+            r = {"release_id": "r9", "donor_title": "", "lang": "cs", "plan_item_id": 605,
+                 "donor_url": "https://youtu.be/a0z3FKQ_5rI"}
+            t0 = time.monotonic()
+            out = None
+            while time.monotonic() - t0 < 3:
+                try:
+                    out = s._make_title(c, r)
+                    break
+                except TitleUnavailable:
+                    time.sleep(0.05)
+            check("название сделано из найденного", (out, got[:1]),
+                  ("Mrazivý název", ["Провёл 66 ЛЕТ в капсуле"]))
+            check("и записано в план", c.execute(
+                "SELECT donor_title FROM pub_plan_items WHERE id=605").fetchone()[0],
+                "Провёл 66 ЛЕТ в капсуле")
+            pub_tags.donor_lookup = lambda url, c_=None: ("gone", "")
+            S.make_title_codex = bad
+            s = svc()
+            (kind, msg), _ = attempt(s, {**r, "release_id": "r10", "plan_item_id": 1})
+            check("донора нет — по-прежнему ошибка выпуска", (kind, "нет названия" in msg),
+                  ("error", True))
+        finally:
+            pub_tags.donor_lookup = saved_lookup
+
         print("\nНеожиданное исключение в фоне — ждём, а не роняем круг")
         def boom(*a, **k):
             raise ValueError("сломалось")

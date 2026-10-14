@@ -323,11 +323,20 @@ def _video_really_gone(vid: str) -> bool:
     """
     if not vid:
         return False
+    c = None
     try:
         from pub_tags import donor_lookup                          # noqa: PLC0415
-        return donor_lookup(f"https://www.youtube.com/watch?v={vid}")[0] == "gone"
+        # Соединение — для «закрыт» у oembed: его разбирает ключ API с учётом квоты.
+        c = _cabinet_db()
+        c.row_factory = __import__("sqlite3").Row
+        gone = donor_lookup(f"https://www.youtube.com/watch?v={vid}", c)[0] == "gone"
+        c.commit()
+        return gone
     except Exception:                                              # noqa: BLE001
         return False
+    finally:
+        if c is not None:
+            c.close()
 
 
 def _no_subtitles(exc) -> bool:
