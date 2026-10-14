@@ -4003,6 +4003,9 @@ def source_is_donor_cta_only(text: str) -> bool:
     sentences = [s.rstrip(".!?") for s in re.split(r"(?<=[.!?])\s+", text)]
     requests = (
         r"(?:hit|click|press) (?:that |the )?like button",
+        # 14.10.2026, «Oțel și Aripi»: просьба и лайк одной фразой через запятую.
+        r"if this story moved you(?: the way it moved (?:us|me))?, do (?:me|us) a favor, "
+        r"(?:hit|click|press) (?:that |the )?like button",
         r"(?:hit |please )?subscribe(?: and turn on notifications)?",
         r"(?:drop|leave) a comment(?: right now)?(?: and tell (?:us|me) where you(?:'re| are) watching from)?",
         r"tell (?:us|me) (?:your location|if someone in your family served|where you(?:'re| are) watching from)",
@@ -4011,19 +4014,21 @@ def source_is_donor_cta_only(text: str) -> bool:
     support = (
         r"if this story moved you(?: the way it moved (?:us|me))?, do (?:me|us) a favor",
         r"every (?:single )?like tells youtube to show this story to more people",
-        r"we(?:'re| are) rescuing forgotten stories from dusty archives every (?:single )?day",
+        r"we(?:'re| are)? rescu(?:e|ing) forgotten stories from dusty archives every (?:single )?day",
         r"real (?:people|stories|history|heroism)(?:, real (?:people|stories|history|heroism))?",
         r"are you watching from the (?:united states|united kingdom)(?:, (?:united kingdom|canada|australia))*",
         r"our community stretches across the (?:entire |whole )?world",
         r"you(?:'re| are) not just a viewer",
         r"you(?:'re| are) part of keeping these memories alive",
-        r"thank you for watching(?: and thank you for making sure [a-z]+(?: [a-z]+){0,3} doesn't disappear into silence)?",
-        r"these (?:men|people) deserve to be remembered, and you(?:'re| are) helping make that(?: happen)?",
+        r"thank you for watching(?: and thank you for making sure [a-z]+(?: [a-z]+){0,5} "
+        r"(?:doesn't|does not|don't|do not) disappear into silence)?",
+        r"these (?:men|people) deserve to be remembered,? and you(?:'re| are) helping make that(?: happen)?",
     )
     # Topic labels are promotional context, not permission to drop a narrative.
     # The small vocabulary rejects dates, named places/people and unknown facts.
     teaser_words = set("fighter pilots soldiers people heroes stories history war battles weapons pistols "
-                       "planes jets oceans archives modified attacked crossed impossible odds and who about".split())
+                       "planes jets oceans archives modified attacked crossed impossible odds and who about "
+                       "risked everything for their comrades".split())
     request_count = 0
     for index, sentence in enumerate(sentences):
         if any(re.fullmatch(pattern, sentence, re.I) for pattern in requests):
