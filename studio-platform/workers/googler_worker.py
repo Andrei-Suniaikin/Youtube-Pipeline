@@ -7438,6 +7438,36 @@ def image_gaps_acceptable(gaps, total: int, giveup=None) -> bool:
             and len(gaps) <= image_filter_gaps_allowed(total))
 
 
+# 14.10.2026, владелец: «ребята сказали просто в таком случае кадры растягивать, которые
+# уже готовы, вместо тех, что не отрисовались». За неделю 29 задач картинок упали на
+# пределах 2% / 10%, хотя рендер и так отдаёт время сцены без картинки предыдущему
+# готовому кадру (render_worker._collapse_missing_images). Теперь итог решает не доля, а
+# самая длинная серия пропусков подряд: разрозненные пропуски растягиваются всегда, а
+# серия длиннее IMAGE_GAP_MAX_RUN — минуты одной картинки — по-прежнему ошибка. Граница
+# та же, что у гейта рендера (main.IMG_RENDER_MAX_GAP = 5). Доли выше остаются для
+# «повтора позже»: ждать и платить повторно имеет смысл, только когда недостаёт немного.
+IMAGE_GAP_MAX_RUN = int(os.environ.get("VS_IMAGE_GAP_MAX_RUN", "5") or 5)
+
+
+def longest_gap_run(gaps) -> int:
+    """Самая длинная серия пропущенных сцен подряд."""
+    best = run = 0
+    prev = None
+    for i in sorted(set(int(g) for g in gaps)):
+        run = run + 1 if prev is not None and i == prev + 1 else 1
+        best = max(best, run)
+        prev = i
+    return best
+
+
+def image_gaps_stretchable(gaps, total: int) -> bool:
+    """Можно ли отдать пропуски готовым кадрам: хоть один кадр есть, и подряд пропущено
+    не больше IMAGE_GAP_MAX_RUN сцен."""
+    gaps = list(gaps)
+    return (bool(gaps) and len(set(gaps)) < int(total)
+            and longest_gap_run(gaps) <= IMAGE_GAP_MAX_RUN)
+
+
 def late_retry_indices(gaps, giveup=None) -> list:
     """Кадры, которые имеет смысл повторить позже: всё, кроме отказа фильтра."""
     giveup = _FRAME_GIVEUP if giveup is None else giveup
@@ -14504,7 +14534,7 @@ def cmd_full_pipeline(args):
                        os.path.join(output_dir, f"{i + 1:03d}.jpg"),
                    )]
     _accepted = []
-    if _final_gaps and image_gaps_acceptable(_final_gaps, total):
+    if _final_gaps and image_gaps_stretchable(_final_gaps, total):
         _accepted = _final_gaps
         for _row in write_image_gaps(output_dir, _accepted):
             print_user(f"🧩 [{_row['scene']}] Сцена {_row['scene']} заменена кадром предыдущей сцены: "
@@ -14514,10 +14544,9 @@ def cmd_full_pipeline(args):
         if _final_gaps:
             _filt = len(_final_gaps) - len(late_retry_indices(_final_gaps))
             print_user(f"⛔ Недостающих кадров {len(_final_gaps)} из {total} (из них отказ фильтра: "
-                       f"{_filt}) — больше допустимого: сбоев не больше "
-                       f"{image_gaps_allowed(total)} (2%), всего не больше "
-                       f"{image_filter_gaps_allowed(total)} (10%); кадрами предыдущих сцен не "
-                       f"заменяю, нужен разбор", "ERROR")
+                       f"{_filt}), подряд пропущено {longest_gap_run(_final_gaps)} сцен — "
+                       f"больше {IMAGE_GAP_MAX_RUN}: растянуть готовые кадры нельзя, "
+                       f"картинка висела бы минутами; нужен разбор", "ERROR")
     reconciliation = _reconcile_authoritative_image_set(
         project_dir, receipt_path, image_receipts,
         [f"{index + 1:03d}.jpg" for index in range(total)],

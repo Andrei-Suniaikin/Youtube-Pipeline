@@ -128,12 +128,24 @@ def main() -> int:
     check("маленький ролик: 1 из 40 — да, как раньше",
           G.image_gaps_acceptable([3], 40, {3: (G.GAP_OTHER, "x")}), True)
 
+    print("\nИтог решает серия пропусков подряд, а не доля (14.10.2026)")
+    check("11 разрозненных из 481 (Všední Den) — растягиваем",
+          G.image_gaps_stretchable([30, 31, 44, 57, 58, 64, 153, 157, 358, 364, 392], 481), True)
+    check("60 из 242 вразброс (25%) — тоже растягиваем",
+          G.image_gaps_stretchable(list(range(0, 240, 4)), 242), True)
+    check("5 подряд — ещё можно", G.image_gaps_stretchable([10, 11, 12, 13, 14], 242), True)
+    check("6 подряд — нет, картинка висела бы минутами",
+          G.image_gaps_stretchable([10, 11, 12, 13, 14, 15], 242), False)
+    check("ни одного кадра — нет", G.image_gaps_stretchable([0, 1, 2], 3), False)
+    check("пропусков нет — подменять нечего", G.image_gaps_stretchable([], 10), False)
+    check("серия подряд: 3", G.longest_gap_run([1, 2, 3, 7, 9, 10]), 3)
+
     print("\nКонец прогона устроен именно так")
     src = open(os.path.join(BASE, "workers", "googler_worker.py"), encoding="utf-8").read()
     tail = src[src.find("_final_gaps = [i for i in range(total)"):]
     tail = tail[:tail.find("def cmd_check_usage")]
-    check("в пределах допуска — сцены принимаются и записываются",
-          "image_gaps_acceptable(_final_gaps, total)" in tail
+    check("растяжимые пропуски — сцены принимаются и записываются",
+          "image_gaps_stretchable(_final_gaps, total)" in tail
           and "write_image_gaps(output_dir, _accepted)" in tail, True)
     check("и исключаются из проверки квитанций",
           'skip_frames={f"{index + 1:03d}" for index in _accepted}' in tail, True)
