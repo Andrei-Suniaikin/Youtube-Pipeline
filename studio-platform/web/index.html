@@ -9861,6 +9861,10 @@ async function viewProfile(){
       <div class="secbody"><div class="note bad">Состояние ключей прочитать не удалось:
         ${esc(e.message)}. Денег это не стоило — карточка только читает.</div></div></div>`));
   }
+  // Личный отчёт в телеграм (владелец 14.10.2026) — у КАЖДОГО свой, поэтому в профиле
+  // и без проверки роли: про свои каналы может узнавать и оператор.
+  app.append(await tgReportCard());
+
   // Подписки для текста — рядом с ключами: заказчик меняет их отсюда, а не по SSH.
   if (me.role === 'admin'){
     const srv = await serverKeysCard();
@@ -11856,6 +11860,158 @@ async function accountsCard(){
     act(() => post(`/ui/accounts/${inp.dataset.id}`, {quota: inp.value})));
 
   return card;
+}
+
+/* ─────────────────────── личный отчёт в телеграм ───────────────────────
+
+   14.10.2026, владелец: «в настройках подключать свой тг, чтобы тебе по твоим каналам
+   приходил отчёт: у этих каналов проебан AdsPower, этим каналам не хватает донора».
+
+   Свой chat_id никто не знает, поэтому привязка — кодом: «Подключить Telegram» даёт
+   ссылку t.me/<бот>?start=<код>, человек жмёт Start, и студия при ближайшем опросе
+   бота (раз в минуту, или сразу по «Проверить») привязывает этот чат к нему. Код живёт
+   15 минут и срабатывает один раз.
+
+   Каналов «своих» в студии нет — у канала нет ведущего. Поэтому отбор выбирает сам
+   человек: все каналы или теги/каналы. Рассылка выключена, пока её не включат: бед нет
+   — сообщения нет (жалоба владельца 28.09.2026 на поток сообщений). */
+async function tgReportCard(){
+  let d;
+  try{ d = await api('/ui/tg-report'); }
+  catch(e){
+    if (e instanceof NeedLogin) throw e;
+    return $(`<div class="card" style="margin-top:16px">
+      <div class="sec">Telegram-отчёт</div>
+      <div class="secbody"><div class="note bad">Настройку прочитать не удалось:
+        ${esc(e.message)}</div></div></div>`);
+  }
+  const wrap = $('');
+  const paint = () => {
+    const f = d.filter || {mode: 'all', tags: [], channels: []};
+    const pick = f.mode === 'pick';
+    const tagsOn = new Set(f.tags || []), chOn = new Set(f.channels || []);
+    const chips = (list, on, kind) => list.length
+      ? `<div class="langs" data-kind="${kind}">${list.map(x => `<label data-id="${x.id}"
+          class="${on.has(x.id) ? 'on' : ''}"><input type="checkbox"
+          ${on.has(x.id) ? 'checked' : ''}>${esc(x.name)}</label>`).join('')}</div>`
+      : `<div class="note muted">${kind === 'tags' ? 'Тегов в студии нет.' : 'Каналов нет.'}</div>`;
+    const left = d.code_expires ? Math.max(0, Math.ceil((d.code_expires * 1000 - Date.now()) / 60000)) : 0;
+    wrap.innerHTML = `<div class="card" style="margin-top:16px">
+      <div class="sec">Telegram-отчёт ${hintDot('Раз в сутки, в выбранный час, бот присылает '
+        + 'короткую выжимку только о бедах: каналы, у которых заливка упирается в профиль '
+        + 'AdsPower или вход, и каналы, которым не хватает донора. Бед нет — сообщения нет. '
+        + 'Время — по поясу сводки (' + (d.tz || '') + ').')}</div>
+      <div class="secbody">
+        ${!d.bot_ready ? `<div class="note bad">Бот студии не настроен (нет VS_TG_TOKEN) —
+           подключить телеграм пока нельзя.</div>` : ''}
+        <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap">
+          ${d.linked
+            ? `<span class="pill s-done">подключён</span>
+               <span>${esc(d.chat_title || 'чат')}</span>
+               <button class="ghost small" id="tgr-unlink">Отключить</button>
+               <button class="ghost small" id="tgr-now">Прислать сейчас (проверка)</button>`
+            : `<span class="pill s-idle">не подключён</span>
+               <button class="small" id="tgr-link"${d.bot_ready ? '' : ' disabled'}
+                 >Подключить Telegram</button>`}
+        </div>
+        ${!d.linked && d.code ? `<div class="note" style="margin-top:10px">
+            Откройте ссылку и нажмите Start в телеграме:
+            ${d.link ? `<a href="${esc(d.link)}" target="_blank" rel="noopener"
+              class="mono">${esc(d.link)}</a>` : `код <span class="mono">${esc(d.code)}</span>`}
+            <div class="muted">Ссылка одноразовая, действует ещё ${left} мин. Привязка
+              подхватится в течение минуты — или сразу:
+              <button class="ghost small" id="tgr-check">Проверить</button></div></div>` : ''}
+        ${d.poll_error ? `<div class="note bad">${esc(d.poll_error)}</div>` : ''}
+        ${d.linked ? `
+        <div style="display:flex;gap:10px;align-items:center;margin-top:12px;flex-wrap:wrap">
+          <label style="display:flex;gap:8px;align-items:center">
+            <input type="checkbox" id="tgr-on"${d.enabled ? ' checked' : ''}>
+            Присылать раз в сутки</label>
+          <label style="display:flex;gap:8px;align-items:center" class="muted">
+            в <input type="number" id="tgr-hour" min="0" max="23" value="${d.hour}"
+              style="width:64px;text-align:right"> часов</label>
+        </div>
+        <div style="margin-top:12px">
+          <label class="k" style="display:block">О каких каналах</label>
+          <label style="margin-right:14px"><input type="radio" name="tgr-mode" value="all"
+            ${pick ? '' : 'checked'}> все каналы студии</label>
+          <label><input type="radio" name="tgr-mode" value="pick"
+            ${pick ? 'checked' : ''}> по выбору</label>
+          <div id="tgr-pick"${pick ? '' : ' hidden'}>
+            <div class="muted" style="margin-top:8px">Теги — канал с любым из них:</div>
+            ${chips(d.tags || [], tagsOn, 'tags')}
+            <div class="muted" style="margin-top:8px">И отдельные каналы:</div>
+            ${chips(d.channels || [], chOn, 'channels')}
+          </div>
+        </div>` : ''}
+        <div class="note muted">Рассылка выключена, пока вы её не включите. В дни без бед
+          отчёт не приходит.</div>
+        <div id="tgr-err"></div>
+      </div></div>`;
+    // Свёртка — как у остальных разделов профиля. Перерисовка заменяет карточку
+    // целиком, поэтому сворачиваем заново; открытое состояние помнит REF_FOLD_OPEN.
+    foldRefCard(wrap.querySelector('.card'), 'profile:tgreport',
+      d.linked ? (d.enabled ? `приходит в ${d.hour}:00` : 'подключён, выключен')
+               : 'не подключён');
+    // Любой исход — перерисовка из `d`, то есть из сохранённого на сервере. При отказе
+    // галочка возвращается как была: оставшись включённой, она обещала бы рассылку,
+    // которой не будет. Текст отказа пишется уже в перерисованную карточку.
+    const act = async (fn, okText) => {
+      let msg = '';
+      try{
+        const out = await fn();
+        if (out && out.filter) d = out;
+        const t = typeof okText === 'function' ? okText(d) : okText;
+        if (t) toast(t, 'ok');
+      }catch(e){
+        if (e instanceof NeedLogin) throw e;
+        msg = e.message;
+      }
+      paint();
+      if (msg) wrap.querySelector('#tgr-err').innerHTML = `<div class="err">${esc(msg)}</div>`;
+    };
+    const on = id => wrap.querySelector(id);
+    if (on('#tgr-link')) on('#tgr-link').onclick = () => act(() => post('/ui/tg-report/link'));
+    if (on('#tgr-check')) on('#tgr-check').onclick = () => act(async () => {
+      const out = await post('/ui/tg-report/check');
+      toast(out.linked ? 'телеграм подключён' : 'пока не видно — нажмите Start в телеграме',
+            out.linked ? 'ok' : 'bad');
+      return out;
+    });
+    if (on('#tgr-unlink')) on('#tgr-unlink').onclick = () => confirmInline(on('#tgr-unlink'),
+      'Отключить телеграм? Отчёт перестанет приходить.',
+      () => act(() => post('/ui/tg-report/unlink'), 'телеграм отключён'));
+    if (on('#tgr-now')) on('#tgr-now').onclick = () => act(async () => {
+      const out = await post('/ui/tg-report/send-now');
+      toast(out.empty ? 'отправлено: бед нет' : 'отчёт отправлен', 'ok');
+    });
+    if (!d.linked) return;
+    // Каждая правка сохраняется сама, как у рассылки сводки.
+    const save = (body, okText) => act(() => post('/ui/tg-report/settings', body), okText);
+    on('#tgr-on').onchange = () => save({enabled: on('#tgr-on').checked}, x => x.enabled
+      ? `отчёт будет приходить в ${x.hour}:00, если есть беды` : 'отчёт выключен');
+    on('#tgr-hour').onchange = () => save({hour: Number(on('#tgr-hour').value)});
+    const readFilter = mode => {
+      const ids = kind => [...wrap.querySelectorAll(`.langs[data-kind="${kind}"] label`)]
+        .filter(l => l.querySelector('input').checked).map(l => Number(l.dataset.id));
+      return {mode, tags: ids('tags'), channels: ids('channels')};
+    };
+    wrap.querySelectorAll('input[name="tgr-mode"]').forEach(r => r.onchange = () => {
+      on('#tgr-pick').hidden = r.value !== 'pick';
+      // «По выбору» без единой галочки сервер не примет (это было бы вечное молчание),
+      // поэтому сохраняем режим только когда выбор уже есть.
+      const fl = readFilter(r.value);
+      if (r.value === 'all' || fl.tags.length || fl.channels.length) save({filter: fl});
+    });
+    wrap.querySelectorAll('#tgr-pick .langs label').forEach(l => {
+      l.querySelector('input').onchange = () => {
+        l.classList.toggle('on', l.querySelector('input').checked);
+        save({filter: readFilter('pick')});
+      };
+    });
+  };
+  paint();
+  return wrap;
 }
 
 /* ─────────────────────────── админ: тревоги и диск ─────────────────────────── */

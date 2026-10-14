@@ -83,13 +83,28 @@ class Telegram:
                 self.log("[тревоги] телеграм не настроен: нет VS_TG_TOKEN / VS_TG_CHAT")
                 self._warned = True
             return False
+        return self._send(self.chat, text)
+
+    def send_to(self, chat, text: str) -> bool:
+        """Отправить в УКАЗАННЫЙ чат тем же ботом (личный отчёт, 14.10.2026).
+
+        Общий чат тревог (`VS_TG_CHAT`) здесь не нужен и не трогается: личный отчёт
+        человека уходит в его собственный чат, который он привязал сам. Без токена —
+        False, как и у `send`: молчащий транспорт не делает отчёт «отправленным».
+        """
+        chat = str(chat or "").strip()
+        if not (self.token and chat):
+            return False
+        return self._send(chat, text)
+
+    def _send(self, chat: str, text: str) -> bool:
         gap = MIN_GAP - (time.time() - self._last)
         if gap > 0:
             time.sleep(gap)
         body = str(text or "")[:LIMIT]
         for attempt in (1, 2):
             try:
-                r = self._call("sendMessage", {"chat_id": self.chat, "text": body,
+                r = self._call("sendMessage", {"chat_id": chat, "text": body,
                                                "disable_web_page_preview": True})
                 self._last = time.time()
                 return bool(r.get("ok"))
@@ -159,6 +174,48 @@ class Telegram:
                          or username or ""}
         out["chats"] = sorted(seen.values(), key=lambda x: str(x["id"]))
         return out
+
+
+    def me(self) -> dict:
+        """Кто этот бот: {"username": ...}. Пусто — не узнали (ошибка в `error`).
+
+        Нужен ради ссылки t.me/<бот>?start=<код>: имя бота студия не хранит в
+        настройках, его знает только сам Telegram.
+        """
+        if not self.token:
+            return {"error": "нет VS_TG_TOKEN"}
+        try:
+            r = self._call("getMe", {})
+        except urllib.error.HTTPError as exc:
+            return {"error": f"HTTP {exc.code}: "
+                             f"{exc.read().decode('utf-8', 'replace')[:200]}"}
+        except Exception as exc:                                   # noqa: BLE001
+            return {"error": f"{type(exc).__name__}: {exc}"}
+        return (r.get("result") or {}) if r.get("ok") else {"error": str(r)[:200]}
+
+    def updates(self, offset: int = 0) -> dict:
+        """Короткий опрос getUpdates (без ожидания): {"ok", "result", "error"}.
+
+        `offset` подтверждает Telegram всё, что младше него: прочитанное второй раз не
+        придёт. Если у бота задан webhook, Telegram отвечает 409 — это не авария
+        студии, а чужая настройка бота, и вызывающий говорит об этом словами.
+        """
+        if not self.token:
+            return {"ok": False, "result": [], "error": "нет VS_TG_TOKEN"}
+        payload = {"limit": 100, "timeout": 0,
+                   "allowed_updates": ["message"]}
+        if offset:
+            payload["offset"] = int(offset)
+        try:
+            r = self._call("getUpdates", payload)
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", "replace")
+            return {"ok": False, "result": [], "code": exc.code,
+                    "error": f"HTTP {exc.code}: {raw[:200]}"}
+        except Exception as exc:                                   # noqa: BLE001
+            return {"ok": False, "result": [], "error": f"{type(exc).__name__}: {exc}"}
+        return {"ok": bool(r.get("ok")), "result": r.get("result") or [],
+                "error": "" if r.get("ok") else str(r.get("description") or r)[:200]}
 
 
 def _retry_after(raw: str) -> int:

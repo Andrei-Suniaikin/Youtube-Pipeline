@@ -44,6 +44,7 @@ load_env()
 
 import pub_alerts as A                                            # noqa: E402
 import pub_digest as D                                            # noqa: E402
+import pub_tg_personal as P                                       # noqa: E402
 from pub_alerts_tg import Telegram                                # noqa: E402
 
 DB = os.environ.get("VS_DEV_DB", os.path.join(BASE, "dev", "vsgen.dev.db"))
@@ -242,7 +243,23 @@ def main() -> int:
             # пришлось учить следить за родителем. По умолчанию она ВЫКЛЮЧЕНА, и тогда
             # этот вызов ничего не делает и в сеть не ходит.
             digest = D.daily_tick(c, tg.send, TENANT, now=time.time())
+            # Личные отчёты (14.10.2026) — на том же таймере и по той же причине: свой
+            # процесс был бы ещё одной сиротой. Здесь же привязываются чаты по коду из
+            # профиля. Пока никто не включил отчёт и не ждёт привязки, в сеть не ходит.
+            # Сбой личного отчёта не должен ронять тревоги: они важнее.
+            try:
+                personal = P.tick(c, tg, now=time.time())
+            except Exception as exc:                               # noqa: BLE001
+                personal = {"poll": {"bound": [], "error": str(exc)}, "reports": []}
+                print(f"личные отчёты: сбой — {exc}")
             stamp = time.strftime("%H:%M:%S")
+            for uid in personal["poll"].get("bound") or []:
+                print(f"{stamp}  телеграм привязан: учётка {uid}")
+            for rep in personal["reports"]:
+                if rep["sent"]:
+                    print(f"{stamp}  личный отчёт отправлен: учётка {rep['user_id']}")
+                elif rep["why"]:
+                    print(f"{stamp}  личный отчёт, учётка {rep['user_id']}: {rep['why']}")
             if sent:
                 for key, kind, _text in sent:
                     print(f"{stamp}  {kind:<6} {key}")

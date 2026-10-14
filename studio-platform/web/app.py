@@ -81,6 +81,7 @@ import pub_retention                                             # noqa: E402
 import pub_verify                                                # noqa: E402
 import pub_stats                                                 # noqa: E402
 import pub_digest                                                # noqa: E402
+import pub_tg_personal                                           # noqa: E402
 import pub_analytics                                              # noqa: E402
 import pub_earn                                                   # noqa: E402
 import channel_oauth                                              # noqa: E402
@@ -3193,6 +3194,142 @@ def ui_digest_settings(body: DigestSettingsIn, request: Request):
         c.close()
     _audit(f"рассылка сводки: {'включена' if out['telegram'] else 'выключена'}, "
            f"час {out['hour']}, это сделал {who['name']}")
+    return out
+
+
+# ─────────────────── личный отчёт в телеграм (14.10.2026) ───────────────────
+#
+# Владелец: «в настройках подключать свой тг, чтобы тебе конкретно по твоим каналам
+# приходил отчёт: 1. у этих каналов проебан AdsPower, 2. этим каналам не хватает донора».
+# Всё здесь — про ВОШЕДШЕГО человека: id берётся из сессии, а не из запроса, поэтому
+# чужую привязку нельзя ни прочитать, ни поменять, как ни составь запрос. Каналы и теги
+# отбора — только арендатора пульта. Смысл и правила — в `server/pub_tg_personal.py`.
+
+def _tg():
+    """Транспорт личных отчётов: тот же бот, что у тревог. Тесты подменяют функцию."""
+    return pub_alerts_tg.Telegram(log=lambda *_a: None)
+
+
+def _me_id(request) -> int:
+    user = getattr(request.state, "user", None)
+    if user is None:
+        raise HTTPException(401, "нужен вход")
+    return int(user["id"])
+
+
+def _tg_report_view(c, uid: int) -> dict:
+    out = pub_tg_personal.settings(c, uid)
+    tg = _tg()
+    out["bot_ready"] = bool(tg.token)
+    # Беда опроса важна, пока человек ждёт привязки; после неё — уже не его забота.
+    out["poll_error"] = pub_tg_personal.poll_error(c) if out["code"] else ""
+    out["link"] = ""
+    if out["code"]:
+        name = (pub_alerts._state_row(c, pub_tg_personal.BOT_KEY) or {})  # noqa: SLF001
+        if isinstance(name, dict) and name.get("username"):
+            out["link"] = f"https://t.me/{name['username']}?start={out['code']}"
+    # Справочник для отбора: теги и каналы студии — только своего арендатора.
+    out["tags"] = [{"id": r["id"], "name": r["name"]} for r in c.execute(
+        "SELECT id, name FROM pub_tags WHERE tenant_id=? ORDER BY name COLLATE NOCASE",
+        (TENANT,))]
+    out["channels"] = [{"id": r["id"], "name": r["name"]} for r in c.execute(
+        "SELECT id, name FROM pub_channels WHERE tenant_id=? AND status!='archived' "
+        "ORDER BY name COLLATE NOCASE", (TENANT,))]
+    return out
+
+
+@app.get("/ui/tg-report")
+def ui_tg_report(request: Request):
+    """Состояние личного отчёта вошедшего человека. В сеть не ходит."""
+    uid = _me_id(request)
+    c = db()
+    try:
+        return _tg_report_view(c, uid)
+    finally:
+        c.close()
+
+
+@app.post("/ui/tg-report/link")
+def ui_tg_report_link(request: Request):
+    """Новый одноразовый код и ссылка t.me/<бот>?start=<код>.
+
+    Имя бота спрашивается у Telegram (getMe) и кэшируется на сутки; не узнали — честно
+    говорим почему, а не выдаём ссылку, ведущую в никуда.
+    """
+    uid = _me_id(request)
+    tg = _tg()
+    if not tg.token:
+        raise HTTPException(503, "бот студии не настроен (нет VS_TG_TOKEN) — "
+                                 "подключить телеграм пока нельзя")
+    c = db()
+    try:
+        name, why = pub_tg_personal.bot_username(c, tg)
+        if not name:
+            raise HTTPException(503, f"Telegram не назвал имя бота: {why}")
+        pub_tg_personal.start_link(c, uid, TENANT)
+        return _tg_report_view(c, uid)
+    finally:
+        c.close()
+
+
+@app.post("/ui/tg-report/check")
+def ui_tg_report_check(request: Request):
+    """«Я нажал Start — проверить»: один короткий опрос бота, не дожидаясь таймера."""
+    uid = _me_id(request)
+    c = db()
+    try:
+        tg = _tg()
+        if tg.token:
+            pub_tg_personal.poll(c, tg, force=True)
+        return _tg_report_view(c, uid)
+    finally:
+        c.close()
+
+
+class TgReportIn(BaseModel):
+    enabled: bool | None = None
+    hour: int | None = None
+    filter: dict | None = None
+
+
+@app.post("/ui/tg-report/settings")
+def ui_tg_report_settings(body: TgReportIn, request: Request):
+    uid = _me_id(request)
+    c = db()
+    try:
+        try:
+            pub_tg_personal.set_settings(c, uid, TENANT, enabled=body.enabled,
+                                         hour=body.hour, flt=body.filter)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc))
+        return _tg_report_view(c, uid)
+    finally:
+        c.close()
+
+
+@app.post("/ui/tg-report/unlink")
+def ui_tg_report_unlink(request: Request):
+    uid = _me_id(request)
+    c = db()
+    try:
+        pub_tg_personal.unlink(c, uid)
+        return _tg_report_view(c, uid)
+    finally:
+        c.close()
+
+
+@app.post("/ui/tg-report/send-now")
+def ui_tg_report_send_now(request: Request):
+    """«Прислать сейчас (проверка)»: отчёт уходит сразу, суточную отметку не трогает."""
+    uid = _me_id(request)
+    c = db()
+    try:
+        out = pub_tg_personal.send_now(c, _tg(), uid)
+    finally:
+        c.close()
+    if not out["sent"]:
+        raise HTTPException(502 if out["why"] != "телеграм не подключён" else 400,
+                            out["why"])
     return out
 
 
