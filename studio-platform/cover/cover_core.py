@@ -640,6 +640,22 @@ SUBSCRIPTION_PROVIDERS = ("codex", "claude")
 SUBSCRIPTION_TIMEOUT = float(os.environ.get("COVER_SUBSCRIPTION_TIMEOUT", "900"))
 
 
+# Ключ кладёт самонастройка студии, а она идёт после startup частей. Задачи, поднятые
+# очередью обложек в первые секунды после перезапуска, приходили раньше ключа и падали
+# (14.10.2026: две обложки сразу после выкатки). Ключа нет — подождать, а не падать.
+TEXT_KEY_WAIT = float(os.environ.get("COVER_TEXT_KEY_WAIT", "120"))
+
+
+def _text_service_key() -> str:
+    import time as _time
+    deadline = _time.monotonic() + TEXT_KEY_WAIT
+    while True:
+        key = os.environ.get("COVER_TEXT_SERVICE_KEY") or ""
+        if key or _time.monotonic() >= deadline:
+            return key
+        _time.sleep(1.0)
+
+
 def _subscription_call(provider: str, messages: list, model: str = "",
                        images: list | None = None) -> str:
     """Один вызов подпиской. Картинки принимает только Codex — так устроен его CLI."""
@@ -648,7 +664,7 @@ def _subscription_call(provider: str, messages: list, model: str = "",
     import urllib.request
 
     base = (os.environ.get("VS_REWRITE_BASE") or "http://127.0.0.1:8899").rstrip("/")
-    key = os.environ.get("COVER_TEXT_SERVICE_KEY") or ""
+    key = _text_service_key()
     if not key:
         raise RuntimeError(
             "не задан ключ доступа к сервису текста (COVER_TEXT_SERVICE_KEY): "

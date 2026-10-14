@@ -132,11 +132,20 @@ def main() -> int:
 
     print("Ключ доступа к сервису текста обязателен")
     saved = os.environ.pop("COVER_TEXT_SERVICE_KEY", "")
+    wait = C.TEXT_KEY_WAIT
     try:
+        C.TEXT_KEY_WAIT = 0.5
         refused("без него — честный отказ, а не молчание",
                 lambda: real_call("codex", [{"role": "user", "content": "x"}]),
                 "ключ доступа")
+        # Задача сразу после перезапуска: ключ появляется через секунду — ждём его.
+        import threading
+        C.TEXT_KEY_WAIT = 10
+        threading.Timer(0.3, lambda: os.environ.__setitem__(
+            "COVER_TEXT_SERVICE_KEY", "rws_поздний")).start()
+        check("ключ пришёл позже задачи — дождались", C._text_service_key(), "rws_поздний")
     finally:
+        C.TEXT_KEY_WAIT = wait
         os.environ["COVER_TEXT_SERVICE_KEY"] = saved
 
     print()
