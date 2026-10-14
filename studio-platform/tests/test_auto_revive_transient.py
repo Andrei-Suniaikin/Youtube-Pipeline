@@ -126,6 +126,17 @@ def main() -> int:
         if step == "cover_ready":
             check("упавшее задание обложки забыто", has_job(c, "cover", "job"), False)
 
+    print("\nОбложка: временные отказы сервиса (14.10)")
+    for reason in ("обложка не сделалась: не задан ключ доступа к сервису текста "
+                   "(COVER_TEXT_SERVICE_KEY): подписками распоряжается он, а не обложки",
+                   "обложка не сделалась: timed out",
+                   "обложка не сделалась: Error code: 402 - {'error': {'message': "
+                   "\"API key token allowance exhausted.",
+                   "обложка не сделалась: Error code: 503 - upstream"):
+        check(f"временное: {reason[22:60]}…", E.transient_kind(reason), ("cover", ""))
+    check("400 — не временное", E.transient_kind(
+        "обложка не сделалась: Error code: 400 - bad prompt"), None)
+
     print("\nТо, что чинят люди, — не трогаем")
     for reason in ("обложка деградировала дважды: текст наложен поверх картинки",
                    "у ролика нет субтитров (VideoUnplayable)",
