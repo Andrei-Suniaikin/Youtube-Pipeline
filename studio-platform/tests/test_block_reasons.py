@@ -290,6 +290,18 @@ def main() -> int:
     check("готовый/отменённый — молчим", G("", "", phase="created", status="done"), [])
     check("всё выбрано — пусто", G("X", "Y", phase="created", status="pending"), [])
 
+    print("Слова заливщика о входе — дословно (15.10.2026)")
+    said = B.explain("Studio не отдала рабочее состояние канала (доступ не подтверждён): u | "
+                     "account recovery blocked: RecoveryBlocked: sign-in did not complete")["what"]
+    check("текст RecoveryBlocked виден", "Дословно от заливщика: RecoveryBlocked: sign-in did not complete." in said, True)
+    step = B.explain("account recovery needs the owner: Google requires an additional sign-in step: "
+                     "stage=selection; options=12=Confirm your recovery email — загрузка НЕ выполняется")["what"]
+    check("какой шаг спросил Google — виден, хвост «загрузка НЕ выполняется» отрезан",
+          step.endswith("options=12=Confirm your recovery email."), True)
+    bare = B.explain("Studio не отдала рабочее состояние канала (доступ не подтверждён): u | "
+                     "account recovery blocked: RecoveryBlocked")["what"]
+    check("одно имя класса — без «дословно»", "Дословно" in bare, False)
+
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
         for f in FAILS:

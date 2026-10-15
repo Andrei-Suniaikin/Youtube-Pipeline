@@ -105,6 +105,9 @@ def _donor(title: str) -> dict:
     return b
 
 
+_RECOVERY_SAID = re.compile(r"account recovery (?:blocked|needs the owner): (.+?)(?:\s+—\s+загрузка|$)")
+
+
 def explain(reason) -> dict:
     """Причина остановки → {kind, tag, title, what, fix, who, revive, short}. {} — не узнали."""
     text = str(reason or "").strip()
@@ -158,6 +161,12 @@ def explain(reason) -> dict:
         if start in text:
             if "RecoveryBlocked" in text:
                 what += _RECOVERY_BLOCKED
+            # 15.10.2026: заливщик теперь пишет, что именно ответил вход (какой шаг
+            # Google спросил, почему отказ). Показываем это дословно — без него у 12
+            # каналов причина остановки была неизвестна.
+            said = _RECOVERY_SAID.search(text)
+            if said and said.group(1).strip() not in ("RecoveryBlocked",):
+                what += f" Дословно от заливщика: {' '.join(said.group(1).split())[:220]}."
             busy = _BUSY_BY.search(text)
             if busy:
                 what = what.replace("другой учёткой команды", f"учёткой {busy.group(1)}")
