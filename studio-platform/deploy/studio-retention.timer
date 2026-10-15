@@ -1,0 +1,12 @@
+[Unit]
+Description=Studio: уборка диска раз в час
+
+[Timer]
+# Проекты стареют днями; час — чтобы место не копилось между проходами.
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+Unit=studio-retention.service
+
+[Install]
+WantedBy=timers.target

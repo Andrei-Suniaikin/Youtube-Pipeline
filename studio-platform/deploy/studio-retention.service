@@ -1,0 +1,36 @@
+# Уборка диска: кадры и клипы опубликованных роликов, затем проекты целиком.
+#
+# 15.10.2026, владелец: «нужно сделать так, чтобы память всегда была». Уборщик
+# (`dev/retention.py`, `server/pub_retention.py`) был написан и оттестирован, но в бою
+# его никто не запускал: таймера не было, и место освобождалось только руками.
+# Сроки — в /srv/studio/studio.env (VS_RETENTION_STRIP_DAYS / _DROP_DAYS), трогается
+# только фаза «опубликован» (подтверждено studio-verify), занятые работой проекты — нет.
+#
+#   sudo cp deploy/studio-retention.{service,timer} /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now studio-retention.timer
+#   journalctl -u studio-retention -n 50
+
+[Unit]
+Description=Studio: уборка диска по сроку хранения
+After=network-online.target studio-platform.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/srv/studio/app
+EnvironmentFile=-/srv/studio/studio.env
+Environment=VS_DEV_DB=/srv/studio/data/vsgen.db
+Environment=VS_TENANTS_DIR=/srv/studio/data/tenants
+ExecStart=/srv/studio/.venv/bin/python dev/retention.py --apply
+TimeoutStartSec=1800
+Nice=10
+IOSchedulingClass=idle
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/srv/studio
+
+[Install]
+WantedBy=multi-user.target
