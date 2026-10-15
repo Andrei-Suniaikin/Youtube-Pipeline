@@ -79,6 +79,38 @@ def main() -> int:
     check("строка для сводки", b["short"],
           "настройки канала: не выбран пресет обложек — выбрать в настройках канала")
 
+    print("\nЗаписи заливщика, которые экран показывал по-английски (база VPS 15.10)")
+    заливщик = {
+        "account recovery needs the owner: signed in but exact channel not confirmed":
+            ("access", True, "в аккаунте нет этого канала — нужны права менеджера"),
+        "account recovery needs the owner: owner help already requested for this "
+        "account recently": ("access", True, "автовход ждёт человека"),
+        "account recovery needs the owner: unexpected sign-in destination: "
+        "myaccount.google.com/verification/u//selfie/precollection":
+            ("access", True, "Google просит подтвердить личность"),
+        "AUTH_GATE: native confirmation stopped; inspect non-secret auth outcome; "
+        "existing upload preserved": ("access", True, "Google просит подтвердить личность"),
+        "PROFILE_BUSY: профиль 54 не освободился за 180 мин (профиль уже открыт на этой "
+        "машине (руками или остался от прошлой заливки)); файл в YouTube не передавался, "
+        "повтор безопасен": ("access", True, "профиль открыт на машине заливки и не закрыт"),
+        # Внутри есть «AUTH_GATE», но файл, возможно, уже ушёл: повтор = риск дубля.
+        "UPLOAD_IN_PROGRESS_PROFILE_RETAINED: MP4 completion unproven; browser left open, "
+        "shared lease must be retained; do not reupload; AUTH_GATE: Google requires "
+        "identity confirmation (before_thumbnail)":
+            ("check", False, "заливка оборвалась — неизвестно, дошёл ли файл"),
+        "нода молчит дольше 45 минут — нужен разбор":
+            ("check", False, "машина заливки замолчала посреди заливки"),
+        "HTTPConnectionPool(host='localhost', port=36587): Read timed out. "
+        "(read timeout=120)": ("check", False, "браузер заливки завис — неизвестно, дошёл ли файл"),
+        "обложка не сделалась: Error code: 402 - {'error': {'message': \"API key token "
+        "allowance exhausted.": ("cover", False, "сервис обложек дал сбой"),
+    }
+    for сырая, (сторона, вернуть, смысл) in заливщик.items():
+        b = B.explain(сырая)
+        check(f"«{сырая[:44]}» → {сторона}", (b.get("kind"), b.get("revive")),
+              (сторона, вернуть))
+        check("   и смысл словами", b.get("title"), смысл)
+
     print("\nДонор — «проблема в доноре», имя исключения переведено")
     реальные = {   # дословно из pub_releases.blocked_reason на VPS 03.10.2026
         # 09.10.2026, владелец: показывать настоящую ошибку — ролика нет, а не субтитров.

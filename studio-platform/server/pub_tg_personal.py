@@ -44,6 +44,16 @@
    студия не трогает очередь апдейтов бота вовсе (ею пользуется ещё и
    `dev/alerts.py --whoami`, который смотрит апдейты без подтверждения).
 
+6. **«Завтра без видео» — третья группа, и она главная (15.10.2026).** Владелец:
+   «сделай для ребят отчёты, на каких каналах не выходят видео, и объедини причины».
+   Канал попадает сюда, если у него есть расписание, а ни одного ролика, стоящего в
+   YouTube на ближайшие `SILENT_HOURS` часов, нет. Причина у канала одна — главная:
+   сначала остановленные выпуски (переводчик `block_reasons`, причина последней
+   остановки), затем беда профиля AdsPower,
+   потом «ролик ещё делается», потом «в плане нет доноров». Группируется отчёт по
+   причине, а не по каналу: «нужны права менеджера: А, Б, В» читается за секунду, и
+   сразу видно, кому это нести.
+
 Сети в модуле нет: транспорт передаётся объектом с методами `send_to(chat, text)`,
 `updates(offset)` и `me()` — это `pub_alerts_tg.Telegram`, а в тестах подставной.
 """
@@ -55,7 +65,7 @@ import secrets
 import time
 
 import pub_alerts
-from block_reasons import ACCESS, DONOR, explain as explain_block
+from block_reasons import ACCESS, DONOR, STUDIO, TAGS, WHO, explain as explain_block
 from channel_supply import channel_supply, supply_facts
 from pub_digest import DIGEST_TZ, _zone                               # noqa: F401
 
@@ -67,6 +77,8 @@ POLL_KEY = "tg_personal_poll"         # чем кончился последни
 BOT_KEY = "tg_bot_me"                 # имя бота: спрашиваем у Telegram один раз
 BOT_TTL = 24 * 3600
 
+SILENT_HOURS = 30                # «завтра»: ближайший выход дальше этого — канал молчит
+SIDE_SILENT = "silent"
 SIDE_ADSPOWER = "adspower"
 SIDE_DONOR = "donor"
 
@@ -379,8 +391,8 @@ def collect(c, tenant_id: str, flt: dict = None, now: float = None) -> dict:
     donor: dict = {}
     unknown: list = []
     if not channels:
-        return {"adspower": [], "donor": [], "supply_unknown": [], "channels": 0,
-                "min_days": float(pub_alerts.SUPPLY_MIN_DAYS)}
+        return {"adspower": [], "donor": [], "silent": [], "supply_unknown": [],
+                "channels": 0, "min_days": float(pub_alerts.SUPPLY_MIN_DAYS)}
     active = [r for r in channels if (r["status"] or "active") == "active"]
 
     # ── AdsPower: профиль канала ──
@@ -442,8 +454,83 @@ def collect(c, tenant_id: str, flt: dict = None, now: float = None) -> dict:
                         "stuck": sum(reasons.values())})
         return sorted(out, key=lambda x: (-x["stuck"], x["name"].lower()))
     return {"adspower": listing(ads), "donor": listing(donor),
+            "silent": silent(c, active, now, ads),
             "supply_unknown": sorted(unknown, key=str.lower), "channels": len(channels),
             "min_days": float(pub_alerts.SUPPLY_MIN_DAYS)}
+
+
+def _has_schedule(row) -> bool:
+    try:
+        sch = json.loads(row["schedule"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    return any(sch.values()) if isinstance(sch, dict) else bool(sch)
+
+
+# Фаза выпуска, который ещё делается → что именно он ждёт. Словами оператора.
+_IN_WORK = {"created": "ролик ещё делается: ждёт текст",
+            "source_ready": "ролик ещё делается: ждёт текст",
+            "project_ready": "ролик ещё делается: картинки и сборка",
+            "media_ready": "ролик ещё делается: обложка",
+            "cover_ready": "ролик готов, ждёт заливку"}
+
+
+def silent(c, channels: list, now: float, ads: dict = None) -> list:
+    """Каналы, у которых на ближайшие SILENT_HOURS часов в YouTube не стоит ни одного
+    ролика, — сгруппированные по одной главной причине канала (п. 6)."""
+    chans = [r for r in channels if _has_schedule(r)]
+    if not chans:
+        return []
+    ids = [r["id"] for r in chans]
+    marks = ",".join("?" * len(ids))
+    rels: dict = {}
+    for r in c.execute(f"SELECT channel_id, status, phase, slot_at, blocked_reason, updated "
+                       f"FROM pub_releases WHERE channel_id IN ({marks}) "
+                       f"AND status IN ('done','blocked','running','pending')", ids):
+        rels.setdefault(r["channel_id"], []).append(r)
+    planned = {r[0]: r[1] for r in c.execute(
+        f"SELECT channel_id, count(*) FROM pub_plan_items WHERE channel_id IN ({marks}) "
+        f"AND status='planned' GROUP BY channel_id", ids)}
+    groups: dict = {}
+    for ch in chans:
+        mine = rels.get(ch["id"], [])
+        if any(r["status"] == "done" and r["slot_at"] and
+               now < float(r["slot_at"]) <= now + SILENT_HOURS * 3600 for r in mine):
+            continue
+        # Главная причина — у последней остановки, а не у самой частой: двенадцать
+        # старых «автовход ждёт человека» — следствие, а свежее «в аккаунте нет канала»
+        # — то, что надо чинить сейчас.
+        latest, blocked = 0.0, None
+        for r in mine:
+            if r["status"] != "blocked" or float(r["updated"] or 0) < latest:
+                continue
+            b = explain_block(r["blocked_reason"])
+            latest = float(r["updated"] or 0)
+            blocked = (b.get("kind") or STUDIO,
+                       b.get("title") or "остановлен по непереведённой причине — смотреть выпуск")
+        work = sorted((r for r in mine if r["status"] in ("running", "pending")),
+                      key=lambda r: float(r["slot_at"] or 0))
+        prof = (ads or {}).get(ch["id"]) or {}
+        if blocked:
+            kind, title = blocked
+        elif prof:
+            # Профиль не привязан, пропал или занят: выпуск дальше заливки не уйдёт.
+            kind, title = ACCESS, max(prof, key=lambda t: (prof[t], t))
+            if "пропал из AdsPower" in title:
+                title = "профиль пропал из AdsPower"
+        elif work:
+            kind, title = STUDIO, _IN_WORK.get(work[0]["phase"] or "", "ролик ещё делается")
+        elif not planned.get(ch["id"]):
+            kind, title = DONOR, "в плане нет доноров"
+        else:
+            kind, title = STUDIO, "доноры в плане есть, выпуск ещё не заведён"
+        g = groups.setdefault((kind, title), {"side": TAGS[kind], "title": title,
+                                              "who": WHO[kind], "channels": []})
+        g["channels"].append(ch["name"])
+    out = list(groups.values())
+    for g in out:
+        g["channels"].sort(key=str.lower)
+    return sorted(out, key=lambda g: (-len(g["channels"]), g["side"], g["title"]))
 
 
 def _plural(n: int, one: str, few: str, many: str) -> str:
@@ -456,8 +543,8 @@ def _plural(n: int, one: str, few: str, many: str) -> str:
 
 
 def has_problems(data: dict) -> bool:
-    """Повод писать — только две группы. «Запас неизвестен» сам повода не даёт (п. 4)."""
-    return bool(data["adspower"] or data["donor"])
+    """Повод писать — три группы. «Запас неизвестен» сам повода не даёт (п. 4)."""
+    return bool(data["adspower"] or data["donor"] or data.get("silent"))
 
 
 def render(data: dict, day: str, scope: str = "") -> str:
@@ -479,6 +566,20 @@ def render(data: dict, day: str, scope: str = "") -> str:
     budget = LIMIT - len("\n".join(tail)) - 80
     used = len(head)
     hidden = 0
+    groups = data.get("silent") or []
+    if groups:
+        n = sum(len(g["channels"]) for g in groups)
+        sec = ["", f"Завтра без видео ({n} {_plural(n, 'канал', 'канала', 'каналов')}):"]
+        lines += sec
+        used += len("\n".join(sec)) + 1
+        for g in groups:
+            k = len(g["channels"])
+            line = f"· {g['side']} — {g['title']} ({k}): " + ", ".join(g["channels"])
+            if used + len(line) + 1 > budget:
+                hidden += k
+                continue
+            lines.append(line)
+            used += len(line) + 1
     for key, title in ((SIDE_ADSPOWER, "AdsPower — заливка упирается в профиль или вход"),
                        (SIDE_DONOR, "Донор — не хватает материала")):
         items = data[key]
@@ -593,7 +694,8 @@ def send_now(c, tg, user_id: int, now: float = None) -> dict:
     empty = not text
     if empty:
         flt = _filter_of(row)
-        text = (f"Проверка связи · {scope_text(c, flt)}: по AdsPower и донору бед нет. "
+        text = (f"Проверка связи · {scope_text(c, flt)}: видео завтра выходят везде, "
+                f"по AdsPower и донору бед нет. "
                 f"Утренний отчёт в такие дни не приходит.")
     ok = bool(tg.send_to(row["chat_id"], text))
     return {"sent": ok, "empty": empty, "text": text,

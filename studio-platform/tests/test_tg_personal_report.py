@@ -161,12 +161,35 @@ def blocked(c, cid, reason, tid="t1"):
     c.commit()
 
 
+def scheduled(c, cid, days=5, tid="t1"):
+    """Ролики, уже стоящие в YouTube на 10:00 ближайших дней: канал «выходит»."""
+    first = dt.datetime(2026, 10, 14, 10, 0, tzinfo=dt.timezone.utc).timestamp()
+    for i in range(days):
+        _n[0] += 1
+        c.execute("INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,"
+                  "plan_item_version,channel_id,uc,slot_at,phase,status,created,updated) "
+                  "VALUES(?,?,?,1,?,'UC',?,'scheduled','done',?,?)",
+                  (f"ok{_n[0]}", tid, 10_000 + _n[0], cid, first + i * DAY, NOW, NOW))
+    c.commit()
+
+
+def in_work(c, cid, phase, tid="t1"):
+    _n[0] += 1
+    c.execute("INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,plan_item_version,"
+              "channel_id,uc,slot_at,phase,status,created,updated) "
+              "VALUES(?,?,?,1,?,'UC',?,?,'running',?,?)",
+              (f"w{_n[0]}", tid, 20_000 + _n[0], cid, NOW + 3 * HOUR, phase, NOW, NOW))
+    c.commit()
+
+
 def fixture():
     """Каналы на все случаи: два здоровых и по одному на каждую беду."""
     c = setup_db(os.path.join(TMP, f"f{len(os.listdir(TMP))}.db"))
     ids = {}
     ids["ok1"] = channel(c, "Здоровый", tags=("ww2",))
     ids["ok2"] = channel(c, "Тоже здоровый")
+    scheduled(c, ids["ok1"])
+    scheduled(c, ids["ok2"])
     ids["noprof"] = channel(c, "Без профиля", profile=False, tags=("ww2",))
     ids["gone"] = channel(c, "Пропал профиль", missing=True)
     ids["proxy"] = channel(c, "Прокси", tags=("манхва",))
@@ -301,6 +324,40 @@ def part_report():
     # Канал без расписания сам повода писать не даёт.
     d5 = P.collect(c, "t1", {"mode": "pick", "tags": [], "channels": [ids["nosched"]]}, NOW)
     check("только «запас неизвестен» — тоже молчим", P.render(d5, "14.10.2026"), "")
+
+    # «Завтра без видео»: каналы по главной причине, группами.
+    c2, _ = fixture()
+    a = channel(c2, "Права А"); b = channel(c2, "Права Б")
+    for cid in (a, b):
+        blocked(c2, cid, "account recovery needs the owner: signed in but exact channel "
+                         "not confirmed")
+    w = channel(c2, "Делается")
+    in_work(c2, w, "project_ready")
+    late = channel(c2, "Выйдет послезавтра")
+    scheduled(c2, late, days=0)
+    c2.execute("INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,plan_item_version,"
+               "channel_id,uc,slot_at,phase,status,created,updated) VALUES('late','t1',"
+               "30001,1,?,'UC',?,'scheduled','done',?,?)", (late, NOW + 2 * DAY, NOW, NOW))
+    c2.commit()
+    sil = {g["title"]: g for g in P.collect(c2, "t1", None, NOW)["silent"]}
+    check("права менеджера — одной группой на два канала",
+          sil.get("в аккаунте нет этого канала — нужны права менеджера", {}).get("channels"),
+          ["Права А", "Права Б"])
+    check("   сторона и кто чинит",
+          sil["в аккаунте нет этого канала — нужны права менеджера"]["side"], "Вход и профиль")
+    check("ролик ещё делается — наша сторона",
+          (sil.get("ролик ещё делается: картинки и сборка", {}).get("channels"),
+           sil.get("ролик ещё делается: картинки и сборка", {}).get("side")),
+          (["Делается"], "Студия"))
+    check("ролик только послезавтра — тоже «завтра без видео»",
+          any("Выйдет послезавтра" in g["channels"] for g in sil.values()), True)
+    check("здоровые и без расписания не молчат",
+          any(n in g["channels"] for g in sil.values()
+              for n in ("Здоровый", "Тоже здоровый", "Без расписания", "Чужой")), False)
+    text = P.render(P.collect(c2, "t1", None, NOW), "15.10.2026")
+    print("\n----- «завтра без видео» -----\n" + text + "\n----------------------------\n")
+    check("в тексте раздел и группа",
+          ("Завтра без видео" in text and "Права А, Права Б" in text), True)
 
     # Длина: сотня бед сворачивается в «и ещё N».
     many = {"adspower": [{"name": f"Канал номер {i:03d}", "reasons": ["x" * 60], "stuck": 1}
