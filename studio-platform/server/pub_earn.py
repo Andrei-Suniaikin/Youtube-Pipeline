@@ -65,6 +65,33 @@ def ensure_earn_schema(c: sqlite3.Connection) -> None:
     have = {r[1] for r in c.execute("PRAGMA table_info(pub_channel_earn)")}
     if "profile" not in have:
         c.execute("ALTER TABLE pub_channel_earn ADD COLUMN profile TEXT")
+    # 15.10.2026: «Studio за 28 дней» с дашборда канала (JSON, см. `_dash`).
+    if "dash" not in have:
+        c.execute("ALTER TABLE pub_channel_earn ADD COLUMN dash TEXT")
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def _dash(doc: dict, verified: bool) -> str:
+    """Карточка «Channel analytics» дашборда Studio → JSON для колонки `dash`.
+
+    Читает её наша копия сборщика (`workers/minsk/collector_studio.py`) на той же
+    странице, куда Studio открывает канал. Берём, только если считыватель подтвердил
+    канал и сессию, и карточка про этот же UC — иначе это чужие цифры.
+    """
+    d = doc.get("dashboard")
+    if not verified or not isinstance(d, dict) or d.get("uc") != doc.get("uc"):
+        return ""
+    top = [{"title": str(t.get("title") or "")[:160], "views": _num(t.get("views"))}
+           for t in (d.get("top") or [])[:5] if isinstance(t, dict) and t.get("title")]
+    out = {"subs": _num(d.get("subs")), "views_28": _num(d.get("views_28")),
+           "hours_28": _num(d.get("hours_28")), "top": top,
+           "period": str(d.get("period") or "")[:60]}
+    if all(out[k] is None for k in ("subs", "views_28", "hours_28")) and not top:
+        return ""
+    return json.dumps(out, ensure_ascii=False)
 
 
 def _ts(text) -> float | None:
@@ -126,6 +153,7 @@ def reading(doc: dict) -> dict | None:
         # иначе это может быть чужой аккаунт, и выводы по нему хуже, чем никаких.
         "email": str(ctx.get("email") or "")[:120] if verified else "",
         "profile": str(ctx.get("profile") or "")[:20] if verified else "",
+        "dash": _dash(doc, verified),
     }
 
 
@@ -215,11 +243,11 @@ def apply(c: sqlite3.Connection, planned: dict, now: float | None = None) -> int
             continue
         cur = c.execute(
             "INSERT OR IGNORE INTO pub_channel_earn(channel_id,read_at,uc,state,hours_365,"
-            "shorts_90,subs,life_views,life_hours,as_of,email,reason,loaded,profile) "
-            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "shorts_90,subs,life_views,life_hours,as_of,email,reason,loaded,profile,dash) "
+            "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (w["channel_id"], w["read_at"], w["uc"], w["state"], w["hours_365"], w["shorts_90"],
              w["subs"], w["life_views"], w["life_hours"], w["as_of"], w["email"], w["reason"],
-             now, w.get("profile") or ""))
+             now, w.get("profile") or "", w.get("dash") or ""))
         n += cur.rowcount
     return n
 
@@ -241,9 +269,17 @@ def channel_state(c: sqlite3.Connection, channel_id: int) -> dict:
         return {}
     good = c.execute("SELECT * FROM pub_channel_earn WHERE channel_id=? AND state='ok' "
                      "ORDER BY read_at DESC LIMIT 2", (channel_id,)).fetchall()
+    dash = c.execute("SELECT read_at, dash FROM pub_channel_earn WHERE channel_id=? "
+                     "AND COALESCE(dash,'')<>'' ORDER BY read_at DESC LIMIT 1",
+                     (channel_id,)).fetchone()
+    try:
+        dash_doc = {**json.loads(dash[1]), "read_at": dash[0]} if dash else None
+    except ValueError:
+        dash_doc = None
     return {"last": _row(last),
             "good": _row(good[0]) if good else None,
             "prev": _row(good[1]) if len(good) > 1 else None,
+            "dash": dash_doc,
             "goal_hours": YPP_HOURS, "goal_subs": YPP_SUBS}
 
 
@@ -471,7 +507,8 @@ def claim_request(c: sqlite3.Connection, host: str, now: float | None = None,
                     "WHERE id=? AND status='queued'", (token, host[:40], now, now, row[0]))
     if cur.rowcount != 1:
         return None
-    return {"id": row[0], "profile": row[2], "token": token, "auto": bool(row[3])}
+    return {"id": row[0], "profile": row[2], "token": token, "auto": bool(row[3]),
+            "ucs": profile_ucs(c, row[1], row[2])}
 
 
 def _own_request(c: sqlite3.Connection, req_id: int, token: str):
@@ -526,7 +563,23 @@ def channel_request(c: sqlite3.Connection, tenant, channel_id: int) -> dict:
         out["last"] = {"id": row[0], "status": row[1], "title": REQ_TITLE.get(row[1], row[1]),
                        "created": row[2], "claimed": row[3], "finished": row[4],
                        "note": row[5] or ""}
+        # 15.10.2026: профиль обойдён, а этого канала в выхлопе нет — у профиля
+        # «готово», у канала «сбора не было», и что это значит, было не понять.
+        if row[1] == "done" and row[3]:
+            ensure_earn_schema(c)
+            got = c.execute("SELECT 1 FROM pub_channel_earn WHERE channel_id=? AND loaded>=?",
+                            (channel_id, float(row[3]))).fetchone()
+            out["last"]["missed"] = got is None
     return out
+
+
+def profile_ucs(c: sqlite3.Connection, tenant, serial: str) -> list:
+    """UC каналов студии на профиле: сборщик откроет их напрямую, если ни одна почта
+    профиля не показала канал в своём списке (так бывает с доступом менеджера)."""
+    rows = c.execute("SELECT ch.uc FROM pub_channels ch JOIN pub_profiles p ON p.id=ch.profile_id "
+                     "WHERE ch.tenant_id=? AND p.serial=? AND ch.status='active' "
+                     "AND COALESCE(ch.uc,'')<>'' ORDER BY ch.id", (tenant, str(serial))).fetchall()
+    return [r[0] for r in rows if UC_RE.match(r[0] or "")]
 
 
 # ─────────────────────── ежедневный сбор (14.10.2026) ───────────────────────

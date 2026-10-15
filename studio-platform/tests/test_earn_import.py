@@ -297,6 +297,33 @@ last = client.get(f"/ui/channels/{CID['a']}").json()["earn_request"]["last"]
 check("это не «готово», а расхождение словами",
       (last["status"], "ни одного из студии" in last["note"]), ("failed", True))
 
+print("Каналы студии на профиле, «Studio за 28 дней», канал не найден (15.10.2026)")
+DASH = {"uc": UC["a"], "subs": 1, "views_28": 337, "hours_28": 18.1, "period": "Last 28 days",
+        "top": [{"title": "Istoria sării", "views": 3}, {"title": "", "views": 9}]}
+r = E.reading({**result(UC["a"]), "dashboard": DASH})
+check("дашборд принят", json.loads(r["dash"]),
+      {"subs": 1, "views_28": 337, "hours_28": 18.1, "period": "Last 28 days",
+       "top": [{"title": "Istoria sării", "views": 3}]})
+check("без подтверждения сессии — дашборд не принят",
+      E.reading({**result(UC["a"], verified=False), "dashboard": DASH})["dash"], "")
+check("дашборд чужого UC — не принят",
+      E.reading({**result(UC["a"]), "dashboard": {**DASH, "uc": UC["b"]}})["dash"], "")
+as_("s-user")
+client.post(f"/ui/channels/{CID['a']}/earn/collect")
+client.cookies.clear()
+j = client.post("/api/earn/claim", json={}, headers=AG).json()["job"]
+check("в задании — UC каналов студии на профиле", j.get("ucs"), [UC["a"], UC["c"]])
+doc = {**result(UC["a"], at="2026-10-19T03:00:00+00:00"), "dashboard": DASH}
+client.post(f"/api/earn/{j['id']}/result", headers={**AG, "X-Earn-Claim": j["token"]},
+            files={"file": ("earn.zip", zipped([doc]), "application/zip")})
+as_("s-user")
+ca = client.get(f"/ui/channels/{CID['a']}").json()
+check("прочитанный канал — не «не найден»", ca["earn_request"]["last"].get("missed"), False)
+check("в карточке — Studio за 28 дней", (ca["earn"]["dash"] or {}).get("views_28"), 337)
+cc = client.get(f"/ui/channels/{CID['c']}").json()
+check("соседний канал профиля без чтения — «не найден»",
+      (cc["earn_request"]["last"]["status"], cc["earn_request"]["last"].get("missed")), ("done", True))
+
 print()
 if FAILS:
     print(f"провалов: {len(FAILS)}")

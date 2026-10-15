@@ -209,10 +209,23 @@ class Beat:
                 log(f"пульс не дошёл: {exc}")
 
 
-def run_collector(profile: str, out: Path, beat: Beat) -> int:
-    cmd = [PYTHON, str(COLLECTOR_DIR / "collector.py"), "--api", LOCAL_API,
+def collector_script() -> Path:
+    """Наша копия сборщика (`make_collector_studio.py`), если она собрана, иначе Володин.
+
+    15.10.2026: копия открывает напрямую каналы студии, которых нет в списках почт
+    профиля (доступ менеджера), и читает «Studio за 28 дней» с дашборда.
+    """
+    ours = COLLECTOR_DIR / "collector_studio.py"
+    return ours if ours.exists() else COLLECTOR_DIR / "collector.py"
+
+
+def run_collector(profile: str, out: Path, beat: Beat, ucs=None) -> int:
+    script = collector_script()
+    cmd = [PYTHON, str(script), "--api", LOCAL_API,
            "--peer-api", PEER_API, "--lease-context", str(COLLECTOR_DIR / "lease_context.json"),
            "--out", str(out), "--profiles", profile]
+    if ucs and script.name == "collector_studio.py":
+        cmd += ["--expect-ucs", ",".join(ucs)]
     env = dict(os.environ)
     env.setdefault("ADSPOWER_RATE_LIMIT_DIR",
                    os.path.expanduser("~/.local/state/video-studio/adspower-rate"))
@@ -305,7 +318,7 @@ def handle(job) -> None:
             else:
                 out = RUNS / f"{job['id']}-{profile}-{time.strftime('%Y%m%dT%H%M%S')}-{attempt}"
                 beat.note = f"сборщик читает профиль {profile}"
-                rc = run_collector(profile, out, beat)
+                rc = run_collector(profile, out, beat, job.get("ucs") or [])
                 if beat.lost:
                     log(f"#{job['id']}: задание отдали другому — результат не шлю")
                     return

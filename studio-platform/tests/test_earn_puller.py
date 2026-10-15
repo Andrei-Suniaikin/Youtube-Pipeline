@@ -359,6 +359,38 @@ check("Мак пропал во время сбора — понятная пр�
       (last2["status"], last2["note"]), ("failed", P.PEER_DOWN_NOTE))
 check("пуллер запомнил, что Мак молчит", P._PEER["ok"], False)
 
+print("Наша копия сборщика: каналы студии напрямую (15.10.2026)")
+import pathlib, subprocess as _sp                                  # noqa: E402
+_seen = []
+
+
+class _FakeProc:
+    returncode = 0
+
+    def __init__(self, cmd, **kw):
+        _seen.append(cmd)
+
+    def poll(self):
+        return 0
+
+
+_orig_popen, P.subprocess.Popen = P.subprocess.Popen, _FakeProc
+try:
+    out_dir = pathlib.Path(tempfile.mkdtemp()) / "run"
+    ours = pathlib.Path(COLL) / "collector_studio.py"
+    ours.exists() and ours.unlink()
+    P.run_collector("54", out_dir, type("B", (), {"lost": False})(), ["UC" + "a" * 22])
+    check("копии нет — Володин сборщик, без нового ключа",
+          (_seen[-1][1].endswith("/collector.py"), "--expect-ucs" in _seen[-1]), (True, False))
+    ours.write_text("# copy\n")
+    P.run_collector("54", out_dir, type("B", (), {"lost": False})(), ["UC" + "a" * 22])
+    check("копия есть — она и список каналов",
+          (_seen[-1][1].endswith("/collector_studio.py"),
+           _seen[-1][_seen[-1].index("--expect-ucs") + 1]), (True, "UC" + "a" * 22))
+    ours.unlink()
+finally:
+    P.subprocess.Popen = _orig_popen
+
 print()
 if FAILS:
     print(f"провалов: {len(FAILS)}")

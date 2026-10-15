@@ -3937,6 +3937,7 @@ function earnCard(e){
       g.as_of ? ` · Studio: данные на ${esc(g.as_of)}` : ''}${
       g.shorts_90 !== null ? ` · подходящих просмотров Shorts за 90 дней: ${bigNum(g.shorts_90)}` : ''}</div>`);
   }
+  if (e.dash) parts.push(earnDash(e.dash));
   if (!g || last.read_at > g.read_at){
     const bad = last.state !== 'ok' && last.state !== 'partner';
     parts.push(`<div class="note ${bad ? 'bad' : 'muted'}" style="margin-top:8px">
@@ -3945,6 +3946,28 @@ function earnCard(e){
   }
   body.innerHTML = parts.join('');
   return card;
+}
+
+// «Studio за 28 дней» (15.10.2026): карточка «Channel analytics» с дашборда канала —
+// её читает сборщик Минска на той же странице, куда Studio открывает канал.
+function earnDash(d){
+  const num = v => v === null || v === undefined ? '—' : bigNum(v);
+  const top = (d.top || []).map(t => `<li>${esc(t.title)}${
+    t.views !== null && t.views !== undefined ? ` <span class="muted">— ${bigNum(t.views)}</span>` : ''}</li>`).join('');
+  return `<div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--line)">
+    <div class="muted" style="font-size:12px;margin-bottom:6px">Studio за 28 дней ${hintDot(
+      'Карточка «Channel analytics» с главной страницы канала в YouTube Studio: подписчики ' +
+      'сейчас, просмотры и время просмотра за последние 28 дней, лучшие ролики за 48 часов. ' +
+      'Читает сборщик на Минске при ежедневном сборе.')}</div>
+    <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:14px">
+      <div><div style="font-size:22px">${num(d.subs)}</div><div class="muted">подписчиков</div></div>
+      <div><div style="font-size:22px">${num(d.views_28)}</div><div class="muted">просмотров</div></div>
+      <div><div style="font-size:22px">${d.hours_28 === null || d.hours_28 === undefined ? '—'
+        : esc(String(d.hours_28))}</div><div class="muted">часов просмотра</div></div>
+    </div>
+    ${top ? `<div class="note muted" style="margin-top:8px">Лучшие за 48 часов:</div>
+      <ol style="margin:4px 0 0 18px;padding:0">${top}</ol>` : ''}
+    <div class="note muted" style="margin-top:6px">Прочитано ${esc(when(d.read_at))}</div></div>`;
 }
 
 async function earnSend(file, apply){
@@ -4111,6 +4134,9 @@ function earnCollectLine(id, r, card){
       : l ? `Сбор по профилю №${esc(st.profile)}: ${esc(l.title)}${
           l.status === 'queued' ? ` (${esc(when(l.created))})` : ''}${
           l.finished ? ` — ${esc(when(l.finished))}` : ''}${l.note ? ` · ${esc(l.note)}` : ''}${
+          l.missed ? `. Этот канал сборщик в профиле не нашёл: ни одна почта профиля не
+            показала его в своём списке каналов (так бывает, когда почта — менеджер
+            канала). Следующий сбор откроет его в Studio напрямую.` : ''}${
           busy && st.peer_down_since ? `. Мак Володи не отвечает с ${esc(when(st.peer_down_since))
             } — без него сбор не запускается, задание ждёт его.`
           : busy ? '. Если профиль сейчас заливает, сбор подождёт.' : ''}`
