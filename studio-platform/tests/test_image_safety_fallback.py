@@ -18,6 +18,8 @@
   * откат выключается настройкой;
   * openai-image дважды молча отказал («Generation failed») — тот же один заказ откатом
     (14.10.2026), а добивка основную модель больше не оплачивает;
+  * openai-image N раз подряд ответил «No accounts available» — тот же откат (15.10.2026);
+    откат тоже занят — кадр «позже», и добивка снова имеет право на откат;
   * журнал платных вызовов: строка основной модели закрыта отказом, откат заявлен своей
     строкой с моделью отката;
   * фактическая модель кадра — в image_model_fallbacks.json; кадр, позже нарисованный
@@ -300,6 +302,42 @@ try:
            any("дважды вернул generic terminal" in l for l in lines)), (None, 2, True))
 finally:
     G.IMAGE_SAFETY_FALLBACK_MODEL = saved_fb
+
+print("\nopenai-image: «No accounts available» подряд — откат (15.10.2026)")
+# С 00:00 UTC 15.10 пул аккаунтов openai-image у FastGen пуст; кадр крутил 15 попыток
+# и падал дырой. Владелец: такие кадры — тем же откатом.
+N = G.IMAGE_BUSY_FALLBACK_AFTER
+check("порог по умолчанию — 3", N, 3)
+out, prov, lines, (reserves, _c), _d = run({OPENAI_V6: BUSY, FLOWER: "ok"},
+                                           scene=21, model="OPENAI")
+check("кадр получен откатом после N «занято»",
+      (out[1] is not None, prov.count(OPENAI_V6), prov.count(FLOWER)), (True, N, 1))
+check("в журнале задачи — что нет свободных аккаунтов",
+      any("🛟" in l and "нет свободных аккаунтов" in l for l in lines), True)
+check("журнал вызовов: откат заявлен своей моделью", reserves[-1], "FLOWER")
+check("модель кадра записана рядом",
+      (sidecar(_d) or {}).get("frames", [{}])[0].get("instead_of"), "OPENAI")
+d22 = tempfile.mkdtemp(dir=TMP)
+out, prov, lines, _j, _d = run({OPENAI_V6: BUSY, FLOWER: BUSY}, scene=22,
+                               model="OPENAI", out_dir=d22)
+check("откат тоже занят — кадр отложен «позже», не «фильтр»",
+      (out[1], (G._FRAME_GIVEUP.get(21) or ("", ""))[0]), (None, G.GAP_LATER))
+out, prov, lines, _j, _d = run({OPENAI_V6: BUSY, FLOWER: "ok"}, scene=22, model="OPENAI",
+                               out_dir=d22, fresh_run=False)
+check("добивка того же прогона: право на откат вернулось, кадр получен",
+      (out[1] is not None, prov.count(FLOWER)), (True, 1))
+saved_fb = G.IMAGE_SAFETY_FALLBACK_MODEL
+G.IMAGE_SAFETY_FALLBACK_MODEL = "OFF"
+try:
+    out, prov, lines, _j, _d = run({OPENAI_V6: BUSY}, scene=23, model="OPENAI")
+    check("откат выключен — крутит все попытки, как раньше, без «фильтра»",
+          (out[1], prov.count(OPENAI_V6) > N, (G._FRAME_GIVEUP.get(22) or ("", ""))[0] != G.GAP_FILTER),
+          (None, True, True))
+finally:
+    G.IMAGE_SAFETY_FALLBACK_MODEL = saved_fb
+out, prov, lines, _j, _d = run({LITE: BUSY, FLOWER: "ok"}, scene=24)
+check("другая основная модель «занято» — без отката, как раньше",
+      (out[1], prov.count(FLOWER)), (None, 0))
 
 print("\nПорядок отката: Nano Banana 2 → Pro → Flower последним (11.10.2026)")
 # Владелец: Flower по качеству сильно хуже — в последнюю очередь.

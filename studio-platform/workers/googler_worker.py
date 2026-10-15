@@ -7525,6 +7525,11 @@ IMAGE_SAFETY_FALLBACK_MODEL = (os.environ.get("VS_IMAGE_SAFETY_FALLBACK_MODEL",
 # flower принимает ровно одну картинку на вход (так же решено у обложек) — откату на неё
 # отдаём только первый референс кадра.
 IMAGE_FALLBACK_MAX_INPUTS = {"FLOWER": 1}
+# 15.10.2026: с 00:00 UTC openai-image у FastGen сутки отвечает «No accounts available» —
+# пул аккаунтов провайдера пуст, у gen то же самое. Кадр крутил 15 попыток и падал дырой,
+# картинки встали (1 ролик за день вместо ~15). Владелец: такие кадры делать тем же откатом,
+# что и при отказе фильтра. Сколько «занято» подряд у основной модели — и кадр уходит в откат.
+IMAGE_BUSY_FALLBACK_AFTER = int(os.environ.get("VS_IMAGE_BUSY_FALLBACK_AFTER", "3") or 3)
 IMAGE_MODEL_FALLBACKS_FILE = "image_model_fallbacks.json"
 _SAFETY_FALLBACK_USED: set = set()      # кадры, уже получившие откат в этом прогоне
 _SAFETY_FALLBACK_BUSY: set = set()      # модели отката, ответившие «занято» в этом прогоне
@@ -7575,6 +7580,17 @@ def _fallback_gave_up(index: int, model: str, reason: str, last: str,
                        f"{reason}; откат на модель {model} не дал кадр: {last}")
     print_user(f"⛔ [{index+1}] Откат на {label} не дал кадр ({last}) — пропускаю картинку",
                "ERROR")
+
+
+def safety_fallback_claimed(frame_key: str) -> bool:
+    """Получал ли кадр откат в этом прогоне (проверка без захвата)."""
+    with _SAFETY_FALLBACK_LOCK:
+        return str(frame_key) in _SAFETY_FALLBACK_USED
+
+
+def _is_no_accounts_error(msg) -> bool:
+    """Провайдер занят: «No accounts available» — свободных аккаунтов модели нет."""
+    return "no accounts available" in " ".join(str(msg or "").split()).lower()
 
 
 def claim_safety_fallback(frame_key: str) -> bool:
@@ -11459,6 +11475,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
     _fallback_used = False
     _fallback_orders = 0
     _fallback_reason = ""
+    _busy_hits = 0      # «No accounts available» основной модели подряд (см. IMAGE_BUSY_FALLBACK_AFTER)
 
     # while вместо for: последний шанс добавляет попытку уже ПОСЛЕ входа в цикл, а range()
     # фиксируется на старте. attempt увеличивается первым делом, поэтому все `continue`
@@ -11955,10 +11972,21 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 and _is_generic_v6_terminal_error(_last_gen_error())
                 and bool(safety_fallback_model(_model))
             )
-            if (_generic_again or _is_fatal_gen_error(error)
+            if _is_no_accounts_error(error) or _is_no_accounts_error(_last_gen_error()):
+                _busy_hits += 1
+            else:
+                _busy_hits = 0
+            _busy_again = (
+                _model == "OPENAI" and not _fallback_used and not _generic_again
+                and IMAGE_BUSY_FALLBACK_AFTER > 0 and _busy_hits >= IMAGE_BUSY_FALLBACK_AFTER
+                and bool(safety_fallback_model(_model))
+                and not safety_fallback_claimed(output_path or f"#{index}")
+            )
+            if (_generic_again or _busy_again or _is_fatal_gen_error(error)
                     or _is_fatal_gen_error(_last_gen_error())):
                 _changed = False
-                while _soften_rounds < 3 and not _changed and not _generic_again:
+                while (_soften_rounds < 3 and not _changed and not _generic_again
+                       and not _busy_again):
                     _soften_rounds += 1
                     _softened = _soften_image_prompt_contract(
                         prompt_contract, _soften_rounds
@@ -11973,7 +12001,7 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                 if _changed:
                     print_user(f"🩹 [{index+1}] Контент-фильтр: промпт смягчён локально (раунд {_soften_rounds}/3), пробую снова", "WARNING")
                     continue
-                if not _generic_again:
+                if not _generic_again and not _busy_again:
                     _note_soften_exhausted()   # копим статистику: сюжет режется устойчиво
                 _fb_model = safety_fallback_model(_model)
                 if _fb_model and claim_safety_fallback(output_path or f"#{index}"):
@@ -11986,6 +12014,10 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                         _fallback_reason = (f"модель {_fb_from} дважды отказала без причины "
                                             f"(generic terminal)")
                         _fb_why = f"{_fb_label} дважды отказала без причины"
+                    elif _busy_again:
+                        _fallback_reason = (f"у модели {_fb_from} нет свободных аккаунтов "
+                                            f"(No accounts available ×{_busy_hits})")
+                        _fb_why = f"у {_fb_label} нет свободных аккаунтов"
                     else:
                         _fallback_reason = (f"фильтр модели {_fb_from} после смягчений "
                                             f"({_soften_rounds})")
@@ -11997,6 +12029,8 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                     _journal_close_frame(None, error=(
                         (f"провайдер дважды вернул generic terminal status=failed "
                          if _generic_again else
+                         f"провайдер ответил No accounts available ×{_busy_hits} "
+                         if _busy_again else
                          f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds}) ")
                         + f"— кадр заказан моделью {_fb_model}"))
                     _model = _fb_model
@@ -12074,10 +12108,11 @@ def generate_image(scene_data: dict, style: str, auto_hero_path: Optional[str] =
                         "ERROR",
                     )
                     return (index, None)
-                _note_frame_giveup(index, GAP_FILTER,
-                                   f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds})")
-                print_user(f"⛔ [{index+1}] Контент-фильтр провайдера — пропускаю картинку (смягчений: {_soften_rounds})", "ERROR")
-                return (index, None)
+                if not _busy_again:     # «занято» без отката — обычный повтор ниже
+                    _note_frame_giveup(index, GAP_FILTER,
+                                       f"провайдер отказал фильтром безопасности (смягчений: {_soften_rounds})")
+                    print_user(f"⛔ [{index+1}] Контент-фильтр провайдера — пропускаю картинку (смягчений: {_soften_rounds})", "ERROR")
+                    return (index, None)
 
             # FastGen/openai-image sometimes returns a paid terminal ``status=failed``
             # without a safety or transport reason.  Repeating the identical operation
