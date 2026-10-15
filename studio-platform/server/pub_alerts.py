@@ -62,6 +62,14 @@
     выходу. Канал без расписания сюда не попадает никогда: у него запас не ноль, а
     неизвестен, и звать человека к каналу, который и не должен выходить, — ложь
 
+Пятнадцатый повод добавлен 15.10.2026 по задаче Володи («отдельные уведомления об
+остановках: какой канал, почему, что уже попробовано и какое действие нужно»):
+
+15. канал остановился — у него есть выпуск в статусе «остановлен». Это единственный
+    повод ПО КАНАЛУ, а не один на всё: просили именно так, а причина и действие у
+    каждого канала свои. Повтор — раз в сутки (`STOPPED_REPEAT_SEC`), «починилось» —
+    когда у канала не осталось остановленных выпусков
+
 Три правила подачи, тоже из ТЗ: одно сообщение на случай, повтор не чаще раза в час,
 обязательное сообщение «починилось».
 
@@ -130,6 +138,10 @@ REPEAT_SEC = _sec("VS_ALERT_REPEAT_SEC", 60 * 60)        # повтор не ч�
 # сроке не добавляет ни одного нового сведения, зато к третьему разу тревоги
 # перестают читать — и пропускают ту, которая про очередь.
 KEY_REPEAT_SEC = _sec("VS_ALERT_KEY_REPEAT_SEC", 24 * 3600)
+# §15: остановленный канал — раз в сутки (по сообщению на канал, чаще — шум).
+STOPPED_REPEAT_SEC = _sec("VS_ALERT_STOPPED_REPEAT_SEC", 24 * 3600)
+STOPPED_HOLD_SEC = _sec("VS_ALERT_STOPPED_HOLD_SEC", 15 * 60)
+STOPPED_PAST_SEC = _sec("VS_ALERT_STOPPED_PAST_SEC", 2 * 86400)
 DISK_MIN_GB = float(os.environ.get("VS_ALERT_DISK_GB") or 100)
 # §9/§10 — не из ТЗ, добавлены владельцем 16.09.2026.
 KEY_EXPIRES_DAYS = _num("VS_ALERT_KEY_EXPIRES_DAYS", 7)          # §9: за сколько дней предупредить
@@ -1216,6 +1228,74 @@ def check_upload_profile_busy(c, now, tenant=None) -> list:
               "Теряется время выхода — слот может уйти.")]
 
 
+def _when(ts) -> str:
+    return time.strftime("%d.%m %H:%M UTC", time.gmtime(_f(ts))) if ts else "—"
+
+
+def check_channel_stopped(c, now, tenant=None) -> list:
+    """§15. Канал остановился: у него есть остановленный выпуск (по поводу на канал).
+
+    Берётся выпуск с самым ранним слотом — он и держит канал. Остановки, чей слот ушёл
+    в прошлое дальше `STOPPED_PAST_SEC`, не считаются: выход уже потерян, а звать
+    человека к выпуску недельной давности — шум. Пока выпуск остановлен меньше
+    `STOPPED_HOLD_SEC`, молчим: часть остановок студия возвращает в работу сама.
+    """
+    have = {r[0] for r in c.execute(
+        "SELECT name FROM sqlite_master WHERE name IN "
+        "('pub_channels_live','pub_releases','pub_profiles','pub_release_log')")}
+    if len(have) < 4:
+        return []
+    from block_reasons import explain
+
+    where, args = _tenant_where(tenant, "r.tenant_id")
+    rows = c.execute(
+        "SELECT r.release_id, r.channel_id, r.slot_at, r.phase, r.blocked_reason, "
+        "r.updated, r.attempts, ch.name, ch.handle, p.serial, p.title AS ptitle "
+        "FROM pub_releases r JOIN pub_channels_live ch ON ch.id=r.channel_id "
+        "LEFT JOIN pub_profiles p ON p.id=ch.profile_id "
+        f"WHERE r.status='blocked' AND ch.status='active' AND r.slot_at>?{where} "
+        "ORDER BY r.channel_id, r.slot_at",
+        [now - STOPPED_PAST_SEC] + list(args)).fetchall()
+    first: dict = {}
+    count: dict = {}
+    for r in rows:
+        first.setdefault(r[1], r)
+        count[r[1]] = count.get(r[1], 0) + 1
+    out = []
+    for cid, r in first.items():
+        (rid, _cid, slot, phase, reason, updated, attempts,
+         name, handle, serial, ptitle) = r
+        if now - _f(updated) < STOPPED_HOLD_SEC:
+            continue
+        b = explain(reason) or {}
+        revived = c.execute(
+            "SELECT count(*), max(ts) FROM pub_release_log WHERE release_id=? "
+            "AND message LIKE 'возвращён в работу%'", (rid,)).fetchone()
+        why = b.get("title") or (" ".join(str(reason or "").split())[:200]
+                                   or "причина не записана")
+        lines = [f"Канал: {name}" + (f" ({handle})" if handle else "")]
+        if serial:
+            lines.append(f"Профиль AdsPower: {serial}"
+                         + (f" «{' '.join(str(ptitle).split())}»" if ptitle else ""))
+        lines.append(f"Выпуск {rid}, выход {_when(slot)}, этап «{phase}».")
+        lines.append(f"Почему: {why}.")
+        if b.get("what"):
+            lines.append(b["what"])
+        tried = [f"вернуть в работу — {revived[0]} раз (последний {_when(revived[1])})"
+                 if revived and revived[0] else "в работу ещё не возвращали"]
+        if attempts:
+            tried.append(f"попыток этапа — {attempts}")
+        lines.append("Уже пробовали: " + "; ".join(tried) + ".")
+        fix = b.get("fix") or "разобрать причину на экране «Выпуски»."
+        who = b.get("who") or ""
+        lines.append(f"Что сделать: {fix}" + (f"\nКто: {who}." if who else ""))
+        if count[cid] > 1:
+            lines.append(f"Всего остановлено выпусков на канале: {count[cid]}.")
+        out.append(Alert(f"stopped:{cid}", f"Канал остановился: {name}",
+                         "\n".join(lines), since_hint=_f(updated)))
+    return out
+
+
 def check_channel_supply(c, now, tenant=None) -> list:
     """§14. В канале кончается материал: обеспечено меньше суток, чем порог.
 
@@ -1285,7 +1365,7 @@ CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
           check_missed_slots, check_disk, check_oldest_task, check_failed_tasks,
           check_key_exhausted, check_key_expiring, check_usage_near_limit,
           check_key_dead, check_text_subscription_dead, check_upload_profile_busy,
-          check_channel_supply)
+          check_channel_supply, check_channel_stopped)
 
 # Сколько повод должен продержаться, прежде чем о нём говорят. Там, где длительность
 # и есть суть повода (§2), она проверяется здесь; остальные поводы уже содержат свой
@@ -1323,6 +1403,8 @@ KEY_ALERT_KEYS = {"fastgen_key_expiring", "fastgen_usage_near_limit", "key_dead"
 
 def repeat_after(key: str) -> float:
     """Через сколько повторять этот повод. Первое сообщение задержки не знает."""
+    if key.split(":")[0] == "stopped":
+        return STOPPED_REPEAT_SEC
     return KEY_REPEAT_SEC if key.split(":")[0] in KEY_ALERT_KEYS else REPEAT_SEC
 
 
