@@ -52,3 +52,42 @@ X11-журнал подтвердил чтение и снимки при дру
 Проверенная версия установлена атомарно с повторной сверкой исходного SHA и
 резервной копией. Пуллер и сервис не перезапускались. SHA-256 установленного reader:
 `33b8524d21f832d4a07d2a71f3ad4d6dba03228c9a8892862da1444ee43daea8`.
+
+## Защита фокуса Xfwm4 на Минске
+
+15.10.2026 для рабочего стола AdsPower применены `/general/focus_new=false` и
+`/general/prevent_focus_stealing=true`. Обычный браузер с окном и CDP-снимки PNG
+сохранены. Значения подтверждены чтением и сохранённым XML; PID Xfwm4 и Xvfb
+не изменились. Новое тестовое окно `xmessage` не перехватило фокус.
+
+Повторные обходы свободных профилей 26 и 19 остановились до открытия браузера:
+AdsPower вернул `Check Proxy Fail`. Браузеры этих профилей не открылись, закрытие
+подтверждено на обеих машинах. Эти попытки не подтверждают работу обхода и PNG
+после изменения Xfwm4; успешный пилот CDP-снимков выше выполнен до этой настройки.
+
+Команды `xfconf-query` выполнять в окружении **живого процесса `xfwm4`**:
+взять `DBUS_SESSION_BUS_ADDRESS`, `DISPLAY`, `XAUTHORITY`, `XDG_CONFIG_HOME`
+из `/proc/<PID xfwm4>/environ`. Для этой сессии `DISPLAY=:99`,
+`XDG_CONFIG_HOME=/home/vova/.config/adspower-desktop`. Произвольная D-Bus-шина
+SSH-сессии или новый `dbus-run-session` не подходят. После переноса и проверки
+этих четырёх переменных:
+
+```sh
+cp -p "$XDG_CONFIG_HOME/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml" \
+  "$XDG_CONFIG_HOME/xfce4/xfconf/xfce-perchannel-xml/xfwm4.xml.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+xfconf-query -c xfwm4 -p /general/focus_new -s false
+xfconf-query -c xfwm4 -p /general/prevent_focus_stealing -s true
+xfconf-query -c xfwm4 -p /general/focus_new
+xfconf-query -c xfwm4 -p /general/prevent_focus_stealing
+```
+
+XML сохраняет `xfconfd`; вручную его не перезаписывать и службы не перезапускать.
+Откат прежних значений через ту же живую шину:
+
+```sh
+xfconf-query -c xfwm4 -p /general/focus_new -s true
+xfconf-query -c xfwm4 -p /general/prevent_focus_stealing -s false
+```
+
+Новое окно теперь требует клика для ввода. Явная активация приложением всё ещё
+может пройти: эти настройки не обеспечивают полную изоляцию фокуса.
