@@ -483,12 +483,17 @@ def _codex_refresh_possible(codex_home: str) -> bool:
     замком, то есть более старый вызов не может затереть более новый auth.
 
     Не смогли прочитать срок — считаем, что обновление возможно (перестраховка).
+
+    Окно — 6 ч, было 48 (15.10.2026). CLI обновляет токен у самого конца срока
+    (auth.json на VPS: last_refresh 05.10 23:35 = истечение прежнего), а 48 ч замка
+    каждые десять суток на двое суток сводили промпты к одному вызову на учётку:
+    задача шла 80–140 мин вместо 20, в очереди копилось под 30 задач.
     """
     margin_h = os.environ.get("VS_CODEX_REFRESH_MARGIN_H")
     try:
-        margin = float(margin_h) if margin_h else 48.0
+        margin = float(margin_h) if margin_h else 6.0
     except ValueError:
-        margin = 48.0
+        margin = 6.0
     if margin <= 0:                      # 0 = вернуть прежнее поведение (замок всегда)
         return True
     try:

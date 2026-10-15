@@ -8976,15 +8976,16 @@ def _codex_refresh_possible(codex_home: str) -> bool:
     compare-and-swap в ``_sync_codex_auth_back``: более старый вызов не может
     затереть более новый токен.
 
-    Порог — ``REWRITE_CODEX_REFRESH_MARGIN_H`` (48 ч). 0 возвращает прежнее
+    Порог — ``REWRITE_CODEX_REFRESH_MARGIN_H`` (6 ч; до 15.10.2026 было 48 — см.
+    `workers/prompt_llm._codex_refresh_possible`). 0 возвращает прежнее
     поведение «замок всегда». Не смогли прочитать срок — считаем, что ротация
     возможна (перестраховка).
     """
     raw = os.environ.get("REWRITE_CODEX_REFRESH_MARGIN_H")
     try:
-        margin = float(raw) if raw else 48.0
+        margin = float(raw) if raw else 6.0
     except ValueError:
-        margin = 48.0
+        margin = 6.0
     if margin <= 0:
         return True
     import base64 as _b64                      # в модуле не импортирован
