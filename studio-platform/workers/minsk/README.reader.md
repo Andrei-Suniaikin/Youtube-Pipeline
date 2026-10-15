@@ -183,10 +183,16 @@ PID `2647545 → 1316918`. AdsPower, Xvfb и загрузчики не пере�
 `active=false`, `state=inactive`; состояние брони при проверке не менялось.
 Улика: `/home/vova/headless_rollout_20261015T111614Z/lease_verification_20261015T113615Z_9ca6bd.json`.
 
-Общий статус записи остался `partial` только из-за discovery: `authuser=2`
-разрешился в уже известный индекс 0 (`repeated_session_alias`). Это не мешало
-прочитать три найденных канала. Сравнение профиля 40 с обычным оконным обходом
-не выполнялось. Сервер принял задание №16 как `done`: `read=3`, `channels=1`,
+Общий статус записи остался `partial` на discovery: для `authuser=1` текущий
+парсер не разрешил четыре менеджерских канала из `popup.confirmDialogRenderer`
+(`channels_status=partial`, `unknown_crossowner`; среди них Bitvy, Ocel и Valka).
+Также `authuser=2` разрешился в уже известный индекс 0 (`repeated_session_alias`),
+но этот повтор не является единственной причиной частичного статуса.
+Все три обнаруженных reader-результата полные. Старый оконный обход от 04.10.2026
+содержал пять других UC; свежего оконного сравнения профиля 40 нет, поэтому связь
+неразрешённых каналов с headless не установлена. Сравнение discovery:
+`/home/vova/headless_rollout_20261015T111614Z/p40_historical_discovery_comparison.json`.
+Сервер принял задание №16 как `done`: `read=3`, `channels=1`,
 `read=1` при импорте и `notfromstudio=2`. Один UC совпал с каналом этого tenant и
 обновлён; два других отсутствуют в его `pub_channels` и отфильтрованы штатно.
 Проверка: `/home/vova/headless_rollout_20261015T111614Z/job16_verification_20261015T113447Z_e88bab.json`.
