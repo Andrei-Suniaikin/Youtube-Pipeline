@@ -171,6 +171,20 @@ def main() -> int:
     step(c)
     check("выход не тронут", slot(c, "rel-R"), at(17))
 
+    print("\nОтложка полна (лимит 5, стоят 10–14.10): ролик в дыру льётся, дальше — ждёт")
+    c = fresh()
+    c.execute("UPDATE pub_channels SET deferred_limit=5")
+    for n, day in enumerate(range(10, 15), start=2):
+        release(c, f"rel-{n}", n, at(day), "done", "scheduled")
+        job(c, f"rel-{n}", at(day), "done")
+    c.execute("UPDATE pub_upload_jobs SET verdict='scheduled'")
+    room = lambda rid: svc()._deferred_room(c, rel_of(c, rid))   # noqa: E731
+    release(c, "rel-gap", 90, at(9), "pending", "cover_ready")
+    check("выход 09.10 раньше стоящих — место есть", room("rel-gap"), True)
+    check("выход 17.10 позже последнего — ждёт места", room("rel-R"), False)
+    c.execute("UPDATE pub_channels SET deferred_limit=6")
+    check("лимит не исчерпан — место есть", room("rel-R"), True)
+
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
         for f in FAILS:

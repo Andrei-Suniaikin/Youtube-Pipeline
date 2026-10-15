@@ -1474,10 +1474,16 @@ class PubServices:
         limit = int(rel["deferred_limit"] or 0)
         if limit <= 0:
             return True
-        waiting = c.execute(
-            "SELECT COUNT(*) FROM pub_upload_jobs u JOIN pub_releases r "
+        waiting, last = c.execute(
+            "SELECT COUNT(*), MAX(u.slot_at) FROM pub_upload_jobs u JOIN pub_releases r "
             "ON r.release_id=u.release_id WHERE r.channel_id=? AND u.verdict='scheduled' "
-            "AND u.slot_at > ?", (rel["channel_id"], self._clock())).fetchone()[0]
+            "AND u.slot_at > ?", (rel["channel_id"], self._clock())).fetchone()
+        # 15.10.2026, владелец: «ролик в дыру — без лимита». В отложке стояли ролики на
+        # 17–21.10, а готовые на 15 и 16.10 ждали места — и канал два дня молчал, а сами
+        # ролики уезжали за 21.10. Ролик, чей выход раньше последнего уже стоящего,
+        # отложку вперёд не удлиняет — он закрывает пустой день, поэтому льётся сразу.
+        if waiting and last is not None and float(rel["slot_at"] or 0) < float(last):
+            return True
         return waiting < limit
 
     def _clock(self) -> float:
