@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""§15: канал остановился — сообщение по каналу (15.10.2026).
+"""§15: каналы остановились — одно сообщение на весь набор (15.10.2026).
 
 Задача Володи: «отдельные уведомления об остановках. В сообщении: какой канал
 остановился, почему, что уже попробовано и какое действие нужно».
 
 Проверяется:
-  * остановленный выпуск → одно сообщение на канал, даже если остановлено несколько;
-  * в тексте канал, профиль AdsPower, причина словами, сколько раз возвращали в работу,
-    что сделать и кто;
+  * все остановленные каналы — ОДНИМ сообщением, по причинам (первая версия слала по
+    сообщению на канал: при включении ушло 29 разом);
+  * в тексте канал, профиль AdsPower, слот, сколько раз возвращали, что сделать и кто;
   * только что остановленный (меньше STOPPED_HOLD_SEC) — молчим: студия может вернуть сама;
   * выход давно в прошлом и канал на паузе — не зовём;
-  * повтор раз в сутки, «починилось» — когда остановок не осталось.
+  * сообщение — только когда набор устоялся полчаса; повтор раз в сутки; без «починилось».
 
     .venv/bin/python tests/test_alert_channel_stopped.py
 """
@@ -83,17 +83,17 @@ def main() -> int:
     release(c, "r_old", 3, NOW - 5 * 86400)               # выход давно прошёл
     release(c, "r_ok", 3, NOW + 3600, status="done", reason=None)
 
-    print("Сообщение по каналу")
+    print("Одно сообщение на весь набор")
+    release(c, "r_c2", 3, NOW + 7200)                     # второй канал, та же причина
     al = A.check_channel_stopped(c, NOW, "3")
-    check("одно сообщение — только остановленный активный канал",
-          [a.key for a in al], ["stopped:1"])
+    check("одно сообщение на два канала", len(al), 1)
     text = al[0].text if al else ""
-    check("заголовок называет канал", al[0].title if al else "", "Канал остановился: Stal i Popiół")
-    for want in ("@ch1", "Профиль AdsPower: 55 «V - WW2 HU 1»", "r_a",
-                 "Почему: в аккаунте нет этого канала — нужны права менеджера",
-                 "вернуть в работу — 1 раз", "Что сделать:", "Кто:",
-                 "Всего остановлено выпусков на канале: 2"):
+    check("заголовок с числом", al[0].title if al else "", "Остановлены каналы: 2")
+    for want in ("в аккаунте нет этого канала — нужны права менеджера — 2:",
+                 "· Stal i Popiół — профиль 55", "возвращали 1 раз", "стоит выпусков: 2",
+                 "· Здоровый — профиль 55", "Что сделать:", "Кто:"):
         check(f"в тексте есть «{want}»", want in text, True)
+    check("канал на паузе не попал", "Пауза" not in text, True)
 
     print("Только что остановленный — ждём")
     c2 = world()
@@ -104,24 +104,39 @@ def main() -> int:
     c3 = world()
     release(c3, "r_x", 1, NOW + 3600, reason="что-то новое   с пробелами")
     al3 = A.check_channel_stopped(c3, NOW, "3")
-    check("причина показана как есть", "Почему: что-то новое с пробелами." in al3[0].text, True)
+    check("причина показана как есть", "что-то новое с пробелами — 1:" in al3[0].text, True)
 
-    print("Повтор и «починилось»")
-    check("повтор раз в сутки", A.repeat_after("stopped:1"), 24 * 3600.0)
+    print("Длинный список режется под телеграм")
+    c4 = world()
+    pid = c4.execute("SELECT id FROM pub_profiles").fetchone()[0]
+    for i in range(200):
+        c4.execute("INSERT INTO pub_channels(tenant_id,uc,name,lang,tz,schedule,deferred,"
+                   "deferred_limit,profile_id,status,created,updated) "
+                   "VALUES('3',?,?,'pl','Europe/Warsaw','{}',1,0,?,'active',?,?)",
+                   (f"UL{i:022d}", f"Канал с длинным именем {i}", pid, NOW, NOW))
+        cid = c4.execute("SELECT max(id) FROM pub_channels").fetchone()[0]
+        release(c4, f"r_l{i}", cid, NOW + 3600 + i, item=10_000 + i,
+                reason=f"причина номер {i % 7} " + "х" * 40)
+    al4 = A.check_channel_stopped(c4, NOW, "3")
+    check("не длиннее STOPPED_TEXT_MAX + хвост", len(al4[0].text) < A.STOPPED_TEXT_MAX + 80, True)
+
+    print("Подача: полчаса устояться, повтор раз в сутки, без «починилось»")
     sent = []
     saved = A.CHECKS
     A.CHECKS = (A.check_channel_stopped,)
+    say = lambda t: sent.append(t) or True                # noqa: E731
     try:
-        A.tick(c, lambda t: sent.append(t) or True, now=NOW, tenant="3")
-        check("первый проход — тревога", [t.split("\n")[0] for t in sent],
-              ["ТРЕВОГА · Канал остановился: Stal i Popiół"])
+        A.tick(c, say, now=NOW, tenant="3")
+        check("сразу — молчим (набор должен устояться)", sent, [])
+        A.tick(c, say, now=NOW + A.STOPPED_SETTLE_SEC + 1, tenant="3")
+        check("через полчаса — одно сообщение", [t.split("\n")[0] for t in sent],
+              ["ТРЕВОГА · Остановлены каналы: 2"])
         sent.clear()
-        A.tick(c, lambda t: sent.append(t) or True, now=NOW + 3600, tenant="3")
-        check("через час — тишина", sent, [])
-        c.execute("UPDATE pub_releases SET status='done' WHERE channel_id=1")
-        A.tick(c, lambda t: sent.append(t) or True, now=NOW + 7200, tenant="3")
-        check("остановок не осталось — «починилось»",
-              [t.split("\n")[0] for t in sent], ["ПОЧИНИЛОСЬ · Канал остановился: Stal i Popiół"])
+        A.tick(c, say, now=NOW + 3 * 3600, tenant="3")
+        check("через три часа — тишина", sent, [])
+        c.execute("UPDATE pub_releases SET status='done' WHERE channel_id IN (1,3)")
+        A.tick(c, say, now=NOW + 4 * 3600, tenant="3")
+        check("всё починилось — без отдельного «починилось»", sent, [])
     finally:
         A.CHECKS = saved
 

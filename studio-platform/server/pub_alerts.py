@@ -65,10 +65,12 @@
 Пятнадцатый повод добавлен 15.10.2026 по задаче Володи («отдельные уведомления об
 остановках: какой канал, почему, что уже попробовано и какое действие нужно»):
 
-15. канал остановился — у него есть выпуск в статусе «остановлен». Это единственный
-    повод ПО КАНАЛУ, а не один на всё: просили именно так, а причина и действие у
-    каждого канала свои. Повтор — раз в сутки (`STOPPED_REPEAT_SEC`), «починилось» —
-    когда у канала не осталось остановленных выпусков
+15. каналы остановились — у канала есть выпуск в статусе «остановлен». ОДНО сообщение
+    на весь набор, сгруппированное по причине: канал, профиль, слот, сколько раз
+    возвращали, что сделать и кто. Новое сообщение — когда набор поменялся и
+    продержался полчаса; повтор того же набора — раз в сутки; «починилось» не шлётся
+    (уход канала из набора виден в следующем сообщении). Первая версия слала по
+    сообщению на канал — при включении ушло 29 разом
 
 Три правила подачи, тоже из ТЗ: одно сообщение на случай, повтор не чаще раза в час,
 обязательное сообщение «починилось».
@@ -138,10 +140,14 @@ REPEAT_SEC = _sec("VS_ALERT_REPEAT_SEC", 60 * 60)        # повтор не ч�
 # сроке не добавляет ни одного нового сведения, зато к третьему разу тревоги
 # перестают читать — и пропускают ту, которая про очередь.
 KEY_REPEAT_SEC = _sec("VS_ALERT_KEY_REPEAT_SEC", 24 * 3600)
-# §15: остановленный канал — раз в сутки (по сообщению на канал, чаще — шум).
+# §15: тот же набор остановленных каналов — повтор раз в сутки.
 STOPPED_REPEAT_SEC = _sec("VS_ALERT_STOPPED_REPEAT_SEC", 24 * 3600)
 STOPPED_HOLD_SEC = _sec("VS_ALERT_STOPPED_HOLD_SEC", 15 * 60)
 STOPPED_PAST_SEC = _sec("VS_ALERT_STOPPED_PAST_SEC", 2 * 86400)
+# Набор остановленных каналов должен продержаться полчаса — иначе каждое «вернул /
+# снова встал» давало бы новое сообщение.
+STOPPED_SETTLE_SEC = _sec("VS_ALERT_STOPPED_SETTLE_SEC", 30 * 60)
+STOPPED_TEXT_MAX = 3500                                     # телеграм режет на 4096
 DISK_MIN_GB = float(os.environ.get("VS_ALERT_DISK_GB") or 100)
 # §9/§10 — не из ТЗ, добавлены владельцем 16.09.2026.
 KEY_EXPIRES_DAYS = _num("VS_ALERT_KEY_EXPIRES_DAYS", 7)          # §9: за сколько дней предупредить
@@ -1233,7 +1239,7 @@ def _when(ts) -> str:
 
 
 def check_channel_stopped(c, now, tenant=None) -> list:
-    """§15. Канал остановился: у него есть остановленный выпуск (по поводу на канал).
+    """§15. Каналы с остановленным выпуском — одно сообщение на весь набор.
 
     Берётся выпуск с самым ранним слотом — он и держит канал. Остановки, чей слот ушёл
     в прошлое дальше `STOPPED_PAST_SEC`, не считаются: выход уже потерян, а звать
@@ -1261,7 +1267,7 @@ def check_channel_stopped(c, now, tenant=None) -> list:
     for r in rows:
         first.setdefault(r[1], r)
         count[r[1]] = count.get(r[1], 0) + 1
-    out = []
+    groups: dict = {}
     for cid, r in first.items():
         (rid, _cid, slot, phase, reason, updated, attempts,
          name, handle, serial, ptitle) = r
@@ -1271,29 +1277,34 @@ def check_channel_stopped(c, now, tenant=None) -> list:
         revived = c.execute(
             "SELECT count(*), max(ts) FROM pub_release_log WHERE release_id=? "
             "AND message LIKE 'возвращён в работу%'", (rid,)).fetchone()
-        why = b.get("title") or (" ".join(str(reason or "").split())[:200]
-                                   or "причина не записана")
-        lines = [f"Канал: {name}" + (f" ({handle})" if handle else "")]
-        if serial:
-            lines.append(f"Профиль AdsPower: {serial}"
-                         + (f" «{' '.join(str(ptitle).split())}»" if ptitle else ""))
-        lines.append(f"Выпуск {rid}, выход {_when(slot)}, этап «{phase}».")
-        lines.append(f"Почему: {why}.")
-        if b.get("what"):
-            lines.append(b["what"])
-        tried = [f"вернуть в работу — {revived[0]} раз (последний {_when(revived[1])})"
-                 if revived and revived[0] else "в работу ещё не возвращали"]
-        if attempts:
-            tried.append(f"попыток этапа — {attempts}")
-        lines.append("Уже пробовали: " + "; ".join(tried) + ".")
-        fix = b.get("fix") or "разобрать причину на экране «Выпуски»."
-        who = b.get("who") or ""
-        lines.append(f"Что сделать: {fix}" + (f"\nКто: {who}." if who else ""))
+        why = b.get("title") or (" ".join(str(reason or "").split())[:160]
+                                 or "причина не записана")
+        g = groups.setdefault(why, {"fix": b.get("fix") or "разобрать на экране «Выпуски».",
+                                    "who": b.get("who") or "", "rows": []})
+        bits = [f"профиль {serial}" if serial else "без профиля",
+                f"выход {_when(slot)}"]
+        if revived and revived[0]:
+            bits.append(f"возвращали {revived[0]} раз")
         if count[cid] > 1:
-            lines.append(f"Всего остановлено выпусков на канале: {count[cid]}.")
-        out.append(Alert(f"stopped:{cid}", f"Канал остановился: {name}",
-                         "\n".join(lines), since_hint=_f(updated)))
-    return out
+            bits.append(f"стоит выпусков: {count[cid]}")
+        g["rows"].append((cid, f"· {name} — " + ", ".join(bits)))
+    if not groups:
+        return []
+    ids = sorted(cid for g in groups.values() for cid, _t in g["rows"])
+    parts = []
+    for why, g in sorted(groups.items(), key=lambda kv: -len(kv[1]["rows"])):
+        parts.append(f"{why} — {len(g['rows'])}:\n"
+                     + "\n".join(t for _c, t in g["rows"])
+                     + f"\nЧто сделать: {g['fix']}"
+                     + (f"\nКто: {g['who']}." if g["who"] else ""))
+    text = "\n\n".join(parts)
+    if len(text) > STOPPED_TEXT_MAX:
+        text = text[:STOPPED_TEXT_MAX].rsplit("\n", 1)[0] + "\n… полный список — на экране «Выпуски»"
+    # Ключ — набор остановленных каналов: новое сообщение только когда набор поменялся
+    # (и продержался MIN_HOLD), а не по сообщению на канал. 15.10.2026 по сообщению на
+    # канал при включении ушло 29 штук разом — владелец: «1000000 сообщений».
+    key = "stopped:" + hashlib.sha1(",".join(map(str, ids)).encode()).hexdigest()[:12]
+    return [Alert(key, f"Остановлены каналы: {len(ids)}", text)]
 
 
 def check_channel_supply(c, now, tenant=None) -> list:
@@ -1370,12 +1381,12 @@ CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
 # Сколько повод должен продержаться, прежде чем о нём говорят. Там, где длительность
 # и есть суть повода (§2), она проверяется здесь; остальные поводы уже содержат свой
 # порог внутри запроса, и держать их дополнительно значило бы удваивать ожидание.
-MIN_HOLD = {"provider_resting": RESTING_SEC}
+MIN_HOLD = {"provider_resting": RESTING_SEC, "stopped": STOPPED_SETTLE_SEC}
 
 # Поводы-события, а не состояния: сказать один раз и не возвращаться. Повтор и
 # «починилось» осмысленны, только когда повод описывает то, что тянется.
 NO_REPEAT = {"failed"}
-NO_FIXED = {"failed"}
+NO_FIXED = {"failed", "stopped"}
 
 # §9/§10/§11 читают один и тот же снимок FastGen. Пока он протух (или его вовсе не
 # было), «пропал из active» значит «нет свежих цифр», а не «починилось» — иначе именно
