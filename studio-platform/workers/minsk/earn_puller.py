@@ -212,7 +212,7 @@ class Beat:
 def run_collector(profile: str, out: Path, beat: Beat) -> int:
     cmd = [PYTHON, str(COLLECTOR_DIR / "collector.py"), "--api", LOCAL_API,
            "--peer-api", PEER_API, "--lease-context", str(COLLECTOR_DIR / "lease_context.json"),
-           "--out", str(out), "--profiles", profile]
+           "--out", str(out), "--profiles", profile, "--headless"]
     env = dict(os.environ)
     env.setdefault("ADSPOWER_RATE_LIMIT_DIR",
                    os.path.expanduser("~/.local/state/video-studio/adspower-rate"))

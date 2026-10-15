@@ -663,6 +663,60 @@ def confirm_proxy_start_inactive(legacy, hosts, profile, assert_held):
             "uploaders": [], "lease_held": True}
 
 
+def configure_headless_viewport(driver, directory, guard, *, enabled=False):
+    """Match headed PNG dimensions using native window geometry on our safe tab."""
+    if not enabled:
+        return
+    target = {"width": 1590, "height": 903}
+    evidence = {"before": None, "after": None, "target": target,
+                "attempts": [], "confirmed": False}
+
+    def checked(name, action):
+        guard()
+        try:
+            value = action()
+        except Exception as exc:
+            # A lease error must take precedence over a browser failure.
+            guard()
+            raise StopRun(f"Headless viewport {name} failed: {type(exc).__name__}: "
+                          f"{safe_api_message(str(exc))}") from exc
+        guard()
+        return value
+
+    def inner_size():
+        value = checked("read", lambda: driver.execute_script(
+            "return {width:innerWidth,height:innerHeight}"))
+        if (not isinstance(value, dict) or set(value) != {"width", "height"}
+                or any(type(value[key]) is not int or value[key] <= 0 for key in target)):
+            raise StopRun("Headless viewport dimensions are invalid")
+        return value
+
+    try:
+        inner = inner_size()
+        evidence["before"] = evidence["after"] = inner
+        for _ in range(2):
+            if inner == target:
+                break
+            rect = checked("get_window_rect", driver.get_window_rect)
+            if (not isinstance(rect, dict) or any(type(rect.get(key)) is not int
+                    or rect[key] <= 0 for key in target)):
+                raise StopRun("Headless native window dimensions are invalid")
+            requested = {key: rect[key] + target[key] - inner[key] for key in target}
+            attempt = {"before": inner, "window_rect": rect, "requested": requested}
+            evidence["attempts"].append(attempt)
+            checked("set_window_rect", lambda: driver.set_window_rect(**requested))
+            inner = inner_size()
+            attempt["after"] = evidence["after"] = inner
+        evidence["confirmed"] = inner == target
+        if not evidence["confirmed"]:
+            raise StopRun("Headless viewport could not be matched to evidence baseline")
+    except Exception as exc:
+        evidence["error"] = {"type": type(exc).__name__, "message": str(exc)[:1000]}
+        raise
+    finally:
+        save(Path(directory) / "headless_viewport.json", evidence)
+
+
 def scan_profile(args, profile, legacy, coordination, lease_context, reader, options, journal, metric_cache=None):
     directory = args.out / "profiles" / f"{profile['serial']}_{profile['user_id']}" / ("attempt_" + stamp())
     rec = {"schema_version": 1, "profile": profile, "started_at": now(), "status": "starting",
@@ -696,7 +750,8 @@ def scan_profile(args, profile, legacy, coordination, lease_context, reader, opt
             try:
                 # Deliberately one start call. Never retry or attach to a prior session.
                 response = api_json(legacy, args.api, "/api/v1/browser/start",
-                                    {"user_id": profile["user_id"], "open_tabs": 1, "ip_tab": 0, "headless": 0},
+                                    {"user_id": profile["user_id"], "open_tabs": 1, "ip_tab": 0,
+                                     "headless": int(args.headless)},
                                     timeout=180, check=guard)
                 data = response.get("data") or {}
                 debugger = (data.get("ws") or {}).get("selenium")
@@ -752,7 +807,10 @@ def scan_profile(args, profile, legacy, coordination, lease_context, reader, opt
             journal.checkpoint(directory, rec, "original_tabs_recorded")
             preserve = False
             # Navigation happens in our own new tab, preserving original tabs/URLs.
+            guard()
             driver.switch_to.new_window("tab")
+            guard()
+            configure_headless_viewport(driver, directory, guard, enabled=args.headless)
             discover(driver, legacy, rec, directory, journal, guard, args.max_authuser)
             if reader:
                 read_all_channels(driver, reader, legacy, rec, directory, journal, guard, options,
@@ -830,6 +888,8 @@ def main():
     selection.add_argument("--profiles")
     selection.add_argument("--all", action="store_true")
     parser.add_argument("--identity-only", action="store_true")
+    parser.add_argument("--headless", action="store_true",
+                        help="Run this automatic scan without a browser window; preserve full-size PNGs")
     parser.add_argument("--lease-context", type=Path, required=True)
     parser.add_argument("--reader-options", type=Path)
     parser.add_argument("--max-authuser", type=int, choices=range(20), default=19)
