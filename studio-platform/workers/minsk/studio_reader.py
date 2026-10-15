@@ -5,6 +5,7 @@ No verification/SMS or profile lifecycle. The only optional mutation is
 setting an explicitly unset country to Argentina, under exact guards.
 """
 from datetime import datetime, timezone
+import base64
 import json
 import os
 from pathlib import Path
@@ -206,6 +207,20 @@ def numeric(raw, integer=False):
     return int(number) if integer and number.is_integer() else number if not integer else None
 
 
+def capture_screenshot(driver, filename=None):
+    """Capture the page surface without activating its browser window."""
+    png = base64.b64decode(driver.execute_cdp_cmd(
+        "Page.captureScreenshot", {"format": "png", "fromSurface": True})["data"])
+    if filename is None:
+        return png
+    try:
+        with open(filename, "wb") as output:
+            output.write(png)
+    except OSError:
+        return False
+    return True
+
+
 def wake_render(driver, check, observations, reason):
     """Minsk 2026-10-04: one screenshot wakes paused background UI rendering.
 
@@ -216,7 +231,7 @@ def wake_render(driver, check, observations, reason):
     started = time.monotonic()
     observation = {"at": now(), "reason": reason}
     try:
-        png = driver.get_screenshot_as_png()
+        png = capture_screenshot(driver)
         observation["status"] = "ok" if isinstance(png, bytes) and png else "empty_screenshot"
     except Exception as exc:
         observation.update(status="error", error=type(exc).__name__ + ": " + str(exc)[:300])
@@ -533,7 +548,7 @@ def read_channel(driver, expected_uc, output_dir, options):
         if screenshot.exists():
             shutil.copy2(screenshot, str(screenshot) + ".bak")
         try:
-            if not driver.save_screenshot(str(screenshot)):
+            if not capture_screenshot(driver, str(screenshot)):
                 raise RuntimeError("screenshot_returned_false")
             record["screenshot"] = screenshot.name
         except Exception as exc:
