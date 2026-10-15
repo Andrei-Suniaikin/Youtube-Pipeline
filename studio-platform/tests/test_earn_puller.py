@@ -161,6 +161,7 @@ def collector(mode: str) -> None:
     with open(os.path.join(COLL, "collector.py"), "w") as f:
         f.write(f"""import json, os, sys
 a = sys.argv; out = a[a.index('--out') + 1]; prof = a[a.index('--profiles') + 1]
+assert '--headless' in a, 'earn_puller must request headless explicitly'
 os.makedirs(out, exist_ok=True)
 mode = {mode!r}
 if mode == 'busy-then-ok':
