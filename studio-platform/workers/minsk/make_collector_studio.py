@@ -167,7 +167,15 @@ def read_expected_channels(driver, reader, legacy, rec, directory, journal, asse
                 state, ident = open_direct(driver, uc, au, assert_held)
             except Exception as exc:
                 state, ident = "error", {"error": f"{type(exc).__name__}: {str(exc)[:300]}"}
-            tried.append({"authuser": au, "email": account["email"], "state": state})
+            tried.append({"authuser": au, "email": account["email"], "state": state,
+                          "seen_uc": (ident or {}).get("uc"), "url": (ident or {}).get("url")})
+            # 16.10.2026: снимок экрана на каждую почту — доказательство для операторов,
+            # что Studio под этой почтой канал не открывает (а не «скрипт сломался»).
+            try:
+                channel_dir.mkdir(parents=True, exist_ok=True)
+                driver.save_screenshot(str(channel_dir / f"open_{state}.png"))
+            except Exception:
+                pass
             if state != "ok":
                 continue
             context = {"profile": rec["profile"]["serial"], "user_id": rec["profile"]["user_id"],
@@ -226,16 +234,28 @@ def main(src: str, dst: str) -> int:
                 if getattr(args, "expect_ucs", None):
                     read_expected_channels(driver, reader, legacy, rec, directory, journal, guard,
                                            options, args.expect_ucs)''')
+    # 3а) 16.10.2026: второй хост AdsPower (macbook-pro-4) выключен — сборщик вставал целиком.
+    # С --peer-offline-ok недоступный peer считается пустым; доступный — проверяется как раньше.
+    rep('''                    raise StopRun(f"Host {name} active-list unavailable ({type(exc).__name__})") from None''',
+        '''                    if name == "peer" and globals().get("PEER_OFFLINE_OK"):
+                        print(f"peer offline ({type(exc).__name__}): считаем пустым (--peer-offline-ok)",
+                              flush=True)
+                        break
+                    raise StopRun(f"Host {name} active-list unavailable ({type(exc).__name__})") from None''')
     # 4) ключ командной строки
     rep('''    parser.add_argument("--max-authuser", type=int, choices=range(20), default=19)''',
         '''    parser.add_argument("--max-authuser", type=int, choices=range(20), default=19)
     parser.add_argument("--expect-ucs", default="",
                         help="UC каналов студии на профиле через запятую: открыть напрямую тех, "
-                             "кого нет в списках почт (доступ менеджера)")''')
+                             "кого нет в списках почт (доступ менеджера)")
+    parser.add_argument("--peer-offline-ok", action="store_true",
+                        help="второй хост AdsPower недоступен — не останавливаться (только если "
+                             "владелец подтвердил, что профили на нём закрыты)")''')
     rep('''    args.api, args.peer_api = origin(args.api), origin(args.peer_api)''',
         '''    args.api, args.peer_api = origin(args.api), origin(args.peer_api)
     args.expect_ucs = [u.strip() for u in (args.expect_ucs or "").split(",")
-                       if UC_RE.match(u.strip())]''')
+                       if UC_RE.match(u.strip())]
+    globals()["PEER_OFFLINE_OK"] = bool(args.peer_offline_ok)''')
     s = s.replace('"""Isolated, resumable AdsPower inventory; never modifies a registry or profile.',
                   '"""Isolated, resumable AdsPower inventory; never modifies a registry or profile.\n\n'
                   'STUDIO COPY (15.10.2026): built by studio-platform/workers/minsk/'

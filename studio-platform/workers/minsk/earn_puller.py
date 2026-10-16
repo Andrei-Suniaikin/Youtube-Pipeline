@@ -72,6 +72,8 @@ LEASE_CONTEXT = Path(os.environ.get("EARN_LEASE_CONTEXT",
 PEER_TRIES = int(os.environ.get("EARN_PEER_TRIES", "3"))
 PEER_PAUSE_SEC = float(os.environ.get("EARN_PEER_PAUSE_SEC", "10"))
 PEER_CACHE_SEC = float(os.environ.get("EARN_PEER_CACHE_SEC", "60"))
+# 16.10.2026: Мак выключен, профили на нём закрыты (Володя) — сбор идёт без него.
+PEER_OFFLINE_OK = os.environ.get("EARN_PEER_OFFLINE_OK", "1") == "1"
 PEER_DOWN_NOTE = ("Мак Володи не отвечает — без него сбор не запускается, "
                   "чтобы не открыть профиль на двух машинах сразу")
 
@@ -145,6 +147,13 @@ def peer_alive(force: bool = False) -> bool:
                 break
         except Exception:                        # noqa: BLE001 — молчит = не ответил
             continue
+    if not ok and PEER_OFFLINE_OK and COLLECTOR_DIR.joinpath("collector_studio.py").exists():
+        # 16.10.2026: Мак выключен, Володя подтвердил — профили на нём закрыты. Наша копия
+        # сборщика с --peer-offline-ok считает молчащий Мак пустым; отвечающий проверяет.
+        if _PEER["ok"] is not True:
+            log("Мак Володи не отвечает — собираем без него (EARN_PEER_OFFLINE_OK=1)")
+        _PEER.update(at=time.time(), ok=True)
+        return True
     if ok is not _PEER["ok"]:
         log("Мак Володи отвечает" if ok else "Мак Володи не отвечает — ночные задания ждут")
     _PEER.update(at=time.time(), ok=ok)
@@ -226,6 +235,11 @@ def run_collector(profile: str, out: Path, beat: Beat, ucs=None) -> int:
            "--out", str(out), "--profiles", profile]
     if ucs and script.name == "collector_studio.py":
         cmd += ["--expect-ucs", ",".join(ucs)]
+    # 16.10.2026: macbook-pro-4 (второй хост AdsPower) выключен, Володя подтвердил, что
+    # профили на нём закрыты. Недоступный второй хост не останавливает сбор; доступный
+    # проверяется как раньше. Выключить: EARN_PEER_OFFLINE_OK=0.
+    if script.name == "collector_studio.py" and PEER_OFFLINE_OK:
+        cmd += ["--peer-offline-ok"]
     env = dict(os.environ)
     env.setdefault("ADSPOWER_RATE_LIMIT_DIR",
                    os.path.expanduser("~/.local/state/video-studio/adspower-rate"))
