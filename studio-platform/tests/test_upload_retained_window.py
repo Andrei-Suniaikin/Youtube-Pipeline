@@ -109,6 +109,7 @@ def main():
     r = client.get("/api/upload/retained", params={"profile": "28", "uc": UC_A}, headers=H)
     check("нашли самое свежее задание этого профиля и канала", r.json().get("release_id"), "rel-stuck")
     check("отдан заголовок — по нему машина сверит окно", r.json().get("title"), "ролик rel-stuck")
+    check("сказано, что таких заданий у канала два — машина окно не атрибутирует", r.json().get("candidates"), 2)
     r = client.get("/api/upload/retained", params={"profile": "29", "uc": UC_A}, headers=H)
     check("чужой профиль — ничего", r.json().get("release_id"), None)
     r = client.get("/api/upload/retained", params={"profile": "28", "uc": UC_B}, headers=H)

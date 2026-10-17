@@ -488,13 +488,20 @@ def register_upload_routes(app, ctx):
                 "ORDER BY u.updated DESC", (uc,)).fetchall()
         except sqlite3.OperationalError:
             return None
+        found = []
         for r in rows:
             if str(_agent_profile(r["ads_serial"]) if r["ads_serial"] else r["profile_id"]) != str(serial):
                 continue
             if r["hand_confirmed"] or r["rel_status"] != "blocked":
                 continue
-            return r
-        return None
+            found.append(r)
+        if not found:
+            return None
+        # Свежее — первым; сколько всего — машине важно: при двух и более окно не
+        # атрибутировать по профилю и каналу, номер мог бы уйти чужому выпуску.
+        first = dict(found[0])
+        first["candidates"] = len(found)
+        return first
 
     @app.get("/api/upload/retained")
     def upload_retained(request: Request, profile: str = "", uc: str = ""):
@@ -509,6 +516,7 @@ def register_upload_routes(app, ctx):
                 return JSONResponse({"release_id": None})
             return JSONResponse({"release_id": r["release_id"], "title": r["title"],
                                  "video_sha256": r["video_sha256"] or "",
+                                 "candidates": r["candidates"],
                                  "error": (r["error"] or "")[:200]})
         finally:
             c.close()
