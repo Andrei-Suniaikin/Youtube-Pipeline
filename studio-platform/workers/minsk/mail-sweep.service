@@ -1,0 +1,14 @@
+# ~/.config/systemd/user/mail-sweep.service (Минск, пользователь vova)
+# Обход почты каналов: чтение списка писем Gmail в профилях AdsPower, отправка в студию.
+# Запускается таймером mail-sweep.timer; руками — systemctl --user start mail-sweep.service
+[Unit]
+Description=Обход почты каналов в профилях AdsPower (только чтение, отправка в студию)
+After=adspower.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/mail_sweep.sh
+Nice=10
+IOSchedulingClass=idle
+# Сам обход ограничен двумя часами (--max-minutes 120); запас — на закрытие браузера.
+TimeoutStartSec=2h30m

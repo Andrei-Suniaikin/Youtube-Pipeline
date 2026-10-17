@@ -1,0 +1,15 @@
+# ~/.config/systemd/user/mail-sweep.timer (Минск, пользователь vova)
+# Раз в сутки в 04:30 по Минску — когда заливка почти не идёт и профили свободны.
+# НЕ включён по умолчанию: включает владелец:
+#   systemctl --user daemon-reload && systemctl --user enable --now mail-sweep.timer
+[Unit]
+Description=Обход почты каналов раз в сутки в 04:30 (Минск)
+
+[Timer]
+OnCalendar=*-*-* 04:30:00
+# Пропущенный ночной запуск днём не навёрстываем: днём профили заняты заливкой.
+Persistent=false
+AccuracySec=5min
+
+[Install]
+WantedBy=timers.target
