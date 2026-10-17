@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -74,6 +75,10 @@ def _draining(now: float = None) -> bool:
     except OSError:
         return False
     return 0 <= age < DRAIN_MAX_SEC
+
+
+UC_RE = re.compile(r"UC[A-Za-z0-9_-]{22}")
+VIDEO_ID_RE = re.compile(r"[A-Za-z0-9_-]{11}")
 
 
 def _agent_profile(serial):
@@ -453,6 +458,107 @@ def register_upload_routes(app, ctx):
             "video_sha256": row["video_sha256"] or "",
             "repeat": bool(repeat),
         }}
+
+    # ── удержанное окно: заливка оборвалась на «Verify it's you» до номера видео ──
+    #
+    # 17.10.2026. Восемь профилей на Минске стояли сутками с открытым мастером: файл залит,
+    # шаг Details, поверх «Verify it's you», ссылки на видео нет. Заливщик по правилу
+    # «не перезаливать» оставил браузер открытым (UPLOAD_IN_PROGRESS_PROFILE_RETAINED),
+    # задание ушло в `repair` без номера видео — и дальше его не мог взять никто: пуллер
+    # видит открытый профиль и ждёт, «вернуть в работу» запрещено (загрузка начиналась),
+    # доведение черновика требует номер видео. Владелец: «работа ведётся для того, чтобы
+    # это было не руками, а скриптом».
+    #
+    # Две ручки для машины заливки (общий секрет ноды, без клейма — клейма у такого
+    # задания уже нет):
+    #   • GET  /api/upload/retained?profile=&uc=  — чьё это окно: задание в `repair` без
+    #     номера видео на этом профиле и канале;
+    #   • POST /api/upload/{release_id}/retained_progress — машина прошла подтверждение
+    #     в том же окне и прочитала номер видео: записываем его в задание. Статус остаётся
+    #     `repair` — доведение черновика до расписания идёт отдельным шагом по номеру.
+    # Ничего, кроме записи номера и фазы, здесь не происходит: файл не отправляется,
+    # повтор заливки не разрешается, прежний номер не перетирается.
+    def _retained_job(c, serial, uc):
+        try:
+            rows = c.execute(
+                "SELECT u.*, p.serial ads_serial, r.status rel_status, r.hand_confirmed "
+                "FROM pub_upload_jobs u JOIN pub_releases r ON r.release_id=u.release_id "
+                "LEFT JOIN pub_profiles p ON p.id=u.profile_id "
+                "WHERE u.status='repair' AND COALESCE(u.video_id,'')='' AND u.uc=? "
+                "ORDER BY u.updated DESC", (uc,)).fetchall()
+        except sqlite3.OperationalError:
+            return None
+        for r in rows:
+            if str(_agent_profile(r["ads_serial"]) if r["ads_serial"] else r["profile_id"]) != str(serial):
+                continue
+            if r["hand_confirmed"] or r["rel_status"] != "blocked":
+                continue
+            return r
+        return None
+
+    @app.get("/api/upload/retained")
+    def upload_retained(request: Request, profile: str = "", uc: str = ""):
+        _auth(request)
+        profile, uc = str(profile or "").strip(), str(uc or "").strip()
+        if not profile or not UC_RE.fullmatch(uc):
+            raise HTTPException(400, "нужны profile и uc")
+        c = db()
+        try:
+            r = _retained_job(c, profile, uc)
+            if r is None:
+                return JSONResponse({"release_id": None})
+            return JSONResponse({"release_id": r["release_id"], "title": r["title"],
+                                 "video_sha256": r["video_sha256"] or "",
+                                 "error": (r["error"] or "")[:200]})
+        finally:
+            c.close()
+
+    @app.post("/api/upload/{release_id}/retained_progress")
+    async def upload_retained_progress(release_id: str, request: Request):
+        _auth(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "жду JSON")
+        profile = str(body.get("profile") or "").strip()
+        uc = str(body.get("uc") or "").strip()
+        phase = str(body.get("phase") or "")[:400]
+        now = _now()
+        c = db()
+        try:
+            rel = _release(c, release_id)
+            if rel is None:
+                raise HTTPException(404, "нет такого задания")
+            ours = _retained_job(c, profile, uc)
+            if ours is None or ours["release_id"] != release_id:
+                raise HTTPException(409, "это не удержанное задание этого профиля и канала")
+            said, video_id = phase, ""
+            try:
+                parsed = json.loads(phase)
+                if isinstance(parsed, dict):
+                    said = str(parsed.get("phase") or "")
+                    video_id = str(parsed.get("video_id") or "")
+            except (ValueError, TypeError):
+                pass
+            if video_id and not VIDEO_ID_RE.fullmatch(video_id):
+                raise HTTPException(400, "кривой номер видео")
+            fields = ["phase=?", "heartbeat=?", "updated=?"]
+            args = [phase or rel["phase"], now, now]
+            if video_id:
+                fields.append("video_id=?")
+                args.append(video_id)
+            c.execute(f"UPDATE pub_upload_jobs SET {', '.join(fields)} WHERE id=?",
+                      args + [rel["id"]])
+            log_line(c, release_id, "заливка",
+                     f"удержанное окно: машина сообщает {said or 'фазу'}"
+                     + (f", видео {video_id}" if video_id else ""), now=now)
+            stdout = str(body.get("stdout") or "")
+            if stdout:
+                add_lines(c, release_id, "заливщик", stdout)
+            c.commit()
+            return JSONResponse({"ok": True, "video_id": video_id or rel["video_id"] or ""})
+        finally:
+            c.close()
 
     # ── забрать файлы ──
     @app.get("/api/upload/{release_id}/assets")
