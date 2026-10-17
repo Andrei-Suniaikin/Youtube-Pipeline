@@ -505,8 +505,13 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
     # канал уходила версия, которую никто не принимал. Задания, допущенные до этой
     # колонки, живут с пустым значением — пустое значит «не знаем», и сверка по ним
     # молчит, а не объявляет их пересобранными.
+    # `finalize_tries` / `finalize_last` — доведение черновика по номеру (18.10.2026):
+    # сколько раз машина уже пыталась довести залитый ролик до расписания по его номеру
+    # и когда в последний раз. Счёт живёт отдельными колонками, а не меткой в `error`:
+    # текст причины принадлежит человеку, и разбирать его на слова нельзя.
     for _col, _sql in (("blocked_since", "REAL"), ("blocked_why", "TEXT"),
-                       ("video_passport", "TEXT")):
+                       ("video_passport", "TEXT"),
+                       ("finalize_tries", "INTEGER"), ("finalize_last", "REAL")):
         try:
             c.execute(f"ALTER TABLE pub_upload_jobs ADD COLUMN {_col} {_sql}")
         except Exception:

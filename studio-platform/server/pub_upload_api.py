@@ -24,6 +24,12 @@
    задание остаётся в очереди, профиль не трогаем. Молчание AdsPower — это НЕ занятость:
    при нём выдаём как раньше и говорим об этом в журнале, иначе один обрыв сети
    остановил бы заливку сразу на всех каналах.
+6. **Залитый ролик с номером, но без расписания, доводится машиной по номеру.** Задание
+   в `repair` с `video_id` выдаётся той же ручкой клейма как ЗАДАЧА ДОВЕДЕНИЯ
+   (`finalize_video_id` в теле): файл второй раз не отдаётся и не нужен, заливщик
+   находит черновик по номеру в Studio и дописывает расписание. Неудача возвращает
+   задание в `repair` (не в `error` — номер нельзя потерять), следующая попытка не
+   раньше чем через 6 часов, всего три; дальше — человеку словами (18.10.2026).
 """
 
 from __future__ import annotations
@@ -42,6 +48,8 @@ from starlette.concurrency import run_in_threadpool
 import pub_adspower
 import pub_artifact
 import pub_upload_census
+from pub_engine import (FINALIZE_GAP_SEC, FINALIZE_MAX_TRIES, finalize_due,
+                        finalize_exhausted_reason, finalize_tries, reslot_upload_job)
 from pub_log import add as log_line, add_lines
 
 # Сколько ждать вестей от ноды, прежде чем считать заливку зависшей.
@@ -87,6 +95,27 @@ def _agent_profile(serial):
     if not text:
         return None
     return int(text) if text.isdigit() else text
+
+
+def _finalizing(row) -> bool:
+    """Машина держит это задание ради ДОВЕДЕНИЯ черновика по номеру, а не заливки файла.
+
+    Признак — номер ролика уже известен, а клейм выдан в момент начала попытки
+    доведения (`finalize_last`). У обычной заливки номер в задании появляется только
+    вместе с вердиктом или от удержанного окна — то есть никогда у задания `running`.
+    """
+    if row is None or (row["status"] or "") != "running" or not (row["video_id"] or ""):
+        return False
+    try:
+        last = row["finalize_last"]
+    except (KeyError, IndexError):
+        return False
+    return last is not None and float(last) >= float(row["claimed"] or 0)
+
+
+# Чем держится задание на доведение, когда профиль свободен, а выдавать всё равно нельзя.
+FINALIZE_HOLD_SLOT = ("доведение черновика по номеру ждёт: время выхода прошло, а свободного "
+                      "выхода на 30 дней вперёд нет — добавьте времена выхода каналу")
 
 
 def register_upload_routes(app, ctx):
@@ -140,7 +169,8 @@ def register_upload_routes(app, ctx):
             "SELECT DISTINCT p.default_host_id hid, h.adspower_url url, h.title htitle, "
             "h.code hcode FROM pub_upload_jobs u JOIN pub_profiles p ON p.id=u.profile_id "
             "LEFT JOIN pub_hosts h ON h.id=p.default_host_id "
-            "WHERE u.status='queued' AND p.default_host_id IS NOT NULL").fetchall()
+            "WHERE (u.status='queued' OR (u.status='repair' AND COALESCE(u.video_id,'')!='')) "
+            "AND p.default_host_id IS NOT NULL").fetchall()
         return [(r["hid"], r["url"] or "",
                  (r["htitle"] or r["hcode"] or "").strip() or f"№{r['hid']}") for r in rows]
 
@@ -345,12 +375,21 @@ def register_upload_routes(app, ctx):
             busy_channels = {r["uc"] for r in running}
             # Только задания ЖИВЫХ выпусков: отменённый или карантинный выпуск мог оставить
             # своё задание в очереди — заливать его значит заливать ролик без хозяина.
+            #
+            # Вторая ветка WHERE — задачи ДОВЕДЕНИЯ (п. 6 в шапке): задание в `repair` с
+            # номером ролика. Выпуск тут может быть и в разборе (`blocked`): туда его
+            # увёл как раз вердикт «залит, но не подтверждён», и доведение — способ из
+            # разбора выйти машиной, а не руками. Подтверждённый руками выпуск закрыт
+            # человеком — его не трогаем.
             rows = c.execute(
                 "SELECT u.*, p.id ads_pid, p.serial ads_serial, p.adspower_user_id ads_uid, "
-                "p.default_host_id ads_host FROM pub_upload_jobs u JOIN pub_releases r "
-                "ON r.release_id=u.release_id AND r.status IN ('pending','running') "
+                "p.default_host_id ads_host, r.plan_item_id rel_plan_item "
+                "FROM pub_upload_jobs u JOIN pub_releases r ON r.release_id=u.release_id "
                 "LEFT JOIN pub_profiles p ON p.id=u.profile_id "
-                "WHERE u.status='queued' ORDER BY u.slot_at, u.id").fetchall()
+                "WHERE (u.status='queued' AND r.status IN ('pending','running')) "
+                "OR (u.status='repair' AND COALESCE(u.video_id,'')!='' "
+                "AND r.status IN ('pending','running','blocked') AND r.hand_confirmed IS NULL) "
+                "ORDER BY u.slot_at, u.id").fetchall()
             task = None
             unknown_why = ""
             # Перебираем ВСЕ задания, даже найдя подходящее: пометка «стоит из-за чужого
@@ -358,9 +397,32 @@ def register_upload_routes(app, ctx):
             # освободилось, но до которого очередь не дошла, поднимет ложную тревогу
             # через полчаса.
             for r in rows:
+                finalize = r["status"] == "repair"
+                if finalize:
+                    # Не раньше чем через 6 часов после прошлой попытки и не больше трёх;
+                    # без обложки строгий режим заливщика черновик не доводит — такое
+                    # задание не выдаём вовсе, им займётся человек (см. finalize_refusal).
+                    if not finalize_due(r, now):
+                        continue
+                    if r["schedule_iso"] and r["slot_at"] <= now + 1800:
+                        # Выход прошёл, пока ждали: переносим на ближайший свободный, как
+                        # движок делает для очереди. Некуда — задание остаётся, но об
+                        # этом сказано в журнале один раз, а не на каждый опрос.
+                        iso = reslot_upload_job(c, r["id"], r["release_id"], r["channel_id"],
+                                                r["rel_plan_item"], now, status="repair")
+                        if not iso:
+                            if (r["blocked_why"] or "") != FINALIZE_HOLD_SLOT:
+                                c.execute("UPDATE pub_upload_jobs SET blocked_why=? WHERE id=?",
+                                          (FINALIZE_HOLD_SLOT, r["id"]))
+                                log_line(c, r["release_id"], "заливка", FINALIZE_HOLD_SLOT,
+                                         level="warn", now=now)
+                            continue
+                        log_line(c, r["release_id"], "заливка",
+                                 f"время выхода прошло, пока черновик ждал доведения — "
+                                 f"перенёс выход на {iso}", now=now)
                 # Задание могло состариться в очереди: запланировать прошедший момент
                 # нельзя, отсеиваем ДО того, как нода начнёт качать файл.
-                if r["schedule_iso"] and r["slot_at"] <= now + 1800:
+                elif r["schedule_iso"] and r["slot_at"] <= now + 1800:
                     c.execute("UPDATE pub_upload_jobs SET status='error', error=?, "
                               "updated=? WHERE id=? AND status='queued'",
                               ("к времени выхода не успели — задание состарилось в очереди",
@@ -393,8 +455,9 @@ def register_upload_routes(app, ctx):
                     # Сверяем ровно того кандидата, которого собираемся выдать: чтение
                     # файла идёт внутри `BEGIN IMMEDIATE`, а замок держит запись всей
                     # базы. Проверять так все задания очереди значило бы упереть кабинет
-                    # в диск на каждом опросе ноды.
-                    stale = _stale_reason(c, r)
+                    # в диск на каждом опросе ноды. Доведению сверка не нужна: файл с
+                    # сервера не уходит, ролик уже на канале.
+                    stale = "" if finalize else _stale_reason(c, r)
                     if stale:
                         _refuse_stale(c, r, stale, now, "queued")
                         continue
@@ -411,25 +474,46 @@ def register_upload_routes(app, ctx):
                 return JSONResponse({"task": None})
 
             token = "upc_" + secrets.token_urlsafe(18)
-            done = c.execute(
-                # Пометку ожидания снимаем вместе с выдачей: она означает «стоит из-за
-                # чужого профиля», а выданное задание уже не стоит. Оставленная на
-                # работающем задании, она врала бы на экране и всплыла бы тревогой, если
-                # задание когда-нибудь вернётся в очередь.
-                "UPDATE pub_upload_jobs SET status='running', claim_token=?, claimed=?, "
-                "host=?, worker=?, lease_until=?, blocked_since=NULL, blocked_why=NULL, "
-                "updated=? WHERE id=? AND status='queued'",
-                (token, now, host, worker, now + UPLOAD_LEASE_SEC, now, task["id"]))
+            finalize = task["status"] == "repair"
+            if finalize:
+                # Попытка считается с момента выдачи, а не с вердикта: если машина
+                # замолчит, задание вернётся в `repair` по сроку, и следующая попытка
+                # всё равно отсчитается от этой. Три молчания подряд — тоже три попытки.
+                done = c.execute(
+                    "UPDATE pub_upload_jobs SET status='running', claim_token=?, claimed=?, "
+                    "host=?, worker=?, lease_until=?, blocked_since=NULL, blocked_why=NULL, "
+                    "finished=NULL, finalize_tries=COALESCE(finalize_tries,0)+1, "
+                    "finalize_last=?, updated=? WHERE id=? AND status='repair'",
+                    (token, now, host, worker, now + UPLOAD_LEASE_SEC, now, now, task["id"]))
+            else:
+                done = c.execute(
+                    # Пометку ожидания снимаем вместе с выдачей: она означает «стоит из-за
+                    # чужого профиля», а выданное задание уже не стоит. Оставленная на
+                    # работающем задании, она врала бы на экране и всплыла бы тревогой, если
+                    # задание когда-нибудь вернётся в очередь.
+                    "UPDATE pub_upload_jobs SET status='running', claim_token=?, claimed=?, "
+                    "host=?, worker=?, lease_until=?, blocked_since=NULL, blocked_why=NULL, "
+                    "updated=? WHERE id=? AND status='queued'",
+                    (token, now, host, worker, now + UPLOAD_LEASE_SEC, now, task["id"]))
             if done.rowcount != 1:
                 c.commit()                        # кто-то успел раньше — пусть спросит снова
                 return JSONResponse({"task": None})
             c.commit()
             fresh = c.execute("SELECT * FROM pub_upload_jobs WHERE id=?", (task["id"],)).fetchone()
-            log_line(c, fresh["release_id"], "заливка",
-                     f"выдал задание машине {host}, место {worker}, профиль "
-                     f"{fresh['profile_id']} (AdsPower №"
-                     f"{_profile_for_agent(c, fresh['profile_id'])}), "
-                     f"выход {fresh['schedule_iso'] or 'сразу'}", now=now)
+            if finalize:
+                log_line(c, fresh["release_id"], "заливка",
+                         f"выдал машине {host}, место {worker}, ДОВЕДЕНИЕ черновика "
+                         f"{fresh['video_id']} по номеру (попытка {finalize_tries(fresh)} из "
+                         f"{FINALIZE_MAX_TRIES}): файл не отдаю, заливщик найдёт строку в "
+                         f"Studio и допишет расписание; профиль {fresh['profile_id']} "
+                         f"(AdsPower №{_profile_for_agent(c, fresh['profile_id'])}), "
+                         f"выход {fresh['schedule_iso'] or 'сразу'}", now=now)
+            else:
+                log_line(c, fresh["release_id"], "заливка",
+                         f"выдал задание машине {host}, место {worker}, профиль "
+                         f"{fresh['profile_id']} (AdsPower №"
+                         f"{_profile_for_agent(c, fresh['profile_id'])}), "
+                         f"выход {fresh['schedule_iso'] or 'сразу'}", now=now)
             if unknown_why:
                 # Выдали, НЕ проверив занятость. Молчать об этом нельзя: если в профиль
                 # в этот момент кто-то зашёл руками, разбираться с порванными куками
@@ -445,7 +529,8 @@ def register_upload_routes(app, ctx):
             c.close()
 
     def _task_payload(c, row, repeat: bool = False) -> dict:
-        return {"task": {
+        fin = _finalizing(row)
+        task = {
             "release_id": row["release_id"],
             "claim_token": row["claim_token"],
             "profile": _profile_for_agent(c, row["profile_id"]),
@@ -455,9 +540,17 @@ def register_upload_routes(app, ctx):
             "schedule": row["schedule_iso"] or "",
             "visibility": row["visibility"] or "public",
             "collaborator": row["collaborator"] or "",
-            "video_sha256": row["video_sha256"] or "",
+            # У задачи доведения отпечатка файла нет: файл машине не нужен и не отдаётся.
+            "video_sha256": "" if fin else (row["video_sha256"] or ""),
             "repeat": bool(repeat),
-        }}
+        }
+        if fin:
+            # Машина по этим двум полям не качает ролик, запускает заливщик с
+            # `--finalize-draft --finalize-video-id` и строгим режимом; обложку качает
+            # как обычно — строгий режим без неё черновик не доводит.
+            task["finalize"] = True
+            task["finalize_video_id"] = row["video_id"]
+        return {"task": task}
 
     # ── удержанное окно: заливка оборвалась на «Verify it's you» до номера видео ──
     #
@@ -611,6 +704,11 @@ def register_upload_routes(app, ctx):
                 raise HTTPException(404, "нет такого задания")
             _own(request, rel)
             path = rel["video_path"] if kind == "video" else (rel["cover_path"] or "")
+            if kind == "video" and _finalizing(rel):
+                # Доведение по номеру: ролик уже на канале, второй экземпляр файла
+                # машине не нужен — и отдать его значило бы дать повод залить снова.
+                raise HTTPException(409, "задание на доведение черновика по номеру — "
+                                         "файл ролика не отдаётся, он уже на канале")
             if kind == "video":
                 # Последние ворота перед тем, как байты уйдут с сервера. Ворота на
                 # выдаче задания стоят раньше, но между ними и этой секундой рендер
@@ -699,19 +797,50 @@ def register_upload_routes(app, ctx):
             _own(request, rel)
             verdict = read_verdict(body, expected_uc=rel["uc"] or "",
                                    expected_iso=rel["schedule_iso"] or "")
-            if rel["status"] not in ("running", "error"):
+            ok = verdict["kind"] in ("scheduled", "published")
+            # `repair` среди принимаемых — ради позднего успеха доведения: задание,
+            # снятое по молчанию во время доведения, возвращается в `repair` с клеймом,
+            # и подтверждение Studio, пришедшее после, обязано его закрыть.
+            if rel["status"] not in ("running", "error", "repair"):
                 # Задание уже закрыто (двойная доставка) — не перетираем итог.
                 return JSONResponse({"ok": True, "verdict": rel["verdict"] or "already"})
-            if rel["status"] == "error" and verdict["kind"] not in ("scheduled", "published"):
+            if rel["status"] in ("error", "repair") and not ok:
                 # Задание снято по молчанию; поздний НЕуспех ничего не меняет.
                 return JSONResponse({"ok": True, "verdict": "already_error"})
+            fin = _finalizing(rel)
+            state, error = verdict["state"], verdict["error"]
+            video_id = verdict["video_id"] or rel["video_id"] or ""
+            if not ok and (rel["video_id"] or ""):
+                # Номер ролика — улика, что он на канале. Ни один неуспех его не стирает,
+                # и задание с номером не уходит в `error`: из `repair` его доведёт машина
+                # или закроет человек «подтвердить руками», из `error` — никто.
+                if verdict["video_id"] and verdict["video_id"] != rel["video_id"]:
+                    log_line(c, release_id, "заливка",
+                             f"машина назвала другой номер ролика ({verdict['video_id']}), "
+                             f"чем записан ({rel['video_id']}) — оставляю записанный, "
+                             f"нужен разбор", level="warn", now=now)
+                video_id, state = rel["video_id"], "repair"
+                if fin:
+                    tries = finalize_tries(rel)
+                    said = error or "заливщик не объяснил"
+                    if tries >= FINALIZE_MAX_TRIES:
+                        error = finalize_exhausted_reason(said)
+                    else:
+                        error = (f"доведение по номеру не удалось (попытка {tries} из "
+                                 f"{FINALIZE_MAX_TRIES}, следующая не раньше чем через "
+                                 f"{FINALIZE_GAP_SEC // 3600} ч): {said}")
             c.execute(
                 "UPDATE pub_upload_jobs SET status=?, verdict=?, video_id=?, evidence=?, "
                 "error=?, finished=?, updated=?, claim_token=NULL WHERE id=?",
-                (verdict["state"], verdict["kind"], verdict["video_id"],
-                 json.dumps(verdict["evidence"], ensure_ascii=False) if verdict["evidence"] else None,
-                 verdict["error"], now, now, rel["id"]))
-            if verdict["kind"] in ("scheduled", "published"):
+                (state, verdict["kind"], video_id or None,
+                 json.dumps(verdict["evidence"], ensure_ascii=False) if verdict["evidence"]
+                 else rel["evidence"],
+                 error, now, now, rel["id"]))
+            if ok and fin:
+                log_line(c, release_id, "заливка",
+                         f"черновик {video_id} доведён до расписания по номеру "
+                         f"(попытка {finalize_tries(rel)} из {FINALIZE_MAX_TRIES})", now=now)
+            if ok:
                 # Поздний успех: выпуск мог уже уехать в разбор — и по молчанию ноды
                 # (задание в error), и по таймеру движка, пока задание ещё шло
                 # (06.10.2026: ролик встал в расписание через 6 минут после разбора,
@@ -823,6 +952,21 @@ def sweep_stuck(c, now: float) -> list:
         "AND lease_until < ?", (now,)).fetchall()
     out = []
     for r in rows:
+        if _finalizing(r):
+            # Доведение по номеру: обратно в `repair`, не в `error` — номер ролика
+            # должен остаться виден и следующей попытке, и человеку. Попытка уже
+            # сосчитана при выдаче; следующая — не раньше чем через 6 часов.
+            tries = finalize_tries(r)
+            said = (f"машина молчит дольше {UPLOAD_LEASE_SEC // 60} минут при доведении "
+                    f"черновика по номеру")
+            text = (finalize_exhausted_reason(said) if tries >= FINALIZE_MAX_TRIES else
+                    f"{said} (попытка {tries} из {FINALIZE_MAX_TRIES}, следующая не раньше "
+                    f"чем через {FINALIZE_GAP_SEC // 3600} ч)")
+            c.execute("UPDATE pub_upload_jobs SET status='repair', error=?, finished=?, "
+                      "updated=? WHERE id=?", (text, now, now, r["id"]))
+            pub_upload_census.note(c, r["release_id"], said, now=now, silent=True)
+            out.append(r["release_id"])
+            continue
         # claim_token СОХРАНЯЕМ: нода могла продолжать молча и довести мастер до конца —
         # её поздний вердикт с этим клеймом обязан доехать и поднять запись до успеха.
         c.execute(

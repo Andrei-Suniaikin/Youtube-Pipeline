@@ -264,6 +264,53 @@ def ready_slot_horizon(ch) -> int:
     return max(own, RESLOT_MAX_DAYS)
 
 
+def reslot_upload_job(c, job_id: int, release_id: str, channel_id: int, plan_item_id,
+                      now: float, status: str = "queued") -> str:
+    """Перенести одно задание заливки (и его выпуск, и строку плана) на ближайший
+    свободный выход канала. Возвращает новое время для YouTube или '' — некуда.
+
+    Общее место для очереди (`reslot_pending_uploads`) и для доведения черновика по
+    номеру (`pub_upload_api`, 18.10.2026): у задания в `repair` выход тоже мог пройти,
+    пока оно ждало человека, а планировать прошедший момент Studio не даст.
+    `status` — из какого статуса задание переносится: UPDATE условный, чтобы не
+    сдвинуть время заданию, которое машина как раз держит.
+    """
+    import datetime as dt
+    import json as _json
+    from channel_slots import upcoming_slots, ScheduleError
+
+    ch = c.execute("SELECT * FROM pub_channels_live WHERE id=?", (channel_id,)).fetchone()
+    if not ch:
+        return ""
+    try:
+        schedule = _json.loads(ch["schedule"] or "{}")
+        if not schedule:
+            return ""
+        slots = upcoming_slots(schedule, ch["tz"], ready_slot_horizon(ch),
+                               dt.datetime.fromtimestamp(now, dt.timezone.utc))
+    except (ScheduleError, ValueError):
+        return ""
+    busy = {round(r["slot_at"]) for r in c.execute(
+        "SELECT slot_at FROM pub_plan_items WHERE channel_id=? AND slot_at IS NOT NULL "
+        "AND status IN ('planned','frozen','running','done','error')",
+        (channel_id,)).fetchall() if r["slot_at"]}
+    for point in slots:
+        stamp = round(point.timestamp())
+        if stamp in busy or point.timestamp() <= now + UPLOAD_LEAD_SEC:
+            continue
+        iso = schedule_iso(stamp, ch["tz"])
+        done = c.execute("UPDATE pub_upload_jobs SET slot_at=?, schedule_iso=?, updated=? "
+                         "WHERE id=? AND status=?", (stamp, iso, now, job_id, status))
+        if done.rowcount != 1:
+            return ""
+        c.execute("UPDATE pub_plan_items SET slot_at=?, updated=? WHERE id=?",
+                  (stamp, now, plan_item_id))
+        c.execute("UPDATE pub_releases SET slot_at=?, updated=? WHERE release_id=?",
+                  (stamp, now, release_id))
+        return iso
+    return ""
+
+
 def reslot_pending_uploads(c, now: float) -> int:
     """Перенести выходы у заданий заливки, до которых уже не успеть.
 
@@ -272,10 +319,6 @@ def reslot_pending_uploads(c, now: float) -> int:
     задание просто помечалось ошибкой, и готовый ролик пропадал, хотя всё, что ему
     нужно, — другое время. Двигаем сами: ролик выйдет позже, но выйдет.
     """
-    import datetime as dt
-    import json as _json
-    from channel_slots import upcoming_slots, ScheduleError
-
     rows = c.execute(
         "SELECT u.id, u.release_id, u.channel_id, u.slot_at, r.plan_item_id "
         "FROM pub_upload_jobs u JOIN pub_releases r ON r.release_id=u.release_id "
@@ -283,37 +326,90 @@ def reslot_pending_uploads(c, now: float) -> int:
         (now + UPLOAD_LEAD_SEC,)).fetchall()
     moved = 0
     for row in rows:
-        ch = c.execute("SELECT * FROM pub_channels_live WHERE id=?", (row["channel_id"],)).fetchone()
-        if not ch:
+        iso = reslot_upload_job(c, row["id"], row["release_id"], row["channel_id"],
+                                row["plan_item_id"], now, status="queued")
+        if not iso:
             continue
-        try:
-            schedule = _json.loads(ch["schedule"] or "{}")
-            if not schedule:
-                continue
-            slots = upcoming_slots(schedule, ch["tz"], ready_slot_horizon(ch),
-                                   dt.datetime.fromtimestamp(now, dt.timezone.utc))
-        except (ScheduleError, ValueError):
-            continue
-        busy = {round(r["slot_at"]) for r in c.execute(
-            "SELECT slot_at FROM pub_plan_items WHERE channel_id=? AND slot_at IS NOT NULL "
-            "AND status IN ('planned','frozen','running','done','error')",
-            (row["channel_id"],)).fetchall() if r["slot_at"]}
-        for point in slots:
-            stamp = round(point.timestamp())
-            if stamp in busy or point.timestamp() <= now + UPLOAD_LEAD_SEC:
-                continue
-            iso = schedule_iso(stamp, ch["tz"])
-            c.execute("UPDATE pub_upload_jobs SET slot_at=?, schedule_iso=?, updated=? "
-                      "WHERE id=? AND status='queued'", (stamp, iso, now, row["id"]))
-            c.execute("UPDATE pub_plan_items SET slot_at=?, updated=? WHERE id=?",
-                      (stamp, now, row["plan_item_id"]))
-            c.execute("UPDATE pub_releases SET slot_at=?, updated=? WHERE release_id=?",
-                      (stamp, now, row["release_id"]))
-            log_line(c, row["release_id"], "заливка",
-                     f"к прежнему времени машина не успела — перенёс выход на {iso}", now=now)
-            moved += 1
-            break
+        log_line(c, row["release_id"], "заливка",
+                 f"к прежнему времени машина не успела — перенёс выход на {iso}", now=now)
+        moved += 1
     return moved
+
+
+# ─────────────────────────── доведение черновика по номеру ───────────────────────────
+#
+# 18.10.2026, третий шаг «скрипта удержанных окон». Ролик залит, номер известен, а
+# вердикта «в расписании» нет (черновик под «Verify it's you», мастер упал на шаге
+# видимости, Studio показала не то время). Раньше такой выпуск ждал человека: правило
+# «загрузка начиналась — повтор запрещён» верно, но доведение ЧЕРНОВИКА по его номеру —
+# не повтор: файл второй раз не уходит, заливщик находит строку с этим номером в Studio
+# и дописывает ей расписание (`upload_worker --finalize-draft --finalize-video-id`).
+#
+# Попытки считаются: не чаще раза в FINALIZE_GAP_SEC (Studio после сбоя нередко просит
+# подождать, а ранний повтор лишь тратит окно профиля) и не больше FINALIZE_MAX_TRIES —
+# дальше причина остаётся человеку словами. Пока попытки не исчерпаны, выпуск в
+# `do_scheduled` ждёт, а не падает в разбор.
+FINALIZE_MAX_TRIES = 3
+FINALIZE_GAP_SEC = 6 * 3600
+
+
+def _job_field(job, name, default=None):
+    """Колонка задания, которой у старой базы может не быть."""
+    try:
+        value = job[name]
+    except (KeyError, IndexError):
+        return default
+    return default if value is None else value
+
+
+def finalize_tries(job) -> int:
+    return int(_job_field(job, "finalize_tries", 0) or 0)
+
+
+def finalize_refusal(job) -> str:
+    """Почему машина НЕ будет доводить этот черновик по номеру. Пусто — будет.
+
+    Доводится задание в `repair` (вердикта «в расписании» нет, но и не окончательный
+    отказ) с известным номером ролика, пока попытки не исчерпаны и пока есть файл
+    обложки: заливщик доводит черновик только в строгом режиме, а строгий режим без
+    обложки не стартует — такое задание человеку виднее сразу, чем после трёх пустых
+    попыток. Задание `error` сюда не попадает: номер у него, если и есть, пришёл не от
+    вердикта, и с таким решает человек.
+    """
+    import os as _os
+    if job is None:
+        return "задания заливки нет"
+    if (job["status"] or "") != "repair":
+        return f"задание в состоянии «{job['status']}», а не в repair"
+    if not (job["video_id"] or ""):
+        return "номер ролика неизвестен"
+    if finalize_tries(job) >= FINALIZE_MAX_TRIES:
+        return finalize_exhausted_reason("")
+    cover = str(_job_field(job, "cover_path", "") or "")
+    if not cover or not _os.path.exists(cover):
+        return ("у задания нет файла обложки, а строгий режим заливщика без неё черновик "
+                "не доводит — довести руками или подтвердить руками")
+    return ""
+
+
+def finalize_pending(job) -> bool:
+    """Ждёт ли задание доведения по номеру машиной (см. `finalize_refusal`)."""
+    return finalize_refusal(job) == ""
+
+
+def finalize_due(job, now: float) -> bool:
+    """Пора ли выдавать задание на доведение: ждёт и с прошлой попытки прошло ≥ 6 ч."""
+    if not finalize_pending(job):
+        return False
+    last = _job_field(job, "finalize_last")
+    return last is None or float(last) <= now - FINALIZE_GAP_SEC
+
+
+def finalize_exhausted_reason(error: str) -> str:
+    """Причина для человека, когда три доведения не удались."""
+    tail = (error or "").strip()
+    return (f"доведение по номеру не удалось {FINALIZE_MAX_TRIES} раза — нужен человек"
+            + (f": {tail}" if tail else ""))
 
 
 # ─────────────────────────── заведение выпусков ───────────────────────────

@@ -1980,7 +1980,19 @@ class PubServices:
             return {"video_id": job["video_id"] or "",
                     "evidence": json.loads(job["evidence"]) if job["evidence"] else None}
         if job["status"] == "repair":
-            raise ItemFailed(job["error"] or "ролик залит, но Studio не подтвердила — нужен разбор")
+            # 18.10.2026: ролик залит и номер известен, но расписания нет — это не
+            # разбор, а работа машины: она доведёт черновик по номеру (до трёх попыток,
+            # не чаще раза в 6 часов; выдача — `pub_upload_api.upload_claim`). Пока
+            # попытки не исчерпаны, выпуск ждёт. Исчерпаны — причина словами человеку.
+            base = job["error"] or "ролик залит, но Studio не подтвердила — нужен разбор"
+            if not (job["video_id"] or ""):
+                raise ItemFailed(base)
+            from pub_engine import finalize_refusal
+            why = finalize_refusal(job)
+            if not why:
+                return {"wait": True}
+            # Исчерпанные попытки уже записаны в причину вердиктом — не повторяем.
+            raise ItemFailed(base if base.startswith(why) else f"{base} ({why})")
         if job["status"] == "error":
             raise ItemFailed(job["error"] or "заливка не удалась")
         return {"wait": True}
