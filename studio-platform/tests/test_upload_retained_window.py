@@ -47,6 +47,7 @@ TOKEN = "upl_test"
 NOW = time.time()
 FAILS = []
 UC_A, UC_B = "UC" + "a" * 22, "UC" + "b" * 22
+UC_C, UC_D = "UC" + "c" * 22, "UC" + "d" * 22
 
 
 def check(label, got, want):
@@ -78,7 +79,9 @@ def seed():
     rows = (("rel-stuck", UC_A, "repair", "", "blocked", 0),
             ("rel-old", UC_A, "repair", "", "blocked", 0),      # старее — не берётся первой
             ("rel-hand", UC_B, "repair", "", "blocked", 1),     # подтверждён руками
-            ("rel-vid", UC_B, "repair", "VID00000001", "blocked", 0))  # номер уже есть
+            ("rel-vid", UC_B, "repair", "VID00000001", "blocked", 0),  # номер уже есть
+            ("rel-gate", UC_C, "error", "", "blocked", 0),      # вердикт failed с AUTH_GATE — окно тоже держит
+            ("rel-err", UC_D, "error", "", "blocked", 0))       # другой отказ — окна нет
     for n, (rid, uc, st, vid, rst, hand) in enumerate(rows, start=1):
         c.execute("INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,plan_item_version,"
                   "channel_id,uc,slot_at,status,phase,created,updated,hand_confirmed) "
@@ -88,9 +91,11 @@ def seed():
                   "host_id,channel_url,title,description,schedule_iso,visibility,video_path,"
                   "slot_at,status,video_id,error,created,updated) "
                   "VALUES(?,?,?,?,?,1,?,?,'','','public','/v.mp4',?,?,?,"
-                  "'UPLOAD_IN_PROGRESS_PROFILE_RETAINED: …',?,?)",
+                  "?,?,?)",
                   (rid, "t1", n, uc, pid, f"https://studio.youtube.com/channel/{uc}/",
                    f"ролик {rid}", NOW + 3600, st, vid or None,
+                   {"rel-gate": "AUTH_GATE: native confirmation stopped; existing upload preserved",
+                    "rel-err": "нода: HTTP Error 502"}.get(rid, "UPLOAD_IN_PROGRESS_PROFILE_RETAINED: …"),
                    NOW - (100 if rid == "rel-old" else 0), NOW - (100 if rid == "rel-old" else 0)))
     c.commit(); c.close()
 
@@ -114,6 +119,10 @@ def main():
     check("чужой профиль — ничего", r.json().get("release_id"), None)
     r = client.get("/api/upload/retained", params={"profile": "28", "uc": UC_B}, headers=H)
     check("подтверждённое руками и с номером — не удержанные", r.json().get("release_id"), None)
+    r = client.get("/api/upload/retained", params={"profile": "28", "uc": UC_C}, headers=H)
+    check("вердикт failed с AUTH_GATE — окно тоже удержанное", r.json().get("release_id"), "rel-gate")
+    r = client.get("/api/upload/retained", params={"profile": "28", "uc": UC_D}, headers=H)
+    check("другой отказ без окна — ничего", r.json().get("release_id"), None)
     r = client.get("/api/upload/retained", params={"profile": "28", "uc": "UCbad"}, headers=H)
     check("кривой UC — отказ", r.status_code, 400)
     r = client.get("/api/upload/retained", params={"profile": "28", "uc": UC_A})

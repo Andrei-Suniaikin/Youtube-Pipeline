@@ -484,7 +484,8 @@ def register_upload_routes(app, ctx):
                 "SELECT u.*, p.serial ads_serial, r.status rel_status, r.hand_confirmed "
                 "FROM pub_upload_jobs u JOIN pub_releases r ON r.release_id=u.release_id "
                 "LEFT JOIN pub_profiles p ON p.id=u.profile_id "
-                "WHERE u.status='repair' AND COALESCE(u.video_id,'')='' AND u.uc=? "
+                "WHERE (u.status='repair' OR (u.status='error' AND u.error LIKE 'AUTH_GATE%')) "
+                "AND COALESCE(u.video_id,'')='' AND u.uc=? "
                 "ORDER BY u.updated DESC", (uc,)).fetchall()
         except sqlite3.OperationalError:
             return None
