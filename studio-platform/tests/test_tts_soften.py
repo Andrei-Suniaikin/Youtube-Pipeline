@@ -144,7 +144,7 @@ def test_soften_project_writes_backup():
 
 # ─────────────────────────── движок ───────────────────────────
 
-def fresh(mark=None, logs=LOG_3861):
+def fresh(mark=None, logs=LOG_3861, settings='{"engine":"fastgen","voice":"algieba"}'):
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     c.executescript("""
@@ -161,7 +161,7 @@ def fresh(mark=None, logs=LOG_3861):
         ts REAL, level TEXT, step TEXT, message TEXT, repeats INTEGER NOT NULL DEFAULT 1, last_ts REAL);
     """)
     c.execute("INSERT INTO users VALUES(1,'dev','dev','{}','{}')")
-    c.execute("INSERT INTO projects VALUES('proj-1','dev','{\"engine\":\"fastgen\",\"voice\":\"algieba\"}')")
+    c.execute("INSERT INTO projects VALUES('proj-1','dev',?)", (settings,))
     c.execute("INSERT INTO queue_tasks VALUES(10,'dev','proj-1','tts','error','rc=1')")
     for line in logs:
         c.execute("INSERT INTO job_logs(job_id,ts,line) VALUES(10,?,?)", (NOW, line))
@@ -220,7 +220,31 @@ def test_engine():
         check("в журнале выпуска сказано, что сделано",
               "смягчён" in last_msg(c) and "блок 6" in last_msg(c), True)
 
-        print("\nТри раунда кончились — остановка с названным блоком")
+        print("\nТри раунда кончились, у пресета есть шаблон Lumean — озвучка уходит на Lumean")
+        c = fresh(mark="tts-soften:3",
+                  settings='{"engine":"fastgen","voice":"algieba","voice_uuid":"0b1c2d3e-aaaa-bbbb-cccc-0123456789ab"}')
+        placed = []
+        out = services(placed, pdir).do_media_ready(c, REL)
+        check("движок ждёт озвучку", out, {"wait": True})
+        lum = [p for k, p in placed if k == "tts"]
+        check("поставлена одна задача озвучки", len(lum), 1)
+        check("движок — Lumean, шаблон из пресета",
+              (lum[0].get("engine"), lum[0].get("voice_uuid")),
+              ("lumean", "0b1c2d3e-aaaa-bbbb-cccc-0123456789ab"))
+        check("зеркало помнит переход", tts_row(c)["error"], "tts-lumean:1")
+        check("в журнале сказано про Lumean", "Lumean" in last_msg(c), True)
+
+        print("\nLumean тоже упал на фильтре — дальше человек, второго круга нет")
+        c = fresh(mark="tts-lumean:1", settings='{"engine":"fastgen","voice_uuid":"0b1c2d3e-aaaa-bbbb-cccc-0123456789ab"}')
+        placed = []
+        try:
+            services(placed, pdir).do_media_ready(c, REL)
+            check("остановлен", False, True)
+        except pub_engine.ItemFailed as exc:
+            check("остановлен", "перехода на Lumean" in str(exc), True)
+        check("озвучку не ставили", [k for k, _ in placed if k == "tts"], [])
+
+        print("\nТри раунда кончились, шаблона Lumean нет — остановка с названным блоком")
         c = fresh(mark="tts-soften:3")
         placed = []
         try:

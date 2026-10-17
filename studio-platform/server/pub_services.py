@@ -1210,8 +1210,42 @@ class PubServices:
     def _tts_filter_reason(self, c, known) -> str:
         import tts_soften
         block = tts_soften.failed_block(self._tts_job_lines(c, known["remote_job_id"])) or "?"
+        mark = str(known["error"] or "")
+        if mark.startswith("tts-lumean"):
+            return (f"озвучка: блок {block} не прошёл фильтр провайдера после "
+                    f"{self.TTS_SOFTEN_ROUNDS} смягчений текста и перехода на Lumean — нужен человек")
         return (f"озвучка: блок {block} не прошёл фильтр провайдера после "
                 f"{self.TTS_SOFTEN_ROUNDS} смягчений текста — нужен человек")
+
+    def _tts_lumean_fallback(self, c, rel, known, block) -> str:
+        """Три смягчения не помогли — озвучить другим провайдером (владелец 17.10.2026:
+        «в случае чего переходим на Lumean»). Только если у пресета канала есть шаблон
+        Lumean (`voice_uuid`): на серверном ключе Lumean принимает только свой Template ID,
+        выдумывать голос каналу нельзя. Один переход на выпуск — метка `tts-lumean`."""
+        params = self._preset_params(c, rel)
+        template = str(params.get("voice_uuid") or "").strip()
+        if not template:
+            log_line(c, rel["release_id"], "ролик",
+                     f"блок {block} не прошёл фильтр после {self.TTS_SOFTEN_ROUNDS} смягчений; "
+                     f"перейти на Lumean нечем — у пресета канала нет шаблона Lumean (voice_uuid)",
+                     level="warn")
+            return "exhausted"
+        uid = self._uid(c, rel["tenant_id"])
+        if not uid:
+            return "exhausted"
+        c.commit()
+        job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], "tts",
+                              dict(params, engine="lumean"))
+        if not job_id:
+            return "exhausted"
+        c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', error=?, "
+                  "updated=? WHERE release_id=? AND service='vsgen' AND kind='tts'",
+                  (str(job_id), "tts-lumean:1", rel["updated"], rel["release_id"]))
+        log_line(c, rel["release_id"], "ролик",
+                 f"блок {block} не прошёл фильтр FastGen после {self.TTS_SOFTEN_ROUNDS} "
+                 f"смягчений — озвучка целиком поставлена на Lumean (шаблон пресета канала), "
+                 f"задача {job_id}", level="warn")
+        return "requeued"
 
     def _soften_tts(self, c, rel, known) -> str:
         """«requeued» — блок смягчён и озвучка поставлена заново; «exhausted» — три раунда
@@ -1223,9 +1257,11 @@ class PubServices:
         block = tts_soften.failed_block(lines)
         if not block:
             return ""
+        if str(known["error"] or "").startswith("tts-lumean"):
+            return "exhausted"            # запасной провайдер уже был — дальше человек
         done = self._tts_soften_done(known)
         if done >= self.TTS_SOFTEN_ROUNDS:
-            return "exhausted"
+            return self._tts_lumean_fallback(c, rel, known, block)
         key = get_key(c, "rewrite")
         if not key:
             log_line(c, rel["release_id"], "ролик",
