@@ -62,9 +62,17 @@ def main() -> int:
     print("Поводы про конвейер — как раньше")
     # Эти чинятся за минуты, и частое напоминание о них — польза, а не шум. Если правка
     # зацепит их, конвейер будет молча стоять сутки.
-    for key in ("queue_stalled", "upload_stalled", "oldest_task", "disk_low",
-                "disk_low_node:minsk", "slot_missed", "slot_empty", "failed:17"):
+    for key in ("queue_stalled", "upload_stalled", "failed:17"):
         check(f"{key} — час", A.repeat_after(key), A.REPEAT_SEC)
+
+    print("Хронические состояния — сутки (17.10.2026, владелец: «без воды»)")
+    # «Слот прошёл, ролика нет» за 14 суток ушло 358 раз — по разу в час про одно и то же.
+    # Такие поводы не чинятся за час; напоминание раз в сутки, а раньше — только если
+    # цифра выросла (см. ниже).
+    for key in ("oldest_task", "disk_low", "disk_low_node:minsk", "slot_missed",
+                "slot_empty", "upload_profile_busy", "channel_supply"):
+        check(f"{key} — сутки", A.repeat_after(key), A.CHRONIC_REPEAT_SEC)
+    check("хронический срок — сутки", A.CHRONIC_REPEAT_SEC, 24 * HOUR)
 
     print("Семейство в ключе не мешает узнать повод")
     check("ключ с двоеточием разбирается по префиксу",
@@ -128,11 +136,35 @@ def main() -> int:
         check("а очередь напоминала каждый час",
               len(said.get("queue_stalled", [])), 7)
 
+
         # Через сутки с минутой — ключ напомнит один раз.
         run(t0 + 24 * HOUR + 60)
         check("через сутки ключ напомнил", len(said.get("key_dead:googler", [])), 2)
         check("и это повтор, а не новая тревога",
               said["key_dead:googler"][-1][1], "repeat")
+
+        print("Хронический повод: молчит сутки, но выросшая цифра — новость")
+        c.execute("DELETE FROM admin_state"); c.commit(); A.load_limits(c)
+        figure = {"n": 5}
+        def chronic(c_, now_, tenant_):
+            return [A.Alert("slot_missed", "Слот прошёл, ролика нет", "текст",
+                            now_ - 10 * HOUR, figure=figure["n"])]
+        A.CHECKS = (chronic,)
+        said.clear()
+        run(t0)
+        run(t0 + HOUR + 60)
+        check("через час при той же цифре — тишина", len(said.get("slot_missed", [])), 1)
+        figure["n"] = 9
+        run(t0 + HOUR + 120)
+        check("цифра выросла — сказали, не дожидаясь суток",
+              len(said.get("slot_missed", [])), 2)
+        figure["n"] = 11
+        run(t0 + HOUR + 180)
+        check("но не чаще общего часа", len(said.get("slot_missed", [])), 2)
+        figure["n"] = 3
+        run(t0 + 26 * HOUR)
+        check("цифра упала — ждали сутки, потом напомнили",
+              len(said.get("slot_missed", [])), 3)
         c.close()
     finally:
         A.CHECKS = saved_checks

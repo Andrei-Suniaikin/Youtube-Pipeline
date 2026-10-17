@@ -148,6 +148,13 @@ STOPPED_PAST_SEC = _sec("VS_ALERT_STOPPED_PAST_SEC", 2 * 86400)
 # снова встал» давало бы новое сообщение.
 STOPPED_SETTLE_SEC = _sec("VS_ALERT_STOPPED_SETTLE_SEC", 30 * 60)
 STOPPED_TEXT_MAX = 3500                                     # телеграм режет на 4096
+# 17.10.2026, владелец: «алерты должны нести суть, без воды». Хронические состояния —
+# слот прошёл, задача ждёт, мало места, профиль занят, нет материала — не чинятся за
+# час, и ежечасное «ВСЁ ЕЩЁ (358)» про одно и то же есть шум: за 14 суток «слот прошёл,
+# ролика нет» ушло 358 раз, и из-за него перестали читать остальное. Повтор таких
+# поводов — раз в сутки; раньше — только если главная цифра повода выросла (Alert.figure):
+# это уже новая беда, а не напоминание о старой.
+CHRONIC_REPEAT_SEC = _sec("VS_ALERT_CHRONIC_REPEAT_SEC", 24 * 3600)
 DISK_MIN_GB = float(os.environ.get("VS_ALERT_DISK_GB") or 100)
 # §9/§10 — не из ТЗ, добавлены владельцем 16.09.2026.
 KEY_EXPIRES_DAYS = _num("VS_ALERT_KEY_EXPIRES_DAYS", 7)          # §9: за сколько дней предупредить
@@ -277,12 +284,16 @@ class Alert:
     скрыть половину аварии.
     """
 
-    __slots__ = ("key", "title", "text", "since_hint", "money")
+    __slots__ = ("key", "title", "text", "since_hint", "money", "figure")
 
-    def __init__(self, key, title, text, since_hint=None, money=""):
+    def __init__(self, key, title, text, since_hint=None, money="", figure=None):
         self.key = key
         self.title = title
         self.text = text
+        # Главная цифра повода (сколько выпусков, заданий, гигабайт нехватки). Хронический
+        # повод повторяется раз в сутки — но если цифра выросла, это новая беда, и о ней
+        # говорим раньше. См. CHRONIC_KEYS и tick().
+        self.figure = figure
         # Момент, с которого повод уже был верен, если его видно из данных. Без него
         # отсчёт идёт с первого наблюдения — см. `min_hold` в tick().
         self.since_hint = since_hint
@@ -436,7 +447,7 @@ def check_missed_slots(c, now, tenant=None) -> list:
             f"С прошедшим временем публикации: "
             f"{_plural(late[0], 'выпуск', 'выпуска', 'выпусков')}.\n"
             f"Самый ранний просрочен на {_human(now - late[1])}.",
-            since_hint=late[1],
+            since_hint=late[1], figure=int(late[0]),
             money="Деньги на эти выпуски уже потрачены."))
     pw, pargs = _tenant_where(tenant, "p.tenant_id")
     orphan = c.execute(
@@ -450,7 +461,7 @@ def check_missed_slots(c, now, tenant=None) -> list:
             "Слот прошёл, выпуск не заводился",
             f"Позиций плана с прошедшим слотом и без выпуска: {orphan[0]}.\n"
             f"Самая ранняя просрочена на {_human(now - orphan[1])}.",
-            since_hint=orphan[1],
+            since_hint=orphan[1], figure=int(orphan[0]),
             money="Денег не потрачено — работа не начиналась."))
     return out
 
@@ -488,6 +499,7 @@ def check_disk(c, now, tenant=None, path=None) -> list:
             "Мало места на сервере",
             f"Свободно {free_gb:.1f} ГБ из {usage.total / GB:.0f} ГБ ({probe}).\n"
             f"Порог тревоги — {DISK_MIN_GB:.0f} ГБ.",
+            figure=int(max(0.0, DISK_MIN_GB - free_gb) // 10),
             money="Место кончится — встанет и производство, и заливка. "
                   "Что можно убрать, показывает экран «Диск»."))
     return out + _check_nodes(c, now)
@@ -711,10 +723,26 @@ def последние_слова(c, job_id, сколько: int = 3) -> str:
         # Итоговая строка самого сервера — та же пустота, что и `rc=N`.
         if текст.startswith("❌ ошибка (код") or _ПУСТОЙ_КОД.match(текст):
             continue
-        годные.append(текст.lstrip("❌⛔⚠️🔴 ").strip()[:220])
+        текст = _чисто(текст)
+        # Одна и та же причина, напечатанная воркером трижды (по блоку, по итогу,
+        # по задаче), — одна строка, а не три.
+        if any(текст[:60] == г[:60] or текст in г for г in годные):
+            continue
+        годные.append(текст[:220])
         if len(годные) >= сколько:
             break
     return "\n".join(reversed(годные))
+
+
+_ОТМЕТКА_ВРЕМЕНИ = re.compile(r"^\[?\d{1,2}:\d{2}:\d{2}(?:\.\d+)?\]?\s*")
+_НОМЕР_ГЕНЕРАЦИИ = re.compile(r"\bgen(?:eration)?_[0-9a-f]{8,}\b", re.I)
+
+
+def _чисто(текст: str) -> str:
+    """Строка журнала без времени, значков и номеров генераций — человеку они не нужны."""
+    текст = _ОТМЕТКА_ВРЕМЕНИ.sub("", текст).lstrip("❌⛔⚠️🔴ℹ️⏳ ").strip()
+    текст = _НОМЕР_ГЕНЕРАЦИИ.sub("", текст)
+    return " ".join(текст.replace("  ", " ").split())
 
 
 def check_failed_tasks(c, now, tenant=None) -> list:
@@ -1218,18 +1246,24 @@ def check_upload_profile_busy(c, now, tenant=None) -> list:
     if not stuck:
         return []
     oldest = _f(stuck[0][1])
-    names = "\n".join(f"· {r[0]}: {(r[2] or 'профиль занят посторонним')[:160]}"
-                       for r in stuck[:int(FAILED_MAX)])
-    more = (f"\nи ещё {len(stuck) - int(FAILED_MAX)} — остальные видно на экране "
-            f"«Выпуски»" if len(stuck) > int(FAILED_MAX) else "")
+    # По профилю, а не по заданию: десять строк «профиль 31 … жду» — это одна беда у
+    # одного профиля, и читать её надо одной строкой (владелец 17.10.2026: «без воды»).
+    по_профилю: dict = {}
+    for r in stuck:
+        m = re.search(r"профил[ьяе]\s+(\S+)", str(r[2] or ""))
+        по_профилю.setdefault(m.group(1) if m else "?", []).append(r[0])
+    строки = []
+    for профиль, задания in sorted(по_профилю.items(), key=lambda kv: -len(kv[1])):
+        показ = ", ".join(задания[:3]) + (f" и ещё {len(задания) - 3}" if len(задания) > 3 else "")
+        строки.append(f"· профиль {профиль} — {_plural_tasks(len(задания))} ({показ})")
     return [Alert(
         "upload_profile_busy",
         "Заливка ждёт чужой профиль AdsPower",
-        f"Заданий ждёт профиля: {len(stuck)}, самое раннее — {_human(now - oldest)}.\n"
-        f"{names}{more}\n"
-        f"Что сделать: закрыть профиль в AdsPower на машине заливки — тем, кто его "
-        f"открыл. Сами мы его не тронем: два браузера в одном профиле рвут куки.",
-        since_hint=oldest + PROFILE_BUSY_SEC,
+        f"Ждут профиля: {_plural_tasks(len(stuck))}, самое раннее — {_human(now - oldest)}.\n"
+        + "\n".join(строки[:8])
+        + (f"\nи ещё профилей: {len(строки) - 8}" if len(строки) > 8 else "")
+        + "\nЧто сделать: закрыть профиль в AdsPower на машине заливки — тому, кто его открыл.",
+        since_hint=oldest + PROFILE_BUSY_SEC, figure=len(stuck),
         money="Денег это не стоит: задание ещё не начиналось, оплаченный ролик цел. "
               "Теряется время выхода — слот может уйти.")]
 
@@ -1412,11 +1446,31 @@ KEY_ALERT_KEYS = {"fastgen_key_expiring", "fastgen_usage_near_limit", "key_dead"
                   "key_exhausted", "text_sub_dead", "provider_resting"}
 
 
+# Поводы-состояния, которые тянутся сутками и чинятся не за час. Очередь и заливка
+# («queue_stalled», «upload_stalled») сюда не входят: там час — это уже много.
+CHRONIC_KEYS = {"slot_missed", "slot_empty", "oldest_task", "disk_low", "disk_low_node",
+                "upload_profile_busy", "channel_supply"}
+
+
 def repeat_after(key: str) -> float:
     """Через сколько повторять этот повод. Первое сообщение задержки не знает."""
-    if key.split(":")[0] == "stopped":
+    kind = key.split(":")[0]
+    if kind == "stopped":
         return STOPPED_REPEAT_SEC
-    return KEY_REPEAT_SEC if key.split(":")[0] in KEY_ALERT_KEYS else REPEAT_SEC
+    if kind in KEY_ALERT_KEYS:
+        return KEY_REPEAT_SEC
+    if kind in CHRONIC_KEYS:
+        return CHRONIC_REPEAT_SEC
+    return REPEAT_SEC
+
+
+def _grew(alert: Alert, st: dict) -> bool:
+    """Главная цифра повода выросла с прошлого сообщения — говорить можно раньше срока."""
+    try:
+        return (alert.figure is not None and st.get("figure") is not None
+                and float(alert.figure) > float(st["figure"]))
+    except (TypeError, ValueError):
+        return False
 
 
 def detect(c, now=None, tenant=None) -> dict:
@@ -1480,14 +1534,19 @@ def tick(c, send, now=None, tenant=None) -> list:
         if held < MIN_HOLD.get(key.split(":")[0], 0):
             continue
         last_sent = _f(st.get("sent"))
-        if last_sent and (key.split(":")[0] in NO_REPEAT
-                          or now - last_sent < repeat_after(key)):
+        if last_sent and key.split(":")[0] in NO_REPEAT:
             continue
+        if last_sent and now - last_sent < repeat_after(key):
+            # Хронический повод с выросшей цифрой — новость, а не напоминание; но не
+            # чаще общего часа, иначе растущий счётчик слал бы каждую минуту.
+            if not (_grew(alert, st) and now - last_sent >= REPEAT_SEC):
+                continue
         kind = "repeat" if last_sent else "alarm"
         text = _format(alert, kind, held, int(st.get("n") or 0) + 1)
         if not send(text):
             continue
         st["sent"] = now
+        st["figure"] = alert.figure
         st["n"] = int(st.get("n") or 0) + 1
         sent.append((key, kind, text))
 
@@ -1518,14 +1577,24 @@ def tick(c, send, now=None, tenant=None) -> list:
     return sent
 
 
+# Строки про деньги, которые ничего не сообщают: «денег не потрачено» в каждом втором
+# сообщении — вода. Правило ТЗ §14 «отвечать про деньги прямо» остаётся для случаев, где
+# деньги под угрозой или уже потрачены; про «ничего не потрачено» молчим.
+# У упавшей задачи строка про деньги остаётся всегда: «оплачено N вызовов до падения»
+# и его отрицание — это и есть ответ на вопрос владельца «что я потерял».
+_MONEY_NOISE = ("денег не потрачено", "денег это не стоит",
+                "неизвестно:", "деньги по этим задачам не считались")
+
+
 def _format(alert: Alert, kind: str, held: float, n: int) -> str:
-    head = "ТРЕВОГА" if kind == "alarm" else f"ВСЁ ЕЩЁ ({n})"
-    parts = [f"{head} · {alert.title}", "", alert.text.strip()]
+    head = "ТРЕВОГА" if kind == "alarm" else "ВСЁ ЕЩЁ"
+    parts = [f"{head} · {alert.title}", alert.text.strip()]
     if kind != "alarm":
-        parts.append(f"\nДлится {_human(held)}.")
-    if alert.money:
-        parts.append(f"\nДеньги: {alert.money}")
-    return "\n".join(parts).strip()
+        parts.append(f"Длится {_human(held)}.")
+    money = " ".join(str(alert.money or "").split())
+    if money and not money.lower().startswith(_MONEY_NOISE):
+        parts.append(f"Деньги: {money}")
+    return "\n\n".join(p for p in parts if p)
 
 
 # ─────────────────────────────── мелочи ───────────────────────────────
