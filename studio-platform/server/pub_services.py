@@ -1362,6 +1362,22 @@ class PubServices:
 
     COVER_SOFTEN_ROUNDS = 3
 
+    @staticmethod
+    def _payload_of(row) -> dict:
+        try:
+            raw = row["payload"]
+        except (KeyError, IndexError, TypeError):
+            return {}
+        try:
+            data = json.loads(raw or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def _cover_text_of(self, row) -> str:
+        """Надпись прошлого раунда смягчения из нашей копии задачи обложки."""
+        return str(self._payload_of(row).get("cover_text") or "").strip()
+
     def _soften_cover(self, c, rel, known, info, client, preset) -> str:
         """«requeued» — надпись смягчена и обложка заказана заново; «exhausted» — три
         раунда кончились; "" — смягчить не вышло (падаем прежней причиной)."""
@@ -1370,11 +1386,19 @@ class PubServices:
         done = int(mark.split(":", 1)[1]) if mark.startswith("cover-soften:") else 0
         if done >= self.COVER_SOFTEN_ROUNDS:
             return "exhausted"
-        text = cover_soften.adapted_text(info.get("log") or "")
+        try:
+            donor_title = rel["donor_title"] if "donor_title" in rel.keys() else ""
+        except (AttributeError, TypeError):
+            donor_title = ""
+        # Откуда взять надпись: журнал задачи (его отдаёт только сам сервис, по API его нет),
+        # потом надпись прошлого раунда из нашей копии задачи, потом название донора —
+        # модель сделает из него короткую надпись сама.
+        text = (cover_soften.adapted_text(info.get("log") or "")
+                or self._cover_text_of(known) or str(donor_title or "").strip())
         if not text:
             log_line(c, rel["release_id"], "обложка",
-                     "генератор не отдал обложку, а смягчить надпись нечего: в журнале "
-                     "задачи её нет", level="warn")
+                     "генератор не отдал обложку, а смягчить надпись нечего: ни журнала "
+                     "задачи, ни названия донора", level="warn")
             return ""
         key = get_key(c, "rewrite")
         if not key:
@@ -1382,10 +1406,6 @@ class PubServices:
                      "генератор не отдал обложку, а смягчить надпись нечем: нет ключа "
                      "сервиса текста", level="warn")
             return ""
-        try:
-            donor_title = rel["donor_title"] if "donor_title" in rel.keys() else ""
-        except (AttributeError, TypeError):
-            donor_title = ""
         try:
             new_text = cover_soften.soften_text(text, rel["lang"] or "ru", done + 1, key,
                                                 REWRITE_BASE, video_title=donor_title or "")
@@ -1396,9 +1416,12 @@ class PubServices:
             return ""
         job_id = client.create_title_job(preset, rel["lang"] or "ru", new_text,
                                          cover_soften.scene_hint(done + 1))
+        payload = self._payload_of(known)
+        payload["cover_text"] = new_text
         c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='running', error=?, "
-                  "updated=? WHERE release_id=? AND service='cover' AND kind='job'",
-                  (str(job_id), f"cover-soften:{done + 1}", rel["updated"], rel["release_id"]))
+                  "payload=?, updated=? WHERE release_id=? AND service='cover' AND kind='job'",
+                  (str(job_id), f"cover-soften:{done + 1}", json.dumps(payload, ensure_ascii=False),
+                   rel["updated"], rel["release_id"]))
         shown = " / ".join(new_text.splitlines())
         log_line(c, rel["release_id"], "обложка",
                  f"генератор не отдал обложку с надписью «{text[:60]}» — надпись смягчена "

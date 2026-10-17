@@ -131,6 +131,23 @@ def main() -> int:
         check("после трёх раундов — разбор с понятной причиной", got[0] == "разбор" and "после 3 смягчений" in got[1], True)
         check("четвёртого заказа нет", len(FakeCover.title_jobs), 3)
 
+        print("\nПо API журнала задачи нет: надпись берём из названия донора, дальше — из нашей копии")
+        FakeCover.title_jobs = []
+        answers[:] = ["PO 1945: CO DALEJ", "LISTY Z FRONTU"]
+        c = db("re-ordered")
+        no_log = dict(empty, log="")
+        pdir = tempfile.mkdtemp(prefix="cov-soft-")
+        svc = S.PubServices({"create_project": None, "enqueue": None, "project_dir": lambda *a, **k: pdir})
+        rel = {"release_id": "rel-1", "tenant_id": "dev", "project_id": "p1", "lang": "pl", "preset_cover": "обложки",
+               "donor_url": "https://youtu.be/aaa", "updated": NOW, "donor_title": "What Happened to the Nazis after 1945?"}
+        FakeCover.info = no_log
+        out = svc.do_cover_ready(c, rel)
+        check("раунд 1 из названия донора", (out, job_row(c)["error"], FakeCover.title_jobs[-1][0]), ({"wait": True}, "cover-soften:1", "PO 1945: CO DALEJ"))
+        row = c.execute("SELECT payload FROM pub_release_jobs WHERE service='cover'").fetchone()
+        check("надпись раунда запомнена в копии задачи", "PO 1945: CO DALEJ" in (row["payload"] or ""), True)
+        out = svc.do_cover_ready(c, rel)
+        check("раунд 2 от надписи раунда 1, не от донора", (job_row(c)["error"], FakeCover.title_jobs[-1][0]), ("cover-soften:2", "LISTY Z FRONTU"))
+
         print("\nМодель отказалась — прежняя причина, без заказа")
         FakeCover.title_jobs = []
         answers[:] = ["Извините, я не могу помочь с этим запросом"]
