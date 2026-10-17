@@ -1644,6 +1644,20 @@ class CoverClient:
         resp = _call("POST", self._url("/jobs"), self.key, "обложки", json=body)
         return resp.json()["job_id"]
 
+    def create_title_job(self, preset_name: str, lang_code: str, text: str,
+                         extra_prompt: str = "") -> str:
+        """Обложка по готовой надписи (режим `title`) — для смягчённых повторов (17.10.2026).
+
+        Сцена рисуется по надписи и подсказке, превью донора не используется: оно и его
+        слова уже дали молчаливый отказ генератора, повторять их незачем.
+        """
+        body = {"mode": "title", "preset_name": preset_name,
+                "languages": [lang_ru(lang_code)],
+                "titles_per_lang": {lang_ru(lang_code): text},
+                "extra_prompt": (extra_prompt or "")[:2000]}
+        resp = _call("POST", self._url("/jobs"), self.key, "обложки", json=body)
+        return resp.json()["job_id"]
+
     def job(self, job_id: str) -> dict:
         return _call("GET", self._url(f"/jobs/{job_id}"), self.key, "обложки").json()
 

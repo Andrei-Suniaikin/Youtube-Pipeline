@@ -1360,6 +1360,52 @@ class PubServices:
                      f"заранее заказать не вышло ({type(exc).__name__}) — "
                      f"вернёмся к ней на своей фазе", level="warn")
 
+    COVER_SOFTEN_ROUNDS = 3
+
+    def _soften_cover(self, c, rel, known, info, client, preset) -> str:
+        """«requeued» — надпись смягчена и обложка заказана заново; «exhausted» — три
+        раунда кончились; "" — смягчить не вышло (падаем прежней причиной)."""
+        import cover_soften
+        mark = str(known["error"] or "")
+        done = int(mark.split(":", 1)[1]) if mark.startswith("cover-soften:") else 0
+        if done >= self.COVER_SOFTEN_ROUNDS:
+            return "exhausted"
+        text = cover_soften.adapted_text(info.get("log") or "")
+        if not text:
+            log_line(c, rel["release_id"], "обложка",
+                     "генератор не отдал обложку, а смягчить надпись нечего: в журнале "
+                     "задачи её нет", level="warn")
+            return ""
+        key = get_key(c, "rewrite")
+        if not key:
+            log_line(c, rel["release_id"], "обложка",
+                     "генератор не отдал обложку, а смягчить надпись нечем: нет ключа "
+                     "сервиса текста", level="warn")
+            return ""
+        try:
+            donor_title = rel["donor_title"] if "donor_title" in rel.keys() else ""
+        except (AttributeError, TypeError):
+            donor_title = ""
+        try:
+            new_text = cover_soften.soften_text(text, rel["lang"] or "ru", done + 1, key,
+                                                REWRITE_BASE, video_title=donor_title or "")
+        except cover_soften.SoftenError as exc:
+            log_line(c, rel["release_id"], "обложка",
+                     f"генератор не отдал обложку; смягчение надписи (раунд {done + 1} из "
+                     f"{self.COVER_SOFTEN_ROUNDS}) не удалось: {exc}", level="warn")
+            return ""
+        job_id = client.create_title_job(preset, rel["lang"] or "ru", new_text,
+                                         cover_soften.scene_hint(done + 1))
+        c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='running', error=?, "
+                  "updated=? WHERE release_id=? AND service='cover' AND kind='job'",
+                  (str(job_id), f"cover-soften:{done + 1}", rel["updated"], rel["release_id"]))
+        shown = " / ".join(new_text.splitlines())
+        log_line(c, rel["release_id"], "обложка",
+                 f"генератор не отдал обложку с надписью «{text[:60]}» — надпись смягчена "
+                 f"моделью: «{shown[:60]}», обложка заказана заново по надписи, задача {job_id} "
+                 f"(раунд {done + 1} из {self.COVER_SOFTEN_ROUNDS})", level="warn")
+        return "requeued"
+
     def do_cover_ready(self, c, rel):
         """Обложка по заголовку ролика. Деградировавшую (текст оверлеем) не принимаем.
 
@@ -1423,9 +1469,20 @@ class PubServices:
             # Пустой результат — почти всегда занятый сосед по общему генератору картинок,
             # а не негодный ролик. Один раз заказываем заново; второй пустой ответ уже
             # считаем отказом, чтобы выпуск не крутился вечно.
-            if known["error"] in ("re-ordered", "re-ordered-degraded"):
-                reason = ("обложка не нарисовалась дважды: "
-                          + str(info.get("progress_detail") or state))
+            mark = str(known["error"] or "")
+            if mark in ("re-ordered", "re-ordered-degraded") or mark.startswith("cover-soften:"):
+                # 17.10.2026 (владелец): тот же запрос второй раз пуст — значит генератор
+                # молча отказывает на надпись, как фильтр озвучки на текст. Дальше не
+                # повтор, а до трёх раундов смягчения надписи; потом — человек.
+                outcome = self._soften_cover(c, rel, known, info, client, preset)
+                if outcome == "requeued":
+                    return {"wait": True}
+                if outcome == "exhausted":
+                    reason = (f"обложка: генератор не нарисовал после "
+                              f"{self.COVER_SOFTEN_ROUNDS} смягчений надписи — нужен человек")
+                else:
+                    reason = ("обложка не нарисовалась дважды: "
+                              + str(info.get("progress_detail") or state))
                 self._finish_remote(c, rel["release_id"], "cover", "error", reason)
                 raise ItemFailed(reason)
             job_id = client.create_job(preset, rel["lang"] or "ru", rel["donor_url"])
