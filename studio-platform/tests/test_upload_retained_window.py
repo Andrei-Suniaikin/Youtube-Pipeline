@@ -135,8 +135,19 @@ def main():
 
     print("\nЗащиты")
     r = client.post("/api/upload/rel-stuck/retained_progress",
-                    json={"profile": "28", "uc": UC_A, "phase": phase}, headers=H)
-    check("второй раз то же задание уже не удержанное (номер есть) — отказ", r.status_code, 409)
+                    json={"profile": "28", "uc": UC_A, "phase": "", "stdout": "черновик сохранён; профиль закрыт"},
+                    headers=H)
+    check("итог от той же машины после номера — принимается", r.status_code, 200)
+    check("номер при этом не тронут", job("rel-stuck")["video_id"], "Abc-123_xyz")
+    r = client.post("/api/upload/rel-stuck/retained_progress",
+                    json={"profile": "29", "uc": UC_A, "phase": phase}, headers=H)
+    check("после номера чужой профиль — отказ", r.status_code, 409)
+    r = client.post("/api/upload/rel-stuck/retained_progress",
+                    json={"profile": "28", "uc": UC_A, "phase": json.dumps(
+                        {"upload_phase_schema_version": 1, "phase": "video_id_known", "video_id": "Other-1234_"})},
+                    headers=H)
+    check("другой номер поверх записанного — отказ", r.status_code, 409)
+    check("записанный номер не перетёрт", job("rel-stuck")["video_id"], "Abc-123_xyz")
     r = client.post("/api/upload/rel-old/retained_progress",
                     json={"profile": "28", "uc": UC_A, "phase": json.dumps(
                         {"upload_phase_schema_version": 1, "phase": "video_id_known", "video_id": "bad id!!!!!"})},

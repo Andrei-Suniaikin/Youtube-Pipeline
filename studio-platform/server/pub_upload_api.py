@@ -531,7 +531,17 @@ def register_upload_routes(app, ctx):
                 raise HTTPException(404, "нет такого задания")
             ours = _retained_job(c, profile, uc)
             if ours is None or ours["release_id"] != release_id:
-                raise HTTPException(409, "это не удержанное задание этого профиля и канала")
+                # После того как машина донесла номер, задание уже не «без номера» — но
+                # итоговую строку («черновик сохранён, профиль закрыт») от той же машины
+                # по тому же профилю и каналу принимаем: это продолжение того же окна.
+                same = None
+                if rel["status"] == "repair" and rel["uc"] == uc and (rel["video_id"] or ""):
+                    serial = c.execute("SELECT serial FROM pub_profiles WHERE id=?",
+                                       (rel["profile_id"],)).fetchone()
+                    agent = _agent_profile(serial["serial"]) if serial and serial["serial"] else rel["profile_id"]
+                    same = rel if str(agent) == profile else None
+                if same is None:
+                    raise HTTPException(409, "это не удержанное задание этого профиля и канала")
             said, video_id = phase, ""
             try:
                 parsed = json.loads(phase)
@@ -542,6 +552,8 @@ def register_upload_routes(app, ctx):
                 pass
             if video_id and not VIDEO_ID_RE.fullmatch(video_id):
                 raise HTTPException(400, "кривой номер видео")
+            if video_id and (rel["video_id"] or "") and video_id != rel["video_id"]:
+                raise HTTPException(409, "у задания уже другой номер видео")
             fields = ["phase=?", "heartbeat=?", "updated=?"]
             args = [phase or rel["phase"], now, now]
             if video_id:
