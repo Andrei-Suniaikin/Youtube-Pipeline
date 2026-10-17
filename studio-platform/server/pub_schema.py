@@ -340,6 +340,16 @@ def ensure_pub_schema(c: sqlite3.Connection) -> None:
         c.execute("ALTER TABLE pub_channels ADD COLUMN preset_channel_id INTEGER")
     except Exception:
         pass   # колонка уже есть
+    # «Монетный канал» (владелец 17.10.2026: «главное чтобы в студии могли видеть
+    # монетные каналы, которые и будем помечать монеткой, плюс добавим фильтр»).
+    # Отметка руками, не вывод из писем: письмо «можно подавать» — повод, а не факт
+    # монетизации. `coin_note` — зачем/когда поставили, словами человека.
+    for _col, _sql in (("coin", "INTEGER NOT NULL DEFAULT 0"),
+                       ("coin_note", "TEXT")):
+        try:
+            c.execute(f"ALTER TABLE pub_channels ADD COLUMN {_col} {_sql}")
+        except Exception:
+            pass   # колонка уже есть — проверяется живым SELECT в тестах
     # Вид создаётся ПОСЛЕ миграции таблицы: та пересобирает `pub_channels` целиком, и
     # вид, созданный раньше, ссылался бы на таблицу, которой на время миграции нет.
     _migrate_channel_uc_optional(c)

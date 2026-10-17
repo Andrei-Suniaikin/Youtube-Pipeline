@@ -84,6 +84,7 @@ import pub_digest                                                # noqa: E402
 import pub_tg_personal                                           # noqa: E402
 import pub_analytics                                              # noqa: E402
 import pub_earn                                                   # noqa: E402
+import pub_mail                                                   # noqa: E402
 import channel_oauth                                              # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
 
@@ -697,8 +698,12 @@ def _preset_text_of(c, memo: dict, preset_vsgen_id) -> str:
 
 
 @app.get("/ui/channels")
-def ui_channels():
+def ui_channels(coin: int | None = None):
     """Список каналов со всем, по чему их ищут и раскладывают.
+
+    `coin=1` / `coin=0` — только монетные / только без монетки (17.10.2026). Экран
+    отбирает сам, на полученном списке; серверный отбор — для тех, кто зовёт список
+    не из пульта (отчёты, сводка), чтобы «монетные каналы» считались одинаково.
 
     Ниша, теги и запас приезжают сюда не «на всякий случай»: владелец 30.09.2026 —
     «двадцать каналов нормально, а когда будет 150, будет тяжело». Искать и
@@ -716,8 +721,13 @@ def ui_channels():
         порог = _supply_threshold(c)
         out = []
         cover_of = {}          # пресет производства → его пресет обложек: каналы делят пресеты
-        for ch in c.execute("SELECT * FROM pub_channels_live WHERE tenant_id=? ORDER BY name",
-                            (TENANT,)):
+        rows = c.execute("SELECT * FROM pub_channels_live WHERE tenant_id=? ORDER BY name",
+                         (TENANT,)).fetchall()
+        if coin is not None:
+            rows = [ch for ch in rows if bool(ch["coin"]) == bool(coin)]
+        # Письма по каналам — одним запросом к базе почты на весь список, не по каналу.
+        mail_n = pub_mail.mail_counts([ch["uc"] for ch in rows if ch["uc"]])
+        for ch in rows:
             try:
                 schedule = json.loads(ch["schedule"] or "{}")
             except ValueError:
@@ -727,6 +737,11 @@ def ui_channels():
                 "id": ch["id"], "name": ch["name"], "handle": ch["handle"] or "",
                 "lang": (ch["lang"] or "").upper(), "status": ch["status"],
                 "niche": ch["niche"] or "",
+                # Монетный канал — отметка руками (владелец 17.10.2026); письма —
+                # сколько событий почты у канала, чтобы на карточке было видно «есть что
+                # посмотреть», а не только у открытого канала.
+                "coin": bool(ch["coin"]), "coin_note": ch["coin_note"] or "",
+                "mail_n": mail_n.get(ch["uc"] or "", 0),
                 # ID канала отдаём целиком, а не только признаком «есть»: в письмах и
                 # таблицах канал чаще приходит именно строкой UC…, и искать по ней надо.
                 "uc": ch["uc"] or "",
@@ -2867,7 +2882,12 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
                 "preset_vsgen_id": ch["preset_vsgen_id"],
                 "preset_rewrite": ch["preset_rewrite"] or "",
                 "preset_cover": ch["preset_cover"] or "",
+                "coin": bool(ch["coin"]), "coin_note": ch["coin_note"] or "",
             },
+            # Почта канала (17.10.2026): события из базы читалки — своих писем и
+            # писем уровня аккаунта его почты. Только чтение, своя база, своя связь;
+            # базы нет — пустой список, а не ошибка на весь экран.
+            "mail_events": pub_mail.channel_events(ch["uc"] or "", limit=20),
             # `_strip_internal` снимает служебный `_plan_item_id` — наружу контракт
             # календаря не меняется (`counts`/`by_day` выше уже посчитаны по `cal`
             # ДО снятия поля, им оно не мешало).
@@ -8159,6 +8179,36 @@ def ui_channel_status(cid: int, body: dict):
     finally:
         c.close()
     return {"ok": True}
+
+
+class ChannelCoinIn(BaseModel):
+    coin: bool = False
+    note: str = ""
+
+
+@app.post("/ui/channels/{cid:int}/coin")
+def ui_channel_coin(cid: int, body: ChannelCoinIn):
+    """Поставить или снять монетку (владелец 17.10.2026: «помечать монеткой»).
+
+    Отдельный роут, а не поле формы настроек: монетку ставят с экрана канала одним
+    нажатием, а форма настроек сохраняет всё разом и живёт на другой вкладке. Отметка
+    ручная: письма из Gmail — повод посмотреть, монетизацию они не доказывают.
+    """
+    c = db()
+    try:
+        row = c.execute("SELECT id, name FROM pub_channels WHERE id=? AND tenant_id=?",
+                        (cid, TENANT)).fetchone()
+        if not row:
+            raise HTTPException(404, "канал не найден")
+        note = " ".join((body.note or "").split())[:200]
+        c.execute("UPDATE pub_channels SET coin=?, coin_note=?, updated=? WHERE id=? AND tenant_id=?",
+                  (1 if body.coin else 0, note or None, time.time(), cid, TENANT))
+        c.commit()
+        _audit(f'канал «{row["name"]}»: монетка {"поставлена" if body.coin else "снята"}'
+               + (f" ({note})" if note else ""))
+    finally:
+        c.close()
+    return {"ok": True, "coin": bool(body.coin), "coin_note": note}
 
 
 # Массовые действия. Ключ — то, что пришло с экрана, значение — как это назвать человеку

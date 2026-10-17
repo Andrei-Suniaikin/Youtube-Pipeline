@@ -336,6 +336,18 @@
   .chcard.paused{border-left-color:var(--off);opacity:.65}
   .chcard.problem{border-left-color:var(--bad)}
   .chcard h3{margin:0 0 4px;font-size:16px;font-weight:700;color:var(--ink-hi)}
+  /* Монетный канал (17.10.2026): монетка у названия — на карточке и в шапке канала.
+     Значок, а не цветная плашка: монетка читается с полуметра и не спорит с цветом
+     состояния. */
+  .coin{display:inline-block;margin-left:6px;font-size:.95em;line-height:1;vertical-align:-1px}
+  .coinline{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:-6px 0 14px}
+  .mailrow{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;padding:8px 0;
+           border-top:1px solid var(--line);font-size:13px}
+  .mailrow:first-child{border-top:0;padding-top:0}
+  .mailrow .mdate{color:var(--muted);white-space:nowrap}
+  .mailrow .msubj{font-weight:600;color:var(--ink-hi)}
+  .mailrow .mwho{grid-column:2;color:var(--muted)}
+  .mailrow.unread .msubj::before{content:"● ";color:var(--acc);font-size:.7em;vertical-align:2px}
   .chcard .meta{color:var(--muted);font-size:13px}
 
   /* Режим выбора. Отметка — внутри карточки, слева: снаружи она уехала бы в зазор
@@ -3062,7 +3074,7 @@ async function viewChannels(){
       aria-label="Канал ${esc(c.name)}">
       ${picking ? '<span class="chmark">✓</span>' : ''}
       ${supplyCorner(c.supply)}
-      <h3>${esc(c.name)}</h3>
+      <h3>${esc(c.name)}${coinMark(c)}</h3>
       <div class="meta">${esc(c.handle || '—')} · ${esc(c.lang)}</div>
       <div class="meta" style="margin-top:7px">
         ${c.per_day} ${c.per_day === 1 ? 'выход' : 'выхода'} в неделю · горизонт ${c.horizon_days} дн
@@ -3082,6 +3094,7 @@ async function viewChannels(){
           ? '<span class="pill s-queued" title="сценарий пишется на умолчаниях рерайта: без ведущего и стиля канала">нет пресета текста</span>'
           : ''}
         ${supplyPill(c.supply)}
+        ${c.mail_n ? `<span class="pill s-idle" title="письма YouTube/Google по этому каналу — на вкладке «Статистика»">✉ ${c.mail_n}</span>` : ''}
       </div>
     </div>`).join('');
     if (!list.length){
@@ -3628,10 +3641,11 @@ async function viewChannel(id){
 
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/channels">← ко всем каналам</a>
-    <h1>${esc(c.name)}</h1>
+    <h1>${esc(c.name)}${coinMark(c)}</h1>
     <p class="sub">${[c.handle, c.lang, c.niche].filter(Boolean).map(esc).join(' · ')}</p>
     ${c.uc ? '' : `<span class="pill s-error">ID пустой — выпуски на этом канале
       не заводятся. Вписать во вкладке «Настройки» ниже — один раз</span>`}`));
+  app.append(coinLine(c));
   const мало = ((await attention()).low_supply || []).find(x => String(x.id) === String(id));
   if (мало) app.append($(`<div class="attnbar" id="ch-low"><b>!</b> Мало доноров:
     ${esc(мало.text)}. ${whyTipHtml('Что делать?', lowSupplyTip(мало.text,
@@ -4310,12 +4324,103 @@ function oauthReturnNotice(){
   try { history.replaceState(null, '', location.pathname + location.hash); } catch(e) {}
 }
 
+/* ────────── монетка и почта канала (владелец 17.10.2026) ──────────
+
+   «Главное чтобы в студии могли видеть монетные каналы, которые и будем помечать
+   монеткой». Монетка — отметка руками: письмо «можно подавать» — повод открыть канал,
+   а не доказательство монетизации, поэтому из писем она не ставится сама.
+
+   Письма читает сборщик на Минске внутри профиля AdsPower — списком, без открытия
+   писем, без пересылки (Google этим аккаунтам пересылку не даёт). Сюда приезжают
+   отправитель, тема, обрывок и дата; почта аккаунта — маской.                        */
+
+function coinLine(c){
+  const box = $(`<div class="coinline" id="coinline"></div>`).firstElementChild;
+  const paint = () => {
+    box.innerHTML = c.coin
+      ? `<span class="pill s-done">🪙 монетный канал</span>${c.coin_note
+          ? `<span class="note muted" style="margin:0">${esc(c.coin_note)}</span>` : ''}
+         <button class="ghost small" id="coin-off">Снять монетку</button>`
+      : `<button class="ghost small" id="coin-on">🪙 Пометить монетным</button>`;
+    const on = box.querySelector('#coin-on'), off = box.querySelector('#coin-off');
+    if (on) on.onclick = () => modal('Монетный канал',
+      `<div class="fldrow"><label>Заметка</label>
+         <input id="coin-note" style="width:320px" maxlength="200"
+                placeholder="например: одобрен 12.10, AdSense привязан"></div>
+       <div class="note muted">Необязательно. Видна в подсказке к монетке на карточке.</div>`,
+      {ok: 'Поставить', onOk: async (body, close) => {
+        const out = await post(`/ui/channels/${c.id}/coin`,
+          {coin: true, note: body.querySelector('#coin-note').value});
+        c.coin = out.coin; c.coin_note = out.coin_note;
+        close(); paint(); toast('Монетка поставлена', 'ok');
+        const h1 = document.querySelector('h1');
+        if (h1 && !h1.querySelector('.coin')) h1.insertAdjacentHTML('beforeend', coinMark(c));
+      }});
+    if (off) off.onclick = () => confirmModal('Снять монетку',
+      `Снять отметку «монетный канал» с «${c.name}»? Письма и статистика остаются.`,
+      async () => {
+        try{
+          await post(`/ui/channels/${c.id}/coin`, {coin: false, note: ''});
+          c.coin = false; c.coin_note = '';
+          paint(); toast('Монетка снята', 'ok');
+          const mark = document.querySelector('h1 .coin');
+          if (mark) mark.remove();
+        }catch(e){ toast(e.message); }
+      });
+  };
+  paint();
+  return box;
+}
+
+// Какие категории писем считаем «про деньги»: их подсвечиваем в списке.
+const MAIL_MONEY = new Set(['monetization_eligible', 'monetization_review_result',
+                            'monetization_limited_or_off', 'adsense_payments']);
+
+function mailCard(events){
+  const card = $(`<div class="card" style="margin-bottom:16px">
+    <div class="sec">Почта канала ${hintDot(
+      'Письма YouTube, Google и AdSense за последние дни — их читает сборщик на Минске ' +
+      'прямо в почте профиля AdsPower, списком, не открывая писем. Пересылки нет: ' +
+      'Google этим аккаунтам её не даёт. Канал письмо называет редко, поэтому часть ' +
+      'писем — «по почте аккаунта»: они относятся ко всем каналам этой почты сразу.')}</div>
+    <div class="secbody" id="mail-body"></div></div>`);
+  const body = card.querySelector('#mail-body');
+  const list = events || [];
+  if (!list.length){
+    body.innerHTML = `<div class="note muted">Писем по этому каналу ещё нет. Они появятся
+      после ночного обхода почты на Минске (или когда его запустят руками).</div>`;
+    return card;
+  }
+  body.innerHTML = list.map(e => `<div class="mailrow${e.unread ? ' unread' : ''}">
+      <span class="mdate">${esc(mailWhen(e))}</span>
+      <span class="msubj">${esc(e.subject || '(без темы)')}</span>
+      <span class="mwho">
+        <span class="pill ${MAIL_MONEY.has(e.type) ? 's-queued' : 's-idle'}"
+          style="margin-right:6px">${esc(e.title)}</span>
+        ${esc(e.sender || '')}${e.account_level
+          ? ` · по почте аккаунта${e.login ? ` ${esc(e.login)}` : ''}`
+          : e.confidence && e.confidence !== 'high'
+            ? ` · ${esc(e.confidence_title || e.confidence)}` : ''}${
+        e.snippet ? `<br><span class="muted">${esc(e.snippet.slice(0, 160))}</span>` : ''}
+      </span></div>`).join('');
+  return card;
+}
+
+function mailWhen(e){
+  // Время — как показал Gmail (пояс он не сообщает); без разбора — текст как есть.
+  const t = e.event_time || '';
+  const m = t.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
+  if (m) return `${m[3]}.${m[2]} ${m[4]}:${m[5]}`;
+  return e.date_text || t.slice(0, 16) || '—';
+}
+
 function channelStatsTab(id, d){
   app.append(channelStatsCard(id, d.stats || {}));
   const ec = earnCard(d.earn || {});
   app.append(ec);
   earnEmailLine(id, ec);
   earnCollectLine(id, d.earn_request || {}, ec);
+  app.append(mailCard(d.mail_events || []));
   const a = d.analytics || {};
   const acc = a.access || {};
   const card = $(`<div class="card" style="margin-bottom:16px">
@@ -4696,10 +4801,21 @@ const CH_SORTS = [
   ['per_day', 'по числу выходов'],
 ];
 
+// Монетка у названия канала. Подсказка — заметка владельца, если он её оставил.
+function coinMark(c){
+  if (!c || !c.coin) return '';
+  return `<span class="coin" title="${esc('Монетный канал' + (c.coin_note ? ': ' + c.coin_note : ''))}"
+    aria-label="монетный канал">🪙</span>`;
+}
+
+// Отбор по монетке: «любые» / «на монете» / «без монеты» (владелец 17.10.2026).
+const COIN_FILTER = [['', 'монета: любые'], ['1', 'на монете'], ['0', 'без монеты']];
+
 function channelSieve(all, stats, onChange){
   const было = sieveSaved();
   const st = {q: было.q || '', lang: было.lang || '', niche: было.niche || '',
-              status: было.status || '', tag: было.tag || '', sort: было.sort || 'name'};
+              status: было.status || '', tag: было.tag || '', coin: было.coin || '',
+              sort: было.sort || 'name'};
   const uniq = (key) => [...new Set(all.map(c => c[key]).filter(Boolean))].sort(
     (a, b) => String(a).localeCompare(String(b), 'ru'));
   // Функцией, а не разовым списком: массовая простановка тега (кнопка «Выбрать» на этом
@@ -4723,6 +4839,9 @@ function channelSieve(all, stats, onChange){
           `<option value="${esc(k)}"${k === st.status ? ' selected' : ''}>${esc(v)}</option>`
         ).join('')}</select>
       <select id="s-tag" style="width:160px">${opts(tags(), st.tag, 'любой тег')}</select>
+      <select id="s-coin" style="width:150px">${COIN_FILTER.map(([k, v]) =>
+        `<option value="${k}"${k === st.coin ? ' selected' : ''}>${esc(v)}</option>`
+      ).join('')}</select>
       <select id="s-sort" style="width:200px">${CH_SORTS.map(([k, v]) =>
         `<option value="${k}"${k === st.sort ? ' selected' : ''}>${esc(v)}</option>`
       ).join('')}</select>
@@ -4740,6 +4859,7 @@ function channelSieve(all, stats, onChange){
       if (st.niche && c.niche !== st.niche) return false;
       if (st.status && c.status !== st.status) return false;
       if (st.tag && !(c.tags || []).includes(st.tag)) return false;
+      if (st.coin && Boolean(c.coin) !== (st.coin === '1')) return false;
       if (!q) return true;
       // Ищем по тому, чем канал зовут в жизни: название, хэндл и сам ID. По ID — потому
       // что в письмах и таблицах канал чаще приходит именно строкой UC….
@@ -4779,9 +4899,10 @@ function channelSieve(all, stats, onChange){
     });
   };
   bind('#s-q', 'q'); bind('#s-lang', 'lang'); bind('#s-niche', 'niche');
-  bind('#s-status', 'status'); bind('#s-tag', 'tag'); bind('#s-sort', 'sort');
+  bind('#s-status', 'status'); bind('#s-tag', 'tag'); bind('#s-coin', 'coin');
+  bind('#s-sort', 'sort');
   el.querySelector('#s-off').onclick = () => {
-    for (const k of ['q', 'lang', 'niche', 'status', 'tag']) st[k] = '';
+    for (const k of ['q', 'lang', 'niche', 'status', 'tag', 'coin']) st[k] = '';
     st.sort = 'name';
     el.querySelectorAll('input,select').forEach(n => { n.value = ''; });
     const srt = el.querySelector('#s-sort');
