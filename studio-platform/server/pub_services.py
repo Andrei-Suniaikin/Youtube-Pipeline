@@ -1384,6 +1384,28 @@ class PubServices:
         import cover_soften
         mark = str(known["error"] or "")
         done = int(mark.split(":", 1)[1]) if mark.startswith("cover-soften:") else 0
+        # Пустой ответ по вине сервиса (сцена не сгенерировалась: 402 лимит ключа, 429, 5xx),
+        # а не генератора картинок — это не повод для нового раунда. Ждём 15 минут и
+        # заказываем ТОТ ЖЕ раунд заново; счёт раундов не растёт.
+        notes = " ".join(str(n) for n in (info.get("check_notes") or []))
+        service_fault = ("Ошибка генерации сцены" in notes
+                         or re.search(r"Error code: (?:402|429|5\d\d)\b", notes) is not None)
+        if service_fault and done:
+            age = self._clock() - float(known["updated"] or 0)
+            if age < 900:
+                raise ResourceDown("обложки", "сервис обложек не сделал сцену для надписи "
+                                              "(лимит ключа или сбой) — повторю через 15 минут")
+            text = self._cover_text_of(known)
+            if text:
+                job_id = client.create_title_job(preset, rel["lang"] or "ru", text,
+                                                 cover_soften.scene_hint(done))
+                c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='running', updated=? "
+                          "WHERE release_id=? AND service='cover' AND kind='job'",
+                          (str(job_id), self._clock(), rel["release_id"]))
+                log_line(c, rel["release_id"], "обложка",
+                         f"сервис обложек не сделал сцену (сбой ключа) — тот же раунд {done} "
+                         f"заказан заново, задача {job_id}", level="warn")
+                return "requeued"
         if done >= self.COVER_SOFTEN_ROUNDS:
             return "exhausted"
         try:

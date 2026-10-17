@@ -148,6 +148,28 @@ def main() -> int:
         out = svc.do_cover_ready(c, rel)
         check("раунд 2 от надписи раунда 1, не от донора", (job_row(c)["error"], FakeCover.title_jobs[-1][0]), ("cover-soften:2", "LISTY Z FRONTU"))
 
+        print("\nСбой сервиса (402 на сцене) — не раунд: ждём, потом тот же раунд заново")
+        FakeCover.title_jobs = []
+        c = db("cover-soften:1")
+        c.execute("UPDATE pub_release_jobs SET payload=? WHERE service='cover'", ('{"cover_text": "PO 1945: CO DALEJ"}',))
+        c.commit()
+        fault = dict(empty, log="", check_notes=["❌ Ошибка генерации сцены: Error code: 402 - {'error': {'message': \"API key token allowance exhausted\"}}"])
+        svc = S.PubServices({"create_project": None, "enqueue": None, "project_dir": lambda *a, **k: pdir})
+        FakeCover.info = fault
+        try:
+            svc.do_cover_ready(c, rel); got = "ok"
+        except S.ResourceDown as exc:
+            got = "ждём: " + str(exc)
+        except S.ItemFailed as exc:
+            got = "разбор: " + str(exc)
+        check("свежий сбой — ожидание, не раунд", got.startswith("ждём"), True)
+        check("счёт раундов не вырос", job_row(c)["error"], "cover-soften:1")
+        check("заказов нет", FakeCover.title_jobs, [])
+        c.execute("UPDATE pub_release_jobs SET updated=? WHERE service='cover'", (NOW - 1000,)); c.commit()
+        svc._clock = lambda: NOW
+        out = svc.do_cover_ready(c, rel)
+        check("через 15 минут — тот же раунд заказан заново", (out, job_row(c)["error"], FakeCover.title_jobs), ({"wait": True}, "cover-soften:1", [("PO 1945: CO DALEJ", True)]))
+
         print("\nМодель отказалась — прежняя причина, без заказа")
         FakeCover.title_jobs = []
         answers[:] = ["Извините, я не могу помочь с этим запросом"]
