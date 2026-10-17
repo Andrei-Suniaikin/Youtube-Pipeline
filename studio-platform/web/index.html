@@ -1458,6 +1458,11 @@ function blockBox(r){
   if (['channel', 'access', 'studio', 'check'].includes(b.kind) && r.status === 'blocked'
       && !r.hand_confirmed && ['upload_pending', 'upload_running'].includes(r.phase))
     acts.push(`<button class="ghost" id="byhand">Подтвердить руками</button>`);
+  // Окно заливки потеряно (17.10.2026): загрузка начиналась, но номера ролика нет, а
+  // окно на машине закрыто — ролика на канале нет и не будет. Единственный выход —
+  // залить заново; заливщик перед загрузкой сверит контент канала по названию.
+  if (r.status === 'blocked' && !r.hand_confirmed && r.phase === 'upload_running' && !r.video_id)
+    acts.push(`<button class="ghost" id="lostwin">Окно потеряно — залить заново</button>`);
   return `<div class="blk ${esc(b.kind)}" id="blk">
     <div class="blkhead"><span class="blktag ${esc(b.kind)}">${esc(b.tag)}</span> ${esc(b.title)}</div>
     ${b.who ? `<p><b>Кто чинит:</b> ${esc(b.who)}</p>` : ''}
@@ -1803,6 +1808,18 @@ async function viewRelease(id){
       await post(`/ui/releases/${encodeURIComponent(r.release_id)}/revive`);
       await render();
     }catch(e){ rev.disabled = false; toast(e.message); }
+  });
+
+  const lostwin = head.querySelector('#lostwin');
+  if (lostwin) lostwin.onclick = () => confirmInline(lostwin,
+      'Окно на машине закрыто и ролика на канале нет? Комплект соберётся заново и файл '
+      + 'зальётся ещё раз; перед загрузкой заливщик сверит контент канала по названию.',
+      async () => {
+    lostwin.disabled = true;
+    try{
+      await post(`/ui/releases/${encodeURIComponent(r.release_id)}/lost_window`);
+      await render();
+    }catch(e){ lostwin.disabled = false; toast(e.message); }
   });
 
   /* Подтверждение человеком — единственный выход из тупика, в котором у выпуска нет ни

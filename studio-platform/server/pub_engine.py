@@ -170,7 +170,12 @@ def reached_irreversible(c, release_id: str) -> bool:
         # умер браузер). Фазы идут ДО отправки файла, поэтому их отсутствие означает,
         # что в YouTube ничего не ушло — повтор безопасен.
         return False
-    for phase in phase_history(c, release_id):
+    history = phase_history(c, release_id)
+    if "lost_window" in history:
+        # Человек решил, что окно заливки потеряно и ролика на канале нет (17.10.2026):
+        # всё, что было до этой отметки, уликой начатой загрузки больше не считается.
+        history = history[len(history) - history[::-1].index("lost_window"):]
+    for phase in history:
         if PHASE_INDEX.get(phase, -1) >= IRREVERSIBLE_FROM:
             return True
     return False
@@ -440,7 +445,36 @@ def _set(c, rid: str, now: float, guard: bool = True, **fields) -> bool:
     return cur.rowcount > 0
 
 
-def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -> dict:
+def lost_window_refusal(c, release_id: str) -> str:
+    """Почему выпуск НЕЛЬЗЯ заливать заново как «окно потеряно». Пусто — можно.
+
+    17.10.2026. Восемь окон на Минске с «Verify it's you» простояли по двое суток, Google
+    завершил в них сессию, и файл, залитый внутри мастера без номера, пропал вместе с
+    окном. Такому выпуску правило «загрузка начиналась — повтор запрещён» больше не
+    помогает, а вредит: ролика на канале нет, и не будет никогда. Человек закрывает окно
+    и нажимает «окно потеряно» — выпуск собирает комплект заново и заливает файл ещё раз.
+
+    Защита от второго ролика остаётся двойной: сюда не пускаем выпуск с номером ролика
+    (номер — улика, что ролик на канале есть: это «подтвердить руками»), и выпуск, чьё
+    задание машина держит прямо сейчас; а сам заливщик перед свежей загрузкой ищет на
+    канале строку с таким названием и, найдя, доводит её, а не заливает второй раз.
+    """
+    job = c.execute("SELECT status, video_id FROM pub_upload_jobs WHERE release_id=?",
+                    (release_id,)).fetchone()
+    if job is None:
+        return "задания заливки нет — это обычный «Вернуть в работу»"
+    if job["video_id"]:
+        return (f"у ролика есть номер {job['video_id']} — значит, он на канале есть; "
+                "окно не потеряно, закрывайте через «Подтвердить руками»")
+    if (job["status"] or "") == "running":
+        return "машина держит задание прямо сейчас — дождитесь её вердикта"
+    if (job["status"] or "") not in ("repair", "error"):
+        return f"задание в состоянии «{job['status']}» — окно потерянным не считается"
+    return ""
+
+
+def revive(c, release_id: str, now: float = None, keep_attempts: bool = False,
+           lost_window: bool = False) -> dict:
     """Вернуть выпуск из разбора в работу.
 
     ДОБАВЛЕНО 04.09.2026. Карантин был односторонней дверью: движок помечал выпуск
@@ -475,9 +509,20 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
                 "why": "выпуск подтверждён руками — ролик на канале есть, "
                        "возвращать в работу нечего"}
     if reached_irreversible(c, release_id):
-        return {"ok": False,
-                "why": "загрузка уже начиналась — повтор запрещён навсегда, "
-                       "нужен разбор вручную"}
+        if not lost_window:
+            return {"ok": False,
+                    "why": "загрузка уже начиналась — повтор запрещён навсегда, "
+                           "нужен разбор вручную"}
+        why = lost_window_refusal(c, release_id)
+        if why:
+            return {"ok": False, "why": why}
+        # Отметка в истории фаз: с неё `reached_irreversible` считает заново.
+        log_phase(c, release_id, "lost_window", now,
+                  payload={"from_phase": rel["phase"], "reason": rel["blocked_reason"]})
+        log_line(c, release_id, "заливка",
+                 "окно заливки на машине потеряно, ролика на канале нет — человек разрешил "
+                 "новую заливку; комплект соберётся заново, заливщик перед загрузкой сверит "
+                 "контент канала по названию", now=now)
     # Допуск ролика в очередь привязан к конкретной версии проекта и файла, и мёртвое
     # задание заливки означает, что прежняя приёмка недействительна: файл пересобрали
     # либо выпуск сняли в разбор ещё до выдачи. Оставить выпуск на фазе «комплект отдан»
@@ -502,7 +547,7 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False) -
                     "WHERE release_id=?", (release_id,)).fetchone()
     annul = bool(job and phase in ("upload_pending", "upload_running")
                  and (job["status"] or "") != "running"
-                 and not job["claim_token"] and not job["video_id"])
+                 and (lost_window or not job["claim_token"]) and not job["video_id"])
     if annul:
         phase = "cover_ready"
     fields = {"status": "pending", "blocked_reason": None,
