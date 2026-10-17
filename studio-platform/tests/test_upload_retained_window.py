@@ -8,7 +8,10 @@
     `repair` без номера, только у остановленного выпуска, не подтверждённого руками;
   • POST …/retained_progress записывает номер видео и фазу без клейма, но только для
     того задания, что нашла первая ручка; кривой номер и чужое задание — отказ;
-  • записанный номер второй раз не перетирается (задание уже с номером — не удержанное).
+  • записанный номер второй раз не перетирается (задание уже с номером — не удержанное);
+  • POST …/retained_lost (18.10): пуллер сам закрыл окно, довести которое не смог, —
+    выпуск возвращается заново как «окно потеряно»; чужой выпуск и канал с двумя
+    удержанными заданиями — отказ, ничего не меняется.
 
     .venv/bin/python tests/test_upload_retained_window.py
 """
@@ -42,6 +45,7 @@ _c.commit(); _c.close()
 from fastapi import FastAPI                                        # noqa: E402
 from fastapi.testclient import TestClient                          # noqa: E402
 from pub_upload_api import register_upload_routes                  # noqa: E402
+import pub_engine                                                  # noqa: E402
 
 TOKEN = "upl_test"
 NOW = time.time()
@@ -89,14 +93,22 @@ def seed():
                   (rid, "t1", n, n, uc, NOW + 3600, rst, NOW, NOW, NOW if hand else None))
         c.execute("INSERT INTO pub_upload_jobs(release_id,tenant_id,channel_id,uc,profile_id,"
                   "host_id,channel_url,title,description,schedule_iso,visibility,video_path,"
-                  "slot_at,status,video_id,error,created,updated) "
-                  "VALUES(?,?,?,?,?,1,?,?,'','','public','/v.mp4',?,?,?,"
+                  "slot_at,status,phase,video_id,error,created,updated) "
+                  "VALUES(?,?,?,?,?,1,?,?,'','','public','/v.mp4',?,?,?,?,"
                   "?,?,?)",
                   (rid, "t1", n, uc, pid, f"https://studio.youtube.com/channel/{uc}/",
-                   f"ролик {rid}", NOW + 3600, st, vid or None,
+                   f"ролик {rid}", NOW + 3600, st,
+                   # машина успела сообщить «файл пошёл»: загрузка начиналась — как в бою
+                   json.dumps({"upload_phase_schema_version": 1, "phase": "upload_started",
+                               "video_id": vid or ""}),
+                   vid or None,
                    {"rel-gate": "AUTH_GATE: native confirmation stopped; existing upload preserved",
                     "rel-err": "нода: HTTP Error 502"}.get(rid, "UPLOAD_IN_PROGRESS_PROFILE_RETAINED: …"),
                    NOW - (100 if rid == "rel-old" else 0), NOW - (100 if rid == "rel-old" else 0)))
+        # История фаз до «идёт заливка»: загрузка начиналась, выпуск необратим — как в бою.
+        for seq, ph in enumerate(pub_engine.PHASES[:pub_engine.PHASE_INDEX["upload_running"] + 1], start=1):
+            c.execute("INSERT INTO pub_release_events(release_id,seq,phase,created,repeats,last_seen) "
+                      "VALUES(?,?,?,?,1,?)", (rid, seq, ph, NOW - 3600, NOW - 3600))
     c.commit(); c.close()
 
 
@@ -104,6 +116,22 @@ def job(rid):
     c = conn()
     try:
         return dict(c.execute("SELECT * FROM pub_upload_jobs WHERE release_id=?", (rid,)).fetchone())
+    finally:
+        c.close()
+
+
+def rel(rid):
+    c = conn()
+    try:
+        return dict(c.execute("SELECT * FROM pub_releases WHERE release_id=?", (rid,)).fetchone())
+    finally:
+        c.close()
+
+
+def log_of(rid):
+    c = conn()
+    try:
+        return [m[0] for m in c.execute("SELECT message FROM pub_release_log WHERE release_id=?", (rid,))]
     finally:
         c.close()
 
@@ -127,6 +155,48 @@ def main():
     check("кривой UC — отказ", r.status_code, 400)
     r = client.get("/api/upload/retained", params={"profile": "28", "uc": UC_A})
     check("без секрета ноды — не пущу", r.status_code in (401, 403), True)
+
+    print("\nПуллер сам закрыл удержанное окно, которое довести не смог")
+    r = client.post("/api/upload/rel-stuck/retained_lost",
+                    json={"profile": "28", "uc": UC_C, "why": "Verify не пройден, окно закрыто"}, headers=H)
+    check("чужой release_id (у профиля и канала удержано другое) — отказ", r.status_code, 409)
+    check("чужой выпуск не тронут", (rel("rel-stuck")["status"], job("rel-stuck")["status"]), ("blocked", "repair"))
+    check("и своё, rel-gate, тоже не тронуто", rel("rel-gate")["status"], "blocked")
+    r = client.post("/api/upload/rel-stuck/retained_lost",
+                    json={"profile": "28", "uc": UC_A, "why": "окно закрыто"}, headers=H)
+    check("у канала два удержанных задания — отказ, вернуть кнопкой", r.status_code, 409)
+    check("в отказе сказано про кнопку в пульте", "кнопкой в пульте" in r.json().get("detail", ""), True)
+    check("оба выпуска канала не тронуты",
+          (rel("rel-stuck")["status"], rel("rel-old")["status"]), ("blocked", "blocked"))
+    check("ни одного задания не убрано", job("rel-stuck")["status"] and job("rel-old")["status"], "repair")
+    check("в журнале ничего не появилось", any("закрыто пуллером" in m for m in log_of("rel-stuck")), False)
+    r = client.post("/api/upload/rel-gate/retained_lost", json={"uc": UC_C, "why": "x"}, headers=H)
+    check("без profile — отказ 400", r.status_code, 400)
+    r = client.post("/api/upload/rel-gate/retained_lost", content=b"not json", headers=H)
+    check("не JSON — отказ 400", r.status_code, 400)
+    r = client.post("/api/upload/rel-gate/retained_lost", json={"profile": "28", "uc": UC_C, "why": "x"})
+    check("без секрета ноды — не пущу", r.status_code in (401, 403), True)
+    check("после отказов rel-gate всё ещё остановлен", rel("rel-gate")["status"], "blocked")
+    r = client.post("/api/upload/rel-gate/retained_lost",
+                    json={"profile": "28", "uc": UC_C, "why": "Verify it's you не пройден, окно закрыто пуллером"},
+                    headers=H)
+    check("наше удержанное задание — принято", (r.status_code, r.json().get("revived")), (200, True))
+    check("в ответе номер выпуска", r.json().get("release_id"), "rel-gate")
+    g = rel("rel-gate")
+    check("выпуск снова в работе", g["status"], "pending")
+    check("с фазы «обложка готова» — комплект соберётся заново", g["phase"], "cover_ready")
+    c = conn()
+    n_jobs = c.execute("SELECT COUNT(*) FROM pub_upload_jobs WHERE release_id='rel-gate'").fetchone()[0]
+    irrev = pub_engine.reached_irreversible(c, "rel-gate")
+    c.close()
+    check("старое задание убрано", n_jobs, 0)
+    check("после отметки выпуск больше не необратим", irrev, False)
+    msgs = log_of("rel-gate")
+    check("в журнале сказано, что окно закрыто пуллером", any("удержанное окно закрыто пуллером" in m for m in msgs), True)
+    check("и что выпуск возвращён заново", any("окно потеряно" in m for m in msgs), True)
+    r = client.post("/api/upload/rel-gate/retained_lost",
+                    json={"profile": "28", "uc": UC_C, "why": "повтор"}, headers=H)
+    check("второй раз — уже не удержанное, отказ", r.status_code, 409)
 
     print("\nМашина доносит номер видео без клейма")
     phase = json.dumps({"upload_phase_schema_version": 1, "phase": "video_id_known",

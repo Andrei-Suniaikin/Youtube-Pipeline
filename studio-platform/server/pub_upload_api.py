@@ -50,6 +50,7 @@ import pub_artifact
 import pub_upload_census
 from pub_engine import (FINALIZE_GAP_SEC, FINALIZE_MAX_TRIES, finalize_due,
                         finalize_exhausted_reason, finalize_tries, reslot_upload_job)
+from pub_engine import revive as engine_revive
 from pub_log import add as log_line, add_lines
 
 # Сколько ждать вестей от ноды, прежде чем считать заливку зависшей.
@@ -671,6 +672,46 @@ def register_upload_routes(app, ctx):
                 add_lines(c, release_id, "заливщик", stdout)
             c.commit()
             return JSONResponse({"ok": True, "video_id": video_id or rel["video_id"] or ""})
+        finally:
+            c.close()
+
+    # 18.10.2026. Третья ручка того же окна: машина сама закрыла удержанное окно, которое
+    # довести не смогла (мастер без номера видео после неудачного «Verify it's you»), и
+    # сообщает об этом. Ролика на канале нет и не будет — выпуск возвращается заново как
+    # «окно потеряно» (`pub_engine.revive(lost_window=True)`): та же дверь, что у кнопки
+    # в пульте, с теми же защитами от второго ролика (номер есть — отказ, задание держит
+    # машина — отказ). Чужой выпуск трогать нельзя: при двух и более удержанных заданиях
+    # у канала окно по профилю и каналу не атрибутировать — возвращать кнопкой в пульте.
+    @app.post("/api/upload/{release_id}/retained_lost")
+    async def upload_retained_lost(release_id: str, request: Request):
+        _auth(request)
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(400, "жду JSON")
+        profile = str(body.get("profile") or "").strip()
+        uc = str(body.get("uc") or "").strip()
+        why = str(body.get("why") or "").strip()
+        if not profile or not UC_RE.fullmatch(uc):
+            raise HTTPException(400, "нужны profile и uc")
+        now = _now()
+        c = db()
+        try:
+            ours = _retained_job(c, profile, uc)
+            if ours is None or ours["release_id"] != release_id:
+                raise HTTPException(409, "это не удержанное задание этого профиля и канала")
+            if ours["candidates"] > 1:
+                raise HTTPException(409, "у канала несколько удержанных заданий без номера — "
+                                         "вернуть кнопкой в пульте")
+            log_line(c, release_id, "заливка",
+                     f"удержанное окно закрыто пуллером: {why[:200] or 'причина не названа'} — "
+                     "выпуск возвращён заново («окно потеряно»)", now=now)
+            out = engine_revive(c, release_id, now, lost_window=True)
+            if not out["ok"]:
+                c.rollback()
+                raise HTTPException(409, out["why"])
+            c.commit()
+            return JSONResponse({"ok": True, "release_id": release_id, "revived": True})
         finally:
             c.close()
 
