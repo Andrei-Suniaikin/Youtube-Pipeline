@@ -57,6 +57,7 @@ from pub_ui import register_pub_routes
 from pub_engine import tick as pub_tick
 from pub_services import PubServices
 from pub_upload_api import register_upload_routes, sweep_stuck as sweep_upload
+from pub_mail import register_mail_routes
 
 # Момент старта ЭТОГО процесса. Нужен админ-панели, чтобы поймать «залили файл, но не
 # перезапустили сервис»: код в рантайме — тот, что был на диске в момент импорта, и
@@ -20773,6 +20774,15 @@ def _upload_token() -> str:
 register_upload_routes(app, {
     "db": db,
     "_now": _now,
+    "upload_token": _upload_token,
+    "log": log_info,
+})
+
+# Почта каналов с Минска (17.10.2026): строки списка Gmail, прочитанные внутри профиля
+# AdsPower. Тот же токен, что у заливки — вторая машина-нода студии не нужна, это
+# та же нода. Пишет в базу читалки приёмника, не в vsgen.db.
+register_mail_routes(app, {
+    "db": db,
     "upload_token": _upload_token,
     "log": log_info,
 })

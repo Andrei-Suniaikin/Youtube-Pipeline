@@ -37,34 +37,19 @@ ENV_PATH = os.environ.get("MAIL_MONITOR_ENV", "/srv/studio/mail_monitor.env")
 DB_PATH = os.environ.get("MAIL_MONITOR_DB", "/srv/studio/data/mail_monitor.db")
 RAW_DIR = os.environ.get("MAIL_MONITOR_RAW", "/srv/studio/data/mail_raw")
 
-UC_RE = re.compile(r"UC[0-9A-Za-z_-]{22}")
+# Правила классификации общие с приёмом строк Gmail с Минска (`server/pub_mail.py`):
+# одно письмо не должно получать две категории в зависимости от дороги. На VPS
+# читалка лежит копией в /srv/studio рядом с базой, поэтому ищем модуль и рядом с
+# собой, и в каталоге приложения.
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+try:
+    from mail_rules import RULES, UC_RE, classify          # noqa: E402,F401
+except ImportError:                                        # копия вне репозитория
+    sys.path.insert(0, "/srv/studio/app/workers/mail")
+    from mail_rules import RULES, UC_RE, classify          # noqa: E402,F401
+
 VIDEO_RE = re.compile(r"(?:watch\?v=|youtu\.be/|/video/|/shorts/)([0-9A-Za-z_-]{11})")
 LINK_RE = re.compile(r"https?://[^\s<>\"')]+")
-
-# Классификация: сначала проверяемые правила (отправитель + тема).
-# НЕ опираемся на один домен или одно английское слово — паттерны мультиязычные,
-# по умолчанию important_unclassified, чтобы ничего не уехало в неверную категорию молча.
-# (type, domain_substrings, subject_regex) — subject_regex без учёта регистра.
-RULES = [
-    ("monetization_eligible",
-     ["youtube.com", "google.com"],
-     r"(moneti|монетиз|zarab|partner program|партнёрск|партнерск|YPP|применить|eligib|подать заявку)"),
-    ("monetization_review_result",
-     ["youtube.com", "google.com"],
-     r"(review|рассмотр|проверк|approved|одобрен|rejected|отклон|not approved|не одобрен|decision|решени)"),
-    ("monetization_limited_or_off",
-     ["youtube.com", "google.com"],
-     r"(disabled|отключ|limited|ограничен|suspend|приостанов|turned off|monetization.*(off|disabled))"),
-    ("copyright",
-     ["youtube.com", "google.com"],
-     r"(copyright|авторск|claim|претензи|strike|страйк|content id|удал.*за наруш)"),
-    ("adsense_payments",
-     ["adsense", "payments.google.com", "google.com"],
-     r"(adsense|payment|выплат|платёж|платеж|payout|threshold|порог|earnings|доход)"),
-    ("account_security",
-     ["google.com", "accounts.google.com"],
-     r"(security|безопасн|sign-?in|вход|verify|подтверд|suspicious|подозрит|recovery|восстановл|password|пароль)"),
-]
 
 
 def now_utc_iso():
@@ -188,15 +173,6 @@ def extract_route_tag(delivered_to, to_hdr, user):
             if local.startswith(base + "+"):
                 return local[len(base) + 1:]
     return None
-
-
-def classify(from_hdr, subject):
-    f = (from_hdr or "").lower()
-    s = subject or ""
-    for etype, domains, subj_re in RULES:
-        if any(d in f for d in domains) and re.search(subj_re, s, re.I):
-            return etype
-    return "important_unclassified"
 
 
 def bind_channel(conn, uc_hits, route_tag):
