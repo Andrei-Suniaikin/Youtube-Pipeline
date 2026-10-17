@@ -45,6 +45,11 @@ if RENDER_DIR not in sys.path:
 SHARED_DIR = os.path.join(os.path.dirname(HERE), "shared")
 if SHARED_DIR not in sys.path:
     sys.path.append(SHARED_DIR)
+# Замок движка (shared/engine_lock.py): фон поднимается только у того процесса, который
+# держит файловый замок. Нужен выкатке без простоя, когда рядом секунды живут два
+# экземпляра студии. Без STUDIO_ENGINE_LOCK в окружении замок выключен и фон
+# стартует сразу, как раньше.
+import engine_lock
 import card_jobs as card_contract
 import preset_links
 import pub_calls
@@ -2868,25 +2873,39 @@ async def _lifespan(app):
     except Exception:
         log_exc("_lifespan/byok_pool_hint")
     if BACKGROUND_ENABLED:
-        try:
-            # Первым делом — огрызки прерванных заливок рендера. Именно рестарт их и
-            # порождает (деплой, OOM, kill), поэтому старт сервиса и есть тот момент,
-            # когда их гарантированно никто не пишет: нода про свой оборванный запрос
-            # уже забыла и спросит квитанцию заново.
-            _sweep_incoming_renders()
-        except Exception:
-            log_exc("_lifespan/incoming_renders")
-        try:
-            threading.Thread(target=_pub_engine_loop, daemon=True,
-                             name="pub-engine").start()
-        except Exception:
-            log_exc("_lifespan/pub_engine")
-        try:
-            _start_background()
-        except Exception:
-            # Сервер поднимаем в любом случае: без планировщика он хотя бы отдаёт /healthz,
-            # где видно, что фон мёртв, — это лучше, чем циклический краш uvicorn.
-            log_exc("_lifespan/_start_background")
+        def _own_background():
+            """Весь фон кабинета — одним куском, под замком движка.
+
+            Выкатка без простоя (deploy/BLUE_GREEN.md) поднимает второй экземпляр рядом
+            с работающим. Если бы он сразу выполнил `_recover_orphans`, то вернул бы в
+            очередь задачи, которые сосед ведёт прямо сейчас, — и их запустили бы дважды,
+            за двойные деньги. Поэтому всё ниже выполняется, только когда замок наш:
+            сразу, если его никто не держит, или когда прежний владелец выйдет.
+            """
+            try:
+                # Первым делом — огрызки прерванных заливок рендера. Именно рестарт их и
+                # порождает (деплой, OOM, kill), поэтому момент получения замка и есть тот,
+                # когда их гарантированно никто не пишет: нода про свой оборванный запрос
+                # уже забыла и спросит квитанцию заново.
+                _sweep_incoming_renders()
+            except Exception:
+                log_exc("_lifespan/incoming_renders")
+            try:
+                threading.Thread(target=_pub_engine_loop, daemon=True,
+                                 name="pub-engine").start()
+            except Exception:
+                log_exc("_lifespan/pub_engine")
+            try:
+                _start_background()
+            except Exception:
+                # Сервер поднимаем в любом случае: без планировщика он хотя бы отдаёт /healthz,
+                # где видно, что фон мёртв, — это лучше, чем циклический краш uvicorn.
+                log_exc("_lifespan/_start_background")
+
+        if not engine_lock.run_when_owner("кабинет: движок выпусков, планировщик, пул воркеров",
+                                          _own_background):
+            log_info("фон ОТЛОЖЕН: замок движка держит другой экземпляр (%s) — "
+                     "поднимем, когда он выйдет" % (engine_lock.LOCK.holder() or "?"))
     else:
         log_info("фон ОТКЛЮЧЁН (VS_SERVER_DISABLE_BACKGROUND)")
     yield
@@ -13932,6 +13951,11 @@ def _sched_health():
     age = (now - last) if last else None
     if not BACKGROUND_ENABLED:
         ok, state = True, "disabled"
+    elif engine_lock.is_standby():
+        # Запасной экземпляр при выкатке без простоя: фон нарочно не поднят, замок у
+        # соседа. Это не поломка — иначе /healthz отдавал бы 503 и выкатка сочла бы
+        # новый экземпляр мёртвым до того, как ему передали движок.
+        ok, state = True, "standby"
     elif not alive:
         ok, state = False, "dead"
     elif age is None or age > VS_SCHED_STALE_SEC:
@@ -13966,6 +13990,7 @@ def healthz():
     роут не выключает — это сигнал мониторингу, а не самоотключение.
     """
     sched = _sched_health()
+    sched["engine_lock"] = engine_lock.LOCK.state()   # off | owner | standby
     queued = {}
     try:
         c = db()

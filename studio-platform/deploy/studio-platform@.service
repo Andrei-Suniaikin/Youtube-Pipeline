@@ -1,0 +1,50 @@
+# Единая студия, экземпляр %i — для выкатки без простоя («синий/зелёный»).
+#
+# Два экземпляра одного и того же кода: studio-platform@a (порт 8001) и
+# studio-platform@b (порт 8002). В каждый момент Caddy смотрит на один из них; выкатка
+# поднимает второй, дожидается его ответа, переключает Caddy и только потом гасит
+# первый. Порт и имя экземпляр берёт из /srv/studio/instances/%i.env — этот файл
+# читается ПОСЛЕ studio.env, поэтому VS_PORT оттуда выигрывает у общего.
+# Пошаговая установка и откат — deploy/BLUE_GREEN.md.
+#
+#   cp deploy/studio-platform@.service /etc/systemd/system/
+#   systemctl daemon-reload
+#
+# Секреты в юните не пишутся: они живут в /srv/studio/studio.env (0600) и в файле
+# ключей /srv/studio/keys/video_studio_api_keys.json (0600) — как у одиночной службы.
+[Unit]
+Description=Единая студия, экземпляр %i: пульт, сервер, тексты, обложки
+After=network-online.target
+Wants=network-online.target
+# Conflicts= со старой одиночной службой здесь нарочно НЕТ: при переходе на новую схему
+# экземпляр «a» поднимается РЯДОМ с ней, пока Caddy ещё смотрит на 8090, — иначе сам
+# переход стал бы простоем. От запуска старой службы по привычке защищают
+# `systemctl mask studio-platform` после перехода (deploy/BLUE_GREEN.md) и
+# предохранитель в update.sh.
+
+[Service]
+Type=simple
+WorkingDirectory=/srv/studio/app
+# Общие настройки — как у одиночной службы; без файла служба поднимается на умолчаниях.
+EnvironmentFile=-/srv/studio/studio.env
+# Своё у экземпляра: VS_PORT и STUDIO_INSTANCE. Файл обязателен — без порта экземпляр
+# встал бы на общий 8090 и столкнулся бы с соседом. Образцы: deploy/instances/*.env.example.
+EnvironmentFile=/srv/studio/instances/%i.env
+ExecStart=/srv/studio/start-studio.sh
+Restart=always
+RestartSec=10
+# Остановка — вежливая: uvicorn перестаёт принимать новые соединения и дорабатывает
+# начатые ответы (нода заливки может как раз забирать гигабайтный файл ролика).
+# Поэтому времени на остановку даём много; обычно процесс выходит за секунды.
+# update.sh не ждёт этого вслепую: он переключает Caddy раньше, а старому даёт дожить.
+TimeoutStopSec=1800
+KillSignal=SIGTERM
+# Кабинет держит много одновременных файлов (сборка, кадры, очередь). Системного
+# умолчания 1024 не хватает: стенд уже падал с «Too many open files».
+LimitNOFILE=65535
+# Рендер и заливка идут на других машинах, здесь — веб и очередь. Уступаем процессор
+# боевым сервисам, чтобы параллельная работа не замедлила их.
+Nice=5
+
+[Install]
+WantedBy=multi-user.target

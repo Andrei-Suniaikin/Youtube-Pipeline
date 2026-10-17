@@ -1,0 +1,39 @@
+# Фрагмент /etc/caddy/Caddyfile для студии ПОСЛЕ перехода на выкатку без простоя.
+# Это не весь Caddyfile: блоки rewrite.*, gen.*, cover.*, manga.* и корневой sslip
+# остаются как есть. Меняются ровно три места, отмечены «БЫЛО/СТАЛО».
+#
+# 1) В самое начало файла (до первого блока) — подключение файла с активным портом:
+import /etc/caddy/studio-upstream.caddy
+
+# 2) Блок sslip-адреса студии (по нему ходит минская нода заливки):
+#    БЫЛО:  reverse_proxy 127.0.0.1:8090 { transport http { read_timeout 1h  write_timeout 1h } }
+#    СТАЛО: import studio_backend
+studio.13.140.129.66.sslip.io {
+	encode zstd gzip
+	import studio_backend
+}
+
+# 3) Домен студии: публичные страницы без изменений, а прокси пульта — через тот же сниппет.
+vovastudio.work {
+	encode zstd gzip
+	@pub path / /privacy /terms
+	handle @pub {
+		root * /srv/studio/public
+		rewrite / /index.html
+		rewrite /privacy /privacy.html
+		rewrite /terms /terms.html
+		file_server
+	}
+	@studio path /studio /studio/*
+	handle @studio {
+		# БЫЛО: reverse_proxy 127.0.0.1:8090 { transport http { … } }
+		import studio_backend
+	}
+	handle {
+		redir * /studio/ 302
+	}
+}
+
+www.vovastudio.work {
+	redir https://vovastudio.work{uri} permanent
+}

@@ -23,6 +23,15 @@ from pathlib import Path
 from dataclasses import asdict, fields as dc_fields
 from contextlib import asynccontextmanager
 
+# Замок движка (shared/engine_lock.py, кладёт в sys.path платформа): восстановление
+# прерванных задач и рабочие потоки — только у процесса, который держит замок. Нужен
+# выкатке без простоя, когда рядом живут два экземпляра. Отдельный запуск сервиса
+# обложек модуля не видит — тогда фон поднимается сразу, как раньше.
+try:
+    import engine_lock as _engine_lock
+except ImportError:
+    _engine_lock = None
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -541,30 +550,45 @@ _cleanup_thread = None
 async def lifespan(app: FastAPI):
     ApiAuthState.configure(DB_PATH)
     ApiAuthState.init_db()
-    # Восстановление после рестарта атомарно учитывает persistent cancel_requested:
-    # обычные running → pending, отменённые running → cancelled.
-    try:
-        recovery = queue.recover_interrupted_jobs(
-            max_pending_for_user=_server_queue_limit(),
-        )
-        if (
-            recovery["requeued"]
-            or recovery["cancelled"]
-            or recovery.get("queue_full_failed", 0)
-        ):
-            print(
-                "[startup] recovery: "
-                f"running→pending={recovery['requeued']}, "
-                f"cancelled={recovery['cancelled']}, "
-                f"queue-full→failed={recovery.get('queue_full_failed', 0)}"
+
+    def _own_background():
+        """Фон обложек — только у владельца замка движка (shared/engine_lock.py).
+
+        Восстановление «running → pending» верно после падения и разрушительно, пока
+        прежний экземпляр ещё ведёт эти задачи (выкатка без простоя). Поэтому оно, как
+        и рабочие потоки с уборкой, выполняется, когда замок наш: сразу, если его никто
+        не держит, или когда сосед выйдет.
+        """
+        # Восстановление после рестарта атомарно учитывает persistent cancel_requested:
+        # обычные running → pending, отменённые running → cancelled.
+        try:
+            recovery = queue.recover_interrupted_jobs(
+                max_pending_for_user=_server_queue_limit(),
             )
-    except Exception as e:
-        print(f"[startup] recovery error: {e}")
-    worker.start()
-    _cleanup_old_results()
-    global _cleanup_thread
-    _cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
-    _cleanup_thread.start()
+            if (
+                recovery["requeued"]
+                or recovery["cancelled"]
+                or recovery.get("queue_full_failed", 0)
+            ):
+                print(
+                    "[startup] recovery: "
+                    f"running→pending={recovery['requeued']}, "
+                    f"cancelled={recovery['cancelled']}, "
+                    f"queue-full→failed={recovery.get('queue_full_failed', 0)}"
+                )
+        except Exception as e:
+            print(f"[startup] recovery error: {e}")
+        worker.start()
+        _cleanup_old_results()
+        global _cleanup_thread
+        _cleanup_thread = threading.Thread(target=_cleanup_loop, daemon=True)
+        _cleanup_thread.start()
+
+    if _engine_lock is None:
+        _own_background()
+    elif not _engine_lock.run_when_owner("обложки: очередь генерации", _own_background):
+        print("[startup] фон обложек ОТЛОЖЕН: замок движка держит другой экземпляр — "
+              "поднимем, когда он выйдет")
     yield
     _cleanup_stop.set()
     worker.stop()

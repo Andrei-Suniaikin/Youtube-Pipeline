@@ -157,6 +157,46 @@ def parts():
                       for p, a, t in PARTS]}
 
 
+def _code_version() -> str:
+    """Короткий хеш коммита, из которого поднят процесс. Считается один раз на старте.
+
+    Нужен выкатке без простоя: она сверяет, что новый экземпляр отвечает именно новым
+    кодом, а не тем, что лежал на диске до `git pull`. STUDIO_VERSION в окружении
+    выигрывает — для сборок без git.
+    """
+    v = os.environ.get("STUDIO_VERSION", "").strip()
+    if v:
+        return v
+    try:
+        import subprocess
+        out = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=BASE,
+                             capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() if out.returncode == 0 else ""
+    except Exception:                                              # noqa: BLE001
+        return ""
+
+
+CODE_VERSION = _code_version()
+
+
+@app.get("/_instance", include_in_schema=False)
+def instance():
+    """Кто отвечает: какой экземпляр, на каком порту, каким кодом и у кого движок.
+
+    Без авторизации и без секретов — это ручка выкатки без простоя (deploy/update.sh,
+    STUDIO_BLUE_GREEN=1): по ней скрипт убеждается, что Caddy уже переключился на новый
+    экземпляр и что после остановки старого замок движка перешёл к новому.
+    """
+    import engine_lock
+    return {
+        "instance": os.environ.get("STUDIO_INSTANCE", "") or "single",
+        "port": os.environ.get("VS_PORT", ""),
+        "pid": os.getpid(),
+        "version": CODE_VERSION,
+        "engine": engine_lock.status(),
+    }
+
+
 @app.get("/studio", include_in_schema=False)
 def studio_root():
     # Монтирование по префиксу без завершающей косой оставляет /studio «за бортом».

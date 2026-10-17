@@ -1,0 +1,17 @@
+# Куда Caddy отправляет студию: активный экземпляр (выкатка без простоя).
+#
+# Файл живёт в /etc/caddy/studio-upstream.caddy и ПЕРЕПИСЫВАЕТСЯ скриптом
+# deploy/update.sh (STUDIO_BLUE_GREEN=1): он меняет здесь порт (8001 ↔ 8002) и делает
+# `systemctl reload caddy`. Руками править только при откате по deploy/BLUE_GREEN.md.
+# Сниппет подключается в двух местах Caddyfile — у studio.*.sslip.io и у vovastudio.work —
+# одной строкой `import studio_backend`, чтобы оба адреса переключались вместе.
+(studio_backend) {
+	# Ролик уезжает на ноду заливки целым файлом — гигабайтные ответы не должны
+	# обрываться таймаутом прокси.
+	reverse_proxy 127.0.0.1:8001 {
+		transport http {
+			read_timeout 1h
+			write_timeout 1h
+		}
+	}
+}

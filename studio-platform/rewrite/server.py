@@ -19,6 +19,15 @@ from typing import Annotated, Any, List, Optional
 from dataclasses import asdict
 from contextlib import asynccontextmanager
 
+# Замок движка (shared/engine_lock.py, кладёт в sys.path платформа): возврат прерванных
+# задач и рабочие потоки — только у процесса, который держит замок. Нужен выкатке без
+# простоя, когда рядом живут два экземпляра. Отдельный запуск рерайта (без платформы)
+# модуля не видит — тогда фон поднимается сразу, как раньше.
+try:
+    import engine_lock as _engine_lock
+except ImportError:
+    _engine_lock = None
+
 from fastapi import Body, FastAPI, UploadFile, File, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, HTMLResponse, Response, StreamingResponse
@@ -1742,16 +1751,20 @@ def _cleanup_old_files():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Migration 001: api_keys table + zombie cleanup (idempotent, safe on every restart)
+    _migrate_001 = None
     try:
         import sys as _sys
         _sys.path.insert(0, str(BASE_DIR / "migrations"))
         from migrations.api_v1_001 import migrate_001_api_v1  # type: ignore
+        _migrate_001 = migrate_001_api_v1
         created, zombies, msg = migrate_001_api_v1(
             sessions_db_path=os.environ.get("SESSION_DB", str(BASE_DIR / "sessions.db")),
             jobs_db_path=DB_PATH,
-            # только здесь, в lifespan: на старте процесса рабочих потоков ещё нет,
-            # поэтому вернуть прерванные джобы в очередь безопасно
-            requeue_running=True,
+            # Таблицу ключей — сразу: без неё не отвечает API. А возврат прерванных
+            # джобов в очередь — ниже, в `_own_background`, под замком движка: при
+            # выкатке без простоя рядом ещё работает прежний экземпляр, и его
+            # идущие джобы — не зомби, а живая работа.
+            requeue_running=False,
         )
         print(f"[startup] {msg}")
     except Exception as _e:
@@ -1781,12 +1794,38 @@ async def lifespan(app: FastAPI):
         print(f"[startup] {_shared_msg}")
     else:
         print("[startup] shared-key migration disabled; no credential scrub")
-    recovered_accounts = license_mgr.recover_disabling_accounts(DB_PATH)
-    if recovered_accounts:
-        print(
-            f"[startup] recovered {recovered_accounts} interrupted "
-            "account offboarding operation(s)"
-        )
+    def _own_background():
+        """Фон рерайта — только у владельца замка движка (shared/engine_lock.py).
+
+        Здесь всё, что трогает ЧУЖУЮ незавершённую работу: возврат прерванных джобов
+        (`migrate_001`, `requeue_running=True`), доведение прерванного отключения
+        аккаунтов, `worker.start()` (внутри — `reap_stale_running`) и уборка файлов.
+        Второй экземпляр при выкатке без простоя выполнит это, когда первый выйдет, —
+        то есть ровно тогда, когда идущие джобы действительно осиротели.
+        """
+        if _migrate_001 is not None:
+            try:
+                _c2, _z2, _msg2 = _migrate_001(
+                    sessions_db_path=os.environ.get("SESSION_DB", str(BASE_DIR / "sessions.db")),
+                    jobs_db_path=DB_PATH,
+                    # только здесь: рабочих потоков этого процесса ещё нет, а чужих —
+                    # уже нет (замок наш), поэтому вернуть прерванные джобы безопасно
+                    requeue_running=True,
+                )
+                print(f"[startup] {_msg2}")
+            except Exception as _e2:
+                print(f"[startup] migration 001 (requeue) failed: {_e2}")
+        try:
+            recovered_accounts = license_mgr.recover_disabling_accounts(DB_PATH)
+            if recovered_accounts:
+                print(
+                    f"[startup] recovered {recovered_accounts} interrupted "
+                    "account offboarding operation(s)"
+                )
+        except Exception as _e3:
+            print(f"[startup] account recovery failed: {_e3}")
+        worker.start()
+        threading.Thread(target=_cleanup_old_files, daemon=True).start()
     # Migration presets_v2 (Round 1 of Generation refactor, 2026-05-23) — idempotent
     try:
         from migrations.presets_v2_001 import migrate_presets_v2  # type: ignore
@@ -1818,9 +1857,11 @@ async def lifespan(app: FastAPI):
         )
     except Exception as _e:
         print(f"[startup] api_auth configure failed: {_e}")
-    worker.start()
-    cleanup_thread = threading.Thread(target=_cleanup_old_files, daemon=True)
-    cleanup_thread.start()
+    if _engine_lock is None:
+        _own_background()
+    elif not _engine_lock.run_when_owner("тексты: очередь рерайта", _own_background):
+        print("[startup] фон рерайта ОТЛОЖЕН: замок движка держит другой экземпляр — "
+              "поднимем, когда он выйдет")
     yield
     _cleanup_stop.set()
     worker.stop()
