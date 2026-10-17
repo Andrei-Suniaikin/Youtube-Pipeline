@@ -82,7 +82,7 @@ def main() -> int:
     print("\nЗаписи заливщика, которые экран показывал по-английски (база VPS 15.10)")
     заливщик = {
         "account recovery needs the owner: signed in but exact channel not confirmed":
-            ("access", True, "в аккаунте нет этого канала — нужны права менеджера"),
+            ("access", True, "вошли, но канал не подтвердился"),
         "account recovery needs the owner: owner help already requested for this "
         "account recently": ("access", True, "автовход ждёт человека"),
         "account recovery needs the owner: unexpected sign-in destination: "
@@ -150,7 +150,7 @@ def main() -> int:
             "в профиле нет входа в Google",
         "Studio не отдала рабочее состояние канала (доступ не подтверждён): "
         "https://studio.youtube.com/channel/UCWazqTA6b8zOMS7SyrzPbaA/ | account recovery "
-        "blocked: RecoveryBlocked": "Studio канала не открылась — нет входа",
+        "blocked: RecoveryBlocked": "Studio канала не открылась — доступ не подтверждён",
         "account recovery needs the owner: Google requires an additional sign-in step":
             "Google просит подтвердить вход",
         # 09.10.2026: так заливщик отвечает на каждую следующую попытку после первой.
@@ -159,7 +159,7 @@ def main() -> int:
         "dedup не выполнен: состояние канала не прочитано — заливку не начинаю":
             "не прочитан список роликов канала",
         "account recovery needs the owner: no exact account binding for this profile+channel":
-            "нет почты канала для автовхода",
+            "нет привязки почты к каналу на Минске",
     }
     for сырая, смысл in вход.items():
         b = B.explain(сырая)
@@ -301,6 +301,64 @@ def main() -> int:
     bare = B.explain("Studio не отдала рабочее состояние канала (доступ не подтверждён): u | "
                      "account recovery blocked: RecoveryBlocked")["what"]
     check("одно имя класса — без «дословно»", "Дословно" in bare, False)
+
+    print("\nПричины, появившиеся 17.10.2026: «нет доступа», канал не подтвердился, нет привязки")
+    nop = B.explain("активный аккаунт не управляет каналом: Studio показала «нет доступа», "
+                    "канал бренда в переключателе не выбран: https://studio.youtube.com/channel/UCx/")
+    check("«нет доступа» — настройки канала, возврат после починки",
+          (nop.get("kind"), nop.get("revive")), ("channel", True))
+    check("   названо: аккаунт профиля каналом не управляет",
+          nop.get("title"), "аккаунт профиля не управляет каналом")
+    check("   сказано про неверный номер канала", "не тот номер канала" in nop["what"], True)
+    check("   что делать: лента по номеру канала, потом права менеджера",
+          "feeds/videos.xml?channel_id=" in nop["fix"] and "менеджера" in nop["fix"], True)
+    check("   кто чинит — оператор канала, потом права", nop["who"].startswith("оператор канала"), True)
+
+    conf = B.explain("account recovery needs the owner: signed in but exact channel not confirmed: "
+                     "host=studio.youtube.com path=/channel/UCx app_uc= slots=0 — загрузка НЕ выполняется")
+    nob = B.explain("account recovery needs the owner: no exact account binding for this "
+                    "profile+channel — загрузка НЕ выполняется")
+    check("«не подтвердился» и «нет привязки» — разные заголовки",
+          conf["title"] != nob["title"], True)
+    check("не подтвердился: про номер канала и канал бренда",
+          "номер канала" in conf["what"] and "канал бренда" in conf["what"], True)
+    check("   что делать начинается с проверки номера", conf["fix"].startswith("Проверьте номер канала"), True)
+    check("   что видела Studio — дословно", "Дословно от заливщика: signed in but exact channel not confirmed: host=studio.youtube.com" in conf["what"], True)
+    check("нет привязки: про реестр на Минске и пару профиль+канал",
+          "реестре привязок" in nob["what"] and "профиль + канал" in nob["what"], True)
+    check("   что передать: почта, пароль, секрет кода — не в студию",
+          all(w in nob["fix"] for w in ("почту", "пароль", "секрет кода", "в студию их не вводить")), True)
+    check("   оба — вход и профиль, возврат после починки",
+          [(b["kind"], b["revive"]) for b in (conf, nob)], [("access", True)] * 2)
+
+    st = B.explain("Studio не отдала рабочее состояние канала (доступ не подтверждён): u")
+    check("Studio не отдала состояние: обычно достаточно вернуть в работу",
+          st["fix"].startswith("Обычно достаточно «Вернуть в работу»"), True)
+    check("   и сказано, что с 17.10 заливщик знает новую шапку", "17.10" in st["what"], True)
+
+    cov = B.explain("обложка: генератор не нарисовал после 3 смягчений надписи — нужен человек")
+    check("обложка после 3 смягчений — обложка, возврат уместен после правки",
+          (cov.get("kind"), cov.get("revive")), ("cover", True))
+    check("   без правки возврат бесполезен — сказано", "Без правки" in cov["fix"], True)
+    check("остальные причины обложки возврата не предлагают",
+          [B.explain(r)["revive"] for r in ("обложка деградировала дважды: x",
+                                            "обложка не сделалась: 402",
+                                            "обложка не нарисовалась дважды: 0/1")],
+          [False, False, False])
+    check("строка журнала «номер канала исправлен» — не причина, не выдумываем",
+          B.explain("номер канала исправлен: UCPyBo_VBk8-xMZbpXBk1eiQ → UC38dp5WnQGTF0TkYi_FnXFg"), {})
+
+    print("\n  сводка складывает их по тем же заголовкам, что экран")
+    rels = [{"blocked_reason": "активный аккаунт не управляет каналом: Studio показала «нет доступа»: a"},
+            {"blocked_reason": "активный аккаунт не управляет каналом: Studio показала «нет доступа»: b"},
+            {"blocked_reason": "account recovery needs the owner: no exact account binding for this profile+channel"}]
+    groups = pub_digest._blockers({1: rels[:2], 2: rels[2:]}, {1: {"name": "А"}, 2: {"name": "Б"}})
+    check("две группы, заголовки человеческие",
+          [(g["title"], g["count"]) for g in groups],
+          [("аккаунт профиля не управляет каналом", 2), ("нет привязки почты к каналу на Минске", 1)])
+    check("у каждой — метка стороны и что делать",
+          [(g["tag"], bool(g["fix"])) for g in groups],
+          [("Настройки канала", True), ("Вход и профиль", True)])
 
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
