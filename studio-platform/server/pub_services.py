@@ -833,6 +833,12 @@ class PubServices:
                         and self._requeue_dropped_frames(c, rel, known,
                                                          known["remote_job_id"])):
                     return {"wait": True}
+                if kind == "tts" and state == "error":
+                    outcome = self._soften_tts(c, rel, known)
+                    if outcome == "requeued":
+                        return {"wait": True}
+                    if outcome == "exhausted":
+                        raise ItemFailed(self._tts_filter_reason(c, known))
                 raise ItemFailed(f"этап «{kind}» завершился со статусом {state}")
             if state not in TERMINAL_OK:
                 if kind in OPTIONAL_STAGES:
@@ -1179,6 +1185,81 @@ class PubServices:
                  f"оплатить не даст (повтор {done + 1} из {self.IMAGES_RETRIES})",
                  level="warn")
         return True
+
+    # ── озвучка упёрлась в фильтр провайдера → смягчить блок, а не заказывать снова ──
+    #
+    # 17.10.2026. FastGen отказал по «safety filters» на одном блоке из десяти; воркер
+    # заказал тот же текст второй раз, движок вернул выпуск ещё дважды — шесть одинаковых
+    # отказов. По ТЗ отказ фильтра лечится не повтором, а до трёх раундов смягчения
+    # текста. Счёт раундов — в зеркале этапа (`tts-soften:N`), как у картинок.
+    TTS_SOFTEN_ROUNDS = 3
+
+    def _tts_soften_done(self, known) -> int:
+        mark = str(known["error"] or "")
+        return int(mark.split(":", 1)[1]) if mark.startswith("tts-soften:") \
+            and mark.split(":", 1)[1].isdigit() else 0
+
+    def _tts_job_lines(self, c, job_id) -> list:
+        try:
+            return [r[0] for r in c.execute(
+                "SELECT line FROM job_logs WHERE job_id=? ORDER BY id DESC LIMIT 400",
+                (int(job_id),)).fetchall()]
+        except Exception:                                          # noqa: BLE001
+            return []
+
+    def _tts_filter_reason(self, c, known) -> str:
+        import tts_soften
+        block = tts_soften.failed_block(self._tts_job_lines(c, known["remote_job_id"])) or "?"
+        return (f"озвучка: блок {block} не прошёл фильтр провайдера после "
+                f"{self.TTS_SOFTEN_ROUNDS} смягчений текста — нужен человек")
+
+    def _soften_tts(self, c, rel, known) -> str:
+        """«requeued» — блок смягчён и озвучка поставлена заново; «exhausted» — три раунда
+        кончились; "" — это не отказ фильтра или смягчить не вышло (падаем как раньше)."""
+        import tts_soften
+        if not rel["project_id"]:
+            return ""
+        lines = self._tts_job_lines(c, known["remote_job_id"])
+        block = tts_soften.failed_block(lines)
+        if not block:
+            return ""
+        done = self._tts_soften_done(known)
+        if done >= self.TTS_SOFTEN_ROUNDS:
+            return "exhausted"
+        key = get_key(c, "rewrite")
+        if not key:
+            log_line(c, rel["release_id"], "ролик",
+                     f"блок {block} не прошёл фильтр провайдера, а смягчить его нечем: "
+                     f"нет ключа сервиса текста", level="warn")
+            return ""
+        try:
+            info = tts_soften.soften_project(
+                self.project_dir(rel["tenant_id"], rel["project_id"]), block,
+                rel["lang"] or "ru", done + 1, key, REWRITE_BASE)
+        except tts_soften.SoftenError as exc:
+            log_line(c, rel["release_id"], "ролик",
+                     f"блок {block} не прошёл фильтр провайдера; смягчение "
+                     f"(раунд {done + 1} из {self.TTS_SOFTEN_ROUNDS}) не удалось: {exc}",
+                     level="warn")
+            return ""
+        uid = self._uid(c, rel["tenant_id"])
+        if not uid:
+            return ""
+        c.commit()      # постановка задачи откроет своё соединение — замок отпустить
+        job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], "tts",
+                              self._preset_params(c, rel))
+        if not job_id:
+            return ""
+        c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', error=?, "
+                  "updated=? WHERE release_id=? AND service='vsgen' AND kind='tts'",
+                  (str(job_id), f"tts-soften:{done + 1}", rel["updated"], rel["release_id"]))
+        log_line(c, rel["release_id"], "ролик",
+                 f"блок {block} из {info['blocks']} не прошёл фильтр провайдера озвучки — "
+                 f"текст блока смягчён моделью ({info['words_before']}→{info['words_after']} "
+                 f"слов, прежний текст: {os.path.basename(info['backup'])}), озвучка "
+                 f"поставлена заново, задача {job_id}. Готовые блоки не переозвучиваются "
+                 f"(раунд {done + 1} из {self.TTS_SOFTEN_ROUNDS})", level="warn")
+        return "requeued"
 
     def _adopt_stage(self, c, rel, kind: str, jobs: dict) -> str:
         """Этап, который уже поставил кабинет сам, — номер его задачи. "" — такого нет.
