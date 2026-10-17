@@ -2881,6 +2881,8 @@ async function viewChannels(){
       <button class="ghost small" id="stlinks">Подключить статистику</button>
       <button class="ghost small" id="earnimp">Часы монетизации</button>
       <button class="ghost small" id="emails">Почты</button>
+      <button class="ghost small" id="mailrev" title="Письма с Минска, у которых канал не определился">Почта на проверку${
+        d.mail_review_n ? ` · ${d.mail_review_n}` : ''}</button>
       <button class="ghost small" id="spread">Разложить ссылки</button>
       <button class="ghost small" id="impch">Перенести списком</button>
       <button class="ghost small" id="pickmode">Выбрать</button>
@@ -2890,6 +2892,7 @@ async function viewChannels(){
   // Ссылки приходят общим списком, а каналов полтораста: раскладывать их по одному
   // каналу — полтораста заходов в карточки (владелец 30.09.2026).
   bar.querySelector('#spread').onclick = () => { location.hash = '#/spread'; };
+  bar.querySelector('#mailrev').onclick = () => { location.hash = '#/mail-review'; };
   bar.querySelector('#stlinks').onclick = () => analyticsLinksCard(bar);
   bar.querySelector('#earnimp').onclick = () => earnImportCard(bar);
   const em = bar.querySelector('#emails');
@@ -4412,6 +4415,85 @@ function mailWhen(e){
   const m = t.match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})/);
   if (m) return `${m[3]}.${m[2]} ${m[4]}:${m[5]}`;
   return e.date_text || t.slice(0, 16) || '—';
+}
+
+// Почта на проверку (17.10.2026): письма с Минска, у которых канал не определился ни
+// по UC в тексте, ни по единственному каналу почты или профиля. Человек говорит, чей
+// это канал (почта профиля запоминает ответ на следующие письма), либо скрывает письмо.
+async function viewMailReview(){
+  app.innerHTML = '';
+  let d;
+  try{ d = await api('/ui/mail/review'); }
+  catch(e){ app.append($(`<div class="err">${esc(e.message)}</div>`)); return; }
+  const events = d.events || [];
+  const channels = d.channels || [];
+  app.append($(`<div class="head"><div><h1>Почта на проверку ${hintDot(
+    'Сборщик на Минске читает список писем YouTube, Google и AdSense в почте профиля ' +
+    'AdsPower. Канал письмо называет редко; когда у почты или профиля каналов несколько, ' +
+    'студия сама не угадывает — спрашивает здесь. «Привязать» — письмо уйдёт на страницу ' +
+    'канала, а следующие письма этой почты пойдут туда сами. «Скрыть» — просмотрено, ' +
+    'канала нет (рассылка, письмо уровня аккаунта).')}</h1>
+    <p class="sub" id="mr-count">${events.length ? `Ждут решения: ${events.length}` : ''}</p></div>
+    <div class="head-acts"><a class="ghost small" href="#/channels">Ко всем каналам</a></div></div>`));
+  const card = $(`<div class="card" style="margin-bottom:16px"><div class="secbody" id="mr-body"></div></div>`);
+  app.append(card);
+  const body = card.querySelector('#mr-body');
+  const empty = () => { body.innerHTML = `<div class="note muted">Писем на проверку нет: всё,
+      что привёз сборщик, легло по каналам или уже разобрано.</div>`; };
+  if (!events.length){ empty(); return; }
+
+  // Выбор канала: сначала каналы того же профиля AdsPower — чаще всего ответ среди них, —
+  // потом остальные. Канал сам не подставляется: это и есть решение человека.
+  const options = e => {
+    const mine = channels.filter(c => c.profile && c.profile === e.profile);
+    const rest = channels.filter(c => !mine.includes(c));
+    const opt = c => `<option value="${esc(c.uc)}">${esc(c.name)}${
+      c.status !== 'active' ? ` (${esc(c.status)})` : ''}</option>`;
+    return `<option value="">— канал —</option>${mine.length
+      ? `<optgroup label="Каналы профиля ${esc(e.profile)}">${mine.map(opt).join('')}</optgroup>` : ''}${
+      rest.length ? `<optgroup label="${mine.length ? 'Остальные каналы' : 'Каналы'}">${
+        rest.map(opt).join('')}</optgroup>` : ''}`;
+  };
+  body.innerHTML = events.map(e => `<div class="mailrow mrrow${e.unread ? ' unread' : ''}" data-id="${e.id}">
+      <span class="mdate">${esc(mailWhen(e))}</span>
+      <span class="msubj">${esc(e.subject || '(без темы)')}</span>
+      <span class="mwho">
+        <span class="pill ${MAIL_MONEY.has(e.type) ? 's-queued' : 's-idle'}"
+          style="margin-right:6px">${esc(e.title)}</span>
+        ${esc(e.sender || '')}${e.profile ? ` · профиль ${esc(e.profile)}` : ''}${
+          e.login ? ` · ${esc(e.login)}` : ''}${
+        e.snippet ? `<br><span class="muted">${esc(e.snippet.slice(0, 160))}</span>` : ''}
+        <span class="mracts" style="display:flex;gap:8px;align-items:center;margin-top:6px;flex-wrap:wrap">
+          <select class="mr-uc">${options(e)}</select>
+          <button class="small mr-bind">Привязать к каналу</button>
+          <button class="ghost small mr-hide">Скрыть</button>
+          <span class="note bad mr-err" style="margin:0"></span></span>
+      </span></div>`).join('');
+  const left = () => {
+    const n = body.querySelectorAll('.mrrow').length;
+    const c = document.getElementById('mr-count');
+    if (c) c.textContent = n ? `Ждут решения: ${n}` : '';
+    if (!n) empty();
+  };
+  for (const row of body.querySelectorAll('.mrrow')){
+    const id = row.dataset.id;
+    const err = row.querySelector('.mr-err');
+    const act = async (fn) => {
+      err.textContent = '';
+      for (const b of row.querySelectorAll('button')) b.disabled = true;
+      try{ await fn(); row.remove(); left(); }
+      catch(e){ err.textContent = e.message; for (const b of row.querySelectorAll('button')) b.disabled = false; }
+    };
+    row.querySelector('.mr-bind').onclick = () => act(async () => {
+      const uc = row.querySelector('.mr-uc').value;
+      if (!uc) throw new Error('выберите канал');
+      const out = await post(`/ui/mail/review/${encodeURIComponent(id)}/bind`, {uc});
+      toast(`Письмо привязано к каналу «${(out.channel || {}).name || ''}»${
+        out.routed ? ' — следующие письма этой почты пойдут туда сами' : ''}`, 'ok');
+    });
+    row.querySelector('.mr-hide').onclick = () => act(
+      () => post(`/ui/mail/review/${encodeURIComponent(id)}/dismiss`));
+  }
 }
 
 function channelStatsTab(id, d){
@@ -13344,6 +13426,9 @@ const ROUTES = [
   ['releases', h => h === '#/new',                () => viewNew()],
   ['releases', h => h === '#/releases',           () => viewReleases()],
   ['channels', h => h === '#/spread',             () => viewSpread()],
+  // Письма с Минска без канала (17.10.2026) — живут при каналах: решение «чей это
+  // канал» принимает тот же человек, что ведёт каналы.
+  ['channels', h => h === '#/mail-review',        () => viewMailReview()],
   ['profile',  h => h === '#/profile',            () => viewProfile()],
   ['channels', () => true,                        () => viewChannels()],
 ];

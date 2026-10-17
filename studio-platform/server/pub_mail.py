@@ -87,13 +87,44 @@ def ensure_inbox_schema(conn: sqlite3.Connection) -> None:
     # Колонки событий, которых у читалки не было: ссылка на строку с Минска (у
     # `message_ref` внешний ключ на письма IMAP — туда строку списка не вставить) и
     # профиль, чтобы «на проверку» было видно, с какой машины и профиля письмо.
-    for col, typ in (("inbox_ref", "INTEGER"), ("profile", "TEXT")):
+    # `reviewed_utc`/`reviewed_by` (17.10.2026, экран «почта на проверку»): письмо без
+    # канала человек либо привязал к каналу, либо скрыл — в обоих случаях оно уходит
+    # из списка «на проверку», но остаётся в базе: событие не удаляется никогда.
+    for col, typ in (("inbox_ref", "INTEGER"), ("profile", "TEXT"),
+                     ("reviewed_utc", "TEXT"), ("reviewed_by", "TEXT")):
         try:
             conn.execute(f"ALTER TABLE events ADD COLUMN {col} {typ}")
         except sqlite3.OperationalError:
             pass   # колонка уже есть — проверяется живым SELECT в тестах
     conn.execute("CREATE INDEX IF NOT EXISTS ix_events_uc ON events(uc, event_time)")
     conn.commit()
+
+
+# ── ручная привязка почты к каналу ──
+#
+# Хранится в `mail_route` читалки (route_tag → uc): это та же мысль — «письма этого
+# ящика относятся к этому каналу», — только ящик здесь не метка пересылки, а почта
+# профиля AdsPower. Чтобы не путать с метками `z09052581860+<tag>@`, ключ начинается с
+# `minsk:`; `source` хранит маску почты — полного адреса в этой базе нет и не будет.
+
+MANUAL = "manual"            # binding_confidence у привязанного руками события
+
+
+def manual_route_tag(profile: str, login_tag: str, login_sha: str = "") -> str:
+    """Ключ ручной привязки: профиль + почта (хэш полной, если машина прислала, иначе
+    маска). Один профиль — несколько почт (/u/0, /u/1 …), поэтому почта в ключе
+    обязательна; одна почта в двух профилях бывает — поэтому профиль тоже."""
+    return f"minsk:{str(profile or '').strip()}:{(login_sha or login_tag or '').strip()}"
+
+
+def manual_route_uc(mail: sqlite3.Connection, profile: str, login_tag: str,
+                    login_sha: str = ""):
+    """Канал, к которому человек привязал эту почту профиля, или None."""
+    if not str(profile or "").strip() or not (login_sha or login_tag):
+        return None
+    row = mail.execute("SELECT uc FROM mail_route WHERE route_tag=? AND uc IS NOT NULL",
+                       (manual_route_tag(profile, login_tag, login_sha),)).fetchone()
+    return row[0] if row else None
 
 
 def open_mail_db(path: str = None) -> sqlite3.Connection:
@@ -153,12 +184,18 @@ def profile_channel_ucs(vs: sqlite3.Connection, profile: str) -> list:
     return [r[0] for r in rows]
 
 
-def bind_channel(hits: list, login_ucs: list, profile_ucs: list):
+def bind_channel(hits: list, login_ucs: list, profile_ucs: list, manual_uc: str = None):
     """Приоритет §8: явный UC → единственный канал почты → единственный канал профиля
     → иначе на проверку. Почта или профиль с несколькими каналами канал НЕ выбирают:
-    письмо уровня аккаунта (безопасность, AdSense) относится ко всем сразу."""
+    письмо уровня аккаунта (безопасность, AdSense) относится ко всем сразу.
+
+    `manual_uc` — канал, к которому человек привязал эту почту с экрана «почта на
+    проверку» (17.10.2026). Стоит сразу после явного UC, но только пока реестр не
+    говорит, что у почты несколько каналов: тогда письмо снова уровня аккаунта."""
     if hits:
         return hits[0], "high"
+    if manual_uc and len(set(login_ucs)) <= 1:
+        return manual_uc, MANUAL
     if len(set(login_ucs)) == 1:
         return login_ucs[0], "medium"
     if len(set(profile_ucs)) == 1:
@@ -182,6 +219,7 @@ def ingest(mail: sqlite3.Connection, vs, payload: dict, now_utc: str = None) -> 
     login_sha = str(payload.get("login_sha256") or "")[:64]
     login_ucs = _clean_ucs(payload.get("login_ucs"))
     profile_ucs = profile_channel_ucs(vs, profile)
+    manual_uc = manual_route_uc(mail, profile, login_tag, login_sha)
 
     out = {"ok": True, "profile": profile, "received": len(rows), "new": 0, "dup": 0,
            "review": 0, "events": {}}
@@ -210,7 +248,7 @@ def ingest(mail: sqlite3.Connection, vs, payload: dict, now_utc: str = None) -> 
         ref = mail.execute("SELECT id, event_time FROM inbox_messages WHERE msg_key=?",
                            (key,)).fetchone()
         etype = R.classify(sender, subject)
-        uc, conf = bind_channel(hits, login_ucs, profile_ucs)
+        uc, conf = bind_channel(hits, login_ucs, profile_ucs, manual_uc)
         mail.execute(
             "INSERT OR IGNORE INTO events(inbox_ref,profile,type,uc,account,source,event_time,"
             "binding_confidence,idem_key,created_utc) VALUES(?,?,?,?,?,?,?,?,?,?)",
@@ -256,14 +294,84 @@ def _event_dict(r) -> dict:
         "date_text": r["date_text"] or "",
         "event_time": r["event_time"] or r["created_utc"] or "",
         "unread": bool(r["unread"]),
+        "reviewed": bool(r["reviewed_utc"]),
     }
 
 
 _SELECT = ("SELECT e.id, e.type, e.uc, e.account, e.source, e.event_time, e.created_utc, "
-           "e.binding_confidence, e.profile, m.login_tag, m.sender, m.snippet, m.date_text, "
-           "m.unread, m.login_ucs, COALESCE(m.subject, mm.subject) subject "
+           "e.binding_confidence, e.profile, e.reviewed_utc, m.login_tag, m.sender, m.snippet, "
+           "m.date_text, m.unread, m.login_ucs, COALESCE(m.subject, mm.subject) subject "
            "FROM events e LEFT JOIN inbox_messages m ON m.id=e.inbox_ref "
            "LEFT JOIN messages mm ON mm.id=e.message_ref ")
+
+_REVIEW_WHERE = "WHERE e.binding_confidence='review' AND e.reviewed_utc IS NULL "
+
+
+def review_count(path: str = None) -> int:
+    """Сколько писем ждёт человека — для кнопки на экране каналов. Один COUNT."""
+    conn = _ro(path or mail_db_path())
+    if conn is None:
+        return 0
+    try:
+        return int(conn.execute("SELECT COUNT(*) FROM events e " + _REVIEW_WHERE).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def _event_for_review(mail: sqlite3.Connection, event_id: int):
+    """Событие вместе со строкой письма (профиль, почта) — для привязки и скрытия."""
+    return mail.execute(
+        "SELECT e.id, e.uc, e.binding_confidence, e.reviewed_utc, "
+        "COALESCE(e.profile, m.profile) profile, m.login_tag, m.login_sha256 "
+        "FROM events e LEFT JOIN inbox_messages m ON m.id=e.inbox_ref WHERE e.id=?",
+        (int(event_id),)).fetchone()
+
+
+def bind_event(mail: sqlite3.Connection, event_id: int, uc: str, who: str = "",
+               now_utc: str = None) -> dict:
+    """Человек сказал, чей это канал: событие получает `uc`, а почта профиля — ручную
+    привязку, чтобы следующие письма этой почты шли на канал сами (`bind_channel`).
+    Привязываем ОДНО событие: у почты с несколькими каналами соседние письма могут
+    быть про другой канал — решать по каждому человеку. Коммит — на вызывающем."""
+    now_utc = now_utc or datetime.now(timezone.utc).isoformat()
+    uc = str(uc or "").strip()
+    if not R.UC_RE.fullmatch(uc):
+        raise ValueError("нужен номер канала вида UC…")
+    row = _event_for_review(mail, event_id)
+    if row is None:
+        raise LookupError("письмо не найдено")
+    if row["binding_confidence"] != "review" or row["reviewed_utc"]:
+        raise LookupError("письмо уже разобрано")
+    mail.execute("UPDATE events SET uc=?, binding_confidence=?, reviewed_utc=?, reviewed_by=? "
+                 "WHERE id=?", (uc, MANUAL, now_utc, (who or "")[:80], int(event_id)))
+    routed = False
+    if row["profile"] and (row["login_sha256"] or row["login_tag"]):
+        mail.execute(
+            "INSERT INTO mail_route(route_tag,source,uc,status,last_delivery_utc) "
+            "VALUES(?,?,?,?,?) ON CONFLICT(route_tag) DO UPDATE SET uc=excluded.uc, "
+            "source=excluded.source, status=excluded.status, "
+            "last_delivery_utc=excluded.last_delivery_utc",
+            (manual_route_tag(row["profile"], row["login_tag"], row["login_sha256"]),
+             row["login_tag"] or "", uc, MANUAL, now_utc))
+        routed = True
+    return {"ok": True, "id": int(event_id), "uc": uc, "routed": routed,
+            "profile": row["profile"] or "", "login": row["login_tag"] or ""}
+
+
+def dismiss_event(mail: sqlite3.Connection, event_id: int, who: str = "",
+                  now_utc: str = None) -> dict:
+    """Скрыть из «на проверку»: письмо просмотрено, канала у него нет и не будет
+    (рассылка, чужая реклама, письмо уровня аккаунта). Запись остаётся: на странице
+    канала такие письма по-прежнему видны «по почте аккаунта»."""
+    now_utc = now_utc or datetime.now(timezone.utc).isoformat()
+    row = _event_for_review(mail, event_id)
+    if row is None:
+        raise LookupError("письмо не найдено")
+    if row["binding_confidence"] != "review" or row["reviewed_utc"]:
+        raise LookupError("письмо уже разобрано")
+    mail.execute("UPDATE events SET reviewed_utc=?, reviewed_by=? WHERE id=?",
+                 (now_utc, (who or "")[:80], int(event_id)))
+    return {"ok": True, "id": int(event_id)}
 
 
 def channel_events(uc: str, limit: int = 20, path: str = None) -> list:
@@ -285,14 +393,15 @@ def channel_events(uc: str, limit: int = 20, path: str = None) -> list:
 
 
 def review_events(limit: int = 50, path: str = None) -> list:
-    """События без канала и без почты-подсказки — то, что человеку надо разобрать руками."""
+    """События без канала и без почты-подсказки — то, что человеку надо разобрать
+    руками. Уже привязанные или скрытые (`reviewed_utc`) сюда не попадают."""
     conn = _ro(path or mail_db_path())
     if conn is None:
         return []
     try:
         rows = conn.execute(
-            _SELECT + "WHERE e.binding_confidence='review' "
-            "ORDER BY COALESCE(e.event_time, e.created_utc) DESC, e.id DESC LIMIT ?",
+            _SELECT + _REVIEW_WHERE
+            + "ORDER BY COALESCE(e.event_time, e.created_utc) DESC, e.id DESC LIMIT ?",
             (max(1, min(500, int(limit))),)).fetchall()
         return [_event_dict(r) for r in rows]
     finally:

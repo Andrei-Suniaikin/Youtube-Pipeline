@@ -767,7 +767,9 @@ def ui_channels(coin: int | None = None):
                                        and supply["days"] < порог),
                            "text": supply["text"], "min_days": порог},
             })
-        return {"channels": out}
+        # Сколько писем ждёт человека (17.10.2026) — для кнопки «Почта на проверку» в
+        # строке заголовка каналов: один COUNT к базе почты, не отдельный запрос с экрана.
+        return {"channels": out, "mail_review_n": pub_mail.review_count()}
     finally:
         c.close()
 
@@ -8209,6 +8211,91 @@ def ui_channel_coin(cid: int, body: ChannelCoinIn):
     finally:
         c.close()
     return {"ok": True, "coin": bool(body.coin), "coin_note": note}
+
+
+# ── почта на проверку (17.10.2026) ──
+#
+# Сборщик на Минске привозит строки Gmail профилей; письмо, у которого канал не
+# определился ни по UC в тексте, ни по единственному каналу почты или профиля, ложится
+# «на проверку» (`pub_mail.bind_channel`). Здесь человек говорит, чей это канал, — и
+# почта профиля запоминает ответ на следующие письма, — либо скрывает письмо.
+
+def _who(request) -> str:
+    user = getattr(request.state, "user", None)
+    return str(user["name"] if user is not None and "name" in user.keys() else "")[:80]
+
+
+def _tenant_channels(c) -> list:
+    """Каналы тенанта с номером профиля — список для выбора на экране. Только свои:
+    чужой тенант сюда не попадает, значит и привязать к его каналу нельзя."""
+    rows = c.execute(
+        "SELECT ch.id, ch.name, ch.uc, ch.status, p.serial AS profile "
+        "FROM pub_channels ch LEFT JOIN pub_profiles p ON p.id=ch.profile_id "
+        "WHERE ch.tenant_id=? AND ch.uc IS NOT NULL AND ch.uc<>'' ORDER BY ch.name",
+        (TENANT,)).fetchall()
+    return [{"id": r["id"], "name": r["name"], "uc": r["uc"], "status": r["status"],
+             "profile": r["profile"] or ""} for r in rows]
+
+
+@app.get("/ui/mail/review")
+def ui_mail_review():
+    """Письма без канала + каналы тенанта (с профилем), чтобы выбрать, чей канал."""
+    c = db()
+    try:
+        return {"events": pub_mail.review_events(limit=200), "channels": _tenant_channels(c)}
+    finally:
+        c.close()
+
+
+class MailBindIn(BaseModel):
+    uc: str = ""
+
+
+@app.post("/ui/mail/review/{eid:int}/bind")
+def ui_mail_review_bind(eid: int, body: MailBindIn, request: Request):
+    """Привязать письмо к каналу. Канал — только свой: чужой или несуществующий UC — 404,
+    та же дверь, что у монетки и настроек канала."""
+    uc = (body.uc or "").strip()
+    c = db()
+    try:
+        row = c.execute("SELECT id, name FROM pub_channels WHERE uc=? AND tenant_id=?",
+                        (uc, TENANT)).fetchone()
+        if not row:
+            raise HTTPException(404, "канал не найден")
+        mail = pub_mail.open_mail_db()
+        try:
+            try:
+                out = pub_mail.bind_event(mail, eid, uc, who=_who(request))
+            except LookupError as exc:
+                raise HTTPException(404, str(exc))
+            except ValueError as exc:
+                raise HTTPException(400, str(exc))
+            mail.commit()
+        finally:
+            mail.close()
+        _audit(f'почта: письмо {eid} привязано к каналу «{row["name"]}»'
+               + (f" (профиль {out['profile']}, почта {out['login']} — дальше сама)"
+                  if out["routed"] else ""))
+        out["channel"] = {"id": row["id"], "name": row["name"]}
+        return out
+    finally:
+        c.close()
+
+
+@app.post("/ui/mail/review/{eid:int}/dismiss")
+def ui_mail_review_dismiss(eid: int, request: Request):
+    """Скрыть письмо из «на проверку»: просмотрено, канала нет. Запись остаётся."""
+    mail = pub_mail.open_mail_db()
+    try:
+        try:
+            out = pub_mail.dismiss_event(mail, eid, who=_who(request))
+        except LookupError as exc:
+            raise HTTPException(404, str(exc))
+        mail.commit()
+    finally:
+        mail.close()
+    _audit(f"почта: письмо {eid} скрыто из проверки")
+    return out
 
 
 # Массовые действия. Ключ — то, что пришло с экрана, значение — как это назвать человеку
