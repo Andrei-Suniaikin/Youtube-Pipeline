@@ -51,6 +51,7 @@ HOME = Path.home() / "accounts_audit"
 STUDIO_CSV = HOME / "studio_channels.csv"          # профиль,канал,название — выгрузка из студии
 PROPOSED = HOME / "proposed_bindings.csv"
 LIST_URL = "https://accounts.google.com/ListAccounts?gpsia=1&source=ChromiumBrowser&json=standard"
+EMAILS_ONLY = False      # --emails-only: только список аккаунтов профиля, без страниц каналов
 SWITCHER_URL = "https://www.youtube.com/channel_switcher?authuser={n}"
 
 # Почты на странице → маска до снимка (в снимке и тексте полных адресов не остаётся).
@@ -198,6 +199,13 @@ def audit_profile(profile, channels, reg, evidence_root=HOME, settle=7):
                             break
                         full.append((seen, False))
                     rec["accounts_source"] = "gmail_u" if full else "none"
+                # Полные адреса (владелец 18.10: «сделай полные почты») — отдельный файл
+                # 0600 на Минске; в record.json по-прежнему только маски и хэши.
+                priv = out_dir / "private_emails.json"
+                priv.write_text(json.dumps([{"authuser": n, "email": e, "signed_out": so}
+                                            for n, (e, so) in enumerate(full)],
+                                           ensure_ascii=False, indent=1), encoding="utf-8")
+                os.chmod(priv, 0o600)
                 for n, (email, signed_out) in enumerate(full):
                     guard()
                     acc = {"authuser": n, "login_masked": mask(email), "login_sha256": sha(email),
@@ -206,7 +214,7 @@ def audit_profile(profile, channels, reg, evidence_root=HOME, settle=7):
                            "registry_secrets": bool(accounts_reg.get(email)),
                            "registry_profiles": sorted(by_login.get(email, set()), key=lambda p: (len(p), p)),
                            "ucs": [], "titles": []}
-                    if not signed_out:
+                    if not signed_out and not EMAILS_ONLY:
                         try:
                             driver.get(SWITCHER_URL.format(n=n))
                             time.sleep(settle)
@@ -223,7 +231,7 @@ def audit_profile(profile, channels, reg, evidence_root=HOME, settle=7):
                         except Exception as exc:                       # noqa: BLE001
                             acc["error"] = f"{type(exc).__name__}: {str(exc)[:120]}"
                     rec["accounts"].append(acc)
-                rec["result"] = "done" if full else "no_accounts"
+                rec["result"] = ("emails_only" if EMAILS_ONLY else "done") if full else "no_accounts"
             except Exception as exc:                                   # noqa: BLE001
                 rec["error"] = f"{type(exc).__name__}: {str(exc)[:200]}"
             finally:
@@ -252,6 +260,11 @@ def audit_profile(profile, channels, reg, evidence_root=HOME, settle=7):
     except coord.ProfileLeaseError as exc:
         raise RuntimeError(f"busy: бронь не дана: {str(exc)[:120]}")
 
+    if EMAILS_ONLY:
+        rec["finished"] = time.time()
+        (out_dir / "record.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.chmod(out_dir / "record.json", 0o600)
+        return rec
     # ── сверка ──
     present = {e for e, _ in full}
     for login in sorted(l for l, profs in by_login.items() if profile in profs):
@@ -315,7 +328,11 @@ def main():
     ap.add_argument("--all", action="store_true")
     ap.add_argument("--loop-hours", type=float, default=0)
     ap.add_argument("--retry-min", type=float, default=10)
+    ap.add_argument("--emails-only", action="store_true")
+    ap.add_argument("--only", default="", help="через запятую: только эти профили")
     a = ap.parse_args()
+    global EMAILS_ONLY
+    EMAILS_ONLY = a.emails_only
     HOME.mkdir(exist_ok=True)
     os.chmod(HOME, 0o700)
     chans = studio_channels()
@@ -330,6 +347,9 @@ def main():
         print(summary_line(rec))
         return 0
     todo = sorted(chans, key=lambda p: (len(p), p))
+    if a.only:
+        keep = {x.strip() for x in a.only.split(",") if x.strip()}
+        todo = [p for p in todo if p in keep]
     deadline = time.time() + a.loop_hours * 3600
     log = open(HOME / f"run_{time.strftime('%Y%m%dT%H%M%S')}.log", "a", encoding="utf-8", buffering=1)
     while todo:
