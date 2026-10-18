@@ -415,6 +415,34 @@ def main() -> int:
         svc4.do_source_ready(c4, REL)
         check("повтор разрешён и заказ создан", FakeClient.made, 1)
 
+        print("\nОбрыв ЗАГРУЗКИ донора (до заказа) — бронь не виснет «id неизвестен» (18.10)")
+        c7 = fresh()
+        FakeClient.made = 0
+        svc7 = services([])
+        real_upload = FakeClient.upload_text
+
+        def broken_upload(self, text, filename=""):
+            raise TimeoutError("ReadTimeout: рерайт не ответил на загрузку")
+
+        FakeClient.upload_text = broken_upload
+        try:
+            try:
+                svc7.do_source_ready(c7, REL)
+                check("обрыв проброшен", "не проброшен", "TimeoutError")
+            except TimeoutError:
+                check("обрыв проброшен", "TimeoutError", "TimeoutError")
+        finally:
+            FakeClient.upload_text = real_upload
+        row = c7.execute("SELECT * FROM provider_calls").fetchone()
+        check("бронь закрыта как «до провайдера не дошли»", row["status"], "failed")
+        check("в ошибке видно, что это загрузка", (row["error"] or "").startswith("загрузка донора"), True)
+        try:
+            out = svc7.do_source_ready(c7, REL)
+        except ResourceDown as exc:
+            out = f"ResourceDown: {exc}"
+        check("следующий тик заказывает, а не встаёт «id неизвестен»", out, {"wait": True})
+        check("заказ ровно один", FakeClient.made, 1)
+
         print("\nЗадача упала у соседа — повтор не создаёт вторую")
         c5 = fresh()
         FakeClient.made = 0

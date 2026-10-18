@@ -407,7 +407,19 @@ class PubServices:
                                       ordered=False)
                 c.commit()
                 raise model_error
-            file_id = client.upload_text(text, filename=f'{rel["release_id"]}.txt')
+            try:
+                file_id = client.upload_text(text, filename=f'{rel["release_id"]}.txt')
+            except Exception as exc:
+                # 18.10.2026: загрузка донора оборвалась (ReadTimeout / ConnectionError) ДО
+                # заказа, а бронь оставалась `reserved` — следующий тик видел «заказ
+                # создавался, id неизвестен» и вставал навсегда («Biografii de Noapte» с
+                # 14.10, «Muži u Mapy» с 17.10), хотя задачи в рерайте не было и денег не
+                # тратили. Загрузка файла — не заказ: бронь закрываем как «до провайдера не
+                # дошли», повтор безопасен.
+                pub_calls.mark_failed(c, decision["call_id"], f"загрузка донора: {str(exc)[:380]}",
+                                      ordered=False)
+                c.commit()
+                raise
             try:
                 job_id = client.create_job(
                     file_id, lang, preset, channel_name=rel["ch_name"] or "",
