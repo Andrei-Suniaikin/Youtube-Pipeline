@@ -4182,8 +4182,38 @@ def split_text_to_chunks(text: str, max_chars: int) -> List[str]:
     
     if current_chunk:
         chunks.append(current_chunk.strip())
-    
+
     return chunks
+
+
+# 18.10.2026: хвост донора отдельным крошечным куском (875–1591 знак: одна фраза истории +
+# «hit that like button… subscribe… tell us where you're watching from») переписывался в
+# 10–28% длины — модель законно выкидывает призыв, — и проверка длины браковала кусок пять
+# раз подряд, файл не сохранялся («no output files saved»). Повтор детерминированно падал
+# так же: 6 рерайтов с 11.10, в том числе 3 выпуска 17–18.10. Маленький хвост теперь едет
+# вместе с предыдущим куском: там выкинутый призыв — несколько процентов, а не 90%.
+TAIL_MERGE_SHARE = _env_number("REWRITE_TAIL_MERGE_SHARE", 0.25)
+TAIL_MERGE_MAX_GROWTH = _env_number("REWRITE_TAIL_MERGE_MAX_GROWTH", 1.30)
+
+
+def merge_small_tail_chunk(chunks: List[str], max_chars: int,
+                           para_counts: Optional[List[int]] = None,
+                           sep: str = " ") -> Tuple[List[str], Optional[List[int]]]:
+    """Приклеить последний кусок к предыдущему, если он меньше доли нормы и склейка не
+    раздувает предыдущий кусок сверх TAIL_MERGE_MAX_GROWTH × норма. Счёт абзацев (режим
+    сохранения абзацев) складывается. Иначе — всё как было."""
+    if len(chunks) < 2 or max_chars <= 0:
+        return chunks, para_counts
+    tail, prev = chunks[-1], chunks[-2]
+    if len(tail) >= TAIL_MERGE_SHARE * max_chars:
+        return chunks, para_counts
+    if len(prev) + len(sep) + len(tail) > TAIL_MERGE_MAX_GROWTH * max_chars:
+        return chunks, para_counts
+    merged = list(chunks[:-2]) + [prev + sep + tail]
+    counts = para_counts
+    if para_counts is not None and len(para_counts) == len(chunks):
+        counts = list(para_counts[:-2]) + [para_counts[-2] + para_counts[-1]]
+    return merged, counts
 
 
 def analyze_text_structure(
@@ -11430,12 +11460,18 @@ def rewrite_single_language(
 
         if preserve_paragraphs:
             chunks, chunk_para_counts = split_text_to_chunks_by_paragraphs(text, chunk_size)
+            _n_before = len(chunks)
+            chunks, chunk_para_counts = merge_small_tail_chunk(chunks, chunk_size, chunk_para_counts, sep="\n\n")
             total_input_paragraphs = sum(chunk_para_counts) if chunk_para_counts else count_paragraphs(text)
             log_msg(log_queue, f"📐 {lang_display}: режим сохранения абзацев — {total_input_paragraphs} абзацев → {len(chunks)} чанков")
         else:
             chunks = split_text_to_chunks(text, chunk_size)
+            _n_before = len(chunks)
+            chunks, _ = merge_small_tail_chunk(chunks, chunk_size)
             chunk_para_counts = []
             total_input_paragraphs = 0
+        if len(chunks) < _n_before:
+            log_msg(log_queue, f"🧩 {lang_display}: короткий хвост текста приклеен к предыдущей части ({_n_before} → {len(chunks)} частей)")
         total_chunks = len(chunks)
         
         # B5 PATCH-2026-06-25-secfix: user_id для tenant-scoped ключа прогресса.

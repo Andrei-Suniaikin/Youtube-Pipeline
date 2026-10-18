@@ -74,5 +74,33 @@ check("план вместо текста — нет", R.final_cta_short_output_
     TAIL, "Let me rewrite: Radu, Oțel și Aripi, abonați-vă la canal acum.", 4, 5,
     "Oțel și Aripi", "Radu"), False)
 
+print("\nМаленький хвост едет с предыдущей частью (18.10.2026)")
+# «Сталева Гроза» / «Η Ωμή Πλευρά του Πολέμου»: донор 32 705 знаков, пятая часть — 875 знаков,
+# фраза истории с числом + призыв; узнаватель призыва её законно не узнаёт (история, цифра),
+# модель выкидывает призыв → 10% длины → брак пять раз подряд.
+STORY = ("The young officer checked his maps again before the dawn attack on the river crossing. " * 95).strip()
+DONOR = STORY + " A schoolteacher from Illinois flew a 65 horsepower observation plane into fire. " + TAIL
+plain = R.split_text_to_chunks(DONOR, 8000)
+check("нарезка как есть даёт крошечный хвост", len(plain[-1]) < 2000, True)
+merged, _ = R.merge_small_tail_chunk(plain, 8000)
+check("после склейки частей на одну меньше", len(merged), len(plain) - 1)
+check("текст не потерян ни на знак",
+      " ".join(merged).replace(" ", ""), " ".join(plain).replace(" ", ""))
+check("последняя часть не больше 130% нормы", len(merged[-1]) <= 8000 * 1.30, True)
+check("призыв теперь — малая доля последней части", len(TAIL) / len(merged[-1]) < 0.15, True)
+big_tail = ["x" * 7900, "y" * 2500]
+check("хвост в четверть нормы и больше — не трогаем",
+      R.merge_small_tail_chunk(big_tail, 8000)[0], big_tail)
+fat_prev = ["x" * 7900, "y" * 7950, "z" * 1500]
+check("склейка раздула бы часть сверх 130% — не трогаем",
+      R.merge_small_tail_chunk(["a" * 9800, "z" * 1500], 8000)[0], ["a" * 9800, "z" * 1500])
+check("три части: клеится только последняя к предпоследней",
+      [len(c) for c in R.merge_small_tail_chunk(fat_prev, 8000)[0]], [7900, 7950 + 1 + 1500])
+paras = ["p1\n\np2", "p3", "p4"]
+m, counts = R.merge_small_tail_chunk(paras, 100, [2, 1, 1], sep="\n\n")
+check("режим абзацев: склейка через пустую строку, счёт абзацев складывается",
+      (m, counts), (["p1\n\np2", "p3\n\np4"], [2, 2]))
+check("одна часть — без изменений", R.merge_small_tail_chunk(["abc"], 8000)[0], ["abc"])
+
 print(f"\nпровалов: {len(FAILS)}")
 sys.exit(1 if FAILS else 0)
