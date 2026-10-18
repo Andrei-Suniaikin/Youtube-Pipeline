@@ -213,6 +213,30 @@ def main() -> int:
     check("функция pub_mail: событие с uc скрыть нельзя",
           status_of(W.ui_mail_review_dismiss, eligible, REQ), 404)
 
+    print("— база почты старой схемы (18.10: экран каналов падал 500) —")
+    old = os.path.join(TMP, "old_mail.db")
+    pub_mail.open_mail_db(old).close()          # схема как на бою до 17.10 — без двух столбцов
+    oc = sqlite3.connect(old)
+    oc.execute("DROP INDEX IF EXISTS ix_events_uc")
+    oc.execute("ALTER TABLE events DROP COLUMN reviewed_utc")
+    oc.execute("ALTER TABLE events DROP COLUMN reviewed_by")
+    oc.execute("INSERT INTO events(type, idem_key, binding_confidence, created_utc) "
+               "VALUES('x', 'old-1', 'review', '2026-10-18')")
+    oc.commit()
+    oc.close()
+    check("счёт по базе без reviewed_utc: схема доводится сама, письмо видно",
+          pub_mail.review_count(old), 1)
+    check("столбцы появились", {"reviewed_utc", "reviewed_by", "profile", "inbox_ref"}
+          <= {r["name"] for r in sql(old, "PRAGMA table_info(events)")}, True)
+    broken = os.path.join(TMP, "broken_mail.db")
+    bc = sqlite3.connect(broken)
+    bc.executescript("CREATE TABLE events(id INTEGER PRIMARY KEY); CREATE TABLE inbox_messages(id INTEGER);")
+    bc.commit()
+    bc.close()
+    os.chmod(broken, 0o444)
+    check("база только для чтения и кривая — счёт 0, а не падение экрана",
+          pub_mail.review_count(broken), 0)
+
     print()
     if FAILS:
         print(f"ПРОВАЛОВ: {len(FAILS)}")

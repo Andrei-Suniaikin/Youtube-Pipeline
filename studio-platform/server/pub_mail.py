@@ -274,6 +274,22 @@ def _ro(path: str):
     if "events" not in have or "inbox_messages" not in have:
         conn.close()
         return None
+    # 18.10.2026: после выкатки экрана «почта на проверку» боевая база жила без
+    # `reviewed_utc`, пока Минск не прислал первое письмо (миграция была только на
+    # записи) — экран каналов падал 500 «ответ не разобран». Теперь чтение само
+    # доводит схему один раз; не вышло — пусть лучше «писем 0», чем лежащий экран.
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(events)")}
+    if not {"inbox_ref", "profile", "reviewed_utc", "reviewed_by"} <= cols:
+        conn.close()
+        try:
+            open_mail_db(path).close()
+        except sqlite3.Error:
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5)
+        except sqlite3.Error:
+            return None
+        conn.row_factory = sqlite3.Row
     return conn
 
 
@@ -314,6 +330,8 @@ def review_count(path: str = None) -> int:
         return 0
     try:
         return int(conn.execute("SELECT COUNT(*) FROM events e " + _REVIEW_WHERE).fetchone()[0])
+    except sqlite3.Error:
+        return 0            # счётчик на экране каналов не должен ронять сам экран
     finally:
         conn.close()
 
