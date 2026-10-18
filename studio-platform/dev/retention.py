@@ -55,8 +55,12 @@ def describe(pol: dict) -> str:
         return ("не задан — ничего удаляться не будет "
                 f"(см. {R.ENV_STRIP} и {R.ENV_DROP} в .env.example)")
     strip = pol.get("strip_after_days")
+    uploaded = pol.get("uploaded_strip_after_days")
     drop = pol.get("drop_after_days")
     parts = []
+    if uploaded is not None:
+        parts.append(f"у залитого, но не вышедшего — кадры и озвучка через "
+                     f"{uploaded} дн. после заливки")
     if strip is not None:
         parts.append(f"очистка через {strip} дн.")
     if drop is not None:
