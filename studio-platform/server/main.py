@@ -63,6 +63,7 @@ from pub_engine import tick as pub_tick
 from pub_services import PubServices
 from pub_upload_api import register_upload_routes, sweep_stuck as sweep_upload
 from pub_mail import register_mail_routes
+from pub_access import register_access_routes
 
 # Момент старта ЭТОГО процесса. Нужен админ-панели, чтобы поймать «залили файл, но не
 # перезапустили сервис»: код в рантайме — тот, что был на диске в момент импорта, и
@@ -20807,6 +20808,15 @@ register_upload_routes(app, {
 # AdsPower. Тот же токен, что у заливки — вторая машина-нода студии не нужна, это
 # та же нода. Пишет в базу читалки приёмника, не в vsgen.db.
 register_mail_routes(app, {
+    "db": db,
+    "upload_token": _upload_token,
+    "log": log_info,
+})
+
+# Сверка профилей с Минска (19.10.2026): под каким аккаунтом какой канал виден, есть ли
+# у этого аккаунта пароль и ключ 2FA, стоит ли на него привязка. Секреты не ездят —
+# только хэш логина, маска для человека и флаги. Тот же токен ноды, что у заливки.
+register_access_routes(app, {
     "db": db,
     "upload_token": _upload_token,
     "log": log_info,

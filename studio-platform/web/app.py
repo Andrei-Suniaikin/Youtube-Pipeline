@@ -84,6 +84,7 @@ import pub_digest                                                # noqa: E402
 import pub_tg_personal                                           # noqa: E402
 import pub_analytics                                              # noqa: E402
 import pub_earn                                                   # noqa: E402
+import pub_access                                                 # noqa: E402
 import pub_mail                                                   # noqa: E402
 import channel_oauth                                              # noqa: E402
 from pub_env import load_env, mask                                # noqa: E402
@@ -729,6 +730,9 @@ def ui_channels(coin: int | None = None):
         mail_n = pub_mail.mail_counts([ch["uc"] for ch in rows if ch["uc"]])
         # Светофор монетизации — тоже одним проходом (владелец 19.10.2026).
         money = pub_earn.lights(c, TENANT)
+        # Чего не хватает каналу для самостоятельной заливки: под каким аккаунтом он
+        # виден и туда ли смотрит привязка (по сверке профилей с Минска).
+        access = pub_access.verdicts(c, TENANT)
         for ch in rows:
             try:
                 schedule = json.loads(ch["schedule"] or "{}")
@@ -749,6 +753,12 @@ def ui_channels(coin: int | None = None):
                 "money": money.get(ch["id"]) or {"light": "gray",
                                                  "text": "не знаем",
                                                  "why": "часы ни разу не собирались"},
+                # Доступ: «вход настроен» / «привязка не на тот аккаунт» / «нет
+                # пароля и кода» / «канала нет в профиле» / «профиль не сверяли».
+                "access": access.get(ch["id"]) or {"state": "unchecked",
+                                                   "text": "профиль ещё не сверяли",
+                                                   "fix": "", "profile": "",
+                                                   "accounts": []},
                 "mail_n": mail_n.get(ch["uc"] or "", 0),
                 # ID канала отдаём целиком, а не только признаком «есть»: в письмах и
                 # таблицах канал чаще приходит именно строкой UC…, и искать по ней надо.
@@ -777,7 +787,9 @@ def ui_channels(coin: int | None = None):
             })
         # Сколько писем ждёт человека (17.10.2026) — для кнопки «Почта на проверку» в
         # строке заголовка каналов: один COUNT к базе почты, не отдельный запрос с экрана.
-        return {"channels": out, "mail_review_n": pub_mail.review_count()}
+        return {"channels": out, "mail_review_n": pub_mail.review_count(),
+                # Шапка экрана: сколько каналов в каком состоянии доступа.
+                "access_summary": pub_access.summary(c, TENANT)}
     finally:
         c.close()
 
@@ -2937,6 +2949,10 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             # карточка и список не могли разойтись в цвете.
             "money": pub_earn.light_of(earn.get("good"), earn.get("last"),
                                        bool(ch["coin"])),
+            # Тот же вердикт доступа, что на плитке: кто видит канал в профиле.
+            "access": pub_access.verdicts(c, TENANT).get(channel_id)
+                      or {"state": "unchecked", "text": "профиль ещё не сверяли",
+                          "fix": "", "profile": "", "accounts": []},
             # Сбор по кнопке: к какому профилю привязан канал и что с последним заданием.
             "earn_request": pub_earn.channel_request(c, TENANT, channel_id),
         }

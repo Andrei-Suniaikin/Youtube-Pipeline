@@ -3097,6 +3097,7 @@ async function viewChannels(){
           ? '<span class="pill s-queued" title="сценарий пишется на умолчаниях рерайта: без ведущего и стиля канала">нет пресета текста</span>'
           : ''}
         ${supplyPill(c.supply)}
+        ${accessPill(c)}
         ${c.mail_n ? `<span class="pill s-idle" title="письма YouTube/Google по этому каналу — на вкладке «Статистика»">✉ ${c.mail_n}</span>` : ''}
       </div>
     </div>`).join('');
@@ -3649,6 +3650,7 @@ async function viewChannel(id){
     ${c.uc ? '' : `<span class="pill s-error">ID пустой — выпуски на этом канале
       не заводятся. Вписать во вкладке «Настройки» ниже — один раз</span>`}`));
   app.append(coinLine(c));
+  const al = accessLine(c); if (al) app.append(al);
   const мало = ((await attention()).low_supply || []).find(x => String(x.id) === String(id));
   if (мало) app.append($(`<div class="attnbar" id="ch-low"><b>!</b> Мало доноров:
     ${esc(мало.text)}. ${whyTipHtml('Что делать?', lowSupplyTip(мало.text,
@@ -4349,6 +4351,32 @@ function moneyPill(c){
     m.why ? `<span class="note muted" style="margin:0">${esc(m.why)}</span>` : ''}`;
 }
 
+// Подробности доступа — строкой в карточке канала: какой профиль, кто из его аккаунтов
+// видит канал, у кого есть вход, куда смотрит привязка. Это то, что нужно переслать
+// ребятам, когда входа не хватает.
+function accessLine(c){
+  const a = c && c.access;
+  if (!a) return null;
+  const box = $(`<div class="coinline"></div>`).firstElementChild;
+  const rows = (a.accounts || []).map(x => {
+    const marks = [
+      x.sees ? 'видит канал' : 'канала не видит',
+      x.manager ? 'менеджер' : '',
+      x.has_secrets ? 'вход есть' : 'входа нет',
+      x.bound ? 'привязка здесь' : '',
+    ].filter(Boolean).join(' · ');
+    return `<div class="meta">#${x.authuser ?? '?'} ${esc(x.mask || '?')} — ${esc(marks)}</div>`;
+  }).join('');
+  const cls = a.state === 'ok' ? 's-done' : (ACCESS_PILL[a.state] || ['s-idle'])[0];
+  box.innerHTML = `<div style="width:100%">
+    <span class="pill ${cls}">${esc(a.text)}</span>
+    ${a.profile ? `<span class="note muted" style="margin:0">профиль ${esc(a.profile)}</span>` : ''}
+    ${a.fix ? `<div class="note muted" style="margin:6px 0 0">${esc(a.fix)}</div>` : ''}
+    ${rows ? `<div style="margin-top:6px">${rows}</div>` : ''}
+  </div>`;
+  return box;
+}
+
 function coinLine(c){
   const box = $(`<div class="coinline" id="coinline"></div>`).firstElementChild;
   const paint = () => {
@@ -4906,6 +4934,24 @@ function coinMark(c){
 // Чтение страницы Earn падает у половины каналов, и показывать их красным нельзя —
 // красный значит «монеты нет», а не «сбор не дошёл».
 const MONEY_LIGHT = {green: '🟢', yellow: '🟡', red: '🔴', gray: '⚪'};
+
+// Доступ к каналу: под каким аккаунтом он виден и туда ли смотрит привязка. Считает
+// сервер (`pub_access.verdicts`) по сверке профилей с Минска — здесь только показ.
+// «Вход настроен» не показываем вовсе: плашка нужна там, где надо что-то сделать.
+const ACCESS_PILL = {
+  wrong_account: ['s-error', 'вход не в тот аккаунт'],
+  no_secrets:    ['s-error', 'нет входа в аккаунт'],
+  no_binding:    ['s-queued', 'привязка не записана'],
+  not_in_profile:['s-error', 'канала нет в профиле'],
+  unchecked:     ['s-idle', 'профиль не сверяли'],
+};
+
+function accessPill(c){
+  const a = c && c.access;
+  if (!a || a.state === 'ok' || !ACCESS_PILL[a.state]) return '';
+  const [cls, label] = ACCESS_PILL[a.state];
+  return `<span class="pill ${cls}" title="${esc(a.text + (a.fix ? '. ' + a.fix : ''))}">${esc(label)}</span>`;
+}
 
 function moneyMark(c){
   const m = c && c.money;
