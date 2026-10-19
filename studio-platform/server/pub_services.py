@@ -1229,33 +1229,62 @@ class PubServices:
         return (f"озвучка: блок {block} не прошёл фильтр провайдера после "
                 f"{self.TTS_SOFTEN_ROUNDS} смягчений текста — нужен человек")
 
+    def _channel_lumean_template(self, c, rel) -> str:
+        """Шаблон Lumean, которым этот канал уже озвучивался. Пусто — такого не было.
+
+        19.10.2026. Переход на Lumean требует Template ID, а он лежит в настройках
+        КОНКРЕТНОГО проекта: у канала он есть в одном ролике и отсутствует в соседнем,
+        потому что пресет меняли. По базе: шаблон стоит у 240 проектов из 680, но каналов,
+        где он есть хотя бы в одном ролике, — 30 из 80. Брать шаблон у соседнего ролика
+        того же канала безопасно: это ЕГО голос, он уже выходил на этом канале. Чужой
+        канал и чужой язык не берём никогда — голос бы поменялся.
+        """
+        try:
+            row = c.execute(
+                "SELECT json_extract(p.settings,'$.voice_uuid') AS vu "
+                "FROM pub_releases r JOIN projects p ON p.id = r.project_id "
+                "WHERE r.channel_id = ? "
+                "  AND json_extract(p.settings,'$.voice_uuid') IS NOT NULL "
+                "  AND json_extract(p.settings,'$.voice_uuid') <> '' "
+                "ORDER BY r.slot_at DESC LIMIT 1", (rel["channel_id"],)).fetchone()
+        except Exception:                                          # noqa: BLE001
+            return ""
+        return str((row["vu"] if row else "") or "").strip()
+
     def _tts_lumean_fallback(self, c, rel, known, block) -> str:
         """Три смягчения не помогли — озвучить другим провайдером (владелец 17.10.2026:
-        «в случае чего переходим на Lumean»). Только если у пресета канала есть шаблон
-        Lumean (`voice_uuid`): на серверном ключе Lumean принимает только свой Template ID,
-        выдумывать голос каналу нельзя. Один переход на выпуск — метка `tts-lumean`."""
+        «в случае чего переходим на Lumean»). Нужен шаблон Lumean (`voice_uuid`): на
+        серверном ключе Lumean принимает только свой Template ID, выдумывать голос каналу
+        нельзя. Если у пресета этого ролика шаблона нет, берём тот, которым канал уже
+        озвучивался раньше (`_channel_lumean_template`). Один переход — метка `tts-lumean`."""
         params = self._preset_params(c, rel)
         template = str(params.get("voice_uuid") or "").strip()
+        borrowed = ""
+        if not template:
+            template = borrowed = self._channel_lumean_template(c, rel)
         if not template:
             log_line(c, rel["release_id"], "ролик",
                      f"блок {block} не прошёл фильтр после {self.TTS_SOFTEN_ROUNDS} смягчений; "
-                     f"перейти на Lumean нечем — у пресета канала нет шаблона Lumean (voice_uuid)",
-                     level="warn")
+                     f"перейти на Lumean нечем — ни у этого ролика, ни у прежних роликов "
+                     f"канала нет шаблона Lumean (voice_uuid). Нужен шаблон голоса для "
+                     f"этого канала", level="warn")
             return "exhausted"
         uid = self._uid(c, rel["tenant_id"])
         if not uid:
             return "exhausted"
         c.commit()
         job_id = self.enqueue(uid, rel["tenant_id"], rel["project_id"], "tts",
-                              dict(params, engine="lumean"))
+                              dict(params, engine="lumean", voice_uuid=template))
         if not job_id:
             return "exhausted"
         c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', error=?, "
                   "updated=? WHERE release_id=? AND service='vsgen' AND kind='tts'",
                   (str(job_id), "tts-lumean:1", rel["updated"], rel["release_id"]))
+        whose = ("шаблон взят у прежних роликов этого канала" if borrowed
+                 else "шаблон пресета канала")
         log_line(c, rel["release_id"], "ролик",
                  f"блок {block} не прошёл фильтр FastGen после {self.TTS_SOFTEN_ROUNDS} "
-                 f"смягчений — озвучка целиком поставлена на Lumean (шаблон пресета канала), "
+                 f"смягчений — озвучка целиком поставлена на Lumean ({whose}), "
                  f"задача {job_id}", level="warn")
         return "requeued"
 

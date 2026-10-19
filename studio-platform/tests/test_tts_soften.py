@@ -144,13 +144,19 @@ def test_soften_project_writes_backup():
 
 # ─────────────────────────── движок ───────────────────────────
 
-def fresh(mark=None, logs=LOG_3861, settings='{"engine":"fastgen","voice":"algieba"}'):
+def fresh(mark=None, logs=LOG_3861, settings='{"engine":"fastgen","voice":"algieba"}',
+          sibling_template=None):
+    """База для движка. `sibling_template` — шаблон Lumean у ПРЕЖНЕГО ролика того же канала
+    (19.10.2026: шаблон лежит в настройках конкретного проекта, у соседнего ролика канала
+    он может быть, а у этого нет)."""
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     c.executescript("""
       CREATE TABLE admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL);
       CREATE TABLE users(id INTEGER PRIMARY KEY, tenant_id TEXT, name TEXT, key_opts TEXT, keys TEXT);
       CREATE TABLE projects(id TEXT PRIMARY KEY, tenant_id TEXT, settings TEXT);
+      CREATE TABLE pub_releases(release_id TEXT PRIMARY KEY, channel_id INTEGER,
+                                project_id TEXT, slot_at REAL);
       CREATE TABLE queue_tasks(job_id INTEGER PRIMARY KEY, tenant_id TEXT, project_id TEXT,
                                kind TEXT, status TEXT, error TEXT);
       CREATE TABLE job_logs(id INTEGER PRIMARY KEY AUTOINCREMENT, job_id INTEGER, ts REAL, line TEXT);
@@ -162,6 +168,11 @@ def fresh(mark=None, logs=LOG_3861, settings='{"engine":"fastgen","voice":"algie
     """)
     c.execute("INSERT INTO users VALUES(1,'dev','dev','{}','{}')")
     c.execute("INSERT INTO projects VALUES('proj-1','dev',?)", (settings,))
+    c.execute("INSERT INTO pub_releases VALUES('rel-1',7,'proj-1',?)", (NOW,))
+    if sibling_template:
+        c.execute("INSERT INTO projects VALUES('proj-0','dev',?)",
+                  ('{"engine":"fastgen","voice_uuid":"%s"}' % sibling_template,))
+        c.execute("INSERT INTO pub_releases VALUES('rel-0',7,'proj-0',?)", (NOW - 86400,))
     c.execute("INSERT INTO queue_tasks VALUES(10,'dev','proj-1','tts','error','rc=1')")
     for line in logs:
         c.execute("INSERT INTO job_logs(job_id,ts,line) VALUES(10,?,?)", (NOW, line))
@@ -172,7 +183,7 @@ def fresh(mark=None, logs=LOG_3861, settings='{"engine":"fastgen","voice":"algie
 
 
 REL = {"release_id": "rel-1", "tenant_id": "dev", "project_id": "proj-1", "lang": "hr",
-       "preset_cover": "", "donor_url": "", "updated": NOW}
+       "channel_id": 7, "preset_cover": "", "donor_url": "", "updated": NOW}
 
 
 def services(placed, pdir):
@@ -244,7 +255,20 @@ def test_engine():
             check("остановлен", "перехода на Lumean" in str(exc), True)
         check("озвучку не ставили", [k for k, _ in placed if k == "tts"], [])
 
-        print("\nТри раунда кончились, шаблона Lumean нет — остановка с названным блоком")
+        print("\nУ этого ролика шаблона нет, но канал уже озвучивался Lumean — берём его шаблон")
+        c = fresh(mark="tts-soften:3", sibling_template="9f8e7d6c-1111-2222-3333-cba987654321")
+        placed = []
+        out = services(placed, pdir).do_media_ready(c, REL)
+        check("движок ждёт озвучку", out, {"wait": True})
+        lum = [p for k, p in placed if k == "tts"]
+        check("поставлена одна задача озвучки", len(lum), 1)
+        check("движок — Lumean, шаблон от прежнего ролика канала",
+              (lum[0].get("engine"), lum[0].get("voice_uuid")),
+              ("lumean", "9f8e7d6c-1111-2222-3333-cba987654321"))
+        check("в журнале сказано, откуда голос",
+              "прежних роликов этого канала" in last_msg(c), True)
+
+        print("\nТри раунда кончились, шаблона Lumean нет ни здесь, ни у канала — остановка")
         c = fresh(mark="tts-soften:3")
         placed = []
         try:
