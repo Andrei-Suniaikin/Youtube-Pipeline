@@ -727,6 +727,8 @@ def ui_channels(coin: int | None = None):
             rows = [ch for ch in rows if bool(ch["coin"]) == bool(coin)]
         # Письма по каналам — одним запросом к базе почты на весь список, не по каналу.
         mail_n = pub_mail.mail_counts([ch["uc"] for ch in rows if ch["uc"]])
+        # Светофор монетизации — тоже одним проходом (владелец 19.10.2026).
+        money = pub_earn.lights(c, TENANT)
         for ch in rows:
             try:
                 schedule = json.loads(ch["schedule"] or "{}")
@@ -741,6 +743,12 @@ def ui_channels(coin: int | None = None):
                 # сколько событий почты у канала, чтобы на карточке было видно «есть что
                 # посмотреть», а не только у открытого канала.
                 "coin": bool(ch["coin"]), "coin_note": ch["coin_note"] or "",
+                # Светофор: зелёный — зарабатывает, жёлтый — порог пройден и ждём
+                # решения YouTube, красный — монеты нет, серый — часы не собрались.
+                # Серый отдельно от красного намеренно: «не знаем» ≠ «нет монеты».
+                "money": money.get(ch["id"]) or {"light": "gray",
+                                                 "text": "не знаем",
+                                                 "why": "часы ни разу не собирались"},
                 "mail_n": mail_n.get(ch["uc"] or "", 0),
                 # ID канала отдаём целиком, а не только признаком «есть»: в письмах и
                 # таблицах канал чаще приходит именно строкой UC…, и искать по ней надо.
@@ -2859,6 +2867,7 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
                                           "missed": 0, "planned": 0, "free": 0,
                                           "blocked": 0})
             box[row["state"]] = box.get(row["state"], 0) + 1
+        earn = pub_earn.channel_state(c, channel_id)
         return {
             "channel": {
                 "id": ch["id"], "name": ch["name"], "handle": ch["handle"] or "",
@@ -2923,7 +2932,11 @@ def _finish_channel_response_sync(channel_id: int, history: int, ch, cal: list) 
             # `channel_state` отдаёт только «подключено», хвост и состояние.
             "analytics": pub_analytics.channel_state(c, channel_id),
             # Часы для монетизации — то, что сборщик Минска прочитал на странице Earn.
-            "earn": pub_earn.channel_state(c, channel_id),
+            "earn": earn,
+            # Тот же светофор, что на плитке списка: считается одной функцией, чтобы
+            # карточка и список не могли разойтись в цвете.
+            "money": pub_earn.light_of(earn.get("good"), earn.get("last"),
+                                       bool(ch["coin"])),
             # Сбор по кнопке: к какому профилю привязан канал и что с последним заданием.
             "earn_request": pub_earn.channel_request(c, TENANT, channel_id),
         }

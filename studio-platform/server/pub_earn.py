@@ -294,6 +294,74 @@ def overview(c: sqlite3.Connection, tenant) -> dict:
     return {r["channel_id"]: _row(r) for r in rows}
 
 
+# ─────────────────── светофор монетизации на карточке (19.10.2026) ───────────────────
+#
+# Владелец: «монета и светофор на карточке канала — красный нет монеты, жёлтый подались
+# и ждём, зелёный зарабатывает». Три цвета мало: «не знаем» — это не «нет монеты».
+# Чтение Earn падает у половины каналов (на 19.10 — 42 канала из 68 с попытками), и
+# закрасить их красным значило бы соврать. Поэтому четвёртый, серый: сбор не дошёл.
+#
+# Откуда что берётся:
+#   • зелёный — Studio сама сказала «канал в партнёрке» (`state='partner'`, таких 5) или
+#     владелец поставил монетку руками (`pub_channels.coin`);
+#   • жёлтый — порог YPP пройден (4000 подходящих часов и 1000 подписчиков), а партнёрки
+#     ещё нет: значит заявка либо подана и ждёт, либо её пора подать. Различить это
+#     машинно нечем — Studio показывает только счётчики, — поэтому так и написано;
+#   • красный — числа есть, до порога не дотягивает: показываем, сколько набрано;
+#   • серый — принятого чтения нет, причина словами из `STATE_TITLE`.
+
+LIGHTS = {"green": "зарабатывает", "yellow": "ждёт решения YouTube",
+          "red": "монеты нет", "gray": "не знаем"}
+
+
+def light_of(good: dict | None, last: dict | None, coin: bool = False) -> dict:
+    """Светофор одного канала: `{"light", "text", "why"}`. Чистая функция — тестируется
+    без базы и одинаково считается в списке каналов, в карточке и в сводке."""
+    good = good or None
+    state = (good or {}).get("state") or (last or {}).get("state") or ""
+    hours = (good or {}).get("hours_365")
+    subs = (good or {}).get("subs")
+    as_of = (good or {}).get("as_of") or ""
+    if state == "partner":
+        return {"light": "green", "text": LIGHTS["green"],
+                "why": "Studio: канал уже в партнёрской программе"}
+    if coin:
+        return {"light": "green", "text": LIGHTS["green"],
+                "why": "отмечено руками — монетный канал"}
+    if hours is not None and subs is not None and hours >= YPP_HOURS and subs >= YPP_SUBS:
+        return {"light": "yellow", "text": LIGHTS["yellow"],
+                "why": f"порог пройден: {hours} ч из {YPP_HOURS} и {subs} подписчиков из "
+                       f"{YPP_SUBS}{' на ' + as_of if as_of else ''} — заявка подана и ждёт "
+                       f"ответа либо её пора подать"}
+    if hours is not None:
+        need = []
+        if hours < YPP_HOURS:
+            need.append(f"{hours} ч из {YPP_HOURS}")
+        if subs is not None and subs < YPP_SUBS:
+            need.append(f"{subs} подписчиков из {YPP_SUBS}")
+        return {"light": "red", "text": LIGHTS["red"],
+                "why": "до порога партнёрки: " + ", ".join(need) +
+                       (f" (на {as_of})" if as_of else "")}
+    why = STATE_TITLE.get(state, state) if state else "часы ни разу не собирались"
+    return {"light": "gray", "text": LIGHTS["gray"], "why": why}
+
+
+def lights(c: sqlite3.Connection, tenant) -> dict:
+    """Канал → светофор монетизации. Один проход на весь список: поканальный счёт
+    превратил бы открытие списка каналов в сотню запросов."""
+    ensure_earn_schema(c)
+    good = overview(c, tenant)
+    last = {r["channel_id"]: _row(r) for r in c.execute(
+        "SELECT e.* FROM pub_channel_earn e JOIN pub_channels ch ON ch.id=e.channel_id "
+        "WHERE ch.tenant_id=? AND e.read_at=("
+        "  SELECT MAX(read_at) FROM pub_channel_earn x WHERE x.channel_id=e.channel_id)",
+        (tenant,)).fetchall()}
+    out = {}
+    for row in c.execute("SELECT id, coin FROM pub_channels WHERE tenant_id=?", (tenant,)):
+        out[row[0]] = light_of(good.get(row[0]), last.get(row[0]), bool(row[1]))
+    return out
+
+
 # ─────────────────────────── почты каналов (13.10.2026) ───────────────────────────
 #
 # Под какой почтой Google открывается канал. Отдельно почту никто не хранит: ни AdsPower,

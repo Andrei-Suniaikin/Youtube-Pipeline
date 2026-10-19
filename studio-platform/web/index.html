@@ -3077,7 +3077,7 @@ async function viewChannels(){
       aria-label="Канал ${esc(c.name)}">
       ${picking ? '<span class="chmark">✓</span>' : ''}
       ${supplyCorner(c.supply)}
-      <h3>${esc(c.name)}${coinMark(c)}</h3>
+      <h3>${esc(c.name)}${moneyMark(c)}${coinMark(c)}</h3>
       <div class="meta">${esc(c.handle || '—')} · ${esc(c.lang)}</div>
       <div class="meta" style="margin-top:7px">
         ${c.per_day} ${c.per_day === 1 ? 'выход' : 'выхода'} в неделю · горизонт ${c.horizon_days} дн
@@ -3644,7 +3644,7 @@ async function viewChannel(id){
 
   app.innerHTML = '';
   app.append($(`<a class="back" href="#/channels">← ко всем каналам</a>
-    <h1>${esc(c.name)}${coinMark(c)}</h1>
+    <h1>${esc(c.name)}${moneyMark(c)}${coinMark(c)}</h1>
     <p class="sub">${[c.handle, c.lang, c.niche].filter(Boolean).map(esc).join(' · ')}</p>
     ${c.uc ? '' : `<span class="pill s-error">ID пустой — выпуски на этом канале
       не заводятся. Вписать во вкладке «Настройки» ниже — один раз</span>`}`));
@@ -4337,14 +4337,26 @@ function oauthReturnNotice(){
    писем, без пересылки (Google этим аккаунтам пересылку не даёт). Сюда приезжают
    отправитель, тема, обрывок и дата; почта аккаунта — маской.                        */
 
+// Светофор словами — строкой на карточке канала, рядом с монеткой: на плитке виден
+// только цвет, а здесь есть место объяснить, чего не хватает до порога партнёрки.
+const MONEY_PILL = {green: 's-done', yellow: 's-queued', red: 's-error', gray: 's-idle'};
+
+function moneyPill(c){
+  const m = c && c.money;
+  if (!m || !MONEY_LIGHT[m.light]) return '';
+  return `<span class="pill ${MONEY_PILL[m.light] || 's-idle'}"
+    title="${esc(m.why || '')}">${MONEY_LIGHT[m.light]} ${esc(m.text)}</span>${
+    m.why ? `<span class="note muted" style="margin:0">${esc(m.why)}</span>` : ''}`;
+}
+
 function coinLine(c){
   const box = $(`<div class="coinline" id="coinline"></div>`).firstElementChild;
   const paint = () => {
-    box.innerHTML = c.coin
+    box.innerHTML = moneyPill(c) + (c.coin
       ? `<span class="pill s-done">🪙 монетный канал</span>${c.coin_note
           ? `<span class="note muted" style="margin:0">${esc(c.coin_note)}</span>` : ''}
          <button class="ghost small" id="coin-off">Снять монетку</button>`
-      : `<button class="ghost small" id="coin-on">🪙 Пометить монетным</button>`;
+      : `<button class="ghost small" id="coin-on">🪙 Пометить монетным</button>`);
     const on = box.querySelector('#coin-on'), off = box.querySelector('#coin-off');
     if (on) on.onclick = () => modal('Монетный канал',
       `<div class="fldrow"><label>Заметка</label>
@@ -4888,6 +4900,18 @@ function coinMark(c){
   if (!c || !c.coin) return '';
   return `<span class="coin" title="${esc('Монетный канал' + (c.coin_note ? ': ' + c.coin_note : ''))}"
     aria-label="монетный канал">🪙</span>`;
+}
+
+// Светофор монетизации (владелец 19.10.2026). Четыре цвета, не три: серый — «не знаем».
+// Чтение страницы Earn падает у половины каналов, и показывать их красным нельзя —
+// красный значит «монеты нет», а не «сбор не дошёл».
+const MONEY_LIGHT = {green: '🟢', yellow: '🟡', red: '🔴', gray: '⚪'};
+
+function moneyMark(c){
+  const m = c && c.money;
+  if (!m || !MONEY_LIGHT[m.light]) return '';
+  return `<span class="coin" title="${esc(m.text + (m.why ? ' — ' + m.why : ''))}"
+    aria-label="${esc('монетизация: ' + m.text)}">${MONEY_LIGHT[m.light]}</span>`;
 }
 
 // Отбор по монетке: «любые» / «на монете» / «без монеты» (владелец 17.10.2026).
