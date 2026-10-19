@@ -1,0 +1,12 @@
+[Unit]
+Description=Проверять место на Минске и убирать подтверждённое каждые полчаса
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+# Разброс, чтобы уборка не попадала ровно в тот же момент, что остальные таймеры студии.
+RandomizedDelaySec=3min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
