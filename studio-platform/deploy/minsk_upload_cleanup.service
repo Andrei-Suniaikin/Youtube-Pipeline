@@ -1,0 +1,12 @@
+[Unit]
+Description=Уборка копий mp4 от подтверждённых заливок на минской машине
+Documentation=file:///srv/studio/app/deploy/minsk_upload_cleanup.sh
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/minsk_upload_cleanup.sh
+# Уборка не должна валить таймер: Минск мог быть занят или недоступен.
+SuccessExitStatus=0 1
+TimeoutStartSec=900
+Nice=10

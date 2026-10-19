@@ -57,13 +57,16 @@ def make_project(root, tid, pid, frames=10, clips=0, audio=1, final=True):
     return d
 
 
-def fresh_db(projects, phase="published", published_at=NOW - 30 * DAY, busy=0, calls=0):
+def fresh_db(projects, phase="published", published_at=NOW - 30 * DAY, busy=0, calls=0,
+             uploaded_at=None, video_id="yt1"):
     c = sqlite3.connect(":memory:")
     c.executescript("""
       CREATE TABLE admin_state(k TEXT PRIMARY KEY, v TEXT, updated REAL);
       CREATE TABLE projects(id TEXT PRIMARY KEY, tenant_id TEXT, name TEXT);
       CREATE TABLE pub_releases(id INTEGER PRIMARY KEY, project_id TEXT, release_id TEXT,
                                 phase TEXT, status TEXT, video_id TEXT, updated REAL);
+      CREATE TABLE pub_upload_jobs(id INTEGER PRIMARY KEY, release_id TEXT, status TEXT,
+                                   video_id TEXT, finished REAL);
       CREATE TABLE queue_tasks(job_id INTEGER PRIMARY KEY, project_id TEXT, status TEXT);
       CREATE TABLE provider_calls(id INTEGER PRIMARY KEY, project_id TEXT, kind TEXT,
                                   status TEXT, cost REAL);
@@ -71,7 +74,10 @@ def fresh_db(projects, phase="published", published_at=NOW - 30 * DAY, busy=0, c
     for i, (tid, pid) in enumerate(projects):
         c.execute("INSERT INTO projects VALUES(?,?,?)", (pid, tid, "Проект " + pid))
         c.execute("INSERT INTO pub_releases VALUES(?,?,?,?,?,?,?)",
-                  (i + 1, pid, f"rel-{pid}", phase, "done", "yt1", published_at))
+                  (i + 1, pid, f"rel-{pid}", phase, "done", video_id, published_at))
+        if uploaded_at is not None:
+            c.execute("INSERT INTO pub_upload_jobs VALUES(?,?,'done',?,?)",
+                      (i + 1, f"rel-{pid}", video_id, uploaded_at))
         for j in range(busy):
             c.execute("INSERT INTO queue_tasks VALUES(?,?,'running')",
                       (i * 100 + j + 1, pid))
@@ -147,7 +153,7 @@ def main() -> int:
 
         print("\nНеопубликованное не трогаем никогда")
         d2 = make_project(root, "dev", "p2")
-        c = fresh_db([("dev", "p2")], phase="scheduled")
+        c = fresh_db([("dev", "p2")], phase="media_ready")
         c.execute("INSERT INTO admin_state VALUES('retention',?,0)",
                   (json.dumps({"strip_after_days": 0, "drop_after_days": 0}),))
         acts = R.plan(R.scan(c, root), R.policy(c), now=NOW)
@@ -155,6 +161,56 @@ def main() -> int:
         check("причина названа прямо", "не опубликован" in acts[0][2], True)
         R.apply(c, acts, dry_run=False, log=lambda *_a: None)
         check("кадры на месте", os.path.isdir(os.path.join(d2, "googler")), True)
+
+        print("\nЗалитый ролик, ждущий даты выхода: кадры и озвучку можно, mp4 нельзя")
+        d6 = make_project(root, "ждёт", "p6")
+        c = fresh_db([("ждёт", "p6")], phase="scheduled", uploaded_at=NOW - 3 * DAY)
+        check("без своего срока — не трогаем",
+              R.plan(R.scan(c, root, tenant="ждёт"),
+                     R.policy(c, {R.ENV_STRIP: "7"}), now=NOW)[0][1], "keep")
+        acts = R.plan(R.scan(c, root, tenant="ждёт"),
+                      R.policy(c, {R.ENV_UPLOADED_STRIP: "1"}), now=NOW)
+        check("очистить", acts[0][1], "strip")
+        check("сказано, что ролик уже на YouTube",
+              "залит на YouTube 3 дн. назад" in acts[0][2], True)
+        check("и что готовый ролик остаётся", "готовый ролик остаётся" in acts[0][2], True)
+        final_before = acts[0][0].sizes["final"]
+        R.apply(c, acts, dry_run=False, log=lambda *_a: None)
+        check("кадры удалены", os.path.isdir(os.path.join(d6, "googler")), False)
+        check("озвучки нет",
+              [f for f in os.listdir(d6) if f.endswith(".mp3")], [])
+        check("готовый ролик цел",
+              os.path.getsize(os.path.join(d6, "render", "out.mp4")), final_before)
+        check("проект остался в базе",
+              c.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 1)
+        check("повторный проход убирать уже нечего",
+              R.plan(R.scan(c, root, tenant="ждёт"),
+                     R.policy(c, {R.ENV_UPLOADED_STRIP: "1"}), now=NOW)[0][2],
+              "залит, убирать уже нечего")
+
+        print("\n  и те же данные без доказательств заливки остаются нетронутыми")
+        d7 = make_project(root, "ждёт", "p7")
+        pol7 = {R.ENV_UPLOADED_STRIP: "1"}
+
+        def verdict(**kw):
+            c7 = fresh_db([("ждёт", "p7")], phase="scheduled", **kw)
+            return R.plan(R.scan(c7, root, tenant="ждёт"), R.policy(c7, pol7), now=NOW)[0]
+
+        act = verdict(uploaded_at=None)
+        check("нет задания с номером — не трогаем", act[1], "keep")
+        check("причина про неподтверждённую заливку",
+              "момент заливки не подтверждён" in act[2], True)
+        act = verdict(uploaded_at=NOW - 3 * DAY, video_id="")
+        check("нет номера ролика — не трогаем", act[1], "keep")
+        check("и это названо как «не опубликован»", "не опубликован" in act[2], True)
+        act = verdict(uploaded_at=NOW - 2 * 3600)
+        check("срок после заливки не вышел", act[1], "keep")
+        check("сказано, сколько прошло", "залит 0 дн. назад — рано" in act[2], True)
+        act = verdict(uploaded_at=NOW - 3 * DAY, busy=1)
+        check("занятый работой залитый тоже не трогаем", act[1], "keep")
+        check("причина — идёт работа", "идёт работа" in act[2], True)
+        check("кадры всё это время целы", os.path.isdir(os.path.join(d7, "googler")), True)
+        shutil.rmtree(os.path.join(root, "ждёт"))
 
         print("\nЗанятый работой проект не трогаем")
         c = fresh_db([("dev", "p2")], busy=1)

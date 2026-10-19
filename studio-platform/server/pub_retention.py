@@ -23,12 +23,23 @@
   drop   удалить проект целиком вместе с готовым mp4. Только когда ролик опубликован
          и подтверждён публичным — то есть существует уже не только у нас.
 
-Условие для обоих — фаза `published`. Не `done` и не `scheduled`: `done` в этой системе
+Условие для `drop` — фаза `published`. Не `done` и не `scheduled`: `done` в этой системе
 означает «расписание проверено», а не «ролик вышел» (известная ловушка проекта).
+
+**У `strip` условие мягче, и вот почему (18.10.2026).** Ролик, залитый на YouTube и
+ждущий своей даты, лежит у нас полным проектом иногда три недели: план расписан вперёд
+на двадцать дней. Таких на боевом сервере оказалось 266 штук на 159 ГБ — больше
+половины всего места студии. При этом mp4 уже у Google, а кадры и озвучка нужны были
+только чтобы его собрать. Поэтому кадры и озвучку можно убрать раньше публикации — но
+не раньше, чем заливка доказана: нужен и номер ролика, и фаза `scheduled`. Готовый mp4
+остаётся до публикации, чтобы перезаливка оставалась возможной без новых трат.
 
 Сроки задаются в `.env` — их меняет владелец на своём сервере, без нас и без базы:
 
     VS_RETENTION_STRIP_DAYS=14   через сколько дней после публикации убрать промежуточное
+    VS_RETENTION_UPLOADED_STRIP_DAYS=1
+                                 через сколько дней после подтверждённой заливки убрать
+                                 кадры и озвучку у ролика, который ещё не вышел (mp4 цел)
     VS_RETENTION_DROP_DAYS=90    через сколько удалить проект целиком
     VS_RETENTION_AUTO=1          уборка идёт сама; без этого — только показывает
 
@@ -47,6 +58,7 @@ import glob
 import json
 import os
 import shutil
+import sqlite3
 import time
 
 STATE_KEY = "retention"
@@ -55,6 +67,7 @@ GB = 1024 ** 3
 MB = 1024 ** 2
 
 ENV_STRIP = "VS_RETENTION_STRIP_DAYS"
+ENV_UPLOADED_STRIP = "VS_RETENTION_UPLOADED_STRIP_DAYS"
 ENV_DROP = "VS_RETENTION_DROP_DAYS"
 ENV_AUTO = "VS_RETENTION_AUTO"
 ENV_EVERY = "VS_RETENTION_EVERY_SEC"
@@ -87,11 +100,15 @@ PAID_BY = {"frames": "images", "clips": "video", "audio": "tts", "cover": "cover
 
 # Фаза, начиная с которой ролик существует не только у нас.
 SAFE_PHASE = "published"
+# Фаза «файл у Google, ждёт своей даты». Для удаления mp4 её не хватает, для удаления
+# кадров и озвучки — хватает: собирать ролик больше не из чего и не для чего.
+UPLOADED_PHASE = "scheduled"
 
 
 class Project:
     __slots__ = ("pid", "tid", "name", "path", "exists", "sizes", "total", "newest",
-                 "phase", "release_id", "video_id", "published_at", "busy", "paid")
+                 "phase", "release_id", "video_id", "published_at", "uploaded_at",
+                 "busy", "paid")
 
     def __init__(self, **kw):
         for s in self.__slots__:
@@ -169,6 +186,21 @@ def scan(c, tenants_dir: str, tenant=None) -> list:
         rel = c.execute(
             "SELECT release_id, phase, status, video_id, updated FROM pub_releases "
             "WHERE project_id=? ORDER BY updated DESC LIMIT 1", (pid,)).fetchone()
+        # Когда заливка этого выпуска доказанно закончилась. Доказательство — не статус
+        # задания, а номер ролика: без него «залито» означает только «мы пытались».
+        uploaded_at = 0.0
+        if rel and rel[3]:
+            try:
+                row = c.execute(
+                    "SELECT MAX(finished) FROM pub_upload_jobs WHERE release_id=? "
+                    "AND status='done' AND video_id IS NOT NULL AND video_id<>'' "
+                    "AND finished IS NOT NULL", (rel[0],)).fetchone()
+                uploaded_at = float(row[0] or 0.0) if row else 0.0
+            except sqlite3.Error:
+                # Базы без таблицы заданий заливки бывают у старых копий. Молчаливый
+                # ноль здесь означает «момент заливки неизвестен» — и уборка такой
+                # проект не тронет, а не уберёт на всякий случай.
+                uploaded_at = 0.0
         busy = c.execute(
             "SELECT COUNT(*) FROM queue_tasks WHERE project_id=? "
             "AND status IN ('queued','running')", (pid,)).fetchone()[0]
@@ -183,6 +215,7 @@ def scan(c, tenants_dir: str, tenant=None) -> list:
             release_id=(rel[0] if rel else ""), phase=(rel[1] if rel else ""),
             video_id=(rel[3] if rel else ""),
             published_at=(rel[4] if rel and rel[1] == SAFE_PHASE else 0.0),
+            uploaded_at=uploaded_at,
             busy=busy, paid=paid))
     return out
 
@@ -203,7 +236,9 @@ def env_policy(env=None) -> dict:
     """Что задано в `.env`. Пустая переменная — это «не задано», а не «ноль дней»."""
     env = os.environ if env is None else env
     out = {}
-    for key, name in (("strip_after_days", ENV_STRIP), ("drop_after_days", ENV_DROP)):
+    for key, name in (("strip_after_days", ENV_STRIP),
+                      ("uploaded_strip_after_days", ENV_UPLOADED_STRIP),
+                      ("drop_after_days", ENV_DROP)):
         days = _days(env.get(name))
         if days is not None:
             out[key] = days
@@ -240,6 +275,37 @@ def every_sec(env=None) -> int:
     return max(EVERY_MIN, n)
 
 
+def _uploaded_verdict(p: Project, upload_strip_days, now: float) -> tuple:
+    """Что делать с проектом, который ещё не вышел.
+
+    Единственное, что здесь разрешено, — убрать кадры и озвучку у ролика, который уже
+    лежит у Google и ждёт своей даты. Три условия, и все обязательны: фаза `scheduled`,
+    номер ролика на руках и прошёл заданный владельцем срок после заливки. Нет срока —
+    ничего не делаем: это та же осторожность, что и с остальными порогами.
+
+    Готовый mp4 не трогаем ни при каком сроке. До публикации ролик ещё может
+    понадобиться перезалить, и файл на диске — разница между «перезалили» и
+    «собираем и платим заново».
+    """
+    if p.phase != UPLOADED_PHASE or not p.video_id:
+        return (p, KEEP,
+                f"не опубликован (фаза «{p.phase or 'без выпуска'}»): "
+                f"ролик существует только у нас", 0)
+    if upload_strip_days is None:
+        return (p, KEEP, "залит, но срок очистки после заливки владельцем не задан", 0)
+    if not p.uploaded_at:
+        return (p, KEEP, "залит, но момент заливки не подтверждён заданием", 0)
+    age_days = (now - p.uploaded_at) / 86400.0
+    if age_days >= upload_strip_days and p.strippable:
+        return (p, STRIP,
+                f"залит на YouTube {age_days:.0f} дн. назад, ждёт даты выхода "
+                f"(порог очистки после заливки {upload_strip_days}); "
+                f"готовый ролик остаётся", p.strippable)
+    if not p.strippable:
+        return (p, KEEP, "залит, убирать уже нечего", 0)
+    return (p, KEEP, f"залит {age_days:.0f} дн. назад — рано", 0)
+
+
 def plan(projects, pol: dict, now=None) -> list:
     """[(проект, действие, почему, сколько освободит)]. Действие: keep | strip | drop.
 
@@ -248,6 +314,7 @@ def plan(projects, pol: dict, now=None) -> list:
     """
     now = now or time.time()
     strip_days = _days(pol.get("strip_after_days"))
+    upload_strip_days = _days(pol.get("uploaded_strip_after_days"))
     drop_days = _days(pol.get("drop_after_days"))
     out = []
     for p in projects:
@@ -258,9 +325,7 @@ def plan(projects, pol: dict, now=None) -> list:
             out.append((p, KEEP, f"идёт работа: активных задач {p.busy}", 0))
             continue
         if p.phase != SAFE_PHASE:
-            out.append((p, KEEP,
-                        f"не опубликован (фаза «{p.phase or 'без выпуска'}»): "
-                        f"ролик существует только у нас", 0))
+            out.append(_uploaded_verdict(p, upload_strip_days, now))
             continue
         if strip_days is None and drop_days is None:
             out.append((p, KEEP, "срок хранения владельцем не задан", 0))
