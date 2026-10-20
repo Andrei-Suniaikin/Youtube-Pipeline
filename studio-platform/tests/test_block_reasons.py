@@ -104,6 +104,14 @@ def main() -> int:
         "(read timeout=120)": ("check", False, "браузер заливки завис — неизвестно, дошёл ли файл"),
         "обложка не сделалась: Error code: 402 - {'error': {'message': \"API key token "
         "allowance exhausted.": ("cover", False, "сервис обложек дал сбой"),
+        # 20.10.2026: три причины висели в «Прочее» без хозяина (база VPS, вечер).
+        "account recovery needs the owner: too many recovery attempts for this account today":
+            ("access", True, "суточный лимит попыток входа исчерпан"),
+        "channel busy: foreign interrupted upload — retry later":
+            ("access", True, "на канале висит чужая незаконченная заливка"),
+        "доведение по номеру не удалось (попытка 1 из 3, следующая не раньше чем через 6 ч): "
+        "finalize: черновик без доказательства целостности":
+            ("check", False, "черновик на канале, машина довести не смогла"),
     }
     for сырая, (сторона, вернуть, смысл) in заливщик.items():
         b = B.explain(сырая)
