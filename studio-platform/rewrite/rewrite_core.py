@@ -706,6 +706,37 @@ def _note_subscription(provider: str, value: str, outcome: str,
 _CODEX_REL_HOURS = re.compile(r"(\d+)\s*(?:h\b|hr\b|hours?\b|час)", re.I)
 _CODEX_REL_MINUTES = re.compile(r"(\d+)\s*(?:m\b|min\b|minutes?\b|мин)", re.I)
 
+# По чему узнаём «провайдер придержал нас», а не «вызов сломался». Список ОДИН на оба
+# разборщика ошибок codex (одиночный вызов и разговор): раньше он был выписан в каждом
+# из них отдельно, и расходились они молча.
+#
+# ДОБАВЛЕНО 20.10.2026. Восемь выпусков встали «рерайт не справился | no output files
+# saved (0/1)» при живом ключе. В stderr было
+# `ERROR: exceeded retry limit, last status: 429 Too Many Requests` — и ни одно прежнее
+# слово к этому не подходило: «retry limit» это не «rate limit». Отказ уходил как
+# CODEX_ERROR, то есть «вызов сломался»: дом не гасился (пул выдавал его снова и снова),
+# префикс SUBSCRIPTION_LIMIT не ставился, remember_limit_hit молчал — и джоб с тремя
+# готовыми частями из четырёх хоронился вместо того, чтобы дождаться открытия окна.
+# Механизм ожидания был на месте с 03.10 и просто не включался.
+#
+# Фразы, а не числа: в хвост stderr попадают последние 4000 символов, среди них бывает
+# кусок промпта. «429» само по себе встречается в тексте о войне, «429 too many requests»
+# и «exceeded retry limit» — нет.
+_CODEX_LIMIT_MARKERS = (
+    "usage limit",
+    "rate limit",
+    "quota",
+    "limit reached",
+    "too many requests",
+    "exceeded retry limit",
+)
+
+
+def _codex_text_is_limit(text) -> bool:
+    """Это придержанный лимит (ждать и повторить), а не поломка вызова?"""
+    lowered = str(text or "").lower()
+    return any(marker in lowered for marker in _CODEX_LIMIT_MARKERS)
+
 
 def _codex_limit_reset_from_text(text) -> float:
     """«try again in 2h 15m», «resets in 45 minutes» → unix-время сброса; 0 — не нашлось."""
@@ -9580,7 +9611,7 @@ def call_codex_subscription(
                 )
             if any(x in error_lower for x in ("not logged in", "authentication", "unauthorized", "401")):
                 prefix = "CODEX_AUTH"
-            elif any(x in error_lower for x in ("usage limit", "rate limit", "quota", "limit reached")):
+            elif _codex_text_is_limit(error_lower):
                 prefix = "CODEX_LIMIT"
             else:
                 prefix = "CODEX_ERROR"
@@ -9715,7 +9746,7 @@ def call_codex_conversation(
             )
         if any(x in lowered for x in ("not logged in", "authentication", "unauthorized", "401")):
             prefix = "CODEX_AUTH"
-        elif any(x in lowered for x in ("usage limit", "rate limit", "quota", "limit reached")):
+        elif _codex_text_is_limit(lowered):
             prefix = "CODEX_LIMIT"
         else:
             prefix = "CODEX_ERROR"
