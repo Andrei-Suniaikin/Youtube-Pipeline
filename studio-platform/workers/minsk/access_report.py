@@ -36,9 +36,12 @@ import urllib.error
 import urllib.request
 
 AUDIT_DIR = os.environ.get("VS_AUDIT_DIR", "/home/vova/accounts_audit")
-REGISTRY = os.environ.get(
-    "VS_REGISTRY",
-    "/home/vova/ww2_upload_stress_20260914/private/upload_accounts_recovery.json")
+# Умолчания обоих хранилищ входов — те же пути, что стоят в env заливщика (см.
+# registry_paths: почему их два и почему проверять надо оба).
+AUTH_STORE = ("/home/vova/ww2_upload_stress_20260914/private/"
+              "upload_accounts_recovery.json")
+RECOVERY_STORE = ("/home/vova/manager_login_20261012/private/"
+                  "studio_manager_accounts_20261013.json")
 # Машинные ручки (`/api/...`) живут в кабинете на 8899 — там же, куда ходят почта
 # и вердикты заливки. Пульт на 8800 их не знает: проверено, отвечает 404.
 BASE = os.environ.get("VS_STUDIO_BASE", "http://127.0.0.1:8899")
@@ -65,27 +68,77 @@ def token() -> str:
                      + ", ".join(TOKEN_FILES))
 
 
+def registry_paths() -> list:
+    """Все хранилища входов, в которые смотрит заливщик.
+
+    ИСПРАВЛЕНО 20.10.2026. Здесь читался ОДИН файл, и вердикт «вход настроен» выходил
+    неправдой. У заливщика два этапа входа, и каждый читает СВОЙ файл своей переменной:
+
+      * обычный вход и «Verify it's you» — `upload_auth.py`,
+        env `VIDEO_UPLOAD_AUTH_ACCOUNTS`, сейчас `upload_accounts_recovery.json`;
+      * восстановление аккаунта («account recovery needs the owner») —
+        `upload_account_recovery.py`, env `VIDEO_UPLOAD_ACCOUNTS_JSON`, сейчас
+        `manager_login_20261012/private/studio_manager_accounts_20261013.json`.
+
+    Вторая переменная задана в ДВУХ EnvironmentFile, и в unit'е побеждает последний
+    (`~/.vsupload_env_studio`) — то есть файл не тот, который кажется по первому.
+    20.10 из-за этого новый канал был заведён в первое хранилище, а падал на втором:
+    десять выпусков отвечали «no exact account binding for this profile+channel».
+
+    Привязка должна быть в ОБОИХ. Поэтому проверяем оба и говорим, в каком её нет.
+    `VS_REGISTRY` по-прежнему уважается: если задана — только она, как раньше.
+    """
+    one = os.environ.get("VS_REGISTRY")
+    if one:
+        return [one]
+    return [p for p in (os.environ.get("VIDEO_UPLOAD_AUTH_ACCOUNTS") or AUTH_STORE,
+                        os.environ.get("VIDEO_UPLOAD_ACCOUNTS_JSON") or RECOVERY_STORE)
+            if p]
+
+
 def registry_facts() -> dict:
-    """Хэш логина → что о нём знает реестр автовхода: есть ли он там, есть ли секреты,
-    и к каким парам «профиль+канал» он привязан."""
-    try:
-        with open(REGISTRY, encoding="utf-8") as f:
-            doc = json.load(f)
-    except OSError as exc:
-        raise SystemExit(f"реестр не прочитался: {exc}")
+    """Хэш логина → что о нём знают хранилища входов: есть ли он там, есть ли секреты,
+    к каким парам «профиль+канал» привязан и в каком файле привязки НЕ ХВАТАЕТ."""
     out = {}
-    for a in doc.get("accounts") or []:
-        login = a.get("login") or ""
-        out[sha(login)] = {
-            "in_registry": True,
-            "has_secrets": bool(a.get("password")
-                                and (a.get("totp") or a.get("totp_secret"))),
-            "bound": set(),
-        }
-    for b in doc.get("bindings") or []:
-        key = sha(b.get("login") or "")
-        if key in out:
-            out[key]["bound"].add((str(b.get("profile")), b.get("channel_uc")))
+    pairs_by_store = {}
+    for path in registry_paths():
+        try:
+            with open(path, encoding="utf-8") as f:
+                doc = json.load(f)
+        except OSError:
+            # Хранилища может не быть на этой машине — это не повод ронять сверку.
+            print(f"[реестр] НЕ ПРОЧИТАЛОСЬ: {path}", file=sys.stderr)
+            continue
+        here = set()
+        for a in doc.get("accounts") or []:
+            rec = out.setdefault(sha(a.get("login") or ""),
+                                 {"in_registry": True, "has_secrets": False,
+                                  "bound": set()})
+            if a.get("password") and (a.get("totp") or a.get("totp_secret")):
+                rec["has_secrets"] = True
+        for b in doc.get("bindings") or []:
+            pair = (str(b.get("profile")), b.get("channel_uc"))
+            here.add(pair)
+            rec = out.get(sha(b.get("login") or ""))
+            if rec is not None:
+                rec["bound"].add(pair)
+        pairs_by_store[path] = here
+        print(f"[реестр] прочитано: {path} — привязок {len(here)}", file=sys.stderr)
+
+    if not pairs_by_store:
+        raise SystemExit("ни одно хранилище входов не прочиталось")
+
+    # Привязка, которой нет хотя бы в одном хранилище, — мина: вход пройдёт один этап
+    # и упрётся в другой. Именно так 20.10 встали десять выпусков Baśnie Leszego.
+    sets = list(pairs_by_store.values())
+    for rec in out.values():
+        rec["bound_everywhere"] = {p for p in rec["bound"] if all(p in s for s in sets)}
+        rec["bound_partially"] = rec["bound"] - rec["bound_everywhere"]
+    if len(sets) > 1:
+        only_one = set().union(*sets) - set.intersection(*sets)
+        if only_one:
+            print(f"[реестр] привязок есть не во всех хранилищах: {len(only_one)} — "
+                  f"вход по ним пройдёт один этап и упрётся в другой", file=sys.stderr)
     return out
 
 
@@ -136,7 +189,10 @@ def report_for(profile: str, path: str, reg: dict) -> dict:
                 "manager": manager,
                 "in_registry": bool(facts.get("in_registry")),
                 "has_secrets": bool(facts.get("has_secrets")),
-                "bound": (profile, ch["uc"]) in (facts.get("bound") or set()),
+                # Привязка считается записанной только если она есть во ВСЕХ
+                # хранилищах входов: вход идёт двумя этапами и каждый читает своё.
+                # Было «хоть в одном» — и вердикт «вход настроен» выходил неправдой.
+                "bound": (profile, ch["uc"]) in (facts.get("bound_everywhere") or set()),
             })
         if rows:
             items.append({"uc": ch["uc"], "accounts": rows})
