@@ -722,20 +722,53 @@ _CODEX_REL_MINUTES = re.compile(r"(\d+)\s*(?:m\b|min\b|minutes?\b|мин)", re.I
 # Фразы, а не числа: в хвост stderr попадают последние 4000 символов, среди них бывает
 # кусок промпта. «429» само по себе встречается в тексте о войне, «429 too many requests»
 # и «exceeded retry limit» — нет.
-_CODEX_LIMIT_MARKERS = (
+#
+# РАЗДЕЛЕНО 20.10.2026, вечер. Правка выше вылечила смерть задач, но завела новую беду:
+# владелец смотрит на подписку — свободно 70%, а студия пишет «все ключи отдыхают».
+# Причина в том, что под одно слово «лимит» попали две РАЗНЫЕ вещи:
+#   * кончилось окно подписки — ждать до сброса, дом выдавать нельзя (часы);
+#   * частотное ограничение (429 Too Many Requests) — провайдер придержал нас на
+#     секунды, план при этом почти пуст.
+# Обе ветки гасили дом на _LIMIT_DEFAULT_WAIT_SEC = 15 минут. При двух домах хватало
+# пары частотных отказов, чтобы весь пул «ушёл отдыхать» при свободном плане, и каждый
+# следующий рерайт падал с «все ключи отдыхают до сброса окна».
+#
+# Поэтому списка два. Для частотного ограничения ждём _THROTTLE_WAIT_SEC (по умолчанию
+# минуту), а не четверть часа, и в тексте пишем, что это частотное — чтобы причина в
+# разборе не выглядела как исчерпанная подписка.
+_CODEX_QUOTA_MARKERS = (
     "usage limit",
-    "rate limit",
     "quota",
     "limit reached",
+)
+_CODEX_THROTTLE_MARKERS = (
+    "rate limit",
     "too many requests",
     "exceeded retry limit",
 )
+_CODEX_LIMIT_MARKERS = _CODEX_QUOTA_MARKERS + _CODEX_THROTTLE_MARKERS
+# Сколько ждать после частотного отказа. Минута: codex CLI уже отработал свои повторы
+# («exceeded retry limit»), значит мгновенный повтор упрётся туда же, а четверть часа —
+# это выброшенная пропускная способность при живом плане.
+_THROTTLE_WAIT_SEC = int(os.environ.get("REWRITE_THROTTLE_WAIT_SEC", "60") or 60)
 
 
 def _codex_text_is_limit(text) -> bool:
     """Это придержанный лимит (ждать и повторить), а не поломка вызова?"""
     lowered = str(text or "").lower()
     return any(marker in lowered for marker in _CODEX_LIMIT_MARKERS)
+
+
+def _codex_text_is_throttle(text) -> bool:
+    """Частотное ограничение (ждать секунды), а не кончившееся окно подписки (часы)?
+
+    Окно подписки главнее: если провайдер сказал и про исчерпанный план, и про частоту,
+    верим первому — иначе мы вернёмся через минуту и получим то же самое.
+    """
+    lowered = str(text or "").lower()
+    if any(marker in lowered for marker in _CODEX_QUOTA_MARKERS):
+        return False
+    return any(marker in lowered for marker in _CODEX_THROTTLE_MARKERS)
 
 
 def _codex_limit_reset_from_text(text) -> float:
@@ -762,6 +795,10 @@ def _codex_limit_to_cooldown(pool, codex_home: str, result):
     префиксу remember_limit_hit откладывает джоб до сброса, а не роняет его.
     Время сброса: из ответа, если он его называет; иначе _LIMIT_DEFAULT_WAIT_SEC —
     первый успешный вызов снимет кулдаун раньше (clear_limit).
+
+    20.10.2026, вечер: частотный отказ (429) гасит дом на минуту, а не на четверть часа.
+    Пятнадцать минут — это срок для кончившегося окна подписки; за частоту так наказывать
+    нельзя, иначе при живом плане пул пустеет от пары отказов подряд.
     """
     ok = bool(result[0])
     text = str(result[-1] or "")
@@ -773,13 +810,19 @@ def _codex_limit_to_cooldown(pool, codex_home: str, result):
         return result
     if not text.startswith("CODEX_LIMIT"):
         return result
+    throttle = _codex_text_is_throttle(text)
+    default_wait = _THROTTLE_WAIT_SEC if throttle else _LIMIT_DEFAULT_WAIT_SEC
+    # Названный провайдером срок уважаем всегда; выдуманный берём по виду отказа.
     reset_ts = (parse_limit_reset(text) or _codex_limit_reset_from_text(text)
-                or time.time() + _LIMIT_DEFAULT_WAIT_SEC)
+                or time.time() + default_wait)
     try:
         pool.mark_limited(codex_home, reset_ts)
     except Exception:                                       # noqa: BLE001
         pass
-    marked = f"{SUBSCRIPTION_LIMIT_PREFIX}reset={int(reset_ts)}|{text}"
+    # Слово в причину: иначе в разборе частотный отказ неотличим от «подписка кончилась»,
+    # и владелец видит «все ключи отдыхают» при плане, свободном на 70%.
+    kind = "частота" if throttle else "окно"
+    marked = f"{SUBSCRIPTION_LIMIT_PREFIX}reset={int(reset_ts)}|{kind}|{text}"
     return tuple(result[:-1]) + (marked,)
 
 
@@ -1000,9 +1043,15 @@ class ServerCredentialPool:
                     # и соседние джобы повисли бы на пять минут, а потом упали с «lease
                     # timeout» — чужие задачи платили бы за наш лимит. Отвечаем сразу и
                     # с временем сброса: решение «ждать или падать» принимает вызывающий.
+                    #
+                    # 20.10.2026: называем и срок. «Все ключи отдыхают» без срока читается
+                    # как «подписка кончилась», и владелец ищет беду в плане, хотя ближайший
+                    # ключ освобождается через минуту после частотного отказа.
+                    wait_s = max(0, int(min(cooling) - now_ts))
+                    when = f"{wait_s} с" if wait_s < 90 else f"{wait_s // 60} мин"
                     raise CredentialPoolExhausted(
                         f"{SUBSCRIPTION_LIMIT_PREFIX}reset={int(min(cooling))}|"
-                        f"{self.provider}: все ключи отдыхают до сброса окна"
+                        f"{self.provider}: все ключи отдыхают, ближайший освободится через {when}"
                     )
                 remaining = (
                     None if deadline is None else max(0.0, deadline - time.monotonic())
@@ -11309,6 +11358,13 @@ def _cleanup_strict_rewrite_results(
             if any(marker.lower() in reason.lower() for marker in _CLEANUP_FATAL_MARKERS):
                 break
         if reason:
+            # 20.10.2026. Лимит подписки на проверке качества — это ПАУЗА, а не провал.
+            # Утром мы научили ждать сам рерайт, а проверка осталась со старым поведением:
+            # 24 выпуска встали «рерайт не справился», хотя внутри у всех был
+            # SUBSCRIPTION_LIMIT, а куски текста лежали готовые («rewrite chunks retained»).
+            # Отметка для финализации (pop_limit_hit) переводит джоб в отложку до сброса —
+            # дальше он доедет сам, без разбора и без повторной оплаты рерайта.
+            remember_limit_hit(job_id, reason)
             raise RewriteQualityError(
                 f"QUALITY_REVIEW_FAILED: piece {index + 1}/{len(pieces)}: {reason[:200]}; "
                 "rewrite chunks retained for retry")
