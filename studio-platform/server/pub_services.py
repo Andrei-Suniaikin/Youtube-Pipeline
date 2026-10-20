@@ -26,7 +26,7 @@ import time
 
 import pub_artifact
 import pub_calls
-from pub_engine import ItemFailed, ResourceDown
+from pub_engine import ItemFailed, ResourceDown, _limit_text as pub_engine_limit_text
 # Фазу выпуска двигает не только движок: проход «забрать уже оплаченное» (в конце
 # файла) доводит до `source_ready` текст, который сосед написал ещё во время паузы.
 # Охрана по статусу («владелец мог отменить выпуск, пока мы ходили в сеть») обязана
@@ -1486,10 +1486,19 @@ class PubServices:
                      "генератор не отдал обложку, а смягчить надпись нечем: нет ключа "
                      "сервиса текста", level="warn")
             return ""
+        import tts_soften
         try:
             new_text = cover_soften.soften_text(text, rel["lang"] or "ru", done + 1, key,
                                                 REWRITE_BASE, video_title=donor_title or "")
-        except cover_soften.SoftenError as exc:
+        except (cover_soften.SoftenError, tts_soften.SoftenError) as exc:
+            # 20.10.2026. Сюда прилетают ДВА разных класса: свой `cover_soften.SoftenError`
+            # (ответ модели не годится) и `tts_soften.SoftenError` из общего HTTP-вызова
+            # (подписка не ответила). Ловили только первый — второй пролетал в движок и
+            # уводил выпуск в карантин «ошибка на шаге «cover_ready»», хотя это был
+            # частотный отказ 429, и ключ освобождался через минуту (r_f6c094c1d8).
+            if pub_engine_limit_text(exc):
+                # Лимит — не провал раунда смягчения. Раунд не тратим, выпуск ждёт.
+                raise ResourceDown("codex", f"смягчение надписи обложки: {exc}")
             log_line(c, rel["release_id"], "обложка",
                      f"генератор не отдал обложку; смягчение надписи (раунд {done + 1} из "
                      f"{self.COVER_SOFTEN_ROUNDS}) не удалось: {exc}", level="warn")

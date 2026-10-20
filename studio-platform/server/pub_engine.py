@@ -70,6 +70,16 @@ DEFAULT_DEADLINE = 3600
 MAX_ATTEMPTS = 3
 
 
+_LIMIT_MARKERS = ("SUBSCRIPTION_LIMIT", "HOST_BUDGET_WAIT", "все ключи отдыхают")
+
+
+def _limit_text(exc) -> bool:
+    """Это отказ подписки «подожди», а не поломка? По тексту: так его помечает рерайт
+    (SUBSCRIPTION_LIMIT:reset=…|частота|…), и через HTTP 502 он доходит сюда строкой."""
+    text = str(exc or "")
+    return any(marker in text for marker in _LIMIT_MARKERS)
+
+
 class ResourceDown(Exception):
     """Отказ ОБЩЕГО ресурса: кредиты, сосед, машина заливки.
 
@@ -1104,6 +1114,18 @@ def advance(c, rel, services, now: float) -> str:
         quarantine(c, rel, now, str(exc))
         return "quarantined"
     except Exception as exc:                       # noqa: BLE001 — падение обработчика
+        if _limit_text(exc):
+            # 20.10.2026: лимит подписки — не падение обработчика, а занятый общий
+            # ресурс. Обложка (r_f6c094c1d8) улетела в карантин с «ошибка на шаге
+            # «cover_ready»: подписка Codex не ответила (502): SUBSCRIPTION_LIMIT…», хотя
+            # ключи освобождались через минуту. Ведём, как ResourceDown: строка ждёт,
+            # следующий круг движка попробует снова, оплаченное не трогаем.
+            _set(c, rid, now, status="pending",
+                 deadline=now + PHASE_DEADLINES.get(phase, DEFAULT_DEADLINE),
+                 blocked_reason=f"ждём: подписка занята — {exc}")
+            log_phase(c, rid, "resource_wait", now, payload={"resource": "подписка"})
+            log_line(c, rid, "подписка", f"ждём: {exc}", level="warn", now=now)
+            return "resource_wait"
         quarantine(c, rel, now, f"ошибка на шаге «{want}»: {exc}")
         return "quarantined"
 
