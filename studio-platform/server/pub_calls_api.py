@@ -34,6 +34,19 @@ def register_calls_routes(app, ctx):
     db = ctx["db"]
     _now = ctx["_now"]
 
+    def _note(line: str) -> None:
+        """След повторов в journal: по нему видно, что база занята, а не что всё тихо."""
+        print(f"[calls] {line}", flush=True)
+
+    def _write(label: str, work):
+        """Запись в журнал платных вызовов с повтором на занятой базе.
+
+        19.10.2026 так потерялись 23 отметки «результат получен»: движок получил 500,
+        деньги остались потраченными, а строка — в `ordered`. Подробности и доказательство
+        безопасности повтора — в pub_calls.write_retry.
+        """
+        return pc.write_retry(db, work, label=label, log=_note)
+
     def _job(request: Request, body: dict):
         """Задача, от имени которой пишет движок. Возвращает строку queue_tasks.
 
@@ -84,11 +97,11 @@ def register_calls_routes(app, ctx):
         if not unit or not fp:
             raise HTTPException(400, "нужны unit и fingerprint")
         kind = str(body.get("kind") or job["kind"] or "").strip()[:32]
-        c = db()
-        try:
+
+        def work(c):
             rel = c.execute("SELECT release_id FROM pub_releases WHERE project_id=?",
                             (job["project_id"],)).fetchone()
-            res = pc.reserve(
+            return pc.reserve(
                 c,
                 tenant_id=job["tenant_id"],
                 project_id=job["project_id"],
@@ -100,9 +113,8 @@ def register_calls_routes(app, ctx):
                 model=str(body.get("model") or "")[:60],
                 now=_now(),
             )
-            c.commit()
-        finally:
-            c.close()
+
+        res = _write(f"заявка {kind}/{unit}", work)
         row = res["row"]
         return {"action": res["action"], "status": res["status"], "call_id": res["call_id"],
                 "remote_order_id": row["remote_order_id"], "result_path": row["result_path"],
@@ -115,13 +127,12 @@ def register_calls_routes(app, ctx):
         order = str(body.get("remote_order_id") or "").strip()[:120]
         if not order:
             raise HTTPException(400, "нужен remote_order_id")
-        c = db()
-        try:
+
+        def work(c):
             _call_of(c, call_id, job)
             pc.mark_ordered(c, call_id, order, now=_now())
-            c.commit()
-        finally:
-            c.close()
+
+        _write(f"заказ создан #{call_id}", work)
         return {"ok": True}
 
     @app.post("/api/calls/{call_id}/delivered")
@@ -132,28 +143,26 @@ def register_calls_routes(app, ctx):
         if not path:
             raise HTTPException(400, "нужен result_path: «готово» доказывается файлом")
         cost = body.get("cost")
-        c = db()
-        try:
+
+        def work(c):
             _call_of(c, call_id, job)
             pc.mark_delivered(c, call_id, path,
                               cost=(float(cost) if cost not in (None, "") else None),
                               now=_now())
-            c.commit()
-        finally:
-            c.close()
+
+        _write(f"результат получен #{call_id}", work)
         return {"ok": True}
 
     @app.post("/api/calls/{call_id}/failed")
     async def calls_failed(call_id: int, request: Request):
         body = await request.json()
         job = _job(request, body)
-        c = db()
-        try:
+
+        def work(c):
             _call_of(c, call_id, job)
             pc.mark_failed(c, call_id, str(body.get("error") or "")[:500],
                            ordered=bool(body.get("ordered")),
                            lost=bool(body.get("lost")), now=_now())
-            c.commit()
-        finally:
-            c.close()
+
+        _write(f"вызов не удался #{call_id}", work)
         return {"ok": True}

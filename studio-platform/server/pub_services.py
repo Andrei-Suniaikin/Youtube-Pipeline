@@ -647,21 +647,38 @@ class PubServices:
         Повтор должен спросить про существующий заказ, а не создать новый.
         """
         lang = rel["lang"] or "ru"
-        try:
-            row = c.execute(
+
+        def mark(conn):
+            row = conn.execute(
                 "SELECT id FROM provider_calls WHERE release_id=? AND kind='text' "
                 "AND unit=? ORDER BY id DESC LIMIT 1",
                 (rel["release_id"], lang)).fetchone()
             if not row:
-                return
+                return None
             if result:
-                pub_calls.mark_delivered(c, row["id"], result)
+                pub_calls.mark_delivered(conn, row["id"], result)
             else:
-                pub_calls.mark_failed(c, row["id"], (error or "текст не получен")[:400],
+                pub_calls.mark_failed(conn, row["id"], (error or "текст не получен")[:400],
                                       ordered=True)
-            c.commit()
-        except Exception:                                          # noqa: BLE001
-            pass          # журнал не должен ронять сам выпуск
+            return row["id"]
+
+        try:
+            # Занятая база — не повод терять отметку о потраченных деньгах: без неё строка
+            # останется в `ordered`, и следующий проход пойдёт ВЫЯСНЯТЬ судьбу заказа
+            # вместо готового текста. Соединение здесь чужое, переоткрыть нельзя, поэтому
+            # повторяем работу на нём же (pub_calls.retry_here).
+            #
+            # След повторов идёт в journal, а не в журнал выпуска: запись в журнал — это
+            # тоже запись в ту же занятую базу, и жаловаться на замок в него же значит
+            # добавлять работы тому, кто за замок и борется.
+            pub_calls.retry_here(c, mark, label=f"текст {lang}",
+                                 log=lambda line: print(f"[calls] {line}", flush=True))
+        except Exception as exc:                                   # noqa: BLE001
+            # Журнал не должен ронять сам выпуск — но и молчать о потере отметки нельзя:
+            # до 19.10.2026 здесь стоял голый `pass`, и 23 отметки «результат получен»
+            # исчезли бесследно. Пишем в journal и идём дальше.
+            print(f"[calls] НЕ ЗАПИСАНА отметка по тексту {lang} "
+                  f"({type(exc).__name__}: {str(exc)[:200]})", flush=True)
 
     def do_project_ready(self, c, rel):
         """Завести проект VideoStudio из готового текста и запомнить его за выпуском."""

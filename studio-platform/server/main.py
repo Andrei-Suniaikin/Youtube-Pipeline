@@ -145,6 +145,8 @@ _SCHED_HB = {
     "last_launched": 0,    # сколько задач запущено на последнем проходе
     "pass_ms": 0.0,        # длительность последнего прохода (ловит залипание)
     "max_pass_ms": 0.0,
+    "locked": 0,           # проходов пропущено из-за занятой базы (это не ошибка)
+    "last_locked_ts": 0.0,
 }
 _SCHED_THREAD = None       # сам поток — чтобы watchdog видел is_alive()
 
@@ -13916,10 +13918,19 @@ def _scheduler_loop():
             if c:
                 try: c.close()
                 except Exception: pass
-            _SCHED_HB["errors"] += 1
-            _SCHED_HB["last_err"] = "%s: %s" % (type(e).__name__, str(e)[:300])
-            _SCHED_HB["last_err_ts"] = time.time()
-            log_exc("_scheduler_loop")
+            # Занятая база — не сбой диспетчера, а чужая запись в ту же секунду. Раздача
+            # задач идёт раз в секунду, и пропустить один проход дешевле, чем писать в
+            # journal трейсбек: 19.10.2026 `_claim_fair_tasks` так уронил 15 проходов,
+            # и за ними в журнале не стало видно настоящих ошибок. Считаем отдельно —
+            # счётчик виден на /healthz, и по нему заметен рост конкуренции.
+            if pub_calls.is_locked(e):
+                _SCHED_HB["locked"] = _SCHED_HB.get("locked", 0) + 1
+                _SCHED_HB["last_locked_ts"] = time.time()
+            else:
+                _SCHED_HB["errors"] += 1
+                _SCHED_HB["last_err"] = "%s: %s" % (type(e).__name__, str(e)[:300])
+                _SCHED_HB["last_err_ts"] = time.time()
+                log_exc("_scheduler_loop")
         _t.sleep(1.0)
 
 
@@ -13974,6 +13985,12 @@ def _sched_health():
         "last_err": _SCHED_HB["last_err"],
         "last_err_age_sec": round(now - _SCHED_HB["last_err_ts"], 1) if _SCHED_HB["last_err_ts"] else None,
         "last_launched": _SCHED_HB["last_launched"],
+        # Пропуски из-за занятой базы стоят ОТДЕЛЬНО от ошибок: это нормальная
+        # конкуренция на запись, а не поломка. Растущее число — повод смотреть, кто
+        # держит запись дольше секунды, но не повод отдавать 503.
+        "locked_skips": _SCHED_HB.get("locked", 0),
+        "last_locked_age_sec": (round(now - _SCHED_HB["last_locked_ts"], 1)
+                                if _SCHED_HB.get("last_locked_ts") else None),
         "pass_ms": round(_SCHED_HB["pass_ms"], 1),
         "max_pass_ms": round(_SCHED_HB["max_pass_ms"], 1),
         "uptime_sec": round(now - _SCHED_HB["started"], 1) if _SCHED_HB["started"] else None,
