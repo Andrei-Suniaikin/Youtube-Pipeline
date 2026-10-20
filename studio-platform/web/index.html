@@ -1588,11 +1588,20 @@ function wireReasonFolds(root){
 /* ─────────────────────────── список выпусков ─────────────────────────── */
 
 let FILTERS = {channel:'', phase:'', status:''};
+// По сколько выпусков просим за раз (владелец 20.10.2026). Двадцать — это примерно
+// полтора экрана: подгрузка успевает отработать раньше, чем человек долистает.
+const PAGE_RELEASES = 20;
+
+function pageQuery(offset){
+  const q = new URLSearchParams(Object.entries(FILTERS).filter(([,v]) => v));
+  q.set('limit', String(PAGE_RELEASES));
+  q.set('offset', String(offset));
+  return q.toString();
+}
 
 async function viewReleases(){
-  const q = new URLSearchParams(Object.entries(FILTERS).filter(([,v]) => v)).toString();
   const [data, chs] = await Promise.all([
-    api('/ui/releases' + (q ? '?' + q : '')),
+    api('/ui/releases?' + pageQuery(0)),
     api('/ui/channels'),
   ]);
 
@@ -1694,7 +1703,8 @@ async function viewReleases(){
   // ждущие; внутри — в прежнем порядке выходов.
   const THEAD = of => `<thead><tr ${of ? `data-of="${esc(of)}" hidden` : ''}>
     <th>Выпуск</th><th>Канал</th><th>Выход</th><th>Фаза</th><th>Без движения</th></tr></thead>`;
-  const groups = groupByReason(data.releases, blockLabel, r => r.status || '', 'rg');
+  const buildListHtml = rowsNow => {
+  const groups = groupByReason(rowsNow, blockLabel, r => r.status || '', 'rg');
   groups.forEach(g => { g.tip = blockTip(g.rows[0]); });
   const singles = groups.filter(g => g.rows.length < 2).map(g => g.rows[0]);
   const many = groups.filter(g => g.rows.length >= 2);
@@ -1726,11 +1736,67 @@ async function viewReleases(){
       <table>${THEAD('')}<tbody>${singles.map(r => relRowHtml(r, '')).join('')}</tbody></table>
     </div>` : '';
 
-  const box = $(`<div>${cards.join('')}${rest}</div>`);
-  box.querySelectorAll('tr.row').forEach(tr =>
-    tr.onclick = () => location.hash = '#/release/' + tr.dataset.id);
-  wireReasonFolds(box);
-  app.append(box);
+  return cards.join('') + rest;
+  };
+
+  // Подгрузка по двадцать: экран открывается сразу, а не ждёт, пока сервер соберёт
+  // тысячу строк с полосками этапов. Накопленные строки держим здесь и перерисовываем
+  // список целиком — группировка по причине обязана видеть все уже пришедшие выпуски,
+  // иначе одна и та же беда разъедется на несколько карточек по мере прокрутки.
+  // ВАЖНО: `$()` отдаёт ОБЁРТКУ с разобранным HTML внутри, а не сам элемент. Если
+  // написать `$('<div id="rel-list">')` и потом присвоить ему innerHTML, внутренний div
+  // вместе с идентификатором исчезнет при первой же перерисовке — подгрузка переставала
+  // находить собственный список. Поэтому элементы делаем пустыми обёртками и подписываем
+  // их сами.
+  const box = $(''); box.id = 'rel-list';
+  const foot = $(''); foot.id = 'rel-foot';
+  foot.className = 'muted';
+  foot.style.padding = '12px 2px';
+  const rows = data.releases.slice();
+  let hasMore = data.has_more, busy = false;
+
+  const draw = () => {
+    box.innerHTML = buildListHtml(rows);
+    box.querySelectorAll('tr.row').forEach(tr =>
+      tr.onclick = () => location.hash = '#/release/' + tr.dataset.id);
+    wireReasonFolds(box);
+    // Кнопка рядом со счётчиком — не украшение: прокрутка может не сработать (мышь без
+    // колеса, список короче экрана, старый браузер), и тогда нажатие остаётся
+    // единственным способом добраться до остальных выпусков.
+    foot.innerHTML = hasMore
+      ? `показано ${rows.length} из ${data.total} `
+        + `<button class="ghost" id="rel-more">Показать ещё ${PAGE_RELEASES}</button>`
+      : (data.total > PAGE_RELEASES ? `показаны все ${data.total}` : '');
+    const btn = foot.querySelector('#rel-more');
+    if (btn) btn.onclick = loadMore;
+  };
+
+  async function loadMore(){
+    if (busy || !hasMore) return;
+    busy = true;
+    foot.textContent = 'подгружаю…';
+    try {
+      const next = await api('/ui/releases?' + pageQuery(rows.length));
+      // Отборы могли смениться, пока мы ходили на сервер: тогда этот ответ уже не наш.
+      if (!document.getElementById('rel-list')) return;
+      rows.push(...next.releases);
+      hasMore = next.has_more && next.releases.length > 0;
+      draw();
+    } catch (e) {
+      foot.textContent = 'не удалось подгрузить — прокрутите ещё раз';
+    } finally { busy = false; }
+  }
+
+  draw();
+  app.append(box, foot);
+  // Наблюдатель за подвалом: как только он появляется на экране — просим следующие
+  // двадцать. Запас 400 px, чтобы подгрузка успевала до конца списка.
+  if (hasMore && 'IntersectionObserver' in window) {
+    const eye = new IntersectionObserver(entries => {
+      if (entries.some(e => e.isIntersecting)) loadMore();
+    }, {rootMargin: '400px'});
+    eye.observe(foot);
+  }
 }
 
 /* ─────────────────────────── карточка выпуска ─────────────────────────── */

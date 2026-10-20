@@ -273,7 +273,32 @@ def _state(status) -> str:
     return "queued" if s else "idle"
 
 
-def _releases(c, channel=None, phase=None, status=None) -> list:
+def _releases_total(c, channel=None, phase=None, status=None) -> int:
+    """Сколько выпусков под этими отборами — без полосок и объяснений, только счёт."""
+    sql = ("SELECT COUNT(*) FROM pub_releases r "
+           "JOIN pub_channels ch ON ch.id = r.channel_id WHERE r.tenant_id = ?")
+    args = [TENANT]
+    if channel:
+        sql += " AND ch.id = ?"
+        args.append(int(channel))
+    if phase:
+        sql += " AND r.phase = ?"
+        args.append(phase)
+    if status:
+        sql += " AND r.status = ?"
+        args.append(status)
+    row = c.execute(sql, args).fetchone()
+    return int(row[0] if row else 0)
+
+
+def _releases(c, channel=None, phase=None, status=None, limit=0, offset=0) -> list:
+    """Строки экрана выпусков. limit=0 — все (так зовут изнутри, для карточки выпуска).
+
+    20.10.2026: экран грузил ВСЕ выпуски разом — 996 строк, из них 842 давно вышедших,
+    и на каждую считались полоска этапов, объяснение причины и пробелы настройки. На
+    холодную это 2,8 с только в запросах. Поэтому экран теперь просит по двадцать штук
+    и подгружает дальше при прокрутке, а limit/offset живут здесь.
+    """
     sql = ("SELECT r.release_id, r.phase, r.status, r.slot_at, r.attempts, r.updated,"
            "       r.blocked_reason, r.video_id, r.project_id, r.plan_item_id,"
            "       r.hand_confirmed, r.hand_by,"
@@ -294,7 +319,13 @@ def _releases(c, channel=None, phase=None, status=None) -> list:
     if status:
         sql += " AND r.status = ?"
         args.append(status)
-    sql += " ORDER BY r.slot_at"
+    # Порядок обязан быть ОДНОЗНАЧНЫМ: у выпусков одного канала выход часто совпадает
+    # до секунды, и без второго ключа соседние страницы могли бы отдать одну строку
+    # дважды, а другую не отдать совсем.
+    sql += " ORDER BY r.slot_at, r.id"
+    if limit:
+        sql += " LIMIT ? OFFSET ?"
+        args += [int(limit), max(0, int(offset))]
 
     now = time.time()
     rows = list(c.execute(sql, args))
@@ -641,10 +672,18 @@ def ui_static(name: str):
 
 @app.get("/ui/releases")
 def ui_releases(channel: int | None = None, phase: str | None = None,
-                status: str | None = None):
+                status: str | None = None, limit: int = 0, offset: int = 0):
+    """Экран выпусков. Без limit отдаём всё — так зовут старые места и внешние проверки.
+
+    `total` считаем отдельным COUNT по тем же отборам: экран показывает «показано 20 из
+    996», иначе подгрузка выглядит как «список кончился», хотя он только начался.
+    """
     c = db()
     try:
-        return {"releases": _releases(c, channel, phase, status),
+        rows = _releases(c, channel, phase, status, limit=limit, offset=offset)
+        total = _releases_total(c, channel, phase, status)
+        return {"releases": rows, "total": total,
+                "has_more": bool(limit) and (int(offset) + len(rows)) < total,
                 "phases": [{"key": p, "title": PHASE_TITLE.get(p, p)} for p in PHASES]}
     finally:
         c.close()
