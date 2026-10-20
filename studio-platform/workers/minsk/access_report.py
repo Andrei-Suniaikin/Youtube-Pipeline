@@ -19,9 +19,14 @@
 сверки — это идентификаторы разметки страницы, а не номера каналов, и совпадать с нашими
 `UC…` они не обязаны. Название берём из того же списка, что видит человек.
 
-    python3 access_report.py                       # все профили, последняя запись каждого
-    python3 access_report.py --only 54,34          # только эти
-    python3 access_report.py --dry-run             # показать, что отправится
+ЗАПУСКАТЬ С ПОЛНЫМ ОКРУЖЕНИЕМ ПУЛЛЕРА — иначе и токен, и пути к хранилищам будут
+не те. У заливщика два env-файла, и второй ПЕРЕБИВАЕТ первый: в `~/.vsupload_env`
+лежит устаревший `UPLOAD_TOKEN`, верный — в `~/.vsupload_env_studio`. Поэтому:
+
+    set -a; . ~/.vsupload_env; . ~/.vsupload_env_studio; set +a
+    python3 -I access_report.py                    # все профили, последняя запись каждого
+    python3 -I access_report.py --only 54,34       # только эти
+    python3 -I access_report.py --dry-run          # показать, что отправится
 """
 from __future__ import annotations
 
@@ -60,10 +65,22 @@ def sha(text: str) -> str:
 
 
 def token() -> str:
-    """Токен ноды заливки — тот же, которым ходит почта и вердикты заливки."""
-    got = os.environ.get("VIDEO_UPLOAD_TOKEN") or os.environ.get("VS_UPLOAD_TOKEN")
-    if got:
-        return got.strip()
+    """Токен ноды заливки — тот же, которым ходят вердикты заливки.
+
+    ИСПРАВЛЕНО 20.10.2026. Боевые пуллеры берут его из `UPLOAD_TOKEN`
+    (`upload_puller.py`: `TOKEN = os.environ.get("UPLOAD_TOKEN", "")`, задаётся в
+    `~/.vsupload_env`), а здесь этого имени в списке не было — зато первым шёл файл
+    `~/.vsupload_token`, в котором лежит УСТАРЕВШИЙ токен (хэш c6456236…, у студии
+    41e50c5c…). Поэтому студия отвечала 401 на все 23 профиля. Боевое имя теперь первое,
+    файлы остаются запасным вариантом.
+
+    Порядок важен: сначала env, потом файлы — env задаёт systemd рядом с пуллером,
+    а файл может быть забытым слепком с прошлой настройки.
+    """
+    for name in ("UPLOAD_TOKEN", "VIDEO_UPLOAD_TOKEN", "VS_UPLOAD_TOKEN"):
+        got = os.environ.get(name)
+        if got and got.strip():
+            return got.strip()
     for path in TOKEN_FILES:
         try:
             with open(path, encoding="utf-8") as f:
@@ -97,9 +114,14 @@ def registry_paths() -> list:
     one = os.environ.get("VS_REGISTRY")
     if one:
         return [one]
-    return [p for p in (os.environ.get("VIDEO_UPLOAD_AUTH_ACCOUNTS") or AUTH_STORE,
-                        os.environ.get("VIDEO_UPLOAD_ACCOUNTS_JSON") or RECOVERY_STORE)
-            if p]
+    # `dict.fromkeys` — чтобы не читать один файл дважды: когда env подключён не
+    # полностью (только `~/.vsupload_env`, без `~/.vsupload_env_studio`), обе
+    # переменные указывают на одно и то же, и «привязка есть во всех хранилищах»
+    # вышло бы правдой по недоразумению.
+    return list(dict.fromkeys(
+        p for p in (os.environ.get("VIDEO_UPLOAD_AUTH_ACCOUNTS") or AUTH_STORE,
+                    os.environ.get("VIDEO_UPLOAD_ACCOUNTS_JSON") or RECOVERY_STORE)
+        if p))
 
 
 def registry_facts() -> dict:
