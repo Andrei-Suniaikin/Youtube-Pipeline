@@ -39,6 +39,7 @@ import datetime as dt
 import hashlib
 import json
 import os
+import random
 import re
 import sqlite3
 import time
@@ -56,6 +57,109 @@ VERIFY = "verify"           # спросить провайдера про су�
 RETRY = "retry"             # прошлая попытка не дошла до заказа — можно пробовать снова
 
 _ACTION = {DELIVERED: SKIP, ORDERED: VERIFY, RESERVED: VERIFY, FAILED: RETRY}
+
+
+# ── Запись под замком SQLite ─────────────────────────────────────────────────
+# 19.10.2026. За сутки в журнал не легли 23 отметки «результат получен» и 3 «заказ
+# создан»: SQLite ответил `database is locked` несмотря на `busy_timeout=30000`.
+# Это не зависание базы, а конкуренция на запись — две пачки, 10:44 и 14:55–15:19,
+# как раз когда планировщик раздавал задачи, а движки закрывали вызовы.
+#
+# Для ЭТОГО журнала цена отказа особая. Деньги за вызов уже потрачены, а строка
+# осталась в `ordered`: следующий проход увидит её и пойдёт ВЫЯСНЯТЬ судьбу заказа
+# (`VERIFY`) вместо того, чтобы взять готовый файл с диска. В худшем случае — платный
+# заказ заново. Поэтому отметку о потраченных деньгах повторяем, пока база не примет.
+#
+# Повтор здесь безопасен, и это надо сказать прямо: `database is locked` означает, что
+# транзакция НЕ состоялась — ни одной строки не записано. Мы повторяем не платный вызов,
+# а отметку о нём; правило «повтор оплачиваемого create запрещён» этим не нарушается.
+_LOCKED_WORDS = ("database is locked", "database table is locked", "database is busy")
+
+
+def is_locked(exc: BaseException) -> bool:
+    """База была занята другим писателем (а не сломана и не испорчена)."""
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    text = str(exc).lower()
+    return any(word in text for word in _LOCKED_WORDS)
+
+
+def _pause(attempt: int, base: float) -> float:
+    """Пауза растёт с попытками, но со случайной добавкой.
+
+    Без неё два процесса, получившие отказ одновременно, вернутся тоже одновременно и
+    снова столкнутся — расходясь по времени, они расходятся и по замку.
+    """
+    return base * attempt + random.random() * base
+
+
+def write_retry(open_conn, work, *, tries: int = 5, base: float = 0.4,
+                label: str = "", log=None):
+    """Выполнить запись целиком, повторив её, если база была занята.
+
+    Повторяем ВМЕСТЕ с открытием соединения: брошенная транзакция держит свой же замок,
+    и попытка номер два на том же соединении спорила бы сама с собой.
+
+    Что НЕ повторяем: всё, что не `database is locked`. Отказ прав, чужой проект,
+    испорченная строка — это ответы, а не помехи, и повторять их бессмысленно.
+    """
+    last = None
+    for attempt in range(1, max(1, tries) + 1):
+        c = open_conn()
+        try:
+            out = work(c)
+            c.commit()
+            if attempt > 1 and log:
+                log(f"{label or 'запись'}: прошла с {attempt}-й попытки")
+            return out
+        except sqlite3.OperationalError as exc:
+            try:
+                c.rollback()
+            except Exception:                               # noqa: BLE001
+                pass
+            if not is_locked(exc) or attempt >= tries:
+                raise
+            last = exc
+            if log:
+                log(f"{label or 'запись'}: база занята, попытка {attempt} из {tries}")
+            time.sleep(_pause(attempt, base))
+        finally:
+            try:
+                c.close()
+            except Exception:                               # noqa: BLE001
+                pass
+    raise last                                              # pragma: no cover
+
+
+def retry_here(c: sqlite3.Connection, work, *, tries: int = 5, base: float = 0.4,
+               label: str = "", log=None):
+    """То же, но на ЧУЖОМ соединении: повторяем работу и commit, не переоткрывая связь.
+
+    Нужна там, где соединение принадлежит вызывающему (`pub_services._close_text_call`):
+    переоткрыть его нельзя, а терять отметку о потраченных деньгах нельзя тем более.
+
+    Почему повтор на том же соединении безопасен. `database is locked` означает, что НИ
+    ОДНА наша запись не легла: кто первым записал строку, тот и держит замок записи, и
+    второй writer не получает его вовсе. Значит, повторять нечего бояться — повторяется
+    работа, которой в базе нет. Отката здесь поэтому нет: он выбросил бы чужую работу,
+    сделанную в той же транзакции до нас.
+    """
+    last = None
+    for attempt in range(1, max(1, tries) + 1):
+        try:
+            out = work(c)
+            c.commit()
+            if attempt > 1 and log:
+                log(f"{label or 'запись'}: прошла с {attempt}-й попытки")
+            return out
+        except sqlite3.OperationalError as exc:
+            if not is_locked(exc) or attempt >= tries:
+                raise
+            last = exc
+            if log:
+                log(f"{label or 'запись'}: база занята, попытка {attempt} из {tries}")
+            time.sleep(_pause(attempt, base))
+    raise last                                              # pragma: no cover
 
 
 def ensure_calls_schema(c: sqlite3.Connection) -> None:
