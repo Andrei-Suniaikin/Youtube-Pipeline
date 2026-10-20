@@ -1566,6 +1566,19 @@ class PubServices:
                          f"сервис обложек не принял задачу {known['remote_job_id']} обратно "
                          f"(«{said[:80]}») — закажу заново, когда освободится место")
                 raise ResourceDown("обложки", "очередь сервиса обложек заполнена — повторю заказ")
+            if pub_engine_limit_text(said):
+                # 20.10.2026, ночь. Сервис обложек ответил «подписка codex:
+                # SUBSCRIPTION_LIMIT…|все ключи отдыхают» — это не брак обложки, а
+                # придержанная частота: ключ освобождается через минуту. Три выпуска за
+                # вечер ушли с этим в карантин как «обложка не сделалась». Поступаем, как с
+                # заполненной очередью выше: задачу забываем и закажем заново, когда
+                # подписка ответит; раунды и автовозвраты не тратим.
+                c.execute("DELETE FROM pub_release_jobs WHERE release_id=? AND service='cover' "
+                          "AND kind='job'", (rel["release_id"],))
+                log_line(c, rel["release_id"], "обложка",
+                         f"сервис обложек упёрся в лимит подписки («{said[:80]}») — закажу "
+                         "заново, когда ключ освободится", level="warn")
+                raise ResourceDown("codex", f"обложка: {said[:120]}")
             reason = "обложка не сделалась: " + (said or state)
             self._finish_remote(c, rel["release_id"], "cover", "error", reason)
             raise ItemFailed(reason)

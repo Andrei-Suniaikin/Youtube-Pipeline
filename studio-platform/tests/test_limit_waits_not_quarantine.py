@@ -98,6 +98,13 @@ def main() -> int:
     check("причина начинается с «ждём: подписка занята»",
           why.startswith("ждём: подписка занята"), True)
 
+    print("\n1б. Движок: ItemFailed с лимитом в тексте — тоже ждём")
+    out, status, _, why = advance_with(E.ItemFailed(
+        "рерайт не справился: 1 из 1 задач не выполнено | QUALITY_REVIEW_FAILED: piece 1/2: " + LIMIT))
+    check("исход — ожидание ресурса", out, "resource_wait")
+    check("выпуск ждёт", status, "pending")
+    check("причина — «ждём: подписка занята»", why.startswith("ждём: подписка занята"), True)
+
     print("\n2. Движок: обычная поломка по-прежнему в карантин")
     out, status, _, why = advance_with(RuntimeError("KeyError: 'preset'"))
     check("исход — карантин", out, "quarantined")
@@ -124,6 +131,20 @@ def main() -> int:
             check("ресурс назван", exc.resource, "codex")
         check("новая обложка не заказана", T.FakeCover.title_jobs, [])
         check("раунд смягчения не потрачен", T.job_row(c)["error"], "re-ordered")
+
+        print("\n3б. Обложка: сервис обложек ответил лимитом — ResourceDown, задача забыта")
+        cover_soften.tts_soften.chat_once = lambda messages, key, base, **kw: "НЕ НУЖНО"
+        c = T.db("cover-soften:1")
+        limited_job = {"status": "error", "results_count": 0, "output_files": [],
+                       "error": "подписка codex: " + LIMIT, "finished_at": T.NOW, "log": ""}
+        try:
+            got = T.step(c, limited_job)
+            check("лимит сервиса обложек поднимает ResourceDown", got, "ResourceDown")
+        except S.ResourceDown as exc:
+            check("лимит сервиса обложек поднимает ResourceDown", True, True)
+            check("ресурс — codex", exc.resource, "codex")
+        check("задача обложки забыта — закажем заново", T.job_row(c), None)
+        check("смягчение не звали и обложку не заказывали", T.FakeCover.title_jobs, [])
 
         print("\n4. Обложка: обычный отказ сервиса — как раньше: в разбор, без заказа")
         # Не-лимитный отказ (сеть, таймаут) лечить ожиданием нельзя — он не пройдёт сам.

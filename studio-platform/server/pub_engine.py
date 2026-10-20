@@ -1111,6 +1111,17 @@ def advance(c, rel, services, now: float) -> str:
         log_line(c, rid, str(exc.resource), f"ждём: {exc}", level="warn", now=now)
         return "resource_wait"
     except ItemFailed as exc:
+        if _limit_text(exc):
+            # Обработчик честно сказал «не вышло», но причина — лимит подписки
+            # (например, «рерайт не справился … SUBSCRIPTION_LIMIT»). Сервис рерайта сам
+            # продолжит задачу через минуту («продолжит с места обрыва»), а выпуск до
+            # 20.10 успевал уехать в карантин и ждал автовозврата полчаса.
+            _set(c, rid, now, status="pending",
+                 deadline=now + PHASE_DEADLINES.get(phase, DEFAULT_DEADLINE),
+                 blocked_reason=f"ждём: подписка занята — {exc}")
+            log_phase(c, rid, "resource_wait", now, payload={"resource": "подписка"})
+            log_line(c, rid, "подписка", f"ждём: {exc}", level="warn", now=now)
+            return "resource_wait"
         quarantine(c, rel, now, str(exc))
         return "quarantined"
     except Exception as exc:                       # noqa: BLE001 — падение обработчика
