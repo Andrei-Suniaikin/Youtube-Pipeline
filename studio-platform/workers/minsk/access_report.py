@@ -42,9 +42,15 @@ AUTH_STORE = ("/home/vova/ww2_upload_stress_20260914/private/"
               "upload_accounts_recovery.json")
 RECOVERY_STORE = ("/home/vova/manager_login_20261012/private/"
                   "studio_manager_accounts_20261013.json")
-# Машинные ручки (`/api/...`) живут в кабинете на 8899 — там же, куда ходят почта
-# и вердикты заливки. Пульт на 8800 их не знает: проверено, отвечает 404.
-BASE = os.environ.get("VS_STUDIO_BASE", "http://127.0.0.1:8899")
+# Куда отправлять отчёт.
+#
+# ИСПРАВЛЕНО 20.10.2026: тут стояло `http://127.0.0.1:8899` — адрес кабинета НА VPS,
+# а скрипт запускается на МИНСКЕ, где на этом порту нет ничего. Все 23 профиля отвечали
+# «В соединении отказано», и экран доступов стоял пустой. Умолчание теперь публичный
+# адрес студии — тот же, которым ходят минские пуллеры (`VSGEN_SERVER`). Если скрипт
+# всё же запускают на VPS, можно задать `VS_STUDIO_BASE=http://127.0.0.1:8090`.
+BASE = (os.environ.get("VS_STUDIO_BASE") or os.environ.get("VSGEN_SERVER")
+        or "https://studio.13.140.129.66.sslip.io")
 TOKEN_FILES = ("/home/vova/.config/video-studio/upload_token",
                "/home/vova/.vsupload_token")
 

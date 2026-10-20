@@ -225,8 +225,7 @@ def register_access_routes(app, ctx):
         except (UnicodeError, TypeError):                      # noqa: BLE001
             return False
 
-    @app.post("/api/access/report")
-    def api_access_report(body: AccessReportIn, request: Request):
+    def api_access_report(body, request):
         if not _same_secret(request.headers.get("X-Upload-Token", ""), token_of()):
             raise HTTPException(401, "нужен токен ноды заливки")
         c = db()
@@ -242,3 +241,18 @@ def register_access_routes(app, ctx):
             + (f", каналов не из студии {out['unknown_channels']}"
                if out["unknown_channels"] else ""))
         return out
+
+    # Типы проставляем ОБЪЕКТАМИ, а не аннотациями в `def`.
+    #
+    # ИСПРАВЛЕНО 20.10.2026: ручка отвечала 422 на каждый отчёт —
+    # `{"loc":["query","body"],"msg":"Field required"}`, то есть FastAPI считал `body` и
+    # `request` query-параметрами и ждал их в адресе строки. Причина: в этом модуле стоит
+    # `from __future__ import annotations`, поэтому `def f(body: AccessReportIn)` хранит
+    # аннотацию СТРОКОЙ «AccessReportIn», а разрешает её FastAPI через `get_type_hints`
+    # по globals модуля — а модель объявлена ЛОКАЛЬНО, внутри этой функции, и в globals
+    # её нет. Имя не разрешилось, тип остался неизвестным, параметры уехали в query.
+    # (В `pub_mail.py` того же дефекта нет: там нет future-импорта, а модели лежат на
+    # уровне модуля.) Модель держим локальной намеренно: `pub_access` импортируется в
+    # тесте без fastapi и pydantic, поэтому импорт здесь ленивый.
+    api_access_report.__annotations__ = {"body": AccessReportIn, "request": Request}
+    app.post("/api/access/report")(api_access_report)

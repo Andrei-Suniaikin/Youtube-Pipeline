@@ -24,6 +24,7 @@ import hashlib
 import os
 import sqlite3
 import sys
+import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
@@ -221,12 +222,70 @@ def test_bad_payload():
     check("кривой хэш пропущен молча", out["accounts"], 0)
 
 
+def test_route_takes_json_body():
+    """Отчёт уезжает ТЕЛОМ запроса, а не query-параметрами.
+
+    20.10.2026 ручка отвечала 422 на каждый отчёт с Минска:
+    `{"loc":["query","body"],"msg":"Field required"}`. В модуле стоит
+    `from __future__ import annotations`, поэтому аннотация в `def` хранилась строкой,
+    а модель объявлена локально внутри `register_access_routes` — FastAPI не смог
+    разрешить имя через globals модуля и увёл оба параметра в query. Сверка 23 профилей
+    не доходила до студии вообще, и экран доступов стоял пустой.
+
+    Проверяем на настоящем приложении: с ЧУЖИМ токеном ручка должна отвечать 401
+    («тело разобрано, не пустили по секрету»), а не 422 («не вижу тела»).
+    """
+    try:
+        from fastapi import FastAPI
+        from fastapi.testclient import TestClient
+    except Exception:                                           # noqa: BLE001
+        print("  —    fastapi недоступен, проверку ручки пропускаю")
+        return
+
+    path = os.path.join(tempfile.mkdtemp(prefix="access-route-"), "t.db")
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE pub_channels(id INTEGER PRIMARY KEY, tenant_id TEXT, "
+                 "name TEXT, uc TEXT)")
+    conn.execute("INSERT INTO pub_channels VALUES(1,'3','A Háború Nyers Oldala',?)",
+                 ("UC" + "a" * 22,))
+    A.ensure_schema(conn)
+    conn.commit()
+    conn.close()
+
+    def db():
+        x = sqlite3.connect(path)
+        x.row_factory = sqlite3.Row            # как в бою: ingest читает строки по имени
+        return x
+
+    app = FastAPI()
+    A.register_access_routes(app, {
+        "db": db,
+        "upload_token": lambda: "node-token-ok",   # заголовки HTTP только ASCII
+    })
+    client = TestClient(app, raise_server_exceptions=False)
+    payload = {"profile": "54", "checked": NOW, "channels": []}
+
+    r = client.post("/api/access/report", json=payload,
+                    headers={"X-Upload-Token": "node-token-wrong"})
+    check("чужой токен → 401, а не 422 (тело разобрано)", r.status_code, 401)
+
+    r = client.post("/api/access/report", json=payload,
+                    headers={"X-Upload-Token": "node-token-ok"})
+    check("свой токен → отчёт принят", r.status_code, 200)
+    check("профиль в ответе тот же", (r.json() or {}).get("profile"), "54")
+
+    r = client.post("/api/access/report", headers={"X-Upload-Token": "node-token-ok"})
+    check("совсем без тела → 422", r.status_code, 422)
+
+
 def main():
     test_verdicts()
     test_no_secrets_travel()
     test_report_replaces_own_profile_only()
     test_summary()
     test_bad_payload()
+    test_route_takes_json_body()
     print()
     if FAILS:
         print(f"провалов: {len(FAILS)}")
