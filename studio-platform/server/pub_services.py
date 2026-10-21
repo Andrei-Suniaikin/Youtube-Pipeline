@@ -1223,10 +1223,27 @@ class PubServices:
     # текста. Счёт раундов — в зеркале этапа (`tts-soften:N`), как у картинок.
     TTS_SOFTEN_ROUNDS = 3
 
+    # 21.10.2026: сервис текста не ответил вовремя (ReadTimeout, лимит подписки) — это не
+    # отказ модели и не повод хоронить выпуск: ждём TTS_SOFTEN_WAIT_SEC и пробуем ТОТ ЖЕ
+    # раунд снова. Метка ожидания — `tts-soften-wait:N:TS` (N сделанных раундов, TS —
+    # когда не ответил). r_61c7232bb0 так падал четыре раза подряд в часы лимитов.
+    TTS_SOFTEN_WAIT_SEC = 900
+
     def _tts_soften_done(self, known) -> int:
         mark = str(known["error"] or "")
-        return int(mark.split(":", 1)[1]) if mark.startswith("tts-soften:") \
-            and mark.split(":", 1)[1].isdigit() else 0
+        for prefix in ("tts-soften-wait:", "tts-soften:"):
+            if mark.startswith(prefix):
+                digits = mark[len(prefix):].split(":", 1)[0]
+                return int(digits) if digits.isdigit() else 0
+        return 0
+
+    def _tts_soften_wait_since(self, known) -> float:
+        """Когда сервис текста не ответил в прошлый раз; 0 — такой метки нет."""
+        mark = str(known["error"] or "")
+        if not mark.startswith("tts-soften-wait:"):
+            return 0.0
+        parts = mark.split(":")
+        return float(parts[2]) if len(parts) > 2 and parts[2].replace(".", "", 1).isdigit() else 0.0
 
     def _tts_job_lines(self, c, job_id) -> list:
         try:
@@ -1326,11 +1343,27 @@ class PubServices:
                      f"блок {block} не прошёл фильтр провайдера, а смягчить его нечем: "
                      f"нет ключа сервиса текста", level="warn")
             return ""
+        waited = self._clock() - self._tts_soften_wait_since(known)
+        if self._tts_soften_wait_since(known) and waited < self.TTS_SOFTEN_WAIT_SEC:
+            raise ResourceDown("codex", f"смягчение озвучки (блок {block}, раунд {done + 1}): "
+                                        f"сервис текста не ответил, повтор через "
+                                        f"{int((self.TTS_SOFTEN_WAIT_SEC - waited) // 60) + 1} мин")
         try:
             info = tts_soften.soften_project(
                 self.project_dir(rel["tenant_id"], rel["project_id"]), block,
                 rel["lang"] or "ru", done + 1, key, REWRITE_BASE)
         except tts_soften.SoftenError as exc:
+            if "не ответил" in str(exc) or pub_engine_limit_text(exc):
+                # Сервис занят или лимит — раунд не потрачен, выпуск ждёт, а не падает.
+                c.execute("UPDATE pub_release_jobs SET error=?, updated=? WHERE release_id=? "
+                          "AND service='vsgen' AND kind='tts'",
+                          (f"tts-soften-wait:{done}:{int(self._clock())}", rel["updated"],
+                           rel["release_id"]))
+                log_line(c, rel["release_id"], "ролик",
+                         f"блок {block} не прошёл фильтр провайдера; смягчение (раунд "
+                         f"{done + 1} из {self.TTS_SOFTEN_ROUNDS}) отложено: {exc} — повтор "
+                         f"через {self.TTS_SOFTEN_WAIT_SEC // 60} мин", level="warn")
+                raise ResourceDown("codex", f"смягчение озвучки (блок {block}): {exc}")
             log_line(c, rel["release_id"], "ролик",
                      f"блок {block} не прошёл фильтр провайдера; смягчение "
                      f"(раунд {done + 1} из {self.TTS_SOFTEN_ROUNDS}) не удалось: {exc}",

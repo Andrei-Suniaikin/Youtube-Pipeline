@@ -24,6 +24,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BASE = os.path.abspath(os.path.join(HERE, ".."))
@@ -304,6 +305,39 @@ def test_engine():
         except pub_engine.ItemFailed as exc:
             check("ItemFailed", str(exc), "этап «tts» завершился со статусом error")
         check("журнал объясняет", "смягчение" in last_msg(c) and "не удалось" in last_msg(c), True)
+
+        print("\nСервис текста не ответил (21.10.2026) — ждём, раунд не потрачен, выпуск не падает")
+        timeouts = []
+        def slow_chat(m, k, b, **kw):
+            timeouts.append(1)
+            raise S.SoftenError("сервис текста не ответил: ReadTimeout")
+        S.chat_once = slow_chat
+        c = fresh()
+        placed = []
+        try:
+            services(placed, pdir).do_media_ready(c, REL)
+            check("поднят ResourceDown", False, True)
+        except pub_services.ResourceDown as exc:
+            check("поднят ResourceDown", exc.resource, "codex")
+        row = tts_row(c)
+        check("зеркало помнит ожидание (раунд 0)", row["error"].startswith("tts-soften-wait:0:"), True)
+        check("озвучку заново не ставили", [k for k, _ in placed if k == "tts"], [])
+        check("в журнале сказано «отложено»", "отложено" in last_msg(c), True)
+        try:
+            services(placed, pdir).do_media_ready(c, REL)
+            check("второй круг сразу — снова ждём", False, True)
+        except pub_services.ResourceDown as exc:
+            check("второй круг сразу — снова ждём", "повтор через" in str(exc), True)
+        check("сервис текста второй раз не дёргали", len(timeouts), 1)
+        # Прошло больше TTS_SOFTEN_WAIT_SEC — тот же раунд пробуется заново и проходит.
+        S.chat_once = fake_chat
+        pdir2, _ = make_project()       # текст ещё не смягчён — как у настоящего ролика
+        c.execute("UPDATE pub_release_jobs SET error=? WHERE kind='tts'",
+                  (f"tts-soften-wait:0:{int(time.time()) - 2000}",))
+        c.commit()
+        out = services(placed, pdir2).do_media_ready(c, REL)
+        check("после паузы смягчение прошло", out, {"wait": True})
+        check("раунд считается первым, не вторым", tts_row(c)["error"], "tts-soften:1")
     finally:
         S.chat_once = saved
 
