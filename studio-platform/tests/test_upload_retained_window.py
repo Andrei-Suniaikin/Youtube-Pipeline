@@ -243,6 +243,48 @@ def main():
                     json={"profile": "28", "uc": UC_B, "phase": phase}, headers=H)
     check("подтверждённое руками — отказ", r.status_code, 409)
 
+    print("\nЗадание в error с AUTH_GATE получило номер — само становится доведением по номеру (21.10.2026)")
+    c = conn()
+    pid = c.execute("SELECT id FROM pub_profiles").fetchone()[0]
+    c.execute("INSERT INTO pub_releases(release_id,tenant_id,plan_item_id,plan_item_version,"
+              "channel_id,uc,slot_at,status,phase,created,updated,hand_confirmed) "
+              "VALUES('rel-auth','t1',99,1,3,?,?,'blocked','upload_running',?,?,NULL)",
+              (UC_C, NOW + 3600, NOW, NOW))
+    c.execute("UPDATE pub_releases SET blocked_reason='AUTH_GATE: previous confirmation is held' "
+              "WHERE release_id='rel-auth'")
+    c.execute("INSERT INTO pub_upload_jobs(release_id,tenant_id,channel_id,uc,profile_id,"
+              "host_id,channel_url,title,description,schedule_iso,visibility,video_path,"
+              "slot_at,status,phase,video_id,error,cover_path,created,updated) "
+              "VALUES('rel-auth','t1',3,?,?,1,?,'ролик rel-auth','','','public','/v.mp4',?,"
+              "'error',?,NULL,'AUTH_GATE: previous confirmation is held; existing upload preserved',"
+              "'/c.jpg',?,?)",
+              (UC_C, pid, f"https://studio.youtube.com/channel/{UC_C}/", NOW + 3600,
+               json.dumps({"upload_phase_schema_version": 1, "phase": "upload_started", "video_id": ""}),
+               NOW, NOW))
+    c.commit(); c.close()
+    r = client.get("/api/upload/retained", params={"profile": "28", "uc": UC_C}, headers=H)
+    check("окно rel-auth удержанное", r.json().get("release_id"), "rel-auth")
+    r = client.post("/api/upload/rel-auth/retained_progress",
+                    json={"profile": "28", "uc": UC_C, "phase": json.dumps(
+                        {"upload_phase_schema_version": 1, "phase": "video_id_known", "video_id": "Ziua0000001"})},
+                    headers=H)
+    check("номер принят", (r.status_code, r.json().get("video_id")), (200, "Ziua0000001"))
+    j = job("rel-auth")
+    check("задание переведено в repair с номером", (j["status"], j["video_id"]), ("repair", "Ziua0000001"))
+    check_true = lambda label, cond: check(label, bool(cond), True)           # noqa: E731
+    check_true("причина задания говорит про доведение", "доводится по номеру" in (j["error"] or ""))
+    check_true("клейм снят", j["claim_token"] is None)
+    check_true("выпуск остался в разборе, причина — про черновик",
+               rel("rel-auth")["status"] == "blocked" and "Ziua0000001" in (rel("rel-auth")["blocked_reason"] or ""))
+    r = client.post("/api/upload/rel-auth/retained_progress",
+                    json={"profile": "28", "uc": UC_C, "phase": "", "stdout": "черновик сохранён; профиль закрыт"},
+                    headers=H)
+    check("итоговая строка после номера принимается (было 409)", r.status_code, 200)
+    c = conn()
+    msgs = [m[0] for m in c.execute("SELECT message FROM pub_release_log WHERE release_id='rel-auth'")]
+    c.close()
+    check_true("в журнале сказано, что файл второй раз не уходит", any("второй раз не уходит" in m for m in msgs))
+
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}"); [print("  -", f) for f in FAILS]; return 1

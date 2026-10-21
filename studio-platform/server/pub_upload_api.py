@@ -675,11 +675,29 @@ def register_upload_routes(app, ctx):
             if video_id:
                 fields.append("video_id=?")
                 args.append(video_id)
+            became_repair = False
+            if video_id and rel["status"] == "error":
+                # 21.10.2026. Номер пришёл — черновик на канале есть, и дальше его доводит
+                # машина по номеру (`finalize_due`). Задание в `error` движок по номеру не
+                # доводит никогда (см. `finalize_refusal`): r_167758f533 с номером E17CE9HhYMg
+                # простоял в разборе до ручного сброса. Переводим в `repair` здесь же.
+                fields += ["status='repair'", "error=?", "finished=?", "claim_token=NULL"]
+                args += [f"черновик {video_id} сохранён после «Verify it's you» — доводится "
+                         f"по номеру", now]
+                became_repair = True
             c.execute(f"UPDATE pub_upload_jobs SET {', '.join(fields)} WHERE id=?",
                       args + [rel["id"]])
             log_line(c, release_id, "заливка",
                      f"удержанное окно: машина сообщает {said or 'фазу'}"
                      + (f", видео {video_id}" if video_id else ""), now=now)
+            if became_repair:
+                c.execute("UPDATE pub_releases SET blocked_reason=?, updated=? "
+                          "WHERE release_id=? AND status='blocked'",
+                          (f"черновик {video_id} сохранён после «Verify it's you» — машина "
+                           f"доведёт его по номеру", now, release_id))
+                log_line(c, release_id, "заливка",
+                         f"черновик {video_id} на канале — задание переведено на доведение по "
+                         f"номеру, файл второй раз не уходит", now=now)
             stdout = str(body.get("stdout") or "")
             if stdout:
                 add_lines(c, release_id, "заливщик", stdout)
