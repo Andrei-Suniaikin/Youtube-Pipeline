@@ -402,6 +402,59 @@ def check_providers_resting(c, now, tenant=None) -> list:
     return out
 
 
+# Какие «ждём: …» движка — это занятый общий ресурс (ключ, подписка), а не обычная очередь.
+# «В отложке канала уже 5 роликов» и «названия пишутся по очереди» — рабочее ожидание,
+# о нём молчим. Повод состояния: держится RESOURCE_WAIT_HOLD_SEC → тревога, прошёл → «починилось».
+RESOURCE_WAIT_KINDS = (
+    ("обложки", ("ждём: сервис обложек", "ждём: обложка:"),
+     "Сервис обложек не рисует: ключ картинок (xAI) исчерпан или сервис лежит. "
+     "Обложки заказываются заново каждые 15 минут и вернутся сами, как только ключ "
+     "пополнят или сервис ответит."),
+    ("подписка Codex", ("ждём: подписка", "ждём: смягчение", "ждём: рерайт: подписка"),
+     "Подписка Codex в лимите: названия, смягчение текста и рерайт ждут окна. "
+     "Вернётся само, когда лимит отпустит; оплаченное не теряется."),
+)
+RESOURCE_WAIT_HOLD_SEC = _sec("VS_ALERT_RESOURCE_WAIT_SEC", 30 * 60)
+RESOURCE_WAIT_MIN = 2          # один выпуск между повторами — обычное дело, двое и дольше получаса — нет
+
+
+def check_resource_wait(c, now, tenant=None) -> list:
+    """§16 (21.10.2026). Выпуски стоят в «ждём: …» из-за общего ресурса — ключа обложек
+    или подписки Codex. С 20.10 лимиты не роняют выпуск, а переводят его в ожидание, и
+    это состояние ни один прежний повод не читал: три дня 24–28 выпусков ждали ключ xAI
+    молча, а в Телеграме было тихо — «иллюзия, что всё работает».
+    Длительность держит MIN_HOLD: повод должен наблюдаться подряд RESOURCE_WAIT_HOLD_SEC.
+    """
+    where, args = _tenant_where(tenant, "tenant_id")
+    try:
+        rows = c.execute(
+            f"SELECT blocked_reason FROM pub_releases WHERE status='pending' "
+            f"AND blocked_reason LIKE 'ждём: %'{where}", args).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    out = []
+    for name, prefixes, advice in RESOURCE_WAIT_KINDS:
+        reasons = [str(r[0] or "") for r in rows if str(r[0] or "").startswith(prefixes)]
+        if len(reasons) < RESOURCE_WAIT_MIN:
+            continue
+        sample = max(reasons, key=len)
+        code = ""
+        for marker in ("402", "429", "502", "SUBSCRIPTION_LIMIT", "лимит ключа"):
+            if marker in sample:
+                code = marker
+                break
+        out.append(Alert(
+            f"resource_wait:{name}",
+            f"{name[0].upper() + name[1:]}: ждут {len(reasons)} выпуска",
+            f"{len(reasons)} выпусков стоят в ожидании ресурса «{name}»"
+            + (f" (в ответе: {code})" if code else "") + ".\n"
+            f"Пример: {sample[:160]}\n{advice}",
+            money="Платные вызовы не повторяются впустую: каждый повтор — тот же заказ, "
+                  "счёт раундов не растёт. Теряется время слотов.",
+            figure=len(reasons)))
+    return out
+
+
 def check_upload_stalled(c, now, tenant=None) -> list:
     """§3. Есть готовые ролики, но за 3 часа ничего не залито."""
     where, args = _tenant_where(tenant, "tenant_id")
@@ -1406,7 +1459,8 @@ def check_channel_supply(c, now, tenant=None) -> list:
               "замолчит. Потерян будет выход, а его не наверстать.")]
 
 
-CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
+CHECKS = (check_queue_stalled, check_providers_resting, check_resource_wait,
+          check_upload_stalled,
           check_missed_slots, check_disk, check_oldest_task, check_failed_tasks,
           check_key_exhausted, check_key_expiring, check_usage_near_limit,
           check_key_dead, check_text_subscription_dead, check_upload_profile_busy,
@@ -1415,7 +1469,8 @@ CHECKS = (check_queue_stalled, check_providers_resting, check_upload_stalled,
 # Сколько повод должен продержаться, прежде чем о нём говорят. Там, где длительность
 # и есть суть повода (§2), она проверяется здесь; остальные поводы уже содержат свой
 # порог внутри запроса, и держать их дополнительно значило бы удваивать ожидание.
-MIN_HOLD = {"provider_resting": RESTING_SEC, "stopped": STOPPED_SETTLE_SEC}
+MIN_HOLD = {"provider_resting": RESTING_SEC, "stopped": STOPPED_SETTLE_SEC,
+            "resource_wait": RESOURCE_WAIT_HOLD_SEC}
 
 # Поводы-события, а не состояния: сказать один раз и не возвращаться. Повтор и
 # «починилось» осмысленны, только когда повод описывает то, что тянется.
