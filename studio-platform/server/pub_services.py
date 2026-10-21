@@ -1441,6 +1441,10 @@ class PubServices:
             key = get_key(c, "cover")
             if not key:
                 return
+            try:
+                self._cover_order_gate()
+            except ResourceDown:
+                return                       # подписка держит частоту — закажем на своей фазе
             job_id = CoverClient(key).create_job(rel["preset_cover"], rel["lang"] or "ru",
                                                  rel["donor_url"])
             self._remember_remote(c, rel["release_id"], "cover", job_id, rel["updated"])
@@ -1452,6 +1456,43 @@ class PubServices:
                      f"вернёмся к ней на своей фазе", level="warn")
 
     COVER_SOFTEN_ROUNDS = 3
+
+    # 21.10.2026, день. Подписка Codex отвечала обложкам «частота» / «все ключи отдыхают»,
+    # а студия на каждый пустой ответ тут же заказывала заново (повтор по ссылке, потом
+    # раунд смягчения) и раз в 15 минут возвращала всех ждущих разом: 280 заказов за два
+    # часа, 17 обложек — и та же подписка не давала ни названий, ни смягчения озвучки.
+    # Пока подписка держит частоту, обложки заказываем по одной, не чаще раза в
+    # COVER_ORDER_GAP_SEC, а выпуск после такого отказа ждёт COVER_LIMIT_RETRY_SEC.
+    COVER_ORDER_GAP_SEC = float(os.environ.get("VS_COVER_ORDER_GAP_SEC") or 90)
+    COVER_LIMIT_RETRY_SEC = float(os.environ.get("VS_COVER_LIMIT_RETRY_SEC") or 300)
+    COVER_LIMIT_MEMORY_SEC = 900.0
+
+    @staticmethod
+    def _cover_service_fault(info) -> bool:
+        """Пустая обложка по вине сервиса — сцена не сгенерировалась (лимит ключа, частота
+        подписки, 5xx), — а не генератора картинок. Такой ответ не повод ни для повтора по
+        ссылке, ни для раунда смягчения."""
+        notes = " ".join(str(n) for n in (info.get("check_notes") or []))
+        return ("Ошибка генерации сцены" in notes or pub_engine_limit_text(notes)
+                or re.search(r"Error code: (?:402|429|5\d\d)\b", notes) is not None)
+
+    def _note_cover_limit(self) -> None:
+        self._cover_limit_seen = self._clock()
+
+    def _cover_limited(self) -> bool:
+        seen = float(getattr(self, "_cover_limit_seen", 0.0) or 0.0)
+        return 0.0 <= self._clock() - seen <= self.COVER_LIMIT_MEMORY_SEC
+
+    def _cover_order_gate(self) -> None:
+        """Пропуск на заказ обложки. Пока подписка держит частоту (отказ был в последние
+        15 минут) — не чаще одного заказа в COVER_ORDER_GAP_SEC на всю студию."""
+        now = self._clock()
+        last = float(getattr(self, "_cover_last_order", 0.0) or 0.0)
+        if self._cover_limited() and 0.0 <= now - last < self.COVER_ORDER_GAP_SEC:
+            raise ResourceDown("обложки", "подписка Codex держит частоту — обложки заказываем "
+                                          f"по одной, следующий заказ через "
+                                          f"{int(self.COVER_ORDER_GAP_SEC - (now - last))} с")
+        self._cover_last_order = now
 
     @staticmethod
     def _payload_of(row) -> dict:
@@ -1476,27 +1517,34 @@ class PubServices:
         mark = str(known["error"] or "")
         done = int(mark.split(":", 1)[1]) if mark.startswith("cover-soften:") else 0
         # Пустой ответ по вине сервиса (сцена не сгенерировалась: 402 лимит ключа, 429, 5xx),
-        # а не генератора картинок — это не повод для нового раунда. Ждём 15 минут и
-        # заказываем ТОТ ЖЕ раунд заново; счёт раундов не растёт.
-        notes = " ".join(str(n) for n in (info.get("check_notes") or []))
-        service_fault = ("Ошибка генерации сцены" in notes
-                         or re.search(r"Error code: (?:402|429|5\d\d)\b", notes) is not None)
-        if service_fault and done:
+        # а не генератора картинок — это не повод ни для повтора по ссылке, ни для нового
+        # раунда. Ждём COVER_LIMIT_RETRY_SEC и заказываем ТО ЖЕ заново (раунд 0 — по ссылке
+        # донора, раунд N — по его надписи); счёт раундов не растёт. 21.10.2026: раньше это
+        # касалось только раундов смягчения, а первый пустой ответ по лимиту тут же
+        # заказывался заново и шёл в смягчение — по три заказа на выпуск за пять минут.
+        if self._cover_service_fault(info):
+            self._note_cover_limit()
             age = self._clock() - float(known["updated"] or 0)
-            if age < 900:
+            if age < self.COVER_LIMIT_RETRY_SEC:
                 raise ResourceDown("обложки", "сервис обложек не сделал сцену для надписи "
-                                              "(лимит ключа или сбой) — повторю через 15 минут")
+                                              "(лимит подписки или сбой) — повторю через "
+                                              f"{int(self.COVER_LIMIT_RETRY_SEC // 60)} минут")
+            self._cover_order_gate()
             text = self._cover_text_of(known)
-            if text:
+            if done and text:
                 job_id = client.create_title_job(preset, rel["lang"] or "ru", text,
                                                  cover_soften.scene_hint(done))
-                c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='running', updated=? "
-                          "WHERE release_id=? AND service='cover' AND kind='job'",
-                          (str(job_id), self._clock(), rel["release_id"]))
-                log_line(c, rel["release_id"], "обложка",
-                         f"сервис обложек не сделал сцену (сбой ключа) — тот же раунд {done} "
-                         f"заказан заново, задача {job_id}", level="warn")
-                return "requeued"
+                what = f"тот же раунд {done}"
+            else:
+                job_id = client.create_job(preset, rel["lang"] or "ru", rel["donor_url"])
+                what = "тот же заказ по ссылке донора"
+            c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='running', updated=? "
+                      "WHERE release_id=? AND service='cover' AND kind='job'",
+                      (str(job_id), self._clock(), rel["release_id"]))
+            log_line(c, rel["release_id"], "обложка",
+                     f"сервис обложек не сделал сцену (лимит подписки или сбой) — {what} "
+                     f"заказан заново, задача {job_id}", level="warn")
+            return "requeued"
         if done >= self.COVER_SOFTEN_ROUNDS:
             return "exhausted"
         try:
@@ -1536,6 +1584,7 @@ class PubServices:
                      f"генератор не отдал обложку; смягчение надписи (раунд {done + 1} из "
                      f"{self.COVER_SOFTEN_ROUNDS}) не удалось: {exc}", level="warn")
             return ""
+        self._cover_order_gate()
         job_id = client.create_title_job(preset, rel["lang"] or "ru", new_text,
                                          cover_soften.scene_hint(done + 1))
         payload = self._payload_of(known)
@@ -1569,6 +1618,7 @@ class PubServices:
         if known is None:
             if not rel["donor_url"]:
                 raise ItemFailed("у выпуска нет донорской ссылки для обложки")
+            self._cover_order_gate()
             job_id = client.create_job(preset, rel["lang"] or "ru", rel["donor_url"])
             self._remember_remote(c, rel["release_id"], "cover", job_id, rel["updated"])
             log_line(c, rel["release_id"], "обложка",
@@ -1606,6 +1656,7 @@ class PubServices:
                 # вечер ушли с этим в карантин как «обложка не сделалась». Поступаем, как с
                 # заполненной очередью выше: задачу забываем и закажем заново, когда
                 # подписка ответит; раунды и автовозвраты не тратим.
+                self._note_cover_limit()
                 c.execute("DELETE FROM pub_release_jobs WHERE release_id=? AND service='cover' "
                           "AND kind='job'", (rel["release_id"],))
                 log_line(c, rel["release_id"], "обложка",
@@ -1628,7 +1679,10 @@ class PubServices:
             # а не негодный ролик. Один раз заказываем заново; второй пустой ответ уже
             # считаем отказом, чтобы выпуск не крутился вечно.
             mark = str(known["error"] or "")
-            if mark in ("re-ordered", "re-ordered-degraded") or mark.startswith("cover-soften:"):
+            # 21.10.2026: пустой ответ по вине подписки — не повтор по ссылке и не раунд
+            # смягчения, а ожидание и тот же заказ заново (внутри `_soften_cover`).
+            if (mark in ("re-ordered", "re-ordered-degraded") or mark.startswith("cover-soften:")
+                    or self._cover_service_fault(info)):
                 # 17.10.2026 (владелец): тот же запрос второй раз пуст — значит генератор
                 # молча отказывает на надпись, как фильтр озвучки на текст. Дальше не
                 # повтор, а до трёх раундов смягчения надписи; потом — человек.
@@ -1643,6 +1697,7 @@ class PubServices:
                               + str(info.get("progress_detail") or state))
                 self._finish_remote(c, rel["release_id"], "cover", "error", reason)
                 raise ItemFailed(reason)
+            self._cover_order_gate()
             job_id = client.create_job(preset, rel["lang"] or "ru", rel["donor_url"])
             c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='running', "
                       "error='re-ordered', "
@@ -1659,6 +1714,7 @@ class PubServices:
                 reason = "обложка деградировала дважды: текст наложен поверх картинки"
                 self._finish_remote(c, rel["release_id"], "cover", "error", reason)
                 raise ItemFailed(reason)
+            self._cover_order_gate()
             job_id = client.create_job(preset, rel["lang"] or "ru", rel["donor_url"])
             c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='running', "
                       "error='re-ordered-degraded', "
