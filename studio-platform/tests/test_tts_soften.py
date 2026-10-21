@@ -48,6 +48,19 @@ LOG_3861 = [
     "[08:15:03.600] ❌ Озвучка FastGen не завершена: не готово блоков 1 из 10; первая причина — блок 6",
     "❌ ошибка (код 1)",
 ]
+# Задача 5306 (21.10.2026): после первого смягчения блок 6 вернулся обрубком звука дважды —
+# фильтр режет запись, а не отказывает словами.
+LOG_5306 = [
+    "[16:13:08.085] ⏳ FastGen: блок 6: генерация gen_ab096373883148898be0279e976d89c1 создана (805 слов)",
+    "[16:13:48.708] ⚠️ FastGen: блок 6: генерация gen_ab096373883148898be0279e976d89c1 — звук не похож "
+    "на текст: обрубок: 117.9 с на 805 слов (быстрее 200 сл/мин) — заказываю заново",
+    "[16:14:29.427] ⚠️ FastGen: блок 6: генерация gen_b1c86367d380485dbd8a6c1edf6a9408 — звук не похож "
+    "на текст: обрубок: 122.3 с на 805 слов (быстрее 200 сл/мин)",
+    "[16:14:29.428] ⚠️ блок 6 из 10 не готов: блок 6: генерация gen_b1c86367d380485dbd8a6c1edf6a9408 — "
+    "звук не похож на текст: обрубок: 122.3 с на 805 слов (быстрее 200 сл/мин)",
+    "[16:14:29.428] ❌ Озвучка FastGen не завершена: не готово блоков 1 из 10; первая причина — блок 6",
+    "❌ ошибка (код 1)",
+]
 
 
 def check(label, got, want):
@@ -65,6 +78,12 @@ def test_failed_block():
     check("отказ не фильтра — не блок",
           S.failed_block(["⚠️ FastGen: блок 3: нет связи: timed out", "❌ ошибка (код 1)"]), None)
     check("пустой журнал", S.failed_block([]), None)
+    print("Обрубок звука — отдельный детектор")
+    check("журнал 5306: фильтр словами не отказывал", S.failed_block(LOG_5306), None)
+    check("журнал 5306: обрубок на блоке 6", S.stub_block(LOG_5306), 6)
+    check("журнал 5306 с конца", S.stub_block(reversed(LOG_5306)), 6)
+    check("отказ фильтра — не обрубок", S.stub_block(LOG_3861), None)
+    check("нет связи — не обрубок", S.stub_block(["⚠️ FastGen: блок 3: нет связи: timed out"]), None)
 
 
 # ~700 знаков на абзац при пределе 1000 → каждый абзац сам себе блок: блоков 8, блок 6 есть.
@@ -203,6 +222,10 @@ def last_msg(c):
     return r[0] if r else ""
 
 
+def all_msgs(c):
+    return [r[0] for r in c.execute("SELECT message FROM pub_release_log ORDER BY id")]
+
+
 def test_engine():
     print("\nДвижок: фильтр → смягчение → озвучка заново")
     pub_services.get_key = lambda c, name: "rewrite-key"
@@ -225,7 +248,7 @@ def test_engine():
         check("озвучка поставлена заново", len(tts_placed), 1)
         check("с параметрами пресета", tts_placed[0].get("engine"), "fastgen")
         row = tts_row(c)
-        check("зеркало помнит раунд", (row["status"], row["error"]), ("queued", "tts-soften:1"))
+        check("зеркало помнит раунд и блок", (row["status"], row["error"]), ("queued", "tts-soften:1:6"))
         check("ключ сервиса текста передан", calls and calls[0][0] == "rewrite-key", True)
         check("текст изменён", "Ljudi" in open(os.path.join(pdir, "source.txt"), encoding="utf-8").read(), True)
         check("прежний текст рядом", os.path.exists(os.path.join(pdir, "source.txt.before-soften-1")), True)
@@ -286,7 +309,38 @@ def test_engine():
             check("и говорит, какой блок править", "блок 6" in b.get("fix", ""), True)
         check("озвучку заново не ставили", [k for k, _ in placed if k == "tts"], [])
 
+        print("\nОбрубок звука на только что смягчённом блоке (21.10.2026) — следующий раунд")
+        pdir3, _ = make_project()
+        c = fresh(mark="tts-soften:1:6", logs=LOG_5306)
+        placed = []
+        out = services(placed, pdir3).do_media_ready(c, REL)
+        check("движок ждёт новую озвучку", out, {"wait": True})
+        check("озвучка поставлена заново", len([p for k, p in placed if k == "tts"]), 1)
+        check("зеркало: второй раунд, тот же блок", tts_row(c)["error"], "tts-soften:2:6")
+        check("журнал объясняет обрубок",
+              any("обрубком" in m for m in all_msgs(c)) and "раунд 2 из 3" in last_msg(c), True)
+
+        print("\nОбрубок на другом блоке — битый звук, падает как раньше")
+        c = fresh(mark="tts-soften:1:6",
+                  logs=[l.replace("блок 6", "блок 3") for l in LOG_5306])
+        placed = []
+        try:
+            services(placed, pdir3).do_media_ready(c, REL)
+            check("ItemFailed", False, True)
+        except pub_engine.ItemFailed as exc:
+            check("ItemFailed", str(exc), "этап «tts» завершился со статусом error")
+        check("озвучку не ставили", [k for k, _ in placed if k == "tts"], [])
+
+        print("\nОбрубок без смягчения до него — тоже как раньше")
+        c = fresh(logs=LOG_5306)
+        try:
+            services([], pdir3).do_media_ready(c, REL)
+            check("ItemFailed", False, True)
+        except pub_engine.ItemFailed as exc:
+            check("ItemFailed", str(exc), "этап «tts» завершился со статусом error")
+
         print("\nДругой отказ — падает как раньше")
+        n_calls = len(calls)
         c = fresh(logs=["⚠️ FastGen: блок 2: нет связи: timed out", "❌ ошибка (код 1)"])
         placed = []
         try:
@@ -294,7 +348,7 @@ def test_engine():
             check("ItemFailed", False, True)
         except pub_engine.ItemFailed as exc:
             check("ItemFailed", str(exc), "этап «tts» завершился со статусом error")
-        check("модель не звали", len(calls), 1)
+        check("модель не звали", len(calls), n_calls)
 
         print("\nМодель отказалась — падаем как раньше, в журнале сказано почему")
         S.chat_once = lambda m, k, b, **kw: "I can't help with that."
@@ -337,7 +391,7 @@ def test_engine():
         c.commit()
         out = services(placed, pdir2).do_media_ready(c, REL)
         check("после паузы смягчение прошло", out, {"wait": True})
-        check("раунд считается первым, не вторым", tts_row(c)["error"], "tts-soften:1")
+        check("раунд считается первым, не вторым", tts_row(c)["error"], "tts-soften:1:6")
     finally:
         S.chat_once = saved
 

@@ -1237,6 +1237,15 @@ class PubServices:
                 return int(digits) if digits.isdigit() else 0
         return 0
 
+    def _tts_soften_block(self, known) -> int:
+        """Какой блок смягчали в прошлый раз (метка `tts-soften:N:B`); 0 — метки нет или
+        она старого вида без номера блока."""
+        mark = str(known["error"] or "")
+        if not mark.startswith("tts-soften:"):
+            return 0
+        parts = mark.split(":")
+        return int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 0
+
     def _tts_soften_wait_since(self, known) -> float:
         """Когда сервис текста не ответил в прошлый раз; 0 — такой метки нет."""
         mark = str(known["error"] or "")
@@ -1331,7 +1340,18 @@ class PubServices:
         lines = self._tts_job_lines(c, known["remote_job_id"])
         block = tts_soften.failed_block(lines)
         if not block:
-            return ""
+            # 21.10.2026: фильтр может не отказать словами, а обрезать звук. Обрубок на том
+            # же блоке, который мы только что смягчали, — продолжение отказа, идём дальше по
+            # раундам; обрубок на другом блоке или без смягчения — битый звук, не наш случай.
+            prev = self._tts_soften_block(known)
+            stub = tts_soften.stub_block(lines) if prev else None
+            if not stub or stub != prev:
+                return ""
+            block = stub
+            log_line(c, rel["release_id"], "ролик",
+                     f"блок {block} после смягчения вернулся обрубком звука (провайдер режет "
+                     f"запись, а не отказывает словами) — считаю это отказом фильтра, "
+                     f"следующий раунд смягчения", level="warn")
         if str(known["error"] or "").startswith("tts-lumean"):
             return "exhausted"            # запасной провайдер уже был — дальше человек
         done = self._tts_soften_done(known)
@@ -1379,7 +1399,8 @@ class PubServices:
             return ""
         c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', error=?, "
                   "updated=? WHERE release_id=? AND service='vsgen' AND kind='tts'",
-                  (str(job_id), f"tts-soften:{done + 1}", rel["updated"], rel["release_id"]))
+                  (str(job_id), f"tts-soften:{done + 1}:{block}", rel["updated"],
+                   rel["release_id"]))
         log_line(c, rel["release_id"], "ролик",
                  f"блок {block} из {info['blocks']} не прошёл фильтр провайдера озвучки — "
                  f"текст блока смягчён моделью ({info['words_before']}→{info['words_after']} "
