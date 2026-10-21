@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import time
@@ -422,6 +423,100 @@ def finalize_exhausted_reason(error: str) -> str:
             + (f": {tail}" if tail else ""))
 
 
+# ─────────────────────────── пауза профиля или канала ───────────────────────────
+#
+# 21.10.2026. Baśnie Leszego: профиль 62 разлогинен, студия за 50 минут выдала в него десять
+# выпусков по одному, каждый пробовал войти сам и сжёг суточный лимит попыток Google
+# («too many recovery attempts»). Такой отказ чинит только человек: вход в профиль или права
+# менеджера на канал. Пока он не пришёл, следующие выпуски в этот профиль (или канал)
+# не выдаём: задание ждёт в очереди с причиной «на паузе», как при чужом профиле.
+# Снимает паузу человек возвратом выпуска («Вернуть в работу» = «починил»), успешная заливка
+# или срок PROFILE_PAUSE_SEC — после него одна попытка, и при том же отказе пауза ставится снова.
+PROFILE_PAUSE_SEC = float(os.environ.get("VS_PROFILE_PAUSE_SEC", "21600") or 21600)
+# Профиль без входа: восстановление входа не прошло или исчерпано — стоит весь профиль.
+PROFILE_PAUSE_MARKS = ("account recovery needs the owner", "account recovery blocked",
+                       "RecoveryBlocked")
+# Аккаунт в профиле есть, но на этот канал прав нет — стоит только канал, соседи льются.
+CHANNEL_PAUSE_MARKS = ("not logged in / no access", "активный аккаунт не управляет каналом")
+
+
+def pause_scope(error: str) -> str:
+    """«profile» — профиль без входа; «channel» — нет прав на канал; «» — не тот случай."""
+    text = error or ""
+    if any(m in text for m in PROFILE_PAUSE_MARKS):
+        return "profile"
+    if any(m in text for m in CHANNEL_PAUSE_MARKS):
+        return "channel"
+    return ""
+
+
+def _pause_key(scope: str, ident) -> str:
+    return f"pub_pause:{scope}:{ident}"
+
+
+def pause_set(c, scope: str, ident, why: str, release_id: str, now: float) -> float:
+    """Поставить паузу; возвращает момент, до которого она держится."""
+    until = now + PROFILE_PAUSE_SEC
+    c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES(?,?,?)",
+              (_pause_key(scope, ident),
+               json.dumps({"since": now, "until": until, "why": (why or "")[:300],
+                           "release_id": release_id}, ensure_ascii=False), now))
+    return until
+
+
+def pause_get(c, scope: str, ident, now: float):
+    """Действующая пауза ({since, until, why, release_id}) или None; просроченную снимаем."""
+    if ident is None or ident == "":
+        return None
+    try:
+        row = c.execute("SELECT v FROM admin_state WHERE k=?",
+                        (_pause_key(scope, ident),)).fetchone()
+    except Exception:                                  # noqa: BLE001 — база без admin_state
+        return None
+    if not row:
+        return None
+    try:
+        data = json.loads(row[0] or "{}")
+    except Exception:                                  # noqa: BLE001
+        data = {}
+    if float(data.get("until") or 0) <= now:
+        c.execute("DELETE FROM admin_state WHERE k=?", (_pause_key(scope, ident),))
+        return None
+    return data
+
+
+def pause_clear(c, scope: str, ident, now: float) -> bool:
+    if ident is None or ident == "":
+        return False
+    try:
+        return bool(c.execute("DELETE FROM admin_state WHERE k=?",
+                              (_pause_key(scope, ident),)).rowcount)
+    except Exception:                                  # noqa: BLE001
+        return False
+
+
+def pause_text(scope: str, data: dict, serial, uc: str) -> str:
+    """Причина для задания, журнала и тревоги — одной строкой."""
+    where = (f"профиль AdsPower №{serial}" if scope == "profile" else f"канал {uc}")
+    until = time.strftime("%d.%m %H:%M", time.localtime(float(data.get("until") or 0)))
+    return (f"{where} на паузе до {until}: {data.get('why') or 'нужен человек'} — нужен вход "
+            f"человека; пауза снимется возвратом выпуска или успешной заливкой")
+
+
+def pause_clear_for_release(c, rel, now: float) -> str:
+    """Возврат выпуска = «починил»: снять паузы его канала и его профиля."""
+    ch = c.execute("SELECT uc, profile_id FROM pub_channels WHERE id=?",
+                   (rel["channel_id"],)).fetchone()
+    if not ch:
+        return ""
+    gone = []
+    if pause_clear(c, "channel", ch["uc"], now):
+        gone.append("канала")
+    if pause_clear(c, "profile", ch["profile_id"], now):
+        gone.append("профиля")
+    return "" if not gone else ("пауза " + " и ".join(gone) + " снята — человек вернул выпуск")
+
+
 # ─────────────────────────── заведение выпусков ───────────────────────────
 
 def due_items(c, now: float) -> list:
@@ -693,6 +788,9 @@ def revive(c, release_id: str, now: float = None, keep_attempts: bool = False,
              f"возвращён в работу с фазы «{phase}»"
              + ("" if keep_attempts else ", счётчик попыток обнулён"), now=now)
     log_phase(c, release_id, "revived", now, payload={"from_phase": rel["phase"]})
+    unpaused = pause_clear_for_release(c, rel, now)
+    if unpaused:
+        log_line(c, release_id, "движок", unpaused, now=now)
     return {"ok": True, "phase": phase}
 
 

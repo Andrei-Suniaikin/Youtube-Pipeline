@@ -49,7 +49,8 @@ import pub_adspower
 import pub_artifact
 import pub_upload_census
 from pub_engine import (FINALIZE_GAP_SEC, FINALIZE_MAX_TRIES, finalize_due,
-                        finalize_exhausted_reason, finalize_tries, reslot_upload_job)
+                        finalize_exhausted_reason, finalize_tries, pause_clear, pause_get,
+                        pause_scope, pause_set, pause_text, reslot_upload_job)
 from pub_engine import revive as engine_revive
 from pub_log import add as log_line, add_lines
 
@@ -435,6 +436,18 @@ def register_upload_routes(app, ctx):
                     pub_upload_census.note(
                         c, r["release_id"], "время выхода прошло, пока стояло в очереди",
                         now=now, stale=True)
+                    continue
+                # (4а) Профиль без входа или канал без прав — на паузе до человека
+                # (см. pub_engine.pause_scope): задание ждёт с причиной, как при чужом
+                # профиле, и не жжёт попытки входа Google.
+                paused = pause_get(c, "profile", r["profile_id"], now)
+                scope = "profile" if paused else ""
+                if not paused:
+                    paused = pause_get(c, "channel", r["uc"], now)
+                    scope = "channel" if paused else ""
+                if paused:
+                    _remember_block(c, r, pause_text(scope, paused, r["ads_serial"], r["uc"]),
+                                    "", now)
                     continue
                 if r["ads_pid"] is not None and _agent_profile(r["ads_serial"]) is None:
                     # Без номера AdsPower нода откроет профиль по нашему внутреннему
@@ -894,6 +907,26 @@ def register_upload_routes(app, ctx):
                 if lifted:
                     log_line(c, release_id, "заливка",
                              "ролик подтверждён после разбора: снимаю разбор", now=now)
+            # Пауза профиля или канала: отказ, который чинит только человек (вход, права),
+            # останавливает выдачу следующих выпусков туда же; успех паузу снимает.
+            if ok:
+                if pause_clear(c, "profile", rel["profile_id"], now):
+                    log_line(c, release_id, "заливка",
+                             "заливка прошла — пауза профиля снята", now=now)
+                if pause_clear(c, "channel", rel["uc"], now):
+                    log_line(c, release_id, "заливка",
+                             "заливка прошла — пауза канала снята", now=now)
+            elif verdict["kind"] == "failed" and not (rel["video_id"] or ""):
+                scope = pause_scope(verdict["error"])
+                ident = rel["profile_id"] if scope == "profile" else rel["uc"]
+                if scope and ident:
+                    until = pause_set(c, scope, ident, verdict["error"], release_id, now)
+                    log_line(c, release_id, "заливка",
+                             ("профиль" if scope == "profile" else "канал")
+                             + f" ставлю на паузу до "
+                             f"{time.strftime('%d.%m %H:%M', time.localtime(until))}: "
+                             f"следующие выпуски туда не выдаю, пока человек не войдёт "
+                             f"(«Вернуть в работу» снимает паузу)", level="warn", now=now)
             level = {"scheduled": "info", "published": "info"}.get(verdict["kind"], "error")
             if verdict["kind"] not in ("scheduled", "published"):
                 # Класс берётся уликами, а не словом вердикта: `needs_repair` означает,
