@@ -1237,6 +1237,19 @@ class PubServices:
                 return int(digits) if digits.isdigit() else 0
         return 0
 
+    def _tts_soften_rounds_on_disk(self, rel) -> int:
+        """Сколько раундов смягчения пережил текст проекта — по копиям
+        `source.txt.before-soften-N` рядом с ним. Метка зеркала стирается, когда выпуск
+        возвращают в работу («забыть упавший этап»), а копии остаются: 21.10 r_61c7232bb0
+        после возврата снова считался несмягчённым и падал на том же обрубке."""
+        try:
+            names = os.listdir(self.project_dir(rel["tenant_id"], rel["project_id"]))
+        except Exception:                                          # noqa: BLE001
+            return 0
+        rounds = [n[len("source.txt.before-soften-"):] for n in names
+                  if n.startswith("source.txt.before-soften-")]
+        return max((int(r) for r in rounds if r.isdigit()), default=0)
+
     def _tts_soften_block(self, known) -> int:
         """Какой блок смягчали в прошлый раз (метка `tts-soften:N:B`); 0 — метки нет или
         она старого вида без номера блока."""
@@ -1339,14 +1352,16 @@ class PubServices:
             return ""
         lines = self._tts_job_lines(c, known["remote_job_id"])
         block = tts_soften.failed_block(lines)
+        # Раунды: по метке зеркала или по копиям текста на диске — что больше (метку стирает
+        # возврат выпуска, копии переживают всё).
+        done = max(self._tts_soften_done(known), self._tts_soften_rounds_on_disk(rel))
         if not block:
             # 21.10.2026: фильтр может не отказать словами, а обрезать звук. Обрубок на том
             # же блоке, который мы только что смягчали, — продолжение отказа, идём дальше по
             # раундам; обрубок на другом блоке или без смягчения — битый звук, не наш случай.
             prev = self._tts_soften_block(known)
-            done_rounds = self._tts_soften_done(known)
-            stub = tts_soften.stub_block(lines) if done_rounds else None
-            # Метка старого вида «tts-soften:N» номера блока не хранит (смягчения до 21.10) —
+            stub = tts_soften.stub_block(lines) if done else None
+            # Метка старого вида «tts-soften:N» или стёртая метка номера блока не хранит —
             # тогда обрубок на любом блоке после смягчения считаем продолжением отказа.
             if not stub or (prev and stub != prev):
                 return ""
@@ -1357,7 +1372,6 @@ class PubServices:
                      f"следующий раунд смягчения", level="warn")
         if str(known["error"] or "").startswith("tts-lumean"):
             return "exhausted"            # запасной провайдер уже был — дальше человек
-        done = self._tts_soften_done(known)
         if done >= self.TTS_SOFTEN_ROUNDS:
             return self._tts_lumean_fallback(c, rel, known, block)
         key = get_key(c, "rewrite")

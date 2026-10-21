@@ -339,10 +339,21 @@ def test_engine():
             check("ItemFailed", str(exc), "этап «tts» завершился со статусом error")
         check("озвучку не ставили", [k for k, _ in placed if k == "tts"], [])
 
+        print("\nМетка стёрта возвратом выпуска, но на диске копия раунда 1 — обрубок ведёт на раунд 2")
+        pdir5, _ = make_project()
+        open(os.path.join(pdir5, "source.txt.before-soften-1"), "w").close()
+        c = fresh(mark=None, logs=LOG_5306)
+        placed = []
+        out = services(placed, pdir5).do_media_ready(c, REL)
+        check("движок ждёт новую озвучку", out, {"wait": True})
+        check("зеркало: раунд 2 по копии на диске", tts_row(c)["error"], "tts-soften:2:6")
+        check("копия раунда 2 записана", os.path.exists(os.path.join(pdir5, "source.txt.before-soften-2")), True)
+
         print("\nОбрубок без смягчения до него — тоже как раньше")
+        pdir6, _ = make_project()
         c = fresh(logs=LOG_5306)
         try:
-            services([], pdir3).do_media_ready(c, REL)
+            services([], pdir6).do_media_ready(c, REL)
             check("ItemFailed", False, True)
         except pub_engine.ItemFailed as exc:
             check("ItemFailed", str(exc), "этап «tts» завершился со статусом error")
@@ -374,10 +385,11 @@ def test_engine():
             timeouts.append(1)
             raise S.SoftenError("сервис текста не ответил: ReadTimeout")
         S.chat_once = slow_chat
+        pdir_w, _ = make_project()      # свежая папка: без копий раундов на диске
         c = fresh()
         placed = []
         try:
-            services(placed, pdir).do_media_ready(c, REL)
+            services(placed, pdir_w).do_media_ready(c, REL)
             check("поднят ResourceDown", False, True)
         except pub_services.ResourceDown as exc:
             check("поднят ResourceDown", exc.resource, "codex")
@@ -386,7 +398,7 @@ def test_engine():
         check("озвучку заново не ставили", [k for k, _ in placed if k == "tts"], [])
         check("в журнале сказано «отложено»", "отложено" in last_msg(c), True)
         try:
-            services(placed, pdir).do_media_ready(c, REL)
+            services(placed, pdir_w).do_media_ready(c, REL)
             check("второй круг сразу — снова ждём", False, True)
         except pub_services.ResourceDown as exc:
             check("второй круг сразу — снова ждём", "повтор через" in str(exc), True)
