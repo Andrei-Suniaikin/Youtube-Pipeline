@@ -1366,10 +1366,9 @@ class PubServices:
             if not stub or (prev and stub != prev):
                 return ""
             block = stub
-            log_line(c, rel["release_id"], "ролик",
-                     f"блок {block} после смягчения вернулся обрубком звука (провайдер режет "
-                     f"запись, а не отказывает словами) — считаю это отказом фильтра, "
-                     f"следующий раунд смягчения", level="warn")
+            via_stub = True
+        else:
+            via_stub = False
         if str(known["error"] or "").startswith("tts-lumean"):
             return "exhausted"            # запасной провайдер уже был — дальше человек
         if done >= self.TTS_SOFTEN_ROUNDS:
@@ -1385,6 +1384,12 @@ class PubServices:
             raise ResourceDown("codex", f"смягчение озвучки (блок {block}, раунд {done + 1}): "
                                         f"сервис текста не ответил, повтор через "
                                         f"{int((self.TTS_SOFTEN_WAIT_SEC - waited) // 60) + 1} мин")
+        if via_stub:
+            # Пишем один раз перед самим смягчением, а не на каждом тике ожидания Codex.
+            log_line(c, rel["release_id"], "ролик",
+                     f"блок {block} после смягчения вернулся обрубком звука (провайдер режет "
+                     f"запись, а не отказывает словами) — считаю это отказом фильтра, "
+                     f"следующий раунд смягчения", level="warn")
         try:
             info = tts_soften.soften_project(
                 self.project_dir(rel["tenant_id"], rel["project_id"]), block,
