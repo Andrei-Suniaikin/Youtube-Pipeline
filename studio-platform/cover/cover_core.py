@@ -830,6 +830,7 @@ def generate_scene_from_title(
     extra_prompt: str,
     openai_api_key: str,
     model: str = "",
+    provider: str = "",
 ) -> Dict:
     """v1.0.4 — генерация сцены для title-mode (без YouTube превью).
     На вход: название видео + опциональные доп.детали + openai ключ.
@@ -839,7 +840,12 @@ def generate_scene_from_title(
     Все строковые поля ВСЕГДА на английском (для consistency с Fast Gen)."""
     if not title or not title.strip():
         raise ValueError("title must not be empty")
-    if not openai_api_key:
+    # 21.10.2026: разбор превью подпиской (codex/claude) — и сцена по названию ею же,
+    # как adapt_text. Иначе сцена шла ключом OpenAI/прокси, у которого кончился лимит
+    # (402 «token allowance exhausted»), и 24–29 обложек ВВ2 стояли при живой подписке.
+    sub = (provider or "").strip().lower()
+    sub = sub if sub in SUBSCRIPTION_PROVIDERS else ""
+    if not openai_api_key and not sub:
         raise ValueError("openai_api_key required")
 
     model_name = (model or "").strip() or DEFAULT_ANALYSIS_MODEL_OPENAI
@@ -877,18 +883,19 @@ def generate_scene_from_title(
     )
     user = f"Title: {title.strip()}\n\nExtra details: {(extra_prompt or '').strip() or '(none)'}"
 
-    client, model_name, used_key = _chat_route(openai_api_key, model_name)
-    with _provider_semaphore_for_key("openai", used_key):
-        resp = client.chat.completions.create(
-            model=model_name,
-            messages=[
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ],
-            max_tokens=600,
-            temperature=0.8,
-        )
-    raw = (resp.choices[0].message.content or "").strip()
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    if sub:
+        raw = _subscription_call(sub, messages, model=(model or "").strip()).strip()
+    else:
+        client, model_name, used_key = _chat_route(openai_api_key, model_name)
+        with _provider_semaphore_for_key("openai", used_key):
+            resp = client.chat.completions.create(
+                model=model_name,
+                messages=messages,
+                max_tokens=600,
+                temperature=0.8,
+            )
+        raw = (resp.choices[0].message.content or "").strip()
     parsed = _parse_json_response(raw)
     # Гарантируем наличие обязательных полей
     parsed.setdefault("scene_description", "dramatic cinematic scene")
@@ -2741,7 +2748,8 @@ def _process_batch_title_mode(
     log("🎬 Генерация сцены из названия...")
     try:
         analysis_base = generate_scene_from_title(
-            base_title, extra_prompt, openai_api_key, preset.analysis_model
+            base_title, extra_prompt, openai_api_key, preset.analysis_model,
+            provider=str(getattr(preset, "analysis_provider", "") or ""),
         )
         analysis_base["video_title"] = base_title
         log(f"   Scene: {(analysis_base.get('scene_description') or '')[:120]}")
