@@ -1344,8 +1344,11 @@ class PubServices:
             # же блоке, который мы только что смягчали, — продолжение отказа, идём дальше по
             # раундам; обрубок на другом блоке или без смягчения — битый звук, не наш случай.
             prev = self._tts_soften_block(known)
-            stub = tts_soften.stub_block(lines) if prev else None
-            if not stub or stub != prev:
+            done_rounds = self._tts_soften_done(known)
+            stub = tts_soften.stub_block(lines) if done_rounds else None
+            # Метка старого вида «tts-soften:N» номера блока не хранит (смягчения до 21.10) —
+            # тогда обрубок на любом блоке после смягчения считаем продолжением отказа.
+            if not stub or (prev and stub != prev):
                 return ""
             block = stub
             log_line(c, rel["release_id"], "ролик",

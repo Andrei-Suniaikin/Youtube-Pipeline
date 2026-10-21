@@ -320,6 +320,14 @@ def test_engine():
         check("журнал объясняет обрубок",
               any("обрубком" in m for m in all_msgs(c)) and "раунд 2 из 3" in last_msg(c), True)
 
+        print("\nМетка старого вида без номера блока (r_61c7232bb0) — обрубок тоже ведёт на раунд 2")
+        pdir4, _ = make_project()
+        c = fresh(mark="tts-soften:1", logs=LOG_5306)
+        placed = []
+        out = services(placed, pdir4).do_media_ready(c, REL)
+        check("движок ждёт новую озвучку", out, {"wait": True})
+        check("зеркало: второй раунд, блок теперь записан", tts_row(c)["error"], "tts-soften:2:6")
+
         print("\nОбрубок на другом блоке — битый звук, падает как раньше")
         c = fresh(mark="tts-soften:1:6",
                   logs=[l.replace("блок 6", "блок 3") for l in LOG_5306])
