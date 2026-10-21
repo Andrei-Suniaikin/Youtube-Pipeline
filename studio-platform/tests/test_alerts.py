@@ -295,6 +295,25 @@ def main() -> int:
     check("сказано сразу, без выдержки", len(bag.sent), 1)
     check("в тексте — слова провайдера", "insufficient_quota" in bag.sent[0], True)
     check("и что это про деньги", "означает деньги" in bag.sent[0], True)
+    check("второго ключа нет — сказано, что всё упрётся", "упрётся в тот же отказ" in bag.sent[0], True)
+    # 21.10.2026: два дома Codex — x5 кончился до 27.10, x20 вёз обложки. Тревога обязана
+    # сказать, что второй ключ работает, а не пугать остановкой.
+    c = fresh()
+    rec = {"codex_home:1": {"family": "codex_home", "mask": "…va04", "until": NOW + 10 * 60,
+                            "why": "You've hit your usage limit. Visit … to purchase more credits",
+                            "pool_live": 1, "pool_total": 2}}
+    c.execute("INSERT OR REPLACE INTO admin_state VALUES('credential_cooldown',?,0)",
+              (json.dumps(rec, ensure_ascii=False),))
+    bag2 = Bag()
+    A.tick(c, bag2, now=NOW)
+    check("с живым вторым ключом — повод тот же", keys(c), ["key_exhausted:codex_home"])
+    check("в заголовке сказано, что второй работает", "(второй работает)" in bag2.sent[0], True)
+    check("и названо, сколько живых", "живых 1 из 2" in bag2.sent[0], True)
+    check("без слов «упрётся в тот же отказ»", "упрётся в тот же отказ" in bag2.sent[0], False)
+    c = fresh()
+    cooldown("insufficient_quota: You exceeded your current quota")
+    bag = Bag()
+    A.tick(c, bag, now=NOW)
     c.execute("UPDATE admin_state SET v='{}' WHERE k='credential_cooldown'")
     A.tick(c, bag, now=NOW + 5 * 60)
     check("ключ заменили — сказали «починилось»",

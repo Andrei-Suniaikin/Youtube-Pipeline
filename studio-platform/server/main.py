@@ -520,6 +520,20 @@ def _cred_park(family, value, seconds, why=""):
         _CRED_COOLDOWN[sid] = {"until": until, "why": why_txt,
                                "family": str(family), "mask": _cred_mask(value)}
         _cred_cooldown_save()
+    # 21.10.2026: тревоге §8 важно, остался ли у семейства живой ключ. «Каждая следующая
+    # задача упрётся в тот же отказ» неверно, когда второй дом Codex работает (x5 кончился
+    # до 27.10, x20 вёз обложки). Пул считаем вне замка: чтение конфига ключей — файл.
+    try:
+        cfg = keys()
+        pool_total = len(_credential_candidates(cfg, family))
+        pool_live = len(_live_credential_candidates(cfg, family))
+        with _CRED_COOLDOWN_LOCK:
+            rec = _CRED_COOLDOWN.get(sid)
+            if rec is not None:
+                rec["pool_total"], rec["pool_live"] = pool_total, pool_live
+                _cred_cooldown_save()
+    except Exception:
+        log_exc("cred_cooldown/pool")
     # Соседям по подписке: файловый ввод-вывод делаем вне замка кулдауна.
     if str(family) in _CRED_PROBE_FAMILIES:
         _shared_limit_mark(value, until, kind=_cred_failure_kind(why_txt) or "limit",
