@@ -62,6 +62,7 @@ from pub_ui import register_pub_routes
 from pub_engine import tick as pub_tick
 from pub_services import PubServices
 from pub_upload_api import register_upload_routes, sweep_stuck as sweep_upload
+from pub_table_sync import register_table_sync_routes
 from pub_mail import register_mail_routes
 from pub_access import register_access_routes
 
@@ -20878,6 +20879,45 @@ register_access_routes(app, {
     "db": db,
     "upload_token": _upload_token,
     "log": log_info,
+})
+
+
+def _table_sync_token() -> str:
+    """Токен приёма листов единой таблицы (22.10.2026). Отдельный от токена ноды: он
+    лежит в Apps Script чужой Google-таблицы и открывает ТОЛЬКО приём листов."""
+    c = db()
+    try:
+        row = c.execute("SELECT v FROM admin_state WHERE k='pub_table_sync_token'").fetchone()
+        if row and row[0]:
+            return row[0]
+        token = "tbl_" + secrets.token_urlsafe(24)
+        c.execute("INSERT OR REPLACE INTO admin_state(k,v,updated) VALUES('pub_table_sync_token',?,?)",
+                  (token, time.time()))
+        c.commit()
+        log_info("единая таблица: выписан токен приёма листов (admin_state.pub_table_sync_token)")
+        return token
+    finally:
+        c.close()
+
+
+def _table_sync_tg():
+    """Телеграм тревог для отчётов ноды о единой таблице; без VS_TG_TOKEN молчит."""
+    try:
+        from pub_alerts_tg import Telegram
+        return Telegram(log=log_info)
+    except Exception as exc:                                          # noqa: BLE001
+        log_info(f"единая таблица: телеграм недоступен: {exc}")
+        return None
+
+
+# Единая таблица каналов и аккаунтов (22.10.2026): Google-таблица присылает листы
+# (Apps Script), нода Минска забирает снимок, сверяет с книгами и отчитывается.
+register_table_sync_routes(app, {
+    "db": db,
+    "upload_token": _upload_token,
+    "table_token": _table_sync_token,
+    "log": log_info,
+    "tg": _table_sync_tg(),
 })
 
 # Журнал платных вызовов. Токен задачи (queue_tasks.claim_token) уже защищает её от
