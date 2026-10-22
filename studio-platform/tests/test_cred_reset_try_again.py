@@ -74,7 +74,7 @@ main._prompt_channel_has_spare_credential = lambda ch: True
 with main._PROMPT_DEAD_LOCK:
     main._PROMPT_DEAD.pop("codex", None)
 ret = main._scan_prompt_channel_line(CODEX_TEXT)
-check("скан вернул None (не глушил)", ret, None)
+check("скан вернул канал (инцидент для парковки ключа), но не глушил", ret, "codex")
 check("канал codex жив", main._prompt_channel_dead("codex"), False)
 
 print("4. единственный ключ — глушим, как раньше")
