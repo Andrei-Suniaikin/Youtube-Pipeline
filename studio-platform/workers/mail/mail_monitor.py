@@ -36,6 +36,7 @@ from datetime import datetime, timezone
 ENV_PATH = os.environ.get("MAIL_MONITOR_ENV", "/srv/studio/mail_monitor.env")
 DB_PATH = os.environ.get("MAIL_MONITOR_DB", "/srv/studio/data/mail_monitor.db")
 RAW_DIR = os.environ.get("MAIL_MONITOR_RAW", "/srv/studio/data/mail_raw")
+IMAP_SOCKET_TIMEOUT = float(os.environ.get("MAIL_IMAP_TIMEOUT_SEC", "60") or 60)
 
 # Правила классификации общие с приёмом строк Gmail с Минска (`server/pub_mail.py`):
 # одно письмо не должно получать две категории в зависимости от дороги. На VPS
@@ -143,7 +144,11 @@ def set_state(conn, key, value):
 
 
 def imap_connect(cfg):
-    M = imaplib.IMAP4_SSL(cfg["MAIL_IMAP_HOST"], 993)
+    # 22.10.2026: без таймаута сокета один проход завис на IMAP с 18.10 17:20 на трое
+    # суток — служба оставалась «activating», таймер раз в 5 минут не срабатывал, письма
+    # не читались. Таймаут ловит зависший сокет; срок всего прохода режет TimeoutStartSec
+    # в mail-monitor.service.
+    M = imaplib.IMAP4_SSL(cfg["MAIL_IMAP_HOST"], 993, timeout=IMAP_SOCKET_TIMEOUT)
     M.login(cfg["MAIL_IMAP_USER"], cfg["MAIL_IMAP_PASS"])
     return M
 
