@@ -105,6 +105,15 @@ def main() -> int:
     check("выпуск ждёт", status, "pending")
     check("причина — «ждём: подписка занята»", why.startswith("ждём: подписка занята"), True)
 
+    print("\n1в. Движок: сервис не ответил (перезапуск, таймаут) — ждём, не карантин (22.10.2026)")
+    out, status, _, why = advance_with(RuntimeError(
+        "обложка не сделалась: сервис текста не ответил: [Errno 111] Connection refused"))
+    check("исход — ожидание ресурса", out, "resource_wait")
+    check("выпуск ждёт", status, "pending")
+    check("причина — «ждём: сервис не ответил»", why.startswith("ждём: сервис не ответил"), True)
+    out, status, _, why = advance_with(E.ItemFailed("название не получено: ReadTimeout"))
+    check("ItemFailed с таймаутом — тоже ждём", (out, status), ("resource_wait", "pending"))
+
     print("\n2. Движок: обычная поломка по-прежнему в карантин")
     out, status, _, why = advance_with(RuntimeError("KeyError: 'preset'"))
     check("исход — карантин", out, "quarantined")

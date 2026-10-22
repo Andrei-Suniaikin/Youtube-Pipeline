@@ -81,6 +81,22 @@ def _limit_text(exc) -> bool:
     return any(marker in text for marker in _LIMIT_MARKERS)
 
 
+# 22.10.2026: сервис не ответил (перезапуск студии ~2 минуты, таймаут под нагрузкой) — это
+# тоже «подожди», а не поломка выпуска: обложка r_122751a404 дважды уехала в разбор с
+# «сервис текста не ответил: Connection refused» ровно в минуты выкатки.
+_TRANSIENT_MARKERS = ("не ответил", "Connection refused", "Bad Gateway", "ReadTimeout",
+                      "timed out", "ConnectTimeout", "Max retries exceeded")
+
+
+def _transient_text(exc) -> bool:
+    text = str(exc or "")
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
+
+
+def _wait_reason(exc) -> str:
+    return ("ждём: подписка занята — " if _limit_text(exc) else "ждём: сервис не ответил — ") + str(exc)
+
+
 class ResourceDown(Exception):
     """Отказ ОБЩЕГО ресурса: кредиты, сосед, машина заливки.
 
@@ -1222,21 +1238,21 @@ def advance(c, rel, services, now: float) -> str:
         log_line(c, rid, str(exc.resource), f"ждём: {exc}", level="warn", now=now)
         return "resource_wait"
     except ItemFailed as exc:
-        if _limit_text(exc):
+        if _limit_text(exc) or _transient_text(exc):
             # Обработчик честно сказал «не вышло», но причина — лимит подписки
             # (например, «рерайт не справился … SUBSCRIPTION_LIMIT»). Сервис рерайта сам
             # продолжит задачу через минуту («продолжит с места обрыва»), а выпуск до
             # 20.10 успевал уехать в карантин и ждал автовозврата полчаса.
             _set(c, rid, now, status="pending",
                  deadline=now + PHASE_DEADLINES.get(phase, DEFAULT_DEADLINE),
-                 blocked_reason=f"ждём: подписка занята — {exc}")
+                 blocked_reason=_wait_reason(exc))
             log_phase(c, rid, "resource_wait", now, payload={"resource": "подписка"})
             log_line(c, rid, "подписка", f"ждём: {exc}", level="warn", now=now)
             return "resource_wait"
         quarantine(c, rel, now, str(exc))
         return "quarantined"
     except Exception as exc:                       # noqa: BLE001 — падение обработчика
-        if _limit_text(exc):
+        if _limit_text(exc) or _transient_text(exc):
             # 20.10.2026: лимит подписки — не падение обработчика, а занятый общий
             # ресурс. Обложка (r_f6c094c1d8) улетела в карантин с «ошибка на шаге
             # «cover_ready»: подписка Codex не ответила (502): SUBSCRIPTION_LIMIT…», хотя
@@ -1244,7 +1260,7 @@ def advance(c, rel, services, now: float) -> str:
             # следующий круг движка попробует снова, оплаченное не трогаем.
             _set(c, rid, now, status="pending",
                  deadline=now + PHASE_DEADLINES.get(phase, DEFAULT_DEADLINE),
-                 blocked_reason=f"ждём: подписка занята — {exc}")
+                 blocked_reason=_wait_reason(exc))
             log_phase(c, rid, "resource_wait", now, payload={"resource": "подписка"})
             log_line(c, rid, "подписка", f"ждём: {exc}", level="warn", now=now)
             return "resource_wait"
