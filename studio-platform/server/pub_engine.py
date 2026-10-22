@@ -441,8 +441,17 @@ CHANNEL_PAUSE_MARKS = ("not logged in / no access", "активный аккау
 
 
 def pause_scope(error: str) -> str:
-    """«profile» — профиль без входа; «channel» — нет прав на канал; «» — не тот случай."""
+    """«profile» — профиль без входа; «channel» — нет прав на канал; «» — не тот случай.
+
+    Решает ГОЛОВА отказа (до « | »). 22.10.2026: «активный аккаунт не управляет каналом …
+    | account recovery blocked: …» ставил на паузу весь профиль №13 (4 канала, три из них
+    лились), хотя хвост про восстановление — лишь заметка, что повторный вход не помог:
+    аккаунт в профиле есть, прав на этот канал нет — стоит один канал.
+    """
     text = error or ""
+    head = text.split(" | ", 1)[0]
+    if "активный аккаунт не управляет каналом" in head:
+        return "channel"
     if any(m in text for m in PROFILE_PAUSE_MARKS):
         return "profile"
     if any(m in text for m in CHANNEL_PAUSE_MARKS):

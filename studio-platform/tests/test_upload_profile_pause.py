@@ -270,6 +270,22 @@ def main() -> int:
     check("паузы канала нет", sql("SELECT v FROM admin_state WHERE k=?",
                                   (f"pub_pause:channel:{UCS['a']}",)), [])
 
+    print("— сфера паузы решается головой отказа (22.10) —")
+    check("«не управляет каналом … | account recovery blocked» → канал",
+          pub_engine.pause_scope("активный аккаунт не управляет каналом: Studio показала «нет доступа», "
+                                 "канал бренда в переключателе не выбран (попытка 3): "
+                                 "https://studio.youtube.com/channel/UCx/ | account recovery blocked: "
+                                 "RecoveryBlocked: sign-in stopped making progress at stage: youtube_signin_transition"),
+          "channel")
+    check("«not logged in / no access … | account recovery blocked» → профиль",
+          pub_engine.pause_scope("not logged in / no access: https://studio.youtube.com/channel/UCx/ "
+                                 "| account recovery blocked: RecoveryBlocked"), "profile")
+    check("«account recovery needs the owner» → профиль",
+          pub_engine.pause_scope("account recovery needs the owner: too many recovery attempts"), "profile")
+    check("«not logged in / no access» без хвоста → канал",
+          pub_engine.pause_scope("not logged in / no access: https://studio.youtube.com/channel/UCx/"), "channel")
+    check("чужой отказ → без паузы", pub_engine.pause_scope("transfer incomplete"), "")
+
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}")
