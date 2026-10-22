@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import secrets
 
+from starlette.concurrency import run_in_threadpool
 from fastapi import HTTPException, Request
 
 import pub_calls as pc
@@ -38,14 +39,19 @@ def register_calls_routes(app, ctx):
         """След повторов в journal: по нему видно, что база занята, а не что всё тихо."""
         print(f"[calls] {line}", flush=True)
 
-    def _write(label: str, work):
+    async def _write(label: str, work):
         """Запись в журнал платных вызовов с повтором на занятой базе.
 
         19.10.2026 так потерялись 23 отметки «результат получен»: движок получил 500,
         деньги остались потраченными, а строка — в `ordered`. Подробности и доказательство
         безопасности повтора — в pub_calls.write_retry.
+
+        22.10.2026: write_retry ждёт занятую базу синхронно (до 5 попыток по 30 с со
+        sleep между ними), а обработчики асинхронные — пока он ждал, стоял весь цикл
+        событий, и простые запросы пуллеров (фаза, вердикт) получали таймаут. Ожидание
+        уходит в пул потоков, цикл свободен.
         """
-        return pc.write_retry(db, work, label=label, log=_note)
+        return await run_in_threadpool(pc.write_retry, db, work, label=label, log=_note)
 
     def _job(request: Request, body: dict):
         """Задача, от имени которой пишет движок. Возвращает строку queue_tasks.
@@ -114,7 +120,7 @@ def register_calls_routes(app, ctx):
                 now=_now(),
             )
 
-        res = _write(f"заявка {kind}/{unit}", work)
+        res = await _write(f"заявка {kind}/{unit}", work)
         row = res["row"]
         return {"action": res["action"], "status": res["status"], "call_id": res["call_id"],
                 "remote_order_id": row["remote_order_id"], "result_path": row["result_path"],
@@ -132,7 +138,7 @@ def register_calls_routes(app, ctx):
             _call_of(c, call_id, job)
             pc.mark_ordered(c, call_id, order, now=_now())
 
-        _write(f"заказ создан #{call_id}", work)
+        await _write(f"заказ создан #{call_id}", work)
         return {"ok": True}
 
     @app.post("/api/calls/{call_id}/delivered")
@@ -150,7 +156,7 @@ def register_calls_routes(app, ctx):
                               cost=(float(cost) if cost not in (None, "") else None),
                               now=_now())
 
-        _write(f"результат получен #{call_id}", work)
+        await _write(f"результат получен #{call_id}", work)
         return {"ok": True}
 
     @app.post("/api/calls/{call_id}/failed")
@@ -164,5 +170,5 @@ def register_calls_routes(app, ctx):
                            ordered=bool(body.get("ordered")),
                            lost=bool(body.get("lost")), now=_now())
 
-        _write(f"вызов не удался #{call_id}", work)
+        await _write(f"вызов не удался #{call_id}", work)
         return {"ok": True}
