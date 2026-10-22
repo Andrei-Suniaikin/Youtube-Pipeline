@@ -416,9 +416,48 @@ def test_engine():
         S.chat_once = saved
 
 
+def test_engine_thinking():
+    """22.10.2026: модель думает дольше тика — движок отпущен, выпуск ждёт («thinking»),
+    озвучка ставится, когда ответ пришёл. Один объект служб на оба тика, как в бою."""
+    print("\nМодель думает дольше тика — движок не стоит, выпуск ждёт")
+    import threading
+    import time as _t
+    pub_services.get_key = lambda c, name: "rewrite-key"
+    saved_chat, saved_grace = S.chat_once, pub_services.PubServices.SOFTEN_GRACE_SEC
+    gate = threading.Event()
+
+    def thinking_chat(m, k, b, **kw):
+        gate.wait(10)
+        frag = m[1]["content"].split("ФРАГМЕНТ:\n", 1)[1]
+        return frag.replace("Vojnici", "Ljudi")
+    S.chat_once = thinking_chat
+    pub_services.PubServices.SOFTEN_GRACE_SEC = 0.2
+    try:
+        pdir, _ = make_project()
+        c = fresh()
+        placed = []
+        svc = services(placed, pdir)
+        t0 = _t.monotonic()
+        out = svc.do_media_ready(c, REL)
+        check("движок отпущен за секунду, а не за таймаут модели", _t.monotonic() - t0 < 2, True)
+        check("выпуск ждёт", out, {"wait": True})
+        check("озвучка ещё не поставлена", len([p for k, p in placed if k == "tts"]), 0)
+        check("поток смягчения жив", svc._soften_running(REL["release_id"], 1), True)
+        out = svc.do_media_ready(c, REL)
+        check("второй тик тоже только ждёт", out, {"wait": True})
+        gate.set()
+        svc._softens[REL["release_id"]]["thread"].join(5)
+        out = svc.do_media_ready(c, REL)
+        check("ответ пришёл — озвучка поставлена заново", len([p for k, p in placed if k == "tts"]), 1)
+        check("зеркало помнит раунд и блок", tts_row(c)["error"], "tts-soften:1:6")
+        check("реестр фоновых смягчений пуст", REL["release_id"] in svc._softens, False)
+    finally:
+        S.chat_once, pub_services.PubServices.SOFTEN_GRACE_SEC = saved_chat, saved_grace
+
+
 def main():
     test_failed_block(); test_blocks_match_worker(); test_reply_validation()
-    test_soften_project_writes_backup(); test_engine()
+    test_soften_project_writes_backup(); test_engine(); test_engine_thinking()
     print()
     if FAILS:
         print(f"ПРОВАЛЕНО: {len(FAILS)}"); [print("  -", f) for f in FAILS]; return 1

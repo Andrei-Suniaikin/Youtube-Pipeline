@@ -112,6 +112,11 @@ class PubServices:
         import threading as _threading
         self._titles = {}
         self._titles_lock = _threading.Lock()
+        # 22.10.2026: смягчение озвучки тоже в фоне: выпуск → {"thread", "round", "info", "exc"}.
+        # Синхронный вызов до 8 минут (VS_SOFTEN_TIMEOUT_SEC) останавливал единственный
+        # поток движка: пока модель думала, ни один выпуск не двигался.
+        self._softens = {}
+        self._softens_lock = _threading.Lock()
 
     # 04.10.2026: названия пишет подписка Codex. Её места делят все службы машины, и
     # ответ шёл 4–8 минут (ожидание места плюс сам вызов). Внутри круга движка это
@@ -864,7 +869,7 @@ class PubServices:
                     return {"wait": True}
                 if kind == "tts" and state == "error":
                     outcome = self._soften_tts(c, rel, known)
-                    if outcome == "requeued":
+                    if outcome in ("requeued", "thinking"):
                         return {"wait": True}
                     if outcome == "exhausted":
                         raise ItemFailed(self._tts_filter_reason(c, known))
@@ -1229,6 +1234,55 @@ class PubServices:
     # когда не ответил). r_61c7232bb0 так падал четыре раза подряд в часы лимитов.
     TTS_SOFTEN_WAIT_SEC = 900
 
+    # 22.10.2026: сколько ждать быстрый ответ модели прямо в тике, прежде чем отпустить
+    # поток движка; дальше смягчение думает в фоне, выпуск ждёт («thinking»).
+    SOFTEN_GRACE_SEC = float(os.environ.get("VS_SOFTEN_GRACE_SEC", "10") or 10)
+
+    def _soften_running(self, rid: str, round_no: int) -> bool:
+        with self._softens_lock:
+            job = self._softens.get(rid)
+            return bool(job and job["round"] == round_no and job["thread"].is_alive())
+
+    def _soften_in_background(self, rel, block: int, done: int, key: str):
+        """Смягчение блока в фоновом потоке. Возвращает job с `info` и `round`; None — думает;
+        исключение потока (SoftenError и прочие) поднимается здесь, как у прямого вызова.
+        Пути и язык берутся в потоке движка: соединение с базой в фон не отдаём."""
+        import threading as _threading
+        import tts_soften
+        rid, round_no = rel["release_id"], done + 1
+        pdir, lang = self.project_dir(rel["tenant_id"], rel["project_id"]), rel["lang"] or "ru"
+        with self._softens_lock:
+            job = self._softens.get(rid)
+            if job is not None and job.get("block") != block:
+                job = None            # другой блок — прежний поток дорабатывает впустую
+            if job is None:
+                job = {"round": round_no, "block": block, "info": None, "exc": None}
+
+                def work(job=job):
+                    try:
+                        job["info"] = tts_soften.soften_project(pdir, block, lang, round_no,
+                                                                key, REWRITE_BASE)
+                    except BaseException as exc:                   # noqa: BLE001
+                        job["exc"] = exc
+                job["thread"] = _threading.Thread(target=work, daemon=True, name=f"soften-{rid}")
+                self._softens[rid] = job
+                job["thread"].start()
+        job["thread"].join(self.SOFTEN_GRACE_SEC)
+        if job["thread"].is_alive():
+            return None
+        with self._softens_lock:
+            if self._softens.get(rid) is job:
+                self._softens.pop(rid, None)
+        if job["exc"] is not None:
+            raise job["exc"]
+        return job
+
+    def _soften_result_pending(self, rid: str):
+        """Готовый, но ещё не принятый результат фонового смягчения (поток закончил)."""
+        with self._softens_lock:
+            job = self._softens.get(rid)
+            return job if job is not None and not job["thread"].is_alive() else None
+
     def _tts_soften_done(self, known) -> int:
         mark = str(known["error"] or "")
         for prefix in ("tts-soften-wait:", "tts-soften:"):
@@ -1355,6 +1409,11 @@ class PubServices:
         # Раунды: по метке зеркала или по копиям текста на диске — что больше (метку стирает
         # возврат выпуска, копии переживают всё).
         done = max(self._tts_soften_done(known), self._tts_soften_rounds_on_disk(rel))
+        # 22.10.2026: фоновое смягчение уже записало копию текста на диск, а результат ещё
+        # не принят — его раунд главнее счёта по копиям, иначе раунд засчитался бы дважды.
+        pending = self._soften_result_pending(rel["release_id"])
+        if pending is not None:
+            done = max(0, pending["round"] - 1)
         if not block:
             # 21.10.2026: фильтр может не отказать словами, а обрезать звук. Обрубок на том
             # же блоке, который мы только что смягчали, — продолжение отказа, идём дальше по
@@ -1384,7 +1443,7 @@ class PubServices:
             raise ResourceDown("codex", f"смягчение озвучки (блок {block}, раунд {done + 1}): "
                                         f"сервис текста не ответил, повтор через "
                                         f"{int((self.TTS_SOFTEN_WAIT_SEC - waited) // 60) + 1} мин")
-        if via_stub:
+        if via_stub and not self._soften_running(rel["release_id"], done + 1):
             # Пишем один раз перед самим смягчением, а не на каждом тике ожидания Codex.
             log_line(c, rel["release_id"], "ролик",
                      f"блок {block} после смягчения вернулся обрубком звука (провайдер режет "
@@ -1397,9 +1456,7 @@ class PubServices:
         # подтверждения фазы и снимали заливки (4 за утро). Замок отпускаем до сети.
         c.commit()
         try:
-            info = tts_soften.soften_project(
-                self.project_dir(rel["tenant_id"], rel["project_id"]), block,
-                rel["lang"] or "ru", done + 1, key, REWRITE_BASE)
+            soften_job = self._soften_in_background(rel, block, done, key)
         except tts_soften.SoftenError as exc:
             if "не ответил" in str(exc) or pub_engine_limit_text(exc):
                 # Сервис занят или лимит — раунд не потрачен, выпуск ждёт, а не падает.
@@ -1417,6 +1474,9 @@ class PubServices:
                      f"(раунд {done + 1} из {self.TTS_SOFTEN_ROUNDS}) не удалось: {exc}",
                      level="warn")
             return ""
+        if soften_job is None:
+            return "thinking"             # модель думает в фоне — выпуск ждёт, движок свободен
+        info, round_no = soften_job["info"], soften_job["round"]
         uid = self._uid(c, rel["tenant_id"])
         if not uid:
             return ""
@@ -1427,14 +1487,14 @@ class PubServices:
             return ""
         c.execute("UPDATE pub_release_jobs SET remote_job_id=?, status='queued', error=?, "
                   "updated=? WHERE release_id=? AND service='vsgen' AND kind='tts'",
-                  (str(job_id), f"tts-soften:{done + 1}:{block}", rel["updated"],
+                  (str(job_id), f"tts-soften:{round_no}:{block}", rel["updated"],
                    rel["release_id"]))
         log_line(c, rel["release_id"], "ролик",
                  f"блок {block} из {info['blocks']} не прошёл фильтр провайдера озвучки — "
                  f"текст блока смягчён моделью ({info['words_before']}→{info['words_after']} "
                  f"слов, прежний текст: {os.path.basename(info['backup'])}), озвучка "
                  f"поставлена заново, задача {job_id}. Готовые блоки не переозвучиваются "
-                 f"(раунд {done + 1} из {self.TTS_SOFTEN_ROUNDS})", level="warn")
+                 f"(раунд {round_no} из {self.TTS_SOFTEN_ROUNDS})", level="warn")
         return "requeued"
 
     def _adopt_stage(self, c, rel, kind: str, jobs: dict) -> str:
