@@ -597,7 +597,11 @@ def _cred_pool_view(family):
 # (Europe/Berlin)». Разбираем его — иначе срок пришлось бы гадать таймаутом, а лимит
 # подписки живёт часами, а не 600 секундами.
 _RESET_TZ_RE = re.compile(r"\(([A-Za-z]+/[A-Za-z_+\-]+)\)")
-_RESET_AT_RE = re.compile(r"reset[s]?\s+(?:at\s+)?(?P<body>[^()·|;]{1,48})", re.I)
+# 22.10.2026: Codex на исчерпанной подписке пишет «try again at Oct 27th, 2026 7:01 AM» —
+# без разбора этой формы ключ x5 парковался на час по умолчанию, раз в час просыпался,
+# падал снова и каждым отказом глушил весь канал промптов на 600 с при живом x20
+# (7 раз за ночь 21→22.10, ≈70 минут простоя промптов).
+_RESET_AT_RE = re.compile(r"(?:reset[s]?|try again)\s+(?:at\s+)?(?P<body>[^()·|;]{1,48})", re.I)
 _RESET_MONTHS = {m: i for i, m in enumerate(
     ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
 
@@ -1007,8 +1011,28 @@ def _scan_prompt_channel_line(line, uid=None, own_credential=False, u=None):
     if u is not None:
         family = _PROMPT_CHANNEL_FAMILY.get(ch)
         own = bool(family and _own_credential_for_family(u, family))
+    if not own and _prompt_channel_has_spare_credential(ch):
+        # 22.10.2026: отказ ОДНОГО серверного ключа при живом втором (x5 кончился, x20
+        # везёт) — не повод глушить канал всем на 600 с: ключ паркует _note_credential_failure,
+        # а следующая задача возьмёт живой. Глушим только когда подменить нечем.
+        print(f"[prompt] канал {ch}: отказ ключа, но в пуле есть ещё живой — канал не глушу: "
+              f"{line.strip()[:120]}", flush=True)
+        return None
     _mark_prompt_channel_dead(ch, line.strip(), uid=(uid if own else None))
     return ch
+
+
+def _prompt_channel_has_spare_credential(ch) -> bool:
+    """Есть ли у серверного пула канала хотя бы два живых ключа (отказавший ещё не
+    припаркован в момент скана строки, поэтому «один живой» = подменить нечем)."""
+    family = _PROMPT_CHANNEL_FAMILY.get(str(ch or "").strip().lower())
+    if not family:
+        return False
+    try:
+        return len(_live_credential_candidates(keys(), family)) >= 2
+    except Exception:                                          # noqa: BLE001
+        log_exc("prompt_channel/spare")
+        return False
 
 
 # ── «Кончился лимит аккаунта image-провайдера» — причина падения задачи ──────
