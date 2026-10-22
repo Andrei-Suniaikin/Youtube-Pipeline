@@ -452,6 +452,10 @@ def pause_scope(error: str) -> str:
     head = text.split(" | ", 1)[0]
     if "активный аккаунт не управляет каналом" in head:
         return "channel"
+    if "no exact account binding" in head:
+        # Нет привязки на пару профиль+канал в книге входов: соседние каналы профиля
+        # со своими привязками льются (22.10: ARTA в №25 остановила бы весь профиль).
+        return "channel"
     if any(m in text for m in PROFILE_PAUSE_MARKS):
         return "profile"
     if any(m in text for m in CHANNEL_PAUSE_MARKS):

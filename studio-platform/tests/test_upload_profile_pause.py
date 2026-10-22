@@ -285,6 +285,12 @@ def main() -> int:
     check("«not logged in / no access» без хвоста → канал",
           pub_engine.pause_scope("not logged in / no access: https://studio.youtube.com/channel/UCx/"), "channel")
     check("чужой отказ → без паузы", pub_engine.pause_scope("transfer incomplete"), "")
+    check("«needs the owner: no exact account binding» → канал",
+          pub_engine.pause_scope("account recovery needs the owner: no exact account binding for this "
+                                 "profile+channel"), "channel")
+    check("«needs the owner: too many recovery attempts» → профиль",
+          pub_engine.pause_scope("account recovery needs the owner: too many recovery attempts for this "
+                                 "account today"), "profile")
 
     print()
     if FAILS:
