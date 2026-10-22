@@ -197,7 +197,7 @@ def tg_text(cur: dict, rec: dict) -> str:
 
 
 def register_table_sync_routes(app, ctx):
-    """`/studio/api/table-sync/{push,pull,report,status}` (снаружи; внутри пульта без /studio).
+    """`/api/table-sync/{push,pull,report,status}` (кабинет в корне: https://studio…/api/table-sync/…).
 
     push — из Google-таблицы (Apps Script), свой токен `X-Table-Token`: он лежит в чужой
     таблице и не должен открывать ничего, кроме приёма листов. pull/report/status — токен
@@ -291,8 +291,8 @@ def register_table_sync_routes(app, ctx):
     api_pull.__annotations__ = {"request": Request}
     api_report.__annotations__ = {"request": Request}
     api_status.__annotations__ = {"request": Request}
-    # Пульт смонтирован под /studio со срезанием префикса (web/platform.py), поэтому
-    # снаружи это /studio/api/table-sync/…, а здесь — без /studio.
+    # Это приложение кабинета, web/platform.py монтирует его в корень, поэтому снаружи
+    # адреса те же: https://studio…/api/table-sync/… (без /studio — тот префикс у пульта).
     app.post("/api/table-sync/push")(api_push)
     app.get("/api/table-sync/pull")(api_pull)
     app.post("/api/table-sync/report")(api_report)
